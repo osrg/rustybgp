@@ -1,0 +1,23 @@
+[package]
+name = "daemon"
+version = "0.1.0"
+authors = ["FUJITA Tomonori <fujita.tomonori@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+grpcio = "0.4.6"
+protobuf = "2.8.1"
+futures = "0.1.29"
+log = "*"
+env_logger = "*"
+byteorder = "1.3.2"
+failure = "*"
+clap = "2.33"
+
+api = { path = "../api" }
+proto = { path = "../proto" }
+
+[build-dependencies]
+grpcio-compiler = "*"
