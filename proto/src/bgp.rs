@@ -208,7 +208,7 @@ pub struct OpenMessage {
 
 impl OpenMessage {
     const VERSION: u8 = 4;
-    const HOLDTIME: u16 = 30;
+    pub const HOLDTIME: u16 = 90;
 
     pub fn new(as_number: u32, id: Ipv4Addr) -> OpenMessage {
         let params = vec![
@@ -706,7 +706,7 @@ impl UpdateMessage {
             }
         }
 
-        let nlri_len = c.get_ref().len() - c.position() as usize;
+        let _nlri_len = c.get_ref().len() - c.position() as usize;
 
         let mut routes: Vec<Nlri> = Vec::new();
 
