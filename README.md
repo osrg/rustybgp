@@ -6,10 +6,20 @@ RustyBGP supports the gRPC APIs same as GoBGP; GoBGP's CLI command enables you t
 
 ## Get Started
 
+You can easily build RusyBGP on any system that has Docker running. You don't need Rust development environment. You can build the x86_64 statically-linked binary as follows:
+
+```bash
+$ git clone https://github.com/osrg/rustybgp.git
+$ cd rustybgp
+$ docker run --rm -it -v "$(pwd)":/home/rust/src ekidd/rust-musl-builder cargo build --release
+$ ls -hl target/x86_64-unknown-linux-musl/release/daemon
+-rwxr-xr-x 2 fujita fujita 8.1M Dec  6 12:26 target/x86_64-unknown-linux-musl/release/daemon
+```
+
 No configuration file support.
 
 ```bash
-bash-3.2# ./target/debug/daemon
+$ sudo ./target/debug/daemon
 Hello, RustyBGP!
 grpc: listening on 127.0.0.1:50051
 ```
@@ -23,10 +33,10 @@ $ gobgp global as 65000 router-id 10.0.0.1
 Then you set up peer configuration.
 
 ```bash
-$ gobgp neighbor add 10.0.0.2 as 65001 
+$ gobgp neighbor add 10.0.0.2 as 65001
 $ gobgp neighbor
 Peer        AS Up/Down State       |#Received  Accepted
 10.0.0.2 65001   never Idle        |        0         0
 ```
 
-If you are too lazy to set up peer configuration, start the daemon with `--any-peer` option. The daemon accepts any peer without configuration.
+If you just want to check out the performance, start the daemon with `--perf` option. The daemon starts immediately with AS number 65001, then accepts any peers.
