@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Upload
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@master
+      - name: setup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake musl-dev musl-tools
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-musl
+          override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target x86_64-unknown-linux-musl
+      - name: set env
+        run: |
+          echo "::set-env name=BINARY_NAME::rustybgp_${GITHUB_REF:10}_linux_amd64.zip"
+      - name: set outputs
+        id: software_version
+        run: |
+          echo "::set-output name=version::${BINARY_NAME}"
+      - name: package
+        run: |
+          cp ./target/x86_64-unknown-linux-musl/release/daemon rustybgpd
+          zip --junk-paths ${BINARY_NAME} rustybgpd README.md
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+      - name: Upload Release Asset
+        id: upload-release-asset
+        uses: actions/upload-release-asset@v1.0.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./${{ steps.software_version.outputs.version }}
+          asset_name: ${{ steps.software_version.outputs.version }}
+          asset_content_type: application/zip
