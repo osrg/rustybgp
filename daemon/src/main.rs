@@ -1252,7 +1252,7 @@ async fn handle_session(
             set_state(&global, addr, state).await;
         }
 
-        let mut b = [0; 4096];
+        let mut b = [0; 65536];
         let n = stream.read(&mut b).await.unwrap_or(0);
         if n > 0 {
             buf.extend_from_slice(&b[0..n]);
