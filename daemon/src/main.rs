@@ -278,12 +278,14 @@ impl Destination {
 
 #[derive(Clone)]
 pub struct Table {
+    pub disable_best_path_selection: bool,
     pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
 }
 
 impl Table {
     pub fn new() -> Table {
         Table {
+            disable_best_path_selection: false,
             master: HashMap::new(),
         }
     }
@@ -318,27 +320,29 @@ impl Table {
                 let prev_len = d.entry.len();
 
                 let b = Path::new(source, attrs);
-                for i in 0..d.entry.len() {
-                    let a = &d.entry[i];
+                if self.disable_best_path_selection == false {
+                    for i in 0..d.entry.len() {
+                        let a = &d.entry[i];
 
-                    if b.get_local_preference().await > a.get_local_preference().await {
-                        d.entry.insert(i, b);
-                        return replaced == false;
-                    }
+                        if b.get_local_preference().await > a.get_local_preference().await {
+                            d.entry.insert(i, b);
+                            return replaced == false;
+                        }
 
-                    if b.get_as_len().await < a.get_as_len().await {
-                        d.entry.insert(i, b);
-                        return replaced == false;
-                    }
+                        if b.get_as_len().await < a.get_as_len().await {
+                            d.entry.insert(i, b);
+                            return replaced == false;
+                        }
 
-                    if b.get_origin().await < a.get_origin().await {
-                        d.entry.insert(i, b);
-                        return replaced == false;
-                    }
+                        if b.get_origin().await < a.get_origin().await {
+                            d.entry.insert(i, b);
+                            return replaced == false;
+                        }
 
-                    if b.get_med().await < a.get_med().await {
-                        d.entry.insert(i, b);
-                        return replaced == false;
+                        if b.get_med().await < a.get_med().await {
+                            d.entry.insert(i, b);
+                            return replaced == false;
+                        }
                     }
                 }
 
@@ -1157,7 +1161,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (init_tx, mut init_rx) = mpsc::channel::<()>(1);
 
     let global = Arc::new(Mutex::new(Global::new(args.is_present("perf"), init_tx)));
-    let table = Arc::new(Mutex::new(Table::new()));
+    let mut table = Table::new();
+    table.disable_best_path_selection = args.is_present("perf");
+    let table = Arc::new(Mutex::new(table));
 
     let addr = "127.0.0.1:50051".parse()?;
     let service = Service {
