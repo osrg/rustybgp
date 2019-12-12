@@ -1264,7 +1264,7 @@ async fn handle_session(
         if state == bgp::State::Established
             && Instant::now().duration_since(last_keepalive).as_secs() >= keepalive_interval as u64
         {
-            let keepalive = bgp::Message::Keepalive;
+            let kkeepalive = bgp::Message::Keepalive;
             let buf = keepalive.to_bytes().unwrap();
             if stream.write_all(&buf).await.is_err() {
                 break 'outer;
