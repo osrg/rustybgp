@@ -1383,7 +1383,7 @@ async fn handle_session(
                                 }
                             }
                         }
-                        {
+                        if update.withdrawns.len() > 0 {
                             let mut t = table.lock().await;
                             for r in update.withdrawns {
                                 if t.remove(bgp::Family::Ipv4Uc, r, addr) {
