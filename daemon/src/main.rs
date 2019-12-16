@@ -1425,8 +1425,10 @@ async fn handle_session(
     }
 
     println!("disconnected {}", addr);
-    // let mut t = table.write().unwrap();
-    // t.clear(addr);
+    {
+        let mut t = table.lock().await;
+        t.clear(addr);
+    }
 
     let peers = &mut global.lock().await.peers;
     peers.remove(&addr);
