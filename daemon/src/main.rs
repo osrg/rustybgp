@@ -16,16 +16,26 @@
 extern crate clap;
 extern crate futures;
 extern crate tokio;
+extern crate tokio_timer;
 
+use bytes::{BufMut, BytesMut};
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr};
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime};
 
-use tokio::net::{TcpListener, TcpStream};
-use tokio::prelude::*;
-use tokio::sync::{mpsc, Mutex};
+use tokio::{
+    codec::{Decoder, Encoder, Framed},
+    net::{TcpListener, TcpStream},
+    prelude::*,
+    sync::{mpsc, Mutex},
+};
+
+use tokio_timer::{timer::Handle, Delay};
 
 use clap::{App, Arg};
 
@@ -1208,10 +1218,66 @@ async fn set_state(global: &Arc<Mutex<Global>>, addr: IpAddr, state: bgp::State)
     peers.get_mut(&addr).unwrap().state = state;
 }
 
+struct Bgp;
+
+impl Encoder for Bgp {
+    type Item = bgp::Message;
+    type Error = io::Error;
+
+    fn encode(&mut self, item: bgp::Message, dst: &mut BytesMut) -> io::Result<()> {
+        let buf = item.to_bytes().unwrap();
+        dst.reserve(buf.len());
+        dst.put(buf);
+        Ok(())
+    }
+}
+
+impl Decoder for Bgp {
+    type Item = bgp::Message;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> io::Result<Option<bgp::Message>> {
+        match bgp::Message::from_bytes(src) {
+            Ok(m) => {
+                src.split_to(m.length());
+                Ok(Some(m))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+enum Event {
+    Message(bgp::Message),
+    Holdtimer,
+}
+
+struct Session {
+    lines: Framed<TcpStream, Bgp>,
+    delay: Delay,
+}
+
+impl Stream for Session {
+    type Item = Result<Event, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Poll::Ready(()) = self.delay.poll_unpin(cx) {
+            return Poll::Ready(Some(Ok(Event::Holdtimer)));
+        }
+
+        let result: Option<_> = futures::ready!(self.lines.poll_next_unpin(cx));
+        Poll::Ready(match result {
+            Some(Ok(message)) => Some(Ok(Event::Message(message))),
+            Some(Err(e)) => Some(Err(e)),
+            None => None,
+        })
+    }
+}
+
 async fn handle_session(
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
-    mut stream: TcpStream,
+    stream: TcpStream,
     addr: IpAddr,
 ) {
     {
@@ -1221,142 +1287,140 @@ async fn handle_session(
         g.peers.insert(addr, peer);
     }
 
-    let mut state = bgp::State::Idle;
-    let mut buf = Vec::new();
     let mut keepalive_interval = bgp::OpenMessage::HOLDTIME / 3;
-    let mut last_keepalive = Instant::now();
-    'outer: loop {
-        if state == bgp::State::Idle {
-            let (as_number, router_id) = {
-                let global = global.lock().await;
-                (global.as_number, global.id)
-            };
-            let open = bgp::OpenMessage::new(as_number, router_id);
-            {
-                let peers = &mut global.lock().await.peers;
-                let mut peer = peers.get_mut(&addr).unwrap();
-                peer.local_cap = open
-                    .get_parameters()
-                    .into_iter()
-                    .filter_map(|p| match p {
-                        bgp::OpenParam::CapabilityParam(c) => Some(c),
-                        _ => None,
-                    })
-                    .collect();
-            }
-            let buf = bgp::Message::Open(open).to_bytes().unwrap();
-            if stream.write_all(&buf).await.is_err() {
-                break;
-            }
-            state = bgp::State::OpenSent;
-            set_state(&global, addr, state).await;
-        }
+    let mut session = Session {
+        lines: Framed::new(stream, Bgp),
+        delay: Handle::default().delay(Instant::now()),
+    };
 
-        let mut b = [0; 65536];
-        let n = stream.read(&mut b).await.unwrap_or(0);
-        if n > 0 {
-            buf.extend_from_slice(&b[0..n]);
-        } else {
-            break;
-        }
+    let (as_number, router_id) = {
+        let global = global.lock().await;
+        (global.as_number, global.id)
+    };
+    let open = bgp::OpenMessage::new(as_number, router_id);
+    {
+        let peers = &mut global.lock().await.peers;
+        let mut peer = peers.get_mut(&addr).unwrap();
+        peer.local_cap = open
+            .get_parameters()
+            .into_iter()
+            .filter_map(|p| match p {
+                bgp::OpenParam::CapabilityParam(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+    }
+    if session.lines.send(bgp::Message::Open(open)).await.is_err() {
+        // in this case, the bellow session.next() will fail.
+    }
+    let mut state = bgp::State::OpenSent;
+    set_state(&global, addr, state).await;
 
-        // hacky, fix this when select! can wait on stream and timer.
-        if state == bgp::State::Established
-            && Instant::now().duration_since(last_keepalive).as_secs() >= keepalive_interval as u64
-        {
-            let keepalive = bgp::Message::Keepalive;
-            let buf = keepalive.to_bytes().unwrap();
-            if stream.write_all(&buf).await.is_err() {
-                break 'outer;
-            }
-            last_keepalive = Instant::now();
-        }
-        while let Some(msg) = bgp::Message::from_bytes(&buf).ok() {
-            {
-                let peers = &mut global.lock().await.peers;
-                let peer = peers.get_mut(&addr).unwrap();
-                peer.counter_rx.sync(&msg);
-            }
-            let length = msg.length();
-            match msg {
-                bgp::Message::Open(open) => {
+    while let Some(event) = session.next().await {
+        match event {
+            Ok(Event::Holdtimer) => {
+                session
+                    .delay
+                    .reset(Instant::now() + Duration::from_secs(keepalive_interval as u64));
+
+                if state == bgp::State::OpenConfirm || state == bgp::State::Established {
+                    let msg = bgp::Message::Keepalive;
                     {
                         let peers = &mut global.lock().await.peers;
                         let peer = peers.get_mut(&addr).unwrap();
-                        peer.router_id = open.id;
-                        peer.remote_as = open.get_as_number();
-
-                        peer.remote_cap = open
-                            .params
-                            .into_iter()
-                            .filter_map(|p| match p {
-                                bgp::OpenParam::CapabilityParam(c) => Some(c),
-                                _ => None,
-                            })
-                            .collect();
-
-                        let interval = open.holdtime / 3;
-                        if interval < keepalive_interval {
-                            keepalive_interval = interval;
-                        }
+                        peer.counter_tx.sync(&msg);
                     }
-
-                    state = bgp::State::OpenConfirm;
-                    set_state(&global, addr, state).await;
-                    let keepalive = bgp::Message::Keepalive;
-                    let buf = keepalive.to_bytes().unwrap();
-                    if stream.write_all(&buf).await.is_err() {
-                        break 'outer;
+                    if session.lines.send(msg).await.is_err() {
+                        break;
                     }
-                    last_keepalive = Instant::now();
-                }
-                bgp::Message::Update(update) => {
-                    let mut accept: i64 = 0;
-                    if update.attrs.len() > 0 {
-                        let pa = Arc::new(Mutex::new(PathAttr {
-                            attrs: update.attrs,
-                        }));
-                        let mut t = table.lock().await;
-                        for r in update.routes {
-                            if t.insert(bgp::Family::Ipv4Uc, r, addr, pa.clone()).await {
-                                accept += 1;
-                            }
-                        }
-                    }
-                    {
-                        let mut t = table.lock().await;
-                        for r in update.withdrawns {
-                            if t.remove(bgp::Family::Ipv4Uc, r, addr) {
-                                accept -= 1;
-                            }
-                        }
-                    }
-                    {
-                        let peers = &mut global.lock().await.peers;
-                        if accept > 0 {
-                            peers.get_mut(&addr).unwrap().accepted += accept as u64;
-                        } else {
-                            peers.get_mut(&addr).unwrap().accepted -= accept.abs() as u64;
-                        }
-                    }
-                }
-                bgp::Message::Notification(_) => {
-                    break 'outer;
-                }
-                bgp::Message::Keepalive => {
-                    if state != bgp::State::Established {
-                        state = bgp::State::Established;
-                        set_state(&global, addr, state).await;
-                        let peers = &mut global.lock().await.peers;
-                        peers.get_mut(&addr).unwrap().uptime = SystemTime::now();
-                    }
-                }
-                bgp::Message::RouteRefresh(m) => println!("{:?}", m.family),
-                bgp::Message::Unknown { length: _, code } => {
-                    println!("unknown message type {}", code)
                 }
             }
-            buf = buf.drain(length as usize..).collect();
+            Ok(Event::Message(msg)) => {
+                {
+                    let peers = &mut global.lock().await.peers;
+                    let peer = peers.get_mut(&addr).unwrap();
+                    peer.counter_rx.sync(&msg);
+                }
+                match msg {
+                    bgp::Message::Open(open) => {
+                        {
+                            let peers = &mut global.lock().await.peers;
+                            let peer = peers.get_mut(&addr).unwrap();
+                            peer.router_id = open.id;
+                            peer.remote_as = open.get_as_number();
+
+                            peer.remote_cap = open
+                                .params
+                                .into_iter()
+                                .filter_map(|p| match p {
+                                    bgp::OpenParam::CapabilityParam(c) => Some(c),
+                                    _ => None,
+                                })
+                                .collect();
+
+                            let interval = open.holdtime / 3;
+                            if interval < keepalive_interval {
+                                keepalive_interval = interval;
+                            }
+                        }
+
+                        state = bgp::State::OpenConfirm;
+                        set_state(&global, addr, state).await;
+
+                        // trigger delay to send keepalive soon.
+                        session.delay.reset(Instant::now());
+                    }
+                    bgp::Message::Update(update) => {
+                        let mut accept: i64 = 0;
+                        if update.attrs.len() > 0 {
+                            let pa = Arc::new(Mutex::new(PathAttr {
+                                attrs: update.attrs,
+                            }));
+                            let mut t = table.lock().await;
+                            for r in update.routes {
+                                if t.insert(bgp::Family::Ipv4Uc, r, addr, pa.clone()).await {
+                                    accept += 1;
+                                }
+                            }
+                        }
+                        {
+                            let mut t = table.lock().await;
+                            for r in update.withdrawns {
+                                if t.remove(bgp::Family::Ipv4Uc, r, addr) {
+                                    accept -= 1;
+                                }
+                            }
+                        }
+                        {
+                            let peers = &mut global.lock().await.peers;
+                            if accept > 0 {
+                                peers.get_mut(&addr).unwrap().accepted += accept as u64;
+                            } else {
+                                peers.get_mut(&addr).unwrap().accepted -= accept.abs() as u64;
+                            }
+                        }
+                    }
+                    bgp::Message::Notification(_) => {
+                        break;
+                    }
+                    bgp::Message::Keepalive => {
+                        if state != bgp::State::Established {
+                            state = bgp::State::Established;
+                            set_state(&global, addr, state).await;
+                            let peers = &mut global.lock().await.peers;
+                            peers.get_mut(&addr).unwrap().uptime = SystemTime::now();
+                        }
+                    }
+                    bgp::Message::RouteRefresh(m) => println!("{:?}", m.family),
+                    bgp::Message::Unknown { length: _, code } => {
+                        println!("unknown message type {}", code)
+                    }
+                }
+            }
+            Err(e) => {
+                println!("{}", e);
+                break;
+            }
         }
     }
 
