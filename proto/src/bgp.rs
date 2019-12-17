@@ -17,7 +17,7 @@ use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use failure::Error;
 use std::convert::From;
 use std::io::{Cursor, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
 const AS_TRANS: u16 = 23456;
@@ -36,6 +36,27 @@ impl IpNet {
             let mask: u16 = 0xff00 >> rem;
             buf[prefix_len as usize - 1] = buf[prefix_len as usize - 1] & mask as u8;
         }
+    }
+
+    fn to_bytes(&self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
+        let pos = c.position();
+        let prefix_len = (self.mask + 7) / 8;
+
+        c.write_u8(self.mask)?;
+        match self.addr {
+            IpAddr::V4(addr) => {
+                for i in 0..prefix_len {
+                    c.write_u8(addr.octets()[i as usize])?;
+                }
+            }
+
+            IpAddr::V6(addr) => {
+                for i in 0..prefix_len {
+                    c.write_u8(addr.octets()[i as usize])?;
+                }
+            }
+        }
+        Ok((c.position() - pos) as usize)
     }
 }
 
@@ -454,6 +475,10 @@ impl Message {
                 Ok(n) => body_length += n,
                 Err(_) => {}
             },
+            Message::Update(b) => match b.to_bytes(&mut c) {
+                Ok(n) => body_length += n,
+                Err(_) => {}
+            },
             _ => {}
         }
 
@@ -545,6 +570,9 @@ pub enum Attribute {
 
 impl Attribute {
     const FLAG_EXTENDED: u8 = 1 << 4;
+    const FLAG_PARTIAL: u8 = 1 << 5;
+    const FLAG_TRANSITIVE: u8 = 1 << 6;
+    const FLAG_OPTIONAL: u8 = 1 << 7;
 
     const ORIGIN: u8 = 1;
     const AS_PATH: u8 = 2;
@@ -684,9 +712,12 @@ impl Attribute {
 
     pub fn to_bytes(&self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
         let pos = c.position();
+
+        let flag = self.flag();
+
         match self {
             Attribute::Origin { origin } => {
-                c.write_u8(0)?;
+                c.write_u8(flag)?;
                 c.write_u8(Attribute::ORIGIN)?;
                 c.write_u8(1)?;
                 c.write_u8(*origin)?;
@@ -694,11 +725,9 @@ impl Attribute {
             Attribute::AsPath { segments } => {
                 let mut len = 0;
                 for segment in segments {
-                    for n in &segment.number {
-                        len += 2 + n * 4;
-                    }
+                    len += 2 + segment.number.len() * 4;
                 }
-                c.write_u8(Attribute::FLAG_EXTENDED)?;
+                c.write_u8(flag | Attribute::FLAG_EXTENDED)?;
                 c.write_u8(Attribute::AS_PATH)?;
                 c.write_u16::<NetworkEndian>(len as u16)?;
                 for segment in segments {
@@ -710,7 +739,7 @@ impl Attribute {
                 }
             }
             Attribute::Nexthop { nexthop } => {
-                c.write_u8(0)?;
+                c.write_u8(flag)?;
                 c.write_u8(Attribute::NEXTHOP)?;
 
                 match nexthop {
@@ -727,19 +756,19 @@ impl Attribute {
                 }
             }
             Attribute::MultiExitDesc { descriptor } => {
-                c.write_u8(0)?;
+                c.write_u8(flag)?;
                 c.write_u8(Attribute::MULTI_EXIT_DESC)?;
                 c.write_u8(4)?;
                 c.write_u32::<NetworkEndian>(*descriptor)?;
             }
             Attribute::LocalPref { preference } => {
-                c.write_u8(0)?;
+                c.write_u8(flag)?;
                 c.write_u8(Attribute::LOCAL_PREF)?;
                 c.write_u8(4)?;
                 c.write_u32::<NetworkEndian>(*preference)?;
             }
             Attribute::AtomicAggregate => {
-                c.write_u8(0)?;
+                c.write_u8(flag)?;
                 c.write_u8(Attribute::ATOMIC_AGGREGATE)?;
                 c.write_u8(0)?;
             }
@@ -748,7 +777,7 @@ impl Attribute {
                 number,
                 address,
             } => {
-                c.write_u8(0)?;
+                c.write_u8(flag)?;
                 c.write_u8(Attribute::AGGREGATOR)?;
                 if *four_byte {
                     c.write_u8(8)?;
@@ -763,7 +792,7 @@ impl Attribute {
                 }
             }
             Attribute::Community { communities } => {
-                c.write_u8(Attribute::FLAG_EXTENDED)?;
+                c.write_u8(flag | Attribute::FLAG_EXTENDED)?;
                 c.write_u8(Attribute::COMMUNITY)?;
                 c.write_u16::<NetworkEndian>(communities.len() as u16 * 4)?;
                 for i in communities {
@@ -771,7 +800,7 @@ impl Attribute {
                 }
             }
             Attribute::OriginatorId { address } => {
-                c.write_u8(0)?;
+                c.write_u8(flag)?;
                 c.write_u8(Attribute::ORIGINATOR_ID)?;
                 c.write_u8(4)?;
                 match address {
@@ -779,7 +808,7 @@ impl Attribute {
                     _ => {}
                 }
             }
-            Attribute::ClusterList { addresses } => {}
+            Attribute::ClusterList { .. } => {}
             // MpReach,
             // MpUnreach,
             // ExtendedCommunity,
@@ -808,6 +837,31 @@ impl Attribute {
             }
         }
         Ok((c.position() - pos) as usize)
+    }
+
+    pub fn flag(&self) -> u8 {
+        match self {
+            Attribute::Origin { .. } => Attribute::FLAG_TRANSITIVE,
+            Attribute::AsPath { .. } => Attribute::FLAG_TRANSITIVE,
+            Attribute::Nexthop { .. } => Attribute::FLAG_TRANSITIVE,
+            Attribute::MultiExitDesc { .. } => Attribute::FLAG_OPTIONAL,
+            Attribute::LocalPref { .. } => Attribute::FLAG_TRANSITIVE,
+            Attribute::AtomicAggregate => Attribute::FLAG_TRANSITIVE,
+            Attribute::Aggregator { .. } => Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
+            Attribute::Community { .. } => Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
+            Attribute::OriginatorId { .. } => Attribute::FLAG_OPTIONAL,
+            Attribute::ClusterList { .. } => Attribute::FLAG_OPTIONAL,
+            // MpReach,
+            // MpUnreach,
+            // ExtendedCommunity,
+            // As4Path,
+            // As4Aggregator,
+            // PmsiTunnel,
+            // TunnelEncap,
+            // TraficEngineering,
+            // IpV6ExtendedCommunity,
+            Attribute::NotSupported { attr_flag, .. } => *attr_flag,
+        }
     }
 }
 
@@ -840,6 +894,7 @@ fn path_attribute_nexthop_v4() {
 
 #[test]
 fn path_attribute_nexthop_v6() {
+    use std::net::Ipv6Addr;
     let addr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc00a, 0x2ff));
     let buf = Vec::new();
     let mut c = Cursor::new(buf);
@@ -853,6 +908,37 @@ fn path_attribute_nexthop_v6() {
     }
 }
 
+#[test]
+fn path_attribute_as_path() {
+    let buf = Vec::new();
+    let segments = vec![
+        Segment {
+            segment_type: 2,
+            number: vec![3, 4],
+        },
+        Segment {
+            segment_type: 1,
+            number: vec![5, 6, 7],
+        },
+    ];
+    let mut c = Cursor::new(buf);
+    let _ = Attribute::AsPath { segments }.to_bytes(&mut c).unwrap();
+    let c: &[u8] = &c.get_ref();
+    match Attribute::from_bytes(&mut Cursor::new(c)).unwrap() {
+        Attribute::AsPath { segments: segs } => {
+            assert_eq!(segs[0].segment_type, 2);
+            assert_eq!(segs[0].number[0], 3);
+            assert_eq!(segs[0].number[1], 4);
+
+            assert_eq!(segs[1].segment_type, 1);
+            assert_eq!(segs[1].number.len(), 3);
+            assert_eq!(segs[1].number[0], 5);
+            assert_eq!(segs[1].number[1], 6);
+        }
+        _ => assert!(false),
+    }
+}
+
 pub struct UpdateMessage {
     pub attrs: Vec<Attribute>,
     pub routes: Vec<Nlri>,
@@ -861,6 +947,15 @@ pub struct UpdateMessage {
 }
 
 impl UpdateMessage {
+    pub fn new(routes: Vec<Nlri>, withdrawns: Vec<Nlri>, attrs: Vec<Attribute>) -> UpdateMessage {
+        UpdateMessage {
+            routes,
+            withdrawns,
+            attrs,
+            length: 0,
+        }
+    }
+
     pub fn from_bytes(c: &mut Cursor<&[u8]>) -> Result<UpdateMessage, Error> {
         let withdrawn_len = c.read_u16::<NetworkEndian>()?;
         let mut withdrawns: Vec<Nlri> = Vec::new();
@@ -905,6 +1000,44 @@ impl UpdateMessage {
             withdrawns,
             length: c.get_ref().len(),
         })
+    }
+
+    pub fn to_bytes(self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
+        let start_pos = c.position();
+
+        c.set_position(start_pos + 2);
+        let mut withdrawn_len = 0;
+        for withdrawn in &self.withdrawns {
+            match withdrawn {
+                Nlri::Ip(ip) => {
+                    withdrawn_len += ip.to_bytes(c)?;
+                }
+            }
+        }
+        let attr_pos = c.position();
+        c.set_position(start_pos);
+        c.write_u16::<NetworkEndian>(withdrawn_len as u16)?;
+        c.set_position(attr_pos + 2);
+
+        let mut attr_len = 0;
+        for attr in &self.attrs {
+            attr_len += attr.to_bytes(c)?;
+        }
+
+        let route_pos = c.position();
+        c.set_position(attr_pos);
+        c.write_u16::<NetworkEndian>(attr_len as u16)?;
+        c.set_position(route_pos);
+
+        for route in &self.routes {
+            match route {
+                Nlri::Ip(ip) => {
+                    ip.to_bytes(c)?;
+                }
+            }
+        }
+
+        Ok((c.position() - start_pos) as usize)
     }
 }
 

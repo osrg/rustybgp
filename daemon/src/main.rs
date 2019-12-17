@@ -1315,7 +1315,6 @@ async fn handle_session(
     }
     let mut state = bgp::State::OpenSent;
     set_state(&global, addr, state).await;
-
     while let Some(event) = session.next().await {
         match event {
             Ok(Event::Holdtimer) => {
