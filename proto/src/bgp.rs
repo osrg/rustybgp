@@ -17,7 +17,7 @@ use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use failure::Error;
 use std::convert::From;
 use std::io::{Cursor, Read, Write};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 const AS_TRANS: u16 = 23456;
@@ -544,9 +544,20 @@ pub enum Attribute {
 }
 
 impl Attribute {
-    pub fn new(c: &mut Cursor<&[u8]>) -> Result<Attribute, Error> {
-        const FLAG_EXTENDED: u8 = 1 << 4;
+    const FLAG_EXTENDED: u8 = 1 << 4;
 
+    const ORIGIN: u8 = 1;
+    const AS_PATH: u8 = 2;
+    const NEXTHOP: u8 = 3;
+    const MULTI_EXIT_DESC: u8 = 4;
+    const LOCAL_PREF: u8 = 5;
+    const ATOMIC_AGGREGATE: u8 = 6;
+    const AGGREGATOR: u8 = 7;
+    const COMMUNITY: u8 = 8;
+    const ORIGINATOR_ID: u8 = 9;
+    //    const CLUSTER_LIST: u8 = 10;
+
+    pub fn from_bytes(c: &mut Cursor<&[u8]>) -> Result<Attribute, Error> {
         // flag
         let attr_flag = c.read_u8()?;
 
@@ -555,18 +566,18 @@ impl Attribute {
 
         // attribute len
         let mut attr_len = 0;
-        if attr_flag & FLAG_EXTENDED != 0 {
+        if attr_flag & Attribute::FLAG_EXTENDED != 0 {
             attr_len += c.read_u16::<NetworkEndian>()?
         } else {
             attr_len += c.read_u8()? as u16;
         }
 
         match attr_type {
-            1 => {
+            Attribute::ORIGIN => {
                 let origin = c.read_u8()?;
                 Ok(Attribute::Origin { origin })
             }
-            2 => {
+            Attribute::AS_PATH => {
                 let mut segments: Vec<Segment> = Vec::new();
                 while attr_len > 0 {
                     let code = c.read_u8()?;
@@ -588,7 +599,7 @@ impl Attribute {
                 }
                 Ok(Attribute::AsPath { segments })
             }
-            3 => {
+            Attribute::NEXTHOP => {
                 if attr_len == 4 {
                     let mut buf = [0; 4];
                     c.read_exact(&mut buf)?;
@@ -604,16 +615,16 @@ impl Attribute {
                 }
                 Err(format_err!("invalid attribute length"))
             }
-            4 => {
+            Attribute::MULTI_EXIT_DESC => {
                 let descriptor = c.read_u32::<NetworkEndian>()?;
                 Ok(Attribute::MultiExitDesc { descriptor })
             }
-            5 => {
+            Attribute::LOCAL_PREF => {
                 let preference = c.read_u32::<NetworkEndian>()?;
                 Ok(Attribute::LocalPref { preference })
             }
-            6 => Ok(Attribute::AtomicAggregate {}),
-            7 => {
+            Attribute::ATOMIC_AGGREGATE => Ok(Attribute::AtomicAggregate {}),
+            Attribute::AGGREGATOR => {
                 if attr_len == 6 {
                     let number = c.read_u16::<NetworkEndian>()?;
                     let mut buf = [0; 4];
@@ -635,7 +646,7 @@ impl Attribute {
                 }
                 Err(format_err!("invalid attribute length"))
             }
-            8 => {
+            Attribute::COMMUNITY => {
                 if attr_len % 4 == 0 {
                     let mut communities: Vec<u32> = Vec::new();
                     while attr_len > 0 {
@@ -646,7 +657,7 @@ impl Attribute {
                 }
                 Err(format_err!("invalid attribute length"))
             }
-            9 => {
+            Attribute::ORIGINATOR_ID => {
                 if attr_len == 4 {
                     let mut buf = [0; 4];
                     c.read_exact(&mut buf)?;
@@ -669,6 +680,176 @@ impl Attribute {
                 })
             }
         }
+    }
+
+    pub fn to_bytes(&self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
+        let pos = c.position();
+        match self {
+            Attribute::Origin { origin } => {
+                c.write_u8(0)?;
+                c.write_u8(Attribute::ORIGIN)?;
+                c.write_u8(1)?;
+                c.write_u8(*origin)?;
+            }
+            Attribute::AsPath { segments } => {
+                let mut len = 0;
+                for segment in segments {
+                    for n in &segment.number {
+                        len += 2 + n * 4;
+                    }
+                }
+                c.write_u8(Attribute::FLAG_EXTENDED)?;
+                c.write_u8(Attribute::AS_PATH)?;
+                c.write_u16::<NetworkEndian>(len as u16)?;
+                for segment in segments {
+                    c.write_u8(segment.segment_type)?;
+                    c.write_u8(segment.number.len() as u8)?;
+                    for n in &segment.number {
+                        c.write_u32::<NetworkEndian>(*n)?;
+                    }
+                }
+            }
+            Attribute::Nexthop { nexthop } => {
+                c.write_u8(0)?;
+                c.write_u8(Attribute::NEXTHOP)?;
+
+                match nexthop {
+                    IpAddr::V4(addr) => {
+                        c.write_u8(4)?;
+                        c.write_u32::<NetworkEndian>(u32::from(*addr))?;
+                    }
+                    IpAddr::V6(addr) => {
+                        c.write_u8(16)?;
+                        for i in &addr.octets() {
+                            c.write_u8(*i)?;
+                        }
+                    }
+                }
+            }
+            Attribute::MultiExitDesc { descriptor } => {
+                c.write_u8(0)?;
+                c.write_u8(Attribute::MULTI_EXIT_DESC)?;
+                c.write_u8(4)?;
+                c.write_u32::<NetworkEndian>(*descriptor)?;
+            }
+            Attribute::LocalPref { preference } => {
+                c.write_u8(0)?;
+                c.write_u8(Attribute::LOCAL_PREF)?;
+                c.write_u8(4)?;
+                c.write_u32::<NetworkEndian>(*preference)?;
+            }
+            Attribute::AtomicAggregate => {
+                c.write_u8(0)?;
+                c.write_u8(Attribute::ATOMIC_AGGREGATE)?;
+                c.write_u8(0)?;
+            }
+            Attribute::Aggregator {
+                four_byte,
+                number,
+                address,
+            } => {
+                c.write_u8(0)?;
+                c.write_u8(Attribute::AGGREGATOR)?;
+                if *four_byte {
+                    c.write_u8(8)?;
+                    c.write_u32::<NetworkEndian>(*number)?;
+                } else {
+                    c.write_u8(6)?;
+                    c.write_u16::<NetworkEndian>(*number as u16)?;
+                }
+                match address {
+                    IpAddr::V4(addr) => c.write_u32::<NetworkEndian>(u32::from(*addr))?,
+                    _ => {}
+                }
+            }
+            Attribute::Community { communities } => {
+                c.write_u8(Attribute::FLAG_EXTENDED)?;
+                c.write_u8(Attribute::COMMUNITY)?;
+                c.write_u16::<NetworkEndian>(communities.len() as u16 * 4)?;
+                for i in communities {
+                    c.write_u32::<NetworkEndian>(*i)?;
+                }
+            }
+            Attribute::OriginatorId { address } => {
+                c.write_u8(0)?;
+                c.write_u8(Attribute::ORIGINATOR_ID)?;
+                c.write_u8(4)?;
+                match address {
+                    IpAddr::V4(addr) => c.write_u32::<NetworkEndian>(u32::from(*addr))?,
+                    _ => {}
+                }
+            }
+            Attribute::ClusterList { addresses } => {}
+            // MpReach,
+            // MpUnreach,
+            // ExtendedCommunity,
+            // As4Path,
+            // As4Aggregator,
+            // PmsiTunnel,
+            // TunnelEncap,
+            // TraficEngineering,
+            // IpV6ExtendedCommunity,
+            Attribute::NotSupported {
+                attr_flag,
+                attr_type,
+                attr_len,
+                buf,
+            } => {
+                c.write_u8(*attr_flag)?;
+                c.write_u8(*attr_type)?;
+                if (*attr_flag & Attribute::FLAG_EXTENDED) != 0 {
+                    c.write_u16::<NetworkEndian>(*attr_len)?;
+                } else {
+                    c.write_u8(*attr_len as u8)?;
+                }
+                for i in buf {
+                    c.write_u8(*i)?;
+                }
+            }
+        }
+        Ok((c.position() - pos) as usize)
+    }
+}
+
+#[test]
+fn path_attribute_origin() {
+    let buf = Vec::new();
+    let mut c = Cursor::new(buf);
+    let _ = Attribute::Origin { origin: 3 }.to_bytes(&mut c).unwrap();
+    let c: &[u8] = &c.get_ref();
+    match Attribute::from_bytes(&mut Cursor::new(c)).unwrap() {
+        Attribute::Origin { origin } => assert_eq!(origin, 3),
+        _ => assert!(false),
+    }
+}
+
+#[test]
+fn path_attribute_nexthop_v4() {
+    let addr = IpAddr::V4(Ipv4Addr::new(12, 0, 0, 1));
+    let buf = Vec::new();
+    let mut c = Cursor::new(buf);
+    let _ = Attribute::Nexthop { nexthop: addr }
+        .to_bytes(&mut c)
+        .unwrap();
+    let c: &[u8] = &c.get_ref();
+    match Attribute::from_bytes(&mut Cursor::new(c)).unwrap() {
+        Attribute::Nexthop { nexthop } => assert_eq!(nexthop, addr),
+        _ => assert!(false),
+    }
+}
+
+#[test]
+fn path_attribute_nexthop_v6() {
+    let addr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc00a, 0x2ff));
+    let buf = Vec::new();
+    let mut c = Cursor::new(buf);
+    let _ = Attribute::Nexthop { nexthop: addr }
+        .to_bytes(&mut c)
+        .unwrap();
+    let c: &[u8] = &c.get_ref();
+    match Attribute::from_bytes(&mut Cursor::new(c)).unwrap() {
+        Attribute::Nexthop { nexthop } => assert_eq!(nexthop, addr),
+        _ => assert!(false),
     }
 }
 
@@ -699,7 +880,7 @@ impl UpdateMessage {
 
         let attr_end = c.position() + attr_len as u64;
         while c.position() < attr_end {
-            let attr = Attribute::new(c);
+            let attr = Attribute::from_bytes(c);
             match attr {
                 Ok(a) => attrs.push(a),
                 Err(_) => break,
