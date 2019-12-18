@@ -570,7 +570,7 @@ pub enum Attribute {
 
 impl Attribute {
     const FLAG_EXTENDED: u8 = 1 << 4;
-    const FLAG_PARTIAL: u8 = 1 << 5;
+    // const FLAG_PARTIAL: u8 = 1 << 5;
     const FLAG_TRANSITIVE: u8 = 1 << 6;
     const FLAG_OPTIONAL: u8 = 1 << 7;
 
