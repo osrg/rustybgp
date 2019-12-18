@@ -1322,7 +1322,7 @@ async fn handle_session(
                     .delay
                     .reset(Instant::now() + Duration::from_secs(keepalive_interval as u64));
 
-                if state == bgp::State::OpenConfirm || state == bgp::State::Established {
+                if state == bgp::State::Established {
                     let msg = bgp::Message::Keepalive;
                     {
                         let peers = &mut global.lock().await.peers;
@@ -1366,8 +1366,18 @@ async fn handle_session(
                         state = bgp::State::OpenConfirm;
                         set_state(&global, addr, state).await;
 
-                        // trigger delay to send keepalive soon.
-                        session.delay.reset(Instant::now());
+                        let msg = bgp::Message::Keepalive;
+                        {
+                            let peers = &mut global.lock().await.peers;
+                            let peer = peers.get_mut(&addr).unwrap();
+                            peer.counter_tx.sync(&msg);
+                        }
+                        if session.lines.send(msg).await.is_err() {
+                            break;
+                        }
+                        session
+                            .delay
+                            .reset(Instant::now() + Duration::from_secs(keepalive_interval as u64));
                     }
                     bgp::Message::Update(update) => {
                         let mut accept: i64 = 0;
@@ -1408,6 +1418,10 @@ async fn handle_session(
                             set_state(&global, addr, state).await;
                             let peers = &mut global.lock().await.peers;
                             peers.get_mut(&addr).unwrap().uptime = SystemTime::now();
+
+                            session.delay.reset(
+                                Instant::now() + Duration::from_secs(keepalive_interval as u64),
+                            );
                         }
                     }
                     bgp::Message::RouteRefresh(m) => println!("{:?}", m.family),
