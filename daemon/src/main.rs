@@ -91,7 +91,7 @@ impl ToApi<api::Family> for bgp::Family {
 
 #[derive(Clone)]
 pub struct PathAttr {
-    pub attrs: Vec<bgp::Attribute>,
+    pub entry: Vec<bgp::Attribute>,
 }
 
 #[derive(Clone)]
@@ -99,11 +99,11 @@ pub struct Path {
     pub source: IpAddr,
     pub timestamp: SystemTime,
     as_number: u32,
-    pub attrs: Arc<Mutex<PathAttr>>,
+    pub attrs: Arc<PathAttr>,
 }
 
 impl Path {
-    fn new(source: IpAddr, attrs: Arc<Mutex<PathAttr>>) -> Path {
+    fn new(source: IpAddr, attrs: Arc<PathAttr>) -> Path {
         Path {
             source: source,
             timestamp: SystemTime::now(),
@@ -112,7 +112,7 @@ impl Path {
         }
     }
 
-    async fn to_api(&self, net: &bgp::Nlri) -> api::Path {
+    fn to_api(&self, net: &bgp::Nlri) -> api::Path {
         let mut path: api::Path = Default::default();
 
         match net {
@@ -135,8 +135,7 @@ impl Path {
         path.age = Some(self.timestamp.to_api());
 
         let mut attrs = Vec::new();
-        let a = self.attrs.lock().await;
-        for attr in &a.attrs {
+        for attr in &self.attrs.entry {
             match attr {
                 bgp::Attribute::Origin { origin } => {
                     let a = api::OriginAttribute {
@@ -216,9 +215,9 @@ impl Path {
         path
     }
 
-    pub async fn get_local_preference(&self) -> u32 {
+    pub fn get_local_preference(&self) -> u32 {
         const DEFAULT: u32 = 100;
-        for a in &self.attrs.lock().await.attrs {
+        for a in &self.attrs.entry {
             match a {
                 bgp::Attribute::LocalPref { preference } => return *preference,
                 _ => {}
@@ -227,8 +226,8 @@ impl Path {
         return DEFAULT;
     }
 
-    pub async fn get_as_len(&self) -> u32 {
-        for a in &self.attrs.lock().await.attrs {
+    pub fn get_as_len(&self) -> u32 {
+        for a in &self.attrs.entry {
             match a {
                 bgp::Attribute::AsPath { segments } => {
                     let mut l: usize = 0;
@@ -243,8 +242,8 @@ impl Path {
         0
     }
 
-    pub async fn get_origin(&self) -> u8 {
-        for a in &self.attrs.lock().await.attrs {
+    pub fn get_origin(&self) -> u8 {
+        for a in &self.attrs.entry {
             match a {
                 bgp::Attribute::Origin { origin } => return *origin,
                 _ => {}
@@ -253,8 +252,8 @@ impl Path {
         0
     }
 
-    pub async fn get_med(&self) -> u32 {
-        for a in &self.attrs.lock().await.attrs {
+    pub fn get_med(&self) -> u32 {
+        for a in &self.attrs.entry {
             match a {
                 bgp::Attribute::MultiExitDesc { descriptor } => return *descriptor,
                 _ => {}
@@ -300,12 +299,12 @@ impl Table {
         }
     }
 
-    pub async fn insert(
+    pub fn insert(
         &mut self,
         family: bgp::Family,
         net: bgp::Nlri,
         source: IpAddr,
-        attrs: Arc<Mutex<PathAttr>>,
+        attrs: Arc<PathAttr>,
     ) -> bool {
         let mut replaced = false;
         let t = self.master.get_mut(&family);
@@ -334,22 +333,22 @@ impl Table {
                     for i in 0..d.entry.len() {
                         let a = &d.entry[i];
 
-                        if b.get_local_preference().await > a.get_local_preference().await {
+                        if b.get_local_preference() > a.get_local_preference() {
                             d.entry.insert(i, b);
                             return replaced == false;
                         }
 
-                        if b.get_as_len().await < a.get_as_len().await {
+                        if b.get_as_len() < a.get_as_len() {
                             d.entry.insert(i, b);
                             return replaced == false;
                         }
 
-                        if b.get_origin().await < a.get_origin().await {
+                        if b.get_origin() < a.get_origin() {
                             d.entry.insert(i, b);
                             return replaced == false;
                         }
 
-                        if b.get_med().await < a.get_med().await {
+                        if b.get_med() < a.get_med() {
                             d.entry.insert(i, b);
                             return replaced == false;
                         }
@@ -932,7 +931,7 @@ impl GobgpApi for Service {
                         }
                         let mut r = Vec::new();
                         for p in &dst.entry {
-                            r.push(p.to_api(&dst.net).await);
+                            r.push(p.to_api(&dst.net));
                         }
                         //let mut rsp = api::gobgp::ListPathResponse::new();
                         // let mut r: Vec<api::Path> =
@@ -1382,12 +1381,12 @@ async fn handle_session(
                     bgp::Message::Update(update) => {
                         let mut accept: i64 = 0;
                         if update.attrs.len() > 0 {
-                            let pa = Arc::new(Mutex::new(PathAttr {
-                                attrs: update.attrs,
-                            }));
+                            let pa = Arc::new(PathAttr {
+                                entry: update.attrs,
+                            });
                             let mut t = table.lock().await;
                             for r in update.routes {
-                                if t.insert(bgp::Family::Ipv4Uc, r, addr, pa.clone()).await {
+                                if t.insert(bgp::Family::Ipv4Uc, r, addr, pa.clone()) {
                                     accept += 1;
                                 }
                             }
