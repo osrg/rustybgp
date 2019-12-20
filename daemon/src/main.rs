@@ -285,10 +285,20 @@ impl Destination {
     }
 }
 
+pub enum TableUpdate {
+    NewBest(bgp::Nlri, Arc<PathAttr>),
+    Withdrawn(bgp::Nlri),
+}
+
+type Tx = mpsc::UnboundedSender<TableUpdate>;
+type Rx = mpsc::UnboundedReceiver<TableUpdate>;
+
 #[derive(Clone)]
 pub struct Table {
     pub disable_best_path_selection: bool,
     pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
+
+    pub active_peers: HashMap<IpAddr, Tx>,
 }
 
 impl Table {
@@ -296,6 +306,7 @@ impl Table {
         Table {
             disable_best_path_selection: false,
             master: HashMap::new(),
+            active_peers: HashMap::new(),
         }
     }
 
@@ -305,8 +316,7 @@ impl Table {
         net: bgp::Nlri,
         source: IpAddr,
         attrs: Arc<PathAttr>,
-    ) -> bool {
-        let mut replaced = false;
+    ) -> (Option<TableUpdate>, bool) {
         let t = self.master.get_mut(&family);
         let t = match t {
             Some(t) => t,
@@ -316,63 +326,84 @@ impl Table {
             }
         };
 
-        match t.get_mut(&net) {
+        let mut replaced = false;
+        let mut new_best = false;
+        let attrs = match t.get_mut(&net) {
             Some(d) => {
                 for i in 0..d.entry.len() {
                     if d.entry[i].source == source {
                         d.entry.remove(i);
                         replaced = true;
+                        if i == 0 {
+                            new_best = true;
+                        }
                         break;
                     }
                 }
 
-                let prev_len = d.entry.len();
-
                 let b = Path::new(source, attrs);
-                if self.disable_best_path_selection == false {
+
+                let idx = if self.disable_best_path_selection == false {
+                    0
+                } else {
+                    let mut idx = d.entry.len();
                     for i in 0..d.entry.len() {
                         let a = &d.entry[i];
 
                         if b.get_local_preference() > a.get_local_preference() {
-                            d.entry.insert(i, b);
-                            return replaced == false;
+                            idx = i;
+                            break;
                         }
 
                         if b.get_as_len() < a.get_as_len() {
-                            d.entry.insert(i, b);
-                            return replaced == false;
+                            idx = i;
+                            break;
                         }
 
                         if b.get_origin() < a.get_origin() {
-                            d.entry.insert(i, b);
-                            return replaced == false;
+                            idx = i;
+                            break;
                         }
 
                         if b.get_med() < a.get_med() {
-                            d.entry.insert(i, b);
-                            return replaced == false;
+                            idx = i;
+                            break;
                         }
                     }
+                    idx
+                };
+                if idx == 0 {
+                    new_best = true;
                 }
-
-                if prev_len == d.entry.len() {
-                    d.entry.push(b);
-                }
+                d.entry.insert(idx, b);
+                d.entry[0].attrs.clone()
             }
 
             None => {
                 let mut d = Destination::new(net);
+                let a = attrs.clone();
                 d.entry.push(Path::new(source, attrs));
                 t.insert(net, d);
+                new_best = true;
+                a
             }
+        };
+        if new_best {
+            (Some(TableUpdate::NewBest(net, attrs)), !replaced)
+        } else {
+            (None, !replaced)
         }
-        replaced == false
     }
 
-    pub fn remove(&mut self, family: bgp::Family, net: bgp::Nlri, source: IpAddr) -> bool {
+    pub fn remove(
+        &mut self,
+        family: bgp::Family,
+        net: bgp::Nlri,
+        source: IpAddr,
+    ) -> (Option<TableUpdate>, bool) {
         let t = self.master.get_mut(&family);
         if t.is_none() {
-            return false;
+            return (None, false);
         }
         let t = t.unwrap();
         match t.get_mut(&net) {
@@ -382,17 +413,26 @@ impl Table {
                         d.entry.remove(i);
                         if d.entry.len() == 0 {
                             t.remove(&net);
-                            return true;
+                            return (Some(TableUpdate::Withdrawn(net)), true);
+                        }
+                        if i == 0 {
+                            return (
+                                Some(TableUpdate::NewBest(net, d.entry[0].attrs.clone())),
+                                true,
+                            );
+                        } else {
+                            return (None, true);
                         }
                     }
                 }
             }
             None => {}
         }
-        false
+        return (None, false);
     }
 
-    pub fn clear(&mut self, source: IpAddr) {
+    pub fn clear(&mut self, source: IpAddr) -> Vec<TableUpdate> {
+        let mut update = Vec::new();
         let mut m: HashMap<bgp::Family, Vec<bgp::Nlri>> = HashMap::new();
         for f in self.master.keys() {
             m.insert(*f, Vec::new());
@@ -403,6 +443,11 @@ impl Table {
                 for i in 0..d.entry.len() {
                     if d.entry[i].source == source {
                         d.entry.remove(i);
+                        if d.entry.len() == 0 {
+                            update.push(TableUpdate::Withdrawn(*n));
+                        } else if i == 0 {
+                            update.push(TableUpdate::NewBest(*n, d.entry[0].attrs.clone()));
+                        }
                         break;
                     }
                 }
@@ -417,6 +462,25 @@ impl Table {
             let t = self.master.get_mut(&f).unwrap();
             for n in l {
                 t.remove(n);
+            }
+        }
+        update
+    }
+
+    pub async fn broadcast(&mut self, source: IpAddr, msg: &TableUpdate) {
+        for peer in self.active_peers.iter_mut() {
+            if *peer.0 != source {
+                match msg {
+                    TableUpdate::NewBest(nlri, attrs) => {
+                        peer.1
+                            .send(TableUpdate::NewBest(*nlri, attrs.clone()))
+                            .await
+                            .unwrap();
+                    }
+                    TableUpdate::Withdrawn(nlri) => {
+                        peer.1.send(TableUpdate::Withdrawn(*nlri)).await.unwrap();
+                    }
+                }
             }
         }
     }
@@ -1201,14 +1265,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::]:179".to_string();
     let mut listener = TcpListener::bind(&addr).await?;
 
+    let f = |sock: std::net::SocketAddr| -> IpAddr {
+        let mut addr = sock.ip();
+        if let IpAddr::V6(a) = addr {
+            if let Some(a) = a.to_ipv4() {
+                addr = IpAddr::V4(a);
+            }
+        }
+        addr
+    };
+
     loop {
-        let (stream, addr) = listener.accept().await?;
-        println!("got new connection {:?} {}", addr, addr.is_ipv6());
-        let global = Arc::clone(&global);
-        let table = Arc::clone(&table);
-        tokio::spawn(async move {
-            handle_session(global, table, stream, addr.ip()).await;
-        });
+        let (stream, sock) = listener.accept().await?;
+        let addr = f(sock);
+        println!("got new connection {:?}", addr);
+        if let Ok(l) = stream.local_addr() {
+            let global = Arc::clone(&global);
+            let table = Arc::clone(&table);
+            tokio::spawn(async move {
+                handle_session(global, table, stream, addr, f(l)).await;
+            });
+        }
     }
 }
 
@@ -1249,11 +1326,94 @@ impl Decoder for Bgp {
 enum Event {
     Message(bgp::Message),
     Holdtimer,
+    Broadcast(TableUpdate),
 }
 
 struct Session {
     lines: Framed<TcpStream, Bgp>,
     delay: Delay,
+    rx: Rx,
+    families: Vec<bgp::Family>,
+    local_as: u32,
+    local_addr: IpAddr,
+}
+
+impl Session {
+    async fn send_update(&mut self, updates: Vec<TableUpdate>) -> Result<(), io::Error> {
+        for update in updates {
+            match update {
+                TableUpdate::NewBest(nlri, attrs) => {
+                    let mut v = Vec::new();
+                    let mut nexthop_idx = 0;
+                    let mut segments = Vec::new();
+
+                    for i in 0..attrs.entry.len() {
+                        let a = &attrs.entry[i];
+                        let t = a.attr();
+                        if t < bgp::Attribute::NEXTHOP {
+                            nexthop_idx += 1;
+                        }
+                        if !a.is_transitive() {
+                            continue;
+                        }
+                        match t {
+                            bgp::Attribute::CLUSTER_LIST => continue,
+                            bgp::Attribute::ORIGINATOR_ID => continue,
+                            _ => {}
+                        }
+                        match a {
+                            bgp::Attribute::AsPath { segments: segs } => {
+                                for s in segs {
+                                    segments
+                                        .insert(0, bgp::Segment::new(s.segment_type, &s.number));
+                                }
+                            }
+                            _ => {}
+                        }
+                        v.push(a);
+                    }
+                    let n = bgp::Attribute::Nexthop {
+                        nexthop: self.local_addr,
+                    };
+                    v.insert(nexthop_idx, &n);
+
+                    let aspath = if segments.len() == 0 {
+                        bgp::Attribute::AsPath {
+                            segments: vec![bgp::Segment {
+                                segment_type: bgp::Segment::TYPE_SEQ,
+                                number: vec![1],
+                            }],
+                        }
+                    } else {
+                        if segments[0].segment_type != bgp::Segment::TYPE_SEQ
+                            || segments[0].number.len() == 255
+                        {
+                            segments.insert(
+                                0,
+                                bgp::Segment {
+                                    segment_type: bgp::Segment::TYPE_SEQ,
+                                    number: vec![self.local_as],
+                                },
+                            );
+                        } else {
+                            segments[0].number.insert(0, self.local_as);
+                        }
+                        bgp::Attribute::AsPath { segments }
+                    };
+                    if nexthop_idx == 0 {
+                        v.insert(0, &aspath);
+                    } else {
+                        v.insert(nexthop_idx - 1, &aspath);
+                    }
+
+                    let buf = bgp::UpdateMessage::to_bytes(vec![nlri], Vec::new(), v).unwrap();
+                    self.lines.get_mut().write_all(&buf).await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Stream for Session {
@@ -1262,6 +1422,10 @@ impl Stream for Session {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Poll::Ready(()) = self.delay.poll_unpin(cx) {
             return Poll::Ready(Some(Ok(Event::Holdtimer)));
+        }
+
+        if let Poll::Ready(Some(v)) = Pin::new(&mut self.rx).poll_next(cx) {
+            return Poll::Ready(Some(Ok(Event::Broadcast(v))));
         }
 
         let result: Option<_> = futures::ready!(self.lines.poll_next_unpin(cx));
@@ -1278,18 +1442,25 @@ async fn handle_session(
     table: Arc<Mutex<Table>>,
     stream: TcpStream,
     addr: IpAddr,
+    local_addr: IpAddr,
 ) {
-    {
+    let local_as = {
         let mut g = global.lock().await;
         let peer = Peer::new(addr);
 
         g.peers.insert(addr, peer);
-    }
+        g.as_number
+    };
 
     let mut keepalive_interval = bgp::OpenMessage::HOLDTIME / 3;
+    let (_, rx) = mpsc::unbounded_channel();
     let mut session = Session {
         lines: Framed::new(stream, Bgp),
         delay: Handle::default().delay(Instant::now()),
+        rx: rx,
+        families: vec![bgp::Family::Ipv4Uc],
+        local_addr: local_addr,
+        local_as,
     };
 
     let (as_number, router_id) = {
@@ -1333,6 +1504,20 @@ async fn handle_session(
                     }
                 }
             }
+            Ok(Event::Broadcast(msg)) => match msg {
+                TableUpdate::NewBest(_, _) => {
+                    if session.send_update(vec![msg]).await.is_err() {
+                        break;
+                    }
+                }
+                TableUpdate::Withdrawn(nlri) => {
+                    let buf =
+                        bgp::UpdateMessage::to_bytes(Vec::new(), vec![nlri], Vec::new()).unwrap();
+                    if session.lines.get_mut().write_all(&buf).await.is_err() {
+                        break;
+                    }
+                }
+            },
             Ok(Event::Message(msg)) => {
                 {
                     let peers = &mut global.lock().await.peers;
@@ -1378,15 +1563,25 @@ async fn handle_session(
                             .delay
                             .reset(Instant::now() + Duration::from_secs(keepalive_interval as u64));
                     }
-                    bgp::Message::Update(update) => {
+                    bgp::Message::Update(mut update) => {
                         let mut accept: i64 = 0;
                         if update.attrs.len() > 0 {
-                            let pa = Arc::new(PathAttr {
-                                entry: update.attrs,
-                            });
+                            let mut v = Vec::with_capacity(update.attrs.len());
+                            for _ in 0..update.attrs.len() {
+                                let a = update.attrs.remove(0);
+                                if a.attr() != bgp::Attribute::NEXTHOP {
+                                    v.push(a);
+                                }
+                            }
+                            v.sort_by_key(|a| a.attr());
+                            let pa = Arc::new(PathAttr { entry: v });
                             let mut t = table.lock().await;
                             for r in update.routes {
-                                if t.insert(bgp::Family::Ipv4Uc, r, addr, pa.clone()) {
+                                let (u, added) = t.insert(bgp::Family::Ipv4Uc, r, addr, pa.clone());
+                                if let Some(u) = u {
+                                    t.broadcast(addr, &u).await;
+                                }
+                                if added {
                                     accept += 1;
                                 }
                             }
@@ -1394,7 +1589,8 @@ async fn handle_session(
                         if update.withdrawns.len() > 0 {
                             let mut t = table.lock().await;
                             for r in update.withdrawns {
-                                if t.remove(bgp::Family::Ipv4Uc, r, addr) {
+                                let (_, deleted) = t.remove(bgp::Family::Ipv4Uc, r, addr);
+                                if deleted {
                                     accept -= 1;
                                 }
                             }
@@ -1415,12 +1611,37 @@ async fn handle_session(
                         if state != bgp::State::Established {
                             state = bgp::State::Established;
                             set_state(&global, addr, state).await;
-                            let peers = &mut global.lock().await.peers;
-                            peers.get_mut(&addr).unwrap().uptime = SystemTime::now();
+                            {
+                                let peers = &mut global.lock().await.peers;
+                                peers.get_mut(&addr).unwrap().uptime = SystemTime::now();
+                            }
 
                             session.delay.reset(
                                 Instant::now() + Duration::from_secs(keepalive_interval as u64),
                             );
+
+                            let mut v = Vec::new();
+                            {
+                                let (tx, rx) = mpsc::unbounded_channel();
+                                let mut t = table.lock().await;
+                                t.active_peers.insert(addr, tx);
+                                session.rx = rx;
+
+                                for family in &session.families {
+                                    if let Some(m) = t.master.get_mut(&family) {
+                                        for route in m {
+                                            let u = TableUpdate::NewBest(
+                                                *route.0,
+                                                route.1.entry[0].attrs.clone(),
+                                            );
+                                            v.push(u);
+                                        }
+                                    }
+                                }
+                            }
+                            if session.send_update(v).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     bgp::Message::RouteRefresh(m) => println!("{:?}", m.family),
@@ -1442,6 +1663,12 @@ async fn handle_session(
         t.clear(addr);
     }
 
-    let peers = &mut global.lock().await.peers;
-    peers.remove(&addr);
+    {
+        let peers = &mut global.lock().await.peers;
+        peers.remove(&addr);
+    }
+    {
+        let mut t = table.lock().await;
+        t.active_peers.remove(&addr);
+    }
 }

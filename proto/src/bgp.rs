@@ -157,7 +157,7 @@ fn ipnet_oddbits() {
     assert_eq!(octests[2], 0xfe);
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Nlri {
     Ip(IpNet),
 }
@@ -475,10 +475,10 @@ impl Message {
                 Ok(n) => body_length += n,
                 Err(_) => {}
             },
-            Message::Update(b) => match b.to_bytes(&mut c) {
-                Ok(n) => body_length += n,
-                Err(_) => {}
-            },
+            // Message::Update(b) => match b.to_bytes(&mut c) {
+            //     Ok(n) => body_length += n,
+            //     Err(_) => {}
+            // },
             _ => {}
         }
 
@@ -489,6 +489,14 @@ impl Message {
             c.set_position(pos);
         }
         Ok(c.into_inner())
+    }
+
+    fn header_bytes(c: &mut Cursor<Vec<u8>>, t: u8, body_length: u16) -> Result<usize, Error> {
+        let pos = c.position();
+        c.write(&vec![0xff; 16])?;
+        c.write_u16::<NetworkEndian>(Message::HEADER_LENGTH + body_length)?;
+        c.write_u8(t)?;
+        Ok((c.position() - pos) as usize)
     }
 }
 
@@ -509,11 +517,23 @@ pub struct Segment {
 }
 
 impl Segment {
+    pub const TYPE_SET: u8 = 1;
+    pub const TYPE_SEQ: u8 = 2;
+    pub const TYPE_CONFED_SET: u8 = 3;
+    pub const TYPE_CONFED_SEQ: u8 = 4;
+
     pub fn as_len(&self) -> usize {
         match self.segment_type {
-            1 => 1,
-            2 => self.number.len(),
+            Segment::TYPE_SET => 1,
+            Segment::TYPE_SEQ => self.number.len(),
             _ => 0,
+        }
+    }
+
+    pub fn new(t: u8, number: &Vec<u32>) -> Segment {
+        Segment {
+            segment_type: t,
+            number: number.into_iter().map(|x| x.to_owned()).collect(),
         }
     }
 }
@@ -574,16 +594,16 @@ impl Attribute {
     const FLAG_TRANSITIVE: u8 = 1 << 6;
     const FLAG_OPTIONAL: u8 = 1 << 7;
 
-    const ORIGIN: u8 = 1;
-    const AS_PATH: u8 = 2;
-    const NEXTHOP: u8 = 3;
-    const MULTI_EXIT_DESC: u8 = 4;
-    const LOCAL_PREF: u8 = 5;
-    const ATOMIC_AGGREGATE: u8 = 6;
-    const AGGREGATOR: u8 = 7;
-    const COMMUNITY: u8 = 8;
-    const ORIGINATOR_ID: u8 = 9;
-    //    const CLUSTER_LIST: u8 = 10;
+    pub const ORIGIN: u8 = 1;
+    pub const AS_PATH: u8 = 2;
+    pub const NEXTHOP: u8 = 3;
+    pub const MULTI_EXIT_DESC: u8 = 4;
+    pub const LOCAL_PREF: u8 = 5;
+    pub const ATOMIC_AGGREGATE: u8 = 6;
+    pub const AGGREGATOR: u8 = 7;
+    pub const COMMUNITY: u8 = 8;
+    pub const ORIGINATOR_ID: u8 = 9;
+    pub const CLUSTER_LIST: u8 = 10;
 
     pub fn from_bytes(c: &mut Cursor<&[u8]>) -> Result<Attribute, Error> {
         // flag
@@ -863,6 +883,26 @@ impl Attribute {
             Attribute::NotSupported { attr_flag, .. } => *attr_flag,
         }
     }
+
+    pub fn attr(&self) -> u8 {
+        match self {
+            Attribute::Origin { .. } => Attribute::ORIGIN,
+            Attribute::AsPath { .. } => Attribute::AS_PATH,
+            Attribute::Nexthop { .. } => Attribute::NEXTHOP,
+            Attribute::MultiExitDesc { .. } => Attribute::MULTI_EXIT_DESC,
+            Attribute::LocalPref { .. } => Attribute::LOCAL_PREF,
+            Attribute::AtomicAggregate { .. } => Attribute::ATOMIC_AGGREGATE,
+            Attribute::Aggregator { .. } => Attribute::AGGREGATOR,
+            Attribute::Community { .. } => Attribute::COMMUNITY,
+            Attribute::OriginatorId { .. } => Attribute::ORIGINATOR_ID,
+            Attribute::ClusterList { .. } => Attribute::CLUSTER_LIST,
+            Attribute::NotSupported { attr_type, .. } => *attr_type,
+        }
+    }
+
+    pub fn is_transitive(&self) -> bool {
+        self.flag() & Attribute::FLAG_TRANSITIVE != 0
+    }
 }
 
 #[test]
@@ -1002,15 +1042,22 @@ impl UpdateMessage {
         })
     }
 
-    pub fn to_bytes(self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
-        let start_pos = c.position();
+    pub fn to_bytes(
+        routes: Vec<Nlri>,
+        withdrawns: Vec<Nlri>,
+        attrs: Vec<&Attribute>,
+    ) -> Result<Vec<u8>, Error> {
+        let buf: Vec<u8> = Vec::new();
+        let mut c = Cursor::new(buf);
+
+        let start_pos = Message::HEADER_LENGTH as u64;
 
         c.set_position(start_pos + 2);
         let mut withdrawn_len = 0;
-        for withdrawn in &self.withdrawns {
+        for withdrawn in withdrawns {
             match withdrawn {
                 Nlri::Ip(ip) => {
-                    withdrawn_len += ip.to_bytes(c)?;
+                    withdrawn_len += ip.to_bytes(&mut c)?;
                 }
             }
         }
@@ -1020,24 +1067,26 @@ impl UpdateMessage {
         c.set_position(attr_pos + 2);
 
         let mut attr_len = 0;
-        for attr in &self.attrs {
-            attr_len += attr.to_bytes(c)?;
+        for attr in attrs {
+            attr_len += attr.to_bytes(&mut c)?;
         }
 
         let route_pos = c.position();
         c.set_position(attr_pos);
         c.write_u16::<NetworkEndian>(attr_len as u16)?;
         c.set_position(route_pos);
-
-        for route in &self.routes {
+        for route in routes {
             match route {
                 Nlri::Ip(ip) => {
-                    ip.to_bytes(c)?;
+                    ip.to_bytes(&mut c)?;
                 }
             }
         }
+        let body_length = c.position() - start_pos;
+        c.set_position(0);
+        Message::header_bytes(&mut c, Message::UPDATE, body_length as u16)?;
 
-        Ok((c.position() - start_pos) as usize)
+        Ok(c.into_inner())
     }
 }
 
