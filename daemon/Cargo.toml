@@ -20,4 +20,4 @@ futures = "0.3.0"
 proto = { path = "../proto" }
 
 [build-dependencies]
-tonic-build = "0.1.0-alpha.6"
+tonic-build = "=0.1.0-alpha.6"
