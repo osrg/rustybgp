@@ -1377,11 +1377,13 @@ impl Session {
                     };
                     v.insert(nexthop_idx, &n);
 
+                    let aspath_found = !(segments.len() == 0);
+
                     let aspath = if segments.len() == 0 {
                         bgp::Attribute::AsPath {
                             segments: vec![bgp::Segment {
                                 segment_type: bgp::Segment::TYPE_SEQ,
-                                number: vec![1],
+                                number: vec![self.local_as],
                             }],
                         }
                     } else {
@@ -1400,10 +1402,9 @@ impl Session {
                         }
                         bgp::Attribute::AsPath { segments }
                     };
-                    if nexthop_idx == 0 {
-                        v.insert(0, &aspath);
-                    } else {
-                        v.insert(nexthop_idx - 1, &aspath);
+                    v.insert(nexthop_idx, &aspath);
+                    if aspath_found {
+                        v.swap_remove(nexthop_idx - 1);
                     }
 
                     let buf = bgp::UpdateMessage::to_bytes(vec![nlri], Vec::new(), v).unwrap();
