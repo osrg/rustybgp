@@ -556,13 +556,7 @@ pub struct Peer {
 
 impl Peer {
     fn addr(&self) -> String {
-        match self.address {
-            IpAddr::V4(_) => self.address.to_string(),
-            IpAddr::V6(addr) => match addr.to_ipv4() {
-                Some(x) => x.to_string(),
-                None => self.address.to_string(),
-            },
-        }
+        self.address.to_string()
     }
 
     pub fn new(address: IpAddr) -> Peer {
