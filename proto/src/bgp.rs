@@ -733,12 +733,18 @@ impl Attribute {
     pub fn to_bytes(&self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
         let pos = c.position();
 
-        let flag = self.flag();
+        let t = self.attr();
+        let flag = if t == Attribute::AS_PATH || t == Attribute::COMMUNITY {
+            self.flag() | Attribute::FLAG_EXTENDED
+        } else {
+            self.flag()
+        };
+
+        c.write_u8(flag)?;
+        c.write_u8(t)?;
 
         match self {
             Attribute::Origin { origin } => {
-                c.write_u8(flag)?;
-                c.write_u8(Attribute::ORIGIN)?;
                 c.write_u8(1)?;
                 c.write_u8(*origin)?;
             }
@@ -747,8 +753,6 @@ impl Attribute {
                 for segment in segments {
                     len += 2 + segment.number.len() * 4;
                 }
-                c.write_u8(flag | Attribute::FLAG_EXTENDED)?;
-                c.write_u8(Attribute::AS_PATH)?;
                 c.write_u16::<NetworkEndian>(len as u16)?;
                 for segment in segments {
                     c.write_u8(segment.segment_type)?;
@@ -758,38 +762,27 @@ impl Attribute {
                     }
                 }
             }
-            Attribute::Nexthop { nexthop } => {
-                c.write_u8(flag)?;
-                c.write_u8(Attribute::NEXTHOP)?;
-
-                match nexthop {
-                    IpAddr::V4(addr) => {
-                        c.write_u8(4)?;
-                        c.write_u32::<NetworkEndian>(u32::from(*addr))?;
-                    }
-                    IpAddr::V6(addr) => {
-                        c.write_u8(16)?;
-                        for i in &addr.octets() {
-                            c.write_u8(*i)?;
-                        }
+            Attribute::Nexthop { nexthop } => match nexthop {
+                IpAddr::V4(addr) => {
+                    c.write_u8(4)?;
+                    c.write_u32::<NetworkEndian>(u32::from(*addr))?;
+                }
+                IpAddr::V6(addr) => {
+                    c.write_u8(16)?;
+                    for i in &addr.octets() {
+                        c.write_u8(*i)?;
                     }
                 }
-            }
+            },
             Attribute::MultiExitDesc { descriptor } => {
-                c.write_u8(flag)?;
-                c.write_u8(Attribute::MULTI_EXIT_DESC)?;
                 c.write_u8(4)?;
                 c.write_u32::<NetworkEndian>(*descriptor)?;
             }
             Attribute::LocalPref { preference } => {
-                c.write_u8(flag)?;
-                c.write_u8(Attribute::LOCAL_PREF)?;
                 c.write_u8(4)?;
                 c.write_u32::<NetworkEndian>(*preference)?;
             }
             Attribute::AtomicAggregate => {
-                c.write_u8(flag)?;
-                c.write_u8(Attribute::ATOMIC_AGGREGATE)?;
                 c.write_u8(0)?;
             }
             Attribute::Aggregator {
@@ -797,8 +790,6 @@ impl Attribute {
                 number,
                 address,
             } => {
-                c.write_u8(flag)?;
-                c.write_u8(Attribute::AGGREGATOR)?;
                 if *four_byte {
                     c.write_u8(8)?;
                     c.write_u32::<NetworkEndian>(*number)?;
@@ -812,16 +803,12 @@ impl Attribute {
                 }
             }
             Attribute::Community { communities } => {
-                c.write_u8(flag | Attribute::FLAG_EXTENDED)?;
-                c.write_u8(Attribute::COMMUNITY)?;
                 c.write_u16::<NetworkEndian>(communities.len() as u16 * 4)?;
                 for i in communities {
                     c.write_u32::<NetworkEndian>(*i)?;
                 }
             }
             Attribute::OriginatorId { address } => {
-                c.write_u8(flag)?;
-                c.write_u8(Attribute::ORIGINATOR_ID)?;
                 c.write_u8(4)?;
                 match address {
                     IpAddr::V4(addr) => c.write_u32::<NetworkEndian>(u32::from(*addr))?,
@@ -840,12 +827,10 @@ impl Attribute {
             // IpV6ExtendedCommunity,
             Attribute::NotSupported {
                 attr_flag,
-                attr_type,
+                attr_type: _,
                 attr_len,
                 buf,
             } => {
-                c.write_u8(*attr_flag)?;
-                c.write_u8(*attr_type)?;
                 if (*attr_flag & Attribute::FLAG_EXTENDED) != 0 {
                     c.write_u16::<NetworkEndian>(*attr_len)?;
                 } else {
