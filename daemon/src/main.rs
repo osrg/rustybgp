@@ -1297,7 +1297,9 @@ async fn set_state(global: &Arc<Mutex<Global>>, addr: IpAddr, state: bgp::State)
     peers.get_mut(&addr).unwrap().state = state;
 }
 
-struct Bgp;
+struct Bgp {
+    param: bgp::ParseParam,
+}
 
 impl Encoder for Bgp {
     type Item = bgp::Message;
@@ -1316,7 +1318,7 @@ impl Decoder for Bgp {
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> io::Result<Option<bgp::Message>> {
-        match bgp::Message::from_bytes(src) {
+        match bgp::Message::from_bytes(&self.param, src) {
             Ok(m) => {
                 src.split_to(m.length());
                 Ok(Some(m))
@@ -1459,7 +1461,12 @@ async fn handle_session(
     let mut keepalive_interval = bgp::OpenMessage::HOLDTIME / 3;
     let (_, rx) = mpsc::unbounded_channel();
     let mut session = Session {
-        lines: Framed::new(stream, Bgp),
+        lines: Framed::new(
+            stream,
+            Bgp {
+                param: bgp::ParseParam { local_as },
+            },
+        ),
         delay: Handle::default().delay(Instant::now()),
         rx: rx,
         families: vec![bgp::Family::Ipv4Uc],

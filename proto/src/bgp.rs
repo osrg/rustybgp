@@ -372,6 +372,10 @@ impl RouteRefreshMessage {
     }
 }
 
+pub struct ParseParam {
+    pub local_as: u32,
+}
+
 pub enum Message {
     Open(OpenMessage),
     Update(UpdateMessage),
@@ -414,7 +418,7 @@ impl Message {
         len
     }
 
-    pub fn from_bytes(buf: &[u8]) -> Result<Message, Error> {
+    pub fn from_bytes(param: &ParseParam, buf: &[u8]) -> Result<Message, Error> {
         let buflen = buf.len();
         let mut c = Cursor::new(buf);
 
@@ -435,7 +439,7 @@ impl Message {
                 return Ok(Message::Open(b));
             }
             Message::UPDATE => {
-                let b = UpdateMessage::from_bytes(&mut c)?;
+                let b = UpdateMessage::from_bytes(param, &mut c)?;
                 return Ok(Message::Update(b));
             }
             Message::NOTIFICATION => {
@@ -984,7 +988,7 @@ impl UpdateMessage {
         }
     }
 
-    pub fn from_bytes(c: &mut Cursor<&[u8]>) -> Result<UpdateMessage, Error> {
+    pub fn from_bytes(param: &ParseParam, c: &mut Cursor<&[u8]>) -> Result<UpdateMessage, Error> {
         let withdrawn_len = c.read_u16::<NetworkEndian>()?;
         let mut withdrawns: Vec<Nlri> = Vec::new();
         let mut ip_nexthop = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
@@ -1002,6 +1006,7 @@ impl UpdateMessage {
         let attr_len = c.read_u16::<NetworkEndian>()?;
         let mut attrs: Vec<Attribute> = Vec::new();
 
+        let mut handle_as_withdrawns = false;
         let mut seen = HashSet::new();
         let attr_end = c.position() + attr_len as u64;
         while c.position() < attr_end {
@@ -1012,8 +1017,18 @@ impl UpdateMessage {
                         // ignore duplicated attribute
                         continue;
                     }
-                    match a {
-                        Attribute::Nexthop { nexthop } => ip_nexthop = nexthop,
+                    match &a {
+                        Attribute::Nexthop { nexthop } => ip_nexthop = *nexthop,
+                        Attribute::AsPath { segments } => {
+                            for seg in segments {
+                                for n in &seg.number {
+                                    if *n == param.local_as {
+                                        handle_as_withdrawns = true;
+                                    }
+                                }
+                            }
+                            attrs.push(a);
+                        }
                         _ => attrs.push(a),
                     }
                 }
@@ -1035,7 +1050,8 @@ impl UpdateMessage {
         }
 
         if routes.len() > 0 {
-            if !seen.contains(&Attribute::ORIGIN)
+            if handle_as_withdrawns
+                || !seen.contains(&Attribute::ORIGIN)
                 || !seen.contains(&Attribute::AS_PATH)
                 || !seen.contains(&Attribute::NEXTHOP)
             {
