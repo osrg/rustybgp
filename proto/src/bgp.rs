@@ -15,6 +15,7 @@
 
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use failure::Error;
+use std::collections::HashSet;
 use std::convert::From;
 use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
@@ -1001,14 +1002,21 @@ impl UpdateMessage {
         let attr_len = c.read_u16::<NetworkEndian>()?;
         let mut attrs: Vec<Attribute> = Vec::new();
 
+        let mut seen = HashSet::new();
         let attr_end = c.position() + attr_len as u64;
         while c.position() < attr_end {
             let attr = Attribute::from_bytes(c);
             match attr {
-                Ok(a) => match a {
-                    Attribute::Nexthop { nexthop } => ip_nexthop = nexthop,
-                    _ => attrs.push(a),
-                },
+                Ok(a) => {
+                    if seen.insert(a.attr()) == false {
+                        // ignore duplicated attribute
+                        continue;
+                    }
+                    match a {
+                        Attribute::Nexthop { nexthop } => ip_nexthop = nexthop,
+                        _ => attrs.push(a),
+                    }
+                }
                 Err(_) => break,
             }
         }
