@@ -1033,6 +1033,16 @@ impl UpdateMessage {
             }
             routes.push(Nlri::Ip(IpNet::new(addr, bit_len)));
         }
+
+        if routes.len() > 0 {
+            if !seen.contains(&Attribute::ORIGIN)
+                || !seen.contains(&Attribute::AS_PATH)
+                || !seen.contains(&Attribute::NEXTHOP)
+            {
+                withdrawns.append(&mut routes);
+            }
+        }
+
         Ok(UpdateMessage {
             attrs,
             routes,
