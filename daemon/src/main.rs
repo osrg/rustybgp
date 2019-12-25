@@ -98,17 +98,19 @@ pub struct PathAttr {
 pub struct Path {
     pub source: IpAddr,
     pub timestamp: SystemTime,
-    as_number: u32,
+    pub as_number: u32,
+    pub nexthop: IpAddr,
     pub attrs: Arc<PathAttr>,
 }
 
 impl Path {
-    fn new(source: IpAddr, attrs: Arc<PathAttr>) -> Path {
+    fn new(source: IpAddr, nexthop: IpAddr, attrs: Arc<PathAttr>) -> Path {
         Path {
             source: source,
             timestamp: SystemTime::now(),
             as_number: 0,
             attrs,
+            nexthop,
         }
     }
 
@@ -135,6 +137,12 @@ impl Path {
         path.age = Some(self.timestamp.to_api());
 
         let mut attrs = Vec::new();
+        attrs.push(to_any(
+            api::NextHopAttribute {
+                next_hop: self.nexthop.to_string(),
+            },
+            "NextHopAttribute",
+        ));
         for attr in &self.attrs.entry {
             match attr {
                 bgp::Attribute::Origin { origin } => {
@@ -315,6 +323,7 @@ impl Table {
         family: bgp::Family,
         net: bgp::Nlri,
         source: IpAddr,
+        nexthop: IpAddr,
         attrs: Arc<PathAttr>,
     ) -> (Option<TableUpdate>, bool) {
         let t = self.master.get_mut(&family);
@@ -341,7 +350,7 @@ impl Table {
                     }
                 }
 
-                let b = Path::new(source, attrs);
+                let b = Path::new(source, nexthop, attrs);
 
                 let idx = if self.disable_best_path_selection == false {
                     0
@@ -382,7 +391,7 @@ impl Table {
             None => {
                 let mut d = Destination::new(net);
                 let a = attrs.clone();
-                d.entry.push(Path::new(source, attrs));
+                d.entry.push(Path::new(source, nexthop, attrs));
                 t.insert(net, d);
                 new_best = true;
                 a
@@ -1561,18 +1570,19 @@ async fn handle_session(
                     bgp::Message::Update(mut update) => {
                         let mut accept: i64 = 0;
                         if update.attrs.len() > 0 {
-                            let mut v = Vec::with_capacity(update.attrs.len());
-                            for _ in 0..update.attrs.len() {
-                                let a = update.attrs.remove(0);
-                                if a.attr() != bgp::Attribute::NEXTHOP {
-                                    v.push(a);
-                                }
-                            }
-                            v.sort_by_key(|a| a.attr());
-                            let pa = Arc::new(PathAttr { entry: v });
+                            update.attrs.sort_by_key(|a| a.attr());
+                            let pa = Arc::new(PathAttr {
+                                entry: update.attrs,
+                            });
                             let mut t = table.lock().await;
                             for r in update.routes {
-                                let (u, added) = t.insert(bgp::Family::Ipv4Uc, r, addr, pa.clone());
+                                let (u, added) = t.insert(
+                                    bgp::Family::Ipv4Uc,
+                                    r,
+                                    addr,
+                                    update.nexthop,
+                                    pa.clone(),
+                                );
                                 if let Some(u) = u {
                                     t.broadcast(addr, &u).await;
                                 }

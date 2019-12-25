@@ -968,6 +968,7 @@ pub struct UpdateMessage {
     pub attrs: Vec<Attribute>,
     pub routes: Vec<Nlri>,
     pub withdrawns: Vec<Nlri>,
+    pub nexthop: IpAddr,
     length: usize,
 }
 
@@ -977,6 +978,7 @@ impl UpdateMessage {
             routes,
             withdrawns,
             attrs,
+            nexthop: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             length: 0,
         }
     }
@@ -984,6 +986,7 @@ impl UpdateMessage {
     pub fn from_bytes(c: &mut Cursor<&[u8]>) -> Result<UpdateMessage, Error> {
         let withdrawn_len = c.read_u16::<NetworkEndian>()?;
         let mut withdrawns: Vec<Nlri> = Vec::new();
+        let mut ip_nexthop = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
 
         let pos = c.position();
         while c.position() - pos < withdrawn_len as u64 {
@@ -1002,7 +1005,10 @@ impl UpdateMessage {
         while c.position() < attr_end {
             let attr = Attribute::from_bytes(c);
             match attr {
-                Ok(a) => attrs.push(a),
+                Ok(a) => match a {
+                    Attribute::Nexthop { nexthop } => ip_nexthop = nexthop,
+                    _ => attrs.push(a),
+                },
                 Err(_) => break,
             }
         }
@@ -1023,6 +1029,7 @@ impl UpdateMessage {
             attrs,
             routes,
             withdrawns,
+            nexthop: ip_nexthop,
             length: c.get_ref().len(),
         })
     }
