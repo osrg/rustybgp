@@ -978,12 +978,14 @@ pub struct UpdateMessage {
 }
 
 impl UpdateMessage {
+    const INVALID_NEXTHOP: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+
     pub fn new(routes: Vec<Nlri>, withdrawns: Vec<Nlri>, attrs: Vec<Attribute>) -> UpdateMessage {
         UpdateMessage {
             routes,
             withdrawns,
             attrs,
-            nexthop: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            nexthop: UpdateMessage::INVALID_NEXTHOP,
             length: 0,
         }
     }
@@ -991,7 +993,7 @@ impl UpdateMessage {
     pub fn from_bytes(param: &ParseParam, c: &mut Cursor<&[u8]>) -> Result<UpdateMessage, Error> {
         let withdrawn_len = c.read_u16::<NetworkEndian>()?;
         let mut withdrawns: Vec<Nlri> = Vec::new();
-        let mut ip_nexthop = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+        let mut ip_nexthop = UpdateMessage::INVALID_NEXTHOP;
 
         let pos = c.position();
         while c.position() - pos < withdrawn_len as u64 {
