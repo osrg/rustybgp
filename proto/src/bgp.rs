@@ -630,6 +630,16 @@ impl Attribute {
             attr_len += c.read_u8()? as u16;
         }
 
+        if ((attr_flag ^ Attribute::flag(attr_type))
+            & (Attribute::FLAG_OPTIONAL | Attribute::FLAG_TRANSITIVE))
+            > 0
+        {
+            for _i in 0..attr_len {
+                c.read_u8()?;
+            }
+            return Err(failure::err_msg("invalid flag"));
+        }
+
         match attr_type {
             Attribute::ORIGIN => {
                 let origin = c.read_u8()?;
@@ -744,11 +754,13 @@ impl Attribute {
         let pos = c.position();
 
         let t = self.attr();
-        let flag = if t == Attribute::AS_PATH || t == Attribute::COMMUNITY {
-            self.flag() | Attribute::FLAG_EXTENDED
-        } else {
-            self.flag()
-        };
+        let mut flag = Attribute::flag(t);
+        match self {
+            Attribute::AsPath { .. } => flag |= Attribute::FLAG_EXTENDED,
+            Attribute::Community { .. } => flag |= Attribute::FLAG_EXTENDED,
+            Attribute::NotSupported { attr_flag, .. } => flag = *attr_flag,
+            _ => {}
+        }
 
         c.write_u8(flag)?;
         c.write_u8(t)?;
@@ -854,18 +866,18 @@ impl Attribute {
         Ok((c.position() - pos) as usize)
     }
 
-    pub fn flag(&self) -> u8 {
-        match self {
-            Attribute::Origin { .. } => Attribute::FLAG_TRANSITIVE,
-            Attribute::AsPath { .. } => Attribute::FLAG_TRANSITIVE,
-            Attribute::Nexthop { .. } => Attribute::FLAG_TRANSITIVE,
-            Attribute::MultiExitDesc { .. } => Attribute::FLAG_OPTIONAL,
-            Attribute::LocalPref { .. } => Attribute::FLAG_TRANSITIVE,
-            Attribute::AtomicAggregate => Attribute::FLAG_TRANSITIVE,
-            Attribute::Aggregator { .. } => Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
-            Attribute::Community { .. } => Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
-            Attribute::OriginatorId { .. } => Attribute::FLAG_OPTIONAL,
-            Attribute::ClusterList { .. } => Attribute::FLAG_OPTIONAL,
+    pub fn flag(t: u8) -> u8 {
+        match t {
+            Attribute::ORIGIN => Attribute::FLAG_TRANSITIVE,
+            Attribute::AS_PATH => Attribute::FLAG_TRANSITIVE,
+            Attribute::NEXTHOP => Attribute::FLAG_TRANSITIVE,
+            Attribute::MULTI_EXIT_DESC => Attribute::FLAG_OPTIONAL,
+            Attribute::LOCAL_PREF => Attribute::FLAG_TRANSITIVE,
+            Attribute::ATOMIC_AGGREGATE => Attribute::FLAG_TRANSITIVE,
+            Attribute::AGGREGATOR => Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
+            Attribute::COMMUNITY => Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
+            Attribute::ORIGINATOR_ID => Attribute::FLAG_OPTIONAL,
+            Attribute::CLUSTER_LIST => Attribute::FLAG_OPTIONAL,
             // MpReach,
             // MpUnreach,
             // ExtendedCommunity,
@@ -875,7 +887,7 @@ impl Attribute {
             // TunnelEncap,
             // TraficEngineering,
             // IpV6ExtendedCommunity,
-            Attribute::NotSupported { attr_flag, .. } => *attr_flag,
+            _ => Attribute::FLAG_OPTIONAL,
         }
     }
 
@@ -896,7 +908,12 @@ impl Attribute {
     }
 
     pub fn is_transitive(&self) -> bool {
-        self.flag() & Attribute::FLAG_TRANSITIVE != 0
+        let mut flag = Attribute::flag(self.attr());
+        match self {
+            Attribute::NotSupported { attr_flag, .. } => flag = *attr_flag,
+            _ => {}
+        }
+        flag & Attribute::FLAG_TRANSITIVE != 0
     }
 }
 
