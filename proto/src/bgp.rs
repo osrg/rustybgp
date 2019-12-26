@@ -611,6 +611,11 @@ impl Attribute {
     pub const CLUSTER_LIST: u8 = 10;
 
     pub fn from_bytes(c: &mut Cursor<&[u8]>) -> Result<Attribute, Error> {
+        let attr_len_err = Error::from(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "invalid attribute length",
+        ));
+
         // flag
         let attr_flag = c.read_u8()?;
 
@@ -666,7 +671,7 @@ impl Attribute {
                         nexthop: IpAddr::from(buf),
                     });
                 }
-                Err(format_err!("invalid attribute length"))
+                Err(attr_len_err)
             }
             Attribute::MULTI_EXIT_DESC => {
                 let descriptor = c.read_u32::<NetworkEndian>()?;
@@ -697,7 +702,7 @@ impl Attribute {
                         address: IpAddr::from(buf),
                     });
                 }
-                Err(format_err!("invalid attribute length"))
+                Err(attr_len_err)
             }
             Attribute::COMMUNITY => {
                 if attr_len % 4 == 0 {
@@ -708,7 +713,7 @@ impl Attribute {
                     }
                     return Ok(Attribute::Community { communities });
                 }
-                Err(format_err!("invalid attribute length"))
+                Err(attr_len_err)
             }
             Attribute::ORIGINATOR_ID => {
                 if attr_len == 4 {
@@ -718,7 +723,7 @@ impl Attribute {
                         address: IpAddr::from(buf),
                     });
                 }
-                Err(format_err!("invalid attribute length"))
+                Err(attr_len_err)
             }
             _ => {
                 let mut buf: Vec<u8> = Vec::new();
@@ -1034,7 +1039,13 @@ impl UpdateMessage {
                         _ => attrs.push(a),
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    // io:Error means that we can't parse any more
+                    if e.downcast_ref::<std::io::Error>().is_some() {
+                        return Err(e);
+                    }
+                    handle_as_withdrawns = true;
+                }
             }
         }
 
