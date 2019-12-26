@@ -8,5 +8,5 @@ edition = "2018"
 
 [dependencies]
 byteorder = "1.3.2"
-failure = "*"
+failure = "0.1.6"
 
