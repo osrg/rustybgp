@@ -1415,7 +1415,11 @@ impl Session {
                     let buf = bgp::UpdateMessage::to_bytes(vec![nlri], Vec::new(), v).unwrap();
                     self.lines.get_mut().write_all(&buf).await?;
                 }
-                _ => {}
+                TableUpdate::Withdrawn(nlri) => {
+                    let buf =
+                        bgp::UpdateMessage::to_bytes(Vec::new(), vec![nlri], Vec::new()).unwrap();
+                    self.lines.get_mut().write_all(&buf).await?;
+                }
             }
         }
         Ok(())
@@ -1601,7 +1605,10 @@ async fn handle_session(
                         if update.withdrawns.len() > 0 {
                             let mut t = table.lock().await;
                             for r in update.withdrawns {
-                                let (_, deleted) = t.remove(bgp::Family::Ipv4Uc, r, addr);
+                                let (u, deleted) = t.remove(bgp::Family::Ipv4Uc, r, addr);
+                                if let Some(u) = u {
+                                    t.broadcast(addr, &u).await;
+                                }
                                 if deleted {
                                     accept -= 1;
                                 }
@@ -1671,16 +1678,14 @@ async fn handle_session(
 
     println!("disconnected {}", addr);
     {
-        let mut t = table.lock().await;
-        t.clear(addr);
-    }
-
-    {
         let peers = &mut global.lock().await.peers;
         peers.remove(&addr);
     }
     {
         let mut t = table.lock().await;
         t.active_peers.remove(&addr);
+        for u in t.clear(addr) {
+            t.broadcast(addr, &u).await;
+        }
     }
 }
