@@ -1,8 +1,8 @@
 # RustyBGP: BGP implementation in Rust
 
-The mission is to develop a high-perofrmance, low-memory-footprint, and safe BGP implementaiton; an experiment to implement aged and rusty BGP protocol in a modern language.
+The mission is to develop a high-performance, low-memory-footprint, and safe BGP implementation; an experiment to implement aged and rusty BGP protocol in a modern language.
 
-RustyBGP supports the gRPC APIs same as GoBGP; GoBGP's CLI command enables you to manage RustyBGP. Currently, all RustyBGP can do is accepting peers, getting routes, doing the best path selection, advertising the best paths, and showing you these routes via the gRPC API. No active connection, policy, etc.
+RustyBGP supports the gRPC APIs same as GoBGP; GoBGP's CLI command allows you to manage RustyBGP. Currently, all RustyBGP can do is accept peers, get routes, select the best paths, advertise the best paths, and show you routes via the gRPC API. No active connection, policy, etc.
 
 ## Get Started
 
