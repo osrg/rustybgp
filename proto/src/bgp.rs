@@ -30,6 +30,47 @@ pub struct IpNet {
 }
 
 impl IpNet {
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        let f = |a: &Vec<u8>, b: &Vec<u8>, mask: u8| {
+            let div = (mask >> 3) as usize;
+
+            for i in 0..div {
+                if a[i] != b[i] {
+                    return false;
+                }
+            }
+
+            let r = mask & 0x07;
+            if r > 0 {
+                let bit = 8 - r;
+                if a[div] != (b[div] & (0xff >> bit << bit)) {
+                    return false;
+                }
+            }
+            true
+        };
+        match addr {
+            IpAddr::V4(addr) => {
+                let prefix_octets: Vec<u8> = match self.addr {
+                    IpAddr::V4(addr) => addr.octets().into_iter().map(|x| *x).collect(),
+                    _ => return false,
+                };
+
+                let addr_octests: Vec<u8> = addr.octets().into_iter().map(|x| *x).collect();
+                return f(&prefix_octets, &addr_octests, self.mask);
+            }
+            IpAddr::V6(addr) => {
+                let prefix_octets: Vec<u8> = match self.addr {
+                    IpAddr::V6(addr) => addr.octets().into_iter().map(|x| *x).collect(),
+                    _ => return false,
+                };
+
+                let addr_octests: Vec<u8> = addr.octets().into_iter().map(|x| *x).collect();
+                return f(&prefix_octets, &addr_octests, self.mask);
+            }
+        }
+    }
+
     fn clear_bits(buf: &mut [u8], mask: u8) {
         let rem = mask % 8;
         if rem != 0 {
@@ -156,6 +197,24 @@ fn ipnet_oddbits() {
     let mut octests = [1, 0xff, 0xff, 0];
     IpNet::clear_bits(&mut octests, 23);
     assert_eq!(octests[2], 0xfe);
+}
+
+#[test]
+
+fn ipnet_contains() {
+    use std::net::Ipv6Addr;
+
+    let n1 = IpNet::from_str("2.2.2.0/24").unwrap();
+    assert_eq!(n1.contains(IpAddr::V4(Ipv4Addr::new(2, 2, 2, 3))), true);
+    assert_eq!(n1.contains(IpAddr::V4(Ipv4Addr::new(2, 2, 1, 3))), false);
+    assert_eq!(
+        n1.contains(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))),
+        false
+    );
+
+    let n2 = IpNet::from_str("2.2.2.128/25").unwrap();
+    assert_eq!(n2.contains(IpAddr::V4(Ipv4Addr::new(2, 2, 2, 129))), true);
+    assert_eq!(n2.contains(IpAddr::V4(Ipv4Addr::new(2, 2, 2, 5))), false);
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
