@@ -585,6 +585,13 @@ impl Peer {
             local_cap: Vec::new(),
         }
     }
+
+    fn reset(&mut self) {
+        self.state = bgp::State::Idle;
+        self.downtime = SystemTime::now();
+        self.accepted = 0;
+        self.remote_cap = Vec::new();
+    }
 }
 
 impl ToApi<api::Peer> for Peer {
@@ -745,6 +752,15 @@ impl ToApi<prost_types::Any> for bgp::Capability {
     }
 }
 
+pub struct DynamicPeer {
+    pub prefix: bgp::IpNet,
+}
+
+pub struct PeerGroup {
+    pub as_number: u32,
+    pub dynamic_peers: Vec<DynamicPeer>,
+}
+
 pub struct Global {
     pub as_number: u32,
     pub id: Ipv4Addr,
@@ -753,6 +769,8 @@ pub struct Global {
     pub perf: bool,
 
     pub peers: HashMap<IpAddr, Peer>,
+    pub peer_group: HashMap<String, PeerGroup>,
+
     pub init: mpsc::Sender<()>,
 }
 
@@ -781,6 +799,7 @@ impl Global {
             id: Ipv4Addr::new(0, 0, 0, 0),
             perf: perf,
             peers: HashMap::new(),
+            peer_group: HashMap::new(),
             init: init,
         }
     }
@@ -921,9 +940,34 @@ impl GobgpApi for Service {
     }
     async fn add_peer_group(
         &self,
-        _request: tonic::Request<api::AddPeerGroupRequest>,
+        request: tonic::Request<api::AddPeerGroupRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        match request.into_inner().peer_group {
+            Some(pg) => {
+                if let Some(conf) = pg.conf {
+                    let mut global = self.global.lock().await;
+
+                    if global.peer_group.contains_key(&conf.peer_group_name) {
+                        return Err(tonic::Status::new(
+                            tonic::Code::AlreadyExists,
+                            "peer group name already exists",
+                        ));
+                    } else {
+                        let p = PeerGroup {
+                            as_number: conf.peer_as,
+                            dynamic_peers: Vec::new(),
+                        };
+                        global.peer_group.insert(conf.peer_group_name, p);
+                        return Ok(tonic::Response::new(()));
+                    }
+                }
+            }
+            None => {}
+        }
+        Err(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "peer group conf is empty",
+        ))
     }
     async fn delete_peer_group(
         &self,
@@ -939,9 +983,39 @@ impl GobgpApi for Service {
     }
     async fn add_dynamic_neighbor(
         &self,
-        _request: tonic::Request<api::AddDynamicNeighborRequest>,
+        request: tonic::Request<api::AddDynamicNeighborRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let dynamic = request
+            .into_inner()
+            .dynamic_neighbor
+            .ok_or(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "conf is empty",
+            ))?;
+
+        let prefix = bgp::IpNet::from_str(&dynamic.prefix)
+            .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
+
+        let mut global = self.global.lock().await;
+
+        let pg = global
+            .peer_group
+            .get_mut(&dynamic.peer_group)
+            .ok_or(tonic::Status::new(
+                tonic::Code::NotFound,
+                "peer group isn't found",
+            ))?;
+
+        for p in &pg.dynamic_peers {
+            if p.prefix == prefix {
+                return Err(tonic::Status::new(
+                    tonic::Code::AlreadyExists,
+                    "prefix already exists",
+                ));
+            }
+        }
+        pg.dynamic_peers.push(DynamicPeer { prefix });
+        return Ok(tonic::Response::new(()));
     }
     async fn add_path(
         &self,
@@ -1282,13 +1356,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, sock) = listener.accept().await?;
         let addr = f(sock);
         println!("got new connection {:?}", addr);
-        if let Ok(l) = stream.local_addr() {
-            let global = Arc::clone(&global);
-            let table = Arc::clone(&table);
-            tokio::spawn(async move {
-                handle_session(global, table, stream, addr, f(l)).await;
-            });
+        let local_addr = {
+            if let Ok(l) = stream.local_addr() {
+                f(l)
+            } else {
+                continue;
+            }
+        };
+
+        let mut g = global.lock().await;
+        let mut is_dynamic = false;
+        if g.peers.contains_key(&addr) == true {
+        } else {
+            for p in &g.peer_group {
+                for d in &*p.1.dynamic_peers {
+                    if d.prefix.contains(addr) {
+                        println!("found dynamic neighbor conf {} {:?}", p.0, d.prefix);
+                        is_dynamic = true;
+                        break;
+                    }
+                }
+            }
+
+            if is_dynamic == false {
+                println!(
+                    "can't find configuration for a new passive connection from {}",
+                    addr
+                );
+                continue;
+            }
+            let peer = Peer::new(addr);
+            g.peers.insert(addr, peer);
         }
+
+        let global = Arc::clone(&global);
+        let table = Arc::clone(&table);
+        tokio::spawn(async move {
+            handle_session(global, table, stream, addr, local_addr, is_dynamic).await;
+        });
     }
 }
 
@@ -1453,13 +1558,11 @@ async fn handle_session(
     stream: TcpStream,
     addr: IpAddr,
     local_addr: IpAddr,
+    is_dynamic: bool,
 ) {
-    let local_as = {
-        let mut g = global.lock().await;
-        let peer = Peer::new(addr);
-
-        g.peers.insert(addr, peer);
-        g.as_number
+    let (as_number, router_id) = {
+        let global = global.lock().await;
+        (global.as_number, global.id)
     };
 
     let mut keepalive_interval = bgp::OpenMessage::HOLDTIME / 3;
@@ -1468,20 +1571,18 @@ async fn handle_session(
         lines: Framed::new(
             stream,
             Bgp {
-                param: bgp::ParseParam { local_as },
+                param: bgp::ParseParam {
+                    local_as: as_number,
+                },
             },
         ),
         delay: Handle::default().delay(Instant::now()),
         rx: rx,
         families: vec![bgp::Family::Ipv4Uc],
         local_addr: local_addr,
-        local_as,
+        local_as: as_number,
     };
 
-    let (as_number, router_id) = {
-        let global = global.lock().await;
-        (global.as_number, global.id)
-    };
     let open = bgp::OpenMessage::new(as_number, router_id);
     {
         let peers = &mut global.lock().await.peers;
@@ -1679,7 +1780,11 @@ async fn handle_session(
     println!("disconnected {}", addr);
     {
         let peers = &mut global.lock().await.peers;
-        peers.remove(&addr);
+        if is_dynamic {
+            peers.remove(&addr);
+        } else {
+            peers.get_mut(&addr).unwrap().reset();
+        }
     }
     {
         let mut t = table.lock().await;
