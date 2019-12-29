@@ -669,12 +669,14 @@ impl Attribute {
     pub const ORIGINATOR_ID: u8 = 9;
     pub const CLUSTER_LIST: u8 = 10;
 
-    pub fn from_bytes(c: &mut Cursor<&[u8]>) -> Result<Attribute, Error> {
-        let attr_len_err = Error::from(std::io::Error::new(
+    fn length_error() -> Error {
+        Error::from(std::io::Error::new(
             std::io::ErrorKind::Other,
             "invalid attribute length",
-        ));
+        ))
+    }
 
+    pub fn from_bytes(c: &mut Cursor<&[u8]>) -> Result<Attribute, Error> {
         // flag
         let attr_flag = c.read_u8()?;
 
@@ -740,7 +742,7 @@ impl Attribute {
                         nexthop: IpAddr::from(buf),
                     });
                 }
-                Err(attr_len_err)
+                Err(Attribute::length_error())
             }
             Attribute::MULTI_EXIT_DESC => {
                 let descriptor = c.read_u32::<NetworkEndian>()?;
@@ -771,7 +773,7 @@ impl Attribute {
                         address: IpAddr::from(buf),
                     });
                 }
-                Err(attr_len_err)
+                Err(Attribute::length_error())
             }
             Attribute::COMMUNITY => {
                 if attr_len % 4 == 0 {
@@ -782,7 +784,7 @@ impl Attribute {
                     }
                     return Ok(Attribute::Community { communities });
                 }
-                Err(attr_len_err)
+                Err(Attribute::length_error())
             }
             Attribute::ORIGINATOR_ID => {
                 if attr_len == 4 {
@@ -792,7 +794,7 @@ impl Attribute {
                         address: IpAddr::from(buf),
                     });
                 }
-                Err(attr_len_err)
+                Err(Attribute::length_error())
             }
             _ => {
                 let mut buf: Vec<u8> = Vec::new();
