@@ -13,20 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate clap;
-extern crate futures;
-extern crate tokio;
-extern crate tokio_timer;
-
-use bytes::{BufMut, BytesMut};
-use std::collections::HashMap;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr};
-use std::pin::Pin;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    collections::HashMap,
+    io,
+    net::{IpAddr, Ipv4Addr},
+    pin::Pin,
+    str::FromStr,
+    sync::Arc,
+    task::{Context, Poll},
+    time::{Duration, Instant, SystemTime},
+};
 
 use tokio::{
     codec::{Decoder, Encoder, Framed},
@@ -34,13 +30,13 @@ use tokio::{
     prelude::*,
     sync::{mpsc, Mutex},
 };
-
 use tokio_timer::{timer::Handle, Delay};
 
+use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
-
 use prost;
-pub mod api {
+
+mod api {
     tonic::include_proto!("gobgpapi");
 }
 use api::server::{GobgpApi, GobgpApiServer};
