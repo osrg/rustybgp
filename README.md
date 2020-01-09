@@ -33,4 +33,4 @@ Peer        AS Up/Down State       |#Received  Accepted
 10.0.0.2 65001   never Idle        |        0         0
 ```
 
-If you just want to check out the performance, start the daemon with `--any-peers` option. The daemon starts immediately with AS number 65001, then accepts any peers.
+If you just want to check out the performance, start the daemon with `--any-peers` option. The daemon starts immediately accepts any peers.
