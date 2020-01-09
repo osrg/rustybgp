@@ -348,7 +348,7 @@ impl Table {
 
                 let b = Path::new(source, nexthop, attrs);
 
-                let idx = if self.disable_best_path_selection == false {
+                let idx = if self.disable_best_path_selection == true {
                     0
                 } else {
                     let mut idx = d.entry.len();
@@ -393,7 +393,7 @@ impl Table {
                 a
             }
         };
-        if new_best {
+        if self.disable_best_path_selection == false && new_best {
             (Some(TableUpdate::NewBest(net, attrs)), !replaced)
         } else {
             (None, !replaced)
@@ -1280,6 +1280,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .required(true)
                 .help("specify router id"),
         )
+        .arg(
+            Arg::with_name("collector")
+                .long("disable-best")
+                .help("disable best path selection"),
+        )
         .get_matches();
 
     let asn = args.value_of("asn").unwrap().parse()?;
@@ -1287,7 +1292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let global = Arc::new(Mutex::new(Global::new(asn, router_id)));
     let mut table = Table::new();
-    table.disable_best_path_selection = args.is_present("perf");
+    table.disable_best_path_selection = args.is_present("collector");
     let table = Arc::new(Mutex::new(table));
 
     let addr = "127.0.0.1:50051".parse()?;
@@ -1714,14 +1719,16 @@ async fn handle_session(
                                 t.active_peers.insert(addr, tx);
                                 session.rx = rx;
 
-                                for family in &session.families {
-                                    if let Some(m) = t.master.get_mut(&family) {
-                                        for route in m {
-                                            let u = TableUpdate::NewBest(
-                                                *route.0,
-                                                route.1.entry[0].attrs.clone(),
-                                            );
-                                            v.push(u);
+                                if t.disable_best_path_selection == false {
+                                    for family in &session.families {
+                                        if let Some(m) = t.master.get_mut(&family) {
+                                            for route in m {
+                                                let u = TableUpdate::NewBest(
+                                                    *route.0,
+                                                    route.1.entry[0].attrs.clone(),
+                                                );
+                                                v.push(u);
+                                            }
                                         }
                                     }
                                 }
