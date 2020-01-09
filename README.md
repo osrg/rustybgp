@@ -19,15 +19,9 @@ $ ls -hl target/x86_64-unknown-linux-musl/release/daemon
 No configuration file support.
 
 ```bash
-$ sudo ./target/debug/daemon
+$ sudo ./target/debug/daemon --as-number 65001 --router-id 1.1.1.1
 Hello, RustyBGP!
 grpc: listening on 127.0.0.1:50051
-```
-
-After starting the RustyBGP daemon, you need to configure the AS number and the router ID then the daemon starts accepting peers.
-
-```bash
-$ gobgp global as 65000 router-id 10.0.0.1
 ```
 
 Then you set up peer configuration.
@@ -39,4 +33,4 @@ Peer        AS Up/Down State       |#Received  Accepted
 10.0.0.2 65001   never Idle        |        0         0
 ```
 
-If you just want to check out the performance, start the daemon with `--perf` option. The daemon starts immediately with AS number 65001, then accepts any peers.
+If you just want to check out the performance, start the daemon with `--any-peers` option. The daemon starts immediately with AS number 65001, then accepts any peers.
