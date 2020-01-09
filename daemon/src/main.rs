@@ -1285,12 +1285,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .long("disable-best")
                 .help("disable best path selection"),
         )
+        .arg(
+            Arg::with_name("any")
+                .long("any-peers")
+                .help("accept any peers"),
+        )
         .get_matches();
 
     let asn = args.value_of("asn").unwrap().parse()?;
     let router_id = Ipv4Addr::from_str(args.value_of("id").unwrap())?;
 
     let global = Arc::new(Mutex::new(Global::new(asn, router_id)));
+    if args.is_present("any") {
+        let mut global = global.lock().await;
+        global.peer_group.insert(
+            "any".to_string(),
+            PeerGroup {
+                as_number: 0,
+                dynamic_peers: vec![DynamicPeer {
+                    prefix: bgp::IpNet::from_str("0.0.0.0/0").unwrap(),
+                }],
+            },
+        );
+    }
+
     let mut table = Table::new();
     table.disable_best_path_selection = args.is_present("collector");
     let table = Arc::new(Mutex::new(table));
