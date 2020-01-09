@@ -761,13 +761,8 @@ pub struct Global {
     pub as_number: u32,
     pub id: Ipv4Addr,
 
-    // hack for now; will be replaced with neighbor group.
-    pub perf: bool,
-
     pub peers: HashMap<IpAddr, Peer>,
     pub peer_group: HashMap<String, PeerGroup>,
-
-    pub init: mpsc::Sender<()>,
 }
 
 impl ToApi<api::Global> for Global {
@@ -789,14 +784,12 @@ impl ToApi<api::Global> for Global {
 }
 
 impl Global {
-    pub fn new(perf: bool, init: mpsc::Sender<()>) -> Global {
+    pub fn new(asn: u32, id: Ipv4Addr) -> Global {
         Global {
-            as_number: 0,
-            id: Ipv4Addr::new(0, 0, 0, 0),
-            perf: perf,
+            as_number: asn,
+            id: id,
             peers: HashMap::new(),
             peer_group: HashMap::new(),
-            init: init,
         }
     }
 }
@@ -810,26 +803,9 @@ pub struct Service {
 impl GobgpApi for Service {
     async fn start_bgp(
         &self,
-        request: tonic::Request<api::StartBgpRequest>,
+        _request: tonic::Request<api::StartBgpRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        match request.into_inner().global {
-            Some(g) => {
-                let mut global = self.global.lock().await;
-                if g.r#as != 0 && global.as_number == 0 {
-                    match Ipv4Addr::from_str(&g.router_id) {
-                        Ok(addr) => {
-                            global.id = addr;
-                            global.as_number = g.r#as;
-
-                            global.init.send(()).await.unwrap();
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-            None => {}
-        }
-        Ok(tonic::Response::new(()))
+        Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn stop_bgp(
         &self,
@@ -849,11 +825,6 @@ impl GobgpApi for Service {
         &self,
         request: tonic::Request<api::AddPeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        {
-            if self.global.lock().await.perf {
-                return Ok(tonic::Response::new(()));
-            }
-        }
         if let Some(peer) = request.into_inner().peer {
             if let Some(conf) = peer.conf {
                 if let Ok(addr) = IpAddr::from_str(&conf.neighbor_address) {
@@ -1292,21 +1263,29 @@ impl GobgpApi for Service {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    const PERFORMANCE_MODE_AS: u32 = 65001;
-
     println!("Hello, RustyBGP!");
 
     let args = App::new("rustybgp")
         .arg(
-            Arg::with_name("perf")
-                .long("perf")
-                .help("start without any configuraiton and accept any peers"),
+            Arg::with_name("asn")
+                .long("as-number")
+                .takes_value(true)
+                .required(true)
+                .help("specify as number"),
+        )
+        .arg(
+            Arg::with_name("id")
+                .long("router-id")
+                .takes_value(true)
+                .required(true)
+                .help("specify router id"),
         )
         .get_matches();
 
-    let (init_tx, mut init_rx) = mpsc::channel::<()>(1);
+    let asn = args.value_of("asn").unwrap().parse()?;
+    let router_id = Ipv4Addr::from_str(args.value_of("id").unwrap())?;
 
-    let global = Arc::new(Mutex::new(Global::new(args.is_present("perf"), init_tx)));
+    let global = Arc::new(Mutex::new(Global::new(asn, router_id)));
     let mut table = Table::new();
     table.disable_best_path_selection = args.is_present("perf");
     let table = Arc::new(Mutex::new(table));
@@ -1326,14 +1305,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("failed to listen on grpc {}", e);
         }
     });
-
-    if args.is_present("perf") {
-        let mut g = global.lock().await;
-        g.as_number = PERFORMANCE_MODE_AS;
-        g.id = Ipv4Addr::new(1, 1, 1, 1);
-    } else {
-        init_rx.recv().await;
-    }
 
     let addr = "[::]:179".to_string();
     let mut listener = TcpListener::bind(&addr).await?;
