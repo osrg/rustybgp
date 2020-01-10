@@ -100,6 +100,10 @@ impl IpNet {
         }
         Ok((c.position() - pos) as usize)
     }
+
+    fn length(&self) -> u8 {
+        (self.mask + 7) / 8 + 1
+    }
 }
 
 #[derive(Debug)]
@@ -222,6 +226,13 @@ pub enum Nlri {
     Ip(IpNet),
 }
 
+impl Nlri {
+    fn length(&self) -> u8 {
+        let Nlri::Ip(net) = self;
+        net.length()
+    }
+}
+
 impl std::string::ToString for Nlri {
     fn to_string(&self) -> String {
         match self {
@@ -267,14 +278,18 @@ impl Family {
     const IPV4_UC: u32 = (Family::AFI_IP as u32) << 16 | Family::SAFI_UNICAST as u32;
     const IPV6_UC: u32 = (Family::AFI_IP6 as u32) << 16 | Family::SAFI_UNICAST as u32;
 
-    fn afi(self) -> u16 {
+    pub fn afi(self) -> u16 {
         let family: u32 = From::from(self);
         (family >> 16) as u16
     }
 
-    fn safi(self) -> u8 {
+    pub fn safi(self) -> u8 {
         let family: u32 = From::from(self);
         (family & 0xff) as u8
+    }
+
+    pub fn new(afi: u16, safi: u8) -> Family {
+        Family::from((afi as u32) << 16 | safi as u32)
     }
 }
 
@@ -291,23 +306,17 @@ impl OpenMessage {
     const VERSION: u8 = 4;
     pub const HOLDTIME: u16 = 90;
 
-    pub fn new(as_number: u32, id: Ipv4Addr) -> OpenMessage {
-        let params = vec![
-            OpenParam::CapabilityParam(Capability::RouteRefresh),
-            OpenParam::CapabilityParam(Capability::FourOctetAsNumber {
-                as_number: as_number,
-            }),
-            OpenParam::CapabilityParam(Capability::MultiProtocol {
-                family: Family::Ipv4Uc,
-            }),
-        ];
-
+    pub fn new(id: Ipv4Addr, caps: Vec<Capability>) -> OpenMessage {
         OpenMessage {
             version: OpenMessage::VERSION,
             as_number: AS_TRANS,
             holdtime: OpenMessage::HOLDTIME,
             id: id,
-            params: params,
+            params: caps
+                .iter()
+                .cloned()
+                .map(|c| OpenParam::CapabilityParam(c))
+                .collect(),
             length: 0,
         }
     }
@@ -634,8 +643,16 @@ pub enum Attribute {
     ClusterList {
         addresses: Vec<IpAddr>,
     },
-    // MpReach,
-    // MpUnreach,
+    MpReach {
+        family: Family,
+        // TODO: link-local
+        nexthop: IpAddr,
+        nlri: Nlri,
+    },
+    MpUnreach {
+        family: Family,
+        nlri: Nlri,
+    },
     // ExtendedCommunity,
     // As4Path,
     // As4Aggregator,
@@ -668,6 +685,8 @@ impl Attribute {
     pub const COMMUNITY: u8 = 8;
     pub const ORIGINATOR_ID: u8 = 9;
     pub const CLUSTER_LIST: u8 = 10;
+    pub const MP_REACH: u8 = 14;
+    pub const MP_UNREACH: u8 = 15;
 
     fn length_error() -> Error {
         Error::from(std::io::Error::new(
@@ -796,6 +815,60 @@ impl Attribute {
                 }
                 Err(Attribute::length_error())
             }
+            Attribute::MP_REACH => {
+                let afi = c.read_u16::<NetworkEndian>()?;
+                let safi = c.read_u8()?;
+                let nexthop_len = c.read_u8()?;
+                let nexthop = match nexthop_len {
+                    4 => {
+                        let mut buf = [0; 4];
+                        c.read_exact(&mut buf)?;
+                        IpAddr::from(buf)
+                    }
+                    16 => {
+                        let mut buf = [0; 16];
+                        c.read_exact(&mut buf)?;
+                        IpAddr::from(buf)
+                    }
+                    32 => {
+                        // TODO
+                        let mut buf = [0; 16];
+                        c.read_exact(&mut buf)?;
+                        c.read_exact(&mut buf)?;
+                        IpAddr::from(buf)
+                    }
+                    _ => return Err(Attribute::length_error()),
+                };
+                c.read_u8()?;
+                let bit_len = c.read_u8()?;
+                let mut addr = [0 as u8; 16];
+                for i in 0..(bit_len + 7) / 8 {
+                    addr[i as usize] = c.read_u8()?;
+                }
+                let nlri = Nlri::Ip(IpNet::new(addr, bit_len));
+
+                Ok(Attribute::MpReach {
+                    family: Family::new(afi, safi),
+                    nlri,
+                    nexthop,
+                })
+            }
+            Attribute::MP_UNREACH => {
+                let afi = c.read_u16::<NetworkEndian>()?;
+                let safi = c.read_u8()?;
+
+                let bit_len = c.read_u8()?;
+                let mut addr = [0 as u8; 16];
+                for i in 0..(bit_len + 7) / 8 {
+                    addr[i as usize] = c.read_u8()?;
+                }
+                let nlri = Nlri::Ip(IpNet::new(addr, bit_len));
+
+                Ok(Attribute::MpUnreach {
+                    family: Family::new(afi, safi),
+                    nlri,
+                })
+            }
             _ => {
                 let mut buf: Vec<u8> = Vec::new();
                 for _ in 0..attr_len {
@@ -817,8 +890,10 @@ impl Attribute {
         let t = self.attr();
         let mut flag = Attribute::flag(t);
         match self {
-            Attribute::AsPath { .. } => flag |= Attribute::FLAG_EXTENDED,
-            Attribute::Community { .. } => flag |= Attribute::FLAG_EXTENDED,
+            Attribute::AsPath { .. }
+            | Attribute::Community { .. }
+            | Attribute::MpReach { .. }
+            | Attribute::MpUnreach { .. } => flag |= Attribute::FLAG_EXTENDED,
             Attribute::NotSupported { attr_flag, .. } => flag = *attr_flag,
             _ => {}
         }
@@ -899,8 +974,42 @@ impl Attribute {
                 }
             }
             Attribute::ClusterList { .. } => {}
-            // MpReach,
-            // MpUnreach,
+            Attribute::MpReach {
+                family,
+                nexthop,
+                nlri,
+            } => {
+                let mut l = match nexthop {
+                    IpAddr::V4(_) => 4,
+                    IpAddr::V6(_) => 16,
+                };
+                l += 2 + 1 + 1 + 1 + nlri.length();
+                c.write_u16::<NetworkEndian>(l as u16)?;
+                c.write_u16::<NetworkEndian>(family.afi())?;
+                c.write_u8(family.safi())?;
+                match nexthop {
+                    IpAddr::V4(addr) => {
+                        c.write_u8(4)?;
+                        c.write_u32::<NetworkEndian>(u32::from(*addr))?
+                    }
+                    IpAddr::V6(addr) => {
+                        c.write_u8(16)?;
+                        for i in &addr.octets() {
+                            c.write_u8(*i)?;
+                        }
+                    }
+                }
+                c.write_u8(0)?;
+                let Nlri::Ip(ip) = nlri;
+                ip.to_bytes(c)?;
+            }
+            Attribute::MpUnreach { family, nlri } => {
+                c.write_u16::<NetworkEndian>(3 + nlri.length() as u16)?;
+                c.write_u16::<NetworkEndian>(family.afi())?;
+                c.write_u8(family.safi())?;
+                let Nlri::Ip(ip) = nlri;
+                ip.to_bytes(c)?;
+            }
             // ExtendedCommunity,
             // As4Path,
             // As4Aggregator,
@@ -939,8 +1048,8 @@ impl Attribute {
             Attribute::COMMUNITY => Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
             Attribute::ORIGINATOR_ID => Attribute::FLAG_OPTIONAL,
             Attribute::CLUSTER_LIST => Attribute::FLAG_OPTIONAL,
-            // MpReach,
-            // MpUnreach,
+            Attribute::MP_REACH => Attribute::FLAG_OPTIONAL,
+            Attribute::MP_UNREACH => Attribute::FLAG_OPTIONAL,
             // ExtendedCommunity,
             // As4Path,
             // As4Aggregator,
@@ -964,6 +1073,8 @@ impl Attribute {
             Attribute::Community { .. } => Attribute::COMMUNITY,
             Attribute::OriginatorId { .. } => Attribute::ORIGINATOR_ID,
             Attribute::ClusterList { .. } => Attribute::CLUSTER_LIST,
+            Attribute::MpReach { .. } => Attribute::MP_REACH,
+            Attribute::MpUnreach { .. } => Attribute::MP_UNREACH,
             Attribute::NotSupported { attr_type, .. } => *attr_type,
         }
     }
@@ -1057,15 +1168,22 @@ pub struct UpdateMessage {
     pub routes: Vec<Nlri>,
     pub withdrawns: Vec<Nlri>,
     pub nexthop: IpAddr,
+    pub mp_routes: Vec<(Nlri, IpAddr)>,
     length: usize,
 }
 
 impl UpdateMessage {
     const INVALID_NEXTHOP: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
 
-    pub fn new(routes: Vec<Nlri>, withdrawns: Vec<Nlri>, attrs: Vec<Attribute>) -> UpdateMessage {
+    pub fn new(
+        routes: Vec<Nlri>,
+        mp_routes: Vec<(Nlri, IpAddr)>,
+        withdrawns: Vec<Nlri>,
+        attrs: Vec<Attribute>,
+    ) -> UpdateMessage {
         UpdateMessage {
             routes,
+            mp_routes,
             withdrawns,
             attrs,
             nexthop: UpdateMessage::INVALID_NEXTHOP,
@@ -1094,6 +1212,7 @@ impl UpdateMessage {
         let mut handle_as_withdrawns = false;
         let mut seen = HashSet::new();
         let attr_end = c.position() + attr_len as u64;
+        let mut mp_routes = Vec::new();
         while c.position() < attr_end {
             let attr = Attribute::from_bytes(c);
             match attr {
@@ -1114,6 +1233,16 @@ impl UpdateMessage {
                             }
                             attrs.push(a);
                         }
+                        Attribute::MpReach {
+                            family: _,
+                            nlri,
+                            nexthop,
+                        } => {
+                            mp_routes.push((*nlri, *nexthop));
+                        }
+                        Attribute::MpUnreach { family: _, nlri } => {
+                            withdrawns.push(*nlri);
+                        }
                         _ => attrs.push(a),
                     }
                 }
@@ -1126,8 +1255,6 @@ impl UpdateMessage {
                 }
             }
         }
-
-        let _nlri_len = c.get_ref().len() - c.position() as usize;
 
         let mut routes: Vec<Nlri> = Vec::new();
 
@@ -1144,7 +1271,7 @@ impl UpdateMessage {
             if handle_as_withdrawns
                 || !seen.contains(&Attribute::ORIGIN)
                 || !seen.contains(&Attribute::AS_PATH)
-                || !seen.contains(&Attribute::NEXTHOP)
+                || routes.len() > 0 && !seen.contains(&Attribute::NEXTHOP)
             {
                 withdrawns.append(&mut routes);
             }
@@ -1155,6 +1282,7 @@ impl UpdateMessage {
             routes,
             withdrawns,
             nexthop: ip_nexthop,
+            mp_routes,
             length: c.get_ref().len(),
         })
     }

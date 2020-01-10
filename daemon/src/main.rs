@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     net::{IpAddr, Ipv4Addr},
     pin::Pin,
@@ -74,7 +74,7 @@ impl ToApi<api::Family> for bgp::Family {
                 safi: api::family::Safi::Unicast as i32,
             },
             bgp::Family::Ipv6Uc => api::Family {
-                afi: api::family::Afi::Ip as i32,
+                afi: api::family::Afi::Ip6 as i32,
                 safi: api::family::Safi::Unicast as i32,
             },
             bgp::Family::Unknown(v) => api::Family {
@@ -553,7 +553,7 @@ pub struct Peer {
     pub counter_tx: MessageCounter,
     pub counter_rx: MessageCounter,
 
-    pub accepted: u64,
+    pub accepted: HashMap<bgp::Family, u64>,
 
     pub remote_cap: Vec<bgp::Capability>,
     pub local_cap: Vec<bgp::Capability>,
@@ -564,7 +564,7 @@ impl Peer {
         self.address.to_string()
     }
 
-    pub fn new(address: IpAddr) -> Peer {
+    pub fn new(as_number: u32, address: IpAddr) -> Peer {
         Peer {
             address: address,
             remote_as: 0,
@@ -576,17 +576,46 @@ impl Peer {
             downtime: SystemTime::UNIX_EPOCH,
             counter_tx: Default::default(),
             counter_rx: Default::default(),
-            accepted: 0,
+            accepted: HashMap::new(),
             remote_cap: Vec::new(),
-            local_cap: Vec::new(),
+            local_cap: vec![
+                bgp::Capability::RouteRefresh,
+                bgp::Capability::FourOctetAsNumber {
+                    as_number: as_number,
+                },
+                bgp::Capability::MultiProtocol {
+                    family: bgp::Family::Ipv4Uc,
+                },
+                bgp::Capability::MultiProtocol {
+                    family: bgp::Family::Ipv6Uc,
+                },
+            ],
         }
     }
 
     fn reset(&mut self) {
         self.state = bgp::State::Idle;
         self.downtime = SystemTime::now();
-        self.accepted = 0;
+        self.accepted = HashMap::new();
         self.remote_cap = Vec::new();
+    }
+
+    fn update_accepted(&mut self, family: bgp::Family, delta: i64) {
+        match self.accepted.get_mut(&family) {
+            Some(v) => {
+                if delta > 0 {
+                    *v += delta as u64;
+                } else {
+                    *v -= delta.abs() as u64;
+                }
+            }
+            None => {
+                // ignore bogus withdrawn
+                if delta > 0 {
+                    self.accepted.insert(family, delta as u64);
+                }
+            }
+        }
     }
 }
 
@@ -624,16 +653,20 @@ impl ToApi<api::Peer> for Peer {
             };
             tm.state = Some(ts);
         }
-        let afisafis = vec![api::AfiSafi {
-            state: Some(api::AfiSafiState {
-                family: Some(bgp::Family::Ipv4Uc {}.to_api()),
-                enabled: true,
-                received: self.accepted,
-                accepted: self.accepted,
+        let afisafis = self
+            .accepted
+            .iter()
+            .map(|x| api::AfiSafi {
+                state: Some(api::AfiSafiState {
+                    family: Some(x.0.to_api()),
+                    enabled: true,
+                    received: *x.1,
+                    accepted: *x.1,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        }];
+            })
+            .collect();
         api::Peer {
             state: Some(ps),
             conf: Some(Default::default()),
@@ -828,9 +861,10 @@ impl GobgpApi for Service {
         if let Some(peer) = request.into_inner().peer {
             if let Some(conf) = peer.conf {
                 if let Ok(addr) = IpAddr::from_str(&conf.neighbor_address) {
-                    let mut p = Peer::new(addr);
+                    let g = &mut self.global.lock().await;
+                    let mut p = Peer::new(g.as_number, addr);
                     p.remote_as = conf.peer_as;
-                    let peers = &mut self.global.lock().await.peers;
+                    let peers = &mut g.peers;
                     if peers.contains_key(&addr) {
                     } else {
                         peers.insert(addr, p);
@@ -1006,12 +1040,19 @@ impl GobgpApi for Service {
         tokio::spawn(async move {
             let mut v = Vec::new();
 
+            let request = request.into_inner();
+
             let prefixes: Vec<_> = request
-                .into_inner()
                 .prefixes
                 .iter()
                 .filter_map(|p| bgp::IpNet::from_str(&p.prefix).ok())
                 .collect();
+
+            let family = if let Some(family) = request.family {
+                bgp::Family::new(family.afi as u16, family.safi as u8)
+            } else {
+                bgp::Family::Ipv4Uc
+            };
 
             let prefix_filter = |ipnet: bgp::IpNet| -> bool {
                 if prefixes.len() == 0 {
@@ -1025,7 +1066,6 @@ impl GobgpApi for Service {
                 true
             };
             {
-                let family = bgp::Family::Ipv4Uc;
                 let table = table.lock().await;
                 let t = table.master.get(&family);
                 if !t.is_none() {
@@ -1375,7 +1415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 continue;
             }
-            let peer = Peer::new(addr);
+            let peer = Peer::new(g.as_number, addr);
             g.peers.insert(addr, peer);
         }
 
@@ -1433,25 +1473,48 @@ struct Session {
     lines: Framed<TcpStream, Bgp>,
     delay: Delay,
     rx: Rx,
-    families: Vec<bgp::Family>,
+    families: HashSet<bgp::Family>,
     local_as: u32,
     local_addr: IpAddr,
 }
 
 impl Session {
+    fn is_family_enabled(&self, is_mp: bool) -> bool {
+        if (is_mp && !self.families.contains(&bgp::Family::Ipv6Uc))
+            || !is_mp && !self.families.contains(&bgp::Family::Ipv4Uc)
+        {
+            return false;
+        }
+        true
+    }
+
     async fn send_update(&mut self, updates: Vec<TableUpdate>) -> Result<(), io::Error> {
         for update in updates {
             match update {
                 TableUpdate::NewBest(nlri, attrs) => {
                     let mut v = Vec::new();
                     let mut nexthop_idx = 0;
+                    let mut mp_idx = 0;
                     let mut segments = Vec::new();
+
+                    let bgp::Nlri::Ip(net) = nlri;
+                    let is_mp = match net.addr {
+                        IpAddr::V4(_) => false,
+                        _ => true,
+                    };
+
+                    if !Session::is_family_enabled(self, is_mp) {
+                        continue;
+                    }
 
                     for i in 0..attrs.entry.len() {
                         let a = &attrs.entry[i];
                         let t = a.attr();
                         if t < bgp::Attribute::NEXTHOP {
                             nexthop_idx += 1;
+                        }
+                        if t < bgp::Attribute::MP_REACH {
+                            mp_idx += 1;
                         }
                         if !a.is_transitive() {
                             continue;
@@ -1475,7 +1538,9 @@ impl Session {
                     let n = bgp::Attribute::Nexthop {
                         nexthop: self.local_addr,
                     };
-                    v.insert(nexthop_idx, &n);
+                    if !is_mp {
+                        v.insert(nexthop_idx, &n);
+                    }
 
                     let aspath_found = !(segments.len() == 0);
 
@@ -1506,14 +1571,47 @@ impl Session {
                     if aspath_found {
                         v.swap_remove(nexthop_idx - 1);
                     }
-
-                    let buf = bgp::UpdateMessage::to_bytes(vec![nlri], Vec::new(), v).unwrap();
+                    let mp_reach = bgp::Attribute::MpReach {
+                        family: bgp::Family::Ipv6Uc,
+                        nexthop: self.local_addr,
+                        nlri: nlri,
+                    };
+                    if is_mp {
+                        if !aspath_found {
+                            mp_idx += 1;
+                        }
+                        v.insert(mp_idx, &mp_reach);
+                    }
+                    let routes = if is_mp { Vec::new() } else { vec![nlri] };
+                    let buf = bgp::UpdateMessage::to_bytes(routes, Vec::new(), v).unwrap();
                     self.lines.get_mut().write_all(&buf).await?;
                 }
                 TableUpdate::Withdrawn(nlri) => {
-                    let buf =
-                        bgp::UpdateMessage::to_bytes(Vec::new(), vec![nlri], Vec::new()).unwrap();
-                    self.lines.get_mut().write_all(&buf).await?;
+                    let bgp::Nlri::Ip(net) = nlri;
+                    let is_mp = match net.addr {
+                        IpAddr::V4(_) => false,
+                        _ => true,
+                    };
+                    if !Session::is_family_enabled(self, is_mp) {
+                        continue;
+                    }
+
+                    if is_mp {
+                        let buf = bgp::UpdateMessage::to_bytes(
+                            Vec::new(),
+                            Vec::new(),
+                            vec![&bgp::Attribute::MpUnreach {
+                                family: bgp::Family::Ipv6Uc,
+                                nlri: nlri,
+                            }],
+                        )
+                        .unwrap();
+                        self.lines.get_mut().write_all(&buf).await?;
+                    } else {
+                        let buf = bgp::UpdateMessage::to_bytes(Vec::new(), vec![nlri], Vec::new())
+                            .unwrap();
+                        self.lines.get_mut().write_all(&buf).await?;
+                    }
                 }
             }
         }
@@ -1568,26 +1666,26 @@ async fn handle_session(
         ),
         delay: Handle::default().delay(Instant::now()),
         rx: rx,
-        families: vec![bgp::Family::Ipv4Uc],
+        families: HashSet::new(),
         local_addr: local_addr,
         local_as: as_number,
     };
 
-    let open = bgp::OpenMessage::new(as_number, router_id);
     {
         let peers = &mut global.lock().await.peers;
-        let mut peer = peers.get_mut(&addr).unwrap();
-        peer.local_cap = open
-            .get_parameters()
-            .into_iter()
-            .filter_map(|p| match p {
-                bgp::OpenParam::CapabilityParam(c) => Some(c),
-                _ => None,
-            })
-            .collect();
-    }
-    if session.lines.send(bgp::Message::Open(open)).await.is_err() {
-        // in this case, the bellow session.next() will fail.
+        let peer = peers.get_mut(&addr).unwrap();
+
+        if session
+            .lines
+            .send(bgp::Message::Open(bgp::OpenMessage::new(
+                router_id,
+                peer.local_cap.iter().cloned().collect(),
+            )))
+            .await
+            .is_err()
+        {
+            // in this case, the bellow session.next() will fail.
+        }
     }
     let mut state = bgp::State::OpenSent;
     set_state(&global, addr, state).await;
@@ -1610,20 +1708,11 @@ async fn handle_session(
                     }
                 }
             }
-            Ok(Event::Broadcast(msg)) => match msg {
-                TableUpdate::NewBest(_, _) => {
-                    if session.send_update(vec![msg]).await.is_err() {
-                        break;
-                    }
+            Ok(Event::Broadcast(msg)) => {
+                if session.send_update(vec![msg]).await.is_err() {
+                    break;
                 }
-                TableUpdate::Withdrawn(nlri) => {
-                    let buf =
-                        bgp::UpdateMessage::to_bytes(Vec::new(), vec![nlri], Vec::new()).unwrap();
-                    if session.lines.get_mut().write_all(&buf).await.is_err() {
-                        break;
-                    }
-                }
-            },
+            }
             Ok(Event::Message(msg)) => {
                 {
                     let peers = &mut global.lock().await.peers;
@@ -1647,6 +1736,29 @@ async fn handle_session(
                                 })
                                 .collect();
 
+                            let remote_families: HashSet<_> = peer
+                                .remote_cap
+                                .iter()
+                                .filter_map(|c| match c {
+                                    bgp::Capability::MultiProtocol { family } => Some(family),
+                                    _ => None,
+                                })
+                                .collect();
+                            session.families = peer
+                                .local_cap
+                                .iter()
+                                .filter_map(|c| match c {
+                                    bgp::Capability::MultiProtocol { family } => Some(family),
+                                    _ => None,
+                                })
+                                .filter_map(|f| {
+                                    if remote_families.contains(&f) {
+                                        Some(*f)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
                             let interval = open.holdtime / 3;
                             if interval < keepalive_interval {
                                 keepalive_interval = interval;
@@ -1670,7 +1782,8 @@ async fn handle_session(
                             .reset(Instant::now() + Duration::from_secs(keepalive_interval as u64));
                     }
                     bgp::Message::Update(mut update) => {
-                        let mut accept: i64 = 0;
+                        let mut accept_v4: i64 = 0;
+                        let mut accept_v6: i64 = 0;
                         if update.attrs.len() > 0 {
                             update.attrs.sort_by_key(|a| a.attr());
                             let pa = Arc::new(PathAttr {
@@ -1689,29 +1802,51 @@ async fn handle_session(
                                     t.broadcast(addr, &u).await;
                                 }
                                 if added {
-                                    accept += 1;
+                                    accept_v4 += 1;
+                                }
+                            }
+                            for r in update.mp_routes {
+                                let (u, added) =
+                                    t.insert(bgp::Family::Ipv6Uc, r.0, addr, r.1, pa.clone());
+                                if let Some(u) = u {
+                                    t.broadcast(addr, &u).await;
+                                }
+                                if added {
+                                    accept_v6 += 1;
                                 }
                             }
                         }
                         if update.withdrawns.len() > 0 {
                             let mut t = table.lock().await;
                             for r in update.withdrawns {
-                                let (u, deleted) = t.remove(bgp::Family::Ipv4Uc, r, addr);
+                                let bgp::Nlri::Ip(net) = r;
+                                let family = match net.addr {
+                                    IpAddr::V4(_) => bgp::Family::Ipv4Uc,
+                                    IpAddr::V6(_) => bgp::Family::Ipv6Uc,
+                                };
+                                let (u, deleted) = t.remove(family, r, addr);
                                 if let Some(u) = u {
                                     t.broadcast(addr, &u).await;
                                 }
                                 if deleted {
-                                    accept -= 1;
+                                    if family == bgp::Family::Ipv4Uc {
+                                        accept_v4 -= 1;
+                                    } else {
+                                        accept_v6 -= 1;
+                                    }
                                 }
                             }
                         }
                         {
                             let peers = &mut global.lock().await.peers;
-                            if accept > 0 {
-                                peers.get_mut(&addr).unwrap().accepted += accept as u64;
-                            } else {
-                                peers.get_mut(&addr).unwrap().accepted -= accept.abs() as u64;
-                            }
+                            peers
+                                .get_mut(&addr)
+                                .unwrap()
+                                .update_accepted(bgp::Family::Ipv4Uc, accept_v4);
+                            peers
+                                .get_mut(&addr)
+                                .unwrap()
+                                .update_accepted(bgp::Family::Ipv6Uc, accept_v6);
                         }
                     }
                     bgp::Message::Notification(_) => {
