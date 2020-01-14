@@ -7,17 +7,17 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tonic = "0.1.0-alpha.6"
-bytes = "0.4"
-prost = "0.5"
-prost-derive = "0.5"
-tokio = "=0.2.0-alpha.6"
-tokio-timer = "0.3.0-alpha.6"
+tonic = "=0.1.0"
+bytes = "0.5"
+prost = "0.6"
+prost-types = "0.6"
+prost-derive = "0.6"
+tokio = { version = "0.2", features = ["full"] }
+tokio-util = { version = "0.2" }
 clap = "2.33"
-prost-types = "0.5"
-futures = "0.3.0"
+futures = "0.3"
 
 proto = { path = "../proto" }
 
 [build-dependencies]
-tonic-build = "=0.1.0-alpha.6"
+tonic-build = "=0.1.0"

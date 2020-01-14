@@ -21,16 +21,19 @@ use std::{
     str::FromStr,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
+use futures::{FutureExt, SinkExt};
+
 use tokio::{
-    codec::{Decoder, Encoder, Framed},
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
-    prelude::*,
+    stream::{Stream, StreamExt},
     sync::{mpsc, Mutex},
+    time::{delay_for, Delay, Instant},
 };
-use tokio_timer::{timer::Handle, Delay};
+use tokio_util::codec::{Decoder, Encoder, Framed};
 
 use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
@@ -39,7 +42,7 @@ use prost;
 mod api {
     tonic::include_proto!("gobgpapi");
 }
-use api::server::{GobgpApi, GobgpApiServer};
+use api::gobgp_api_server::{GobgpApi, GobgpApiServer};
 
 use proto::bgp;
 
@@ -477,13 +480,10 @@ impl Table {
             if *peer.0 != source {
                 match msg {
                     TableUpdate::NewBest(nlri, attrs) => {
-                        peer.1
-                            .send(TableUpdate::NewBest(*nlri, attrs.clone()))
-                            .await
-                            .unwrap();
+                        let _ = peer.1.send(TableUpdate::NewBest(*nlri, attrs.clone()));
                     }
                     TableUpdate::Withdrawn(nlri) => {
-                        peer.1.send(TableUpdate::Withdrawn(*nlri)).await.unwrap();
+                        let _ = peer.1.send(TableUpdate::Withdrawn(*nlri));
                     }
                 }
             }
@@ -1485,10 +1485,10 @@ impl Encoder for Bgp {
     type Item = bgp::Message;
     type Error = io::Error;
 
-    fn encode(&mut self, item: bgp::Message, dst: &mut BytesMut) -> io::Result<()> {
+    fn encode(&mut self, item: bgp::Message, dst: &mut BytesMut) -> Result<(), io::Error> {
         let buf = item.to_bytes().unwrap();
         dst.reserve(buf.len());
-        dst.put(buf);
+        dst.put_slice(&buf);
         Ok(())
     }
 }
@@ -1500,7 +1500,7 @@ impl Decoder for Bgp {
     fn decode(&mut self, src: &mut BytesMut) -> io::Result<Option<bgp::Message>> {
         match bgp::Message::from_bytes(&self.param, src) {
             Ok(m) => {
-                src.split_to(m.length());
+                let _ = src.split_to(m.length());
                 Ok(Some(m))
             }
             Err(_) => Ok(None),
@@ -1676,7 +1676,7 @@ impl Stream for Session {
             return Poll::Ready(Some(Ok(Event::Broadcast(v))));
         }
 
-        let result: Option<_> = futures::ready!(self.lines.poll_next_unpin(cx));
+        let result: Option<_> = futures::ready!(Pin::new(&mut self.lines).poll_next(cx));
         Poll::Ready(match result {
             Some(Ok(message)) => Some(Ok(Event::Message(message))),
             Some(Err(e)) => Some(Err(e)),
@@ -1709,7 +1709,7 @@ async fn handle_session(
                 },
             },
         ),
-        delay: Handle::default().delay(Instant::now()),
+        delay: delay_for(Duration::from_secs(0)),
         rx: rx,
         families: HashSet::new(),
         local_addr: local_addr,
