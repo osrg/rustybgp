@@ -884,15 +884,24 @@ impl GobgpApi for Service {
     type ListPeerStream = mpsc::Receiver<Result<api::ListPeerResponse, tonic::Status>>;
     async fn list_peer(
         &self,
-        _request: tonic::Request<api::ListPeerRequest>,
+        request: tonic::Request<api::ListPeerRequest>,
     ) -> Result<tonic::Response<Self::ListPeerStream>, tonic::Status> {
+        let request = request.into_inner();
+        let addr = IpAddr::from_str(&request.address);
+
         let (mut tx, rx) = mpsc::channel(1024);
         let global = self.global.clone();
 
         tokio::spawn(async move {
             let global = global.lock().await;
 
-            for (_, p) in &global.peers {
+            for (a, p) in &global.peers {
+                if let Ok(addr) = addr {
+                    if &addr != a {
+                        continue;
+                    }
+                }
+
                 let rsp = api::ListPeerResponse {
                     peer: Some(p.to_api()),
                 };
@@ -1035,12 +1044,36 @@ impl GobgpApi for Service {
         &self,
         request: tonic::Request<api::ListPathRequest>,
     ) -> Result<tonic::Response<Self::ListPathStream>, tonic::Status> {
+        let request = request.into_inner();
+        let (table_type, source) = if let Some(t) = api::TableType::from_i32(request.table_type) {
+            let s = match t {
+                api::TableType::Global => None,
+                api::TableType::Local | api::TableType::AdjOut | api::TableType::Vrf => {
+                    return Err(tonic::Status::unimplemented("Not yet implemented"));
+                }
+                api::TableType::AdjIn => {
+                    if let Ok(addr) = IpAddr::from_str(&request.name) {
+                        Some(addr)
+                    } else {
+                        return Err(tonic::Status::new(
+                            tonic::Code::InvalidArgument,
+                            "invalid neighbor name",
+                        ));
+                    }
+                }
+            };
+            (t, s)
+        } else {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "invalid table type",
+            ));
+        };
+
         let (mut tx, rx) = mpsc::channel(1024);
         let table = self.table.clone();
         tokio::spawn(async move {
             let mut v = Vec::new();
-
-            let request = request.into_inner();
 
             let prefixes: Vec<_> = request
                 .prefixes
@@ -1065,6 +1098,17 @@ impl GobgpApi for Service {
                 }
                 true
             };
+
+            let source_filter = |src: IpAddr| -> bool {
+                if table_type != api::TableType::AdjIn {
+                    false
+                } else if source.unwrap() == src {
+                    false
+                } else {
+                    true
+                }
+            };
+
             {
                 let table = table.lock().await;
                 let t = table.master.get(&family);
@@ -1079,16 +1123,17 @@ impl GobgpApi for Service {
                         }
                         let mut r = Vec::new();
                         for p in &dst.entry {
+                            if source_filter(p.source) {
+                                continue;
+                            }
                             r.push(p.to_api(&dst.net));
                         }
-                        //let mut rsp = api::gobgp::ListPathResponse::new();
-                        // let mut r: Vec<api::Path> =
-                        //     dst.entry.iter().map(|p| p.to_api(&dst.net).await).collect();
-                        r[0].best = true;
-                        //rsp.set_destination(dst.to_api(r));
-                        v.push(api::ListPathResponse {
-                            destination: Some(dst.to_api(r)),
-                        });
+                        if r.len() > 0 {
+                            r[0].best = true;
+                            v.push(api::ListPathResponse {
+                                destination: Some(dst.to_api(r)),
+                            });
+                        }
                     }
                 }
             }
