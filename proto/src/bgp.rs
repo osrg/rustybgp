@@ -1,4 +1,4 @@
-// Copyright (C) 2019 The RustyBGP Authors.
+// Copyright (C) 2019-2020 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,6 +30,23 @@ pub struct IpNet {
 }
 
 impl IpNet {
+    pub fn from_bytes(c: &mut Cursor<&[u8]>, is_v6: bool) -> Result<IpNet, Error> {
+        let bit_len = c.read_u8()?;
+        if is_v6 {
+            let mut addr = [0 as u8; 16];
+            for i in 0..(bit_len + 7) / 8 {
+                addr[i as usize] = c.read_u8()?;
+            }
+            Ok(IpNet::new(addr, bit_len))
+        } else {
+            let mut addr = [0 as u8; 4];
+            for i in 0..(bit_len + 7) / 8 {
+                addr[i as usize] = c.read_u8()?;
+            }
+            Ok(IpNet::new(addr, bit_len))
+        }
+    }
+
     pub fn contains(&self, addr: IpAddr) -> bool {
         let f = |a: &Vec<u8>, b: &Vec<u8>, mask: u8| {
             let div = (mask >> 3) as usize;
@@ -840,16 +857,11 @@ impl Attribute {
                     _ => return Err(Attribute::length_error()),
                 };
                 c.read_u8()?;
-                let bit_len = c.read_u8()?;
-                let mut addr = [0 as u8; 16];
-                for i in 0..(bit_len + 7) / 8 {
-                    addr[i as usize] = c.read_u8()?;
-                }
-                let nlri = Nlri::Ip(IpNet::new(addr, bit_len));
 
+                let net = IpNet::from_bytes(c, true)?;
                 Ok(Attribute::MpReach {
                     family: Family::new(afi, safi),
-                    nlri,
+                    nlri: Nlri::Ip(net),
                     nexthop,
                 })
             }
@@ -857,16 +869,11 @@ impl Attribute {
                 let afi = c.read_u16::<NetworkEndian>()?;
                 let safi = c.read_u8()?;
 
-                let bit_len = c.read_u8()?;
-                let mut addr = [0 as u8; 16];
-                for i in 0..(bit_len + 7) / 8 {
-                    addr[i as usize] = c.read_u8()?;
-                }
-                let nlri = Nlri::Ip(IpNet::new(addr, bit_len));
+                let net = IpNet::from_bytes(c, true)?;
 
                 Ok(Attribute::MpUnreach {
                     family: Family::new(afi, safi),
-                    nlri,
+                    nlri: Nlri::Ip(net),
                 })
             }
             _ => {
@@ -1198,12 +1205,8 @@ impl UpdateMessage {
 
         let pos = c.position();
         while c.position() - pos < withdrawn_len as u64 {
-            let bit_len = c.read_u8()?;
-            let mut addr = [0 as u8; 4];
-            for i in 0..(bit_len + 7) / 8 {
-                addr[i as usize] = c.read_u8()?;
-            }
-            withdrawns.push(Nlri::Ip(IpNet::new(addr, bit_len)));
+            let net = IpNet::from_bytes(c, false)?;
+            withdrawns.push(Nlri::Ip(net));
         }
 
         let attr_len = c.read_u16::<NetworkEndian>()?;
@@ -1259,12 +1262,8 @@ impl UpdateMessage {
         let mut routes: Vec<Nlri> = Vec::new();
 
         while c.get_ref().len() > c.position() as usize {
-            let bit_len = c.read_u8()?;
-            let mut addr = [0 as u8; 4];
-            for i in 0..(bit_len + 7) / 8 {
-                addr[i as usize] = c.read_u8()?;
-            }
-            routes.push(Nlri::Ip(IpNet::new(addr, bit_len)));
+            let net = IpNet::from_bytes(c, false)?;
+            routes.push(Nlri::Ip(net));
         }
 
         if routes.len() > 0 {
