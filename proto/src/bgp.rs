@@ -1266,7 +1266,7 @@ impl UpdateMessage {
             routes.push(Nlri::Ip(net));
         }
 
-        if routes.len() > 0 {
+        if routes.len() > 0 || mp_routes.len() > 0 {
             if handle_as_withdrawns
                 || !seen.contains(&Attribute::ORIGIN)
                 || !seen.contains(&Attribute::AS_PATH)
