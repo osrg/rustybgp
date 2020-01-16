@@ -113,7 +113,7 @@ impl Path {
         }
     }
 
-    fn to_api(&self, net: &bgp::Nlri) -> api::Path {
+    fn to_api(&self, net: &bgp::Nlri, nexthop: IpAddr, pattrs: Vec<&bgp::Attribute>) -> api::Path {
         let mut path: api::Path = Default::default();
 
         match net {
@@ -136,13 +136,7 @@ impl Path {
         path.age = Some(self.timestamp.to_api());
 
         let mut attrs = Vec::new();
-        attrs.push(to_any(
-            api::NextHopAttribute {
-                next_hop: self.nexthop.to_string(),
-            },
-            "NextHopAttribute",
-        ));
-        for attr in &self.attrs.entry {
+        for attr in pattrs {
             match attr {
                 bgp::Attribute::Origin { origin } => {
                     let a = api::OriginAttribute {
@@ -163,12 +157,7 @@ impl Path {
                     };
                     attrs.push(to_any(a, "AsPathAttribute"));
                 }
-                bgp::Attribute::Nexthop { nexthop } => {
-                    let a = api::NextHopAttribute {
-                        next_hop: nexthop.to_string(),
-                    };
-                    attrs.push(to_any(a, "NextHopAttribute"));
-                }
+                bgp::Attribute::Nexthop { .. } => {}
                 bgp::Attribute::MultiExitDesc { descriptor } => {
                     let a = api::MultiExitDiscAttribute { med: *descriptor };
                     attrs.push(to_any(a, "MultiExitDiscAttribute"));
@@ -217,6 +206,13 @@ impl Path {
                 _ => {}
             }
         }
+        attrs.push(to_any(
+            api::NextHopAttribute {
+                next_hop: nexthop.to_string(),
+            },
+            "NextHopAttribute",
+        ));
+
         path.pattrs = attrs;
 
         path
@@ -305,7 +301,7 @@ pub struct Table {
     pub disable_best_path_selection: bool,
     pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
 
-    pub active_peers: HashMap<IpAddr, Tx>,
+    pub active_peers: HashMap<IpAddr, (Tx, Arc<Source>)>,
 }
 
 impl Table {
@@ -489,12 +485,12 @@ impl Table {
         update
     }
 
-    pub async fn broadcast(&mut self, source: Arc<Source>, msg: &TableUpdate) {
-        for peer in self.active_peers.iter_mut() {
-            if *peer.0 != source.address {
+    pub async fn broadcast(&mut self, from: Arc<Source>, msg: &TableUpdate) {
+        for (addr, (tx, target)) in self.active_peers.iter_mut() {
+            if *addr != from.address && !(from.ibgp && target.ibgp) {
                 match msg {
                     TableUpdate::NewBest(nlri, nexthop, attrs, source) => {
-                        let _ = peer.1.send(TableUpdate::NewBest(
+                        let _ = tx.send(TableUpdate::NewBest(
                             *nlri,
                             *nexthop,
                             attrs.clone(),
@@ -502,7 +498,7 @@ impl Table {
                         ));
                     }
                     TableUpdate::Withdrawn(nlri, source) => {
-                        let _ = peer.1.send(TableUpdate::Withdrawn(*nlri, source.clone()));
+                        let _ = tx.send(TableUpdate::Withdrawn(*nlri, source.clone()));
                     }
                 }
             }
@@ -1064,30 +1060,31 @@ impl GobgpApi for Service {
         request: tonic::Request<api::ListPathRequest>,
     ) -> Result<tonic::Response<Self::ListPathStream>, tonic::Status> {
         let request = request.into_inner();
-        let (table_type, source) = if let Some(t) = api::TableType::from_i32(request.table_type) {
-            let s = match t {
-                api::TableType::Global => None,
-                api::TableType::Local | api::TableType::AdjOut | api::TableType::Vrf => {
-                    return Err(tonic::Status::unimplemented("Not yet implemented"));
-                }
-                api::TableType::AdjIn => {
-                    if let Ok(addr) = IpAddr::from_str(&request.name) {
-                        Some(addr)
-                    } else {
-                        return Err(tonic::Status::new(
-                            tonic::Code::InvalidArgument,
-                            "invalid neighbor name",
-                        ));
+        let (table_type, source_addr) =
+            if let Some(t) = api::TableType::from_i32(request.table_type) {
+                let s = match t {
+                    api::TableType::Global => None,
+                    api::TableType::Local | api::TableType::Vrf => {
+                        return Err(tonic::Status::unimplemented("Not yet implemented"));
                     }
-                }
+                    api::TableType::AdjIn | api::TableType::AdjOut => {
+                        if let Ok(addr) = IpAddr::from_str(&request.name) {
+                            Some(addr)
+                        } else {
+                            return Err(tonic::Status::new(
+                                tonic::Code::InvalidArgument,
+                                "invalid neighbor name",
+                            ));
+                        }
+                    }
+                };
+                (t, s)
+            } else {
+                return Err(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "invalid table type",
+                ));
             };
-            (t, s)
-        } else {
-            return Err(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "invalid table type",
-            ));
-        };
 
         let (mut tx, rx) = mpsc::channel(1024);
         let table = self.table.clone();
@@ -1118,18 +1115,42 @@ impl GobgpApi for Service {
                 true
             };
 
-            let source_filter = |src: IpAddr| -> bool {
+            let adjin_filter = |src: IpAddr| -> bool {
                 if table_type != api::TableType::AdjIn {
                     false
-                } else if source.unwrap() == src {
+                } else if source_addr.unwrap() == src {
                     false
                 } else {
                     true
                 }
             };
 
+            let table = table.lock().await;
+            let source = if table_type == api::TableType::AdjOut {
+                table.active_peers.get(&source_addr.unwrap())
+            } else {
+                None
+            };
+
+            let adjout_filter = |from: Arc<Source>| -> bool {
+                if table_type != api::TableType::AdjOut {
+                    return false;
+                }
+
+                match source {
+                    Some(s) => {
+                        let (_, source) = s;
+                        if (source.ibgp && from.ibgp) || (source_addr.unwrap() == from.address) {
+                            return true;
+                        }
+
+                        false
+                    }
+                    None => true,
+                }
+            };
+
             {
-                let table = table.lock().await;
                 let t = table.master.get(&family);
                 if !t.is_none() {
                     for (_, dst) in t.unwrap() {
@@ -1141,11 +1162,40 @@ impl GobgpApi for Service {
                             }
                         }
                         let mut r = Vec::new();
+                        let bgp::Nlri::Ip(net) = dst.net;
+                        let is_mp = match net.addr {
+                            IpAddr::V4(_) => false,
+                            _ => true,
+                        };
                         for p in &dst.entry {
-                            if source_filter(p.source.address) {
+                            if adjin_filter(p.source.address) {
                                 continue;
                             }
-                            r.push(p.to_api(&dst.net));
+                            if adjout_filter(p.source.clone()) {
+                                continue;
+                            }
+                            if table_type == api::TableType::AdjOut {
+                                let (_, my) = source.unwrap();
+                                let nexthop = if my.ibgp { p.nexthop } else { my.local_addr };
+                                let (mut v, n) = update_attrs(
+                                    my.ibgp,
+                                    is_mp,
+                                    my.local_as,
+                                    dst.net,
+                                    p.nexthop,
+                                    my.local_addr,
+                                    p.attrs.entry.iter().collect(),
+                                );
+                                v.append(&mut n.iter().collect());
+                                v.sort_by_key(|a| a.attr());
+                                r.push(p.to_api(&dst.net, nexthop, v));
+                            } else {
+                                r.push(p.to_api(
+                                    &dst.net,
+                                    p.nexthop,
+                                    p.attrs.entry.iter().collect(),
+                                ));
+                            }
                         }
                         if r.len() > 0 {
                             r[0].best = true;
@@ -1533,9 +1583,101 @@ enum Event {
     Broadcast(TableUpdate),
 }
 
+fn update_attrs(
+    is_ibgp: bool,
+    is_mp: bool,
+    local_as: u32,
+    nlri: bgp::Nlri,
+    original_nexthop: IpAddr,
+    local_addr: IpAddr,
+    attrs: Vec<&bgp::Attribute>,
+) -> (Vec<&bgp::Attribute>, Vec<bgp::Attribute>) {
+    let mut seen = HashSet::new();
+    let mut v = Vec::new();
+    let mut n = Vec::new();
+
+    for attr in attrs {
+        seen.insert(attr.attr());
+        if !attr.is_transitive() {
+            continue;
+        }
+        if !is_ibgp {
+            match attr {
+                bgp::Attribute::AsPath { segments: segs } => {
+                    let mut segments = Vec::new();
+
+                    for s in segs {
+                        segments.insert(0, bgp::Segment::new(s.segment_type, &s.number));
+                    }
+
+                    let aspath = if segments.len() == 0 {
+                        bgp::Attribute::AsPath {
+                            segments: vec![bgp::Segment {
+                                segment_type: bgp::Segment::TYPE_SEQ,
+                                number: vec![local_as],
+                            }],
+                        }
+                    } else {
+                        if segments[0].segment_type != bgp::Segment::TYPE_SEQ
+                            || segments[0].number.len() == 255
+                        {
+                            segments.insert(
+                                0,
+                                bgp::Segment {
+                                    segment_type: bgp::Segment::TYPE_SEQ,
+                                    number: vec![local_as],
+                                },
+                            );
+                        } else {
+                            segments[0].number.insert(0, local_as);
+                        }
+                        bgp::Attribute::AsPath { segments }
+                    };
+
+                    n.push(aspath);
+                    continue;
+                }
+                bgp::Attribute::MultiExitDesc { .. } => {
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        v.push(attr);
+    }
+
+    let nexthop = if is_ibgp {
+        original_nexthop
+    } else {
+        local_addr
+    };
+    if is_mp {
+        n.push(bgp::Attribute::MpReach {
+            family: bgp::Family::Ipv6Uc,
+            nexthop,
+            nlri: nlri,
+        })
+    } else {
+        n.push(bgp::Attribute::Nexthop { nexthop });
+    }
+
+    if is_ibgp {
+        if !seen.contains(&bgp::Attribute::LOCAL_PREF) {
+            n.push(bgp::Attribute::LocalPref {
+                preference: bgp::Attribute::DEFAULT_LOCAL_PREF,
+            });
+        }
+    }
+
+    return (v, n);
+}
+
 pub struct Source {
     address: IpAddr,
     ibgp: bool,
+    local_as: u32,
+    local_addr: IpAddr,
 }
 
 struct Session {
@@ -1543,13 +1685,10 @@ struct Session {
     delay: Delay,
     rx: Rx,
     families: HashSet<bgp::Family>,
-    local_as: u32,
-    local_addr: IpAddr,
-    source: Arc<Source>,
 }
 
 impl Session {
-    fn new(stream: TcpStream, as_number: u32, local_addr: IpAddr, remote_addr: IpAddr) -> Session {
+    fn new(stream: TcpStream, as_number: u32) -> Session {
         let (_, rx) = mpsc::unbounded_channel();
         Session {
             lines: Framed::new(
@@ -1563,12 +1702,6 @@ impl Session {
             delay: delay_for(Duration::from_secs(0)),
             rx: rx,
             families: HashSet::new(),
-            local_addr: local_addr,
-            local_as: as_number,
-            source: Arc::new(Source {
-                address: remote_addr,
-                ibgp: false,
-            }),
         }
     }
 
@@ -1581,13 +1714,14 @@ impl Session {
         true
     }
 
-    async fn send_update(&mut self, updates: Vec<TableUpdate>) -> Result<(), io::Error> {
+    async fn send_update(
+        &mut self,
+        my: Arc<Source>,
+        updates: Vec<TableUpdate>,
+    ) -> Result<(), io::Error> {
         for update in updates {
             match update {
-                TableUpdate::NewBest(nlri, nexthop, attrs, source) => {
-                    if source.ibgp == true && self.source.ibgp == true {
-                        continue;
-                    }
+                TableUpdate::NewBest(nlri, nexthop, attrs, _source) => {
                     let bgp::Nlri::Ip(net) = nlri;
                     let is_mp = match net.addr {
                         IpAddr::V4(_) => false,
@@ -1598,91 +1732,16 @@ impl Session {
                         continue;
                     }
 
-                    let mut v = Vec::new();
-                    let mut segments = Vec::new();
-                    let mut local_pref = false;
-
-                    for i in 0..attrs.entry.len() {
-                        let a = &attrs.entry[i];
-                        if !a.is_transitive() {
-                            continue;
-                        }
-
-                        let t = a.attr();
-                        match t {
-                            bgp::Attribute::CLUSTER_LIST => continue,
-                            bgp::Attribute::ORIGINATOR_ID => continue,
-                            bgp::Attribute::MULTI_EXIT_DESC => {
-                                if self.source.ibgp == false {
-                                    continue;
-                                }
-                            }
-                            bgp::Attribute::LOCAL_PREF => local_pref = true,
-                            _ => {}
-                        }
-                        match a {
-                            bgp::Attribute::AsPath { segments: segs } => {
-                                for s in segs {
-                                    segments
-                                        .insert(0, bgp::Segment::new(s.segment_type, &s.number));
-                                }
-                            }
-                            _ => {}
-                        }
-                        v.push(a);
-                    }
-                    let aspath = if segments.len() == 0 {
-                        bgp::Attribute::AsPath {
-                            segments: vec![bgp::Segment {
-                                segment_type: bgp::Segment::TYPE_SEQ,
-                                number: vec![self.local_as],
-                            }],
-                        }
-                    } else {
-                        if segments[0].segment_type != bgp::Segment::TYPE_SEQ
-                            || segments[0].number.len() == 255
-                        {
-                            segments.insert(
-                                0,
-                                bgp::Segment {
-                                    segment_type: bgp::Segment::TYPE_SEQ,
-                                    number: vec![self.local_as],
-                                },
-                            );
-                        } else {
-                            segments[0].number.insert(0, self.local_as);
-                        }
-                        bgp::Attribute::AsPath { segments }
-                    };
-                    if self.source.ibgp == false {
-                        v.remove(1);
-                        v.push(&aspath);
-                    }
-
-                    let n = if self.source.ibgp {
-                        bgp::Attribute::Nexthop { nexthop: nexthop }
-                    } else {
-                        bgp::Attribute::Nexthop {
-                            nexthop: self.local_addr,
-                        }
-                    };
-                    if !is_mp {
-                        v.push(&n);
-                    }
-
-                    let lp = bgp::Attribute::LocalPref { preference: 0 };
-                    if local_pref == false && self.source.ibgp {
-                        v.push(&lp);
-                    }
-
-                    let mp_reach = bgp::Attribute::MpReach {
-                        family: bgp::Family::Ipv6Uc,
-                        nexthop: self.local_addr,
-                        nlri: nlri,
-                    };
-                    if is_mp {
-                        v.push(&mp_reach);
-                    }
+                    let (mut v, n) = update_attrs(
+                        my.ibgp,
+                        is_mp,
+                        my.local_as,
+                        nlri,
+                        nexthop,
+                        my.local_addr,
+                        attrs.entry.iter().collect(),
+                    );
+                    v.append(&mut n.iter().collect());
 
                     v.sort_by_key(|a| a.attr());
 
@@ -1690,10 +1749,7 @@ impl Session {
                     let buf = bgp::UpdateMessage::to_bytes(routes, Vec::new(), v).unwrap();
                     self.lines.get_mut().write_all(&buf).await?;
                 }
-                TableUpdate::Withdrawn(nlri, source) => {
-                    if source.ibgp == true && self.source.ibgp == true {
-                        continue;
-                    }
+                TableUpdate::Withdrawn(nlri, _source) => {
                     let bgp::Nlri::Ip(net) = nlri;
                     let is_mp = match net.addr {
                         IpAddr::V4(_) => false,
@@ -1761,7 +1817,13 @@ async fn handle_session(
     };
 
     let mut keepalive_interval = bgp::OpenMessage::HOLDTIME / 3;
-    let mut session = Session::new(stream, as_number, local_addr, addr);
+    let mut session = Session::new(stream, as_number);
+    let mut source = Arc::new(Source {
+        local_addr: local_addr,
+        local_as: as_number,
+        address: addr,
+        ibgp: false,
+    });
 
     {
         let peers = &mut global.lock().await.peers;
@@ -1801,7 +1863,11 @@ async fn handle_session(
                 }
             }
             Ok(Event::Broadcast(msg)) => {
-                if session.send_update(vec![msg]).await.is_err() {
+                if session
+                    .send_update(source.clone(), vec![msg])
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1886,12 +1952,12 @@ async fn handle_session(
                                 let (u, added) = t.insert(
                                     bgp::Family::Ipv4Uc,
                                     r,
-                                    session.source.clone(),
+                                    source.clone(),
                                     update.nexthop,
                                     pa.clone(),
                                 );
                                 if let Some(u) = u {
-                                    t.broadcast(session.source.clone(), &u).await;
+                                    t.broadcast(source.clone(), &u).await;
                                 }
                                 if added {
                                     accept_v4 += 1;
@@ -1901,12 +1967,12 @@ async fn handle_session(
                                 let (u, added) = t.insert(
                                     bgp::Family::Ipv6Uc,
                                     r.0,
-                                    session.source.clone(),
+                                    source.clone(),
                                     r.1,
                                     pa.clone(),
                                 );
                                 if let Some(u) = u {
-                                    t.broadcast(session.source.clone(), &u).await;
+                                    t.broadcast(source.clone(), &u).await;
                                 }
                                 if added {
                                     accept_v6 += 1;
@@ -1921,9 +1987,9 @@ async fn handle_session(
                                     IpAddr::V4(_) => bgp::Family::Ipv4Uc,
                                     IpAddr::V6(_) => bgp::Family::Ipv6Uc,
                                 };
-                                let (u, deleted) = t.remove(family, r, session.source.clone());
+                                let (u, deleted) = t.remove(family, r, source.clone());
                                 if let Some(u) = u {
-                                    t.broadcast(session.source.clone(), &u).await;
+                                    t.broadcast(source.clone(), &u).await;
                                 }
                                 if deleted {
                                     if family == bgp::Family::Ipv4Uc {
@@ -1958,7 +2024,9 @@ async fn handle_session(
                                 let peer = peers.get_mut(&addr).unwrap();
                                 peer.uptime = SystemTime::now();
 
-                                session.source = Arc::new(Source {
+                                source = Arc::new(Source {
+                                    local_addr: local_addr,
+                                    local_as: as_number,
                                     address: addr,
                                     ibgp: peer.local_as == peer.remote_as,
                                 });
@@ -1971,7 +2039,7 @@ async fn handle_session(
                             {
                                 let (tx, rx) = mpsc::unbounded_channel();
                                 let mut t = table.lock().await;
-                                t.active_peers.insert(addr, tx);
+                                t.active_peers.insert(addr, (tx, source.clone()));
                                 session.rx = rx;
 
                                 if t.disable_best_path_selection == false {
@@ -1982,7 +2050,7 @@ async fn handle_session(
                                                     *route.0,
                                                     route.1.entry[0].nexthop,
                                                     route.1.entry[0].attrs.clone(),
-                                                    session.source.clone(),
+                                                    source.clone(),
                                                 );
                                                 v.push(u);
                                             }
@@ -1990,7 +2058,7 @@ async fn handle_session(
                                     }
                                 }
                             }
-                            if session.send_update(v).await.is_err() {
+                            if session.send_update(source.clone(), v).await.is_err() {
                                 break;
                             }
                         }
@@ -2020,8 +2088,8 @@ async fn handle_session(
     {
         let mut t = table.lock().await;
         t.active_peers.remove(&addr);
-        for u in t.clear(session.source.clone()) {
-            t.broadcast(session.source.clone(), &u).await;
+        for u in t.clear(source.clone()) {
+            t.broadcast(source.clone(), &u).await;
         }
     }
 }

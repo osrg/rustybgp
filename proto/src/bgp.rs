@@ -705,6 +705,8 @@ impl Attribute {
     pub const MP_REACH: u8 = 14;
     pub const MP_UNREACH: u8 = 15;
 
+    pub const DEFAULT_LOCAL_PREF: u32 = 100;
+
     fn length_error() -> Error {
         Error::from(std::io::Error::new(
             std::io::ErrorKind::Other,
