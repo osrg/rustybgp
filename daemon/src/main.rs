@@ -16,7 +16,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     str::FromStr,
     sync::Arc,
@@ -31,12 +31,13 @@ use tokio::{
     net::{TcpListener, TcpStream},
     stream::{Stream, StreamExt},
     sync::{mpsc, Mutex},
-    time::{delay_for, Delay, Instant},
+    time::{delay_for, Delay, DelayQueue, Instant},
 };
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
+
 use prost;
 
 mod api {
@@ -555,12 +556,85 @@ impl MessageCounter {
     }
 }
 
+impl api::Peer {
+    pub fn get_passive_mode(&self) -> bool {
+        if let Some(transport) = &self.transport {
+            return transport.passive_mode;
+        }
+        false
+    }
+
+    pub fn get_local_as(&self) -> u32 {
+        if let Some(conf) = &self.conf {
+            return conf.local_as;
+        }
+        0
+    }
+
+    pub fn get_remote_as(&self) -> u32 {
+        if let Some(conf) = &self.conf {
+            return conf.peer_as;
+        }
+        0
+    }
+
+    pub fn get_connect_retry_time(&self) -> u64 {
+        if let Some(timers) = &self.timers {
+            if let Some(conf) = &timers.config {
+                return conf.connect_retry;
+            }
+        }
+        0
+    }
+
+    pub fn get_hold_time(&self) -> u64 {
+        if let Some(timers) = &self.timers {
+            if let Some(conf) = &timers.config {
+                return conf.hold_time;
+            }
+        }
+        0
+    }
+
+    pub fn get_families(&self) -> Vec<bgp::Family> {
+        let mut v = Vec::new();
+        for afisafi in &self.afi_safis {
+            if let Some(conf) = &afisafi.config {
+                if let Some(family) = &conf.family {
+                    let f =
+                        bgp::Family::from((family.afi as u32) << 16 | (family.safi as u32 & 0xff));
+                    match f {
+                        bgp::Family::Ipv4Uc | bgp::Family::Ipv6Uc => v.push(f),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if v.len() == 0 {
+            if let Some(conf) = &self.conf {
+                if let Ok(addr) = IpAddr::from_str(&conf.neighbor_address) {
+                    match addr {
+                        IpAddr::V4(_) => return vec![bgp::Family::Ipv4Uc],
+                        IpAddr::V6(_) => return vec![bgp::Family::Ipv6Uc],
+                    }
+                }
+            }
+        }
+        v
+    }
+}
+
 pub struct Peer {
     pub address: IpAddr,
     pub remote_as: u32,
     pub router_id: Ipv4Addr,
     pub local_as: u32,
     pub peer_type: u8,
+    pub passive: bool,
+
+    pub hold_time: u64,
+    pub connect_retry_time: u64,
+
     pub state: bgp::State,
     pub uptime: SystemTime,
     pub downtime: SystemTime,
@@ -575,17 +649,23 @@ pub struct Peer {
 }
 
 impl Peer {
+    const DEFAULT_HOLD_TIME: u64 = 180;
+    const DEFAULT_CONNECT_RETRY_TIME: u64 = 3;
+
     fn addr(&self) -> String {
         self.address.to_string()
     }
 
-    pub fn new(as_number: u32, address: IpAddr) -> Peer {
+    pub fn new(address: IpAddr, as_number: u32) -> Peer {
         Peer {
             address: address,
             remote_as: 0,
             router_id: Ipv4Addr::new(0, 0, 0, 0),
             local_as: 0,
             peer_type: 0,
+            passive: false,
+            hold_time: Self::DEFAULT_HOLD_TIME,
+            connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
             state: bgp::State::Idle,
             uptime: SystemTime::UNIX_EPOCH,
             downtime: SystemTime::UNIX_EPOCH,
@@ -598,14 +678,41 @@ impl Peer {
                 bgp::Capability::FourOctetAsNumber {
                     as_number: as_number,
                 },
-                bgp::Capability::MultiProtocol {
-                    family: bgp::Family::Ipv4Uc,
-                },
-                bgp::Capability::MultiProtocol {
-                    family: bgp::Family::Ipv6Uc,
-                },
             ],
         }
+    }
+
+    pub fn families(mut self, families: Vec<bgp::Family>) -> Self {
+        let mut v: Vec<bgp::Capability> = families
+            .iter()
+            .map(|family| bgp::Capability::MultiProtocol { family: *family })
+            .collect();
+        self.local_cap.append(&mut v);
+        self
+    }
+
+    pub fn remote_as(mut self, remote_as: u32) -> Self {
+        self.remote_as = remote_as;
+        self
+    }
+
+    pub fn passive(mut self, passive: bool) -> Self {
+        self.passive = passive;
+        self
+    }
+
+    pub fn hold_time(mut self, t: u64) -> Self {
+        if t != 0 {
+            self.hold_time = t;
+        }
+        self
+    }
+
+    pub fn connect_retry_time(mut self, t: u64) -> Self {
+        if t != 0 {
+            self.connect_retry_time = t;
+        }
+        self
     }
 
     fn reset(&mut self) {
@@ -811,6 +918,8 @@ pub struct Global {
 
     pub peers: HashMap<IpAddr, Peer>,
     pub peer_group: HashMap<String, PeerGroup>,
+
+    pub active_tx: mpsc::UnboundedSender<IpAddr>,
 }
 
 impl ToApi<api::Global> for Global {
@@ -832,12 +941,13 @@ impl ToApi<api::Global> for Global {
 }
 
 impl Global {
-    pub fn new(asn: u32, id: Ipv4Addr) -> Global {
+    pub fn new(asn: u32, id: Ipv4Addr, active_tx: mpsc::UnboundedSender<IpAddr>) -> Global {
         Global {
             as_number: asn,
             id: id,
             peers: HashMap::new(),
             peer_group: HashMap::new(),
+            active_tx: active_tx,
         }
     }
 }
@@ -874,17 +984,40 @@ impl GobgpApi for Service {
         request: tonic::Request<api::AddPeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         if let Some(peer) = request.into_inner().peer {
-            if let Some(conf) = peer.conf {
+            if let Some(conf) = &peer.conf {
                 if let Ok(addr) = IpAddr::from_str(&conf.neighbor_address) {
+                    let as_number = {
+                        let local = peer.get_local_as();
+                        if local == 0 {
+                            self.global.lock().await.as_number
+                        } else {
+                            local
+                        }
+                    };
+
                     let g = &mut self.global.lock().await;
-                    let mut p = Peer::new(g.as_number, addr);
-                    p.remote_as = conf.peer_as;
-                    let peers = &mut g.peers;
-                    if peers.contains_key(&addr) {
+                    if g.peers.contains_key(&addr) {
+                        return Err(tonic::Status::new(
+                            tonic::Code::AlreadyExists,
+                            "peer address already exists",
+                        ));
                     } else {
-                        peers.insert(addr, p);
+                        let passive = peer.get_passive_mode();
+                        g.peers.insert(
+                            addr,
+                            Peer::new(addr, as_number)
+                                .remote_as(peer.get_remote_as())
+                                .families(peer.get_families())
+                                .passive(passive)
+                                .hold_time(peer.get_hold_time())
+                                .connect_retry_time(peer.get_connect_retry_time()),
+                        );
+
+                        if !passive {
+                            let _ = g.active_tx.send(addr);
+                        }
+                        return Ok(tonic::Response::new(()));
                     }
-                    return Ok(tonic::Response::new(()));
                 }
             }
         }
@@ -1415,6 +1548,40 @@ impl GobgpApi for Service {
     }
 }
 
+enum GlobalEvent {
+    Passive((TcpStream, SocketAddr)),
+    Active(SocketAddr),
+}
+
+struct Streamer {
+    listener: TcpListener,
+    rx: mpsc::UnboundedReceiver<IpAddr>,
+    expirations: DelayQueue<SocketAddr>,
+}
+
+impl Stream for Streamer {
+    type Item = Result<GlobalEvent, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Poll::Ready(Some(v)) = Pin::new(&mut self.rx).poll_next(cx) {
+            let sock = std::net::SocketAddr::new(v, 179);
+            self.expirations.insert(sock, Duration::from_secs(5));
+        }
+
+        if let Poll::Ready(Some(Ok(v))) = Pin::new(&mut self.expirations).poll_expired(cx) {
+            return Poll::Ready(Some(Ok(GlobalEvent::Active(v.into_inner()))));
+        }
+
+        match Pin::new(&mut self.listener).poll_accept(cx) {
+            Poll::Ready(Ok((socket, addr))) => {
+                Poll::Ready(Some(Ok(GlobalEvent::Passive((socket, addr)))))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, RustyBGP!");
@@ -1449,7 +1616,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let asn = args.value_of("asn").unwrap().parse()?;
     let router_id = Ipv4Addr::from_str(args.value_of("id").unwrap())?;
 
-    let global = Arc::new(Mutex::new(Global::new(asn, router_id)));
+    let (active_tx, active_rx) = mpsc::unbounded_channel::<IpAddr>();
+
+    let global = Arc::new(Mutex::new(Global::new(asn, router_id, active_tx)));
     if args.is_present("any") {
         let mut global = global.lock().await;
         global.peer_group.insert(
@@ -1484,7 +1653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let addr = "[::]:179".to_string();
-    let mut listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&addr).await?;
 
     let f = |sock: std::net::SocketAddr| -> IpAddr {
         let mut addr = sock.ip();
@@ -1495,9 +1664,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         addr
     };
+    let mut streamer = Streamer {
+        listener: listener,
+        rx: active_rx,
+        expirations: DelayQueue::new(),
+    };
 
     loop {
-        let (stream, sock) = listener.accept().await?;
+        let (stream, sock) = match streamer.next().await {
+            Some(r) => match r {
+                Ok(GlobalEvent::Passive((stream, sock))) => (stream, sock),
+                Ok(GlobalEvent::Active(sock)) => {
+                    let t = table.lock().await;
+                    if t.active_peers.contains_key(&sock.ip()) {
+                        // already connected
+                        continue;
+                    }
+                    println!("try connect to {}", sock);
+                    match TcpStream::connect(sock).await {
+                        Ok(stream) => (stream, sock),
+                        Err(_) => {
+                            streamer.expirations.insert(sock, Duration::from_secs(15));
+                            continue;
+                        }
+                    }
+                }
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+
         let addr = f(sock);
         println!("got new connection {:?}", addr);
         let local_addr = {
@@ -1529,7 +1725,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 continue;
             }
-            let peer = Peer::new(g.as_number, addr);
+
+            let families = match addr {
+                IpAddr::V4(_) => vec![bgp::Family::Ipv4Uc],
+                IpAddr::V6(_) => vec![bgp::Family::Ipv6Uc],
+            };
+            let peer = Peer::new(addr, g.as_number).families(families);
             g.peers.insert(addr, peer);
         }
 
@@ -2078,18 +2279,23 @@ async fn handle_session(
 
     println!("disconnected {}", addr);
     {
-        let peers = &mut global.lock().await.peers;
-        if is_dynamic {
-            peers.remove(&addr);
-        } else {
-            peers.get_mut(&addr).unwrap().reset();
-        }
-    }
-    {
         let mut t = table.lock().await;
         t.active_peers.remove(&addr);
         for u in t.clear(source.clone()) {
             t.broadcast(source.clone(), &u).await;
+        }
+    }
+
+    {
+        let g = &mut global.lock().await;
+        if is_dynamic {
+            g.peers.remove(&addr);
+        } else {
+            let peer = g.peers.get_mut(&addr).unwrap();
+            peer.reset();
+            if !peer.passive {
+                let _ = g.active_tx.send(addr);
+            }
         }
     }
 }
