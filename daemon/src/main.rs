@@ -30,7 +30,7 @@ use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     stream::{Stream, StreamExt},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Barrier, Mutex},
     time::{delay_for, Delay, DelayQueue, Instant},
 };
 use tokio_util::codec::{Decoder, Encoder, Framed};
@@ -955,15 +955,52 @@ impl Global {
 pub struct Service {
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
+    init_tx: Arc<Barrier>,
 }
 
 #[tonic::async_trait]
 impl GobgpApi for Service {
     async fn start_bgp(
         &self,
-        _request: tonic::Request<api::StartBgpRequest>,
+        request: tonic::Request<api::StartBgpRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        match request.into_inner().global {
+            Some(global) => {
+                let g = &mut self.global.lock().await;
+                if g.as_number != 0 {
+                    return Err(tonic::Status::new(
+                        tonic::Code::InvalidArgument,
+                        "already started",
+                    ));
+                }
+                if global.r#as == 0 {
+                    return Err(tonic::Status::new(
+                        tonic::Code::InvalidArgument,
+                        "invalid as number",
+                    ));
+                }
+                match Ipv4Addr::from_str(&global.router_id) {
+                    Ok(addr) => {
+                        g.as_number = global.r#as;
+                        g.id = addr;
+                        self.init_tx.wait().await;
+                    }
+                    Err(_) => {
+                        return Err(tonic::Status::new(
+                            tonic::Code::InvalidArgument,
+                            "invalid router id",
+                        ));
+                    }
+                }
+            }
+            None => {
+                return Err(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "empty configuration",
+                ));
+            }
+        }
+        Ok(tonic::Response::new(()))
     }
     async fn stop_bgp(
         &self,
@@ -1591,14 +1628,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arg::with_name("asn")
                 .long("as-number")
                 .takes_value(true)
-                .required(true)
                 .help("specify as number"),
         )
         .arg(
             Arg::with_name("id")
                 .long("router-id")
                 .takes_value(true)
-                .required(true)
                 .help("specify router id"),
         )
         .arg(
@@ -1613,8 +1648,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .get_matches();
 
-    let asn = args.value_of("asn").unwrap().parse()?;
-    let router_id = Ipv4Addr::from_str(args.value_of("id").unwrap())?;
+    let asn = if let Some(asn) = args.value_of("asn") {
+        asn.parse()?
+    } else {
+        0
+    };
+    let router_id = if let Some(id) = args.value_of("id") {
+        Ipv4Addr::from_str(id)?
+    } else {
+        Ipv4Addr::new(0, 0, 0, 0)
+    };
 
     let (active_tx, active_rx) = mpsc::unbounded_channel::<IpAddr>();
 
@@ -1635,11 +1678,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut table = Table::new();
     table.disable_best_path_selection = args.is_present("collector");
     let table = Arc::new(Mutex::new(table));
-
+    let init_tx = Arc::new(Barrier::new(2));
     let addr = "127.0.0.1:50051".parse()?;
     let service = Service {
         global: Arc::clone(&global),
         table: Arc::clone(&table),
+        init_tx: init_tx.clone(),
     };
 
     tokio::spawn(async move {
@@ -1651,6 +1695,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("failed to listen on grpc {}", e);
         }
     });
+    if asn == 0 {
+        init_tx.wait().await;
+    }
 
     let addr = "[::]:179".to_string();
     let listener = TcpListener::bind(&addr).await?;
