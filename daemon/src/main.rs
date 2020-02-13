@@ -1904,7 +1904,7 @@ fn update_attrs(
         n.push(bgp::Attribute::MpReach {
             family: bgp::Family::Ipv6Uc,
             nexthop,
-            nlri: nlri,
+            nlri: vec![nlri],
         })
     } else {
         n.push(bgp::Attribute::Nexthop { nexthop });
@@ -2013,7 +2013,7 @@ impl Session {
                             Vec::new(),
                             vec![&bgp::Attribute::MpUnreach {
                                 family: bgp::Family::Ipv6Uc,
-                                nlri: nlri,
+                                nlri: vec![nlri],
                             }],
                         )
                         .unwrap();
@@ -2211,19 +2211,21 @@ async fn handle_session(
                                     accept_v4 += 1;
                                 }
                             }
-                            for r in update.mp_routes {
-                                let (u, added) = t.insert(
-                                    bgp::Family::Ipv6Uc,
-                                    r.0,
-                                    source.clone(),
-                                    r.1,
-                                    pa.clone(),
-                                );
-                                if let Some(u) = u {
-                                    t.broadcast(source.clone(), &u).await;
-                                }
-                                if added {
-                                    accept_v6 += 1;
+                            for f in update.mp_routes {
+                                for r in f.0 {
+                                    let (u, added) = t.insert(
+                                        bgp::Family::Ipv6Uc,
+                                        r,
+                                        source.clone(),
+                                        f.1,
+                                        pa.clone(),
+                                    );
+                                    if let Some(u) = u {
+                                        t.broadcast(source.clone(), &u).await;
+                                    }
+                                    if added {
+                                        accept_v6 += 1;
+                                    }
                                 }
                             }
                         }
