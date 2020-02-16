@@ -121,10 +121,6 @@ impl IpNet {
         }
         Ok((c.position() - pos) as usize)
     }
-
-    fn length(&self) -> u8 {
-        (self.mask + 7) / 8 + 1
-    }
 }
 
 #[derive(Debug)]
@@ -245,13 +241,6 @@ fn ipnet_contains() {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Nlri {
     Ip(IpNet),
-}
-
-impl Nlri {
-    fn length(&self) -> u8 {
-        let Nlri::Ip(net) = self;
-        net.length()
-    }
 }
 
 impl std::string::ToString for Nlri {
@@ -891,7 +880,7 @@ impl Attribute {
 
                 Ok(Attribute::MpUnreach {
                     family: Family::new(afi, safi),
-                    nlri: withdrawn
+                    nlri: withdrawn,
                 })
             }
             _ => {
