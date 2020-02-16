@@ -1,0 +1,19 @@
+name: build
+
+on: [pull_request]
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-18.04
+    steps:
+      - name: checking out
+        uses: actions/checkout@v2
+      - name: setup
+        run: |
+          rustup component add rustfmt --toolchain stable-x86_64-unknown-linux-gnu
+      - name: build
+        run: |
+          cd /home/runner/work/rustybgp/rustybgp
+          cargo build --verbose --all
+          cargo test --verbose --all
