@@ -69,20 +69,20 @@ impl IpNet {
         match addr {
             IpAddr::V4(addr) => {
                 let prefix_octets: Vec<u8> = match self.addr {
-                    IpAddr::V4(addr) => addr.octets().into_iter().map(|x| *x).collect(),
+                    IpAddr::V4(addr) => addr.octets().iter().map(|x| *x).collect(),
                     _ => return false,
                 };
 
-                let addr_octests: Vec<u8> = addr.octets().into_iter().map(|x| *x).collect();
+                let addr_octests: Vec<u8> = addr.octets().iter().map(|x| *x).collect();
                 return f(&prefix_octets, &addr_octests, self.mask);
             }
             IpAddr::V6(addr) => {
                 let prefix_octets: Vec<u8> = match self.addr {
-                    IpAddr::V6(addr) => addr.octets().into_iter().map(|x| *x).collect(),
+                    IpAddr::V6(addr) => addr.octets().iter().map(|x| *x).collect(),
                     _ => return false,
                 };
 
-                let addr_octests: Vec<u8> = addr.octets().into_iter().map(|x| *x).collect();
+                let addr_octests: Vec<u8> = addr.octets().iter().map(|x| *x).collect();
                 return f(&prefix_octets, &addr_octests, self.mask);
             }
         }
