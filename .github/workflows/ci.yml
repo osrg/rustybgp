@@ -1,0 +1,78 @@
+name: ci
+
+on: [pull_request]
+
+env:
+  RUSTYBGP_IMAGE: rustybgp-ci
+
+jobs:
+  build:
+    name: build container image
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@master
+
+      - name: setup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            curl \
+            musl-dev \
+            musl-tools
+          curl -OL https://github.com/osrg/gobgp/releases/download/v2.11.0/gobgp_2.11.0_linux_amd64.tar.gz
+          tar xzf gobgp_2.11.0_linux_amd64.tar.gz
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-musl
+          override: true
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target x86_64-unknown-linux-musl
+
+      - name: build docker image
+        run: |
+          docker build -t ${RUSTYBGP_IMAGE} --file tests/integration/functional/docker/Dockerfile .
+
+      - name: save docker image
+        run: |
+          docker save ${RUSTYBGP_IMAGE} > ${RUSTYBGP_IMAGE}.tar
+
+      - name: upload image file
+        uses: actions/upload-artifact@v1
+        with:
+          name: artifact
+          path: rustybgp-ci.tar
+
+  ibgp:
+    name: ibgp
+    runs-on: ubuntu-18.04
+    needs: build
+    steps:
+      - uses: actions/checkout@master
+
+      - name: Login GitHub Registry
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
+
+      - name: pull gobgp image
+        run: |
+          docker pull docker.pkg.github.com/fujita/gobgp/gobgp-daemon
+
+      - name: download rustybgp image
+        uses: actions/download-artifact@v1
+        with:
+          name: artifact
+
+      - name: load rustybgp image
+        run: |
+          docker load < artifact/${RUSTYBGP_IMAGE}.tar
+
+      - name: test
+        run: |
+          cd tests/integration/functional/pkg && RUSTYBGP_IMAGE_NAME=${RUSTYBGP_IMAGE} go test -run TestIbgp
