@@ -1679,7 +1679,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     table.disable_best_path_selection = args.is_present("collector");
     let table = Arc::new(Mutex::new(table));
     let init_tx = Arc::new(Barrier::new(2));
-    let addr = "127.0.0.1:50051".parse()?;
+    let addr = "[::]:50051".parse()?;
     let service = Service {
         global: Arc::clone(&global),
         table: Arc::clone(&table),
