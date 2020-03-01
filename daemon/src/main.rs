@@ -661,7 +661,7 @@ impl Peer {
             address: address,
             remote_as: 0,
             router_id: Ipv4Addr::new(0, 0, 0, 0),
-            local_as: 0,
+            local_as: as_number,
             peer_type: 0,
             passive: false,
             hold_time: Self::DEFAULT_HOLD_TIME,
@@ -2276,7 +2276,7 @@ async fn handle_session(
 
                                 source = Arc::new(Source {
                                     local_addr: local_addr,
-                                    local_as: as_number,
+                                    local_as: peer.local_as,
                                     address: addr,
                                     ibgp: peer.local_as == peer.remote_as,
                                 });
