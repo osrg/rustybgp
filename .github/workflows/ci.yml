@@ -4,6 +4,7 @@ on: [pull_request]
 
 env:
   RUSTYBGP_IMAGE: rustybgp-ci
+  IMAGE_FILE: image.tar.zip
 
 jobs:
   build:
@@ -11,9 +12,6 @@ jobs:
     runs-on: ubuntu-18.04
     steps:
       - uses: actions/checkout@master
-
-      - name: Login GitHub Registry
-        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
 
       - name: build
         run: |
@@ -29,10 +27,17 @@ jobs:
           cargo build --release --target x86_64-unknown-linux-musl
           curl -OL https://github.com/osrg/gobgp/releases/download/v2.11.0/gobgp_2.11.0_linux_amd64.tar.gz
           tar xzf gobgp_2.11.0_linux_amd64.tar.gz
-          docker build -t docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE}:${GITHUB_SHA} --file tests/integration/functional/docker/Dockerfile .
+          docker build -t ${RUSTYBGP_IMAGE} --file tests/integration/functional/docker/Dockerfile .
 
       - name: Push image to GitHub Registry
-        run: docker push docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE}:${GITHUB_SHA}
+        run: |
+          docker save ${RUSTYBGP_IMAGE} |zip > ${IMAGE_FILE}
+
+      - name: upload image file
+        uses: actions/upload-artifact@v1
+        with:
+          name: image
+          path: ${IMAGE_FILE}
 
   ibgp:
     name: ibgp
@@ -44,11 +49,18 @@ jobs:
       - name: Login GitHub Registry
         run: echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
 
-      - name: pull image
+      - name: pull gobgp image
         run: |
-          docker pull docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE}:${GITHUB_SHA}
           docker pull docker.pkg.github.com/fujita/gobgp/gobgp-daemon
+
+      - name: download rustybgp image
+        uses: actions/download-artifact@v1
+        with:
+          name: ${IMAGE_FILE}
+
+      - name: load rustybgp image
+        run: unzip -p ${IMAGE_FILE} |docker load
 
       - name: test
         run: |
-          cd tests/integration/functional/pkg && RUSTYBGP_IMAGE_NAME=docker.pkg.github.com/${{ github.repository }}/${RUSTYBGP_IMAGE}:${GITHUB_SHA} go test -run TestIbgp
+          cd tests/integration/functional/pkg && RUSTYBGP_IMAGE_NAME=${RUSTYBGP_IMAGE} go test -run TestIbgp
