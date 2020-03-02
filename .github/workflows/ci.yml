@@ -63,7 +63,8 @@ jobs:
         run: |
           pwd
           ls -l
-          docker load < rustybgp-ci.tar
+          ls -R rustybgp-ci.tar
+          docker load < rustybgp-ci.tar/rustybgp-ci.tar
 
       - name: test
         run: |
