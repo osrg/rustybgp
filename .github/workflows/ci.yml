@@ -38,7 +38,7 @@ jobs:
       - name: upload image file
         uses: actions/upload-artifact@v1
         with:
-          name: image
+          name: image.tar.zip
           path: image.tar.zip
 
   ibgp:
@@ -58,10 +58,13 @@ jobs:
       - name: download rustybgp image
         uses: actions/download-artifact@v1
         with:
-          name: image
+          name: image.tar.zip
 
       - name: load rustybgp image
-        run: unzip -p ${IMAGE_FILE} |docker load
+        run: |
+          pwd
+          ls
+          unzip -p ${IMAGE_FILE} |docker load
 
       - name: test
         run: |
