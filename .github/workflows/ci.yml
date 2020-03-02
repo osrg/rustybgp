@@ -28,16 +28,14 @@ jobs:
           tar xzf gobgp_2.11.0_linux_amd64.tar.gz
           docker build -t ${RUSTYBGP_IMAGE} --file tests/integration/functional/docker/Dockerfile .
 
-      - name: Push image to GitHub Registry
+      - name: save docker image
         run: |
-          pwd
           docker save ${RUSTYBGP_IMAGE} > ${RUSTYBGP_IMAGE}.tar
-          ls
 
       - name: upload image file
         uses: actions/upload-artifact@v1
         with:
-          name: rustybgp-ci.tar
+          name: artifact
           path: rustybgp-ci.tar
 
   ibgp:
@@ -57,14 +55,13 @@ jobs:
       - name: download rustybgp image
         uses: actions/download-artifact@v1
         with:
-          name: rustybgp-ci.tar
+          name: artifact
 
       - name: load rustybgp image
         run: |
           pwd
           ls -l
-          ls -R rustybgp-ci.tar
-          docker load < rustybgp-ci.tar/rustybgp-ci.tar
+          docker load < artifact/rustybgp-ci.tar
 
       - name: test
         run: |
