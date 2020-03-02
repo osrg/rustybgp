@@ -4,7 +4,6 @@ on: [pull_request]
 
 env:
   RUSTYBGP_IMAGE: rustybgp-ci
-  RUSTYBGP_IMAGE_FILE: ${RUSTYBGP_IMAGE}.tar
 
 jobs:
   build:
@@ -13,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@master
 
-      - name: build
+      - name: setup
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -22,15 +21,27 @@ jobs:
             curl \
             musl-dev \
             musl-tools
-          rustup target add x86_64-unknown-linux-musl
-          cargo build --release --target x86_64-unknown-linux-musl
           curl -OL https://github.com/osrg/gobgp/releases/download/v2.11.0/gobgp_2.11.0_linux_amd64.tar.gz
           tar xzf gobgp_2.11.0_linux_amd64.tar.gz
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-musl
+          override: true
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target x86_64-unknown-linux-musl
+
+      - name: build docker image
+        run: |
           docker build -t ${RUSTYBGP_IMAGE} --file tests/integration/functional/docker/Dockerfile .
 
       - name: save docker image
         run: |
-          docker save ${RUSTYBGP_IMAGE} > ${RUSTYBGP_IMAGE_FILE}
+          docker save ${RUSTYBGP_IMAGE} > ${RUSTYBGP_IMAGE}.tar
 
       - name: upload image file
         uses: actions/upload-artifact@v1
@@ -45,8 +56,9 @@ jobs:
     steps:
       - uses: actions/checkout@master
 
-      - name: login gitHub registry
-        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
+      - name: Login GitHub Registry
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
 
       - name: pull gobgp image
         run: |
@@ -59,9 +71,7 @@ jobs:
 
       - name: load rustybgp image
         run: |
-          pwd
-          ls -l
-          docker load < artifact/${RUSTYBGP_IMAGE_FILE}
+          docker load < artifact/${RUSTYBGP_IMAGE}.tar
 
       - name: test
         run: |
