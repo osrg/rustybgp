@@ -62,7 +62,7 @@ jobs:
       - name: load rustybgp image
         run: |
           pwd
-          ls
+          ls -l
           docker load < rustybgp-ci.tar
 
       - name: test
