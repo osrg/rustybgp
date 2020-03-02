@@ -31,13 +31,15 @@ jobs:
 
       - name: Push image to GitHub Registry
         run: |
+          pwd
           docker save ${RUSTYBGP_IMAGE} |zip > ${IMAGE_FILE}
+          ls
 
       - name: upload image file
         uses: actions/upload-artifact@v1
         with:
           name: image
-          path: ${IMAGE_FILE}
+          path: image.tar.zip
 
   ibgp:
     name: ibgp
@@ -56,7 +58,7 @@ jobs:
       - name: download rustybgp image
         uses: actions/download-artifact@v1
         with:
-          name: ${IMAGE_FILE}
+          name: image
 
       - name: load rustybgp image
         run: unzip -p ${IMAGE_FILE} |docker load
