@@ -4,7 +4,6 @@ on: [pull_request]
 
 env:
   RUSTYBGP_IMAGE: rustybgp-ci
-  IMAGE_FILE: image.tar.zip
 
 jobs:
   build:
@@ -32,14 +31,14 @@ jobs:
       - name: Push image to GitHub Registry
         run: |
           pwd
-          docker save ${RUSTYBGP_IMAGE} |zip > ${IMAGE_FILE}
+          docker save ${RUSTYBGP_IMAGE} > ${RUSTYBGP_IMAGE}.tar
           ls
 
       - name: upload image file
         uses: actions/upload-artifact@v1
         with:
-          name: image.tar.zip
-          path: image.tar.zip
+          name: rustybgp-ci.tar
+          path: rustybgp-ci.tar
 
   ibgp:
     name: ibgp
@@ -58,13 +57,13 @@ jobs:
       - name: download rustybgp image
         uses: actions/download-artifact@v1
         with:
-          name: image.tar.zip
+          name: rustybgp-ci.tar
 
       - name: load rustybgp image
         run: |
           pwd
           ls
-          unzip -p ${IMAGE_FILE} |docker load
+          docker load < rustybgp-ci.tar
 
       - name: test
         run: |
