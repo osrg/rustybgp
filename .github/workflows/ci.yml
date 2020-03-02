@@ -4,6 +4,7 @@ on: [pull_request]
 
 env:
   RUSTYBGP_IMAGE: rustybgp-ci
+  RUSTYBGP_IMAGE_FILE: ${RUSTYBGP_IMAGE}.tar
 
 jobs:
   build:
@@ -14,7 +15,6 @@ jobs:
 
       - name: build
         run: |
-          echo ${RUSTYBGP_IMAGE}:${GITHUB_SHA}
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
@@ -30,7 +30,7 @@ jobs:
 
       - name: save docker image
         run: |
-          docker save ${RUSTYBGP_IMAGE} > ${RUSTYBGP_IMAGE}.tar
+          docker save ${RUSTYBGP_IMAGE} > ${RUSTYBGP_IMAGE_FILE}
 
       - name: upload image file
         uses: actions/upload-artifact@v1
@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@master
 
-      - name: Login GitHub Registry
+      - name: login gitHub registry
         run: echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
 
       - name: pull gobgp image
@@ -61,7 +61,7 @@ jobs:
         run: |
           pwd
           ls -l
-          docker load < artifact/rustybgp-ci.tar
+          docker load < artifact/${RUSTYBGP_IMAGE_FILE}
 
       - name: test
         run: |
