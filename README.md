@@ -39,3 +39,7 @@ If you just want to check out the performance, start the daemon with `--any-peer
 $ sudo ./target/debug/daemon --as-number 65001 --router-id 1.1.1.1 --any-peers
 Hello, RustyBGP!
 ```
+
+## Community, discussion and support
+
+You have code or documentation for RustyBGP? Awesome! Send a pull request. No CLA, board members, governance, or other mess. See [`BUILD.md`](BUILD.md) for info on code contributing.
