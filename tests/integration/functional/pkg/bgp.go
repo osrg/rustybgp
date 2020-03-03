@@ -399,3 +399,10 @@ func (b *bgpTest) getCounter(name, neighbor string) (messageCounter, error) {
 	}
 	return c, fmt.Errorf("not found")
 }
+
+func (b *bgpTest) disablePeer(name, neighbor string) error {
+	_, err := b.containers[name].apiClient.DisablePeer(context.Background(), &api.DisablePeerRequest{
+		Address: b.containers[neighbor].ip.String(),
+	})
+	return err
+}

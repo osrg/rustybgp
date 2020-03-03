@@ -3,9 +3,20 @@ package bgptest
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
+
+func disableEbgpPeer(t *testing.T, c *bgpTest) {
+	err := c.disablePeer("g3", "r1")
+	assert.Nil(t, err)
+
+	time.Sleep(1 * time.Second)
+	checkAdjout(t, c)
+	has, _ := c.waitForPath("r1", global, "", "10.0.2.0/24", 50)
+	assert.False(t, has)
+}
 
 func addEbgpPeer(t *testing.T, c *bgpTest) {
 	err := c.createPeer("g3", gobgpImageName(), 2)
@@ -99,5 +110,6 @@ func TestIbgp(t *testing.T) {
 	checkGlobalrib(t, c)
 	checkAdjout(t, c)
 	addEbgpPeer(t, c)
+	disableEbgpPeer(t, c)
 	//	c.Stop()
 }
