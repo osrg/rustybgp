@@ -62,6 +62,10 @@ func newBgpTest() (t *bgpTest, err error) {
 	}, nil
 }
 
+func (b *bgpTest) neighborAddress(name string) string {
+	return b.containers[name].ip.String()
+}
+
 func (b *bgpTest) stop() {
 	cr := types.ContainerRemoveOptions{
 		Force: true,
@@ -294,6 +298,72 @@ func (b *bgpTest) waitForPath(name string, table tableType, neighbor, prefix str
 		time.Sleep(time.Millisecond * 100)
 	}
 	return false, nil
+}
+
+type path struct {
+	nlri    string
+	nexthop string
+	aspath  []uint32
+}
+
+func getAsAndNexthop(attrs []*any.Any) (string, []uint32) {
+	aspath := []uint32{}
+	var nexthop string
+	for _, an := range attrs {
+		var value ptypes.DynamicAny
+		if err := ptypes.UnmarshalAny(an, &value); err != nil {
+			return nexthop, aspath
+		}
+		switch a := value.Message.(type) {
+		case *api.AsPathAttribute:
+			for _, segment := range a.Segments {
+				aspath = append(aspath, segment.Numbers...)
+			}
+		case *api.NextHopAttribute:
+			nexthop = a.NextHop
+		}
+	}
+
+	return nexthop, aspath
+}
+
+func (b *bgpTest) listPath(name string, table tableType, neighbor string) ([]path, error) {
+	paths := []path{}
+	var tableName string
+	if neighbor != "" {
+		tableName = b.containers[neighbor].ip.String()
+	}
+	stream, err := b.containers[name].apiClient.ListPath(context.Background(), &api.ListPathRequest{
+		TableType: api.TableType(table),
+		Name:      tableName,
+		Family: &api.Family{
+			Afi:  api.Family_AFI_IP,
+			Safi: api.Family_SAFI_UNICAST,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		r, err := stream.Recv()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, err
+		}
+
+		for _, p := range r.Destination.Paths {
+			n, a := getAsAndNexthop(p.Pattrs)
+			paths = append(paths, path{
+				nlri:    r.Destination.Prefix,
+				nexthop: n,
+				aspath:  a,
+			})
+		}
+	}
+
+	return paths, nil
 }
 
 type messageCounter struct {

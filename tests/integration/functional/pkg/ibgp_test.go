@@ -7,6 +7,40 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func addEbgpPeer(t *testing.T, c *bgpTest) {
+	err := c.createPeer("g3", gobgpImageName(), 2)
+	assert.Nil(t, err)
+	err = c.connectPeers("r1", "g3", false)
+	assert.Nil(t, err)
+	err = c.addPath("g3", "10.0.2.0/24")
+	assert.Nil(t, err)
+	c.waitForEstablish("g3")
+
+	// g3 should receive routes from ibgp peers
+	r, err := c.getCounter("g3", "r1")
+	assert.Nil(t, err)
+	assert.Equal(t, r.accepted, uint64(2))
+
+	// r1 should update path attributes properly
+	l, err := c.listPath("g3", adjin, "r1")
+	assert.Nil(t, err)
+	for _, p := range l {
+		assert.Equal(t, p.nexthop, c.neighborAddress("r1"))
+		assert.Equal(t, p.aspath[0], uint32(1))
+	}
+
+	l, err = c.listPath("g1", adjin, "r1")
+	assert.Nil(t, err)
+	for _, p := range l {
+		// bgp router mustn't change nexthop of routes from eBGP peers
+		// which are sent to iBGP peers
+		assert.Equal(t, p.nexthop, c.neighborAddress("g3"))
+		// bgp router mustn't change aspath of routes from eBGP peers
+		// which are sent to iBGP peers
+		assert.Equal(t, p.aspath[0], uint32(2))
+	}
+}
+
 func checkAdjout(t *testing.T, c *bgpTest) {
 	// should not send routes from ibgp to ibgp peers
 	r, err := c.getCounter("g1", "r1")
@@ -64,5 +98,6 @@ func TestIbgp(t *testing.T) {
 	waitForEstablish(t, c)
 	checkGlobalrib(t, c)
 	checkAdjout(t, c)
+	addEbgpPeer(t, c)
 	//	c.Stop()
 }
