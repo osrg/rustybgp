@@ -2,7 +2,7 @@
 
 The mission is to develop a high-performance, low-memory-footprint, and safe BGP implementation; an experiment to implement aged and rusty BGP protocol in a modern language.
 
-RustyBGP supports the gRPC APIs same as GoBGP; GoBGP's CLI command allows you to manage RustyBGP. Currently, all RustyBGP can do is accept peers, get routes, select the best paths, advertise the best paths, and show you routes via the gRPC API. No active connection, policy, etc.
+RustyBGP supports the gRPC APIs same as GoBGP; GoBGP's CLI command allows you to manage RustyBGP. Currently, the very basic BGP features are supported; eBGP and iBGP, only v4 and v6 families, showing tables via the gRPC API, etc. No policy, route server support, fancy families, etc.
 
 ## Get Started
 
@@ -16,21 +16,26 @@ $ ls -hl target/x86_64-unknown-linux-musl/release/daemon
 -rwxr-xr-x 2 fujita fujita 8.1M Dec  6 12:26 target/x86_64-unknown-linux-musl/release/daemon
 ```
 
-No configuration file support.
+No configuration file support; only via the gRPC API. You can use GoBGP's CLI command.
 
 ```bash
-$ sudo ./target/debug/daemon --as-number 65001 --router-id 1.1.1.1
+$ sudo ./target/debug/daemon
 Hello, RustyBGP!
-grpc: listening on 127.0.0.1:50051
 ```
 
-Then you set up peer configuration.
+Then you can manage the daemon on a different terminal.
 
 ```bash
-$ gobgp neighbor add 10.0.0.2 as 65001
+$ gobgp global as 65001 router-id 1.1.1.1
+$ gobgp neighbor add 10.0.0.2 as 65002
 $ gobgp neighbor
 Peer        AS Up/Down State       |#Received  Accepted
-10.0.0.2 65001   never Idle        |        0         0
+10.0.0.2 65002   never Idle        |        0         0
 ```
 
 If you just want to check out the performance, start the daemon with `--any-peers` option. The daemon accepts any peers without configuration.
+
+```bash
+$ sudo ./target/debug/daemon --as-number 65001 --router-id 1.1.1.1 --any-peers
+Hello, RustyBGP!
+```
