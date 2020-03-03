@@ -2,6 +2,13 @@
 
 cd `dirname $0`
 
+rm_containers() {
+    ids=($(docker ps -a -q -f "label=rustybgp-ci"))
+    if [ $ids ]; then
+        docker rm -f ${ids[@]} > /dev/null
+    fi
+}
+
 case "$1" in
     build)
         if [[ ! -f gobgp  ]]; then
@@ -26,11 +33,29 @@ EOF
     ;;
 
     start)
-        GOBGP_IMAGE_NAME=tomo/gobgp go test ./... -v
+        tests=($(grep "func Test" pkg/*_test.go|gawk -F " " '{ print gensub("\\(t", "", 1, $2) }'))
+        for name in ${tests[@]}
+        do
+            rm_containers
+            GOBGP_IMAGE_NAME=tomo/gobgp go test ./... -v -run $name
+            if [ $? -ne 0 ]; then
+                exit 1
+            fi
+        done
+    ;;
+
+    run)
+        if [ $# -ne 2 ]; then
+            echo "Usage: local-ci.sh run TESTFILE"
+            exit 1
+        fi
+        name=$(grep "func Test" $2|gawk -F " " '{ print gensub("\\(t", "", 1, $2) }')
+        rm_containers
+        GOBGP_IMAGE_NAME=tomo/gobgp go test ./... -v -run $name
     ;;
 
     stop)
-         docker rm -f $(docker ps -a -q -f "label=rustybgp-ci")
+        rm_containers
     ;;
 
     cleanup)
@@ -38,7 +63,7 @@ EOF
     ;;
 
     *)
-        echo "Usage: {build|stop|cleanup}" >&2
+        echo "Usage: {build|start|run|stop|cleanup}" >&2
         exit 1
     ;;
 esac

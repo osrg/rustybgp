@@ -76,3 +76,31 @@ jobs:
       - name: test
         run: |
           cd tests/integration/functional/pkg && RUSTYBGP_IMAGE_NAME=${RUSTYBGP_IMAGE} go test -run TestIbgp
+
+  ebgp:
+    name: ebgp
+    runs-on: ubuntu-18.04
+    needs: build
+    steps:
+      - uses: actions/checkout@master
+
+      - name: Login GitHub Registry
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
+
+      - name: pull gobgp image
+        run: |
+          docker pull docker.pkg.github.com/fujita/gobgp/gobgp-daemon
+
+      - name: download rustybgp image
+        uses: actions/download-artifact@v1
+        with:
+          name: artifact
+
+      - name: load rustybgp image
+        run: |
+          docker load < artifact/${RUSTYBGP_IMAGE}.tar
+
+      - name: test
+        run: |
+          cd tests/integration/functional/pkg && RUSTYBGP_IMAGE_NAME=${RUSTYBGP_IMAGE} go test -run TestEbgp
