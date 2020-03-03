@@ -31,7 +31,7 @@ func rustyImageName() string {
 }
 
 func gobgpImageName() string {
-	const imageNameEnv = "GOBGY_IMAGE_NAME"
+	const imageNameEnv = "GOBGP_IMAGE_NAME"
 
 	if n := os.Getenv(imageNameEnv); n != "" {
 		return n
