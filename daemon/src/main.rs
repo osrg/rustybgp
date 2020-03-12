@@ -1636,9 +1636,33 @@ impl GobgpApi for Service {
     }
     async fn get_table(
         &self,
-        _request: tonic::Request<api::GetTableRequest>,
+        request: tonic::Request<api::GetTableRequest>,
     ) -> Result<tonic::Response<api::GetTableResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let r = request.into_inner();
+        let mut family = bgp::Family::Ipv4Uc;
+        if let Some(f) = r.family {
+            family = f.to_proto();
+        }
+
+        let table = self.table.clone();
+        let t = table.lock().await;
+        let t = t.master.get(&family);
+        let mut nr_dst: u64 = 0;
+        let mut nr_path: u64 = 0;
+        match t {
+            Some(t) => {
+                for (_, dst) in t {
+                    nr_path += dst.entry.len() as u64;
+                }
+                nr_dst = t.len() as u64;
+            }
+            None => {}
+        }
+        Ok(tonic::Response::new(api::GetTableResponse {
+            num_destination: nr_dst,
+            num_path: nr_path,
+            num_accepted: 0,
+        }))
     }
     type MonitorTableStream = mpsc::Receiver<Result<api::MonitorTableResponse, tonic::Status>>;
     async fn monitor_table(
