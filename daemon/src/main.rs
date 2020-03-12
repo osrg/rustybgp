@@ -822,10 +822,13 @@ impl ToApi<api::Peer> for Peer {
             state: Some(Default::default()),
         };
         if self.uptime != SystemTime::UNIX_EPOCH {
-            let ts = api::TimersState {
+            let mut ts = api::TimersState {
                 uptime: Some(self.uptime.to_api()),
                 ..Default::default()
             };
+            if self.downtime != SystemTime::UNIX_EPOCH {
+                ts.downtime = Some(self.downtime.to_api());
+            }
             tm.state = Some(ts);
         }
         let afisafis = self
