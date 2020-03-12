@@ -2,7 +2,7 @@
 
 The mission is to develop a high-performance, low-memory-footprint, and safe BGP implementation; an experiment to implement aged and rusty BGP protocol in a modern language.
 
-RustyBGP supports the gRPC APIs same as GoBGP; GoBGP's CLI command allows you to manage RustyBGP. Currently, the very basic BGP features are supported; eBGP and iBGP, only v4 and v6 families, showing tables via the gRPC API, etc. No policy, route server support, fancy families, etc.
+RustyBGP supports the gRPC APIs same as GoBGP; GoBGP's CLI command allows you to manage RustyBGP. Currently, the very basic BGP features are supported; eBGP and iBGP, active/passive connection, v4 and v6 families, adding/deleting routes, showing the tables, etc. No policy, route server support, fancy families, etc.
 
 ## Get Started
 
