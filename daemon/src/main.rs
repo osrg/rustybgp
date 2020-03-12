@@ -16,6 +16,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
+    io::Cursor,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     str::FromStr,
@@ -86,6 +87,52 @@ impl ToApi<api::Family> for bgp::Family {
                 safi: (v & 0xff) as i32,
             },
         }
+    }
+}
+
+trait FromFamilyApi {
+    fn to_proto(&self) -> bgp::Family;
+}
+
+impl FromFamilyApi for api::Family {
+    fn to_proto(&self) -> bgp::Family {
+        if self.safi == api::family::Safi::Unicast as i32 {
+            if self.afi == api::family::Afi::Ip as i32 {
+                return bgp::Family::Ipv4Uc;
+            } else if self.afi == api::family::Afi::Ip6 as i32 {
+                return bgp::Family::Ipv6Uc;
+            }
+        }
+        return bgp::Family::Unknown((self.afi as u32) << 16 | self.safi as u32);
+    }
+}
+
+trait FromNlriApi {
+    fn to_proto(&self) -> Option<bgp::Nlri>;
+}
+
+impl FromNlriApi for prost_types::Any {
+    fn to_proto(&self) -> Option<bgp::Nlri> {
+        if self.type_url == "type.googleapis.com/gobgpapi.IPAddressPrefix" {
+            let n = prost::Message::decode(Cursor::new(&self.value));
+            match n {
+                Ok(n) => {
+                    let api_nlri: api::IpAddressPrefix = n;
+                    println!("{}", api_nlri.prefix);
+                    match IpAddr::from_str(&api_nlri.prefix) {
+                        Ok(addr) => {
+                            return Some(bgp::Nlri::Ip(bgp::IpNet {
+                                addr: addr,
+                                mask: api_nlri.prefix_len as u8,
+                            }));
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        None
     }
 }
 
@@ -299,6 +346,7 @@ type Rx = mpsc::UnboundedReceiver<TableUpdate>;
 
 #[derive(Clone)]
 pub struct Table {
+    pub local_source: Arc<Source>,
     pub disable_best_path_selection: bool,
     pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
 
@@ -308,6 +356,12 @@ pub struct Table {
 impl Table {
     pub fn new() -> Table {
         Table {
+            local_source: Arc::new(Source {
+                address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                ibgp: false,
+                local_as: 0,
+                local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            }),
             disable_best_path_selection: false,
             master: HashMap::new(),
             active_peers: HashMap::new(),
@@ -958,6 +1012,102 @@ pub struct Service {
     init_tx: Arc<Barrier>,
 }
 
+fn to_native_attrs(api_attrs: Vec<prost_types::Any>) -> (Vec<bgp::Attribute>, IpAddr) {
+    let mut v = Vec::new();
+    let mut nexthop = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    for a in &api_attrs {
+        match &*a.type_url {
+            "type.googleapis.com/gobgpapi.OriginAttribute" => {
+                let a: api::OriginAttribute =
+                    prost::Message::decode(Cursor::new(&a.value)).unwrap();
+                v.push(bgp::Attribute::Origin {
+                    origin: a.origin as u8,
+                });
+            }
+            "type.googleapis.com/gobgpapi.AsPathAttribute" => {
+                let a: api::AsPathAttribute =
+                    prost::Message::decode(Cursor::new(&a.value)).unwrap();
+                let mut s = Vec::new();
+                for seg in &a.segments {
+                    s.push(bgp::Segment {
+                        segment_type: (seg.r#type) as u8,
+                        number: seg.numbers.iter().cloned().collect(),
+                    });
+                }
+                v.push(bgp::Attribute::AsPath { segments: s });
+            }
+            "type.googleapis.com/gobgpapi.NextHopAttribute" => {
+                let a: api::NextHopAttribute =
+                    prost::Message::decode(Cursor::new(&a.value)).unwrap();
+                match IpAddr::from_str(&a.next_hop) {
+                    Ok(addr) => {
+                        nexthop = addr;
+                    }
+                    Err(_) => {}
+                }
+            }
+            "type.googleapis.com/gobgpapi.MultiExitDiscAttribute" => {
+                let a: api::MultiExitDiscAttribute =
+                    prost::Message::decode(Cursor::new(&a.value)).unwrap();
+                v.push(bgp::Attribute::MultiExitDesc { descriptor: a.med });
+            }
+            "type.googleapis.com/gobgpapi.LocalPrefAttribute" => {
+                let a: api::LocalPrefAttribute =
+                    prost::Message::decode(Cursor::new(&a.value)).unwrap();
+                v.push(bgp::Attribute::LocalPref {
+                    preference: a.local_pref,
+                });
+            }
+            "type.googleapis.com/gobgpapi.AtomicAggregateAttribute" => {
+                v.push(bgp::Attribute::AtomicAggregate);
+            }
+            "type.googleapis.com/gobgpapi.AggregateAttribute" => {
+                let a: api::AggregatorAttribute =
+                    prost::Message::decode(Cursor::new(&a.value)).unwrap();
+                match IpAddr::from_str(&a.address) {
+                    Ok(addr) => v.push(bgp::Attribute::Aggregator {
+                        four_byte: true,
+                        number: a.r#as,
+                        address: addr,
+                    }),
+                    Err(_) => {}
+                }
+            }
+            "type.googleapis.com/gobgpapi.CommunitiesAttribute" => {
+                let a: api::CommunitiesAttribute =
+                    prost::Message::decode(Cursor::new(&a.value)).unwrap();
+                v.push(bgp::Attribute::Community {
+                    communities: a.communities.iter().cloned().collect(),
+                });
+            }
+            "type.googleapis.com/gobgpapi.OriginatorIdAttribute" => {
+                let a: api::OriginatorIdAttribute =
+                    prost::Message::decode(Cursor::new(&a.value)).unwrap();
+                match IpAddr::from_str(&a.id) {
+                    Ok(addr) => v.push(bgp::Attribute::OriginatorId { address: addr }),
+                    Err(_) => {}
+                }
+            }
+            "type.googleapis.com/gobgpapi.ClusterListAttribute" => {}
+            _ => {
+                let a: api::ClusterListAttribute =
+                    prost::Message::decode(Cursor::new(&a.value)).unwrap();
+                let mut addrs = Vec::new();
+                for addr in &a.ids {
+                    match IpAddr::from_str(addr) {
+                        Ok(addr) => addrs.push(addr),
+                        Err(_) => {}
+                    }
+                }
+                v.push(bgp::Attribute::ClusterList {
+                    addresses: addrs.iter().cloned().collect(),
+                });
+            }
+        }
+    }
+    (v, nexthop)
+}
+
 #[tonic::async_trait]
 impl GobgpApi for Service {
     async fn start_bgp(
@@ -1214,9 +1364,53 @@ impl GobgpApi for Service {
     }
     async fn add_path(
         &self,
-        _request: tonic::Request<api::AddPathRequest>,
+        request: tonic::Request<api::AddPathRequest>,
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let r = request.into_inner();
+
+        let api_path = r.path.ok_or(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "empty path",
+        ))?;
+
+        let family = api_path
+            .family
+            .ok_or(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "empty family",
+            ))?
+            .to_proto();
+
+        let nlri = api_path
+            .nlri
+            .ok_or(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "empty nlri",
+            ))?
+            .to_proto()
+            .ok_or(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "unknown nlri",
+            ))?;
+
+        let (attrs, nexthop) = to_native_attrs(api_path.pattrs);
+        let table = self.table.clone();
+        let mut t = table.lock().await;
+        let s = t.local_source.clone();
+        let (u, _) = t.insert(
+            family,
+            nlri,
+            s.clone(),
+            nexthop,
+            Arc::new(PathAttr { entry: attrs }),
+        );
+        if let Some(u) = u {
+            t.broadcast(s.clone(), &u).await;
+        }
+
+        Ok(tonic::Response::new(api::AddPathResponse {
+            uuid: Vec::new(),
+        }))
     }
     async fn delete_path(
         &self,
@@ -1910,8 +2104,22 @@ fn update_attrs(
         n.push(bgp::Attribute::Nexthop { nexthop });
     }
 
-    if is_ibgp {
-        if !seen.contains(&bgp::Attribute::LOCAL_PREF) {
+    if !seen.contains(&bgp::Attribute::AS_PATH) {
+        if is_ibgp {
+            n.push(bgp::Attribute::AsPath {
+                segments: Vec::new(),
+            });
+        } else {
+            n.push(bgp::Attribute::AsPath {
+                segments: vec![bgp::Segment {
+                    segment_type: bgp::Segment::TYPE_SEQ,
+                    number: vec![local_as],
+                }],
+            });
+        }
+    }
+    if !seen.contains(&bgp::Attribute::LOCAL_PREF) {
+        if is_ibgp {
             n.push(bgp::Attribute::LocalPref {
                 preference: bgp::Attribute::DEFAULT_LOCAL_PREF,
             });
@@ -1921,6 +2129,7 @@ fn update_attrs(
     return (v, n);
 }
 
+#[derive(Clone)]
 pub struct Source {
     address: IpAddr,
     ibgp: bool,
