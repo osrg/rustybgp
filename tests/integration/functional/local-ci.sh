@@ -37,7 +37,7 @@ EOF
         for name in ${tests[@]}
         do
             rm_containers
-            GOBGP_IMAGE_NAME=tomo/gobgp go test ./... -v -run $name
+            GOBGP_IMAGE_NAME=tomo/gobgp go test ./... -v -count 1 -run $name
             if [ $? -ne 0 ]; then
                 exit 1
             fi
@@ -51,7 +51,7 @@ EOF
         fi
         name=$(grep "func Test" $2|gawk -F " " '{ print gensub("\\(t", "", 1, $2) }')
         rm_containers
-        GOBGP_IMAGE_NAME=tomo/gobgp go test ./... -v -run $name
+        GOBGP_IMAGE_NAME=tomo/gobgp go test ./... -v -count 1 -run $name
     ;;
 
     stop)
