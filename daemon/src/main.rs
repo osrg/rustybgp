@@ -1413,9 +1413,43 @@ impl GobgpApi for Service {
     }
     async fn delete_path(
         &self,
-        _request: tonic::Request<api::DeletePathRequest>,
+        request: tonic::Request<api::DeletePathRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let r = request.into_inner();
+
+        let api_path = r.path.ok_or(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "empty path",
+        ))?;
+
+        let family = api_path
+            .family
+            .ok_or(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "empty family",
+            ))?
+            .to_proto();
+
+        let nlri = api_path
+            .nlri
+            .ok_or(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "empty nlri",
+            ))?
+            .to_proto()
+            .ok_or(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "unknown nlri",
+            ))?;
+
+        let table = self.table.clone();
+        let mut t = table.lock().await;
+        let s = t.local_source.clone();
+        let (u, _) = t.remove(family, nlri, s.clone());
+        if let Some(u) = u {
+            t.broadcast(s.clone(), &u).await;
+        }
+        Ok(tonic::Response::new(()))
     }
     type ListPathStream = mpsc::Receiver<Result<api::ListPathResponse, tonic::Status>>;
     async fn list_path(
