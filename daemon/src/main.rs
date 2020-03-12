@@ -118,7 +118,6 @@ impl FromNlriApi for prost_types::Any {
             match n {
                 Ok(n) => {
                     let api_nlri: api::IpAddressPrefix = n;
-                    println!("{}", api_nlri.prefix);
                     match IpAddr::from_str(&api_nlri.prefix) {
                         Ok(addr) => {
                             return Some(bgp::Nlri::Ip(bgp::IpNet {
@@ -1578,9 +1577,62 @@ impl GobgpApi for Service {
     }
     async fn add_path_stream(
         &self,
-        _request: tonic::Request<tonic::Streaming<api::AddPathStreamRequest>>,
+        request: tonic::Request<tonic::Streaming<api::AddPathStreamRequest>>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let mut stream = request.into_inner();
+
+        let (mut tx, mut rx) = mpsc::channel(1024);
+        tokio::spawn(async move {
+            while let Some(req) = stream.next().await {
+                match req {
+                    Ok(req) => {
+                        for api_path in req.paths {
+                            tx.send(api_path).await.unwrap();
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+
+        while let Some(api_path) = rx.next().await {
+            let family = api_path
+                .family
+                .ok_or(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "empty family",
+                ))?
+                .to_proto();
+
+            let nlri = api_path
+                .nlri
+                .ok_or(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "empty nlri",
+                ))?
+                .to_proto()
+                .ok_or(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "unknown nlri",
+                ))?;
+
+            let (attrs, nexthop) = to_native_attrs(api_path.pattrs);
+            let table = self.table.clone();
+            let mut t = table.lock().await;
+            let s = t.local_source.clone();
+            let (u, _) = t.insert(
+                family,
+                nlri,
+                s.clone(),
+                nexthop,
+                Arc::new(PathAttr { entry: attrs }),
+            );
+            if let Some(u) = u {
+                t.broadcast(s.clone(), &u).await;
+            }
+        }
+
+        Ok(tonic::Response::new(()))
     }
     async fn get_table(
         &self,
