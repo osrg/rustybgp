@@ -420,6 +420,32 @@ pub enum NotificationCode {
     OpenMessageUnsupportedOptionalParameter,
     OpenMessageUnacceptableHoldTime,
     OpenMessageUnsupportedCapability,
+
+    UpdateMessageMalformedAttributeList,
+    UpdateMessageUnrecognizedWellKnownAttribute,
+    UpdateMessageMissingWellKnownAttribute,
+    UpdateMessageAttributeFlagsError,
+    UpdateMessageAttributeLengthError,
+    UpdateMessageInvalidOrigin,
+    UpdateMessageDeprecatedRoutingLoop,
+    UpdateMessageInvalidNextHop,
+    UpdateMessageOptionalAttributeEroor,
+    UpdateMessageInvalidNetworkField,
+    UpdateMessageMalformedAsPath,
+
+    HoldTimerExpired,
+
+    FsmOpensentState,
+    FsmOpenConfirm,
+    FsmEstablished,
+
+    MaximumNumberOfPrefixes,
+    AdministrativeShutdown,
+    PeerDeconfigured,
+    ConnectionRejected,
+    OtherConfigurationChange,
+    ConnectionCollistionResolution,
+    OutOfResource,
 }
 
 impl From<NotificationCode> for u16 {
@@ -456,6 +482,87 @@ impl From<NotificationCode> for u16 {
             NotificationCode::OpenMessageUnsupportedCapability => {
                 NotificationCode::OPEN_MESSAGE_ERROR << 8 | NotificationCode::UNSUPPORTED_CAPABILITY
             }
+
+            NotificationCode::UpdateMessageMalformedAttributeList => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8
+                    | NotificationCode::MALFORMED_ATTRIBUTE_LIST
+            }
+            NotificationCode::UpdateMessageUnrecognizedWellKnownAttribute => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8
+                    | NotificationCode::UNRECOGNIZED_WELL_KNOWN_ATTRIBUTE
+            }
+            NotificationCode::UpdateMessageMissingWellKnownAttribute => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8
+                    | NotificationCode::MISSING_WELL_KNOWN_ATTRIBUTE
+            }
+            NotificationCode::UpdateMessageAttributeFlagsError => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8
+                    | NotificationCode::ATTRIBUTE_FLAGS_ERROR
+            }
+            NotificationCode::UpdateMessageAttributeLengthError => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8
+                    | NotificationCode::ATTRIBUTE_LENGTH_ERROR
+            }
+            NotificationCode::UpdateMessageInvalidOrigin => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8
+                    | NotificationCode::INVALID_ORIGIN_ATTRIBUTE
+            }
+            NotificationCode::UpdateMessageDeprecatedRoutingLoop => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8
+                    | NotificationCode::DEPRECATED_ROUTING_LOOP
+            }
+            NotificationCode::UpdateMessageInvalidNextHop => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8
+                    | NotificationCode::INVALID_NEXT_HOP_ATTRIBUTE
+            }
+            NotificationCode::UpdateMessageOptionalAttributeEroor => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8
+                    | NotificationCode::OPTIONAL_ATTRIBUTE_ERROR
+            }
+            NotificationCode::UpdateMessageInvalidNetworkField => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8
+                    | NotificationCode::INVALID_NETWORK_FIELD
+            }
+            NotificationCode::UpdateMessageMalformedAsPath => {
+                NotificationCode::UPDATE_MESSAGE_ERROR << 8 | NotificationCode::MALFORMED_AS_PATH
+            }
+
+            NotificationCode::HoldTimerExpired => NotificationCode::HOLD_TIMER_EXPIRED << 8 | 1,
+
+            NotificationCode::FsmOpensentState => {
+                NotificationCode::FSM_ERROR << 8
+                    | NotificationCode::RECEIVE_UNEXPECTED_MESSAGE_IN_OPENSENT_STATE
+            }
+            NotificationCode::FsmOpenConfirm => {
+                NotificationCode::FSM_ERROR << 8
+                    | NotificationCode::RECEIVE_UNEXPECTED_MESSAGE_IN_OPENCONFIRM_STATE
+            }
+            NotificationCode::FsmEstablished => {
+                NotificationCode::FSM_ERROR << 8
+                    | NotificationCode::RECEIVE_UNEXPECTED_MESSAGE_IN_ESTABLISHED_STATE
+            }
+
+            NotificationCode::MaximumNumberOfPrefixes => {
+                NotificationCode::CEASE << 8 | NotificationCode::MAXIMUM_NUMBER_OF_PREFIXES_REACHED
+            }
+            NotificationCode::AdministrativeShutdown => {
+                NotificationCode::CEASE << 8 | NotificationCode::ADMINISTRATIVE_SHUTDOWN
+            }
+            NotificationCode::PeerDeconfigured => {
+                NotificationCode::CEASE << 8 | NotificationCode::PEER_DECONFIGURED
+            }
+            NotificationCode::ConnectionRejected => {
+                NotificationCode::CEASE << 8 | NotificationCode::CONNECTION_REJECTED
+            }
+            NotificationCode::OtherConfigurationChange => {
+                NotificationCode::CEASE << 8 | NotificationCode::OTHER_CONFIGURATION_CHANGE
+            }
+            NotificationCode::ConnectionCollistionResolution => {
+                NotificationCode::CEASE << 8 | NotificationCode::CONNECTION_COLLISION_RESOLUTION
+            }
+            NotificationCode::OutOfResource => {
+                NotificationCode::CEASE << 8 | NotificationCode::OUT_OF_RESOURCES
+            }
         }
     }
 }
@@ -463,10 +570,10 @@ impl From<NotificationCode> for u16 {
 impl NotificationCode {
     const MESSAGE_HEADER_ERROR: u16 = 1;
     const OPEN_MESSAGE_ERROR: u16 = 2;
-    // const UPDATE_MESSAGE_ERROR: u16 = 3;
-    // const HOLD_TIMER_EXPIRED: u16 = 4;
-    // const FSM_ERROR: u16 = 5;
-    // const CEASE: u16 = 6;
+    const UPDATE_MESSAGE_ERROR: u16 = 3;
+    const HOLD_TIMER_EXPIRED: u16 = 4;
+    const FSM_ERROR: u16 = 5;
+    const CEASE: u16 = 6;
     // const ROUTE_REFRESH_MESSAGE_ERROR: u16 = 7;
 
     // Message Header Error subcodes
@@ -482,6 +589,34 @@ impl NotificationCode {
     //const DEPRECATED_AUTHENTICATION_FAILURE
     const UNACCEPTABLE_HOLD_TIME: u16 = 6;
     const UNSUPPORTED_CAPABILITY: u16 = 7;
+
+    // Update Message Error subcodes
+    const MALFORMED_ATTRIBUTE_LIST: u16 = 1;
+    const UNRECOGNIZED_WELL_KNOWN_ATTRIBUTE: u16 = 2;
+    const MISSING_WELL_KNOWN_ATTRIBUTE: u16 = 3;
+    const ATTRIBUTE_FLAGS_ERROR: u16 = 4;
+    const ATTRIBUTE_LENGTH_ERROR: u16 = 5;
+    const INVALID_ORIGIN_ATTRIBUTE: u16 = 6;
+    const DEPRECATED_ROUTING_LOOP: u16 = 7;
+    const INVALID_NEXT_HOP_ATTRIBUTE: u16 = 8;
+    const OPTIONAL_ATTRIBUTE_ERROR: u16 = 9;
+    const INVALID_NETWORK_FIELD: u16 = 10;
+    const MALFORMED_AS_PATH: u16 = 11;
+
+    // fsm Error subcodes
+    const RECEIVE_UNEXPECTED_MESSAGE_IN_OPENSENT_STATE: u16 = 1;
+    const RECEIVE_UNEXPECTED_MESSAGE_IN_OPENCONFIRM_STATE: u16 = 2;
+    const RECEIVE_UNEXPECTED_MESSAGE_IN_ESTABLISHED_STATE: u16 = 3;
+
+    // cease Error subcodes
+    const MAXIMUM_NUMBER_OF_PREFIXES_REACHED: u16 = 1;
+    const ADMINISTRATIVE_SHUTDOWN: u16 = 2;
+    const PEER_DECONFIGURED: u16 = 3;
+    const ADMINISTRATIVE_RESET: u16 = 4;
+    const CONNECTION_REJECTED: u16 = 5;
+    const OTHER_CONFIGURATION_CHANGE: u16 = 6;
+    const CONNECTION_COLLISION_RESOLUTION: u16 = 7;
+    const OUT_OF_RESOURCES: u16 = 8;
 }
 
 pub struct NotificationMessage {
