@@ -409,6 +409,81 @@ impl OpenMessage {
     }
 }
 
+pub enum NotificationCode {
+    MessageHeaderConnectionNotSynchronized,
+    MessageHeaderBadMessageLength,
+    MessageHeaderBadMessageType,
+
+    OpenMessageUnsupportedVersionNumber,
+    OpenMessageBadPeerAs,
+    OpenMessageBadBgpIdentifier,
+    OpenMessageUnsupportedOptionalParameter,
+    OpenMessageUnacceptableHoldTime,
+    OpenMessageUnsupportedCapability,
+}
+
+impl From<NotificationCode> for u16 {
+    fn from(code: NotificationCode) -> Self {
+        match code {
+            NotificationCode::MessageHeaderConnectionNotSynchronized => {
+                NotificationCode::MESSAGE_HEADER_ERROR << 8
+                    | NotificationCode::CONNECTION_NOT_SYNCHRONIZED
+            }
+            NotificationCode::MessageHeaderBadMessageLength => {
+                NotificationCode::MESSAGE_HEADER_ERROR << 8 | NotificationCode::BAD_MESSAGE_LENGTH
+            }
+            NotificationCode::MessageHeaderBadMessageType => {
+                NotificationCode::MESSAGE_HEADER_ERROR << 8 | NotificationCode::BAD_MESSAGE_TYPE
+            }
+
+            NotificationCode::OpenMessageUnsupportedVersionNumber => {
+                NotificationCode::OPEN_MESSAGE_ERROR << 8
+                    | NotificationCode::UNSUPPORTED_VERSION_NUMBER
+            }
+            NotificationCode::OpenMessageBadPeerAs => {
+                NotificationCode::OPEN_MESSAGE_ERROR << 8 | NotificationCode::BAD_PEER_AS
+            }
+            NotificationCode::OpenMessageBadBgpIdentifier => {
+                NotificationCode::OPEN_MESSAGE_ERROR << 8 | NotificationCode::BAD_BGP_IDENTIFIER
+            }
+            NotificationCode::OpenMessageUnsupportedOptionalParameter => {
+                NotificationCode::OPEN_MESSAGE_ERROR << 8
+                    | NotificationCode::UNSUPPORTED_OPTIONAL_PARAMETER
+            }
+            NotificationCode::OpenMessageUnacceptableHoldTime => {
+                NotificationCode::OPEN_MESSAGE_ERROR << 8 | NotificationCode::UNACCEPTABLE_HOLD_TIME
+            }
+            NotificationCode::OpenMessageUnsupportedCapability => {
+                NotificationCode::OPEN_MESSAGE_ERROR << 8 | NotificationCode::UNSUPPORTED_CAPABILITY
+            }
+        }
+    }
+}
+
+impl NotificationCode {
+    const MESSAGE_HEADER_ERROR: u16 = 1;
+    const OPEN_MESSAGE_ERROR: u16 = 2;
+    // const UPDATE_MESSAGE_ERROR: u16 = 3;
+    // const HOLD_TIMER_EXPIRED: u16 = 4;
+    // const FSM_ERROR: u16 = 5;
+    // const CEASE: u16 = 6;
+    // const ROUTE_REFRESH_MESSAGE_ERROR: u16 = 7;
+
+    // Message Header Error subcodes
+    const CONNECTION_NOT_SYNCHRONIZED: u16 = 1;
+    const BAD_MESSAGE_LENGTH: u16 = 2;
+    const BAD_MESSAGE_TYPE: u16 = 3;
+
+    // OPEN Message Error subcodes
+    const UNSUPPORTED_VERSION_NUMBER: u16 = 1;
+    const BAD_PEER_AS: u16 = 2;
+    const BAD_BGP_IDENTIFIER: u16 = 3;
+    const UNSUPPORTED_OPTIONAL_PARAMETER: u16 = 4;
+    //const DEPRECATED_AUTHENTICATION_FAILURE
+    const UNACCEPTABLE_HOLD_TIME: u16 = 6;
+    const UNSUPPORTED_CAPABILITY: u16 = 7;
+}
+
 pub struct NotificationMessage {
     pub code: u8,
     pub sub_code: u8,
@@ -416,6 +491,22 @@ pub struct NotificationMessage {
 }
 
 impl NotificationMessage {
+    pub fn new(code: NotificationCode) -> NotificationMessage {
+        let v: u16 = From::from(code);
+        NotificationMessage {
+            code: (v >> 8) as u8,
+            sub_code: (v & 0xff) as u8,
+            length: 2,
+        }
+    }
+
+    pub fn to_bytes(self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
+        c.write_u8(self.code)?;
+        c.write_u8(self.sub_code)?;
+
+        Ok(2)
+    }
+
     pub fn from_bytes(c: &mut Cursor<&[u8]>) -> Result<NotificationMessage, Error> {
         let code = c.read_u8()?;
         let sub_code = c.read_u8()?;
@@ -562,6 +653,10 @@ impl Message {
             //     Ok(n) => body_length += n,
             //     Err(_) => {}
             // },
+            Message::Notification(b) => match b.to_bytes(&mut c) {
+                Ok(n) => body_length += n,
+                Err(_) => {}
+            },
             _ => {}
         }
 

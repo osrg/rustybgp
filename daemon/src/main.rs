@@ -2453,7 +2453,17 @@ async fn handle_session(
                             let peers = &mut global.lock().await.peers;
                             let peer = peers.get_mut(&addr).unwrap();
                             peer.router_id = open.id;
-                            peer.remote_as = open.get_as_number();
+                            let remote_as = open.get_as_number();
+                            if peer.remote_as != 0 && peer.remote_as != remote_as {
+                                peer.state = bgp::State::Idle;
+                                let msg =
+                                    bgp::Message::Notification(bgp::NotificationMessage::new(
+                                        bgp::NotificationCode::OpenMessageBadPeerAs,
+                                    ));
+                                let _err = session.lines.send(msg).await;
+                                break;
+                            }
+                            peer.remote_as = remote_as;
 
                             peer.remote_cap = open
                                 .params
