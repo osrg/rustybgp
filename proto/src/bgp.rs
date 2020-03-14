@@ -442,6 +442,7 @@ pub enum NotificationCode {
     MaximumNumberOfPrefixes,
     AdministrativeShutdown,
     PeerDeconfigured,
+    AdministrativeReset,
     ConnectionRejected,
     OtherConfigurationChange,
     ConnectionCollistionResolution,
@@ -550,6 +551,9 @@ impl From<NotificationCode> for u16 {
             }
             NotificationCode::PeerDeconfigured => {
                 NotificationCode::CEASE << 8 | NotificationCode::PEER_DECONFIGURED
+            }
+            NotificationCode::AdministrativeReset => {
+                NotificationCode::CEASE << 8 | NotificationCode::ADMINISTRATIVE_RESET
             }
             NotificationCode::ConnectionRejected => {
                 NotificationCode::CEASE << 8 | NotificationCode::CONNECTION_REJECTED
