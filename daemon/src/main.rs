@@ -340,16 +340,13 @@ pub enum TableUpdate {
     Withdrawn(bgp::Nlri, Arc<Source>),
 }
 
-type Tx = mpsc::UnboundedSender<TableUpdate>;
-type Rx = mpsc::UnboundedReceiver<TableUpdate>;
-
 #[derive(Clone)]
 pub struct Table {
     pub local_source: Arc<Source>,
     pub disable_best_path_selection: bool,
     pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
 
-    pub active_peers: HashMap<IpAddr, (Tx, Arc<Source>)>,
+    pub active_peers: HashMap<IpAddr, (Sender<TableUpdate>, Arc<Source>)>,
 }
 
 impl Table {
@@ -1900,7 +1897,7 @@ impl GobgpApi for Service {
 }
 
 type Sender<T> = mpsc::UnboundedSender<T>;
-//type Receiver<T> = mpsc::UnboundedReceiver<T>;
+type Receiver<T> = mpsc::UnboundedReceiver<T>;
 
 pub enum SrvEvent {
     EnableActive(IpAddr),
@@ -2158,7 +2155,7 @@ impl Decoder for Bgp {
     }
 }
 
-enum Event {
+enum PeerEvent {
     Message(bgp::Message),
     Holdtimer,
     Broadcast(TableUpdate),
@@ -2279,7 +2276,7 @@ pub struct Source {
 struct Session {
     lines: Framed<TcpStream, Bgp>,
     delay: Delay,
-    rx: Rx,
+    rx: Receiver<TableUpdate>,
     families: HashSet<bgp::Family>,
 }
 
@@ -2379,20 +2376,20 @@ impl Session {
 }
 
 impl Stream for Session {
-    type Item = Result<Event, io::Error>;
+    type Item = Result<PeerEvent, io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Poll::Ready(()) = self.delay.poll_unpin(cx) {
-            return Poll::Ready(Some(Ok(Event::Holdtimer)));
+            return Poll::Ready(Some(Ok(PeerEvent::Holdtimer)));
         }
 
         if let Poll::Ready(Some(v)) = Pin::new(&mut self.rx).poll_next(cx) {
-            return Poll::Ready(Some(Ok(Event::Broadcast(v))));
+            return Poll::Ready(Some(Ok(PeerEvent::Broadcast(v))));
         }
 
         let result: Option<_> = futures::ready!(Pin::new(&mut self.lines).poll_next(cx));
         Poll::Ready(match result {
-            Some(Ok(message)) => Some(Ok(Event::Message(message))),
+            Some(Ok(message)) => Some(Ok(PeerEvent::Message(message))),
             Some(Err(e)) => Some(Err(e)),
             None => None,
         })
@@ -2440,7 +2437,7 @@ async fn handle_session(
     set_state(&global, addr, state).await;
     while let Some(event) = session.next().await {
         match event {
-            Ok(Event::Holdtimer) => {
+            Ok(PeerEvent::Holdtimer) => {
                 session
                     .delay
                     .reset(Instant::now() + Duration::from_secs(keepalive_interval as u64));
@@ -2457,7 +2454,7 @@ async fn handle_session(
                     }
                 }
             }
-            Ok(Event::Broadcast(msg)) => {
+            Ok(PeerEvent::Broadcast(msg)) => {
                 if session
                     .send_update(source.clone(), vec![msg])
                     .await
@@ -2466,7 +2463,7 @@ async fn handle_session(
                     break;
                 }
             }
-            Ok(Event::Message(msg)) => {
+            Ok(PeerEvent::Message(msg)) => {
                 {
                     let peers = &mut global.lock().await.peers;
                     let peer = peers.get_mut(&addr).unwrap();
