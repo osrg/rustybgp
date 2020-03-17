@@ -684,6 +684,7 @@ pub struct Peer {
     pub local_as: u32,
     pub peer_type: u8,
     pub passive: bool,
+    pub delete_on_disconnected: bool,
 
     pub hold_time: u64,
     pub connect_retry_time: u64,
@@ -717,6 +718,7 @@ impl Peer {
             local_as: as_number,
             peer_type: 0,
             passive: false,
+            delete_on_disconnected: false,
             hold_time: Self::DEFAULT_HOLD_TIME,
             connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
             state: bgp::State::Idle,
@@ -751,6 +753,11 @@ impl Peer {
 
     pub fn passive(mut self, passive: bool) -> Self {
         self.passive = passive;
+        self
+    }
+
+    pub fn delete_on_disconnected(mut self, delete: bool) -> Self {
+        self.delete_on_disconnected = delete;
         self
     }
 
@@ -975,7 +982,7 @@ pub struct Global {
     pub peers: HashMap<IpAddr, Peer>,
     pub peer_group: HashMap<String, PeerGroup>,
 
-    pub active_tx: mpsc::UnboundedSender<IpAddr>,
+    pub server_event_tx: Sender<SrvEvent>,
 }
 
 impl ToApi<api::Global> for Global {
@@ -997,13 +1004,13 @@ impl ToApi<api::Global> for Global {
 }
 
 impl Global {
-    pub fn new(asn: u32, id: Ipv4Addr, active_tx: mpsc::UnboundedSender<IpAddr>) -> Global {
+    pub fn new(asn: u32, id: Ipv4Addr, tx: Sender<SrvEvent>) -> Global {
         Global {
             as_number: asn,
             id: id,
             peers: HashMap::new(),
             peer_group: HashMap::new(),
-            active_tx: active_tx,
+            server_event_tx: tx,
         }
     }
 }
@@ -1203,7 +1210,7 @@ impl GobgpApi for Service {
                         );
 
                         if !passive {
-                            let _ = g.active_tx.send(addr);
+                            let _ = g.server_event_tx.send(SrvEvent::EnableActive(addr));
                         }
                         return Ok(tonic::Response::new(()));
                     }
@@ -1892,6 +1899,14 @@ impl GobgpApi for Service {
     }
 }
 
+type Sender<T> = mpsc::UnboundedSender<T>;
+//type Receiver<T> = mpsc::UnboundedReceiver<T>;
+
+pub enum SrvEvent {
+    EnableActive(IpAddr),
+    Disconneced(Arc<Source>),
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, RustyBGP!");
@@ -1932,9 +1947,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ipv4Addr::new(0, 0, 0, 0)
     };
 
-    let (active_tx, mut active_rx) = mpsc::unbounded_channel::<IpAddr>();
+    let (srv_event_tx, mut srv_event_rx) = mpsc::unbounded_channel();
 
-    let global = Arc::new(Mutex::new(Global::new(asn, router_id, active_tx)));
+    let global = Arc::new(Mutex::new(Global::new(asn, router_id, srv_event_tx)));
     if args.is_present("any") {
         let mut global = global.lock().await;
         global.peer_group.insert(
@@ -2022,10 +2037,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
             }
-            Some(addr) = active_rx.next().fuse() =>{
-                   let sock = std::net::SocketAddr::new(addr, 179);
-                    expirations.insert(sock, Duration::from_secs(5));
-                    continue;
+            Some(event) = srv_event_rx.next().fuse() =>{
+                match event {
+                    SrvEvent::EnableActive(addr) => {
+                        let sock = std::net::SocketAddr::new(addr, 179);
+                        expirations.insert(sock, Duration::from_secs(5));
+                        continue;
+                    }
+                    SrvEvent::Disconneced(source) =>{
+                        let addr = source.address;
+                        {
+                            let mut t = table.lock().await;
+                            t.active_peers.remove(&addr);
+                            for u in t.clear(source.clone()) {
+                                t.broadcast(source.clone(), &u).await;
+                            }
+                        }
+                        let mut g = global.lock().await;
+                        let peer = g.peers.get_mut(&addr).unwrap();
+                        if peer.delete_on_disconnected {
+                            g.peers.remove(&addr);
+                        } else {
+                            let peer = g.peers.get_mut(&addr).unwrap();
+                            peer.reset();
+
+                            if !peer.passive {
+                                let sock = std::net::SocketAddr::new(addr, 179);
+                                expirations.insert(sock, Duration::from_secs(5));
+                            }
+                        }
+                        continue;
+                    }
+                }
             }
         };
 
@@ -2065,14 +2108,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 IpAddr::V4(_) => vec![bgp::Family::Ipv4Uc],
                 IpAddr::V6(_) => vec![bgp::Family::Ipv6Uc],
             };
-            let peer = Peer::new(addr, g.as_number).families(families);
+            let peer = Peer::new(addr, g.as_number)
+                .families(families)
+                .delete_on_disconnected(true);
             g.peers.insert(addr, peer);
         }
 
         let global = Arc::clone(&global);
         let table = Arc::clone(&table);
         tokio::spawn(async move {
-            handle_session(global, table, stream, addr, local_addr, is_dynamic).await;
+            handle_session(global, table, stream, addr, local_addr).await;
         });
     }
 }
@@ -2360,7 +2405,6 @@ async fn handle_session(
     stream: TcpStream,
     addr: IpAddr,
     local_addr: IpAddr,
-    is_dynamic: bool,
 ) {
     let (as_number, router_id) = {
         let global = global.lock().await;
@@ -2641,23 +2685,7 @@ async fn handle_session(
 
     println!("disconnected {}", addr);
     {
-        let mut t = table.lock().await;
-        t.active_peers.remove(&addr);
-        for u in t.clear(source.clone()) {
-            t.broadcast(source.clone(), &u).await;
-        }
-    }
-
-    {
         let g = &mut global.lock().await;
-        if is_dynamic {
-            g.peers.remove(&addr);
-        } else {
-            let peer = g.peers.get_mut(&addr).unwrap();
-            peer.reset();
-            if !peer.passive {
-                let _ = g.active_tx.send(addr);
-            }
-        }
+        let _ = g.server_event_tx.send(SrvEvent::Disconneced(source));
     }
 }
