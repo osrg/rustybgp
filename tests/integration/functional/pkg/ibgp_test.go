@@ -101,7 +101,8 @@ func TestIbgp(t *testing.T) {
 	// test rustybgp active connect
 	err = c.connectPeers("g1", "r1", true)
 	assert.Nil(t, err)
-	err = c.connectPeers("g2", "r1", false)
+	// test rustybgp passive connect
+	err = c.connectPeers("r1", "g2", true)
 	assert.Nil(t, err)
 	err = c.connectPeers("g1", "g2", false)
 	assert.Nil(t, err)

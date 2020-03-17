@@ -1892,40 +1892,6 @@ impl GobgpApi for Service {
     }
 }
 
-enum GlobalEvent {
-    Passive((TcpStream, SocketAddr)),
-    Active(SocketAddr),
-}
-
-struct Streamer {
-    listener: TcpListener,
-    rx: mpsc::UnboundedReceiver<IpAddr>,
-    expirations: DelayQueue<SocketAddr>,
-}
-
-impl Stream for Streamer {
-    type Item = Result<GlobalEvent, io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Poll::Ready(Some(v)) = Pin::new(&mut self.rx).poll_next(cx) {
-            let sock = std::net::SocketAddr::new(v, 179);
-            self.expirations.insert(sock, Duration::from_secs(5));
-        }
-
-        if let Poll::Ready(Some(Ok(v))) = Pin::new(&mut self.expirations).poll_expired(cx) {
-            return Poll::Ready(Some(Ok(GlobalEvent::Active(v.into_inner()))));
-        }
-
-        match Pin::new(&mut self.listener).poll_accept(cx) {
-            Poll::Ready(Ok((socket, addr))) => {
-                Poll::Ready(Some(Ok(GlobalEvent::Passive((socket, addr)))))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, RustyBGP!");
@@ -1966,7 +1932,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ipv4Addr::new(0, 0, 0, 0)
     };
 
-    let (active_tx, active_rx) = mpsc::unbounded_channel::<IpAddr>();
+    let (active_tx, mut active_rx) = mpsc::unbounded_channel::<IpAddr>();
 
     let global = Arc::new(Mutex::new(Global::new(asn, router_id, active_tx)));
     if args.is_present("any") {
@@ -2007,7 +1973,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr = "[::]:179".to_string();
-    let listener = TcpListener::bind(&addr).await?;
+    let mut listener = TcpListener::bind(&addr).await?;
 
     let f = |sock: std::net::SocketAddr| -> IpAddr {
         let mut addr = sock.ip();
@@ -2018,34 +1984,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         addr
     };
-    let mut streamer = Streamer {
-        listener: listener,
-        rx: active_rx,
-        expirations: DelayQueue::new(),
-    };
 
+    let mut expirations: DelayQueue<SocketAddr> = DelayQueue::new();
+    let mut incoming = listener.incoming();
     loop {
-        let (stream, sock) = match streamer.next().await {
-            Some(r) => match r {
-                Ok(GlobalEvent::Passive((stream, sock))) => (stream, sock),
-                Ok(GlobalEvent::Active(sock)) => {
-                    let t = table.lock().await;
-                    if t.active_peers.contains_key(&sock.ip()) {
-                        // already connected
-                        continue;
+        let (stream, sock) = tokio::select! {
+            Some(stream) = incoming.next().fuse() => {
+                match stream {
+                    Ok(stream) =>{
+                        match stream.peer_addr() {
+                            Ok(sock) => (stream, sock),
+                            Err(_) => continue,
+                        }
                     }
-                    println!("try connect to {}", sock);
-                    match TcpStream::connect(sock).await {
-                        Ok(stream) => (stream, sock),
-                        Err(_) => {
-                            streamer.expirations.insert(sock, Duration::from_secs(15));
+                    Err(_) =>continue,
+                }
+            }
+            Some(sock) = expirations.next().fuse() => {
+                    match sock {
+                        Ok(sock)=>{
+                            let sock = sock.into_inner();
+                            let t = table.lock().await;
+                            if t.active_peers.contains_key(&sock.ip()) {
+                                // already connected
+                                continue;
+                            }
+                            match TcpStream::connect(sock).await {
+                                Ok(stream) =>(stream, sock),
+                                Err(_) => {
+                                    expirations.insert(sock, Duration::from_secs(5));
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(_)=>{
                             continue;
                         }
                     }
-                }
-                Err(_) => continue,
-            },
-            None => continue,
+            }
+            Some(addr) = active_rx.next().fuse() =>{
+                   let sock = std::net::SocketAddr::new(addr, 179);
+                    expirations.insert(sock, Duration::from_secs(5));
+                    continue;
+            }
         };
 
         let addr = f(sock);
