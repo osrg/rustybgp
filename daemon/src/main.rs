@@ -1226,7 +1226,10 @@ impl GobgpApi for Service {
                 }
             }
         }
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        Err(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "invalid parameters",
+        ))
     }
     async fn delete_peer(
         &self,
