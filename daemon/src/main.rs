@@ -357,6 +357,7 @@ impl Table {
                 ibgp: false,
                 local_as: 0,
                 local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                state: bgp::State::Idle,
             }),
             disable_best_path_selection: false,
             master: HashMap::new(),
@@ -538,7 +539,10 @@ impl Table {
 
     pub async fn broadcast(&mut self, from: Arc<Source>, msg: &TableUpdate) {
         for (addr, (tx, target)) in self.active_peers.iter_mut() {
-            if *addr != from.address && !(from.ibgp && target.ibgp) {
+            if target.state == bgp::State::Established
+                && *addr != from.address
+                && !(from.ibgp && target.ibgp)
+            {
                 match msg {
                     TableUpdate::NewBest(nlri, nexthop, attrs, source) => {
                         let _ = tx.send(TableUpdate::NewBest(
@@ -755,6 +759,11 @@ impl Peer {
 
     pub fn delete_on_disconnected(mut self, delete: bool) -> Self {
         self.delete_on_disconnected = delete;
+        self
+    }
+
+    pub fn state(mut self, state: bgp::State) -> Self {
+        self.state = state;
         self
     }
 
@@ -2005,7 +2014,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match stream {
                     Ok(stream) =>{
                         match stream.peer_addr() {
-                            Ok(sock) => (stream, sock),
+                            Ok(sock) => {
+                                let t = table.lock().await;
+                                if t.active_peers.contains_key(&sock.ip()) {
+                                    // already connected
+                                    continue;
+                                }
+                                (stream, sock)
+                            },
                             Err(_) => continue,
                         }
                     }
@@ -2080,9 +2096,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let mut g = global.lock().await;
-        let mut is_dynamic = false;
         if g.peers.contains_key(&addr) == true {
         } else {
+            let mut is_dynamic = false;
             for p in &g.peer_group {
                 for d in &*p.1.dynamic_peers {
                     if d.prefix.contains(addr) {
@@ -2107,14 +2123,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let peer = Peer::new(addr, g.as_number)
                 .families(families)
+                .state(bgp::State::Active)
                 .delete_on_disconnected(true);
             g.peers.insert(addr, peer);
         }
 
         let global = Arc::clone(&global);
         let table = Arc::clone(&table);
+        let source = Arc::new(Source {
+            local_addr: local_addr,
+            local_as: 0,
+            address: addr,
+            ibgp: false,
+            state: bgp::State::Active,
+        });
+        let rx = {
+            let mut t = table.lock().await;
+            let (tx, rx) = mpsc::unbounded_channel();
+            t.active_peers.insert(addr, (tx, source.clone()));
+            rx
+        };
         tokio::spawn(async move {
-            handle_session(global, table, stream, addr, local_addr).await;
+            handle_session(global, table, rx, stream, addr, local_addr).await;
         });
     }
 }
@@ -2271,6 +2301,7 @@ pub struct Source {
     ibgp: bool,
     local_as: u32,
     local_addr: IpAddr,
+    state: bgp::State,
 }
 
 struct Session {
@@ -2281,8 +2312,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(stream: TcpStream, as_number: u32) -> Session {
-        let (_, rx) = mpsc::unbounded_channel();
+    fn new(stream: TcpStream, as_number: u32, rx: Receiver<TableUpdate>) -> Session {
         Session {
             lines: Framed::new(
                 stream,
@@ -2399,6 +2429,7 @@ impl Stream for Session {
 async fn handle_session(
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
+    rx: Receiver<TableUpdate>,
     stream: TcpStream,
     addr: IpAddr,
     local_addr: IpAddr,
@@ -2409,13 +2440,7 @@ async fn handle_session(
     };
 
     let mut keepalive_interval = bgp::OpenMessage::HOLDTIME / 3;
-    let mut session = Session::new(stream, as_number);
-    let mut source = Arc::new(Source {
-        local_addr: local_addr,
-        local_as: as_number,
-        address: addr,
-        ibgp: false,
-    });
+    let mut session = Session::new(stream, as_number, rx);
 
     {
         let peers = &mut global.lock().await.peers;
@@ -2433,8 +2458,14 @@ async fn handle_session(
             // in this case, the bellow session.next() will fail.
         }
     }
+
     let mut state = bgp::State::OpenSent;
-    set_state(&global, addr, state).await;
+    let mut source = {
+        let t = table.lock().await;
+        let (_, source) = t.active_peers.get(&addr).unwrap();
+        source.clone()
+    };
+
     while let Some(event) = session.next().await {
         match event {
             Ok(PeerEvent::Holdtimer) => {
@@ -2633,6 +2664,7 @@ async fn handle_session(
                                     local_as: peer.local_as,
                                     address: addr,
                                     ibgp: peer.local_as == peer.remote_as,
+                                    state: bgp::State::Established,
                                 });
                             }
 
@@ -2641,10 +2673,9 @@ async fn handle_session(
                             );
                             let mut v = Vec::new();
                             {
-                                let (tx, rx) = mpsc::unbounded_channel();
                                 let mut t = table.lock().await;
+                                let (tx, _) = t.active_peers.remove(&addr).unwrap();
                                 t.active_peers.insert(addr, (tx, source.clone()));
-                                session.rx = rx;
 
                                 if t.disable_best_path_selection == false {
                                     for family in &session.families {
