@@ -30,6 +30,7 @@ ADD gobgp /usr/bin
 ENTRYPOINT ["/usr/bin/supervisord"]
 EOF
         docker build . -t rustybgp-ci -f Dockerfile
+	rm Dockerfile LICENSE README.md gobgp_2.11.0_linux_amd64.tar.gz gobgp gobgpd rustybgpd
     ;;
 
     start)
