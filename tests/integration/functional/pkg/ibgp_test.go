@@ -28,7 +28,7 @@ func addEbgpPeer(t *testing.T, c *bgpTest) {
 	c.waitForEstablish("g3")
 
 	// g3 should receive routes from ibgp peers
-	r, err := c.getCounter("g3", "r1")
+	r, err := c.getTableCounter("g3", "r1")
 	assert.Nil(t, err)
 	assert.Equal(t, r.accepted, uint64(2))
 
@@ -54,10 +54,10 @@ func addEbgpPeer(t *testing.T, c *bgpTest) {
 
 func checkAdjout(t *testing.T, c *bgpTest) {
 	// should not send routes from ibgp to ibgp peers
-	r, err := c.getCounter("g1", "r1")
+	r, err := c.getTableCounter("g1", "r1")
 	assert.Nil(t, err)
 	assert.Equal(t, r.received, uint64(0))
-	r, err = c.getCounter("g2", "r1")
+	r, err = c.getTableCounter("g2", "r1")
 	assert.Nil(t, err)
 	assert.Equal(t, r.received, uint64(0))
 

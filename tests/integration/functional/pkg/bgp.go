@@ -163,6 +163,15 @@ func (b *bgpTest) addPeer(name1, name2 string, passive bool) error {
 	return err
 }
 
+func (b *bgpTest) deletePeer(name1, name2 string) error {
+	p1 := b.containers[name1]
+	p2 := b.containers[name2]
+	_, err := p1.apiClient.DeletePeer(context.Background(), &api.DeletePeerRequest{
+		Address: p2.ip.String(),
+	})
+	return err
+}
+
 func (b *bgpTest) connectPeers(name1, name2 string, passive bool) error {
 	if err := b.addPeer(name1, name2, passive); err != nil {
 		fmt.Println(err)
@@ -367,13 +376,55 @@ func (b *bgpTest) listPath(name string, table tableType, neighbor string) ([]pat
 }
 
 type messageCounter struct {
+	notification   uint64
+	update         uint64
+	open           uint64
+	keepalive      uint64
+	refresh        uint64
+	discarded      uint64
+	total          uint64
+	withdrawUpdate uint64
+	withdrawPrefix uint64
+}
+
+func (b *bgpTest) getMessageCounter(name, neighbor string) (messageCounter, error) {
+	c := messageCounter{}
+	stream, err := b.containers[name].apiClient.ListPeer(context.Background(), &api.ListPeerRequest{Address: b.containers[neighbor].ip.String(), EnableAdvertised: true})
+	if err != nil {
+		return c, err
+	}
+
+	for {
+		r, err := stream.Recv()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return c, err
+		}
+		s := r.Peer.State.Messages.GetReceived()
+		return messageCounter{
+			notification:   s.Notification,
+			update:         s.Update,
+			open:           s.Open,
+			keepalive:      s.Keepalive,
+			refresh:        s.Refresh,
+			discarded:      s.Discarded,
+			total:          s.Total,
+			withdrawUpdate: s.WithdrawUpdate,
+			withdrawPrefix: s.WithdrawPrefix,
+		}, nil
+	}
+	return c, fmt.Errorf("not found")
+}
+
+type tableCounter struct {
 	advertised uint64
 	received   uint64
 	accepted   uint64
 }
 
-func (b *bgpTest) getCounter(name, neighbor string) (messageCounter, error) {
-	c := messageCounter{}
+func (b *bgpTest) getTableCounter(name, neighbor string) (tableCounter, error) {
+	c := tableCounter{}
 	stream, err := b.containers[name].apiClient.ListPeer(context.Background(), &api.ListPeerRequest{Address: b.containers[neighbor].ip.String(), EnableAdvertised: true})
 	if err != nil {
 		return c, err
@@ -388,14 +439,13 @@ func (b *bgpTest) getCounter(name, neighbor string) (messageCounter, error) {
 		}
 		for _, a := range r.Peer.AfiSafis {
 			if a.State.Family.Afi == api.Family_AFI_IP {
-				return messageCounter{
+				return tableCounter{
 					advertised: a.State.Advertised,
 					received:   a.State.Received,
 					accepted:   a.State.Accepted,
 				}, nil
 			}
 		}
-
 	}
 	return c, fmt.Errorf("not found")
 }
