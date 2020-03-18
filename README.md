@@ -2,7 +2,7 @@
 
 The mission is to develop a high-performance, low-memory-footprint, and safe BGP implementation; an experiment to implement aged and rusty BGP protocol in a modern language.
 
-RustyBGP supports the gRPC APIs same as GoBGP; GoBGP's CLI command allows you to manage RustyBGP. Currently, the very basic BGP features are supported; eBGP and iBGP, active/passive connection, v4 and v6 families, adding/deleting routes, showing the tables, etc. No policy, route server support, fancy families, etc.
+RustyBGP supports the gRPC APIs same as GoBGP; your code to manage GoBGP via the APIs should work with RustyBGP. If you need CLI, GoBGP's CLI command allows you to manage RustyBGP.
 
 ## Get Started
 
@@ -39,6 +39,23 @@ If you just want to check out the performance, start the daemon with `--any-peer
 $ sudo ./target/debug/daemon --as-number 65001 --router-id 1.1.1.1 --any-peers
 Hello, RustyBGP!
 ```
+
+## Supported Features
+
+Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/passive connection, etc with the following gRPC APIs.
+
+|API           |CLI                                                    | note        |
+|--------------|-------------------------------------------------------|-------------|
+|start_bgp     |`gobgp global as <VALUE> router-id <IP>`   |             |
+|get_bgp       |`gobgp global`||
+|add_peer      |`gobgp neighbor add <IP> as <VALUE> router-id <IP>`    | only v4/v6 families supported, no fancy capabilities like addpath|
+|delete_peer      |`gobgp neighbor del <IP>`     ||
+|list_peer|`gobgp neighbor`/`gobgp neighbor <IP>`||
+|add_path| `gobgp global rib add <PREFIX>`||
+|delete_path| `gobgp global rib del <PREFIX>`||
+|list_path|`gobgp global rib`/`gobgp neighbor <IP> [adj-in\|adj-out]`||
+|add_path_stream|`gobgp mrt global inject [FILE]`||
+|get_table|`gobgp global rib summary `||
 
 ## Community, discussion and support
 
