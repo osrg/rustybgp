@@ -44,18 +44,18 @@ Hello, RustyBGP!
 
 Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/passive connection, etc with the following gRPC APIs.
 
-|API           |CLI                                                    | note        |
+|API           |Relevant CLI                                           | Note        |
 |--------------|-------------------------------------------------------|-------------|
-|start_bgp     |`gobgp global as <VALUE> router-id <IP>`   |             |
-|get_bgp       |`gobgp global`||
-|add_peer      |`gobgp neighbor add <IP> as <VALUE> router-id <IP>`    | only v4/v6 families supported, no fancy capabilities like addpath|
-|delete_peer      |`gobgp neighbor del <IP>`     ||
+|start_bgp|`gobgp global as <VALUE> router-id <IP>`||
+|get_bgp|`gobgp global`||
+|add_peer|`gobgp neighbor add <IP> as <VALUE> router-id <IP>`| only v4/v6 families supported, no fancy capabilities like addpath|
+|delete_peer|`gobgp neighbor del <IP>`||
 |list_peer|`gobgp neighbor`/`gobgp neighbor <IP>`||
-|add_path| `gobgp global rib add <PREFIX>`||
-|delete_path| `gobgp global rib del <PREFIX>`||
+|add_path|`gobgp global rib add <PREFIX>`||
+|delete_path|`gobgp global rib del <PREFIX>`||
 |list_path|`gobgp global rib`/`gobgp neighbor <IP> [adj-in\|adj-out]`||
 |add_path_stream|`gobgp mrt global inject [FILE]`||
-|get_table|`gobgp global rib summary `||
+|get_table|`gobgp global rib summary`||
 
 ## Community, discussion and support
 
