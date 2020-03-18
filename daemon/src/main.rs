@@ -2015,8 +2015,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         init_tx.wait().await;
     }
 
-    let addr = "[::]:179".to_string();
-    let mut listener = TcpListener::bind(&addr).await?;
+    let mut listener = TcpListener::bind(&"[::]:179".to_string()).await?;
 
     let f = |sock: std::net::SocketAddr| -> IpAddr {
         let mut addr = sock.ip();
@@ -2477,17 +2476,13 @@ async fn handle_session(
         let peers = &mut global.lock().await.peers;
         let peer = peers.get_mut(&addr).unwrap();
 
-        if session
+        let _ = session
             .lines
             .send(bgp::Message::Open(bgp::OpenMessage::new(
                 router_id,
                 peer.local_cap.iter().cloned().collect(),
             )))
-            .await
-            .is_err()
-        {
-            // in this case, the bellow session.next() will fail.
-        }
+            .await;
     }
 
     let mut state = bgp::State::OpenSent;
@@ -2556,7 +2551,7 @@ async fn handle_session(
                                         bgp::Message::Notification(bgp::NotificationMessage::new(
                                             bgp::NotificationCode::OpenMessageBadPeerAs,
                                         ));
-                                    let _err = session.lines.send(msg).await;
+                                    let _ = session.lines.send(msg).await;
                                     break;
                                 }
                                 peer.remote_as = remote_as;
@@ -2750,8 +2745,6 @@ async fn handle_session(
     }
 
     println!("disconnected {}", addr);
-    {
-        let g = &mut global.lock().await;
-        let _ = g.server_event_tx.send(SrvEvent::Disconneced(source));
-    }
+    let g = &mut global.lock().await;
+    let _ = g.server_event_tx.send(SrvEvent::Disconneced(source));
 }
