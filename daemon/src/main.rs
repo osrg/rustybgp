@@ -1230,9 +1230,24 @@ impl GobgpApi for Service {
     }
     async fn delete_peer(
         &self,
-        _request: tonic::Request<api::DeletePeerRequest>,
+        request: tonic::Request<api::DeletePeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        if let Ok(addr) = IpAddr::from_str(&request.into_inner().address) {
+            let g = &mut self.global.lock().await;
+            if g.peers.contains_key(&addr) {
+                let _ = g.server_event_tx.send(SrvEvent::Deconfigured(addr));
+                return Ok(tonic::Response::new(()));
+            } else {
+                return Err(tonic::Status::new(
+                    tonic::Code::AlreadyExists,
+                    "peer address doesn't exists",
+                ));
+            }
+        }
+        Err(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "invalid peer address",
+        ))
     }
     type ListPeerStream = mpsc::Receiver<Result<api::ListPeerResponse, tonic::Status>>;
     async fn list_peer(
@@ -1914,6 +1929,7 @@ type Receiver<T> = mpsc::UnboundedReceiver<T>;
 pub enum SrvEvent {
     EnableActive(IpAddr),
     Disconneced(Arc<Source>),
+    Deconfigured(IpAddr),
 }
 
 #[tokio::main]
@@ -2084,6 +2100,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     }
+                    SrvEvent::Deconfigured(addr) =>{
+                        let mut g = global.lock().await;
+                        let t = table.lock().await;
+
+                        match g.peers.get_mut(&addr) {
+                            Some(peer) =>{
+                                if t.active_peers.contains_key(&addr) {
+                                    peer.delete_on_disconnected = true;
+                                    let (tx, _) = t.active_peers.get(&addr).unwrap();
+                                    let _=tx.send(PeerEvent::Notification(
+                                        bgp::NotificationMessage::new(
+                                            bgp::NotificationCode::PeerDeconfigured,
+                                        )
+                                    ));
+                                } else {
+                                    g.peers.remove(&addr);
+                                }
+                            }
+                            None => continue,
+                        }
+
+                        continue;
+                    }
                 }
             }
         };
@@ -2190,6 +2229,7 @@ impl Decoder for Bgp {
 
 pub enum PeerEvent {
     Broadcast(TableUpdate),
+    Notification(bgp::NotificationMessage),
 }
 
 fn update_attrs(
@@ -2482,6 +2522,10 @@ async fn handle_session(
                         {
                             break;
                         }
+                    }
+                    PeerEvent::Notification(msg) => {
+                        let _ = session.lines.send(bgp::Message::Notification(msg)).await;
+                        break;
                     }
                 }
             }
