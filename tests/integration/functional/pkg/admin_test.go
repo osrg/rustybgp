@@ -39,8 +39,9 @@ func TestAdmin(t *testing.T) {
 
 	c.deletePeer("r1", "g1")
 
-	checkGlobalRibNum(t, c, "g2", 1)
+	c.waitForActive("g1", "r1")
 
+	checkGlobalRibNum(t, c, "g2", 1)
 	// rustybgp sent notification?
 	m, err := c.getMessageCounter("g1", "r1")
 	assert.Nil(t, err)

@@ -188,6 +188,39 @@ func (b *bgpTest) connectPeers(name1, name2 string, passive bool) error {
 	return nil
 }
 
+func (b *bgpTest) waitForState(name1, name2 string, s api.PeerState_SessionState) error {
+	p1 := b.containers[name1]
+	p2 := b.containers[name2]
+	for {
+		stream, err := p1.apiClient.ListPeer(context.Background(), &api.ListPeerRequest{
+			Address: p2.ip.String(),
+		})
+		if err != nil {
+			fmt.Println(err)
+			return err
+		}
+
+		for {
+			r, err := stream.Recv()
+			if err == io.EOF {
+				break
+			} else if err != nil {
+				fmt.Println(err)
+				return err
+			}
+			if r.Peer.State.SessionState == s {
+				return nil
+			}
+		}
+		time.Sleep(time.Millisecond * 100)
+	}
+	return nil
+}
+
+func (b *bgpTest) waitForActive(name1, name2 string) error {
+	return b.waitForState(name1, name2, api.PeerState_ACTIVE)
+}
+
 func (b *bgpTest) waitForEstablish(name string) error {
 	for {
 		stream, err := b.containers[name].apiClient.ListPeer(context.Background(), &api.ListPeerRequest{})
