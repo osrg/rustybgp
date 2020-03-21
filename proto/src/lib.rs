@@ -14,5 +14,6 @@
 // limitations under the License.
 
 pub mod bgp;
+pub mod bmp;
 #[macro_use]
 extern crate failure;

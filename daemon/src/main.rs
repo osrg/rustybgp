@@ -46,7 +46,7 @@ mod api {
 }
 use api::gobgp_api_server::{GobgpApi, GobgpApiServer};
 
-use proto::bgp;
+use proto::{bgp, bmp};
 
 fn to_any<T: prost::Message>(m: T, name: &str) -> prost_types::Any {
     let mut v = Vec::new();
@@ -347,6 +347,7 @@ pub struct Table {
     pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
 
     pub active_peers: HashMap<IpAddr, (Sender<PeerEvent>, Arc<Source>)>,
+    pub bmp_sessions: HashMap<SocketAddr, Sender<bmp::Message>>,
 }
 
 impl Table {
@@ -362,6 +363,7 @@ impl Table {
             disable_best_path_selection: false,
             master: HashMap::new(),
             active_peers: HashMap::new(),
+            bmp_sessions: HashMap::new(),
         }
     }
 
@@ -692,6 +694,7 @@ impl api::Peer {
 
 pub struct Peer {
     pub address: IpAddr,
+    pub local_port: u16,
     pub remote_port: u16,
     pub remote_as: u32,
     pub router_id: Ipv4Addr,
@@ -727,6 +730,7 @@ impl Peer {
     pub fn new(address: IpAddr, as_number: u32) -> Peer {
         Peer {
             address: address,
+            local_port: 0,
             remote_port: 0,
             remote_as: 0,
             router_id: Ipv4Addr::new(0, 0, 0, 0),
@@ -822,6 +826,52 @@ impl Peer {
                     self.accepted.insert(family, delta as u64);
                 }
             }
+        }
+    }
+
+    fn to_bmp_up(&self, router_id: Ipv4Addr, local_address: IpAddr) -> bmp::PeerUpNotification {
+        let sent = bgp::Message::Open(bgp::OpenMessage::new(
+            router_id,
+            self.local_cap.iter().cloned().collect(),
+        ))
+        .to_bytes()
+        .unwrap();
+        let recv = bgp::Message::Open(bgp::OpenMessage::new(
+            self.router_id,
+            self.remote_cap.iter().cloned().collect(),
+        ))
+        .to_bytes()
+        .unwrap();
+        bmp::PeerUpNotification {
+            peer_header: bmp::PeerHeader::new(
+                0,
+                0,
+                self.address,
+                self.remote_as,
+                self.router_id,
+                self.uptime,
+            ),
+            local_address: local_address,
+            local_port: self.local_port,
+            remote_port: self.remote_port,
+            sent_open: sent,
+            received_open: recv,
+        }
+    }
+
+    fn to_bmp_down(&self, r: u8) -> bmp::PeerDownNotification {
+        bmp::PeerDownNotification {
+            peer_header: bmp::PeerHeader::new(
+                0,
+                0,
+                self.address,
+                self.remote_as,
+                self.router_id,
+                self.uptime,
+            ),
+            reason: r,
+            payload: Vec::new(),
+            data: Vec::new(),
         }
     }
 }
@@ -1242,9 +1292,10 @@ impl GobgpApi for Service {
                         );
 
                         if !passive {
-                            let _ = g
-                                .server_event_tx
-                                .send(SrvEvent::EnableActive(SocketAddr::new(addr, remote_port)));
+                            let _ = g.server_event_tx.send(SrvEvent::EnableActive {
+                                proto: Proto::Bgp,
+                                sockaddr: SocketAddr::new(addr, remote_port),
+                            });
                         }
                         return Ok(tonic::Response::new(()));
                     }
@@ -1939,9 +1990,25 @@ impl GobgpApi for Service {
     }
     async fn add_bmp(
         &self,
-        _request: tonic::Request<api::AddBmpRequest>,
+        request: tonic::Request<api::AddBmpRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let request = request.into_inner();
+        if let Ok(addr) = IpAddr::from_str(&request.address) {
+            let g = &mut self.global.lock().await;
+            let mut port = request.port as u16;
+            if port == 0 {
+                port = bmp::DEFAULT_PORT;
+            }
+            let _ = g.server_event_tx.send(SrvEvent::EnableActive {
+                proto: Proto::Bmp,
+                sockaddr: SocketAddr::new(addr, port),
+            });
+            return Ok(tonic::Response::new(()));
+        }
+        Err(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "invalid parameters",
+        ))
     }
     async fn delete_bmp(
         &self,
@@ -1954,9 +2021,21 @@ impl GobgpApi for Service {
 type Sender<T> = mpsc::UnboundedSender<T>;
 type Receiver<T> = mpsc::UnboundedReceiver<T>;
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Proto {
+    Bgp,
+    Bmp,
+    // Rpki,
+}
+
+pub enum DisconnectedProto {
+    Bgp(Arc<Source>),
+    Bmp(SocketAddr),
+}
+
 pub enum SrvEvent {
-    EnableActive(SocketAddr),
-    Disconneced(Arc<Source>),
+    EnableActive { proto: Proto, sockaddr: SocketAddr },
+    Disconnected(DisconnectedProto),
     Deconfigured(IpAddr),
 }
 
@@ -2053,10 +2132,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         addr
     };
 
-    let mut expirations: DelayQueue<SocketAddr> = DelayQueue::new();
+    let mut expirations: DelayQueue<(Proto, SocketAddr)> = DelayQueue::new();
     let mut incoming = listener.incoming();
     loop {
-        let (stream, sock) = tokio::select! {
+        let (proto, stream, sock) = tokio::select! {
             Some(stream) = incoming.next().fuse() => {
                 match stream {
                     Ok(stream) =>{
@@ -2067,7 +2146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // already connected
                                     continue;
                                 }
-                                (stream, sock)
+                                (Proto::Bgp, stream, sock)
                             },
                             Err(_) => continue,
                         }
@@ -2075,19 +2154,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) =>continue,
                 }
             }
-            Some(sock) = expirations.next().fuse() => {
-                    match sock {
-                        Ok(sock)=>{
-                            let sock = sock.into_inner();
+            Some(v) = expirations.next().fuse() => {
+                    match v {
+                        Ok(v)=>{
+                            let (proto, sockaddr) = v.into_inner();
                             let t = table.lock().await;
-                            if t.active_peers.contains_key(&sock.ip()) {
-                                // already connected
-                                continue;
+                            if proto == Proto::Bgp {
+                                if t.active_peers.contains_key(&sockaddr.ip()) {
+                                    // already connected
+                                    continue;
+                                }
                             }
-                            match TcpStream::connect(sock).await {
-                                Ok(stream) => (stream, sock),
+                            match TcpStream::connect(sockaddr).await {
+                                Ok(stream) => (proto, stream, sockaddr),
                                 Err(_) => {
-                                    expirations.insert(sock, Duration::from_secs(5));
+                                    expirations.insert((proto, sockaddr), Duration::from_secs(5));
                                     continue;
                                 }
                             }
@@ -2099,29 +2180,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Some(event) = srv_event_rx.next().fuse() =>{
                 match event {
-                    SrvEvent::EnableActive(sock) => {
-                        expirations.insert(sock, Duration::from_secs(5));
+                    SrvEvent::EnableActive{proto, sockaddr} => {
+                        expirations.insert((proto, sockaddr), Duration::from_secs(5));
                         continue;
                     }
-                    SrvEvent::Disconneced(source) =>{
-                        let addr = source.address;
-                        {
-                            let mut t = table.lock().await;
-                            t.active_peers.remove(&addr);
-                            for u in t.clear(source.clone()) {
-                                t.broadcast(source.clone(), &u).await;
+                    SrvEvent::Disconnected(p) =>{
+                        match p {
+                            DisconnectedProto::Bgp(source) => {
+                                let addr = source.address;
+                                {
+                                    let mut t = table.lock().await;
+                                    t.active_peers.remove(&addr);
+                                    for u in t.clear(source.clone()) {
+                                        t.broadcast(source.clone(), &u).await;
+                                    }
+                                }
+                                {
+                                    let mut g = global.lock().await;
+                                    for (_, tx) in &table.lock().await.bmp_sessions {
+                                        let peer = g.peers.get_mut(&addr).unwrap();
+                                        let _ = tx.send(bmp::Message::PeerDownNotification(peer.to_bmp_down(bmp::PeerDownNotification::REASON_UNKNOWN)));
+                                    }
+                                    let peer = g.peers.get_mut(&addr).unwrap();
+                                    if peer.delete_on_disconnected {
+                                        g.peers.remove(&addr);
+                                    } else {
+                                        let peer = g.peers.get_mut(&addr).unwrap();
+                                        peer.reset();
+                                        if !peer.passive {
+                                            expirations.insert((Proto::Bgp, SocketAddr::new(addr, peer.remote_port)), Duration::from_secs(5));
+                                        }
+                                    }
+                                }
                             }
-                        }
-                        let mut g = global.lock().await;
-                        let peer = g.peers.get_mut(&addr).unwrap();
-                        if peer.delete_on_disconnected {
-                            g.peers.remove(&addr);
-                        } else {
-                            let peer = g.peers.get_mut(&addr).unwrap();
-                            peer.reset();
-
-                            if !peer.passive {
-                                expirations.insert(SocketAddr::new(addr, peer.remote_port), Duration::from_secs(5));
+                            DisconnectedProto::Bmp(sockaddr) =>{
+                                let mut t = table.lock().await;
+                                t.bmp_sessions.remove(&sockaddr);
+                                expirations.insert((Proto::Bmp, sockaddr), Duration::from_secs(5));
                             }
                         }
                         continue;
@@ -2154,7 +2249,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let addr = f(sock);
-        println!("got new connection {:?}", addr);
+        println!("got new connection {:?} {:?}", proto, addr);
+
+        if proto == Proto::Bmp {
+            let global = Arc::clone(&global);
+            let g1 = Arc::clone(&global);
+            let g = g1.lock().await;
+            let mut t = table.lock().await;
+            if !t.bmp_sessions.contains_key(&sock) {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+
+                let _ = tx.send(bmp::Message::Initiation(
+                    bmp::Initiation::new()
+                        .tlv(
+                            bmp::Initiation::TLV_SYS_NAME,
+                            format!("RusytBGP").as_bytes().to_vec(),
+                        )
+                        .tlv(
+                            bmp::Initiation::TLV_SYS_DESCR,
+                            format!("master").as_bytes().to_vec(),
+                        ),
+                ));
+
+                for (_, (_, source)) in t.active_peers.iter() {
+                    if source.state != bgp::State::Established {
+                        continue;
+                    }
+                    let p = g.peers.get(&source.address).unwrap();
+                    let _ = tx.send(bmp::Message::PeerUpNotification(
+                        p.to_bmp_up(g.id, source.address),
+                    ));
+                }
+
+                t.bmp_sessions.insert(sock, tx);
+                tokio::spawn(async move {
+                    handle_bmp_session(Arc::clone(&global), &mut rx, stream, sock).await;
+                });
+            }
+            continue;
+        }
+
         let local_addr = {
             if let Ok(l) = stream.local_addr() {
                 f(l)
@@ -2734,9 +2868,16 @@ async fn handle_session(
                                 );
                                 let mut v = Vec::new();
                                 {
+                                    let g = global.lock().await;
                                     let mut t = table.lock().await;
                                     let (tx, _) = t.active_peers.remove(&addr).unwrap();
                                     t.active_peers.insert(addr, (tx, source.clone()));
+
+                                    for (_, tx) in t.bmp_sessions.iter_mut() {
+                                        let p = g.peers.get(&addr).unwrap();
+                                        let _ = tx.send(bmp::Message::PeerUpNotification(
+                                        p.to_bmp_up(g.id, source.address)));
+                                    }
 
                                     if t.disable_best_path_selection == false {
                                         for family in &session.families {
@@ -2770,5 +2911,36 @@ async fn handle_session(
 
     println!("disconnected {}", addr);
     let g = &mut global.lock().await;
-    let _ = g.server_event_tx.send(SrvEvent::Disconneced(source));
+    let _ = g
+        .server_event_tx
+        .send(SrvEvent::Disconnected(DisconnectedProto::Bgp(source)));
+}
+
+async fn handle_bmp_session(
+    global: Arc<Mutex<Global>>,
+    rx: &mut Receiver<bmp::Message>,
+    mut stream: TcpStream,
+    sockaddr: SocketAddr,
+) {
+    loop {
+        tokio::select! {
+            Some(msg) = rx.next().fuse() => {
+                match msg.to_bytes() {
+                    Ok(buf) => {
+                        if stream.write_all(&buf).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) =>{
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    println!("bmp connection is closed");
+    let g = &mut global.lock().await;
+    let _ = g
+        .server_event_tx
+        .send(SrvEvent::Disconnected(DisconnectedProto::Bmp(sockaddr)));
 }
