@@ -621,6 +621,15 @@ impl api::Peer {
         false
     }
 
+    pub fn get_remote_port(&self) -> u16 {
+        if let Some(transport) = &self.transport {
+            if transport.remote_port != 0 {
+                return transport.remote_port as u16;
+            }
+        }
+        return bgp::BGP_PORT;
+    }
+
     pub fn get_local_as(&self) -> u32 {
         if let Some(conf) = &self.conf {
             return conf.local_as;
@@ -683,6 +692,7 @@ impl api::Peer {
 
 pub struct Peer {
     pub address: IpAddr,
+    pub remote_port: u16,
     pub remote_as: u32,
     pub router_id: Ipv4Addr,
     pub local_as: u32,
@@ -717,6 +727,7 @@ impl Peer {
     pub fn new(address: IpAddr, as_number: u32) -> Peer {
         Peer {
             address: address,
+            remote_port: 0,
             remote_as: 0,
             router_id: Ipv4Addr::new(0, 0, 0, 0),
             local_as: as_number,
@@ -747,6 +758,11 @@ impl Peer {
             .map(|family| bgp::Capability::MultiProtocol { family: *family })
             .collect();
         self.local_cap.append(&mut v);
+        self
+    }
+
+    pub fn remote_port(mut self, remote_port: u16) -> Self {
+        self.remote_port = remote_port;
         self
     }
 
@@ -987,6 +1003,7 @@ pub struct PeerGroup {
 pub struct Global {
     pub as_number: u32,
     pub id: Ipv4Addr,
+    pub listen_port: u16,
 
     pub peers: HashMap<IpAddr, Peer>,
     pub peer_group: HashMap<String, PeerGroup>,
@@ -999,7 +1016,7 @@ impl ToApi<api::Global> for Global {
         api::Global {
             r#as: self.as_number,
             router_id: self.id.to_string(),
-            listen_port: 0,
+            listen_port: self.listen_port as i32,
             listen_addresses: Vec::new(),
             families: Vec::new(),
             use_multiple_paths: false,
@@ -1017,6 +1034,7 @@ impl Global {
         Global {
             as_number: asn,
             id: id,
+            listen_port: bgp::BGP_PORT,
             peers: HashMap::new(),
             peer_group: HashMap::new(),
             server_event_tx: tx,
@@ -1151,6 +1169,9 @@ impl GobgpApi for Service {
                     Ok(addr) => {
                         g.as_number = global.r#as;
                         g.id = addr;
+                        if global.listen_port != 0 {
+                            g.listen_port = global.listen_port as u16;
+                        }
                         self.init_tx.wait().await;
                     }
                     Err(_) => {
@@ -1208,10 +1229,12 @@ impl GobgpApi for Service {
                         ));
                     } else {
                         let passive = peer.get_passive_mode();
+                        let remote_port = peer.get_remote_port();
                         g.peers.insert(
                             addr,
                             Peer::new(addr, as_number)
                                 .remote_as(peer.get_remote_as())
+                                .remote_port(remote_port)
                                 .families(peer.get_families())
                                 .passive(passive)
                                 .hold_time(peer.get_hold_time())
@@ -1219,7 +1242,9 @@ impl GobgpApi for Service {
                         );
 
                         if !passive {
-                            let _ = g.server_event_tx.send(SrvEvent::EnableActive(addr));
+                            let _ = g
+                                .server_event_tx
+                                .send(SrvEvent::EnableActive(SocketAddr::new(addr, remote_port)));
                         }
                         return Ok(tonic::Response::new(()));
                     }
@@ -1930,7 +1955,7 @@ type Sender<T> = mpsc::UnboundedSender<T>;
 type Receiver<T> = mpsc::UnboundedReceiver<T>;
 
 pub enum SrvEvent {
-    EnableActive(IpAddr),
+    EnableActive(SocketAddr),
     Disconneced(Arc<Source>),
     Deconfigured(IpAddr),
 }
@@ -2015,9 +2040,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         init_tx.wait().await;
     }
 
-    let mut listener = TcpListener::bind(&"[::]:179".to_string()).await?;
+    let mut listener =
+        TcpListener::bind(format!("[::]:{}", global.lock().await.listen_port)).await?;
 
-    let f = |sock: std::net::SocketAddr| -> IpAddr {
+    let f = |sock: SocketAddr| -> IpAddr {
         let mut addr = sock.ip();
         if let IpAddr::V6(a) = addr {
             if let Some(a) = a.to_ipv4() {
@@ -2059,7 +2085,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                             match TcpStream::connect(sock).await {
-                                Ok(stream) =>(stream, sock),
+                                Ok(stream) => (stream, sock),
                                 Err(_) => {
                                     expirations.insert(sock, Duration::from_secs(5));
                                     continue;
@@ -2073,8 +2099,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Some(event) = srv_event_rx.next().fuse() =>{
                 match event {
-                    SrvEvent::EnableActive(addr) => {
-                        let sock = std::net::SocketAddr::new(addr, 179);
+                    SrvEvent::EnableActive(sock) => {
                         expirations.insert(sock, Duration::from_secs(5));
                         continue;
                     }
@@ -2096,8 +2121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             peer.reset();
 
                             if !peer.passive {
-                                let sock = std::net::SocketAddr::new(addr, 179);
-                                expirations.insert(sock, Duration::from_secs(5));
+                                expirations.insert(SocketAddr::new(addr, peer.remote_port), Duration::from_secs(5));
                             }
                         }
                         continue;

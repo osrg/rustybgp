@@ -21,6 +21,8 @@ use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
+pub const BGP_PORT: u16 = 179;
+
 const AS_TRANS: u16 = 23456;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
