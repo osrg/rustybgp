@@ -34,7 +34,7 @@ use tokio::{
     sync::{mpsc, Barrier, Mutex},
     time::{delay_for, DelayQueue, Instant},
 };
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::codec::{BytesCodec, Decoder, Encoder, Framed};
 
 use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
@@ -2925,21 +2925,28 @@ async fn handle_session(
 async fn handle_bmp_session(
     global: Arc<Mutex<Global>>,
     rx: &mut Receiver<bmp::Message>,
-    mut stream: TcpStream,
+    stream: TcpStream,
     sockaddr: SocketAddr,
 ) {
+    let mut lines = Framed::new(stream, BytesCodec::new());
     loop {
         tokio::select! {
             Some(msg) = rx.next().fuse() => {
                 match msg.to_bytes() {
                     Ok(buf) => {
-                        if stream.write_all(&buf).await.is_err() {
+                        if lines.get_mut().write_all(&buf).await.is_err() {
                             break;
                         }
                     }
                     Err(_) =>{
                         break;
                     }
+                }
+            }
+            v = lines.next().fuse() => {
+                if let Some(_)= v {
+                } else {
+                    break;
                 }
             }
         }
