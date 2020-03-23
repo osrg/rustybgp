@@ -2691,13 +2691,18 @@ async fn handle_session(
                     }
                 }
             }
-            Some(msg) = session.lines.next().fuse() => {
+            msg = session.lines.next().fuse() => {
                 let msg = match msg {
-                    Ok(msg) => msg,
-                    Err(_) => continue,
+                    Some(msg) => {
+                        match msg {
+                            Ok(msg) => msg,
+                            Err(_) => break,
+                        }
+                    }
+                    None => break,
                 };
 
-                {
+                    {
                         let peers = &mut global.lock().await.peers;
                         let peer = peers.get_mut(&addr).unwrap();
                         peer.counter_rx.sync(&msg);
