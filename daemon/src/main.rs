@@ -90,6 +90,23 @@ impl ToApi<api::Family> for bgp::Family {
     }
 }
 
+trait SocketAddrToIpAddr {
+    fn to_ipaddr(&self) -> IpAddr;
+}
+
+impl SocketAddrToIpAddr for SocketAddr {
+    // convert IPv4-mapped IPv6 address to IPv4 address
+    fn to_ipaddr(&self) -> IpAddr {
+        let mut addr = self.ip();
+        if let IpAddr::V6(a) = addr {
+            if let Some(a) = a.to_ipv4() {
+                addr = IpAddr::V4(a);
+            }
+        }
+        addr
+    }
+}
+
 trait FromFamilyApi {
     fn to_proto(&self) -> bgp::Family;
 }
@@ -2122,16 +2139,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listener =
         TcpListener::bind(format!("[::]:{}", global.lock().await.listen_port)).await?;
 
-    let f = |sock: SocketAddr| -> IpAddr {
-        let mut addr = sock.ip();
-        if let IpAddr::V6(a) = addr {
-            if let Some(a) = a.to_ipv4() {
-                addr = IpAddr::V4(a);
-            }
-        }
-        addr
-    };
-
     let mut expirations: DelayQueue<(Proto, SocketAddr)> = DelayQueue::new();
     let mut incoming = listener.incoming();
     loop {
@@ -2248,7 +2255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let addr = f(sock);
+        let addr = sock.to_ipaddr();
         println!("got new connection {:?} {:?}", proto, addr);
 
         if proto == Proto::Bmp {
@@ -2289,10 +2296,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let local_addr = {
-            if let Ok(l) = stream.local_addr() {
-                f(l)
-            } else {
+        let local_addr = match stream.local_addr() {
+            Ok(addr) => addr.to_ipaddr(),
+            Err(_) => {
                 continue;
             }
         };
