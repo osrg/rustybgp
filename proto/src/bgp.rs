@@ -245,6 +245,16 @@ pub enum Nlri {
     Ip(IpNet),
 }
 
+impl Nlri {
+    pub fn is_mp(self) -> bool {
+        let Nlri::Ip(net) = self;
+        match net.addr {
+            IpAddr::V4(_) => false,
+            _ => true,
+        }
+    }
+}
+
 impl std::string::ToString for Nlri {
     fn to_string(&self) -> String {
         match self {

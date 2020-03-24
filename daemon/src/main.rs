@@ -1689,11 +1689,6 @@ impl GobgpApi for Service {
                             }
                         }
                         let mut r = Vec::new();
-                        let bgp::Nlri::Ip(net) = dst.net;
-                        let is_mp = match net.addr {
-                            IpAddr::V4(_) => false,
-                            _ => true,
-                        };
                         for p in &dst.entry {
                             if adjin_filter(p.source.address) {
                                 continue;
@@ -1706,7 +1701,7 @@ impl GobgpApi for Service {
                                 let nexthop = if my.ibgp { p.nexthop } else { my.local_addr };
                                 let (mut v, n) = update_attrs(
                                     my.ibgp,
-                                    is_mp,
+                                    dst.net.is_mp(),
                                     my.local_as,
                                     dst.net,
                                     p.nexthop,
@@ -2548,11 +2543,7 @@ impl Session {
         for update in updates {
             match update {
                 TableUpdate::NewBest(nlri, nexthop, attrs, _source) => {
-                    let bgp::Nlri::Ip(net) = nlri;
-                    let is_mp = match net.addr {
-                        IpAddr::V4(_) => false,
-                        _ => true,
-                    };
+                    let is_mp = nlri.is_mp();
 
                     if !Session::is_family_enabled(self, is_mp) {
                         continue;
@@ -2576,11 +2567,7 @@ impl Session {
                     self.lines.get_mut().write_all(&buf).await?;
                 }
                 TableUpdate::Withdrawn(nlri, _source) => {
-                    let bgp::Nlri::Ip(net) = nlri;
-                    let is_mp = match net.addr {
-                        IpAddr::V4(_) => false,
-                        _ => true,
-                    };
+                    let is_mp = nlri.is_mp();
                     if !Session::is_family_enabled(self, is_mp) {
                         continue;
                     }
