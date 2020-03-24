@@ -328,6 +328,30 @@ impl Path {
         }
         return 0;
     }
+
+    pub fn to_payload(&self, nlri: bgp::Nlri) -> Vec<u8> {
+        let mut v: Vec<&proto::bgp::Attribute> = self.attrs.entry.iter().collect();
+
+        let (route, n) = if nlri.is_mp() {
+            (
+                Vec::new(),
+                bgp::Attribute::MpReach {
+                    family: bgp::Family::Ipv6Uc,
+                    nexthop: self.nexthop,
+                    nlri: vec![nlri],
+                },
+            )
+        } else {
+            (
+                vec![nlri],
+                bgp::Attribute::Nexthop {
+                    nexthop: self.nexthop,
+                },
+            )
+        };
+        v.push(&n);
+        bgp::UpdateMessage::to_bytes(route, Vec::new(), v).unwrap()
+    }
 }
 
 #[derive(Clone)]
@@ -844,6 +868,17 @@ impl Peer {
                 }
             }
         }
+    }
+
+    fn to_bmp_ph(&self) -> bmp::PeerHeader {
+        bmp::PeerHeader::new(
+            0,
+            0,
+            self.address,
+            self.remote_as,
+            self.router_id,
+            self.uptime,
+        )
     }
 
     fn to_bmp_up(&self, router_id: Ipv4Addr, local_address: IpAddr) -> bmp::PeerUpNotification {
@@ -2198,8 +2233,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 {
+                                    let t = table.lock().await;
                                     let mut g = global.lock().await;
-                                    for (_, tx) in &table.lock().await.bmp_sessions {
+                                    for (_, tx) in &t.bmp_sessions {
                                         let peer = g.peers.get_mut(&addr).unwrap();
                                         let _ = tx.send(bmp::Message::PeerDownNotification(peer.to_bmp_down(bmp::PeerDownNotification::REASON_UNKNOWN)));
                                     }
@@ -2224,8 +2260,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                     SrvEvent::Deconfigured(addr) =>{
-                        let mut g = global.lock().await;
                         let t = table.lock().await;
+                        let mut g = global.lock().await;
 
                         match g.peers.get_mut(&addr) {
                             Some(peer) =>{
@@ -2254,10 +2290,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("got new connection {:?} {:?}", proto, addr);
 
         if proto == Proto::Bmp {
+            let mut t = table.lock().await;
             let global = Arc::clone(&global);
             let g1 = Arc::clone(&global);
             let g = g1.lock().await;
-            let mut t = table.lock().await;
             if !t.bmp_sessions.contains_key(&sock) {
                 let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -2281,6 +2317,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = tx.send(bmp::Message::PeerUpNotification(
                         p.to_bmp_up(g.id, source.address),
                     ));
+                }
+
+                for (_, map) in t.master.iter() {
+                    for (_, dst) in map.iter() {
+                        for path in &dst.entry {
+                            if path.source.address == t.local_source.address {
+                                continue;
+                            }
+
+                            let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
+                                peer_header: g.peers.get(&path.source.address).unwrap().to_bmp_ph(),
+                                payload: path.to_payload(dst.net),
+                            });
+                            let _ = tx.send(m);
+                        }
+                    }
                 }
 
                 t.bmp_sessions.insert(sock, tx);
@@ -2760,6 +2812,39 @@ async fn handle_session(
                                     entry: update.attrs,
                                 });
                                 let mut t = table.lock().await;
+
+                                for (_, tx) in &t.bmp_sessions {
+                                    let g = global.lock().await;
+                                    for r in &update.routes {
+                                        let p = Path::new(source.clone(),update.nexthop, pa.clone());
+
+                                        let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
+                                            peer_header: g.peers.get(&p.source.address).unwrap().to_bmp_ph(),
+                                            payload: p.to_payload(*r),
+                                        });
+                                        let _ = tx.send(m);
+                                    }
+                                    for f in &update.mp_routes {
+                                        for r in &f.0 {
+                                            let p = Path::new(source.clone(), f.1, pa.clone());
+                                            let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
+                                                peer_header: g.peers.get(&p.source.address).unwrap().to_bmp_ph(),
+                                                payload: p.to_payload(*r),
+                                            });
+                                            let _ = tx.send(m);
+                                        }
+                                    }
+                                    for r in &update.withdrawns {
+                                        let payload = bgp::UpdateMessage::to_bytes(Vec::new(), vec![*r], Vec::new()).unwrap();
+                                        let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
+                                            peer_header: g.peers.get(&source.address).unwrap().to_bmp_ph(),
+                                            payload,
+                                        });
+                                        let _ = tx.send(m);
+                                    }
+
+                                }
+
                                 for r in update.routes {
                                     let (u, added) = t.insert(
                                         bgp::Family::Ipv4Uc,
@@ -2852,8 +2937,8 @@ async fn handle_session(
                                 );
                                 let mut v = Vec::new();
                                 {
-                                    let g = global.lock().await;
                                     let mut t = table.lock().await;
+                                    let g = global.lock().await;
                                     let (tx, _) = t.active_peers.remove(&addr).unwrap();
                                     t.active_peers.insert(addr, (tx, source.clone()));
 
@@ -2921,15 +3006,12 @@ async fn handle_bmp_session(
                     }
                 }
             }
-            v = lines.next().fuse() => {
-                if let Some(_)= v {
-                } else {
+            None = lines.next().fuse() => {
                     break;
-                }
             }
         }
     }
-    println!("bmp connection is closed");
+    println!("bmp disconnected {:?}", sockaddr);
     let g = &mut global.lock().await;
     let _ = g
         .server_event_tx
