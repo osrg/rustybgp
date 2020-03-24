@@ -2834,15 +2834,6 @@ async fn handle_session(
                                             let _ = tx.send(m);
                                         }
                                     }
-                                    for r in &update.withdrawns {
-                                        let payload = bgp::UpdateMessage::to_bytes(Vec::new(), vec![*r], Vec::new()).unwrap();
-                                        let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
-                                            peer_header: g.peers.get(&source.address).unwrap().to_bmp_ph(),
-                                            payload,
-                                        });
-                                        let _ = tx.send(m);
-                                    }
-
                                 }
 
                                 for r in update.routes {
@@ -2880,6 +2871,19 @@ async fn handle_session(
                             }
                             if update.withdrawns.len() > 0 {
                                 let mut t = table.lock().await;
+
+                                for (_, tx) in &t.bmp_sessions {
+                                    let g = global.lock().await;
+                                    for r in &update.withdrawns {
+                                        let payload = bgp::UpdateMessage::to_bytes(Vec::new(), vec![*r], Vec::new()).unwrap();
+                                            let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
+                                            peer_header: g.peers.get(&source.address).unwrap().to_bmp_ph(),
+                                            payload,
+                                        });
+                                        let _ = tx.send(m);
+                                    }
+                                }
+
                                 for r in update.withdrawns {
                                     let bgp::Nlri::Ip(net) = r;
                                     let family = match net.addr {
