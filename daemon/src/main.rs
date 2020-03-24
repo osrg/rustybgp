@@ -2567,27 +2567,13 @@ impl Session {
                     self.lines.get_mut().write_all(&buf).await?;
                 }
                 TableUpdate::Withdrawn(nlri, _source) => {
-                    let is_mp = nlri.is_mp();
-                    if !Session::is_family_enabled(self, is_mp) {
+                    if !Session::is_family_enabled(self, nlri.is_mp()) {
                         continue;
                     }
 
-                    if is_mp {
-                        let buf = bgp::UpdateMessage::to_bytes(
-                            Vec::new(),
-                            Vec::new(),
-                            vec![&bgp::Attribute::MpUnreach {
-                                family: bgp::Family::Ipv6Uc,
-                                nlri: vec![nlri],
-                            }],
-                        )
-                        .unwrap();
-                        self.lines.get_mut().write_all(&buf).await?;
-                    } else {
-                        let buf = bgp::UpdateMessage::to_bytes(Vec::new(), vec![nlri], Vec::new())
-                            .unwrap();
-                        self.lines.get_mut().write_all(&buf).await?;
-                    }
+                    let buf =
+                        bgp::UpdateMessage::to_bytes(Vec::new(), vec![nlri], Vec::new()).unwrap();
+                    self.lines.get_mut().write_all(&buf).await?;
                 }
             }
         }

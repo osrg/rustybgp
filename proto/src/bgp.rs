@@ -1572,7 +1572,12 @@ impl UpdateMessage {
 
         c.set_position(start_pos + 2);
         let mut withdrawn_len = 0;
+        let mut mp_withdrawns: Vec<Nlri> = Vec::new();
         for withdrawn in withdrawns {
+            if withdrawn.is_mp() {
+                mp_withdrawns.push(withdrawn);
+                continue;
+            }
             match withdrawn {
                 Nlri::Ip(ip) => {
                     withdrawn_len += ip.to_bytes(&mut c)?;
@@ -1587,6 +1592,13 @@ impl UpdateMessage {
         let mut attr_len = 0;
         for attr in attrs {
             attr_len += attr.to_bytes(&mut c)?;
+        }
+        if mp_withdrawns.len() > 0 {
+            attr_len += Attribute::MpUnreach {
+                family: Family::Ipv6Uc,
+                nlri: mp_withdrawns,
+            }
+            .to_bytes(&mut c)?;
         }
 
         let route_pos = c.position();
