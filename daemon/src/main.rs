@@ -38,6 +38,7 @@ use tokio_util::codec::{BytesCodec, Decoder, Encoder, Framed};
 
 use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
+use radix_trie::{Trie, TrieCommon};
 
 use prost;
 
@@ -46,7 +47,7 @@ mod api {
 }
 use api::gobgp_api_server::{GobgpApi, GobgpApiServer};
 
-use proto::{bgp, bmp};
+use proto::{bgp, bmp, rtr};
 
 fn to_any<T: prost::Message>(m: T, name: &str) -> prost_types::Any {
     let mut v = Vec::new();
@@ -355,6 +356,85 @@ impl Path {
 }
 
 #[derive(Clone)]
+pub struct Roa {
+    max_length: u8,
+    as_number: u32,
+    source: Arc<Source>,
+}
+
+impl Roa {
+    fn to_api(&self, net: bgp::IpNet) -> api::Roa {
+        api::Roa {
+            r#as: self.as_number,
+            prefixlen: net.mask as u32,
+            maxlen: self.max_length as u32,
+            prefix: net.addr.to_string(),
+            conf: Some(api::RpkiConf {
+                address: self.source.address.to_string(),
+                remote_port: 0,
+            }),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RoaTable {
+    pub v4: Trie<Vec<u8>, Vec<Roa>>,
+    pub v6: Trie<Vec<u8>, Vec<Roa>>,
+}
+
+impl RoaTable {
+    pub fn new() -> RoaTable {
+        RoaTable {
+            v4: Trie::new(),
+            v6: Trie::new(),
+        }
+    }
+
+    pub fn insert(&mut self, net: bgp::IpNet, roa: Roa) {
+        let t = if net.is_v6() {
+            &mut self.v6
+        } else {
+            &mut self.v4
+        };
+
+        let mut key: Vec<u8> = Vec::new();
+        match net.addr {
+            IpAddr::V4(addr) => {
+                for i in &addr.octets() {
+                    key.push(*i);
+                }
+                key.push(net.mask);
+            }
+            IpAddr::V6(addr) => {
+                for i in &addr.octets() {
+                    key.push(*i);
+                }
+                key.push(net.mask);
+            }
+        }
+
+        match t.get_mut(&key) {
+            Some(entry) => {
+                for i in 0..entry.len() {
+                    let e = &entry[i];
+                    if e.source.address == roa.source.address
+                        && e.max_length == roa.max_length
+                        && e.as_number == roa.as_number
+                    {
+                        return;
+                    }
+                }
+                entry.push(roa);
+            }
+            None => {
+                t.insert(key, vec![roa]);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Destination {
     pub net: bgp::Nlri,
     pub entry: Vec<Path>,
@@ -382,13 +462,107 @@ pub enum TableUpdate {
 }
 
 #[derive(Clone)]
+pub struct Counter {
+    c: HashMap<u8, i64>,
+}
+
+impl Counter {
+    pub fn new() -> Counter {
+        Counter { c: HashMap::new() }
+    }
+
+    pub fn inc(&mut self, t: u8) {
+        match self.c.get_mut(&t) {
+            Some(v) => *v += 1,
+            None => {
+                self.c.insert(t, 1);
+            }
+        }
+    }
+
+    pub fn get(&self, t: u8) -> i64 {
+        self.c.get(&t).map_or(0, |v| *v)
+    }
+}
+
+#[derive(Clone)]
+pub struct RtrSession {
+    local_address: Option<SocketAddr>,
+
+    uptime: SystemTime,
+    downtime: SystemTime,
+
+    serial_number: u32,
+
+    rx_counter: Counter,
+}
+
+impl RtrSession {
+    pub fn new() -> RtrSession {
+        RtrSession {
+            local_address: None,
+            uptime: SystemTime::UNIX_EPOCH,
+            downtime: SystemTime::UNIX_EPOCH,
+
+            serial_number: 0,
+            rx_counter: Counter::new(),
+        }
+    }
+
+    pub fn inc_rx_counter(&mut self, msg: &rtr::Message) {
+        self.rx_counter.inc(msg.message_type());
+    }
+
+    pub fn rx_counter(&self, t: u8) -> i64 {
+        self.rx_counter.get(t)
+    }
+
+    pub fn to_api(
+        &self,
+        sockaddr: &SocketAddr,
+        r_v4: u32,
+        r_v6: u32,
+        p_v4: u32,
+        p_v6: u32,
+    ) -> api::Rpki {
+        api::Rpki {
+            conf: Some(api::RpkiConf {
+                address: sockaddr.ip().to_string(),
+                remote_port: sockaddr.port() as u32,
+            }),
+            state: Some(api::RpkiState {
+                uptime: Some(self.uptime.to_api()),
+                downtime: Some(self.downtime.to_api()),
+                up: self.local_address.is_some(),
+                record_ipv4: r_v4,
+                record_ipv6: r_v6,
+                prefix_ipv4: p_v4,
+                prefix_ipv6: p_v6,
+                serial: 0,
+                serial_notify: self.rx_counter(rtr::Message::SERIAL_NOTIFY),
+                serial_query: self.rx_counter(rtr::Message::SERIAL_NOTIFY),
+                reset_query: self.rx_counter(rtr::Message::RESET_QUERY),
+                cache_response: self.rx_counter(rtr::Message::CACHE_RESPONSE),
+                received_ipv4: self.rx_counter(rtr::Message::IPV4_PREFIX),
+                received_ipv6: self.rx_counter(rtr::Message::IPV6_PREFIX),
+                end_of_data: self.rx_counter(rtr::Message::END_OF_DATA),
+                cache_reset: self.rx_counter(rtr::Message::CACHE_RESET),
+                error: self.rx_counter(rtr::Message::ERROR_REPORT),
+            }),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Table {
     pub local_source: Arc<Source>,
     pub disable_best_path_selection: bool,
     pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
+    pub roa: RoaTable,
 
     pub active_peers: HashMap<IpAddr, (Sender<PeerEvent>, Arc<Source>)>,
     pub bmp_sessions: HashMap<SocketAddr, Sender<bmp::Message>>,
+    pub rtr_sessions: HashMap<SocketAddr, RtrSession>,
 }
 
 impl Table {
@@ -403,8 +577,10 @@ impl Table {
             }),
             disable_best_path_selection: false,
             master: HashMap::new(),
+            roa: RoaTable::new(),
             active_peers: HashMap::new(),
             bmp_sessions: HashMap::new(),
+            rtr_sessions: HashMap::new(),
         }
     }
 
@@ -1975,9 +2151,37 @@ impl GobgpApi for Service {
     }
     async fn add_rpki(
         &self,
-        _request: tonic::Request<api::AddRpkiRequest>,
+        request: tonic::Request<api::AddRpkiRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let request = request.into_inner();
+        if let Ok(addr) = IpAddr::from_str(&request.address) {
+            let port = request.port as u16;
+            let sockaddr = SocketAddr::new(addr, port);
+
+            let t = &mut self.table.lock().await;
+
+            if t.rtr_sessions.contains_key(&sockaddr) {
+                return Err(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "invalid parameters",
+                ));
+            }
+
+            t.rtr_sessions.insert(sockaddr, RtrSession::new());
+
+            let g = &mut self.global.lock().await;
+
+            let _ = g.server_event_tx.send(SrvEvent::EnableActive {
+                proto: Proto::Rtr,
+                sockaddr,
+            });
+
+            return Ok(tonic::Response::new(()));
+        }
+        Err(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "invalid parameters",
+        ))
     }
     async fn delete_rpki(
         &self,
@@ -1990,7 +2194,40 @@ impl GobgpApi for Service {
         &self,
         _request: tonic::Request<api::ListRpkiRequest>,
     ) -> Result<tonic::Response<Self::ListRpkiStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let (mut tx, rx) = mpsc::channel(1024);
+
+        let table = self.table.clone();
+        tokio::spawn(async move {
+            let mut v = Vec::new();
+            {
+                let t = table.lock().await;
+                for (sockaddr, session) in &t.rtr_sessions {
+                    let mut v4_record = 0;
+                    let mut v4_prefix = 0;
+                    let mut v6_record = 0;
+                    let mut v6_prefix = 0;
+
+                    for (_, entry) in t.roa.v4.iter() {
+                        v4_record += 1;
+                        v4_prefix += entry.len() as u32;
+                    }
+                    for (_, entry) in t.roa.v6.iter() {
+                        v6_record += 1;
+                        v6_prefix += entry.len() as u32;
+                    }
+
+                    v.push(api::ListRpkiResponse {
+                        server: Some(
+                            session.to_api(sockaddr, v4_record, v6_record, v4_prefix, v6_prefix),
+                        ),
+                    });
+                }
+            }
+            for r in v {
+                let _ = tx.send(Ok(r)).await;
+            }
+        });
+        Ok(tonic::Response::new(rx))
     }
     async fn enable_rpki(
         &self,
@@ -2013,9 +2250,69 @@ impl GobgpApi for Service {
     type ListRpkiTableStream = mpsc::Receiver<Result<api::ListRpkiTableResponse, tonic::Status>>;
     async fn list_rpki_table(
         &self,
-        _request: tonic::Request<api::ListRpkiTableRequest>,
+        request: tonic::Request<api::ListRpkiTableRequest>,
     ) -> Result<tonic::Response<Self::ListRpkiTableStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let request = request.into_inner();
+        let family: HashSet<bgp::Family> = match request.family {
+            Some(family) => vec![bgp::Family::from(
+                (family.afi as u32) << 16 | family.safi as u32,
+            )]
+            .into_iter()
+            .collect(),
+            None => vec![bgp::Family::Ipv4Uc, bgp::Family::Ipv6Uc]
+                .into_iter()
+                .collect(),
+        };
+
+        let (mut tx, rx) = mpsc::channel(1024);
+
+        let table = self.table.clone();
+        tokio::spawn(async move {
+            let mut v = Vec::new();
+            {
+                let t = table.lock().await;
+
+                if family.contains(&bgp::Family::Ipv4Uc) {
+                    for (net, entry) in t.roa.v4.iter() {
+                        let mut octets = [0 as u8; 4];
+                        for i in 0..octets.len() {
+                            octets[i] = net[i];
+                        }
+                        let n = bgp::IpNet {
+                            addr: IpAddr::from(octets),
+                            mask: net[octets.len()],
+                        };
+                        for e in entry {
+                            v.push(api::ListRpkiTableResponse {
+                                roa: Some(e.to_api(n)),
+                            });
+                        }
+                    }
+                }
+
+                if family.contains(&bgp::Family::Ipv6Uc) {
+                    for (net, entry) in t.roa.v6.iter() {
+                        let mut octets = [0 as u8; 16];
+                        for i in 0..octets.len() {
+                            octets[i] = net[i];
+                        }
+                        let n = bgp::IpNet {
+                            addr: IpAddr::from(octets),
+                            mask: net[octets.len()],
+                        };
+                        for e in entry {
+                            v.push(api::ListRpkiTableResponse {
+                                roa: Some(e.to_api(n)),
+                            });
+                        }
+                    }
+                }
+            }
+            for r in v {
+                let _ = tx.send(Ok(r)).await;
+            }
+        });
+        Ok(tonic::Response::new(rx))
     }
     async fn enable_zebra(
         &self,
@@ -2072,12 +2369,13 @@ type Receiver<T> = mpsc::UnboundedReceiver<T>;
 pub enum Proto {
     Bgp,
     Bmp,
-    // Rpki,
+    Rtr,
 }
 
 pub enum DisconnectedProto {
     Bgp(Arc<Source>),
     Bmp(SocketAddr),
+    Rtr(SocketAddr),
 }
 
 pub enum SrvEvent {
@@ -2256,6 +2554,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 t.bmp_sessions.remove(&sockaddr);
                                 expirations.insert((Proto::Bmp, sockaddr), Duration::from_secs(5));
                             }
+                            DisconnectedProto::Rtr(sockaddr) => {
+                                let t = table.lock().await;
+                                if t.rtr_sessions.contains_key(&sockaddr) {
+                                    expirations.insert((Proto::Rtr, sockaddr), Duration::from_secs(5));
+                                }
+                            }
                         }
                         continue;
                     }
@@ -2288,6 +2592,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let addr = sock.to_ipaddr();
         println!("got new connection {:?} {:?}", proto, addr);
+
+        let local_addr = match stream.local_addr() {
+            Ok(addr) => addr.to_ipaddr(),
+            Err(_) => {
+                continue;
+            }
+        };
 
         if proto == Proto::Bmp {
             let mut t = table.lock().await;
@@ -2341,14 +2652,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             continue;
-        }
-
-        let local_addr = match stream.local_addr() {
-            Ok(addr) => addr.to_ipaddr(),
-            Err(_) => {
-                continue;
+        } else if proto == Proto::Rtr {
+            let global = Arc::clone(&global);
+            let table = Arc::clone(&table);
+            {
+                let mut t = table.lock().await;
+                let s = t.rtr_sessions.get_mut(&sock).unwrap();
+                match stream.local_addr() {
+                    Ok(sockaddr) => {
+                        s.local_address = Some(sockaddr);
+                        s.uptime = SystemTime::now();
+                    }
+                    Err(_) => continue,
+                }
             }
-        };
+            tokio::spawn(async move {
+                handle_rtr_session(Arc::clone(&global), Arc::clone(&table), stream, sock).await;
+            });
+            continue;
+        }
 
         let mut g = global.lock().await;
         if g.peers.contains_key(&addr) == true {
@@ -3020,4 +3342,85 @@ async fn handle_bmp_session(
     let _ = g
         .server_event_tx
         .send(SrvEvent::Disconnected(DisconnectedProto::Bmp(sockaddr)));
+}
+
+struct Rtr {}
+
+impl Encoder for Rtr {
+    type Item = rtr::Message;
+    type Error = io::Error;
+
+    fn encode(&mut self, item: rtr::Message, dst: &mut BytesMut) -> Result<(), io::Error> {
+        let buf = item.to_bytes().unwrap();
+        dst.reserve(buf.len());
+        dst.put_slice(&buf);
+        Ok(())
+    }
+}
+
+impl Decoder for Rtr {
+    type Item = rtr::Message;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> io::Result<Option<rtr::Message>> {
+        match rtr::Message::from_bytes(src) {
+            Ok((m, len)) => {
+                let _ = src.split_to(len);
+                Ok(Some(m))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+async fn handle_rtr_session(
+    global: Arc<Mutex<Global>>,
+    table: Arc<Mutex<Table>>,
+    stream: TcpStream,
+    sockaddr: SocketAddr,
+) {
+    let mut lines = Framed::new(stream, Rtr {});
+    let _ = lines.send(rtr::Message::ResetQuery).await;
+    let source = Arc::new(Source {
+        address: sockaddr.ip(),
+        ibgp: false,
+        local_as: 0,
+        local_addr: sockaddr.ip(),
+        state: bgp::State::Idle,
+    });
+
+    loop {
+        tokio::select! {
+            msg = lines.next().fuse() => {
+                let msg = match msg {
+                    Some(msg) => {
+                        match msg {
+                            Ok(msg) => msg,
+                            Err(_) => break,
+                        }
+                    }
+                    None => break,
+                };
+
+                let t = &mut table.lock().await;
+                t.rtr_sessions.get_mut(&sockaddr).unwrap().inc_rx_counter(&msg);
+
+                match msg {
+                    rtr::Message::Ipv4Prefix(prefix)|rtr::Message::Ipv6Prefix(prefix)  => {
+                        t.roa.insert(prefix.net, Roa{
+                            max_length: prefix.max_length,
+                            as_number: prefix.as_number,
+                            source: source.clone(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    println!("rpki disconnected {:?}", sockaddr);
+    let g = &mut global.lock().await;
+    let _ = g
+        .server_event_tx
+        .send(SrvEvent::Disconnected(DisconnectedProto::Rtr(sockaddr)));
 }

@@ -32,6 +32,13 @@ pub struct IpNet {
 }
 
 impl IpNet {
+    pub fn is_v6(&self) -> bool {
+        match self.addr {
+            IpAddr::V4(_) => false,
+            IpAddr::V6(_) => true,
+        }
+    }
+
     pub fn from_bytes(c: &mut Cursor<&[u8]>, is_v6: bool) -> Result<IpNet, Error> {
         let bit_len = c.read_u8()?;
         if is_v6 {
@@ -191,7 +198,7 @@ fn from_str_ipnet() {
     );
 }
 
-trait IpNetNew<T>: Sized {
+pub trait IpNetNew<T>: Sized {
     fn new(_: T, mask: u8) -> IpNet;
 }
 

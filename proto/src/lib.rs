@@ -15,5 +15,6 @@
 
 pub mod bgp;
 pub mod bmp;
+pub mod rtr;
 #[macro_use]
 extern crate failure;
