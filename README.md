@@ -56,6 +56,7 @@ Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/pas
 |list_path|`gobgp global rib`/`gobgp neighbor <IP> [adj-in\|adj-out]`||
 |add_path_stream|`gobgp mrt global inject [FILE]`||
 |get_table|`gobgp global rib summary`||
+|add_bmp|`gobgp bmp add <IP>`||
 
 ## Community, discussion and support
 
