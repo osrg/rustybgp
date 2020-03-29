@@ -57,6 +57,9 @@ Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/pas
 |add_path_stream|`gobgp mrt global inject [FILE]`||
 |get_table|`gobgp global rib summary`||
 |add_bmp|`gobgp bmp add <IP>`||
+|add_rpki|`gobgp rpki server <IP> add`||
+|list_rpki|`gobgp rpki server`||
+|list_rpki_table|`gobgp rpki table`||
 
 ## Community, discussion and support
 

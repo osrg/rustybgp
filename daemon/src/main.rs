@@ -38,7 +38,7 @@ use tokio_util::codec::{BytesCodec, Decoder, Encoder, Framed};
 
 use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
-use radix_trie::{Trie, TrieCommon};
+use patricia_tree::PatriciaMap;
 
 use prost;
 
@@ -178,8 +178,80 @@ impl Path {
         }
     }
 
-    fn to_api(&self, net: &bgp::Nlri, nexthop: IpAddr, pattrs: Vec<&bgp::Attribute>) -> api::Path {
+    fn to_validate_api(
+        &self,
+        ipnet: bgp::IpNet,
+        rt: &PatriciaMap<Vec<Roa>>,
+        attr: Option<&bgp::Attribute>,
+    ) -> api::Validation {
+        let mut v = api::Validation {
+            state: api::validation::State::NotFound as i32,
+            reason: api::validation::Reason::ReasotNone as i32,
+            matched: Vec::new(),
+            unmatched_as: Vec::new(),
+            unmatched_length: Vec::new(),
+        };
+
+        let as_number = match attr {
+            Some(bgp::Attribute::AsPath { segments }) => {
+                let seg = &segments[segments.len() - 1];
+                match seg.segment_type {
+                    bgp::Segment::TYPE_SEQ => {
+                        if seg.number.len() == 0 {
+                            self.source.local_as
+                        } else {
+                            seg.number[seg.number.len() - 1]
+                        }
+                    }
+                    _ => self.source.local_as,
+                }
+            }
+            _ => self.source.local_as,
+        };
+
+        let mut octets: Vec<u8> = match ipnet.addr {
+            IpAddr::V4(addr) => addr.octets().iter().map(|x| *x).collect(),
+            IpAddr::V6(addr) => addr.octets().iter().map(|x| *x).collect(),
+        };
+        octets.drain(((ipnet.mask + 7) / 8) as usize..);
+
+        for (_, entry) in rt.iter_prefix(&octets) {
+            for roa in entry {
+                if ipnet.mask <= roa.max_length {
+                    if roa.as_number != 0 && roa.as_number == as_number {
+                        v.matched.push(roa.to_api(ipnet));
+                    } else {
+                        v.unmatched_as.push(roa.to_api(ipnet));
+                    }
+                } else {
+                    v.unmatched_length.push(roa.to_api(ipnet));
+                }
+            }
+        }
+        if v.matched.len() != 0 {
+            v.state = api::validation::State::Valid as i32;
+        } else if v.unmatched_as.len() != 0 {
+            v.state = api::validation::State::Invalid as i32;
+            v.reason = api::validation::Reason::As as i32;
+        } else if v.unmatched_length.len() != 0 {
+            v.state = api::validation::State::Invalid as i32;
+            v.reason = api::validation::Reason::Length as i32;
+        } else {
+            v.state = api::validation::State::NotFound as i32;
+        }
+        v
+    }
+
+    fn to_api(
+        &self,
+        net: &bgp::Nlri,
+        nexthop: IpAddr,
+        pattrs: Vec<&bgp::Attribute>,
+        rt: &PatriciaMap<Vec<Roa>>,
+    ) -> api::Path {
         let mut path: api::Path = Default::default();
+
+        let bgp::Nlri::Ip(ipnet) = net;
 
         match net {
             bgp::Nlri::Ip(ipnet) => {
@@ -199,7 +271,7 @@ impl Path {
         };
 
         path.age = Some(self.timestamp.to_api());
-
+        let mut as_attr = None;
         let mut attrs = Vec::new();
         for attr in pattrs {
             match attr {
@@ -210,6 +282,7 @@ impl Path {
                     attrs.push(to_any(a, "OriginAttribute"));
                 }
                 bgp::Attribute::AsPath { segments } => {
+                    as_attr = Some(attr);
                     let l: Vec<api::AsSegment> = segments
                         .iter()
                         .map(|segment| api::AsSegment {
@@ -279,6 +352,10 @@ impl Path {
         ));
 
         path.pattrs = attrs;
+
+        if rt.len() != 0 {
+            path.validation = Some(self.to_validate_api(*ipnet, rt, as_attr));
+        }
 
         path
     }
@@ -379,16 +456,48 @@ impl Roa {
 
 #[derive(Clone)]
 pub struct RoaTable {
-    pub v4: Trie<Vec<u8>, Vec<Roa>>,
-    pub v6: Trie<Vec<u8>, Vec<Roa>>,
+    pub v4: PatriciaMap<Vec<Roa>>,
+    pub v6: PatriciaMap<Vec<Roa>>,
 }
 
 impl RoaTable {
     pub fn new() -> RoaTable {
         RoaTable {
-            v4: Trie::new(),
-            v6: Trie::new(),
+            v4: PatriciaMap::new(),
+            v6: PatriciaMap::new(),
         }
+    }
+
+    pub fn t(&self, family: bgp::Family) -> &PatriciaMap<Vec<Roa>> {
+        if family == bgp::Family::Ipv4Uc {
+            return &self.v4;
+        }
+        &self.v6
+    }
+
+    pub fn clear(&mut self, source: Arc<Source>) {
+        let f = |t: &mut PatriciaMap<Vec<Roa>>| {
+            let mut empty = Vec::new();
+            for (n, e) in t.iter_mut() {
+                let mut i = 0;
+                while i != e.len() {
+                    if e[i].source.address == source.address {
+                        e.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+                if e.len() == 0 {
+                    empty.push(n);
+                }
+            }
+            for k in empty {
+                t.remove(k);
+            }
+        };
+
+        f(&mut self.v4);
+        f(&mut self.v6);
     }
 
     pub fn insert(&mut self, net: bgp::IpNet, roa: Roa) {
@@ -432,6 +541,59 @@ impl RoaTable {
             }
         }
     }
+}
+
+#[test]
+fn roa_clear() {
+    let mut rt = RoaTable::new();
+
+    let s1 = Arc::new(Source {
+        address: IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+        ibgp: false,
+        local_as: 0,
+        local_addr: IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+        state: bgp::State::Idle,
+    });
+
+    let s2 = Arc::new(Source {
+        address: IpAddr::V4(Ipv4Addr::new(1, 0, 0, 2)),
+        ibgp: false,
+        local_as: 0,
+        local_addr: IpAddr::V4(Ipv4Addr::new(1, 0, 0, 2)),
+        state: bgp::State::Idle,
+    });
+
+    let net1 = bgp::IpNet::from_str("1.1.1.0/24").unwrap();
+    rt.insert(
+        net1,
+        Roa {
+            max_length: 24,
+            as_number: 1,
+            source: s1.clone(),
+        },
+    );
+
+    rt.insert(
+        net1,
+        Roa {
+            max_length: 24,
+            as_number: 1,
+            source: s2.clone(),
+        },
+    );
+
+    rt.insert(
+        bgp::IpNet::from_str("1.1.2.0/24").unwrap(),
+        Roa {
+            max_length: 24,
+            as_number: 1,
+            source: s1.clone(),
+        },
+    );
+
+    assert_eq!(2, rt.v4.len());
+    rt.clear(s1.clone());
+    assert_eq!(1, rt.v4.len());
 }
 
 #[derive(Clone)]
@@ -1907,6 +2069,7 @@ impl GobgpApi for Service {
                             if adjout_filter(p.source.clone()) {
                                 continue;
                             }
+                            let rt = table.roa.t(family);
                             if table_type == api::TableType::AdjOut {
                                 let (_, my) = source.unwrap();
                                 let nexthop = if my.ibgp { p.nexthop } else { my.local_addr };
@@ -1921,12 +2084,13 @@ impl GobgpApi for Service {
                                 );
                                 v.append(&mut n.iter().collect());
                                 v.sort_by_key(|a| a.attr());
-                                r.push(p.to_api(&dst.net, nexthop, v));
+                                r.push(p.to_api(&dst.net, nexthop, v, rt));
                             } else {
                                 r.push(p.to_api(
                                     &dst.net,
                                     p.nexthop,
                                     p.attrs.entry.iter().collect(),
+                                    rt,
                                 ));
                             }
                         }
@@ -3389,6 +3553,7 @@ async fn handle_rtr_session(
         state: bgp::State::Idle,
     });
 
+    let mut v = Vec::new();
     loop {
         tokio::select! {
             msg = lines.next().fuse() => {
@@ -3407,11 +3572,18 @@ async fn handle_rtr_session(
 
                 match msg {
                     rtr::Message::Ipv4Prefix(prefix)|rtr::Message::Ipv6Prefix(prefix)  => {
-                        t.roa.insert(prefix.net, Roa{
+                        v.push((prefix.net, Roa{
                             max_length: prefix.max_length,
                             as_number: prefix.as_number,
                             source: source.clone(),
-                        });
+                        }));
+                    }
+                    rtr::Message::EndOfData{..} => {
+                        t.roa.clear(source.clone());
+                        for (n, r) in v {
+                            t.roa.insert(n, r);
+                        }
+                        v = Vec::new();
                     }
                     _ => {}
                 }
