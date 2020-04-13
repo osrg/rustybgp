@@ -2561,7 +2561,11 @@ fn update_accepted(accepted: &mut HashMap<bgp::Family, u64>, family: bgp::Family
     }
 }
 
-async fn handle_table_update(table: Arc<Mutex<Table>>, table_rx: &mut Receiver<TableChange>) {
+async fn handle_table_update(
+    global: Arc<Mutex<Global>>,
+    table: Arc<Mutex<Table>>,
+    table_rx: &mut Receiver<TableChange>,
+) {
     loop {
         tokio::select! {
             Some(c) = table_rx.next().fuse() => {
@@ -2578,16 +2582,37 @@ async fn handle_table_update(table: Arc<Mutex<Table>>, table_rx: &mut Receiver<T
                             update_accepted(accepted, c.family, -1);
                         }
                     }
+                    for (_, tx) in &t.bmp_sessions {
+                        let g = global.lock().await;
+                        let payload = bgp::UpdateMessage::to_bytes(Vec::new(), vec![c.net], Vec::new()).unwrap();
+                            let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
+                            peer_header: g.peers.get(&source.address).unwrap().to_bmp_ph(),
+                            payload,
+                        });
+                        let _ = tx.send(m);
+                    }
                 } else {
-                    let (u, added) = t.insert(c.family, c.net, source.clone(), c.nexthop, c.attrs);
+                    let (u, added) = t.insert(c.family, c.net, source.clone(), c.nexthop, c.attrs.clone());
                     if let Some(u) = u {
-                        t.broadcast(source, &u).await;
+                        t.broadcast(source.clone(), &u).await;
                     }
                     if added == true {
                         if let Some((_, _, accepted)) = t.active_peers.get_mut(&address) {
                             update_accepted(accepted, c.family, 1);
                         }
                     }
+
+                    for (_, tx) in &t.bmp_sessions {
+                        let g = global.lock().await;
+                        let p = Path::new(source.clone(), c.nexthop, c.attrs.clone());
+
+                        let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
+                            peer_header: g.peers.get(&p.source.address).unwrap().to_bmp_ph(),
+                            payload: p.to_payload(c.net),
+                        });
+                        let _ = tx.send(m);
+                    }
+
                 }
             }
         }
@@ -2678,10 +2703,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TcpListener::bind(format!("[::]:{}", global.lock().await.listen_port)).await?;
 
     let (table_tx, mut table_rx) = mpsc::unbounded_channel();
-    let tb = table.clone();
-    tokio::spawn(async move {
-        handle_table_update(tb, &mut table_rx).await;
-    });
+    {
+        let t = table.clone();
+        let g = global.clone();
+        tokio::spawn(async move {
+            handle_table_update(g, t, &mut table_rx).await;
+        });
+    }
 
     let mut expirations: DelayQueue<(Proto, SocketAddr)> = DelayQueue::new();
     let mut incoming = listener.incoming();
@@ -3350,30 +3378,6 @@ async fn handle_session(
                                 let pa = Arc::new(PathAttr {
                                     entry: update.attrs,
                                 });
-                                let t = table.lock().await;
-
-                                for (_, tx) in &t.bmp_sessions {
-                                    let g = global.lock().await;
-                                    for r in &update.routes {
-                                        let p = Path::new(source.clone(),update.nexthop, pa.clone());
-
-                                        let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
-                                            peer_header: g.peers.get(&p.source.address).unwrap().to_bmp_ph(),
-                                            payload: p.to_payload(*r),
-                                        });
-                                        let _ = tx.send(m);
-                                    }
-                                    for f in &update.mp_routes {
-                                        for r in &f.0 {
-                                            let p = Path::new(source.clone(), f.1, pa.clone());
-                                            let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
-                                                peer_header: g.peers.get(&p.source.address).unwrap().to_bmp_ph(),
-                                                payload: p.to_payload(*r),
-                                            });
-                                            let _ = tx.send(m);
-                                        }
-                                    }
-                                }
 
                                 for r in update.routes {
                                     let _ = table_tx.send(
@@ -3402,39 +3406,23 @@ async fn handle_session(
                                 }
                             }
 
-                            if update.withdrawns.len() > 0 {
-                                let t = table.lock().await;
-
-                                for (_, tx) in &t.bmp_sessions {
-                                    let g = global.lock().await;
-                                    for r in &update.withdrawns {
-                                        let payload = bgp::UpdateMessage::to_bytes(Vec::new(), vec![*r], Vec::new()).unwrap();
-                                            let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
-                                            peer_header: g.peers.get(&source.address).unwrap().to_bmp_ph(),
-                                            payload,
-                                        });
-                                        let _ = tx.send(m);
+                            for r in update.withdrawns {
+                                let bgp::Nlri::Ip(net) = r;
+                                let family = match net.addr {
+                                    IpAddr::V4(_) => bgp::Family::Ipv4Uc,
+                                    IpAddr::V6(_) => bgp::Family::Ipv6Uc,
+                                };
+                                let _ = table_tx.send(
+                                    TableChange{
+                                        family: family,
+                                        net: r,
+                                        source: source.clone(),
+                                        nexthop: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+                                        attrs: Arc::new(PathAttr {
+                                            entry: Vec::new(),
+                                        }),
                                     }
-                                }
-
-                                for r in update.withdrawns {
-                                    let bgp::Nlri::Ip(net) = r;
-                                    let family = match net.addr {
-                                        IpAddr::V4(_) => bgp::Family::Ipv4Uc,
-                                        IpAddr::V6(_) => bgp::Family::Ipv6Uc,
-                                    };
-                                    let _ = table_tx.send(
-                                        TableChange{
-                                            family: family,
-                                            net: r,
-                                            source: source.clone(),
-                                            nexthop: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-                                            attrs: Arc::new(PathAttr {
-                                                entry: Vec::new(),
-                                            }),
-                                        }
-                                    );
-                                }
+                                );
                             }
                         }
                         bgp::Message::Notification(_) => {
