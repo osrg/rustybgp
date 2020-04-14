@@ -3159,7 +3159,8 @@ impl Session {
         &mut self,
         my: Arc<Source>,
         updates: Vec<TableUpdate>,
-    ) -> Result<(), io::Error> {
+    ) -> Result<(u64, u64), io::Error> {
+        let mut withdraw = 0;
         for update in updates {
             match update {
                 TableUpdate::NewBest(nlri, nexthop, attrs, _source) => {
@@ -3194,10 +3195,11 @@ impl Session {
                     let buf =
                         bgp::UpdateMessage::to_bytes(Vec::new(), vec![nlri], Vec::new()).unwrap();
                     self.lines.get_mut().write_all(&buf).await?;
+                    withdraw += 1;
                 }
             }
         }
-        Ok(())
+        Ok((withdraw, withdraw))
     }
 }
 
@@ -3234,13 +3236,12 @@ async fn handle_session(
         let peers = &mut global.lock().await.peers;
         let peer = peers.get_mut(&addr).unwrap();
 
-        let _ = session
-            .lines
-            .send(bgp::Message::Open(bgp::OpenMessage::new(
-                router_id,
-                peer.local_cap.iter().cloned().collect(),
-            )))
-            .await;
+        let msg = bgp::Message::Open(bgp::OpenMessage::new(
+            router_id,
+            peer.local_cap.iter().cloned().collect(),
+        ));
+        peer.counter_tx.sync(&msg);
+        let _ = session.lines.send(msg).await;
     }
 
     let mut state = bgp::State::OpenSent;
@@ -3271,16 +3272,28 @@ async fn handle_session(
             Some(msg) = peer_event_rx.next().fuse() =>{
                 match msg {
                     PeerEvent::Broadcast(msg) => {
-                       if session
-                            .send_update(source.clone(), vec![msg])
-                            .await
-                            .is_err()
-                        {
-                            break;
+                       match session.send_update(source.clone(), vec![msg]).await {
+                            Ok((update, prefix)) => {
+                                let peers = &mut global.lock().await.peers;
+                                let peer = peers.get_mut(&addr).unwrap();
+                                peer.counter_tx.update += 1;
+                                peer.counter_tx.total += 1;
+                                peer.counter_tx.withdraw_update += update;
+                                peer.counter_tx.withdraw_prefix += prefix;
+                            }
+                            Err(_) => {
+                                break;
+                            }
                         }
                     }
-                    PeerEvent::Notification(msg) => {
-                        let _ = session.lines.send(bgp::Message::Notification(msg)).await;
+                    PeerEvent::Notification(n) => {
+                        let msg = bgp::Message::Notification(n);
+                        {
+                            let peers = &mut global.lock().await.peers;
+                            let peer = peers.get_mut(&addr).unwrap();
+                            peer.counter_tx.sync(&msg);
+                        }
+                        let _ = session.lines.send(msg).await;
                         break;
                     }
                 }
@@ -3478,9 +3491,14 @@ async fn handle_session(
                                         }
                                     }
                                 }
+                                let delta = v.len() as u64;
                                 if session.send_update(source.clone(), v).await.is_err() {
                                     break;
                                 }
+                                let peers = &mut global.lock().await.peers;
+                                let peer = peers.get_mut(&addr).unwrap();
+                                peer.counter_tx.update += delta;
+                                peer.counter_tx.total += delta;
                             }
                         }
                         bgp::Message::RouteRefresh(m) => println!("{:?}", m.family),
