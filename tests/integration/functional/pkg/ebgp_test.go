@@ -3,15 +3,25 @@ package bgptest
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func checkPathAttr(t *testing.T, c *bgpTest, peers []string) {
 	for _, peer := range peers {
-		l, err := c.listPath(peer, adjin, "r1")
-		assert.Nil(t, err)
 		// check if routes are properly advertised
+		var l []path
+		for i := 0; i < 100; i++ {
+			var err error
+			l, err = c.listPath(peer, adjin, "r1")
+			assert.Nil(t, err)
+			if len(l) < 2 {
+				time.Sleep(time.Millisecond * 100)
+			} else {
+				break
+			}
+		}
 		assert.Equal(t, len(l), 2)
 		for _, p := range l {
 			// check if the nexthop is updated

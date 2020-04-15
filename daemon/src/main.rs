@@ -2069,6 +2069,7 @@ impl GobgpApi for Service {
                         }
                     }
 
+                    let mut r = Vec::with_capacity(dst.entry.len());
                     for p in &dst.entry {
                         if adjin_filter(p.source.address) {
                             continue;
@@ -2077,7 +2078,6 @@ impl GobgpApi for Service {
                             continue;
                         }
 
-                        let mut r = Vec::new();
                         let rt = table.roa.t(family);
                         if table_type == api::TableType::AdjOut {
                             let (_, my, _) = source.unwrap();
@@ -2097,15 +2097,15 @@ impl GobgpApi for Service {
                         } else {
                             r.push(p.to_api(&net, p.nexthop, p.attrs.entry.iter().collect(), rt));
                         }
-                        if r.len() > 0 {
-                            r[0].best = true;
-                            v.push(api::ListPathResponse {
-                                destination: Some(api::Destination {
-                                    prefix: net.to_string(),
-                                    paths: From::from(r),
-                                }),
-                            });
-                        }
+                    }
+                    if r.len() != 0 {
+                        r[0].best = true;
+                        v.push(api::ListPathResponse {
+                            destination: Some(api::Destination {
+                                prefix: net.to_string(),
+                                paths: From::from(r),
+                            }),
+                        });
                     }
                 }
             }
