@@ -276,6 +276,7 @@ pub enum Family {
     Ipv6Uc,
 
     Unknown(u32),
+    Reserved,
 }
 
 impl From<Family> for u32 {
@@ -284,6 +285,7 @@ impl From<Family> for u32 {
             Family::Ipv4Uc => Family::IPV4_UC,
             Family::Ipv6Uc => Family::IPV6_UC,
             Family::Unknown(f) => f,
+            Family::Reserved => 0,
         }
     }
 }
@@ -293,6 +295,7 @@ impl From<u32> for Family {
         match v {
             Family::IPV4_UC => Family::Ipv4Uc,
             Family::IPV6_UC => Family::Ipv6Uc,
+            0 => Family::Reserved,
             _ => Family::Unknown(v),
         }
     }

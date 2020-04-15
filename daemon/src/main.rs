@@ -87,6 +87,7 @@ impl ToApi<api::Family> for bgp::Family {
                 afi: (v >> 16) as i32,
                 safi: (v & 0xff) as i32,
             },
+            _ => api::Family { afi: 0, safi: 0 },
         }
     }
 }
@@ -598,23 +599,12 @@ fn roa_clear() {
 
 #[derive(Clone)]
 pub struct Destination {
-    pub net: bgp::Nlri,
     pub entry: Vec<Path>,
 }
 
 impl Destination {
-    pub fn new(net: bgp::Nlri) -> Destination {
-        Destination {
-            net: net,
-            entry: Vec::new(),
-        }
-    }
-
-    pub fn to_api(&self, paths: Vec<api::Path>) -> api::Destination {
-        api::Destination {
-            prefix: self.net.to_string(),
-            paths: From::from(paths),
-        }
+    pub fn new(entry: Vec<Path>) -> Destination {
+        Destination { entry }
     }
 }
 
@@ -729,6 +719,8 @@ pub struct Table {
 
 impl Table {
     pub fn new() -> Table {
+        let mut master = HashMap::new();
+        master.insert(bgp::Family::Reserved, HashMap::new());
         Table {
             local_source: Arc::new(Source {
                 address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -738,12 +730,42 @@ impl Table {
                 state: bgp::State::Idle,
             }),
             disable_best_path_selection: false,
-            master: HashMap::new(),
+            master: master,
             roa: RoaTable::new(),
             active_peers: HashMap::new(),
             bmp_sessions: HashMap::new(),
             rtr_sessions: HashMap::new(),
         }
+    }
+
+    fn master_iter(
+        &self,
+        family: &proto::bgp::Family,
+    ) -> impl Iterator<Item = (&proto::bgp::Nlri, &Destination)> {
+        let t = self
+            .master
+            .get(family)
+            .unwrap_or(&self.master.get(&bgp::Family::Reserved).unwrap());
+        t.iter()
+    }
+
+    pub fn adjin(
+        &self,
+        source: IpAddr,
+        family: &proto::bgp::Family,
+    ) -> impl Iterator<Item = (&proto::bgp::Nlri, Vec<&Path>)> {
+        return self.master_iter(family).filter_map(move |(net, dst)| {
+            let mut v = Vec::with_capacity(dst.entry.len());
+            for p in &dst.entry {
+                if p.source.address == source {
+                    v.push(p);
+                }
+            }
+            if v.len() == 0 {
+                return None;
+            }
+            Some((net, v))
+        });
     }
 
     pub fn insert(
@@ -817,11 +839,12 @@ impl Table {
             }
 
             None => {
-                let mut d = Destination::new(net);
                 let a = attrs.clone();
                 let src = source.clone();
-                d.entry.push(Path::new(source, nexthop, attrs));
-                t.insert(net, d);
+                t.insert(
+                    net,
+                    Destination::new(vec![Path::new(source, nexthop, attrs)]),
+                );
                 new_best = true;
                 (a, src)
             }
@@ -1984,18 +2007,17 @@ impl GobgpApi for Service {
                 .filter_map(|p| bgp::IpNet::from_str(&p.prefix).ok())
                 .collect();
 
-            let family = if let Some(family) = request.family {
-                bgp::Family::new(family.afi as u16, family.safi as u8)
-            } else {
-                bgp::Family::Ipv4Uc
-            };
+            let mut family = bgp::Family::Ipv4Uc;
+            if let Some(f) = request.family {
+                family = f.to_proto();
+            }
 
-            let prefix_filter = |ipnet: bgp::IpNet| -> bool {
+            let prefix_filter = |ipnet: &bgp::IpNet| -> bool {
                 if prefixes.len() == 0 {
                     return false;
                 }
                 for prefix in &prefixes {
-                    if ipnet == *prefix {
+                    if ipnet == prefix {
                         return false;
                     }
                 }
@@ -2038,53 +2060,50 @@ impl GobgpApi for Service {
             };
 
             {
-                let t = table.master.get(&family);
-                if !t.is_none() {
-                    for (_, dst) in t.unwrap() {
-                        match dst.net {
-                            bgp::Nlri::Ip(net) => {
-                                if prefix_filter(net) {
-                                    continue;
-                                }
+                for (net, dst) in table.master_iter(&family) {
+                    match net {
+                        bgp::Nlri::Ip(net) => {
+                            if prefix_filter(net) {
+                                continue;
                             }
                         }
+                    }
+
+                    for p in &dst.entry {
+                        if adjin_filter(p.source.address) {
+                            continue;
+                        }
+                        if adjout_filter(p.source.clone()) {
+                            continue;
+                        }
+
                         let mut r = Vec::new();
-                        for p in &dst.entry {
-                            if adjin_filter(p.source.address) {
-                                continue;
-                            }
-                            if adjout_filter(p.source.clone()) {
-                                continue;
-                            }
-                            let rt = table.roa.t(family);
-                            if table_type == api::TableType::AdjOut {
-                                let (_, my, _) = source.unwrap();
-                                let nexthop = if my.ibgp { p.nexthop } else { my.local_addr };
-                                let (mut v, n) = update_attrs(
-                                    my.ibgp,
-                                    dst.net.is_mp(),
-                                    my.local_as,
-                                    dst.net,
-                                    p.nexthop,
-                                    my.local_addr,
-                                    p.attrs.entry.iter().collect(),
-                                );
-                                v.append(&mut n.iter().collect());
-                                v.sort_by_key(|a| a.attr());
-                                r.push(p.to_api(&dst.net, nexthop, v, rt));
-                            } else {
-                                r.push(p.to_api(
-                                    &dst.net,
-                                    p.nexthop,
-                                    p.attrs.entry.iter().collect(),
-                                    rt,
-                                ));
-                            }
+                        let rt = table.roa.t(family);
+                        if table_type == api::TableType::AdjOut {
+                            let (_, my, _) = source.unwrap();
+                            let nexthop = if my.ibgp { p.nexthop } else { my.local_addr };
+                            let (mut v, n) = update_attrs(
+                                my.ibgp,
+                                net.is_mp(),
+                                my.local_as,
+                                *net,
+                                p.nexthop,
+                                my.local_addr,
+                                p.attrs.entry.iter().collect(),
+                            );
+                            v.append(&mut n.iter().collect());
+                            v.sort_by_key(|a| a.attr());
+                            r.push(p.to_api(&net, nexthop, v, rt));
+                        } else {
+                            r.push(p.to_api(&net, p.nexthop, p.attrs.entry.iter().collect(), rt));
                         }
                         if r.len() > 0 {
                             r[0].best = true;
                             v.push(api::ListPathResponse {
-                                destination: Some(dst.to_api(r)),
+                                destination: Some(api::Destination {
+                                    prefix: net.to_string(),
+                                    paths: From::from(r),
+                                }),
                             });
                         }
                     }
@@ -2165,19 +2184,11 @@ impl GobgpApi for Service {
             family = f.to_proto();
         }
 
-        let table = self.table.clone();
-        let t = table.lock().await;
-        let t = t.master.get(&family);
         let mut nr_dst: u64 = 0;
         let mut nr_path: u64 = 0;
-        match t {
-            Some(t) => {
-                for (_, dst) in t {
-                    nr_path += dst.entry.len() as u64;
-                }
-                nr_dst = t.len() as u64;
-            }
-            None => {}
+        for (_, dst) in self.table.lock().await.master_iter(&family) {
+            nr_path += dst.entry.len() as u64;
+            nr_dst += 1;
         }
         Ok(tonic::Response::new(api::GetTableResponse {
             num_destination: nr_dst,
@@ -2875,7 +2886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 for (_, map) in t.master.iter() {
-                    for (_, dst) in map.iter() {
+                    for (net, dst) in map.iter() {
                         for path in &dst.entry {
                             if path.source.address == t.local_source.address {
                                 continue;
@@ -2883,7 +2894,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
                                 peer_header: g.peers.get(&path.source.address).unwrap().to_bmp_ph(),
-                                payload: path.to_payload(dst.net),
+                                payload: path.to_payload(*net),
                             });
                             let _ = tx.send(m);
                         }
@@ -3477,16 +3488,14 @@ async fn handle_session(
 
                                     if t.disable_best_path_selection == false {
                                         for family in &session.families {
-                                            if let Some(m) = t.master.get_mut(&family) {
-                                                for route in m {
-                                                    let u = TableUpdate::NewBest(
-                                                        *route.0,
-                                                        route.1.entry[0].nexthop,
-                                                        route.1.entry[0].attrs.clone(),
-                                                        source.clone(),
-                                                    );
-                                                    v.push(u);
-                                                }
+                                            for route in t.master_iter(&family) {
+                                                let u = TableUpdate::NewBest(
+                                                    *route.0,
+                                                    route.1.entry[0].nexthop,
+                                                    route.1.entry[0].attrs.clone(),
+                                                    source.clone(),
+                                                );
+                                                v.push(u);
                                             }
                                         }
                                     }
