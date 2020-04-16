@@ -747,25 +747,6 @@ impl Table {
         t.iter()
     }
 
-    pub fn adjin(
-        &self,
-        source: IpAddr,
-        family: &proto::bgp::Family,
-    ) -> impl Iterator<Item = (&proto::bgp::Nlri, Vec<&Path>)> {
-        return self.master_iter(family).filter_map(move |(net, dst)| {
-            let mut v = Vec::with_capacity(dst.entry.len());
-            for p in &dst.entry {
-                if p.source.address == source {
-                    v.push(p);
-                }
-            }
-            if v.len() == 0 {
-                return None;
-            }
-            Some((net, v))
-        });
-    }
-
     pub fn insert(
         &mut self,
         family: bgp::Family,
