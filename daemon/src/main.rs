@@ -710,7 +710,7 @@ pub struct Table {
     pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
     pub roa: RoaTable,
 
-    pub active_peers: HashMap<IpAddr, BgpSession>,
+    pub bgp_sessions: HashMap<IpAddr, BgpSession>,
     pub bmp_sessions: HashMap<SocketAddr, Sender<bmp::Message>>,
     pub rtr_sessions: HashMap<SocketAddr, RtrSession>,
 }
@@ -730,7 +730,7 @@ impl Table {
             disable_best_path_selection: false,
             master: master,
             roa: RoaTable::new(),
-            active_peers: HashMap::new(),
+            bgp_sessions: HashMap::new(),
             bmp_sessions: HashMap::new(),
             rtr_sessions: HashMap::new(),
         }
@@ -943,7 +943,7 @@ impl Table {
     }
 
     pub async fn broadcast(&mut self, from: Arc<Source>, family: bgp::Family, msg: &TableUpdate) {
-        for (addr, session) in self.active_peers.iter_mut() {
+        for (addr, session) in self.bgp_sessions.iter_mut() {
             let target = session.source.clone();
             if target.state == bgp::State::Established
                 && *addr != from.address
@@ -1748,7 +1748,7 @@ impl GobgpApi for Service {
                         continue;
                     }
                 }
-                if let Some(s) = table.active_peers.get(&a) {
+                if let Some(s) = table.bgp_sessions.get(&a) {
                     p.accepted = s.accepted.iter().map(|(k, v)| (*k, *v)).collect();
                 }
 
@@ -2047,7 +2047,7 @@ impl GobgpApi for Service {
 
                         let rt = table.roa.t(family);
                         if table_type == api::TableType::AdjOut {
-                            match table.active_peers.get(&target_addr.unwrap()) {
+                            match table.bgp_sessions.get(&target_addr.unwrap()) {
                                 Some(session) => {
                                     let target = session.source.clone();
                                     if need_to_advertise(
@@ -2557,7 +2557,7 @@ async fn handle_table_update(
                         t.broadcast(source.clone(), c.family, &u).await;
                     }
                     if deleted == true {
-                        if let Some(session) = t.active_peers.get_mut(&address) {
+                        if let Some(session) = t.bgp_sessions.get_mut(&address) {
                             session.update_accepted(c.family, -1);
                         }
                     }
@@ -2576,7 +2576,7 @@ async fn handle_table_update(
                         t.broadcast(source.clone(), c.family, &u).await;
                     }
                     if added == true {
-                        if let Some(session) = t.active_peers.get_mut(&address) {
+                        if let Some(session) = t.bgp_sessions.get_mut(&address) {
                             session.update_accepted(c.family, 1);
                         }
                     }
@@ -2700,7 +2700,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match stream.peer_addr() {
                             Ok(sock) => {
                                 let t = table.lock().await;
-                                if t.active_peers.contains_key(&sock.ip()) {
+                                if t.bgp_sessions.contains_key(&sock.ip()) {
                                     // already connected
                                     continue;
                                 }
@@ -2718,7 +2718,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let (proto, sockaddr) = v.into_inner();
                             let t = table.lock().await;
                             if proto == Proto::Bgp {
-                                if t.active_peers.contains_key(&sockaddr.ip()) {
+                                if t.bgp_sessions.contains_key(&sockaddr.ip()) {
                                     // already connected
                                     continue;
                                 }
@@ -2748,7 +2748,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let addr = source.address;
                                 {
                                     let mut t = table.lock().await;
-                                    t.active_peers.remove(&addr);
+                                    t.bgp_sessions.remove(&addr);
                                     for (f, u) in t.clear(source.clone()) {
                                         t.broadcast(source.clone(), f, &u).await;
                                     }
@@ -2792,9 +2792,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         match g.peers.get_mut(&addr) {
                             Some(peer) =>{
-                                if t.active_peers.contains_key(&addr) {
+                                if t.bgp_sessions.contains_key(&addr) {
                                     peer.delete_on_disconnected = true;
-                                    let session = t.active_peers.get(&addr).unwrap();
+                                    let session = t.bgp_sessions.get(&addr).unwrap();
                                     let _= session.tx.send(PeerEvent::Notification(
                                         bgp::NotificationMessage::new(
                                             bgp::NotificationCode::PeerDeconfigured,
@@ -2843,7 +2843,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                 ));
 
-                for (_, session) in t.active_peers.iter() {
+                for (_, session) in t.bgp_sessions.iter() {
                     if session.source.state != bgp::State::Established {
                         continue;
                     }
@@ -2940,13 +2940,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut rx = {
             let mut t = table.lock().await;
             let (tx, rx) = mpsc::unbounded_channel();
-            t.active_peers
+            t.bgp_sessions
                 .insert(addr, BgpSession::new(tx, source.clone()));
             rx
         };
         let table_tx = table_tx.clone();
         tokio::spawn(async move {
-            handle_session(global, table, table_tx, &mut rx, stream, addr, local_addr).await;
+            handle_bgp_session(global, table, table_tx, &mut rx, stream, addr, local_addr).await;
         });
     }
 }
@@ -3193,7 +3193,7 @@ async fn send_update(
     Ok((withdraw, withdraw))
 }
 
-async fn handle_session(
+async fn handle_bgp_session(
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
     table_tx: Sender<TableChange>,
@@ -3232,7 +3232,7 @@ async fn handle_session(
     let mut state = bgp::State::OpenSent;
     let mut source = {
         let t = table.lock().await;
-        let session = t.active_peers.get(&addr).unwrap();
+        let session = t.bgp_sessions.get(&addr).unwrap();
         session.source.clone()
     };
     let mut delay = delay_for(Duration::from_secs(0));
@@ -3336,7 +3336,7 @@ async fn handle_session(
                                     })
                                     .collect();
 
-                                let mut session = t.active_peers.get_mut(&addr).unwrap();
+                                let mut session = t.bgp_sessions.get_mut(&addr).unwrap();
                                 session.families = peer
                                     .local_cap
                                     .iter()
@@ -3454,10 +3454,10 @@ async fn handle_session(
                                 {
                                     let mut t = table.lock().await;
                                     let g = global.lock().await;
-                                    let mut session = t.active_peers.remove(&addr).unwrap();
+                                    let mut session = t.bgp_sessions.remove(&addr).unwrap();
                                     session.source = source.clone();
                                     let families:Vec<bgp::Family> = session.families.iter().cloned().collect();
-                                    t.active_peers.insert(addr, session);
+                                    t.bgp_sessions.insert(addr, session);
 
                                     for (_, tx) in t.bmp_sessions.iter_mut() {
                                         let p = g.peers.get(&addr).unwrap();
