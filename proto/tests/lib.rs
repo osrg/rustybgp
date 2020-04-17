@@ -33,13 +33,12 @@ fn parse_ipv6_update() {
     let msg = Message::from_bytes(param, buf.as_slice()).unwrap();
     match msg {
         Message::Update(update) => {
-            for mp_route in &update.mp_routes {
-                assert_eq!(nlri.len(), mp_route.0.len());
-                for i in 0..mp_route.0.len() {
-                    match mp_route.0[i] {
-                        Nlri::Ip(n) => {
-                            assert_eq!(n, nlri[i]);
-                        }
+            let mp_routes = update.mp_routes.unwrap().1;
+            assert_eq!(nlri.len(), mp_routes.len());
+            for i in 0..mp_routes.len() {
+                match mp_routes[i] {
+                    Nlri::Ip(n) => {
+                        assert_eq!(n, nlri[i]);
                     }
                 }
             }

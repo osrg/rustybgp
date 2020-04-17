@@ -3373,31 +3373,26 @@ async fn handle_bgp_session(
                                     );
                                 }
 
-                                for f in update.mp_routes {
-                                    for r in f.0 {
+                                if let Some((family, mp_routes, nexthop)) = update.mp_routes {
+                                    for r in mp_routes {
                                         let _ = table_tx.send(
                                             TableChange{
-                                                family: bgp::Family::Ipv6Uc,
-                                                net: r,
-                                                source: source.clone(),
-                                                nexthop: f.1,
-                                                attrs: pa.clone(),
+                                            family,
+                                            net: r,
+                                            source: source.clone(),
+                                            nexthop: nexthop,
+                                            attrs: pa.clone(),
                                             }
                                         );
                                     }
                                 }
                             }
 
-                            for r in update.withdrawns {
-                                let bgp::Nlri::Ip(net) = r;
-                                let family = match net.addr {
-                                    IpAddr::V4(_) => bgp::Family::Ipv4Uc,
-                                    IpAddr::V6(_) => bgp::Family::Ipv6Uc,
-                                };
+                            for (family, nlri) in update.withdrawns {
                                 let _ = table_tx.send(
                                     TableChange{
-                                        family: family,
-                                        net: r,
+                                        family,
+                                        net: nlri,
                                         source: source.clone(),
                                         nexthop: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
                                         attrs: Arc::new(PathAttr {

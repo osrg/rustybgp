@@ -1451,9 +1451,9 @@ fn path_attribute_as_path() {
 pub struct UpdateMessage {
     pub attrs: Vec<Attribute>,
     pub routes: Vec<Nlri>,
-    pub withdrawns: Vec<Nlri>,
     pub nexthop: IpAddr,
-    pub mp_routes: Vec<(Vec<Nlri>, IpAddr)>,
+    pub mp_routes: Option<(Family, Vec<Nlri>, IpAddr)>,
+    pub withdrawns: Vec<(Family, Nlri)>,
     length: usize,
 }
 
@@ -1462,8 +1462,8 @@ impl UpdateMessage {
 
     pub fn new(
         routes: Vec<Nlri>,
-        mp_routes: Vec<(Vec<Nlri>, IpAddr)>,
-        withdrawns: Vec<Nlri>,
+        mp_routes: Option<(Family, Vec<Nlri>, IpAddr)>,
+        withdrawns: Vec<(Family, Nlri)>,
         attrs: Vec<Attribute>,
     ) -> UpdateMessage {
         UpdateMessage {
@@ -1478,13 +1478,13 @@ impl UpdateMessage {
 
     pub fn from_bytes(param: &ParseParam, c: &mut Cursor<&[u8]>) -> Result<UpdateMessage, Error> {
         let withdrawn_len = c.read_u16::<NetworkEndian>()?;
-        let mut withdrawns: Vec<Nlri> = Vec::new();
+        let mut withdrawns: Vec<(Family, Nlri)> = Vec::new();
         let mut ip_nexthop = UpdateMessage::INVALID_NEXTHOP;
 
         let pos = c.position();
         while c.position() - pos < withdrawn_len as u64 {
             let net = IpNet::from_bytes(c, false)?;
-            withdrawns.push(Nlri::Ip(net));
+            withdrawns.push((Family::Ipv4Uc, Nlri::Ip(net)));
         }
 
         let attr_len = c.read_u16::<NetworkEndian>()?;
@@ -1493,7 +1493,7 @@ impl UpdateMessage {
         let mut handle_as_withdrawns = false;
         let mut seen = HashSet::new();
         let attr_end = c.position() + attr_len as u64;
-        let mut mp_routes: Vec<(Vec<Nlri>, IpAddr)> = Vec::new();
+        let mut mp_routes: Option<(Family, Vec<Nlri>, IpAddr)> = None;
         while c.position() < attr_end {
             let attr = Attribute::from_bytes(c);
             match attr {
@@ -1515,20 +1515,15 @@ impl UpdateMessage {
                             attrs.push(a);
                         }
                         Attribute::MpReach {
-                            family: _,
+                            family,
                             nlri,
                             nexthop,
                         } => {
-                            let mut routes: Vec<Nlri> = Vec::new();
-                            for r in nlri {
-                                routes.push(*r);
-                            }
-                            mp_routes.push((routes, *nexthop));
+                            mp_routes = Some((*family, nlri.iter().cloned().collect(), *nexthop));
                         }
-                        Attribute::MpUnreach { family: _, nlri } => {
-                            for r in nlri {
-                                withdrawns.push(*r);
-                            }
+                        Attribute::MpUnreach { family, nlri } => {
+                            withdrawns
+                                .append(&mut nlri.iter().cloned().map(|n| (*family, n)).collect());
                         }
                         _ => attrs.push(a),
                     }
@@ -1550,13 +1545,17 @@ impl UpdateMessage {
             routes.push(Nlri::Ip(net));
         }
 
-        if routes.len() > 0 || mp_routes.len() > 0 {
+        if routes.len() > 0 || mp_routes.is_some() {
             if handle_as_withdrawns
                 || !seen.contains(&Attribute::ORIGIN)
                 || !seen.contains(&Attribute::AS_PATH)
-                || routes.len() > 0 && !seen.contains(&Attribute::NEXTHOP)
+                || (routes.len() > 0 && !seen.contains(&Attribute::NEXTHOP))
             {
-                withdrawns.append(&mut routes);
+                withdrawns.append(&mut routes.iter().map(|n| (Family::Ipv4Uc, *n)).collect());
+                if let Some(a) = mp_routes {
+                    withdrawns.append(&mut a.1.iter().map(|n| (a.0, *n)).collect());
+                    mp_routes = None;
+                }
             }
         }
 
