@@ -2022,7 +2022,7 @@ impl GobgpApi for Service {
                     let mut r = Vec::with_capacity(dst.entry.len());
                     for p in &dst.entry {
                         if table_type == api::TableType::AdjIn
-                            && target_addr.unwrap() == p.source.address
+                            && target_addr.unwrap() != p.source.address
                         {
                             continue;
                         }

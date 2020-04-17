@@ -31,6 +31,12 @@ func checkPathAttr(t *testing.T, c *bgpTest, peers []string) {
 			assert.Equal(t, len(p.aspath), 2)
 		}
 	}
+
+	// check if adjin works
+	l, err := c.listPath("r1", adjin, "g1")
+	assert.Nil(t, err)
+	assert.Equal(t, len(l), 1)
+	assert.Equal(t, l[0].nlri, "10.0.1.0/24")
 }
 
 func checkGlobalRib(t *testing.T, c *bgpTest) {
