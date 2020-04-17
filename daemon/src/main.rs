@@ -754,7 +754,7 @@ impl Table {
         source: Arc<Source>,
         nexthop: IpAddr,
         attrs: Arc<PathAttr>,
-    ) -> (Option<TableUpdate>, bool) {
+    ) -> (Option<RoutingTableUpdate>, bool) {
         let t = self.master.get_mut(&family);
         let t = match t {
             Some(t) => t,
@@ -830,7 +830,13 @@ impl Table {
         };
         if self.disable_best_path_selection == false && new_best {
             (
-                Some(TableUpdate::NewBest(net, nexthop, attrs, src)),
+                Some(RoutingTableUpdate::new(
+                    src,
+                    family,
+                    net,
+                    Some(attrs),
+                    Some(nexthop),
+                )),
                 !replaced,
             )
         } else {
@@ -843,7 +849,7 @@ impl Table {
         family: bgp::Family,
         net: bgp::Nlri,
         source: Arc<Source>,
-    ) -> (Option<TableUpdate>, bool) {
+    ) -> (Option<RoutingTableUpdate>, bool) {
         let t = self.master.get_mut(&family);
         if t.is_none() {
             return (None, false);
@@ -856,15 +862,25 @@ impl Table {
                         d.entry.remove(i);
                         if d.entry.len() == 0 {
                             t.remove(&net);
-                            return (Some(TableUpdate::Withdrawn(net, source.clone())), true);
+                            return (
+                                Some(RoutingTableUpdate::new(
+                                    source.clone(),
+                                    family,
+                                    net,
+                                    None,
+                                    None,
+                                )),
+                                true,
+                            );
                         }
                         if i == 0 {
                             return (
-                                Some(TableUpdate::NewBest(
-                                    net,
-                                    d.entry[0].nexthop,
-                                    d.entry[0].attrs.clone(),
+                                Some(RoutingTableUpdate::new(
                                     d.entry[0].source.clone(),
+                                    family,
+                                    net,
+                                    Some(d.entry[0].attrs.clone()),
+                                    Some(d.entry[0].nexthop),
                                 )),
                                 true,
                             );
@@ -879,7 +895,7 @@ impl Table {
         return (None, false);
     }
 
-    pub fn clear(&mut self, source: Arc<Source>) -> Vec<(bgp::Family, TableUpdate)> {
+    pub fn clear(&mut self, source: Arc<Source>) -> Vec<RoutingTableUpdate> {
         let mut update = Vec::new();
         let mut m: HashMap<bgp::Family, Vec<bgp::Nlri>> = HashMap::new();
         for f in self.master.keys() {
@@ -892,16 +908,20 @@ impl Table {
                     if d.entry[i].source.address == source.address {
                         d.entry.remove(i);
                         if d.entry.len() == 0 {
-                            update.push((*f, TableUpdate::Withdrawn(*n, source.clone())));
-                        } else if i == 0 {
-                            update.push((
+                            update.push(RoutingTableUpdate::new(
+                                source.clone(),
                                 *f,
-                                TableUpdate::NewBest(
-                                    *n,
-                                    d.entry[0].nexthop,
-                                    d.entry[0].attrs.clone(),
-                                    source.clone(),
-                                ),
+                                *n,
+                                None,
+                                None,
+                            ));
+                        } else if i == 0 {
+                            update.push(RoutingTableUpdate::new(
+                                source.clone(),
+                                *f,
+                                *n,
+                                Some(d.entry[0].attrs.clone()),
+                                Some(d.entry[0].nexthop),
                             ));
                         }
                         break;
@@ -923,30 +943,16 @@ impl Table {
         update
     }
 
-    pub async fn broadcast(&mut self, from: Arc<Source>, family: bgp::Family, msg: &TableUpdate) {
+    pub async fn broadcast(&mut self, rtu: RoutingTableUpdate) {
+        let from = rtu.source.clone();
         for (addr, session) in self.bgp_sessions.iter_mut() {
             let target = session.source.clone();
             if target.state == bgp::State::Established
                 && *addr != from.address
                 && !(from.ibgp && target.ibgp)
-                && session.families.contains(&family)
+                && session.families.contains(&rtu.family)
             {
-                match msg {
-                    TableUpdate::NewBest(nlri, nexthop, attrs, source) => {
-                        let _ = session.tx.send(PeerEvent::Broadcast(TableUpdate::NewBest(
-                            *nlri,
-                            *nexthop,
-                            attrs.clone(),
-                            source.clone(),
-                        )));
-                    }
-                    TableUpdate::Withdrawn(nlri, source) => {
-                        let _ = session.tx.send(PeerEvent::Broadcast(TableUpdate::Withdrawn(
-                            *nlri,
-                            source.clone(),
-                        )));
-                    }
-                }
+                let _ = session.tx.send(PeerEvent::Update(rtu.clone()));
             }
         }
     }
@@ -1901,7 +1907,7 @@ impl GobgpApi for Service {
             Arc::new(PathAttr { entry: attrs }),
         );
         if let Some(u) = u {
-            t.broadcast(s.clone(), family, &u).await;
+            t.broadcast(u).await;
         }
 
         Ok(tonic::Response::new(api::AddPathResponse {
@@ -1944,7 +1950,7 @@ impl GobgpApi for Service {
         let s = t.local_source.clone();
         let (u, _) = t.remove(family, nlri, s.clone());
         if let Some(u) = u {
-            t.broadcast(s.clone(), family, &u).await;
+            t.broadcast(u).await;
         }
         Ok(tonic::Response::new(()))
     }
@@ -2135,7 +2141,7 @@ impl GobgpApi for Service {
                 Arc::new(PathAttr { entry: attrs }),
             );
             if let Some(u) = u {
-                t.broadcast(s.clone(), family, &u).await;
+                t.broadcast(u).await;
             }
         }
 
@@ -2513,18 +2519,37 @@ pub enum SrvEvent {
     Deconfigured(IpAddr),
 }
 
-pub struct TableChange {
+#[derive(Clone)]
+pub struct RoutingTableUpdate {
+    pub source: Arc<Source>,
     pub family: bgp::Family,
     pub nlri: bgp::Nlri,
-    pub source: Arc<Source>,
-    pub nexthop: Option<IpAddr>,
     pub attrs: Option<Arc<PathAttr>>,
+    pub nexthop: Option<IpAddr>,
+}
+
+impl RoutingTableUpdate {
+    pub fn new(
+        source: Arc<Source>,
+        family: bgp::Family,
+        nlri: bgp::Nlri,
+        attrs: Option<Arc<PathAttr>>,
+        nexthop: Option<IpAddr>,
+    ) -> Self {
+        RoutingTableUpdate {
+            source,
+            family,
+            nlri,
+            nexthop,
+            attrs,
+        }
+    }
 }
 
 async fn handle_table_update(
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
-    table_rx: &mut Receiver<TableChange>,
+    table_rx: &mut Receiver<RoutingTableUpdate>,
 ) {
     loop {
         tokio::select! {
@@ -2536,7 +2561,7 @@ async fn handle_table_update(
                     None => {
                         let (u, deleted) = t.remove(c.family, c.nlri, source.clone());
                         if let Some(u) = u {
-                            t.broadcast(source.clone(), c.family, &u).await;
+                            t.broadcast(u).await;
                         }
                         if deleted == true {
                             if let Some(session) = t.bgp_sessions.get_mut(&address) {
@@ -2556,7 +2581,7 @@ async fn handle_table_update(
                     Some(attrs) => {
                         let (u, added) = t.insert(c.family, c.nlri, source.clone(), c.nexthop.unwrap(), attrs.clone());
                         if let Some(u) = u {
-                            t.broadcast(source.clone(), c.family, &u).await;
+                            t.broadcast(u).await;
                         }
                         if added == true {
                             if let Some(session) = t.bgp_sessions.get_mut(&address) {
@@ -2732,8 +2757,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 {
                                     let mut t = table.lock().await;
                                     t.bgp_sessions.remove(&addr);
-                                    for (f, u) in t.clear(source.clone()) {
-                                        t.broadcast(source.clone(), f, &u).await;
+                                    for u in t.clear(source.clone()) {
+                                        t.broadcast(u).await;
                                     }
                                 }
                                 {
@@ -2971,7 +2996,7 @@ impl Decoder for Bgp {
 }
 
 pub enum PeerEvent {
-    Broadcast(TableUpdate),
+    Update(RoutingTableUpdate),
     Notification(bgp::NotificationMessage),
 }
 
@@ -3141,20 +3166,20 @@ impl BgpSession {
 async fn send_update(
     my: Arc<Source>,
     lines: &mut Framed<TcpStream, Bgp>,
-    updates: Vec<TableUpdate>,
+    updates: Vec<RoutingTableUpdate>,
 ) -> Result<(u64, u64), io::Error> {
     let mut withdraw = 0;
     for update in updates {
-        match update {
-            TableUpdate::NewBest(nlri, nexthop, attrs, _source) => {
-                let is_mp = nlri.is_mp();
+        match update.attrs {
+            Some(attrs) => {
+                let is_mp = update.nlri.is_mp();
 
                 let (mut v, n) = update_attrs(
                     my.ibgp,
                     is_mp,
                     my.local_as,
-                    nlri,
-                    nexthop,
+                    update.nlri,
+                    update.nexthop.unwrap(),
                     my.local_addr,
                     attrs.entry.iter().collect(),
                 );
@@ -3162,12 +3187,13 @@ async fn send_update(
 
                 v.sort_by_key(|a| a.attr());
 
-                let routes = if is_mp { Vec::new() } else { vec![nlri] };
+                let routes = if is_mp { Vec::new() } else { vec![update.nlri] };
                 let buf = bgp::UpdateMessage::to_bytes(routes, Vec::new(), v).unwrap();
                 lines.get_mut().write_all(&buf).await?;
             }
-            TableUpdate::Withdrawn(nlri, _source) => {
-                let buf = bgp::UpdateMessage::to_bytes(Vec::new(), vec![nlri], Vec::new()).unwrap();
+            None => {
+                let buf = bgp::UpdateMessage::to_bytes(Vec::new(), vec![update.nlri], Vec::new())
+                    .unwrap();
                 lines.get_mut().write_all(&buf).await?;
                 withdraw += 1;
             }
@@ -3179,7 +3205,7 @@ async fn send_update(
 async fn handle_bgp_session(
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
-    table_tx: Sender<TableChange>,
+    table_tx: Sender<RoutingTableUpdate>,
     peer_event_rx: &mut Receiver<PeerEvent>,
     stream: TcpStream,
     addr: IpAddr,
@@ -3239,7 +3265,7 @@ async fn handle_bgp_session(
             }
             Some(msg) = peer_event_rx.next().fuse() =>{
                 match msg {
-                    PeerEvent::Broadcast(msg) => {
+                    PeerEvent::Update(msg) => {
                        match send_update(source.clone(), &mut lines, vec![msg]).await {
                             Ok((update, prefix)) => {
                                 let peers = &mut global.lock().await.peers;
@@ -3365,26 +3391,26 @@ async fn handle_bgp_session(
 
                                 for nlri in update.routes {
                                     let _ = table_tx.send(
-                                        TableChange{
-                                            family: bgp::Family::Ipv4Uc,
-                                            nlri: nlri,
-                                            source: source.clone(),
-                                            nexthop: Some(update.nexthop),
-                                            attrs: Some(pa.clone()),
-                                        }
+                                        RoutingTableUpdate::new(
+                                            source.clone(),
+                                            bgp::Family::Ipv4Uc,
+                                            nlri,
+                                            Some(pa.clone()),
+                                            Some(update.nexthop),
+                                        )
                                     );
                                 }
 
                                 if let Some((family, mp_routes, nexthop)) = update.mp_routes {
                                     for nlri in mp_routes {
                                         let _ = table_tx.send(
-                                            TableChange{
-                                            family,
-                                            nlri,
-                                            source: source.clone(),
-                                            nexthop: Some(nexthop),
-                                            attrs: Some(pa.clone()),
-                                            }
+                                            RoutingTableUpdate::new(
+                                                source.clone(),
+                                                family,
+                                                nlri,
+                                                Some(pa.clone()),
+                                                Some(nexthop),
+                                            )
                                         );
                                     }
                                 }
@@ -3392,13 +3418,13 @@ async fn handle_bgp_session(
 
                             for (family, nlri) in update.withdrawns {
                                 let _ = table_tx.send(
-                                    TableChange{
+                                    RoutingTableUpdate::new(
+                                        source.clone(),
                                         family,
                                         nlri,
-                                        source: source.clone(),
-                                        nexthop: None,
-                                        attrs: None,
-                                    }
+                                        None,
+                                        None,
+                                    )
                                 );
                             }
                         }
@@ -3444,11 +3470,12 @@ async fn handle_bgp_session(
                                     if t.disable_best_path_selection == false {
                                         for family in &families {
                                             for route in t.master_iter(&family) {
-                                                let u = TableUpdate::NewBest(
-                                                    *route.0,
-                                                    route.1.entry[0].nexthop,
-                                                    route.1.entry[0].attrs.clone(),
+                                                let u = RoutingTableUpdate::new(
                                                     source.clone(),
+                                                    *family,
+                                                    *route.0,
+                                                    Some(route.1.entry[0].attrs.clone()),
+                                                    Some(route.1.entry[0].nexthop),
                                                 );
                                                 v.push(u);
                                             }
