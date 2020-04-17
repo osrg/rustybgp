@@ -939,13 +939,10 @@ impl Table {
     }
 
     pub async fn broadcast(&mut self, rtu: RoutingTableUpdate) {
-        let from = rtu.source.clone();
-        for (addr, session) in self.bgp_sessions.iter_mut() {
+        for (_, session) in self.bgp_sessions.iter_mut() {
             let target = session.source.clone();
             if target.state == bgp::State::Established
-                && *addr != from.address
-                && !(from.ibgp && target.ibgp)
-                && session.families.contains(&rtu.family)
+                && need_to_advertise(&rtu.source, &target, &rtu.family, &session.families)
             {
                 let _ = session.tx.send(PeerEvent::Update(rtu.clone()));
             }
@@ -2029,38 +2026,23 @@ impl GobgpApi for Service {
 
                         let rt = table.roa.t(family);
                         if table_type == api::TableType::AdjOut {
-                            match table.bgp_sessions.get(&target_addr.unwrap()) {
-                                Some(session) => {
-                                    let target = session.source.clone();
-                                    if need_to_advertise(
-                                        p.source.address,
-                                        p.source.ibgp,
-                                        target.address,
-                                        target.ibgp,
-                                    ) && session.families.contains(&family)
-                                    {
-                                        let nexthop = if target.ibgp {
-                                            p.nexthop
-                                        } else {
-                                            target.local_addr
-                                        };
-                                        let (mut v, n) = update_attrs(
-                                            target.ibgp,
-                                            net.is_mp(),
-                                            target.local_as,
-                                            *net,
-                                            p.nexthop,
-                                            target.local_addr,
-                                            p.attrs.entry.iter().collect(),
-                                        );
-                                        v.append(&mut n.iter().collect());
-                                        v.sort_by_key(|a| a.attr());
-                                        r.push(p.to_api(&net, nexthop, v, rt));
-                                    }
+                            if let Some(session) = table.bgp_sessions.get(&target_addr.unwrap()) {
+                                let to = session.source.clone();
+                                if need_to_advertise(&p.source, &to, &family, &session.families) {
+                                    let nexthop = if to.ibgp { p.nexthop } else { to.local_addr };
+                                    let (mut v, n) = update_attrs(
+                                        &to,
+                                        family,
+                                        *net,
+                                        p.nexthop,
+                                        p.attrs.entry.iter().collect(),
+                                    );
+                                    v.append(&mut n.iter().collect());
+                                    v.sort_by_key(|a| a.attr());
+                                    r.push(p.to_api(&net, nexthop, v, rt));
                                 }
-                                None => {}
                             }
-                            // check out only the first one until addpath support
+                            // only the first one until addpath support
                             break;
                         } else {
                             r.push(p.to_api(&net, p.nexthop, p.attrs.entry.iter().collect(), rt));
@@ -2996,29 +2978,32 @@ pub enum PeerEvent {
 }
 
 fn need_to_advertise(
-    source_addr: IpAddr,
-    source_ibgp: bool,
-    target_addr: IpAddr,
-    target_ibgp: bool,
+    from: &Arc<Source>,
+    to: &Arc<Source>,
+    family: &bgp::Family,
+    enabled_families: &HashSet<bgp::Family>,
 ) -> bool {
-    if (source_ibgp && target_ibgp) || source_addr == target_addr {
+    if (from.ibgp && to.ibgp) || from.address == to.address || !enabled_families.contains(family) {
         return false;
     }
     true
 }
 
-fn update_attrs(
-    is_ibgp: bool,
-    is_mp: bool,
-    local_as: u32,
+fn update_attrs<'a, 'b>(
+    to: &'a Arc<Source>,
+    family: bgp::Family,
     nlri: bgp::Nlri,
     original_nexthop: IpAddr,
-    local_addr: IpAddr,
-    attrs: Vec<&bgp::Attribute>,
-) -> (Vec<&bgp::Attribute>, Vec<bgp::Attribute>) {
+    attrs: Vec<&'b bgp::Attribute>,
+) -> (Vec<&'b bgp::Attribute>, Vec<bgp::Attribute>) {
     let mut seen = HashSet::new();
     let mut v = Vec::new();
     let mut n = Vec::new();
+
+    let is_ibgp = to.ibgp;
+    let local_as = to.local_as;
+    let local_addr = to.local_addr;
+    let is_mp = family != bgp::Family::Ipv4Uc;
 
     for attr in attrs {
         seen.insert(attr.attr());
@@ -3078,7 +3063,7 @@ fn update_attrs(
     };
     if is_mp {
         n.push(bgp::Attribute::MpReach {
-            family: bgp::Family::Ipv6Uc,
+            family,
             nexthop,
             nlri: vec![nlri],
         })
@@ -3107,7 +3092,6 @@ fn update_attrs(
             });
         }
     }
-
     return (v, n);
 }
 
@@ -3159,7 +3143,7 @@ impl BgpSession {
 }
 
 async fn send_update(
-    my: Arc<Source>,
+    to: Arc<Source>,
     lines: &mut Framed<TcpStream, Bgp>,
     updates: Vec<RoutingTableUpdate>,
 ) -> Result<(u64, u64), io::Error> {
@@ -3167,15 +3151,13 @@ async fn send_update(
     for update in updates {
         match update.attrs {
             Some(attrs) => {
-                let is_mp = update.nlri.is_mp();
+                let is_mp = update.family != bgp::Family::Ipv4Uc;
 
                 let (mut v, n) = update_attrs(
-                    my.ibgp,
-                    is_mp,
-                    my.local_as,
+                    &to,
+                    update.family,
                     update.nlri,
                     update.nexthop.unwrap(),
-                    my.local_addr,
                     attrs.entry.iter().collect(),
                 );
                 v.append(&mut n.iter().collect());
