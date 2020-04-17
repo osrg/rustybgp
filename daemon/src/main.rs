@@ -606,11 +606,6 @@ impl Destination {
     }
 }
 
-pub enum TableUpdate {
-    NewBest(bgp::Nlri, IpAddr, Arc<PathAttr>, Arc<Source>),
-    Withdrawn(bgp::Nlri, Arc<Source>),
-}
-
 #[derive(Clone)]
 pub struct Counter {
     c: HashMap<u8, i64>,
