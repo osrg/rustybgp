@@ -24,6 +24,15 @@ func checkAdminDown(t *testing.T, c *bgpTest) {
 	assert.Nil(t, err)
 	err = c.waitForEstablished("r1", "g3", 100)
 	assert.Nil(t, err)
+
+	err = c.disablePeer("r1", "g3")
+	assert.Nil(t, err)
+	c.waitForActive("g3", "r1")
+
+	// rustybgp sent notification?
+	m, err := c.getMessageCounter("g3", "r1")
+	assert.Nil(t, err)
+	assert.Equal(t, uint64(1), m.notification)
 }
 
 func TestAdmin(t *testing.T) {

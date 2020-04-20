@@ -52,6 +52,7 @@ Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/pas
 |delete_peer|`gobgp neighbor del <IP>`||
 |list_peer|`gobgp neighbor`/`gobgp neighbor <IP>`||
 |enable_peer|`gobgp neighbor <IP> enable`||
+|disable_peer|`gobgp neighbor <IP> disable`||
 |add_path|`gobgp global rib add <PREFIX>`||
 |delete_path|`gobgp global rib del <PREFIX>`||
 |list_path|`gobgp global rib`/`gobgp neighbor <IP> [adj-in\|adj-out]`||

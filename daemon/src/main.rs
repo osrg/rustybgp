@@ -1709,8 +1709,8 @@ impl GobgpApi for Service {
                 return Ok(tonic::Response::new(()));
             } else {
                 return Err(tonic::Status::new(
-                    tonic::Code::AlreadyExists,
-                    "peer address doesn't exists",
+                    tonic::Code::NotFound,
+                    "peer address isn't found",
                 ));
             }
         }
@@ -1800,9 +1800,27 @@ impl GobgpApi for Service {
     }
     async fn disable_peer(
         &self,
-        _request: tonic::Request<api::DisablePeerRequest>,
+        request: tonic::Request<api::DisablePeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        if let Ok(addr) = IpAddr::from_str(&request.into_inner().address) {
+            let g = &mut self.global.lock().await;
+            if g.peers.contains_key(&addr) {
+                let _ = g.server_event_tx.send(SrvEvent::Disable {
+                    proto: Proto::Bgp,
+                    sockaddr: SocketAddr::new(addr, 0),
+                });
+                return Ok(tonic::Response::new(()));
+            } else {
+                return Err(tonic::Status::new(
+                    tonic::Code::NotFound,
+                    "peer address isn't found",
+                ));
+            }
+        }
+        Err(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "invalid peer address",
+        ))
     }
 
     type MonitorPeerStream = mpsc::Receiver<Result<api::MonitorPeerResponse, tonic::Status>>;
@@ -2528,6 +2546,7 @@ pub enum DisconnectedProto {
 pub enum SrvEvent {
     EnableActive { proto: Proto, sockaddr: SocketAddr },
     Disconnected(DisconnectedProto),
+    Disable { proto: Proto, sockaddr: SocketAddr },
     Deconfigured(IpAddr),
 }
 
@@ -2844,7 +2863,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             None => continue,
                         }
+                        continue;
+                    }
+                    SrvEvent::Disable{proto, sockaddr} => {
+                        if proto != Proto::Bgp {
+                            continue;
+                        }
 
+                        let addr = sockaddr.ip();
+                        let t = table.lock().await;
+                        let mut g = global.lock().await;
+                        match g.peers.get_mut(&addr) {
+                            Some(peer) => {
+                                peer.admin_down = true;
+                                if let Some(session) = t.bgp_sessions.get(&addr) {
+                                    let _= session.tx.send(PeerEvent::Notification(
+                                        bgp::NotificationMessage::new(
+                                            bgp::NotificationCode::AdministrativeShutdown,
+                                        )
+                                    ));
+                                }
+                            }
+                            None => continue,
+                        }
                         continue;
                     }
                 }
