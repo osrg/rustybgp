@@ -30,7 +30,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     stream::StreamExt,
     sync::{mpsc, Barrier, Mutex},
-    time::{delay_for, DelayQueue, Instant},
+    time::{delay_for, delay_queue, DelayQueue, Instant},
 };
 use tokio_util::codec::{BytesCodec, Decoder, Encoder, Framed};
 
@@ -1101,6 +1101,8 @@ pub struct Peer {
 
     pub remote_cap: Vec<bgp::Capability>,
     pub local_cap: Vec<bgp::Capability>,
+
+    pub expiration_key: Option<delay_queue::Key>,
 }
 
 impl Peer {
@@ -1137,6 +1139,7 @@ impl Peer {
                     as_number: as_number,
                 },
             ],
+            expiration_key: None,
         }
     }
 
@@ -2485,7 +2488,7 @@ pub enum Proto {
 }
 
 pub enum DisconnectedProto {
-    Bgp(Arc<Source>),
+    Bgp(Arc<Source>, SocketAddr),
     Bmp(SocketAddr),
     Rtr(SocketAddr),
 }
@@ -2701,6 +2704,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match v {
                         Ok(v)=>{
                             let (proto, sockaddr) = v.into_inner();
+                            println!("HELLO {}", sockaddr);
                             let t = table.lock().await;
                             if proto == Proto::Bgp {
                                 if t.bgp_sessions.contains_key(&sockaddr.ip()) {
@@ -2708,10 +2712,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     continue;
                                 }
                             }
+                            if !global.lock().await.peers.contains_key(&sockaddr.ip()) {
+                                continue;
+                            }
                             match TcpStream::connect(sockaddr).await {
                                 Ok(stream) => (proto, stream, sockaddr),
                                 Err(_) => {
-                                    expirations.insert((proto, sockaddr), Duration::from_secs(5));
+                                    let _ = global.lock().await.server_event_tx.send(
+                                        SrvEvent::EnableActive{proto, sockaddr}
+                                    );
                                     continue;
                                 }
                             }
@@ -2724,12 +2733,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(event) = srv_event_rx.next().fuse() =>{
                 match event {
                     SrvEvent::EnableActive{proto, sockaddr} => {
-                        expirations.insert((proto, sockaddr), Duration::from_secs(5));
+                        let key = expirations.insert((proto, sockaddr), Duration::from_secs(5));
+                        if proto == Proto::Bgp {
+                            let mut g = global.lock().await;
+                            if let Some(peer) = g.peers.get_mut(&sockaddr.ip()) {
+                                peer.expiration_key = Some(key);
+                            }
+                        }
                         continue;
                     }
                     SrvEvent::Disconnected(p) =>{
                         match p {
-                            DisconnectedProto::Bgp(source) => {
+                            DisconnectedProto::Bgp(source, sockaddr) => {
                                 let addr = source.address;
                                 {
                                     let mut t = table.lock().await;
@@ -2747,12 +2762,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     let peer = g.peers.get_mut(&addr).unwrap();
                                     if peer.delete_on_disconnected {
+                                        if let Some(key) = &peer.expiration_key {
+                                            expirations.remove(key);
+                                        }
                                         g.peers.remove(&addr);
                                     } else {
-                                        let peer = g.peers.get_mut(&addr).unwrap();
                                         peer.reset();
                                         if !peer.passive {
-                                            expirations.insert((Proto::Bgp, SocketAddr::new(addr, peer.remote_port)), Duration::from_secs(5));
+                                            let _ = g.server_event_tx.send(
+                                                SrvEvent::EnableActive{proto: Proto::Bgp, sockaddr}
+                                            );
                                         }
                                     }
                                 }
@@ -2777,9 +2796,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         match g.peers.get_mut(&addr) {
                             Some(peer) =>{
-                                if t.bgp_sessions.contains_key(&addr) {
+                                if let Some(key) = &peer.expiration_key {
+                                    expirations.remove(key);
+                                }
+                                if let Some(session) = t.bgp_sessions.get(&addr) {
                                     peer.delete_on_disconnected = true;
-                                    let session = t.bgp_sessions.get(&addr).unwrap();
                                     let _= session.tx.send(PeerEvent::Notification(
                                         bgp::NotificationMessage::new(
                                             bgp::NotificationCode::PeerDeconfigured,
@@ -2931,7 +2952,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let table_tx = table_tx.clone();
         tokio::spawn(async move {
-            handle_bgp_session(global, table, table_tx, &mut rx, stream, addr, local_addr).await;
+            handle_bgp_session(global, table, table_tx, &mut rx, stream, sock, local_addr).await;
         });
     }
 }
@@ -3185,13 +3206,14 @@ async fn handle_bgp_session(
     table_tx: Sender<RoutingTableUpdate>,
     peer_event_rx: &mut Receiver<PeerEvent>,
     stream: TcpStream,
-    addr: IpAddr,
+    sock: SocketAddr,
     local_addr: IpAddr,
 ) {
     let (as_number, router_id) = {
         let global = global.lock().await;
         (global.as_number, global.id)
     };
+    let addr = sock.to_ipaddr();
 
     let mut keepalive_interval = bgp::OpenMessage::HOLDTIME / 3;
     let mut lines = Framed::new(
@@ -3482,7 +3504,7 @@ async fn handle_bgp_session(
     let g = &mut global.lock().await;
     let _ = g
         .server_event_tx
-        .send(SrvEvent::Disconnected(DisconnectedProto::Bgp(source)));
+        .send(SrvEvent::Disconnected(DisconnectedProto::Bgp(source, sock)));
 }
 
 async fn handle_bmp_session(
