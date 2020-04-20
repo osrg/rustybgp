@@ -140,7 +140,7 @@ func (b *bgpTest) createPeer(name, image string, as uint32) error {
 	return nil
 }
 
-func (b *bgpTest) addPeer(name1, name2 string, passive bool) error {
+func (b *bgpTest) addPeer(name1, name2 string, passive bool, adminDown bool) error {
 	p1 := b.containers[name1]
 	p2 := b.containers[name2]
 	_, err := p1.apiClient.AddPeer(context.Background(), &api.AddPeerRequest{
@@ -148,6 +148,7 @@ func (b *bgpTest) addPeer(name1, name2 string, passive bool) error {
 			Conf: &api.PeerConf{
 				NeighborAddress: p2.ip.String(),
 				PeerAs:          p2.as,
+				AdminDown:       adminDown,
 			},
 			Transport: &api.Transport{
 				PassiveMode: passive,
@@ -172,15 +173,15 @@ func (b *bgpTest) deletePeer(name1, name2 string) error {
 	return err
 }
 
-func (b *bgpTest) connectPeers(name1, name2 string, passive bool) error {
-	if err := b.addPeer(name1, name2, passive); err != nil {
+func (b *bgpTest) connectPeers(name1, name2 string, passive bool, adminDown bool) error {
+	if err := b.addPeer(name1, name2, passive, adminDown); err != nil {
 		fmt.Println(err)
 		return err
 	}
 	if passive == true {
 		passive = false
 	}
-	if err := b.addPeer(name2, name1, passive); err != nil {
+	if err := b.addPeer(name2, name1, passive, false); err != nil {
 		fmt.Println(err)
 		return err
 	}
@@ -188,10 +189,10 @@ func (b *bgpTest) connectPeers(name1, name2 string, passive bool) error {
 	return nil
 }
 
-func (b *bgpTest) waitForState(name1, name2 string, s api.PeerState_SessionState) error {
+func (b *bgpTest) waitForState(name1, name2 string, s api.PeerState_SessionState, try int) error {
 	p1 := b.containers[name1]
 	p2 := b.containers[name2]
-	for {
+	for i := 0; i < try; i++ {
 		stream, err := p1.apiClient.ListPeer(context.Background(), &api.ListPeerRequest{
 			Address: p2.ip.String(),
 		})
@@ -214,14 +215,18 @@ func (b *bgpTest) waitForState(name1, name2 string, s api.PeerState_SessionState
 		}
 		time.Sleep(time.Millisecond * 100)
 	}
-	return nil
+	return fmt.Errorf("timeout")
 }
 
 func (b *bgpTest) waitForActive(name1, name2 string) error {
-	return b.waitForState(name1, name2, api.PeerState_ACTIVE)
+	return b.waitForState(name1, name2, api.PeerState_ACTIVE, 1000)
 }
 
-func (b *bgpTest) waitForEstablish(name string) error {
+func (b *bgpTest) waitForEstablished(name1, name2 string, try int) error {
+	return b.waitForState(name1, name2, api.PeerState_ESTABLISHED, try)
+}
+
+func (b *bgpTest) waitForAllEstablish(name string) error {
 	for {
 		stream, err := b.containers[name].apiClient.ListPeer(context.Background(), &api.ListPeerRequest{})
 		if err != nil {
@@ -485,6 +490,13 @@ func (b *bgpTest) getTableCounter(name, neighbor string) (tableCounter, error) {
 
 func (b *bgpTest) disablePeer(name, neighbor string) error {
 	_, err := b.containers[name].apiClient.DisablePeer(context.Background(), &api.DisablePeerRequest{
+		Address: b.containers[neighbor].ip.String(),
+	})
+	return err
+}
+
+func (b *bgpTest) enablePeer(name, neighbor string) error {
+	_, err := b.containers[name].apiClient.EnablePeer(context.Background(), &api.EnablePeerRequest{
 		Address: b.containers[neighbor].ip.String(),
 	})
 	return err

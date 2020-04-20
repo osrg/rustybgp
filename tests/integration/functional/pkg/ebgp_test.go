@@ -61,13 +61,13 @@ func TestEbgp(t *testing.T) {
 	for i, p := range peers {
 		err = c.createPeer(p, gobgpImage, 65001+uint32(i))
 		assert.Nil(t, err)
-		err = c.connectPeers(p, "r1", true)
+		err = c.connectPeers(p, "r1", true, false)
 		assert.Nil(t, err)
 		err := c.addPath(p, fmt.Sprintf("10.0.%d.0/24", i+1))
 		assert.Nil(t, err)
 	}
 
-	c.waitForEstablish("r1")
+	c.waitForAllEstablish("r1")
 	checkGlobalRib(t, c)
 	checkPathAttr(t, c, peers)
 	//	c.Stop()

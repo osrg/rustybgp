@@ -1085,14 +1085,15 @@ pub struct Peer {
     pub local_as: u32,
     pub peer_type: u8,
     pub passive: bool,
+    pub admin_down: bool,
     pub delete_on_disconnected: bool,
+    pub downtime: SystemTime,
 
     pub hold_time: u64,
     pub connect_retry_time: u64,
 
     pub state: bgp::State,
     pub uptime: SystemTime,
-    pub downtime: SystemTime,
 
     pub counter_tx: MessageCounter,
     pub counter_rx: MessageCounter,
@@ -1124,6 +1125,7 @@ impl Peer {
             peer_type: 0,
             passive: false,
             delete_on_disconnected: false,
+            admin_down: false,
             hold_time: Self::DEFAULT_HOLD_TIME,
             connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
             state: bgp::State::Idle,
@@ -1189,6 +1191,10 @@ impl Peer {
             self.connect_retry_time = t;
         }
         self
+    }
+
+    pub fn admin_down(&mut self, v: bool) {
+        self.admin_down = v;
     }
 
     fn reset(&mut self) {
@@ -1278,6 +1284,11 @@ impl ToApi<api::Peer> for Peer {
             bgp::State::OpenSent => api::peer_state::SessionState::Opensent as i32,
             bgp::State::OpenConfirm => api::peer_state::SessionState::Openconfirm as i32,
             bgp::State::Established => api::peer_state::SessionState::Established as i32,
+        };
+        ps.admin_state = if self.admin_down == true {
+            api::peer_state::AdminState::Down as i32
+        } else {
+            api::peer_state::AdminState::Up as i32
         };
         let mut tm = api::Timers {
             config: Some(Default::default()),
@@ -1660,18 +1671,18 @@ impl GobgpApi for Service {
                     } else {
                         let passive = peer.get_passive_mode();
                         let remote_port = peer.get_remote_port();
-                        g.peers.insert(
-                            addr,
-                            Peer::new(addr, as_number)
-                                .remote_as(peer.get_remote_as())
-                                .remote_port(remote_port)
-                                .families(peer.get_families())
-                                .passive(passive)
-                                .hold_time(peer.get_hold_time())
-                                .connect_retry_time(peer.get_connect_retry_time()),
-                        );
+                        let mut p = Peer::new(addr, as_number)
+                            .remote_as(peer.get_remote_as())
+                            .remote_port(remote_port)
+                            .families(peer.get_families())
+                            .passive(passive)
+                            .hold_time(peer.get_hold_time())
+                            .connect_retry_time(peer.get_connect_retry_time());
 
-                        if !passive {
+                        p.admin_down(conf.admin_down);
+                        g.peers.insert(addr, p);
+
+                        if !passive && !conf.admin_down {
                             let _ = g.server_event_tx.send(SrvEvent::EnableActive {
                                 proto: Proto::Bgp,
                                 sockaddr: SocketAddr::new(addr, remote_port),
@@ -1762,9 +1773,30 @@ impl GobgpApi for Service {
     }
     async fn enable_peer(
         &self,
-        _request: tonic::Request<api::EnablePeerRequest>,
+        request: tonic::Request<api::EnablePeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        if let Ok(addr) = IpAddr::from_str(&request.into_inner().address) {
+            let g = &mut self.global.lock().await;
+            let mut remote_port = 0;
+            if let Some(peer) = g.peers.get_mut(&addr) {
+                if !peer.passive && peer.admin_down {
+                    peer.admin_down = false;
+                    remote_port = peer.remote_port;
+                }
+            } else {
+                return Err(tonic::Status::new(
+                    tonic::Code::AlreadyExists,
+                    "peer address doesn't exists",
+                ));
+            }
+            if remote_port != 0 {
+                let _ = g.server_event_tx.send(SrvEvent::EnableActive {
+                    proto: Proto::Bgp,
+                    sockaddr: SocketAddr::new(addr, remote_port),
+                });
+            }
+        }
+        Ok(tonic::Response::new(()))
     }
     async fn disable_peer(
         &self,
@@ -2768,7 +2800,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         g.peers.remove(&addr);
                                     } else {
                                         peer.reset();
-                                        if !peer.passive {
+                                        if !peer.passive && !peer.admin_down {
                                             let _ = g.server_event_tx.send(
                                                 SrvEvent::EnableActive{proto: Proto::Bgp, sockaddr}
                                             );
@@ -2902,7 +2934,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut g = global.lock().await;
-        if g.peers.contains_key(&addr) == true {
+        if let Some(peer) = g.peers.get(&addr) {
+            if peer.admin_down {
+                println!("admin down; ignore a new passive connection from {}", addr);
+                continue;
+            }
         } else {
             let mut is_dynamic = false;
             for p in &g.peer_group {

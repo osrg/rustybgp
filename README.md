@@ -51,6 +51,7 @@ Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/pas
 |add_peer|`gobgp neighbor add <IP> as <VALUE> router-id <IP>`| only v4/v6 families supported, no fancy capabilities like addpath|
 |delete_peer|`gobgp neighbor del <IP>`||
 |list_peer|`gobgp neighbor`/`gobgp neighbor <IP>`||
+|enable_peer|`gobgp neighbor <IP> enable`||
 |add_path|`gobgp global rib add <PREFIX>`||
 |delete_path|`gobgp global rib del <PREFIX>`||
 |list_path|`gobgp global rib`/`gobgp neighbor <IP> [adj-in\|adj-out]`||
