@@ -699,47 +699,31 @@ impl RtrSession {
 }
 
 #[derive(Clone)]
-pub struct Table {
-    pub local_source: Arc<Source>,
+pub struct RoutingTable {
     pub disable_best_path_selection: bool,
-    pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
-    pub roa: RoaTable,
-
-    pub bgp_sessions: HashMap<IpAddr, BgpSession>,
-    pub bmp_sessions: HashMap<SocketAddr, Sender<bmp::Message>>,
-    pub rtr_sessions: HashMap<SocketAddr, RtrSession>,
+    pub global: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
+    //    pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
 }
 
-impl Table {
-    pub fn new() -> Table {
-        let mut master = HashMap::new();
-        master.insert(bgp::Family::Reserved, HashMap::new());
-        Table {
-            local_source: Arc::new(Source {
-                address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                ibgp: false,
-                local_as: 0,
-                local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                state: bgp::State::Idle,
-            }),
-            disable_best_path_selection: false,
-            master: master,
-            roa: RoaTable::new(),
-            bgp_sessions: HashMap::new(),
-            bmp_sessions: HashMap::new(),
-            rtr_sessions: HashMap::new(),
+impl RoutingTable {
+    pub fn new(disable_best_path_selection: bool) -> Self {
+        RoutingTable {
+            disable_best_path_selection,
+            global: vec![(bgp::Family::Reserved, HashMap::new())]
+                .into_iter()
+                .collect(),
         }
     }
 
-    fn master_iter(
+    pub fn iter_destination(
         &self,
+        _is_rs: bool,
         family: &proto::bgp::Family,
     ) -> impl Iterator<Item = (&proto::bgp::Nlri, &Destination)> {
-        let t = self
-            .master
+        self.global
             .get(family)
-            .unwrap_or(&self.master.get(&bgp::Family::Reserved).unwrap());
-        t.iter()
+            .unwrap_or(&self.global.get(&bgp::Family::Reserved).unwrap())
+            .iter()
     }
 
     pub fn insert(
@@ -750,12 +734,11 @@ impl Table {
         nexthop: IpAddr,
         attrs: Arc<PathAttr>,
     ) -> (Option<RoutingTableUpdate>, bool) {
-        let t = self.master.get_mut(&family);
-        let t = match t {
+        let t = match self.global.get_mut(&family) {
             Some(t) => t,
             None => {
-                self.master.insert(family, HashMap::new());
-                self.master.get_mut(&family).unwrap()
+                self.global.insert(family, HashMap::new());
+                self.global.get_mut(&family).unwrap()
             }
         };
 
@@ -845,7 +828,7 @@ impl Table {
         net: bgp::Nlri,
         source: Arc<Source>,
     ) -> (Option<RoutingTableUpdate>, bool) {
-        let t = self.master.get_mut(&family);
+        let t = self.global.get_mut(&family);
         if t.is_none() {
             return (None, false);
         }
@@ -893,11 +876,11 @@ impl Table {
     pub fn clear(&mut self, source: Arc<Source>) -> Vec<RoutingTableUpdate> {
         let mut update = Vec::new();
         let mut m: HashMap<bgp::Family, Vec<bgp::Nlri>> = HashMap::new();
-        for f in self.master.keys() {
+        for f in self.global.keys() {
             m.insert(*f, Vec::new());
         }
 
-        for (f, t) in self.master.iter_mut() {
+        for (f, t) in self.global.iter_mut() {
             for (n, d) in t {
                 for i in 0..d.entry.len() {
                     if d.entry[i].source.address == source.address {
@@ -930,12 +913,42 @@ impl Table {
         }
 
         for (f, l) in m.iter() {
-            let t = self.master.get_mut(&f).unwrap();
+            let t = self.global.get_mut(&f).unwrap();
             for n in l {
                 t.remove(n);
             }
         }
         update
+    }
+}
+
+#[derive(Clone)]
+pub struct Table {
+    pub local_source: Arc<Source>,
+    pub routing: RoutingTable,
+    pub roa: RoaTable,
+
+    pub bgp_sessions: HashMap<IpAddr, BgpSession>,
+    pub bmp_sessions: HashMap<SocketAddr, Sender<bmp::Message>>,
+    pub rtr_sessions: HashMap<SocketAddr, RtrSession>,
+}
+
+impl Table {
+    pub fn new(disable_best_path_selection: bool) -> Self {
+        Table {
+            local_source: Arc::new(Source {
+                address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                ibgp: false,
+                local_as: 0,
+                local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                state: bgp::State::Idle,
+            }),
+            routing: RoutingTable::new(disable_best_path_selection),
+            roa: RoaTable::new(),
+            bgp_sessions: HashMap::new(),
+            bmp_sessions: HashMap::new(),
+            rtr_sessions: HashMap::new(),
+        }
     }
 
     pub async fn broadcast(&mut self, rtu: RoutingTableUpdate) {
@@ -1944,7 +1957,7 @@ impl GobgpApi for Service {
         let table = self.table.clone();
         let mut t = table.lock().await;
         let s = t.local_source.clone();
-        let (u, _) = t.insert(
+        let (u, _) = t.routing.insert(
             family,
             nlri,
             s.clone(),
@@ -1993,7 +2006,7 @@ impl GobgpApi for Service {
         let table = self.table.clone();
         let mut t = table.lock().await;
         let s = t.local_source.clone();
-        let (u, _) = t.remove(family, nlri, s.clone());
+        let (u, _) = t.routing.remove(family, nlri, s.clone());
         if let Some(u) = u {
             t.broadcast(u).await;
         }
@@ -2064,7 +2077,7 @@ impl GobgpApi for Service {
 
             {
                 let table = table.lock().await;
-                for (net, dst) in table.master_iter(&family) {
+                for (net, dst) in table.routing.iter_destination(false, &family) {
                     if prefix_filter(net) {
                         continue;
                     }
@@ -2163,7 +2176,7 @@ impl GobgpApi for Service {
             let table = self.table.clone();
             let mut t = table.lock().await;
             let s = t.local_source.clone();
-            let (u, _) = t.insert(
+            let (u, _) = t.routing.insert(
                 family,
                 nlri,
                 s.clone(),
@@ -2189,7 +2202,13 @@ impl GobgpApi for Service {
 
         let mut nr_dst: u64 = 0;
         let mut nr_path: u64 = 0;
-        for (_, dst) in self.table.lock().await.master_iter(&family) {
+        for (_, dst) in self
+            .table
+            .lock()
+            .await
+            .routing
+            .iter_destination(false, &family)
+        {
             nr_path += dst.entry.len() as u64;
             nr_dst += 1;
         }
@@ -2590,7 +2609,7 @@ async fn handle_table_update(
                 let source = c.source;
                 match c.attrs {
                     None => {
-                        let (u, deleted) = t.remove(c.family, c.nlri, source.clone());
+                        let (u, deleted) = t.routing.remove(c.family, c.nlri, source.clone());
                         if let Some(u) = u {
                             t.broadcast(u).await;
                         }
@@ -2610,7 +2629,7 @@ async fn handle_table_update(
                         }
                     }
                     Some(attrs) => {
-                        let (u, added) = t.insert(c.family, c.nlri, source.clone(), c.nexthop.unwrap(), attrs.clone());
+                        let (u, added) = t.routing.insert(c.family, c.nlri, source.clone(), c.nexthop.unwrap(), attrs.clone());
                         if let Some(u) = u {
                             t.broadcast(u).await;
                         }
@@ -2693,9 +2712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let mut table = Table::new();
-    table.disable_best_path_selection = args.is_present("collector");
-    let table = Arc::new(Mutex::new(table));
+    let table = Arc::new(Mutex::new(Table::new(args.is_present("collector"))));
     let init_tx = Arc::new(Barrier::new(2));
     let addr = "[::]:50051".parse()?;
     let service = Service {
@@ -2800,7 +2817,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 {
                                     let mut t = table.lock().await;
                                     t.bgp_sessions.remove(&addr);
-                                    for u in t.clear(source.clone()) {
+                                    for u in t.routing.clear(source.clone()) {
                                         t.broadcast(u).await;
                                     }
                                 }
@@ -2932,8 +2949,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ));
                 }
 
-                for (_, map) in t.master.iter() {
-                    for (net, dst) in map.iter() {
+                for family in t.routing.global.keys() {
+                    for (net, dst) in t.routing.iter_destination(false, family) {
                         for path in &dst.entry {
                             if path.source.address == t.local_source.address {
                                 continue;
@@ -3543,9 +3560,9 @@ async fn handle_bgp_session(
                                         p.to_bmp_up(g.id, source.address)));
                                     }
 
-                                    if t.disable_best_path_selection == false {
+                                    if t.routing.disable_best_path_selection == false {
                                         for family in &families {
-                                            for route in t.master_iter(&family) {
+                                            for route in t.routing.iter_destination(false, &family) {
                                                 let u = RoutingTableUpdate::new(
                                                     source.clone(),
                                                     *family,
