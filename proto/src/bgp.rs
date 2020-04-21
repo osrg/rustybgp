@@ -17,6 +17,7 @@ use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use failure::Error;
 use std::collections::HashSet;
 use std::convert::From;
+use std::fmt;
 use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
@@ -196,6 +197,12 @@ fn from_str_ipnet() {
         IpNet::from_str("1.1.1.0/24").unwrap(),
         IpNet::new([1, 1, 1, 0], 24),
     );
+}
+
+impl fmt::Display for IpNet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.addr, self.mask)
+    }
 }
 
 pub trait IpNetNew<T>: Sized {

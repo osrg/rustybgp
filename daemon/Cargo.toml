@@ -17,6 +17,7 @@ tokio-util = { version = "0.2" }
 clap = "2.33"
 futures = "0.3"
 patricia_tree = "0.1"
+regex = "1"
 
 proto = { path = "../proto" }
 

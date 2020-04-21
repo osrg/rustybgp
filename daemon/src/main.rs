@@ -15,7 +15,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io,
+    convert::TryFrom,
+    fmt, io,
     io::Cursor,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
@@ -37,6 +38,8 @@ use tokio_util::codec::{BytesCodec, Decoder, Encoder, Framed};
 use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
 use patricia_tree::PatriciaMap;
+
+use regex::Regex;
 
 use prost;
 
@@ -923,6 +926,242 @@ impl RoutingTable {
 }
 
 #[derive(Clone)]
+pub struct Prefix {
+    net: bgp::IpNet,
+    min_length: u8,
+    max_length: u8,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum SingleAsPathMatch {
+    Include(u32),
+    LeftMost(u32),
+    Origin(u32),
+    Only(u32),
+}
+
+impl SingleAsPathMatch {
+    pub fn new(s: &str) -> Option<Self> {
+        let left_most = Regex::new(r"^\^([0-9]+)_$").unwrap();
+        let origin = Regex::new(r"^_([0-9]+)\$$").unwrap();
+        let include = Regex::new(r"^_([0-9]+)_$").unwrap();
+        let only = Regex::new(r"^\^([0-9]+)\$$").unwrap();
+
+        let f = |m: regex::Match| {
+            let (_, n) = m.as_str().split_at(1);
+            let (n, _) = n.split_at(n.len() - 1);
+            n.parse::<u32>()
+        };
+
+        if let Some(v) = left_most.find(s) {
+            match f(v) {
+                Ok(n) => Some(SingleAsPathMatch::LeftMost(n)),
+                Err(_) => None,
+            }
+        } else if let Some(v) = origin.find(s) {
+            match f(v) {
+                Ok(n) => Some(SingleAsPathMatch::Origin(n)),
+                Err(_) => None,
+            }
+        } else if let Some(v) = include.find(s) {
+            match f(v) {
+                Ok(n) => Some(SingleAsPathMatch::Include(n)),
+                Err(_) => None,
+            }
+        } else if let Some(v) = only.find(s) {
+            match f(v) {
+                Ok(n) => Some(SingleAsPathMatch::Only(n)),
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for SingleAsPathMatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SingleAsPathMatch::Include(v) => write!(f, "_{}_", v),
+            SingleAsPathMatch::LeftMost(v) => write!(f, "^{}_", v),
+            SingleAsPathMatch::Origin(v) => write!(f, "_{}$", v),
+            SingleAsPathMatch::Only(v) => write!(f, "^{}$", v),
+        }
+    }
+}
+
+#[test]
+fn single_aspath_match() {
+    assert_eq!(
+        SingleAsPathMatch::LeftMost(65100),
+        SingleAsPathMatch::new("^65100_").unwrap()
+    );
+    assert_eq!(
+        SingleAsPathMatch::Origin(65100),
+        SingleAsPathMatch::new("_65100$").unwrap()
+    );
+    assert_eq!(
+        SingleAsPathMatch::Include(65100),
+        SingleAsPathMatch::new("_65100_").unwrap()
+    );
+    assert_eq!(
+        SingleAsPathMatch::Only(65100),
+        SingleAsPathMatch::new("^65100$").unwrap(),
+    );
+}
+
+#[derive(Clone)]
+pub enum DefinedSet {
+    PrefixSet(Vec<Prefix>),
+    NeighborSet(Vec<IpAddr>),
+    AsPathSet((Vec<SingleAsPathMatch>, Vec<Regex>)),
+    CommunitySet(Vec<Regex>),
+    // ExtendedCommunitySet,
+    // LargeCommunitySet,
+    NexthopSet(Vec<IpAddr>),
+}
+
+impl DefinedSet {
+    fn to_api(&self, name: &str) -> api::DefinedSet {
+        let (defined_type, list, prefixes) = match self {
+            DefinedSet::PrefixSet(v) => (
+                api::DefinedType::Prefix as i32,
+                Vec::new(),
+                v.iter()
+                    .map(|x| api::Prefix {
+                        ip_prefix: x.net.to_string(),
+                        mask_length_min: x.min_length as u32,
+                        mask_length_max: x.max_length as u32,
+                    })
+                    .collect(),
+            ),
+            DefinedSet::NeighborSet(v) => (
+                api::DefinedType::Neighbor as i32,
+                v.iter().map(|x| x.to_string()).collect(),
+                Vec::new(),
+            ),
+            DefinedSet::AsPathSet(v) => {
+                let mut list: Vec<String> = v.0.iter().map(|x| x.to_string()).collect();
+                list.append(&mut v.1.iter().map(|x| x.to_string()).collect());
+                (api::DefinedType::AsPath as i32, list, Vec::new())
+            }
+
+            DefinedSet::CommunitySet(v) => (
+                api::DefinedType::Community as i32,
+                v.iter().map(|x| x.to_string()).collect(),
+                Vec::new(),
+            ),
+            DefinedSet::NexthopSet(v) => (
+                api::DefinedType::NextHop as i32,
+                v.iter().map(|x| x.to_string()).collect(),
+                Vec::new(),
+            ),
+        };
+        api::DefinedSet {
+            defined_type,
+            name: name.to_string(),
+            list,
+            prefixes,
+        }
+    }
+}
+
+fn parse_community(s: &str) -> Result<Regex, ()> {
+    if let Ok(v) = s.parse::<u32>() {
+        return Regex::new(&format!("^{}:{}$", v >> 16, v & 0xffff)).map_err(|_| ());
+    }
+    let r = Regex::new(r"(\d+.)*\d+:\d+").unwrap();
+    if r.is_match(s) {
+        return Regex::new(&format!("^{}$", s)).map_err(|_| ());
+    }
+    if let Ok(c) = proto::bgp::WellKnownCommunity::from_str(&s.to_string().to_lowercase()) {
+        let v = c as u32;
+        return Regex::new(&format!("^{}:{}$", v >> 16, v & 0xffff)).map_err(|_| ());
+    }
+    Regex::new(s).map_err(|_| ())
+}
+
+impl TryFrom<api::DefinedSet> for DefinedSet {
+    type Error = ();
+    fn try_from(set: api::DefinedSet) -> Result<Self, Self::Error> {
+        if let Some(t) = api::DefinedType::from_i32(set.defined_type) {
+            match t {
+                api::DefinedType::Prefix => {
+                    let mut v = Vec::with_capacity(set.prefixes.len());
+                    for p in &set.prefixes {
+                        match bgp::IpNet::from_str(&p.ip_prefix) {
+                            Ok(n) => {
+                                v.push(Prefix {
+                                    net: n,
+                                    min_length: p.mask_length_min as u8,
+                                    max_length: p.mask_length_max as u8,
+                                });
+                            }
+                            Err(_) => return Err(()),
+                        }
+                    }
+                    if v.len() != 0 {
+                        return Ok(DefinedSet::PrefixSet(v));
+                    }
+                }
+                api::DefinedType::Neighbor | api::DefinedType::NextHop => {
+                    let mut v = Vec::with_capacity(set.list.len());
+                    for n in &set.list {
+                        match IpAddr::from_str(n) {
+                            Ok(addr) => {
+                                v.push(addr);
+                            }
+                            Err(_) => {
+                                return Err(());
+                            }
+                        }
+                    }
+                    if v.len() != 0 {
+                        let s = if t == api::DefinedType::Neighbor {
+                            DefinedSet::NeighborSet(v)
+                        } else {
+                            DefinedSet::NexthopSet(v)
+                        };
+                        return Ok(s);
+                    }
+                }
+                api::DefinedType::AsPath => {
+                    let mut v0 = Vec::with_capacity(set.list.len());
+                    let mut v1 = Vec::with_capacity(set.list.len());
+                    for n in &set.list {
+                        if let Some(n) = SingleAsPathMatch::new(n) {
+                            v0.push(n);
+                        } else if let Ok(n) = Regex::new(&n.replace("_", "(^|[,{}() ]|$)")) {
+                            v1.push(n);
+                        } else {
+                            return Err(());
+                        }
+                    }
+                    if v0.len() != 0 || v1.len() != 0 {
+                        return Ok(DefinedSet::AsPathSet((v0, v1)));
+                    }
+                }
+                api::DefinedType::Community => {
+                    let mut v = Vec::with_capacity(set.list.len());
+                    for n in &set.list {
+                        if let Ok(n) = parse_community(n) {
+                            v.push(n);
+                        } else {
+                            return Err(());
+                        }
+                    }
+                    if v.len() != 0 {
+                        return Ok(DefinedSet::CommunitySet(v));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(())
+    }
+}
+
+#[derive(Clone)]
 pub struct Table {
     pub local_source: Arc<Source>,
     pub routing: RoutingTable,
@@ -931,6 +1170,7 @@ pub struct Table {
     pub bgp_sessions: HashMap<IpAddr, BgpSession>,
     pub bmp_sessions: HashMap<SocketAddr, Sender<bmp::Message>>,
     pub rtr_sessions: HashMap<SocketAddr, RtrSession>,
+    pub defined_sets: HashMap<String, Arc<DefinedSet>>,
 }
 
 impl Table {
@@ -948,6 +1188,7 @@ impl Table {
             bgp_sessions: HashMap::new(),
             bmp_sessions: HashMap::new(),
             rtr_sessions: HashMap::new(),
+            defined_sets: HashMap::new(),
         }
     }
 
@@ -2271,9 +2512,24 @@ impl GobgpApi for Service {
     }
     async fn add_defined_set(
         &self,
-        _request: tonic::Request<api::AddDefinedSetRequest>,
+        request: tonic::Request<api::AddDefinedSetRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let request = request.into_inner();
+        if let Some(set) = request.defined_set {
+            let mut table = self.table.lock().await;
+            let name = set.name.clone();
+            if table.defined_sets.contains_key(&name) {
+                return Err(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "already exists",
+                ));
+            }
+            if let Ok(d) = DefinedSet::try_from(set) {
+                table.defined_sets.insert(name, Arc::new(d));
+                return Ok(tonic::Response::new(()));
+            }
+        }
+        Err(tonic::Status::new(tonic::Code::InvalidArgument, "invalid"))
     }
     async fn delete_defined_set(
         &self,
@@ -2286,7 +2542,28 @@ impl GobgpApi for Service {
         &self,
         _request: tonic::Request<api::ListDefinedSetRequest>,
     ) -> Result<tonic::Response<Self::ListDefinedSetStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let (mut tx, rx) = mpsc::channel(1024);
+        let table = self.table.clone();
+        tokio::spawn(async move {
+            let v: Vec<api::DefinedSet> = {
+                table
+                    .lock()
+                    .await
+                    .defined_sets
+                    .iter()
+                    .map(|(name, s)| s.to_api(&name))
+                    .collect()
+            };
+            for d in v {
+                let _ = tx
+                    .send(Ok(api::ListDefinedSetResponse {
+                        defined_set: Some(d),
+                    }))
+                    .await;
+            }
+        });
+
+        Ok(tonic::Response::new(rx))
     }
     async fn add_statement(
         &self,
