@@ -1843,3 +1843,51 @@ impl Capability {
         Ok((c.position() - pos) as usize)
     }
 }
+
+pub struct ParseError(());
+
+pub enum WellKnownCommunity {
+    GracefulShutdown,
+    AcceptOwn,
+    LlgrStale,
+    NoLlgr,
+    Blackhole,
+    NoExport,
+    NoAdvertise,
+    NoExportSubconfed,
+    NoPeer,
+}
+
+impl FromStr for WellKnownCommunity {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "graceful-shutdown" => Ok(WellKnownCommunity::GracefulShutdown),
+            "accept-own" => Ok(WellKnownCommunity::AcceptOwn),
+            "llgr-stale" => Ok(WellKnownCommunity::LlgrStale),
+            "no-llgr" => Ok(WellKnownCommunity::NoLlgr),
+            "blackhole" => Ok(WellKnownCommunity::Blackhole),
+            "no-export" => Ok(WellKnownCommunity::NoExport),
+            "no-advertise" => Ok(WellKnownCommunity::NoAdvertise),
+            "no-export-subconfed" => Ok(WellKnownCommunity::NoExportSubconfed),
+            "no-peer" => Ok(WellKnownCommunity::NoPeer),
+            _ => Err(ParseError(())),
+        }
+    }
+}
+
+impl From<WellKnownCommunity> for u32 {
+    fn from(c: WellKnownCommunity) -> Self {
+        match c {
+            WellKnownCommunity::GracefulShutdown => 0xffff0000,
+            WellKnownCommunity::AcceptOwn => 0xffff0001,
+            WellKnownCommunity::LlgrStale => 0xffff0006,
+            WellKnownCommunity::NoLlgr => 0xffff0007,
+            WellKnownCommunity::Blackhole => 0xffff029a,
+            WellKnownCommunity::NoExport => 0xffffff01,
+            WellKnownCommunity::NoAdvertise => 0xffffff02,
+            WellKnownCommunity::NoExportSubconfed => 0xffffff03,
+            WellKnownCommunity::NoPeer => 0xffffff04,
+        }
+    }
+}
