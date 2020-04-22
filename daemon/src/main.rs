@@ -1022,6 +1022,16 @@ pub enum DefinedSet {
 }
 
 impl DefinedSet {
+    fn t(&self) -> i32 {
+        match self {
+            DefinedSet::PrefixSet(_) => api::DefinedType::Prefix as i32,
+            DefinedSet::NeighborSet(_) => api::DefinedType::Neighbor as i32,
+            DefinedSet::AsPathSet(_) => api::DefinedType::AsPath as i32,
+            DefinedSet::CommunitySet(_) => api::DefinedType::Community as i32,
+            DefinedSet::NexthopSet(_) => api::DefinedType::NextHop as i32,
+        }
+    }
+
     fn to_api(&self, name: &str) -> api::DefinedSet {
         let (defined_type, list, prefixes) = match self {
             DefinedSet::PrefixSet(v) => (
@@ -1161,16 +1171,167 @@ impl TryFrom<api::DefinedSet> for DefinedSet {
     }
 }
 
+#[derive(Clone, PartialEq)]
+pub enum MatchOption {
+    Any,
+    All,
+    Invert,
+}
+
+impl TryFrom<i32> for MatchOption {
+    type Error = ();
+    fn try_from(o: i32) -> Result<Self, Self::Error> {
+        match o {
+            0 => return Ok(MatchOption::Any),
+            1 => return Ok(MatchOption::All),
+            2 => return Ok(MatchOption::Invert),
+            _ => {}
+        }
+        Err(())
+    }
+}
+
+#[derive(Clone)]
+pub enum Condition {
+    Prefix(MatchOption, Arc<DefinedSet>),
+    Neighbor(MatchOption, Arc<DefinedSet>),
+    AsPath(MatchOption, Arc<DefinedSet>),
+    Community(MatchOption, Arc<DefinedSet>),
+    Nexthop(Vec<proto::bgp::IpNet>),
+    // ExtendedCommunity,
+    // AsPathLength,
+    Rpki(api::validation::State),
+    // RouteType(u32),
+    // LargeCommunity,
+    // AfiSafiIn(Vec<proto::bgp::Family>),
+}
+
+#[derive(Clone)]
+pub struct Statement {
+    pub conditions: Vec<Condition>,
+    // pub route_action: Action,
+}
+
+#[derive(Clone)]
+pub struct RoutingPolicy {
+    pub defined_sets: HashMap<i32, HashMap<String, Arc<DefinedSet>>>,
+    pub statements: HashMap<String, Statement>,
+}
+
+impl RoutingPolicy {
+    pub fn new() -> Self {
+        RoutingPolicy {
+            defined_sets: vec![
+                api::DefinedType::Prefix as i32,
+                api::DefinedType::Neighbor as i32,
+                api::DefinedType::AsPath as i32,
+                api::DefinedType::Community as i32,
+                api::DefinedType::NextHop as i32,
+            ]
+            .into_iter()
+            .map(|t| (t, HashMap::new()))
+            .collect(),
+            statements: HashMap::new(),
+        }
+    }
+
+    pub fn add_defined_set(&mut self, name: String, d: DefinedSet) -> Result<(), ()> {
+        let t = self.defined_sets.get_mut(&d.t()).unwrap();
+        if t.contains_key(&name) {
+            return Err(());
+        }
+        t.insert(name, Arc::new(d));
+        Ok(())
+    }
+
+    fn verify_set(
+        &self,
+        o: i32,
+        is_restricted: bool,
+        t: i32,
+        name: String,
+    ) -> Result<(MatchOption, Arc<DefinedSet>), ()> {
+        let o = MatchOption::try_from(o)?;
+        if is_restricted && o == MatchOption::All {
+            return Err(());
+        }
+        match self.defined_sets.get(&t).unwrap().get(&name) {
+            Some(v) => Ok((o, v.clone())),
+            None => Err(()),
+        }
+    }
+
+    pub fn add_statement(
+        &mut self,
+        name: String,
+        conditions: Option<api::Conditions>,
+    ) -> Result<(), ()> {
+        if self.statements.contains_key(&name) {
+            return Err(());
+        }
+        let mut v = Vec::new();
+        if let Some(conditions) = conditions {
+            if let Some(m) = conditions.prefix_set {
+                let (opt, set) =
+                    self.verify_set(m.match_type, true, api::DefinedType::Prefix as i32, m.name)?;
+                v.push(Condition::Prefix(opt, set));
+            }
+            if let Some(m) = conditions.neighbor_set {
+                let (opt, set) = self.verify_set(
+                    m.match_type,
+                    true,
+                    api::DefinedType::Neighbor as i32,
+                    m.name,
+                )?;
+                v.push(Condition::Neighbor(opt, set));
+            }
+            if let Some(m) = conditions.as_path_set {
+                let (opt, set) =
+                    self.verify_set(m.match_type, false, api::DefinedType::AsPath as i32, m.name)?;
+                v.push(Condition::AsPath(opt, set));
+            }
+            if let Some(m) = conditions.community_set {
+                let (opt, set) = self.verify_set(
+                    m.match_type,
+                    false,
+                    api::DefinedType::Community as i32,
+                    m.name,
+                )?;
+                v.push(Condition::Community(opt, set));
+            }
+            let nexthops: Vec<proto::bgp::IpNet> = conditions
+                .next_hop_in_list
+                .iter()
+                .filter_map(|p| proto::bgp::IpNet::from_str(p).map_or(None, |n| Some(n)))
+                .collect();
+            if nexthops.len() != 0 {
+                if nexthops.len() != conditions.next_hop_in_list.len() {
+                    return Err(());
+                }
+                v.push(Condition::Nexthop(nexthops));
+            }
+            if conditions.rpki_result != api::validation::State::None as i32 {
+                match api::validation::State::from_i32(conditions.rpki_result) {
+                    Some(s) => v.push(Condition::Rpki(s)),
+                    None => return Err(()),
+                }
+            }
+        }
+        self.statements.insert(name, Statement { conditions: v });
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct Table {
     pub local_source: Arc<Source>,
     pub routing: RoutingTable,
+    pub policy: RoutingPolicy,
     pub roa: RoaTable,
 
     pub bgp_sessions: HashMap<IpAddr, BgpSession>,
     pub bmp_sessions: HashMap<SocketAddr, Sender<bmp::Message>>,
     pub rtr_sessions: HashMap<SocketAddr, RtrSession>,
-    pub defined_sets: HashMap<String, Arc<DefinedSet>>,
 }
 
 impl Table {
@@ -1184,11 +1345,11 @@ impl Table {
                 state: bgp::State::Idle,
             }),
             routing: RoutingTable::new(disable_best_path_selection),
+            policy: RoutingPolicy::new(),
             roa: RoaTable::new(),
             bgp_sessions: HashMap::new(),
             bmp_sessions: HashMap::new(),
             rtr_sessions: HashMap::new(),
-            defined_sets: HashMap::new(),
         }
     }
 
@@ -2514,19 +2675,19 @@ impl GobgpApi for Service {
         &self,
         request: tonic::Request<api::AddDefinedSetRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        let request = request.into_inner();
-        if let Some(set) = request.defined_set {
+        if let Some(set) = request.into_inner().defined_set {
             let mut table = self.table.lock().await;
             let name = set.name.clone();
-            if table.defined_sets.contains_key(&name) {
-                return Err(tonic::Status::new(
-                    tonic::Code::InvalidArgument,
-                    "already exists",
-                ));
-            }
             if let Ok(d) = DefinedSet::try_from(set) {
-                table.defined_sets.insert(name, Arc::new(d));
-                return Ok(tonic::Response::new(()));
+                match table.policy.add_defined_set(name, d) {
+                    Ok(_) => return Ok(tonic::Response::new(())),
+                    Err(_) => {
+                        return Err(tonic::Status::new(
+                            tonic::Code::InvalidArgument,
+                            "already exists",
+                        ));
+                    }
+                }
             }
         }
         Err(tonic::Status::new(tonic::Code::InvalidArgument, "invalid"))
@@ -2545,15 +2706,10 @@ impl GobgpApi for Service {
         let (mut tx, rx) = mpsc::channel(1024);
         let table = self.table.clone();
         tokio::spawn(async move {
-            let v: Vec<api::DefinedSet> = {
-                table
-                    .lock()
-                    .await
-                    .defined_sets
-                    .iter()
-                    .map(|(name, s)| s.to_api(&name))
-                    .collect()
-            };
+            let mut v = Vec::new();
+            for (_, h) in &table.lock().await.policy.defined_sets {
+                v.append(&mut h.iter().map(|(name, s)| s.to_api(&name)).collect());
+            }
             for d in v {
                 let _ = tx
                     .send(Ok(api::ListDefinedSetResponse {
@@ -2562,14 +2718,27 @@ impl GobgpApi for Service {
                     .await;
             }
         });
-
         Ok(tonic::Response::new(rx))
     }
     async fn add_statement(
         &self,
-        _request: tonic::Request<api::AddStatementRequest>,
+        request: tonic::Request<api::AddStatementRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        if let Some(statement) = request.into_inner().statement {
+            let mut table = self.table.lock().await;
+            let name = statement.name.clone();
+            if table
+                .policy
+                .add_statement(name, statement.conditions)
+                .is_err()
+            {
+                return Err(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "already exists",
+                ));
+            }
+        }
+        Ok(tonic::Response::new(()))
     }
     async fn delete_statement(
         &self,
