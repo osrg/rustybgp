@@ -3218,16 +3218,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match v {
                         Ok(v)=>{
                             let (proto, sockaddr) = v.into_inner();
-                            println!("HELLO {}", sockaddr);
                             let t = table.lock().await;
                             if proto == Proto::Bgp {
                                 if t.bgp_sessions.contains_key(&sockaddr.ip()) {
                                     // already connected
                                     continue;
                                 }
-                            }
-                            if !global.lock().await.peers.contains_key(&sockaddr.ip()) {
-                                continue;
+                                if !global.lock().await.peers.contains_key(&sockaddr.ip()) {
+                                    continue;
+                                }
                             }
                             match TcpStream::connect(sockaddr).await {
                                 Ok(stream) => (proto, stream, sockaddr),
