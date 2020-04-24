@@ -24,8 +24,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use futures::{FutureExt, SinkExt};
-
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -37,11 +35,11 @@ use tokio_util::codec::{BytesCodec, Decoder, Encoder, Framed};
 
 use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
+use fnv::FnvHashMap;
+use futures::{FutureExt, SinkExt};
 use patricia_tree::PatriciaMap;
-
-use regex::Regex;
-
 use prost;
+use regex::Regex;
 
 mod api {
     tonic::include_proto!("gobgpapi");
@@ -687,7 +685,7 @@ impl RtrSession {
 #[derive(Clone)]
 pub struct RoutingTable {
     pub disable_best_path_selection: bool,
-    pub global: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
+    pub global: HashMap<bgp::Family, FnvHashMap<bgp::Nlri, Destination>>,
     //    pub master: HashMap<bgp::Family, HashMap<bgp::Nlri, Destination>>,
 }
 
@@ -695,7 +693,7 @@ impl RoutingTable {
     pub fn new(disable_best_path_selection: bool) -> Self {
         RoutingTable {
             disable_best_path_selection,
-            global: vec![(bgp::Family::Reserved, HashMap::new())]
+            global: vec![(bgp::Family::Reserved, FnvHashMap::default())]
                 .into_iter()
                 .collect(),
         }
@@ -723,7 +721,7 @@ impl RoutingTable {
         let t = match self.global.get_mut(&family) {
             Some(t) => t,
             None => {
-                self.global.insert(family, HashMap::new());
+                self.global.insert(family, FnvHashMap::default());
                 self.global.get_mut(&family).unwrap()
             }
         };
