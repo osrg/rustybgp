@@ -349,41 +349,50 @@ impl Path {
         path
     }
 
+    pub fn get_attr(&self, attr: u8) -> Option<&proto::bgp::Attribute> {
+        for a in &self.attrs.entry {
+            if a.attr() == attr {
+                return Some(a);
+            }
+        }
+        None
+    }
+
     pub fn get_local_preference(&self) -> u32 {
         const DEFAULT: u32 = 100;
-        for a in &self.attrs.entry {
-            if let bgp::Attribute::LocalPref { preference } = a {
-                return *preference;
-            }
+        if let Some(bgp::Attribute::LocalPref { preference }) =
+            self.get_attr(proto::bgp::Attribute::LOCAL_PREF)
+        {
+            return *preference;
         }
         DEFAULT
     }
 
     pub fn get_as_len(&self) -> u32 {
-        for a in &self.attrs.entry {
-            if let bgp::Attribute::AsPath { segments } = a {
-                let mut l: usize = 0;
-                segments.iter().for_each(|s| l += s.as_len());
-                return l as u32;
-            }
+        if let Some(bgp::Attribute::AsPath { segments }) =
+            self.get_attr(proto::bgp::Attribute::AS_PATH)
+        {
+            let mut l: usize = 0;
+            segments.iter().for_each(|s| l += s.as_len());
+            return l as u32;
         }
         0
     }
 
     pub fn get_origin(&self) -> u8 {
-        for a in &self.attrs.entry {
-            if let bgp::Attribute::Origin { origin } = a {
-                return *origin;
-            }
+        if let Some(bgp::Attribute::Origin { origin }) =
+            self.get_attr(proto::bgp::Attribute::ORIGIN)
+        {
+            return *origin;
         }
         0
     }
 
     pub fn get_med(&self) -> u32 {
-        for a in &self.attrs.entry {
-            if let bgp::Attribute::MultiExitDesc { descriptor } = a {
-                return *descriptor;
-            }
+        if let Some(bgp::Attribute::MultiExitDesc { descriptor }) =
+            self.get_attr(proto::bgp::Attribute::MULTI_EXIT_DESC)
+        {
+            return *descriptor;
         }
         0
     }
