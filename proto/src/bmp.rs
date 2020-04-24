@@ -216,7 +216,7 @@ impl Tlv {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Initiation {
     pub tlv: Vec<Tlv>,
 }
@@ -258,7 +258,7 @@ trait BmpMessage {
     fn to_bytes_body(&self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error>;
 }
 
-fn to_bytes<T: BmpMessage>(m: T, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
+fn to_bytes<T: BmpMessage>(m: &T, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
     let mut len = m.to_bytes_peer_header(c)?;
     len += m.to_bytes_body(c)?;
     Ok(len as usize)
@@ -290,7 +290,7 @@ impl Message {
         }
     }
 
-    pub fn to_bytes(self) -> Result<Vec<u8>, Error> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let buf: Vec<u8> = Vec::new();
         let mut c = Cursor::new(buf);
 

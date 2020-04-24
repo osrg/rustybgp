@@ -79,21 +79,21 @@ impl IpNet {
         match addr {
             IpAddr::V4(addr) => {
                 let prefix_octets: Vec<u8> = match self.addr {
-                    IpAddr::V4(addr) => addr.octets().iter().map(|x| *x).collect(),
+                    IpAddr::V4(addr) => addr.octets().iter().copied().collect(),
                     _ => return false,
                 };
 
-                let addr_octests: Vec<u8> = addr.octets().iter().map(|x| *x).collect();
-                return f(&prefix_octets, &addr_octests, self.mask);
+                let addr_octests: Vec<u8> = addr.octets().iter().copied().collect();
+                f(&prefix_octets, &addr_octests, self.mask)
             }
             IpAddr::V6(addr) => {
                 let prefix_octets: Vec<u8> = match self.addr {
-                    IpAddr::V6(addr) => addr.octets().iter().map(|x| *x).collect(),
+                    IpAddr::V6(addr) => addr.octets().iter().copied().collect(),
                     _ => return false,
                 };
 
-                let addr_octests: Vec<u8> = addr.octets().iter().map(|x| *x).collect();
-                return f(&prefix_octets, &addr_octests, self.mask);
+                let addr_octests: Vec<u8> = addr.octets().iter().copied().collect();
+                f(&prefix_octets, &addr_octests, self.mask)
             }
         }
     }
@@ -103,12 +103,12 @@ impl IpNet {
         if rem != 0 {
             let prefix_len = (mask + 7) / 8;
             let mask: u16 = 0xff00 >> rem;
-            buf[prefix_len as usize - 1] = buf[prefix_len as usize - 1] & mask as u8;
+            buf[prefix_len as usize - 1] &= mask as u8;
         }
     }
 
     fn size(&self) -> usize {
-        return (1 + (self.mask + 7) / 8) as usize;
+        (1 + (self.mask + 7) / 8) as usize
     }
 
     fn to_bytes(&self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
@@ -214,7 +214,7 @@ impl IpNetNew<[u8; 4]> for IpNet {
         IpNet::clear_bits(&mut octets, mask);
         IpNet {
             addr: IpAddr::from(octets),
-            mask: mask,
+            mask,
         }
     }
 }
@@ -224,7 +224,7 @@ impl IpNetNew<[u8; 16]> for IpNet {
         IpNet::clear_bits(&mut octets, mask);
         IpNet {
             addr: IpAddr::from(octets),
-            mask: mask,
+            mask,
         }
     }
 }
@@ -350,11 +350,11 @@ impl OpenMessage {
             version: OpenMessage::VERSION,
             as_number: AS_TRANS,
             holdtime: OpenMessage::HOLDTIME,
-            id: id,
+            id,
             params: caps
                 .iter()
                 .cloned()
-                .map(|c| OpenParam::CapabilityParam(c))
+                .map(OpenParam::CapabilityParam)
                 .collect(),
             length: 0,
         }
@@ -363,25 +363,21 @@ impl OpenMessage {
     pub fn get_as_number(&self) -> u32 {
         if self.as_number == AS_TRANS {
             for param in &self.params {
-                match param {
-                    OpenParam::CapabilityParam(cap) => match cap {
-                        Capability::FourOctetAsNumber { as_number } => {
-                            return *as_number;
-                        }
-                        _ => {}
-                    },
-                    _ => {}
+                if let OpenParam::CapabilityParam(cap) = param {
+                    if let Capability::FourOctetAsNumber { as_number } = cap {
+                        return *as_number;
+                    }
                 }
             }
         }
-        return self.as_number as u32;
+        self.as_number as u32
     }
 
     pub fn get_parameters(&self) -> Vec<OpenParam> {
-        self.params.iter().cloned().collect()
+        self.params.to_vec()
     }
 
-    pub fn to_bytes(self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
+    pub fn to_bytes(&self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
         c.write_u8(self.version)?;
         c.write_u16::<NetworkEndian>(self.as_number)?;
         c.write_u16::<NetworkEndian>(self.holdtime)?;
@@ -668,7 +664,7 @@ impl NotificationMessage {
         }
     }
 
-    pub fn to_bytes(self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
+    pub fn to_bytes(&self, c: &mut Cursor<Vec<u8>>) -> Result<usize, Error> {
         c.write_u8(self.code)?;
         c.write_u8(self.sub_code)?;
 
@@ -738,7 +734,7 @@ impl Message {
             Message::Notification(_) => Message::NOTIFICATION,
             Message::Keepalive => Message::KEEPALIVE,
             Message::RouteRefresh(_) => Message::ROUTE_REFRESH,
-            Message::Unknown { length: _, code } => *code,
+            Message::Unknown { code, .. } => *code,
         }
     }
 
@@ -749,7 +745,7 @@ impl Message {
             Message::Update(m) => len += m.length,
             Message::Notification(m) => len += m.length,
             Message::RouteRefresh(_) => len += 4,
-            Message::Unknown { length, code: _ } => len += length,
+            Message::Unknown { length, .. } => len += length,
             _ => {}
         }
         len
@@ -773,58 +769,60 @@ impl Message {
         match code {
             Message::OPEN => {
                 let b = OpenMessage::from_bytes(&mut c)?;
-                return Ok(Message::Open(b));
+                Ok(Message::Open(b))
             }
             Message::UPDATE => {
                 let b = UpdateMessage::from_bytes(param, &mut c)?;
-                return Ok(Message::Update(b));
+                Ok(Message::Update(b))
             }
             Message::NOTIFICATION => {
                 let b = NotificationMessage::from_bytes(&mut c)?;
-                return Ok(Message::Notification(b));
+                Ok(Message::Notification(b))
             }
-            Message::KEEPALIVE => return Ok(Message::Keepalive),
+            Message::KEEPALIVE => Ok(Message::Keepalive),
             Message::ROUTE_REFRESH => {
                 let b = RouteRefreshMessage::from_bytes(&mut c)?;
-                return Ok(Message::RouteRefresh(b));
+                Ok(Message::RouteRefresh(b))
             }
             _ => {
                 let body_length = length - Message::HEADER_LENGTH;
                 for _ in 0..body_length {
                     c.read_u8()?;
                 }
-                return Ok(Message::Unknown {
+                Ok(Message::Unknown {
                     length: body_length as usize,
-                    code: code,
-                });
+                    code,
+                })
             }
         }
     }
 
-    pub fn to_bytes(self) -> Result<Vec<u8>, Error> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let buf: Vec<u8> = Vec::new();
         let mut c = Cursor::new(buf);
-        c.write(&vec![0xff; 16])?;
+        c.write_all(&[0xff; 16])?;
         // length: might be update later.
         let pos_length = c.position();
         c.write_u16::<NetworkEndian>(Message::HEADER_LENGTH)?;
         // type
-        c.write(&vec![self.to_u8()])?;
+        c.write_all(&[self.to_u8()])?;
 
         let mut body_length = 0;
         match self {
-            Message::Open(b) => match b.to_bytes(&mut c) {
-                Ok(n) => body_length += n,
-                Err(_) => {}
-            },
+            Message::Open(b) => {
+                if let Ok(n) = b.to_bytes(&mut c) {
+                    body_length += n;
+                }
+            }
             // Message::Update(b) => match b.to_bytes(&mut c) {
             //     Ok(n) => body_length += n,
             //     Err(_) => {}
             // },
-            Message::Notification(b) => match b.to_bytes(&mut c) {
-                Ok(n) => body_length += n,
-                Err(_) => {}
-            },
+            Message::Notification(b) => {
+                if let Ok(n) = b.to_bytes(&mut c) {
+                    body_length += n;
+                }
+            }
             _ => {}
         }
 
@@ -839,7 +837,7 @@ impl Message {
 
     fn header_bytes(c: &mut Cursor<Vec<u8>>, t: u8, body_length: u16) -> Result<usize, Error> {
         let pos = c.position();
-        c.write(&vec![0xff; 16])?;
+        c.write_all(&[0xff; 16])?;
         c.write_u16::<NetworkEndian>(Message::HEADER_LENGTH + body_length)?;
         c.write_u8(t)?;
         Ok((c.position() - pos) as usize)
@@ -876,10 +874,10 @@ impl Segment {
         }
     }
 
-    pub fn new(t: u8, number: &Vec<u32>) -> Segment {
+    pub fn new(t: u8, number: &[u32]) -> Segment {
         Segment {
             segment_type: t,
-            number: number.into_iter().map(|x| x.to_owned()).collect(),
+            number: number.iter().map(|x| x.to_owned()).collect(),
         }
     }
 }
@@ -1063,7 +1061,7 @@ impl Attribute {
                     c.read_exact(&mut buf)?;
                     return Ok(Attribute::Aggregator {
                         four_byte: true,
-                        number: number,
+                        number,
                         address: IpAddr::from(buf),
                     });
                 }
@@ -1232,9 +1230,8 @@ impl Attribute {
                     c.write_u8(6)?;
                     c.write_u16::<NetworkEndian>(*number as u16)?;
                 }
-                match address {
-                    IpAddr::V4(addr) => c.write_u32::<NetworkEndian>(u32::from(*addr))?,
-                    _ => {}
+                if let IpAddr::V4(addr) = address {
+                    c.write_u32::<NetworkEndian>(u32::from(*addr))?;
                 }
             }
             Attribute::Community { communities } => {
@@ -1245,9 +1242,8 @@ impl Attribute {
             }
             Attribute::OriginatorId { address } => {
                 c.write_u8(4)?;
-                match address {
-                    IpAddr::V4(addr) => c.write_u32::<NetworkEndian>(u32::from(*addr))?,
-                    _ => {}
+                if let IpAddr::V4(addr) = address {
+                    c.write_u32::<NetworkEndian>(u32::from(*addr))?;
                 }
             }
             Attribute::ClusterList { .. } => {}
@@ -1311,9 +1307,9 @@ impl Attribute {
             // IpV6ExtendedCommunity,
             Attribute::NotSupported {
                 attr_flag,
-                attr_type: _,
                 attr_len,
                 buf,
+                ..
             } => {
                 if (*attr_flag & Attribute::FLAG_EXTENDED) != 0 {
                     c.write_u16::<NetworkEndian>(*attr_len)?;
@@ -1373,9 +1369,8 @@ impl Attribute {
 
     pub fn is_transitive(&self) -> bool {
         let mut flag = Attribute::flag(self.attr());
-        match self {
-            Attribute::NotSupported { attr_flag, .. } => flag = *attr_flag,
-            _ => {}
+        if let Attribute::NotSupported { attr_flag, .. } = self {
+            flag = *attr_flag;
         }
         flag & Attribute::FLAG_TRANSITIVE != 0
     }
@@ -1505,7 +1500,7 @@ impl UpdateMessage {
             let attr = Attribute::from_bytes(c);
             match attr {
                 Ok(a) => {
-                    if seen.insert(a.attr()) == false {
+                    if !seen.insert(a.attr()) {
                         // ignore duplicated attribute
                         continue;
                     }
@@ -1526,7 +1521,7 @@ impl UpdateMessage {
                             nlri,
                             nexthop,
                         } => {
-                            mp_routes = Some((*family, nlri.iter().cloned().collect(), *nexthop));
+                            mp_routes = Some((*family, nlri.to_vec(), *nexthop));
                         }
                         Attribute::MpUnreach { family, nlri } => {
                             withdrawns
@@ -1552,17 +1547,16 @@ impl UpdateMessage {
             routes.push(Nlri::Ip(net));
         }
 
-        if routes.len() > 0 || mp_routes.is_some() {
-            if handle_as_withdrawns
+        if (!routes.is_empty() || mp_routes.is_some())
+            && (handle_as_withdrawns
                 || !seen.contains(&Attribute::ORIGIN)
                 || !seen.contains(&Attribute::AS_PATH)
-                || (routes.len() > 0 && !seen.contains(&Attribute::NEXTHOP))
-            {
-                withdrawns.append(&mut routes.iter().map(|n| (Family::Ipv4Uc, *n)).collect());
-                if let Some(a) = mp_routes {
-                    withdrawns.append(&mut a.1.iter().map(|n| (a.0, *n)).collect());
-                    mp_routes = None;
-                }
+                || (!routes.is_empty() && !seen.contains(&Attribute::NEXTHOP)))
+        {
+            withdrawns.append(&mut routes.iter().map(|n| (Family::Ipv4Uc, *n)).collect());
+            if let Some(a) = mp_routes {
+                withdrawns.append(&mut a.1.iter().map(|n| (a.0, *n)).collect());
+                mp_routes = None;
             }
         }
 
@@ -1576,7 +1570,8 @@ impl UpdateMessage {
         })
     }
 
-    pub fn to_bytes(
+    // FIXME
+    pub fn bytes(
         routes: Vec<Nlri>,
         withdrawns: Vec<Nlri>,
         attrs: Vec<&Attribute>,
@@ -1609,7 +1604,7 @@ impl UpdateMessage {
         for attr in attrs {
             attr_len += attr.to_bytes(&mut c)?;
         }
-        if mp_withdrawns.len() > 0 {
+        if !mp_withdrawns.is_empty() {
             attr_len += Attribute::MpUnreach {
                 family: Family::Ipv6Uc,
                 nlri: mp_withdrawns,
@@ -1778,8 +1773,8 @@ impl Capability {
                     len -= 4;
                 }
                 Ok(Capability::GracefulRestart {
-                    flags: flags,
-                    time: time,
+                    flags,
+                    time,
                     values: v,
                 })
             }
@@ -1818,10 +1813,7 @@ impl Capability {
                 for _ in 0..len {
                     v.push(c.read_u8()?);
                 }
-                Ok(Capability::Unknown {
-                    code: code,
-                    values: v,
-                })
+                Ok(Capability::Unknown { code, values: v })
             }
         }
     }
@@ -1886,15 +1878,15 @@ impl FromStr for WellKnownCommunity {
 impl From<WellKnownCommunity> for u32 {
     fn from(c: WellKnownCommunity) -> Self {
         match c {
-            WellKnownCommunity::GracefulShutdown => 0xffff0000,
-            WellKnownCommunity::AcceptOwn => 0xffff0001,
-            WellKnownCommunity::LlgrStale => 0xffff0006,
-            WellKnownCommunity::NoLlgr => 0xffff0007,
-            WellKnownCommunity::Blackhole => 0xffff029a,
-            WellKnownCommunity::NoExport => 0xffffff01,
-            WellKnownCommunity::NoAdvertise => 0xffffff02,
-            WellKnownCommunity::NoExportSubconfed => 0xffffff03,
-            WellKnownCommunity::NoPeer => 0xffffff04,
+            WellKnownCommunity::GracefulShutdown => 0xffff_0000,
+            WellKnownCommunity::AcceptOwn => 0xffff_0001,
+            WellKnownCommunity::LlgrStale => 0xffff_0006,
+            WellKnownCommunity::NoLlgr => 0xffff_0007,
+            WellKnownCommunity::Blackhole => 0xffff_029a,
+            WellKnownCommunity::NoExport => 0xffff_ff01,
+            WellKnownCommunity::NoAdvertise => 0xffff_ff02,
+            WellKnownCommunity::NoExportSubconfed => 0xffff_ff03,
+            WellKnownCommunity::NoPeer => 0xffff_ff04,
         }
     }
 }

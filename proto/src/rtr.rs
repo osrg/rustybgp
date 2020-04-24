@@ -73,18 +73,15 @@ impl Message {
 		}
 	}
 
-	pub fn to_bytes(self) -> Result<Vec<u8>, Error> {
+	pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
 		let buf: Vec<u8> = Vec::new();
 		let mut c = Cursor::new(buf);
 
-		match self {
-			Message::ResetQuery => {
-				c.write_u8(0)?;
-				c.write_u8(Message::RESET_QUERY)?;
-				c.write_u16::<NetworkEndian>(0)?;
-				c.write_u32::<NetworkEndian>(8)?;
-			}
-			_ => {}
+		if let Message::ResetQuery = self {
+			c.write_u8(0)?;
+			c.write_u8(Message::RESET_QUERY)?;
+			c.write_u16::<NetworkEndian>(0)?;
+			c.write_u32::<NetworkEndian>(8)?;
 		}
 		Ok(c.into_inner())
 	}
@@ -105,11 +102,11 @@ impl Message {
 		match message_type {
 			Message::SERIAL_NOTIFY => {
 				let serial_number = c.read_u32::<NetworkEndian>()?;
-				return Ok((Message::SerialNotify { serial_number }, length));
+				Ok((Message::SerialNotify { serial_number }, length))
 			}
 			Message::SERIAL_QUERY => {
 				let serial_number = c.read_u32::<NetworkEndian>()?;
-				return Ok((Message::SerialQuery { serial_number }, length));
+				Ok((Message::SerialQuery { serial_number }, length))
 			}
 			Message::RESET_QUERY => Ok((Message::ResetQuery, length)),
 			Message::CACHE_RESPONSE => Ok((Message::CacheResponse, length)),
@@ -123,7 +120,7 @@ impl Message {
 					octets[i as usize] = c.read_u8()?;
 				}
 				let as_number = c.read_u32::<NetworkEndian>()?;
-				return Ok((
+				Ok((
 					Message::Ipv4Prefix(Prefix {
 						net: IpNet {
 							addr: IpAddr::from(octets),
@@ -134,7 +131,7 @@ impl Message {
 						as_number,
 					}),
 					length,
-				));
+				))
 			}
 			Message::IPV6_PREFIX => {
 				let flags = c.read_u8()?;
@@ -146,7 +143,7 @@ impl Message {
 					octets[i as usize] = c.read_u8()?;
 				}
 				let as_number = c.read_u32::<NetworkEndian>()?;
-				return Ok((
+				Ok((
 					Message::Ipv6Prefix(Prefix {
 						net: IpNet {
 							addr: IpAddr::from(octets),
@@ -157,17 +154,15 @@ impl Message {
 						as_number,
 					}),
 					length,
-				));
+				))
 			}
 			Message::END_OF_DATA => {
 				let serial_number = c.read_u32::<NetworkEndian>()?;
-				return Ok((Message::EndOfData { serial_number }, length));
+				Ok((Message::EndOfData { serial_number }, length))
 			}
 			Message::CACHE_RESET => Ok((Message::CacheReset, length)),
 			Message::ERROR_REPORT => Ok((Message::ErrorReport, length)),
-			_ => {
-				return Err(format_err!("unknown type {}", message_type));
-			}
+			_ => Err(format_err!("unknown type {}", message_type)),
 		}
 	}
 }

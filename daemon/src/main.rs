@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry::Occupied, hash_map::Entry::Vacant, HashMap, HashSet},
     convert::TryFrom,
     fmt, io,
     io::Cursor,
@@ -123,7 +123,7 @@ impl FromFamilyApi for api::Family {
                 return bgp::Family::Ipv6Uc;
             }
         }
-        return bgp::Family::Unknown((self.afi as u32) << 16 | self.safi as u32);
+        bgp::Family::Unknown((self.afi as u32) << 16 | self.safi as u32)
     }
 }
 
@@ -134,21 +134,14 @@ trait FromNlriApi {
 impl FromNlriApi for prost_types::Any {
     fn to_proto(&self) -> Option<bgp::Nlri> {
         if self.type_url == "type.googleapis.com/gobgpapi.IPAddressPrefix" {
-            let n = prost::Message::decode(Cursor::new(&self.value));
-            match n {
-                Ok(n) => {
-                    let api_nlri: api::IpAddressPrefix = n;
-                    match IpAddr::from_str(&api_nlri.prefix) {
-                        Ok(addr) => {
-                            return Some(bgp::Nlri::Ip(bgp::IpNet {
-                                addr: addr,
-                                mask: api_nlri.prefix_len as u8,
-                            }));
-                        }
-                        Err(_) => {}
-                    }
+            if let Ok(n) = prost::Message::decode(Cursor::new(&self.value)) {
+                let api_nlri: api::IpAddressPrefix = n;
+                if let Ok(addr) = IpAddr::from_str(&api_nlri.prefix) {
+                    return Some(bgp::Nlri::Ip(bgp::IpNet {
+                        addr,
+                        mask: api_nlri.prefix_len as u8,
+                    }));
                 }
-                Err(_) => {}
             }
         }
         None
@@ -172,7 +165,7 @@ pub struct Path {
 impl Path {
     fn new(source: Arc<Source>, nexthop: IpAddr, attrs: Arc<PathAttr>) -> Path {
         Path {
-            source: source,
+            source,
             timestamp: SystemTime::now(),
             as_number: 0,
             attrs,
@@ -199,7 +192,7 @@ impl Path {
                 let seg = &segments[segments.len() - 1];
                 match seg.segment_type {
                     bgp::Segment::TYPE_SEQ => {
-                        if seg.number.len() == 0 {
+                        if seg.number.is_empty() {
                             self.source.local_as
                         } else {
                             seg.number[seg.number.len() - 1]
@@ -212,8 +205,8 @@ impl Path {
         };
 
         let mut octets: Vec<u8> = match ipnet.addr {
-            IpAddr::V4(addr) => addr.octets().iter().map(|x| *x).collect(),
-            IpAddr::V6(addr) => addr.octets().iter().map(|x| *x).collect(),
+            IpAddr::V4(addr) => addr.octets().iter().copied().collect(),
+            IpAddr::V6(addr) => addr.octets().iter().copied().collect(),
         };
         octets.drain(((ipnet.mask + 7) / 8) as usize..);
 
@@ -230,12 +223,12 @@ impl Path {
                 }
             }
         }
-        if v.matched.len() != 0 {
+        if !v.matched.is_empty() {
             v.state = api::validation::State::Valid as i32;
-        } else if v.unmatched_as.len() != 0 {
+        } else if !v.unmatched_as.is_empty() {
             v.state = api::validation::State::Invalid as i32;
             v.reason = api::validation::Reason::As as i32;
-        } else if v.unmatched_length.len() != 0 {
+        } else if !v.unmatched_length.is_empty() {
             v.state = api::validation::State::Invalid as i32;
             v.reason = api::validation::Reason::Length as i32;
         } else {
@@ -289,12 +282,10 @@ impl Path {
                         .iter()
                         .map(|segment| api::AsSegment {
                             r#type: segment.segment_type as u32,
-                            numbers: segment.number.iter().map(|x| *x).collect(),
+                            numbers: segment.number.iter().copied().collect(),
                         })
                         .collect();
-                    let a = api::AsPathAttribute {
-                        segments: From::from(l),
-                    };
+                    let a = api::AsPathAttribute { segments: l };
                     attrs.push(to_any(a, "AsPathAttribute"));
                 }
                 bgp::Attribute::Nexthop { .. } => {}
@@ -315,9 +306,7 @@ impl Path {
                     ));
                 }
                 bgp::Attribute::Aggregator {
-                    four_byte: _,
-                    number,
-                    address,
+                    number, address, ..
                 } => {
                     let a = api::AggregatorAttribute {
                         r#as: *number,
@@ -327,7 +316,7 @@ impl Path {
                 }
                 bgp::Attribute::Community { communities } => {
                     let a = api::CommunitiesAttribute {
-                        communities: communities.iter().map(|x| *x).collect(),
+                        communities: communities.iter().copied().collect(),
                     };
                     attrs.push(to_any(a, "CommunitiesAttribute"));
                 }
@@ -355,7 +344,7 @@ impl Path {
 
         path.pattrs = attrs;
 
-        if rt.len() != 0 {
+        if !rt.is_empty() {
             path.validation = Some(self.to_validate_api(*ipnet, rt, as_attr));
         }
 
@@ -365,25 +354,19 @@ impl Path {
     pub fn get_local_preference(&self) -> u32 {
         const DEFAULT: u32 = 100;
         for a in &self.attrs.entry {
-            match a {
-                bgp::Attribute::LocalPref { preference } => return *preference,
-                _ => {}
+            if let bgp::Attribute::LocalPref { preference } = a {
+                return *preference;
             }
         }
-        return DEFAULT;
+        DEFAULT
     }
 
     pub fn get_as_len(&self) -> u32 {
         for a in &self.attrs.entry {
-            match a {
-                bgp::Attribute::AsPath { segments } => {
-                    let mut l: usize = 0;
-                    for s in segments {
-                        l += s.as_len();
-                    }
-                    return l as u32;
-                }
-                _ => {}
+            if let bgp::Attribute::AsPath { segments } = a {
+                let mut l: usize = 0;
+                segments.iter().for_each(|s| l += s.as_len());
+                return l as u32;
             }
         }
         0
@@ -391,9 +374,8 @@ impl Path {
 
     pub fn get_origin(&self) -> u8 {
         for a in &self.attrs.entry {
-            match a {
-                bgp::Attribute::Origin { origin } => return *origin,
-                _ => {}
+            if let bgp::Attribute::Origin { origin } = a {
+                return *origin;
             }
         }
         0
@@ -401,12 +383,11 @@ impl Path {
 
     pub fn get_med(&self) -> u32 {
         for a in &self.attrs.entry {
-            match a {
-                bgp::Attribute::MultiExitDesc { descriptor } => return *descriptor,
-                _ => {}
+            if let bgp::Attribute::MultiExitDesc { descriptor } = a {
+                return *descriptor;
             }
         }
-        return 0;
+        0
     }
 
     pub fn to_payload(&self, nlri: bgp::Nlri) -> Vec<u8> {
@@ -430,7 +411,7 @@ impl Path {
             )
         };
         v.push(&n);
-        bgp::UpdateMessage::to_bytes(route, Vec::new(), v).unwrap()
+        bgp::UpdateMessage::bytes(route, Vec::new(), v).unwrap()
     }
 }
 
@@ -456,18 +437,15 @@ impl Roa {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RoaTable {
     pub v4: PatriciaMap<Vec<Roa>>,
     pub v6: PatriciaMap<Vec<Roa>>,
 }
 
 impl RoaTable {
-    pub fn new() -> RoaTable {
-        RoaTable {
-            v4: PatriciaMap::new(),
-            v6: PatriciaMap::new(),
-        }
+    pub fn new() -> Self {
+        Default::default()
     }
 
     pub fn t(&self, family: bgp::Family) -> &PatriciaMap<Vec<Roa>> {
@@ -489,7 +467,7 @@ impl RoaTable {
                         i += 1;
                     }
                 }
-                if e.len() == 0 {
+                if e.is_empty() {
                     empty.push(n);
                 }
             }
@@ -527,8 +505,7 @@ impl RoaTable {
 
         match t.get_mut(&key) {
             Some(entry) => {
-                for i in 0..entry.len() {
-                    let e = &entry[i];
+                for e in entry.iter() {
                     if e.source.address == roa.source.address
                         && e.max_length == roa.max_length
                         && e.as_number == roa.as_number
@@ -609,14 +586,14 @@ impl Destination {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Counter {
     c: HashMap<u8, i64>,
 }
 
 impl Counter {
-    pub fn new() -> Counter {
-        Counter { c: HashMap::new() }
+    pub fn new() -> Self {
+        Default::default()
     }
 
     pub fn inc(&mut self, t: u8) {
@@ -643,6 +620,12 @@ pub struct RtrSession {
     serial_number: u32,
 
     rx_counter: Counter,
+}
+
+impl Default for RtrSession {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RtrSession {
@@ -721,10 +704,10 @@ impl RoutingTable {
     pub fn iter_destination(
         &self,
         _is_rs: bool,
-        family: &proto::bgp::Family,
+        family: proto::bgp::Family,
     ) -> impl Iterator<Item = (&proto::bgp::Nlri, &Destination)> {
         self.global
-            .get(family)
+            .get(&family)
             .unwrap_or(&self.global.get(&bgp::Family::Reserved).unwrap())
             .iter()
     }
@@ -762,7 +745,7 @@ impl RoutingTable {
 
                 let b = Path::new(source, nexthop, attrs);
 
-                let idx = if self.disable_best_path_selection == true {
+                let idx = if self.disable_best_path_selection {
                     0
                 } else {
                     let mut idx = d.entry.len();
@@ -809,7 +792,7 @@ impl RoutingTable {
                 (a, src)
             }
         };
-        if self.disable_best_path_selection == false && new_best {
+        if !self.disable_best_path_selection && new_best {
             (
                 Some(RoutingTableUpdate::new(
                     src,
@@ -836,44 +819,35 @@ impl RoutingTable {
             return (None, false);
         }
         let t = t.unwrap();
-        match t.get_mut(&net) {
-            Some(d) => {
-                for i in 0..d.entry.len() {
-                    if d.entry[i].source.address == source.address {
-                        d.entry.remove(i);
-                        if d.entry.len() == 0 {
-                            t.remove(&net);
-                            return (
-                                Some(RoutingTableUpdate::new(
-                                    source.clone(),
-                                    family,
-                                    net,
-                                    None,
-                                    None,
-                                )),
-                                true,
-                            );
-                        }
-                        if i == 0 {
-                            return (
-                                Some(RoutingTableUpdate::new(
-                                    d.entry[0].source.clone(),
-                                    family,
-                                    net,
-                                    Some(d.entry[0].attrs.clone()),
-                                    Some(d.entry[0].nexthop),
-                                )),
-                                true,
-                            );
-                        } else {
-                            return (None, true);
-                        }
+        if let Some(d) = t.get_mut(&net) {
+            for i in 0..d.entry.len() {
+                if d.entry[i].source.address == source.address {
+                    d.entry.remove(i);
+                    if d.entry.is_empty() {
+                        t.remove(&net);
+                        return (
+                            Some(RoutingTableUpdate::new(source, family, net, None, None)),
+                            true,
+                        );
+                    }
+                    if i == 0 {
+                        return (
+                            Some(RoutingTableUpdate::new(
+                                d.entry[0].source.clone(),
+                                family,
+                                net,
+                                Some(d.entry[0].attrs.clone()),
+                                Some(d.entry[0].nexthop),
+                            )),
+                            true,
+                        );
+                    } else {
+                        return (None, true);
                     }
                 }
             }
-            None => {}
         }
-        return (None, false);
+        (None, false)
     }
 
     pub fn clear(&mut self, source: Arc<Source>) -> Vec<RoutingTableUpdate> {
@@ -888,7 +862,7 @@ impl RoutingTable {
                 for i in 0..d.entry.len() {
                     if d.entry[i].source.address == source.address {
                         d.entry.remove(i);
-                        if d.entry.len() == 0 {
+                        if d.entry.is_empty() {
                             update.push(RoutingTableUpdate::new(
                                 source.clone(),
                                 *f,
@@ -909,7 +883,7 @@ impl RoutingTable {
                     }
                 }
 
-                if d.entry.len() == 0 {
+                if d.entry.is_empty() {
                     m.get_mut(f).unwrap().push(*n);
                 }
             }
@@ -1110,7 +1084,7 @@ impl TryFrom<api::DefinedSet> for DefinedSet {
                             Err(_) => return Err(()),
                         }
                     }
-                    if v.len() != 0 {
+                    if !v.is_empty() {
                         return Ok(DefinedSet::PrefixSet(v));
                     }
                 }
@@ -1126,7 +1100,7 @@ impl TryFrom<api::DefinedSet> for DefinedSet {
                             }
                         }
                     }
-                    if v.len() != 0 {
+                    if !v.is_empty() {
                         let s = if t == api::DefinedType::Neighbor {
                             DefinedSet::NeighborSet(v)
                         } else {
@@ -1147,7 +1121,7 @@ impl TryFrom<api::DefinedSet> for DefinedSet {
                             return Err(());
                         }
                     }
-                    if v0.len() != 0 || v1.len() != 0 {
+                    if !v0.is_empty() || !v1.is_empty() {
                         return Ok(DefinedSet::AsPathSet((v0, v1)));
                     }
                 }
@@ -1160,7 +1134,7 @@ impl TryFrom<api::DefinedSet> for DefinedSet {
                             return Err(());
                         }
                     }
-                    if v.len() != 0 {
+                    if !v.is_empty() {
                         return Ok(DefinedSet::CommunitySet(v));
                     }
                 }
@@ -1302,9 +1276,9 @@ impl RoutingPolicy {
             let nexthops: Vec<proto::bgp::IpNet> = conditions
                 .next_hop_in_list
                 .iter()
-                .filter_map(|p| proto::bgp::IpNet::from_str(p).map_or(None, |n| Some(n)))
+                .filter_map(|p| proto::bgp::IpNet::from_str(p).map_or(None, Some))
                 .collect();
-            if nexthops.len() != 0 {
+            if !nexthops.is_empty() {
                 if nexthops.len() != conditions.next_hop_in_list.len() {
                     return Err(());
                 }
@@ -1319,6 +1293,12 @@ impl RoutingPolicy {
         }
         self.statements.insert(name, Statement { conditions: v });
         Ok(())
+    }
+}
+
+impl Default for RoutingPolicy {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1357,7 +1337,7 @@ impl Table {
         for (_, session) in self.bgp_sessions.iter_mut() {
             let target = session.source.clone();
             if target.state == bgp::State::Established
-                && need_to_advertise(&rtu.source, &target, &rtu.family, &session.families)
+                && need_to_advertise(&rtu.source, &target, rtu.family, &session.families)
             {
                 let _ = session.tx.send(PeerEvent::Update(rtu.clone()));
             }
@@ -1401,7 +1381,7 @@ impl MessageCounter {
             bgp::Message::Update(update) => {
                 self.update += 1;
                 self.withdraw_prefix += update.withdrawns.len() as u64;
-                if update.withdrawns.len() > 0 {
+                if !update.withdrawns.is_empty() {
                     self.withdraw_update += 1;
                 }
             }
@@ -1428,7 +1408,7 @@ impl api::Peer {
                 return transport.remote_port as u16;
             }
         }
-        return bgp::BGP_PORT;
+        bgp::BGP_PORT
     }
 
     pub fn get_local_as(&self) -> u32 {
@@ -1477,7 +1457,7 @@ impl api::Peer {
                 }
             }
         }
-        if v.len() == 0 {
+        if v.is_empty() {
             if let Some(conf) = &self.conf {
                 if let Ok(addr) = IpAddr::from_str(&conf.neighbor_address) {
                     match addr {
@@ -1531,7 +1511,7 @@ impl Peer {
 
     pub fn new(address: IpAddr, as_number: u32) -> Peer {
         Peer {
-            address: address,
+            address,
             local_port: 0,
             remote_port: 0,
             remote_as: 0,
@@ -1631,15 +1611,13 @@ impl Peer {
     }
 
     fn to_bmp_up(&self, router_id: Ipv4Addr, local_address: IpAddr) -> bmp::PeerUpNotification {
-        let sent = bgp::Message::Open(bgp::OpenMessage::new(
-            router_id,
-            self.local_cap.iter().cloned().collect(),
-        ))
-        .to_bytes()
-        .unwrap();
-        let recv = bgp::Message::Open(bgp::OpenMessage::new(
+        let sent_open =
+            bgp::Message::Open(bgp::OpenMessage::new(router_id, self.local_cap.to_vec()))
+                .to_bytes()
+                .unwrap();
+        let received_open = bgp::Message::Open(bgp::OpenMessage::new(
             self.router_id,
-            self.remote_cap.iter().cloned().collect(),
+            self.remote_cap.to_vec(),
         ))
         .to_bytes()
         .unwrap();
@@ -1652,15 +1630,15 @@ impl Peer {
                 self.router_id,
                 self.uptime,
             ),
-            local_address: local_address,
+            local_address,
             local_port: self.local_port,
             remote_port: self.remote_port,
-            sent_open: sent,
-            received_open: recv,
+            sent_open,
+            received_open,
         }
     }
 
-    fn to_bmp_down(&self, r: u8) -> bmp::PeerDownNotification {
+    fn to_bmp_down(&self, reason: u8) -> bmp::PeerDownNotification {
         bmp::PeerDownNotification {
             peer_header: bmp::PeerHeader::new(
                 0,
@@ -1670,7 +1648,7 @@ impl Peer {
                 self.router_id,
                 self.uptime,
             ),
-            reason: r,
+            reason,
             payload: Vec::new(),
             data: Vec::new(),
         }
@@ -1700,7 +1678,7 @@ impl ToApi<api::Peer> for Peer {
             bgp::State::OpenConfirm => api::peer_state::SessionState::Openconfirm as i32,
             bgp::State::Established => api::peer_state::SessionState::Established as i32,
         };
-        ps.admin_state = if self.admin_down == true {
+        ps.admin_state = if self.admin_down {
             api::peer_state::AdminState::Down as i32
         } else {
             api::peer_state::AdminState::Up as i32
@@ -1771,9 +1749,7 @@ impl ToApi<prost_types::Any> for bgp::Capability {
                     v.push(e);
                 }
                 to_any(
-                    api::ExtendedNexthopCapability {
-                        tuples: From::from(v),
-                    },
+                    api::ExtendedNexthopCapability { tuples: v },
                     "ExtendedNexthopCapability",
                 )
             }
@@ -1812,12 +1788,7 @@ impl ToApi<prost_types::Any> for bgp::Capability {
                     };
                     v.push(e);
                 }
-                to_any(
-                    api::AddPathCapability {
-                        tuples: From::from(v),
-                    },
-                    "AddPathCapability",
-                )
+                to_any(api::AddPathCapability { tuples: v }, "AddPathCapability")
             }
             bgp::Capability::EnhanshedRouteRefresh => to_any(
                 api::EnhancedRouteRefreshCapability {},
@@ -1833,9 +1804,7 @@ impl ToApi<prost_types::Any> for bgp::Capability {
                     };
                     v.push(e);
                 }
-                let c = api::LongLivedGracefulRestartCapability {
-                    tuples: From::from(v),
-                };
+                let c = api::LongLivedGracefulRestartCapability { tuples: v };
                 to_any(c, "LongLivedGracefulRestartCapability")
             }
             bgp::Capability::RouteRefreshCisco => to_any(
@@ -1886,14 +1855,14 @@ impl ToApi<api::Global> for Global {
 }
 
 impl Global {
-    pub fn new(asn: u32, id: Ipv4Addr, tx: Sender<SrvEvent>) -> Global {
+    pub fn new(as_number: u32, id: Ipv4Addr, server_event_tx: Sender<SrvEvent>) -> Global {
         Global {
-            as_number: asn,
-            id: id,
+            as_number,
+            id,
             listen_port: bgp::BGP_PORT,
             peers: HashMap::new(),
             peer_group: HashMap::new(),
-            server_event_tx: tx,
+            server_event_tx,
         }
     }
 }
@@ -1923,7 +1892,7 @@ fn to_native_attrs(api_attrs: Vec<prost_types::Any>) -> (Vec<bgp::Attribute>, Ip
                 for seg in &a.segments {
                     s.push(bgp::Segment {
                         segment_type: (seg.r#type) as u8,
-                        number: seg.numbers.iter().cloned().collect(),
+                        number: seg.numbers.to_vec(),
                     });
                 }
                 v.push(bgp::Attribute::AsPath { segments: s });
@@ -1931,11 +1900,8 @@ fn to_native_attrs(api_attrs: Vec<prost_types::Any>) -> (Vec<bgp::Attribute>, Ip
             "type.googleapis.com/gobgpapi.NextHopAttribute" => {
                 let a: api::NextHopAttribute =
                     prost::Message::decode(Cursor::new(&a.value)).unwrap();
-                match IpAddr::from_str(&a.next_hop) {
-                    Ok(addr) => {
-                        nexthop = addr;
-                    }
-                    Err(_) => {}
+                if let Ok(addr) = IpAddr::from_str(&a.next_hop) {
+                    nexthop = addr;
                 }
             }
             "type.googleapis.com/gobgpapi.MultiExitDiscAttribute" => {
@@ -1956,28 +1922,26 @@ fn to_native_attrs(api_attrs: Vec<prost_types::Any>) -> (Vec<bgp::Attribute>, Ip
             "type.googleapis.com/gobgpapi.AggregateAttribute" => {
                 let a: api::AggregatorAttribute =
                     prost::Message::decode(Cursor::new(&a.value)).unwrap();
-                match IpAddr::from_str(&a.address) {
-                    Ok(addr) => v.push(bgp::Attribute::Aggregator {
+                if let Ok(addr) = IpAddr::from_str(&a.address) {
+                    v.push(bgp::Attribute::Aggregator {
                         four_byte: true,
                         number: a.r#as,
                         address: addr,
-                    }),
-                    Err(_) => {}
+                    });
                 }
             }
             "type.googleapis.com/gobgpapi.CommunitiesAttribute" => {
                 let a: api::CommunitiesAttribute =
                     prost::Message::decode(Cursor::new(&a.value)).unwrap();
                 v.push(bgp::Attribute::Community {
-                    communities: a.communities.iter().cloned().collect(),
+                    communities: a.communities.to_vec(),
                 });
             }
             "type.googleapis.com/gobgpapi.OriginatorIdAttribute" => {
                 let a: api::OriginatorIdAttribute =
                     prost::Message::decode(Cursor::new(&a.value)).unwrap();
-                match IpAddr::from_str(&a.id) {
-                    Ok(addr) => v.push(bgp::Attribute::OriginatorId { address: addr }),
-                    Err(_) => {}
+                if let Ok(addr) = IpAddr::from_str(&a.id) {
+                    v.push(bgp::Attribute::OriginatorId { address: addr });
                 }
             }
             "type.googleapis.com/gobgpapi.ClusterListAttribute" => {}
@@ -1986,13 +1950,12 @@ fn to_native_attrs(api_attrs: Vec<prost_types::Any>) -> (Vec<bgp::Attribute>, Ip
                     prost::Message::decode(Cursor::new(&a.value)).unwrap();
                 let mut addrs = Vec::new();
                 for addr in &a.ids {
-                    match IpAddr::from_str(addr) {
-                        Ok(addr) => addrs.push(addr),
-                        Err(_) => {}
+                    if let Ok(addr) = IpAddr::from_str(addr) {
+                        addrs.push(addr);
                     }
                 }
                 v.push(bgp::Attribute::ClusterList {
-                    addresses: addrs.iter().cloned().collect(),
+                    addresses: addrs.to_vec(),
                 });
             }
         }
@@ -2078,33 +2041,36 @@ impl GobgpApi for Service {
                     };
 
                     let g = &mut self.global.lock().await;
-                    if g.peers.contains_key(&addr) {
-                        return Err(tonic::Status::new(
-                            tonic::Code::AlreadyExists,
-                            "peer address already exists",
-                        ));
-                    } else {
-                        let passive = peer.get_passive_mode();
-                        let remote_port = peer.get_remote_port();
-                        let mut p = Peer::new(addr, as_number)
-                            .remote_as(peer.get_remote_as())
-                            .remote_port(remote_port)
-                            .families(peer.get_families())
-                            .passive(passive)
-                            .hold_time(peer.get_hold_time())
-                            .connect_retry_time(peer.get_connect_retry_time());
-
-                        p.admin_down(conf.admin_down);
-                        g.peers.insert(addr, p);
-
-                        if !passive && !conf.admin_down {
-                            let _ = g.server_event_tx.send(SrvEvent::EnableActive {
-                                proto: Proto::Bgp,
-                                sockaddr: SocketAddr::new(addr, remote_port),
-                            });
+                    match g.peers.entry(addr) {
+                        Occupied(_) => {
+                            return Err(tonic::Status::new(
+                                tonic::Code::AlreadyExists,
+                                "peer address already exists",
+                            ));
                         }
-                        return Ok(tonic::Response::new(()));
+                        Vacant(v) => {
+                            let passive = peer.get_passive_mode();
+                            let remote_port = peer.get_remote_port();
+                            let mut p = Peer::new(addr, as_number)
+                                .remote_as(peer.get_remote_as())
+                                .remote_port(remote_port)
+                                .families(peer.get_families())
+                                .passive(passive)
+                                .hold_time(peer.get_hold_time())
+                                .connect_retry_time(peer.get_connect_retry_time());
+
+                            p.admin_down(conf.admin_down);
+                            v.insert(p);
+
+                            if !passive && !conf.admin_down {
+                                let _ = g.server_event_tx.send(SrvEvent::EnableActive {
+                                    proto: Proto::Bgp,
+                                    sockaddr: SocketAddr::new(addr, remote_port),
+                                });
+                            }
+                        }
                     }
+                    return Ok(tonic::Response::new(()));
                 }
             }
         }
@@ -2249,27 +2215,31 @@ impl GobgpApi for Service {
         &self,
         request: tonic::Request<api::AddPeerGroupRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        match request.into_inner().peer_group {
-            Some(pg) => {
-                if let Some(conf) = pg.conf {
-                    let mut global = self.global.lock().await;
-
-                    if global.peer_group.contains_key(&conf.peer_group_name) {
+        if let Some(pg) = request.into_inner().peer_group {
+            if let Some(conf) = pg.conf {
+                match self
+                    .global
+                    .lock()
+                    .await
+                    .peer_group
+                    .entry(conf.peer_group_name)
+                {
+                    Occupied(_) => {
                         return Err(tonic::Status::new(
                             tonic::Code::AlreadyExists,
                             "peer group name already exists",
                         ));
-                    } else {
+                    }
+                    Vacant(v) => {
                         let p = PeerGroup {
                             as_number: conf.peer_as,
                             dynamic_peers: Vec::new(),
                         };
-                        global.peer_group.insert(conf.peer_group_name, p);
+                        v.insert(p);
                         return Ok(tonic::Response::new(()));
                     }
                 }
             }
-            None => {}
         }
         Err(tonic::Status::new(
             tonic::Code::InvalidArgument,
@@ -2295,10 +2265,7 @@ impl GobgpApi for Service {
         let dynamic = request
             .into_inner()
             .dynamic_neighbor
-            .ok_or(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "conf is empty",
-            ))?;
+            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "conf is empty"))?;
 
         let prefix = bgp::IpNet::from_str(&dynamic.prefix)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
@@ -2308,10 +2275,7 @@ impl GobgpApi for Service {
         let pg = global
             .peer_group
             .get_mut(&dynamic.peer_group)
-            .ok_or(tonic::Status::new(
-                tonic::Code::NotFound,
-                "peer group isn't found",
-            ))?;
+            .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "peer group isn't found"))?;
 
         for p in &pg.dynamic_peers {
             if p.prefix == prefix {
@@ -2322,7 +2286,7 @@ impl GobgpApi for Service {
             }
         }
         pg.dynamic_peers.push(DynamicPeer { prefix });
-        return Ok(tonic::Response::new(()));
+        Ok(tonic::Response::new(()))
     }
     async fn add_path(
         &self,
@@ -2330,30 +2294,20 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
         let r = request.into_inner();
 
-        let api_path = r.path.ok_or(tonic::Status::new(
-            tonic::Code::InvalidArgument,
-            "empty path",
-        ))?;
+        let api_path = r
+            .path
+            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty path"))?;
 
         let family = api_path
             .family
-            .ok_or(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "empty family",
-            ))?
+            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty family"))?
             .to_proto();
 
         let nlri = api_path
             .nlri
-            .ok_or(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "empty nlri",
-            ))?
+            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty nlri"))?
             .to_proto()
-            .ok_or(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "unknown nlri",
-            ))?;
+            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "unknown nlri"))?;
 
         let (attrs, nexthop) = to_native_attrs(api_path.pattrs);
         let table = self.table.clone();
@@ -2380,30 +2334,20 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let r = request.into_inner();
 
-        let api_path = r.path.ok_or(tonic::Status::new(
-            tonic::Code::InvalidArgument,
-            "empty path",
-        ))?;
+        let api_path = r
+            .path
+            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty path"))?;
 
         let family = api_path
             .family
-            .ok_or(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "empty family",
-            ))?
+            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty family"))?
             .to_proto();
 
         let nlri = api_path
             .nlri
-            .ok_or(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "empty nlri",
-            ))?
+            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty nlri"))?
             .to_proto()
-            .ok_or(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "unknown nlri",
-            ))?;
+            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "unknown nlri"))?;
 
         let table = self.table.clone();
         let mut t = table.lock().await;
@@ -2461,7 +2405,7 @@ impl GobgpApi for Service {
                 .collect();
 
             let prefix_filter = |nlri: &bgp::Nlri| -> bool {
-                if prefixes.len() == 0 {
+                if prefixes.is_empty() {
                     return false;
                 }
                 for prefix in &prefixes {
@@ -2479,7 +2423,7 @@ impl GobgpApi for Service {
 
             {
                 let table = table.lock().await;
-                for (net, dst) in table.routing.iter_destination(false, &family) {
+                for (net, dst) in table.routing.iter_destination(false, family) {
                     if prefix_filter(net) {
                         continue;
                     }
@@ -2496,7 +2440,7 @@ impl GobgpApi for Service {
                         if table_type == api::TableType::AdjOut {
                             if let Some(session) = table.bgp_sessions.get(&target_addr.unwrap()) {
                                 let to = session.source.clone();
-                                if need_to_advertise(&p.source, &to, &family, &session.families) {
+                                if need_to_advertise(&p.source, &to, family, &session.families) {
                                     let nexthop = if to.ibgp { p.nexthop } else { to.local_addr };
                                     let (mut v, n) = update_attrs(
                                         &to,
@@ -2516,12 +2460,12 @@ impl GobgpApi for Service {
                             r.push(p.to_api(&net, p.nexthop, p.attrs.entry.iter().collect(), rt));
                         }
                     }
-                    if r.len() != 0 {
+                    if !r.is_empty() {
                         r[0].best = true;
                         v.push(api::ListPathResponse {
                             destination: Some(api::Destination {
                                 prefix: net.to_string(),
-                                paths: From::from(r),
+                                paths: r,
                             }),
                         });
                     }
@@ -2542,13 +2486,10 @@ impl GobgpApi for Service {
         let (mut tx, mut rx) = mpsc::channel(1024);
         tokio::spawn(async move {
             while let Some(req) = stream.next().await {
-                match req {
-                    Ok(req) => {
-                        for api_path in req.paths {
-                            tx.send(api_path).await.unwrap();
-                        }
+                if let Ok(req) = req {
+                    for api_path in req.paths {
+                        tx.send(api_path).await.unwrap();
                     }
-                    Err(_) => {}
                 }
             }
         });
@@ -2556,23 +2497,14 @@ impl GobgpApi for Service {
         while let Some(api_path) = rx.next().await {
             let family = api_path
                 .family
-                .ok_or(tonic::Status::new(
-                    tonic::Code::InvalidArgument,
-                    "empty family",
-                ))?
+                .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty family"))?
                 .to_proto();
 
             let nlri = api_path
                 .nlri
-                .ok_or(tonic::Status::new(
-                    tonic::Code::InvalidArgument,
-                    "empty nlri",
-                ))?
+                .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty nlri"))?
                 .to_proto()
-                .ok_or(tonic::Status::new(
-                    tonic::Code::InvalidArgument,
-                    "unknown nlri",
-                ))?;
+                .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "unknown nlri"))?;
 
             let (attrs, nexthop) = to_native_attrs(api_path.pattrs);
             let table = self.table.clone();
@@ -2609,7 +2541,7 @@ impl GobgpApi for Service {
             .lock()
             .await
             .routing
-            .iter_destination(false, &family)
+            .iter_destination(false, family)
         {
             nr_path += dst.entry.len() as u64;
             nr_dst += 1;
@@ -2707,7 +2639,7 @@ impl GobgpApi for Service {
         let table = self.table.clone();
         tokio::spawn(async move {
             let mut v = Vec::new();
-            for (_, h) in &table.lock().await.policy.defined_sets {
+            for h in table.lock().await.policy.defined_sets.values() {
                 v.append(&mut h.iter().map(|(name, s)| s.to_api(&name)).collect());
             }
             for d in v {
@@ -2905,9 +2837,7 @@ impl GobgpApi for Service {
                 if family.contains(&bgp::Family::Ipv4Uc) {
                     for (net, entry) in t.roa.v4.iter() {
                         let mut octets = [0 as u8; 4];
-                        for i in 0..octets.len() {
-                            octets[i] = net[i];
-                        }
+                        octets.clone_from_slice(&net[..4]);
                         let n = bgp::IpNet {
                             addr: IpAddr::from(octets),
                             mask: net[octets.len()],
@@ -2923,9 +2853,7 @@ impl GobgpApi for Service {
                 if family.contains(&bgp::Family::Ipv6Uc) {
                     for (net, entry) in t.roa.v6.iter() {
                         let mut octets = [0 as u8; 16];
-                        for i in 0..octets.len() {
-                            octets[i] = net[i];
-                        }
+                        octets.clone_from_slice(&net[..16]);
                         let n = bgp::IpNet {
                             addr: IpAddr::from(octets),
                             mask: net[octets.len()],
@@ -3042,6 +2970,7 @@ impl RoutingTableUpdate {
     }
 }
 
+#[allow(clippy::modulo_one)]
 async fn handle_table_update(
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
@@ -3059,14 +2988,14 @@ async fn handle_table_update(
                         if let Some(u) = u {
                             t.broadcast(u).await;
                         }
-                        if deleted == true {
+                        if deleted {
                             if let Some(session) = t.bgp_sessions.get_mut(&address) {
                                 session.update_accepted(c.family, -1);
                             }
                         }
-                        for (_, tx) in &t.bmp_sessions {
+                        for tx in t.bmp_sessions.values() {
                             let g = global.lock().await;
-                            let payload = bgp::UpdateMessage::to_bytes(Vec::new(), vec![c.nlri], Vec::new()).unwrap();
+                            let payload = bgp::UpdateMessage::bytes(Vec::new(), vec![c.nlri], Vec::new()).unwrap();
                                 let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
                                 peer_header: g.peers.get(&source.address).unwrap().to_bmp_ph(),
                                 payload,
@@ -3079,13 +3008,13 @@ async fn handle_table_update(
                         if let Some(u) = u {
                             t.broadcast(u).await;
                         }
-                        if added == true {
+                        if added {
                             if let Some(session) = t.bgp_sessions.get_mut(&address) {
                                 session.update_accepted(c.family, 1);
                             }
                         }
 
-                        for (_, tx) in &t.bmp_sessions {
+                        for tx in t.bmp_sessions.values() {
                             let g = global.lock().await;
                             let p = Path::new(source.clone(), c.nexthop.unwrap(), attrs.clone());
 
@@ -3202,7 +3131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match stream.peer_addr() {
                             Ok(sock) => {
                                 let t = table.lock().await;
-                                if t.bgp_sessions.contains_key(&sock.ip()) {
+                                if t.bgp_sessions.contains_key(&sock.to_ipaddr()) {
                                     // already connected
                                     continue;
                                 }
@@ -3219,14 +3148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(v)=>{
                             let (proto, sockaddr) = v.into_inner();
                             let t = table.lock().await;
-                            if proto == Proto::Bgp {
-                                if t.bgp_sessions.contains_key(&sockaddr.ip()) {
+                            if proto == Proto::Bgp && t.bgp_sessions.contains_key(&sockaddr.to_ipaddr()) {
                                     // already connected
                                     continue;
-                                }
-                                if !global.lock().await.peers.contains_key(&sockaddr.ip()) {
-                                    continue;
-                                }
                             }
                             match TcpStream::connect(sockaddr).await {
                                 Ok(stream) => (proto, stream, sockaddr),
@@ -3269,7 +3193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 {
                                     let t = table.lock().await;
                                     let mut g = global.lock().await;
-                                    for (_, tx) in &t.bmp_sessions {
+                                    for tx in t.bmp_sessions.values() {
                                         let peer = g.peers.get_mut(&addr).unwrap();
                                         let _ = tx.send(bmp::Message::PeerDownNotification(peer.to_bmp_down(bmp::PeerDownNotification::REASON_UNKNOWN)));
                                     }
@@ -3365,56 +3289,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         if proto == Proto::Bmp {
+            let global = global.clone();
             let mut t = table.lock().await;
-            let global = Arc::clone(&global);
-            let g1 = Arc::clone(&global);
-            let g = g1.lock().await;
-            if !t.bmp_sessions.contains_key(&sock) {
-                let (tx, mut rx) = mpsc::unbounded_channel();
-
-                let _ = tx.send(bmp::Message::Initiation(
-                    bmp::Initiation::new()
-                        .tlv(
-                            bmp::Initiation::TLV_SYS_NAME,
-                            format!("RusytBGP").as_bytes().to_vec(),
-                        )
-                        .tlv(
-                            bmp::Initiation::TLV_SYS_DESCR,
-                            format!("master").as_bytes().to_vec(),
-                        ),
-                ));
-
-                for (_, session) in t.bgp_sessions.iter() {
-                    if session.source.state != bgp::State::Established {
-                        continue;
-                    }
-                    let p = g.peers.get(&session.source.address).unwrap();
-                    let _ = tx.send(bmp::Message::PeerUpNotification(
-                        p.to_bmp_up(g.id, session.source.address),
-                    ));
-                }
-
-                for family in t.routing.global.keys() {
-                    for (net, dst) in t.routing.iter_destination(false, family) {
-                        for path in &dst.entry {
-                            if path.source.address == t.local_source.address {
-                                continue;
-                            }
-
-                            let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
-                                peer_header: g.peers.get(&path.source.address).unwrap().to_bmp_ph(),
-                                payload: path.to_payload(*net),
-                            });
-                            let _ = tx.send(m);
-                        }
-                    }
-                }
-
-                t.bmp_sessions.insert(sock, tx);
-                tokio::spawn(async move {
-                    handle_bmp_session(Arc::clone(&global), &mut rx, stream, sock).await;
-                });
+            if t.bmp_sessions.contains_key(&sock) {
+                continue;
             }
+
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let _ = tx.send(bmp::Message::Initiation(
+                bmp::Initiation::new()
+                    .tlv(
+                        bmp::Initiation::TLV_SYS_NAME,
+                        "RustyBGP".to_string().as_bytes().to_vec(),
+                    )
+                    .tlv(
+                        bmp::Initiation::TLV_SYS_DESCR,
+                        "master".to_string().as_bytes().to_vec(),
+                    ),
+            ));
+
+            let g = global.clone();
+            for (_, session) in t.bgp_sessions.iter() {
+                let g = g.lock().await;
+                if session.source.state != bgp::State::Established {
+                    continue;
+                }
+                let p = g.peers.get(&session.source.address).unwrap();
+                let _ = tx.send(bmp::Message::PeerUpNotification(
+                    p.to_bmp_up(g.id, session.source.address),
+                ));
+            }
+
+            for family in t.routing.global.keys() {
+                for (net, dst) in t.routing.iter_destination(false, *family) {
+                    for path in &dst.entry {
+                        if path.source.address == t.local_source.address {
+                            continue;
+                        }
+                        let g = g.lock().await;
+                        let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
+                            peer_header: g.peers.get(&path.source.address).unwrap().to_bmp_ph(),
+                            payload: path.to_payload(*net),
+                        });
+                        let _ = tx.send(m);
+                    }
+                }
+            }
+
+            t.bmp_sessions.insert(sock, tx);
+            tokio::spawn(async move {
+                handle_bmp_session(global.clone(), &mut rx, stream, sock).await;
+            });
             continue;
         } else if proto == Proto::Rtr {
             let global = Arc::clone(&global);
@@ -3454,7 +3379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            if is_dynamic == false {
+            if !is_dynamic {
                 println!(
                     "can't find configuration for a new passive connection from {}",
                     addr
@@ -3476,7 +3401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let global = Arc::clone(&global);
         let table = Arc::clone(&table);
         let source = Arc::new(Source {
-            local_addr: local_addr,
+            local_addr,
             local_as: 0,
             address: addr,
             ibgp: false,
@@ -3540,10 +3465,10 @@ pub enum PeerEvent {
 fn need_to_advertise(
     from: &Arc<Source>,
     to: &Arc<Source>,
-    family: &bgp::Family,
+    family: bgp::Family,
     enabled_families: &HashSet<bgp::Family>,
 ) -> bool {
-    if (from.ibgp && to.ibgp) || from.address == to.address || !enabled_families.contains(family) {
+    if (from.ibgp && to.ibgp) || from.address == to.address || !enabled_families.contains(&family) {
         return false;
     }
     true
@@ -3579,7 +3504,7 @@ fn update_attrs<'a, 'b>(
                         segments.insert(0, bgp::Segment::new(s.segment_type, &s.number));
                     }
 
-                    let aspath = if segments.len() == 0 {
+                    let aspath = if segments.is_empty() {
                         bgp::Attribute::AsPath {
                             segments: vec![bgp::Segment {
                                 segment_type: bgp::Segment::TYPE_SEQ,
@@ -3645,14 +3570,12 @@ fn update_attrs<'a, 'b>(
             });
         }
     }
-    if !seen.contains(&bgp::Attribute::LOCAL_PREF) {
-        if is_ibgp {
-            n.push(bgp::Attribute::LocalPref {
-                preference: bgp::Attribute::DEFAULT_LOCAL_PREF,
-            });
-        }
+    if !seen.contains(&bgp::Attribute::LOCAL_PREF) && is_ibgp {
+        n.push(bgp::Attribute::LocalPref {
+            preference: bgp::Attribute::DEFAULT_LOCAL_PREF,
+        });
     }
-    return (v, n);
+    (v, n)
 }
 
 #[derive(Clone)]
@@ -3725,12 +3648,12 @@ async fn send_update(
                 v.sort_by_key(|a| a.attr());
 
                 let routes = if is_mp { Vec::new() } else { vec![update.nlri] };
-                let buf = bgp::UpdateMessage::to_bytes(routes, Vec::new(), v).unwrap();
+                let buf = bgp::UpdateMessage::bytes(routes, Vec::new(), v).unwrap();
                 lines.get_mut().write_all(&buf).await?;
             }
             None => {
-                let buf = bgp::UpdateMessage::to_bytes(Vec::new(), vec![update.nlri], Vec::new())
-                    .unwrap();
+                let buf =
+                    bgp::UpdateMessage::bytes(Vec::new(), vec![update.nlri], Vec::new()).unwrap();
                 lines.get_mut().write_all(&buf).await?;
                 withdraw += 1;
             }
@@ -3768,10 +3691,7 @@ async fn handle_bgp_session(
         let peers = &mut global.lock().await.peers;
         let peer = peers.get_mut(&addr).unwrap();
 
-        let msg = bgp::Message::Open(bgp::OpenMessage::new(
-            router_id,
-            peer.local_cap.iter().cloned().collect(),
-        ));
+        let msg = bgp::Message::Open(bgp::OpenMessage::new(router_id, peer.local_cap.to_vec()));
         peer.counter_tx.sync(&msg);
         let _ = lines.send(msg).await;
     }
@@ -3921,7 +3841,7 @@ async fn handle_bgp_session(
                                 .reset(Instant::now() + Duration::from_secs(keepalive_interval as u64));
                         }
                         bgp::Message::Update(mut update) => {
-                            if update.attrs.len() > 0 {
+                            if !update.attrs.is_empty() {
                                 update.attrs.sort_by_key(|a| a.attr());
                                 let pa = Arc::new(PathAttr {
                                     entry: update.attrs,
@@ -4005,12 +3925,12 @@ async fn handle_bgp_session(
                                         p.to_bmp_up(g.id, source.address)));
                                     }
 
-                                    if t.routing.disable_best_path_selection == false {
-                                        for family in &families {
-                                            for route in t.routing.iter_destination(false, &family) {
+                                    if !t.routing.disable_best_path_selection {
+                                        for family in families {
+                                            for route in t.routing.iter_destination(false, family) {
                                                 let u = RoutingTableUpdate::new(
                                                     source.clone(),
-                                                    *family,
+                                                    family,
                                                     *route.0,
                                                     Some(route.1.entry[0].attrs.clone()),
                                                     Some(route.1.entry[0].nexthop),
@@ -4031,7 +3951,7 @@ async fn handle_bgp_session(
                             }
                         }
                         bgp::Message::RouteRefresh(m) => println!("{:?}", m.family),
-                        bgp::Message::Unknown { length: _, code } => {
+                        bgp::Message::Unknown { code, .. } => {
                             println!("unknown message type {}", code)
                         }
                     }
@@ -4108,6 +4028,7 @@ impl Decoder for Rtr {
     }
 }
 
+#[allow(clippy::modulo_one)]
 async fn handle_rtr_session(
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
