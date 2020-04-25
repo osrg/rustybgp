@@ -3847,9 +3847,8 @@ async fn handle_bgp_session(
                             delay
                                 .reset(Instant::now() + Duration::from_secs(keepalive_interval as u64));
                         }
-                        bgp::Message::Update(mut update) => {
+                        bgp::Message::Update(update) => {
                             if !update.attrs.is_empty() {
-                                update.attrs.sort_by_key(|a| a.attr());
                                 let pa = Arc::new(PathAttr {
                                     entry: update.attrs,
                                 });
