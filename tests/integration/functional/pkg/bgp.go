@@ -501,3 +501,62 @@ func (b *bgpTest) enablePeer(name, neighbor string) error {
 	})
 	return err
 }
+
+func (b *bgpTest) addAsDefinedSet(neighbor, setName, matchString string) error {
+	_, err := b.containers[neighbor].apiClient.AddDefinedSet(context.Background(), &api.AddDefinedSetRequest{
+		DefinedSet: &api.DefinedSet{
+			DefinedType: api.DefinedType(3),
+			Name:        setName,
+			List:        []string{matchString},
+		},
+	})
+	return err
+}
+
+func (b *bgpTest) addStatement(neighbor, statementName, asdefinedName string) error {
+	_, err := b.containers[neighbor].apiClient.AddStatement(context.Background(), &api.AddStatementRequest{
+		Statement: &api.Statement{
+			Name: statementName,
+			Conditions: &api.Conditions{
+				AsPathSet: &api.MatchSet{
+					Name: asdefinedName,
+				},
+			},
+		},
+	})
+	return err
+}
+
+func (b *bgpTest) addPolicy(neighbor, policyName string, statements []string) error {
+	var s []*api.Statement
+	for _, name := range statements {
+		s = append(s, &api.Statement{
+			Name: name,
+		})
+	}
+	_, err := b.containers[neighbor].apiClient.AddPolicy(context.Background(), &api.AddPolicyRequest{
+		Policy: &api.Policy{
+			Name:       policyName,
+			Statements: s,
+		},
+		ReferExistingStatements: true,
+	})
+	return err
+}
+
+func (b *bgpTest) addPolicyAssignment(neighbor string, policies []string) error {
+	var s []*api.Policy
+	for _, name := range policies {
+		s = append(s, &api.Policy{
+			Name: name,
+		})
+	}
+	_, err := b.containers[neighbor].apiClient.AddPolicyAssignment(context.Background(), &api.AddPolicyAssignmentRequest{
+		Assignment: &api.PolicyAssignment{
+			Name:      "global",
+			Direction: api.PolicyDirection(1),
+			Policies:  s,
+		},
+	})
+	return err
+}
