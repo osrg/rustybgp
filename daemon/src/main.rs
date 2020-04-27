@@ -1162,7 +1162,6 @@ impl Statement {
                     });
                 }
                 Condition::AsPath(name, opt, _set) => {
-                    println!("aspath {} {}", name, opt.to_i32());
                     conditions.as_path_set = Some(api::MatchSet {
                         name: name.clone(),
                         match_type: opt.to_i32(),
