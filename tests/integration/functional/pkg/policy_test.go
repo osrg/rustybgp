@@ -15,12 +15,12 @@ func TestPolicy(t *testing.T) {
 
 	c, err := newBgpTest()
 	assert.Nil(t, err)
-	err = c.createPeer("r1", rustyImage, 1)
+	err = c.createPeer("r1", rustyImage, 65000)
 	assert.Nil(t, err)
-	err = c.createPeer("g1", gobgpImage, 1)
+	err = c.createPeer("g1", gobgpImage, 65100)
 	assert.Nil(t, err)
 
-	c.addAsDefinedSet("r1", "asset1", "^65100_")
+	c.addAsDefinedSet("r1", "asset1", "_65100_")
 	c.addAsDefinedSet("g1", "asset1", "^65100_")
 
 	c.addAsDefinedSet("r1", "asset2", "_65100$")
@@ -39,5 +39,10 @@ func TestPolicy(t *testing.T) {
 	err = c.addPolicyAssignment("r1", []string{"p1", "p2"})
 	assert.Nil(t, err)
 	err = c.addPolicyAssignment("g1", []string{"p1", "p2"})
+	assert.Nil(t, err)
+
+	err = c.addPath("g1", "10.0.10.0/24")
+	assert.Nil(t, err)
+	err = c.connectPeers("r1", "g1", false, false)
 	assert.Nil(t, err)
 }

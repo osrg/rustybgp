@@ -363,7 +363,7 @@ impl Path {
     pub fn get_local_preference(&self) -> u32 {
         const DEFAULT: u32 = 100;
         if let Some(bgp::Attribute::LocalPref { preference }) =
-            self.attrs.get(proto::bgp::Attribute::LOCAL_PREF)
+            self.attrs.get(bgp::Attribute::LOCAL_PREF)
         {
             return *preference;
         }
@@ -371,9 +371,7 @@ impl Path {
     }
 
     pub fn get_as_len(&self) -> u32 {
-        if let Some(bgp::Attribute::AsPath { segments }) =
-            self.attrs.get(proto::bgp::Attribute::AS_PATH)
-        {
+        if let Some(bgp::Attribute::AsPath { segments }) = self.attrs.get(bgp::Attribute::AS_PATH) {
             let mut l: usize = 0;
             segments.iter().for_each(|s| l += s.as_len());
             return l as u32;
@@ -382,9 +380,7 @@ impl Path {
     }
 
     pub fn get_origin(&self) -> u8 {
-        if let Some(bgp::Attribute::Origin { origin }) =
-            self.attrs.get(proto::bgp::Attribute::ORIGIN)
-        {
+        if let Some(bgp::Attribute::Origin { origin }) = self.attrs.get(bgp::Attribute::ORIGIN) {
             return *origin;
         }
         0
@@ -392,7 +388,7 @@ impl Path {
 
     pub fn get_med(&self) -> u32 {
         if let Some(bgp::Attribute::MultiExitDesc { descriptor }) =
-            self.attrs.get(proto::bgp::Attribute::MULTI_EXIT_DESC)
+            self.attrs.get(bgp::Attribute::MULTI_EXIT_DESC)
         {
             return *descriptor;
         }
@@ -400,7 +396,7 @@ impl Path {
     }
 
     pub fn to_payload(&self, nlri: bgp::Nlri) -> Vec<u8> {
-        let mut v: Vec<&proto::bgp::Attribute> = self.attrs.entry.iter().collect();
+        let mut v: Vec<&bgp::Attribute> = self.attrs.entry.iter().collect();
 
         let (route, n) = if nlri.is_mp() {
             (
@@ -714,7 +710,7 @@ impl RoutingTable {
         &self,
         _is_rs: bool,
         family: proto::bgp::Family,
-    ) -> impl Iterator<Item = (&proto::bgp::Nlri, &Destination)> {
+    ) -> impl Iterator<Item = (&bgp::Nlri, &Destination)> {
         self.global
             .get(&family)
             .unwrap_or(&self.global.get(&bgp::Family::Reserved).unwrap())
@@ -961,7 +957,7 @@ impl SingleAsPathMatch {
         }
     }
 
-    pub fn is_match(&self, segments: &[proto::bgp::Segment]) -> bool {
+    pub fn is_match(&self, segments: &[bgp::Segment]) -> bool {
         match self {
             SingleAsPathMatch::Include(v) => {
                 for seg in segments {
@@ -1042,7 +1038,7 @@ fn parse_community(s: &str) -> Result<Regex, ()> {
     if r.is_match(s) {
         return Regex::new(&format!("^{}$", s)).map_err(|_| ());
     }
-    if let Ok(c) = proto::bgp::WellKnownCommunity::from_str(&s.to_string().to_lowercase()) {
+    if let Ok(c) = bgp::WellKnownCommunity::from_str(&s.to_string().to_lowercase()) {
         let v = c as u32;
         return Regex::new(&format!("^{}:{}$", v >> 16, v & 0xffff)).map_err(|_| ());
     }
@@ -1085,17 +1081,17 @@ pub enum Condition {
     Neighbor(String, MatchOption, Arc<NeighborSet>),
     AsPath(String, MatchOption, Arc<AsPathSet>),
     Community(String, MatchOption, Arc<CommunitySet>),
-    Nexthop(Vec<proto::bgp::IpNet>),
+    Nexthop(Vec<bgp::IpNet>),
     // ExtendedCommunity,
     // AsPathLength,
     Rpki(api::validation::State),
     // RouteType(u32),
     // LargeCommunity,
-    // AfiSafiIn(Vec<proto::bgp::Family>),
+    // AfiSafiIn(Vec<bgp::Family>),
 }
 
 impl Condition {
-    fn is_match(&self, pattr: Arc<PathAttr>) -> bool {
+    fn is_match(&self, neighbor: IpAddr, pattr: Arc<PathAttr>) -> bool {
         match self {
             Condition::AsPath(_name, opt, set) => {
                 if let Some(bgp::Attribute::AsPath { segments }) =
@@ -1111,6 +1107,19 @@ impl Condition {
                     }
                 }
                 return !(*opt == MatchOption::Any);
+            }
+            Condition::Neighbor(_name, opt, set) => {
+                let mut found = false;
+                for n in &set.sets {
+                    if n.contains(neighbor) {
+                        found = true;
+                        break;
+                    }
+                }
+                if *opt == MatchOption::Invert {
+                    found = !found;
+                }
+                return found;
             }
             Condition::Rpki(_) => {
                 return false;
@@ -1190,10 +1199,10 @@ impl Statement {
         s
     }
 
-    fn evaluate(&self, pattr: Arc<PathAttr>) -> Disposition {
+    fn evaluate(&self, neighbor: IpAddr, pattr: Arc<PathAttr>) -> Disposition {
         let mut matched = true;
         for condition in &self.conditions {
-            if !condition.is_match(pattr.clone()) {
+            if !condition.is_match(neighbor, pattr.clone()) {
                 matched = false;
                 break;
             }
@@ -1231,7 +1240,7 @@ impl PrefixSet {
 }
 
 pub struct NeighborSet {
-    pub sets: Vec<IpAddr>,
+    pub sets: Vec<bgp::IpNet>,
 }
 
 impl NeighborSet {
@@ -1292,9 +1301,9 @@ impl Policy {
         }
     }
 
-    pub fn apply(&self, pattrs: Arc<PathAttr>) -> Disposition {
+    pub fn apply(&self, neighbor: IpAddr, pattrs: Arc<PathAttr>) -> Disposition {
         for statement in &self.statements {
-            let r = statement.evaluate(pattrs.clone());
+            let r = statement.evaluate(neighbor, pattrs.clone());
             if r != Disposition::Pass {
                 return r;
             }
@@ -1319,9 +1328,9 @@ impl Default for PolicyAssignment {
 }
 
 impl PolicyAssignment {
-    fn apply(&self, pattr: Arc<PathAttr>) -> Disposition {
+    fn apply(&self, neighbor: IpAddr, pattr: Arc<PathAttr>) -> Disposition {
         for policy in &self.policies {
-            let r = policy.apply(pattr.clone());
+            let r = policy.apply(neighbor, pattr.clone());
             if r != Disposition::Pass {
                 return r;
             }
@@ -1441,7 +1450,7 @@ impl RoutingPolicy {
                 api::DefinedType::Neighbor => {
                     let mut v = Vec::with_capacity(set.list.len());
                     for n in &set.list {
-                        match IpAddr::from_str(n) {
+                        match bgp::IpNet::from_str(n) {
                             Ok(addr) => {
                                 v.push(addr);
                             }
@@ -1546,10 +1555,10 @@ impl RoutingPolicy {
                     None => return Err(()),
                 }
             }
-            let nexthops: Vec<proto::bgp::IpNet> = conditions
+            let nexthops: Vec<bgp::IpNet> = conditions
                 .next_hop_in_list
                 .iter()
-                .filter_map(|p| proto::bgp::IpNet::from_str(p).map_or(None, Some))
+                .filter_map(|p| bgp::IpNet::from_str(p).map_or(None, Some))
                 .collect();
             if !nexthops.is_empty() {
                 if nexthops.len() != conditions.next_hop_in_list.len() {
@@ -3410,7 +3419,7 @@ async fn handle_table_update(
                         }
                     }
                     Some(attrs) => {
-                        t.policy.global_import.apply(attrs.clone());
+                        t.policy.global_import.apply(source.address, attrs.clone());
                         let (u, added) = t.routing.insert(c.family, c.nlri, source.clone(), c.nexthop.unwrap(), attrs.clone());
                         if let Some(u) = u {
                             t.broadcast(u).await;
