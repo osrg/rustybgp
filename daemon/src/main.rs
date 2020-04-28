@@ -151,6 +151,17 @@ pub struct PathAttr {
     pub entry: Vec<bgp::Attribute>,
 }
 
+impl PathAttr {
+    pub fn get(&self, attr: u8) -> Option<&proto::bgp::Attribute> {
+        for a in &self.entry {
+            if a.attr() == attr {
+                return Some(a);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct Path {
     pub source: Arc<Source>,
@@ -349,19 +360,10 @@ impl Path {
         path
     }
 
-    pub fn get_attr(&self, attr: u8) -> Option<&proto::bgp::Attribute> {
-        for a in &self.attrs.entry {
-            if a.attr() == attr {
-                return Some(a);
-            }
-        }
-        None
-    }
-
     pub fn get_local_preference(&self) -> u32 {
         const DEFAULT: u32 = 100;
         if let Some(bgp::Attribute::LocalPref { preference }) =
-            self.get_attr(proto::bgp::Attribute::LOCAL_PREF)
+            self.attrs.get(proto::bgp::Attribute::LOCAL_PREF)
         {
             return *preference;
         }
@@ -370,7 +372,7 @@ impl Path {
 
     pub fn get_as_len(&self) -> u32 {
         if let Some(bgp::Attribute::AsPath { segments }) =
-            self.get_attr(proto::bgp::Attribute::AS_PATH)
+            self.attrs.get(proto::bgp::Attribute::AS_PATH)
         {
             let mut l: usize = 0;
             segments.iter().for_each(|s| l += s.as_len());
@@ -381,7 +383,7 @@ impl Path {
 
     pub fn get_origin(&self) -> u8 {
         if let Some(bgp::Attribute::Origin { origin }) =
-            self.get_attr(proto::bgp::Attribute::ORIGIN)
+            self.attrs.get(proto::bgp::Attribute::ORIGIN)
         {
             return *origin;
         }
@@ -390,7 +392,7 @@ impl Path {
 
     pub fn get_med(&self) -> u32 {
         if let Some(bgp::Attribute::MultiExitDesc { descriptor }) =
-            self.get_attr(proto::bgp::Attribute::MULTI_EXIT_DESC)
+            self.attrs.get(proto::bgp::Attribute::MULTI_EXIT_DESC)
         {
             return *descriptor;
         }
@@ -1093,11 +1095,11 @@ pub enum Condition {
 }
 
 impl Condition {
-    fn is_match(&self, path: &Path) -> bool {
+    fn is_match(&self, pattr: Arc<PathAttr>) -> bool {
         match self {
             Condition::AsPath(_name, opt, set) => {
                 if let Some(bgp::Attribute::AsPath { segments }) =
-                    path.get_attr(bgp::Attribute::AS_PATH)
+                    pattr.get(bgp::Attribute::AS_PATH)
                 {
                     for set in &set.single_sets {
                         if set.is_match(&segments) {
@@ -1188,10 +1190,10 @@ impl Statement {
         s
     }
 
-    fn evaluate(&self, path: &Path) -> Disposition {
+    fn evaluate(&self, pattr: Arc<PathAttr>) -> Disposition {
         let mut matched = true;
         for condition in &self.conditions {
-            if !condition.is_match(path) {
+            if !condition.is_match(pattr.clone()) {
                 matched = false;
                 break;
             }
@@ -1289,19 +1291,50 @@ impl Policy {
             statements: self.statements.iter().map(|x| x.to_api()).collect(),
         }
     }
+
+    pub fn apply(&self, pattrs: Arc<PathAttr>) -> Disposition {
+        for statement in &self.statements {
+            let r = statement.evaluate(pattrs.clone());
+            if r != Disposition::Pass {
+                return r;
+            }
+        }
+        Disposition::Pass
+    }
 }
 
 #[derive(Clone)]
-pub struct Assignment {
-    pub import: (Vec<Arc<Policy>>, Disposition),
-    pub export: (Vec<Arc<Policy>>, Disposition),
+pub struct PolicyAssignment {
+    pub disposition: Disposition,
+    pub policies: Vec<Arc<Policy>>,
 }
 
-impl Default for Assignment {
+impl Default for PolicyAssignment {
     fn default() -> Self {
-        Assignment {
-            import: (Vec::new(), Disposition::Pass),
-            export: (Vec::new(), Disposition::Pass),
+        PolicyAssignment {
+            disposition: Disposition::Pass,
+            policies: Vec::new(),
+        }
+    }
+}
+
+impl PolicyAssignment {
+    fn apply(&self, pattr: Arc<PathAttr>) -> Disposition {
+        for policy in &self.policies {
+            let r = policy.apply(pattr.clone());
+            if r != Disposition::Pass {
+                return r;
+            }
+        }
+        self.disposition
+    }
+
+    fn to_api(&self, name: &str, dir: i32) -> api::PolicyAssignment {
+        api::PolicyAssignment {
+            name: name.to_string(),
+            policies: self.policies.iter().map(|x| x.to_api()).collect(),
+            direction: dir,
+            default_action: self.disposition as i32,
         }
     }
 }
@@ -1316,22 +1349,13 @@ pub struct RoutingPolicy {
     pub statements: HashMap<String, Arc<Statement>>,
     pub policies: HashMap<String, Arc<Policy>>,
 
-    pub global_assignment: Assignment,
+    pub global_import: PolicyAssignment,
+    pub global_export: PolicyAssignment,
 }
 
 impl RoutingPolicy {
     pub fn new() -> Self {
         Default::default()
-    }
-
-    pub fn apply(&self, path: &Path) -> Disposition {
-        for statement in self.statements.values() {
-            let r = statement.evaluate(path);
-            if r != Disposition::Pass {
-                return r;
-            }
-        }
-        Disposition::Pass
     }
 
     pub fn add_assignment(&mut self, assignment: api::PolicyAssignment) -> Result<(), ()> {
@@ -1354,10 +1378,14 @@ impl RoutingPolicy {
                     dis = Disposition::Reject
                 }
 
+                let a = PolicyAssignment {
+                    policies: v,
+                    disposition: dis,
+                };
                 if dir == api::PolicyDirection::Import {
-                    self.global_assignment.import = (v, dis);
+                    self.global_import = a;
                 } else {
-                    self.global_assignment.export = (v, dis);
+                    self.global_export = a;
                 }
                 return Ok(());
             }
@@ -3056,36 +3084,22 @@ impl GobgpApi for Service {
         tokio::spawn(async move {
             let mut v = Vec::new();
             {
-                let _request = request.into_inner();
+                let request = request.into_inner();
                 let t = table.lock().await;
-
-                v.push(api::PolicyAssignment {
-                    name: "global".to_string(),
-                    direction: 1,
-                    policies: t
-                        .policy
-                        .global_assignment
-                        .import
-                        .0
-                        .iter()
-                        .map(|x| x.to_api())
-                        .collect(),
-                    default_action: t.policy.global_assignment.import.1 as i32,
-                });
-
-                v.push(api::PolicyAssignment {
-                    name: "global".to_string(),
-                    direction: 2,
-                    policies: t
-                        .policy
-                        .global_assignment
-                        .export
-                        .0
-                        .iter()
-                        .map(|x| x.to_api())
-                        .collect(),
-                    default_action: t.policy.global_assignment.export.1 as i32,
-                });
+                match request.direction {
+                    1 => {
+                        v.push(t.policy.global_import.to_api("global", 1));
+                    }
+                    2 => {
+                        v.push(t.policy.global_export.to_api("global", 2));
+                    }
+                    _ => {
+                        v.push(t.policy.global_import.to_api("global", 1));
+                        v.push(t.policy.global_export.to_api("global", 2));
+                    }
+                }
+                println!("import {}", t.policy.global_import.policies.len());
+                println!("export {}", t.policy.global_export.policies.len());
             }
             for s in v {
                 let _ = tx
@@ -3396,6 +3410,7 @@ async fn handle_table_update(
                         }
                     }
                     Some(attrs) => {
+                        t.policy.global_import.apply(attrs.clone());
                         let (u, added) = t.routing.insert(c.family, c.nlri, source.clone(), c.nexthop.unwrap(), attrs.clone());
                         if let Some(u) = u {
                             t.broadcast(u).await;
