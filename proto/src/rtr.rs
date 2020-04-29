@@ -14,8 +14,8 @@
 // limitations under the License.
 
 use super::bgp::IpNet;
+use super::error::Error;
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use failure::Error;
 use std::io::Cursor;
 use std::net::IpAddr;
 
@@ -96,7 +96,7 @@ impl Message {
 		let length = c.read_u32::<NetworkEndian>()? as usize;
 
 		if length > buflen {
-			return Err(format_err!("buffer is too short"));
+			return Err(Error::InvalidFormat);
 		}
 
 		match message_type {
@@ -162,7 +162,7 @@ impl Message {
 			}
 			Message::CACHE_RESET => Ok((Message::CacheReset, length)),
 			Message::ERROR_REPORT => Ok((Message::ErrorReport, length)),
-			_ => Err(format_err!("unknown type {}", message_type)),
+			_ => Err(Error::InvalidFormat),
 		}
 	}
 }

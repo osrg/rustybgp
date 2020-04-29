@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::error::Error;
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use failure::Error;
 use std::collections::HashSet;
 use std::convert::From;
 use std::fmt;
@@ -133,30 +133,20 @@ impl IpNet {
     }
 }
 
-#[derive(Debug)]
-pub enum IpNetParseError {
-    InvalidFormat { details: String },
-    InvalidMask { details: String },
-}
-
 impl FromStr for IpNet {
-    type Err = IpNetParseError;
+    type Err = Error;
 
-    fn from_str(s: &str) -> Result<IpNet, IpNetParseError> {
+    fn from_str(s: &str) -> Result<IpNet, Error> {
         let addr_and_mask: Vec<_> = s.split('/').collect();
         if addr_and_mask.len() != 2 {
-            return Err(IpNetParseError::InvalidFormat {
-                details: "multiple slashes".to_string(),
-            });
+            return Err(Error::InvalidFormat);
         }
 
         let addr = IpAddr::from_str(addr_and_mask[0]);
         let addr = match addr {
             Ok(addr) => addr,
             Err(_) => {
-                return Err(IpNetParseError::InvalidFormat {
-                    details: "malformed cidr".to_string(),
-                })
+                return Err(Error::InvalidFormat);
             }
         };
 
@@ -164,26 +154,20 @@ impl FromStr for IpNet {
         let mask = match mask {
             Ok(mask) => mask,
             Err(_) => {
-                return Err(IpNetParseError::InvalidFormat {
-                    details: "malformed mask".to_string(),
-                })
+                return Err(Error::InvalidFormat);
             }
         };
 
         match addr {
             IpAddr::V4(addr) => {
                 if mask > 32 {
-                    return Err(IpNetParseError::InvalidMask {
-                        details: "mask is too large".to_string(),
-                    });
+                    return Err(Error::InvalidFormat);
                 }
                 Ok(IpNet::new(addr.octets(), mask))
             }
             IpAddr::V6(addr) => {
                 if mask > 128 {
-                    return Err(IpNetParseError::InvalidMask {
-                        details: "mask is too large".to_string(),
-                    });
+                    return Err(Error::InvalidFormat);
                 }
                 Ok(IpNet::new(addr.octets(), mask))
             }
@@ -756,12 +740,12 @@ impl Message {
         let mut c = Cursor::new(buf);
 
         if buflen < Message::HEADER_LENGTH as usize {
-            return Err(format_err!("header is too short"));
+            return Err(Error::InvalidFormat);
         }
         c.set_position(16);
         let length = c.read_u16::<NetworkEndian>()?;
         if buflen < length as usize {
-            return Err(format_err!("buffer is too short"));
+            return Err(Error::InvalidFormat);
         }
 
         let code = c.read_u8()?;
@@ -990,7 +974,7 @@ impl Attribute {
             for _i in 0..attr_len {
                 c.read_u8()?;
             }
-            return Err(failure::err_msg("invalid flag"));
+            return Err(Error::InvalidFormat);
         }
 
         match attr_type {
@@ -1532,7 +1516,7 @@ impl UpdateMessage {
                 }
                 Err(e) => {
                     // io:Error means that we can't parse any more
-                    if e.downcast_ref::<std::io::Error>().is_some() {
+                    if let Error::Std(_) = e {
                         return Err(e);
                     }
                     handle_as_withdrawns = true;
@@ -1843,8 +1827,6 @@ impl Capability {
     }
 }
 
-pub struct ParseError(());
-
 pub enum WellKnownCommunity {
     GracefulShutdown,
     AcceptOwn,
@@ -1858,7 +1840,7 @@ pub enum WellKnownCommunity {
 }
 
 impl FromStr for WellKnownCommunity {
-    type Err = ParseError;
+    type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "graceful-shutdown" => Ok(WellKnownCommunity::GracefulShutdown),
@@ -1870,7 +1852,7 @@ impl FromStr for WellKnownCommunity {
             "no-advertise" => Ok(WellKnownCommunity::NoAdvertise),
             "no-export-subconfed" => Ok(WellKnownCommunity::NoExportSubconfed),
             "no-peer" => Ok(WellKnownCommunity::NoPeer),
-            _ => Err(ParseError(())),
+            _ => Err(Error::InvalidFormat),
         }
     }
 }

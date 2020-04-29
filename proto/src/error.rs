@@ -1,4 +1,4 @@
-// Copyright (C) 2019 The RustyBGP Authors.
+// Copyright (C) 2020 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod bgp;
-pub mod bmp;
-pub mod error;
-pub mod rtr;
+use std::io;
+
+#[derive(Debug)]
+pub enum Error {
+    InvalidFormat,
+    Std(io::Error),
+}
+
+impl From<io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Error::Std(error)
+    }
+}

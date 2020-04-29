@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::error::Error;
 use byteorder::{NetworkEndian, WriteBytesExt};
-use failure::Error;
 use std::convert::From;
 use std::io::{Cursor, Write};
 use std::net::{IpAddr, Ipv4Addr};
