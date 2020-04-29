@@ -2257,52 +2257,57 @@ fn to_native_attrs(api_attrs: Vec<prost_types::Any>) -> (Vec<bgp::Attribute>, Ip
     (v, nexthop)
 }
 
+pub enum Error {
+    EmptyArgument,
+}
+
+impl From<Error> for tonic::Status {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::EmptyArgument => {
+                tonic::Status::new(tonic::Code::InvalidArgument, "empty argument")
+            }
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl GobgpApi for Service {
     async fn start_bgp(
         &self,
         request: tonic::Request<api::StartBgpRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        match request.into_inner().global {
-            Some(global) => {
-                let g = &mut self.global.lock().await;
-                if g.as_number != 0 {
-                    return Err(tonic::Status::new(
-                        tonic::Code::InvalidArgument,
-                        "already started",
-                    ));
-                }
-                if global.r#as == 0 {
-                    return Err(tonic::Status::new(
-                        tonic::Code::InvalidArgument,
-                        "invalid as number",
-                    ));
-                }
-                match Ipv4Addr::from_str(&global.router_id) {
-                    Ok(addr) => {
-                        g.as_number = global.r#as;
-                        g.id = addr;
-                        if global.listen_port != 0 {
-                            g.listen_port = global.listen_port as u16;
-                        }
-                        self.init_tx.wait().await;
-                    }
-                    Err(_) => {
-                        return Err(tonic::Status::new(
-                            tonic::Code::InvalidArgument,
-                            "invalid router id",
-                        ));
-                    }
-                }
-            }
-            None => {
-                return Err(tonic::Status::new(
-                    tonic::Code::InvalidArgument,
-                    "empty configuration",
-                ));
-            }
+        let global = request
+            .into_inner()
+            .global
+            .ok_or_else(|| Error::EmptyArgument)?;
+
+        let g = &mut self.global.lock().await;
+        if g.as_number != 0 {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "already started",
+            ));
         }
-        Ok(tonic::Response::new(()))
+        if global.r#as == 0 {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "invalid as number",
+            ));
+        }
+        if let Ok(addr) = Ipv4Addr::from_str(&global.router_id) {
+            g.as_number = global.r#as;
+            g.id = addr;
+            if global.listen_port != 0 {
+                g.listen_port = global.listen_port as u16;
+            }
+            self.init_tx.wait().await;
+            return Ok(tonic::Response::new(()));
+        }
+        Err(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "invalid router id",
+        ))
     }
     async fn stop_bgp(
         &self,
@@ -2322,51 +2327,52 @@ impl GobgpApi for Service {
         &self,
         request: tonic::Request<api::AddPeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        if let Some(peer) = request.into_inner().peer {
-            if let Some(conf) = &peer.conf {
-                if let Ok(addr) = IpAddr::from_str(&conf.neighbor_address) {
-                    let as_number = {
-                        let local = peer.get_local_as();
-                        if local == 0 {
-                            self.global.lock().await.as_number
-                        } else {
-                            local
-                        }
-                    };
+        let peer = request
+            .into_inner()
+            .peer
+            .ok_or_else(|| Error::EmptyArgument)?;
+        let conf = peer.conf.clone().ok_or_else(|| Error::EmptyArgument)?;
+        if let Ok(addr) = IpAddr::from_str(&conf.neighbor_address) {
+            let as_number = {
+                let local = peer.get_local_as();
+                if local == 0 {
+                    self.global.lock().await.as_number
+                } else {
+                    local
+                }
+            };
 
-                    let g = &mut self.global.lock().await;
-                    match g.peers.entry(addr) {
-                        Occupied(_) => {
-                            return Err(tonic::Status::new(
-                                tonic::Code::AlreadyExists,
-                                "peer address already exists",
-                            ));
-                        }
-                        Vacant(v) => {
-                            let passive = peer.get_passive_mode();
-                            let remote_port = peer.get_remote_port();
-                            let mut p = Peer::new(addr, as_number)
-                                .remote_as(peer.get_remote_as())
-                                .remote_port(remote_port)
-                                .families(peer.get_families())
-                                .passive(passive)
-                                .hold_time(peer.get_hold_time())
-                                .connect_retry_time(peer.get_connect_retry_time());
+            let g = &mut self.global.lock().await;
+            match g.peers.entry(addr) {
+                Occupied(_) => {
+                    return Err(tonic::Status::new(
+                        tonic::Code::AlreadyExists,
+                        "peer address already exists",
+                    ));
+                }
+                Vacant(v) => {
+                    let remote_port = peer.get_remote_port();
+                    let passive = peer.get_passive_mode();
+                    let mut p = Peer::new(addr, as_number)
+                        .remote_as(peer.get_remote_as())
+                        .remote_port(remote_port)
+                        .families(peer.get_families())
+                        .passive(passive)
+                        .hold_time(peer.get_hold_time())
+                        .connect_retry_time(peer.get_connect_retry_time());
 
-                            p.admin_down(conf.admin_down);
-                            v.insert(p);
+                    p.admin_down(conf.admin_down);
+                    v.insert(p);
 
-                            if !passive && !conf.admin_down {
-                                let _ = g.server_event_tx.send(SrvEvent::EnableActive {
-                                    proto: Proto::Bgp,
-                                    sockaddr: SocketAddr::new(addr, remote_port),
-                                });
-                            }
-                        }
+                    if !passive && !conf.admin_down {
+                        let _ = g.server_event_tx.send(SrvEvent::EnableActive {
+                            proto: Proto::Bgp,
+                            sockaddr: SocketAddr::new(addr, remote_port),
+                        });
                     }
-                    return Ok(tonic::Response::new(()));
                 }
             }
+            return Ok(tonic::Response::new(()));
         }
         Err(tonic::Status::new(
             tonic::Code::InvalidArgument,
@@ -2509,36 +2515,31 @@ impl GobgpApi for Service {
         &self,
         request: tonic::Request<api::AddPeerGroupRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        if let Some(pg) = request.into_inner().peer_group {
-            if let Some(conf) = pg.conf {
-                match self
-                    .global
-                    .lock()
-                    .await
-                    .peer_group
-                    .entry(conf.peer_group_name)
-                {
-                    Occupied(_) => {
-                        return Err(tonic::Status::new(
-                            tonic::Code::AlreadyExists,
-                            "peer group name already exists",
-                        ));
-                    }
-                    Vacant(v) => {
-                        let p = PeerGroup {
-                            as_number: conf.peer_as,
-                            dynamic_peers: Vec::new(),
-                        };
-                        v.insert(p);
-                        return Ok(tonic::Response::new(()));
-                    }
-                }
+        let pg = request
+            .into_inner()
+            .peer_group
+            .ok_or_else(|| Error::EmptyArgument)?;
+        let conf = pg.conf.ok_or_else(|| Error::EmptyArgument)?;
+        match self
+            .global
+            .lock()
+            .await
+            .peer_group
+            .entry(conf.peer_group_name)
+        {
+            Occupied(_) => Err(tonic::Status::new(
+                tonic::Code::AlreadyExists,
+                "peer group name already exists",
+            )),
+            Vacant(v) => {
+                let p = PeerGroup {
+                    as_number: conf.peer_as,
+                    dynamic_peers: Vec::new(),
+                };
+                v.insert(p);
+                Ok(tonic::Response::new(()))
             }
         }
-        Err(tonic::Status::new(
-            tonic::Code::InvalidArgument,
-            "peer group conf is empty",
-        ))
     }
     async fn delete_peer_group(
         &self,
@@ -2559,7 +2560,7 @@ impl GobgpApi for Service {
         let dynamic = request
             .into_inner()
             .dynamic_neighbor
-            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "conf is empty"))?;
+            .ok_or_else(|| Error::EmptyArgument)?;
 
         let prefix = bgp::IpNet::from_str(&dynamic.prefix)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
@@ -2588,18 +2589,16 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
         let r = request.into_inner();
 
-        let api_path = r
-            .path
-            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty path"))?;
+        let api_path = r.path.ok_or_else(|| Error::EmptyArgument)?;
 
         let family = api_path
             .family
-            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty family"))?
+            .ok_or_else(|| Error::EmptyArgument)?
             .to_proto();
 
         let nlri = api_path
             .nlri
-            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty nlri"))?
+            .ok_or_else(|| Error::EmptyArgument)?
             .to_proto()
             .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "unknown nlri"))?;
 
@@ -2628,18 +2627,16 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let r = request.into_inner();
 
-        let api_path = r
-            .path
-            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty path"))?;
+        let api_path = r.path.ok_or_else(|| Error::EmptyArgument)?;
 
         let family = api_path
             .family
-            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty family"))?
+            .ok_or_else(|| Error::EmptyArgument)?
             .to_proto();
 
         let nlri = api_path
             .nlri
-            .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty nlri"))?
+            .ok_or_else(|| Error::EmptyArgument)?
             .to_proto()
             .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "unknown nlri"))?;
 
@@ -2791,12 +2788,12 @@ impl GobgpApi for Service {
         while let Some(api_path) = rx.next().await {
             let family = api_path
                 .family
-                .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty family"))?
+                .ok_or_else(|| Error::EmptyArgument)?
                 .to_proto();
 
             let nlri = api_path
                 .nlri
-                .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "empty nlri"))?
+                .ok_or_else(|| Error::EmptyArgument)?
                 .to_proto()
                 .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "unknown nlri"))?;
 
@@ -3011,21 +3008,23 @@ impl GobgpApi for Service {
         &self,
         request: tonic::Request<api::AddStatementRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        if let Some(statement) = request.into_inner().statement {
-            let mut table = self.table.lock().await;
-            let name = statement.name.clone();
-            if table
-                .policy
-                .add_statement(name, statement.conditions, statement.actions)
-                .is_err()
-            {
-                println!("failed add statement");
-                return Err(tonic::Status::new(
-                    tonic::Code::InvalidArgument,
-                    "already exists",
-                ));
-            }
+        let statement = request
+            .into_inner()
+            .statement
+            .ok_or_else(|| Error::EmptyArgument)?;
+        let mut table = self.table.lock().await;
+        let name = statement.name.clone();
+        if table
+            .policy
+            .add_statement(name, statement.conditions, statement.actions)
+            .is_err()
+        {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "already exists",
+            ));
         }
+
         Ok(tonic::Response::new(()))
     }
     async fn delete_statement(
@@ -3064,17 +3063,18 @@ impl GobgpApi for Service {
         &self,
         request: tonic::Request<api::AddPolicyAssignmentRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        if let Some(assignment) = request.into_inner().assignment {
-            let mut table = self.table.lock().await;
-            if table.policy.add_assignment(assignment).is_err() {
-                return Err(tonic::Status::new(
-                    tonic::Code::InvalidArgument,
-                    "already exists",
-                ));
-            }
-            return Ok(tonic::Response::new(()));
+        let assignment = request
+            .into_inner()
+            .assignment
+            .ok_or_else(|| Error::EmptyArgument)?;
+        let mut table = self.table.lock().await;
+        if table.policy.add_assignment(assignment).is_err() {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "already exists",
+            ));
         }
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        Ok(tonic::Response::new(()))
     }
     async fn delete_policy_assignment(
         &self,
@@ -3107,8 +3107,6 @@ impl GobgpApi for Service {
                         v.push(t.policy.global_export.to_api("global", 2));
                     }
                 }
-                println!("import {}", t.policy.global_import.policies.len());
-                println!("export {}", t.policy.global_export.policies.len());
             }
             for s in v {
                 let _ = tx
