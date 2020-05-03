@@ -7,7 +7,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tonic = "=0.1.0"
+tonic = "0.2"
 bytes = "0.5"
 prost = "0.6"
 prost-types = "0.6"
@@ -23,4 +23,4 @@ fnv = "1.0"
 proto = { path = "../proto" }
 
 [build-dependencies]
-tonic-build = "=0.1.0"
+tonic-build = "0.2"
