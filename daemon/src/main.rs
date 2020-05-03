@@ -3844,8 +3844,7 @@ struct Bgp {
     param: bgp::ParseParam,
 }
 
-impl Encoder for Bgp {
-    type Item = bgp::Message;
+impl Encoder<bgp::Message> for Bgp {
     type Error = io::Error;
 
     fn encode(&mut self, item: bgp::Message, dst: &mut BytesMut) -> Result<(), io::Error> {
@@ -4414,8 +4413,7 @@ async fn handle_bmp_session(
 
 struct Rtr {}
 
-impl Encoder for Rtr {
-    type Item = rtr::Message;
+impl Encoder<rtr::Message> for Rtr {
     type Error = io::Error;
 
     fn encode(&mut self, item: rtr::Message, dst: &mut BytesMut) -> Result<(), io::Error> {
