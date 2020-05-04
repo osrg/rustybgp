@@ -68,19 +68,10 @@ func checkAdjout(t *testing.T, c *bgpTest) {
 }
 
 func checkGlobalrib(t *testing.T, c *bgpTest) {
-	err := c.addPath("g1", "10.0.0.0/24")
-	assert.Nil(t, err)
-	err = c.addPath("g2", "10.0.1.0/24")
-	assert.Nil(t, err)
 	has, _ := c.waitForPath("r1", global, "", "10.0.0.0/24", 50)
 	assert.True(t, has)
 	has, _ = c.waitForPath("r1", global, "", "10.0.1.0/24", 50)
 	assert.True(t, has)
-}
-
-func waitForEstablish(t *testing.T, c *bgpTest) {
-	c.waitForAllEstablish("g1")
-	c.waitForAllEstablish("g2")
 }
 
 func TestIbgp(t *testing.T) {
@@ -95,19 +86,25 @@ func TestIbgp(t *testing.T) {
 	assert.Nil(t, err)
 	err = c.createPeer("g1", gobgpImage, 1)
 	assert.Nil(t, err)
-	err = c.createPeer("g2", gobgpImage, 1)
+	err = c.addPath("g1", "10.0.0.0/24")
 	assert.Nil(t, err)
 
 	// test rustybgp active connect
 	err = c.connectPeers("g1", "r1", true, false)
+	assert.Nil(t, err)
+	c.waitForAllEstablish("g1")
+
+	err = c.createPeer("g2", gobgpImage, 1)
+	assert.Nil(t, err)
+	err = c.addPath("g2", "10.0.1.0/24")
 	assert.Nil(t, err)
 	// test rustybgp passive connect
 	err = c.connectPeers("r1", "g2", true, false)
 	assert.Nil(t, err)
 	err = c.connectPeers("g1", "g2", false, false)
 	assert.Nil(t, err)
+	c.waitForAllEstablish("g2")
 
-	waitForEstablish(t, c)
 	checkGlobalrib(t, c)
 	checkAdjout(t, c)
 	addEbgpPeer(t, c)
