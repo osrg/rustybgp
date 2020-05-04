@@ -1633,7 +1633,16 @@ impl Table {
             if target.state == bgp::State::Established
                 && need_to_advertise(&rtu.source, &target, rtu.family, &session.families)
             {
-                let _ = session.tx.send(PeerEvent::Update(rtu.clone()));
+                let _ = session.tx.send(ToPeerEvent::Update(rtu.clone()));
+            }
+        }
+    }
+
+    pub async fn unicast(&mut self, address: IpAddr, rtu: RoutingTableUpdate) {
+        if let Some(session) = self.bgp_sessions.get(&address) {
+            let target = session.source.clone();
+            if need_to_advertise(&rtu.source, &target, rtu.family, &session.families) {
+                let _ = session.tx.send(ToPeerEvent::Update(rtu));
             }
         }
     }
@@ -3343,6 +3352,7 @@ pub enum Proto {
     Rtr,
 }
 
+#[derive(Clone)]
 pub enum DisconnectedProto {
     Bgp(Arc<Source>, SocketAddr),
     Bmp(SocketAddr),
@@ -3351,9 +3361,15 @@ pub enum DisconnectedProto {
 
 pub enum SrvEvent {
     EnableActive { proto: Proto, sockaddr: SocketAddr },
-    Disconnected(DisconnectedProto),
     Disable { proto: Proto, sockaddr: SocketAddr },
     Deconfigured(IpAddr),
+}
+
+#[derive(Clone)]
+pub enum FromPeerEvent {
+    Update(RoutingTableUpdate),
+    Established(Arc<Source>),
+    Disconnected(DisconnectedProto),
 }
 
 #[derive(Clone)]
@@ -3383,65 +3399,154 @@ impl RoutingTableUpdate {
     }
 }
 
-#[allow(clippy::modulo_one)]
 async fn handle_table_update(
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
-    table_rx: &mut Receiver<RoutingTableUpdate>,
+    event: FromPeerEvent,
+    dq: &mut DelayQueue<(Proto, SocketAddr)>,
 ) {
-    loop {
-        tokio::select! {
-            Some(c) = table_rx.next().fuse() => {
-                let mut t = table.lock().await;
-                let address = c.source.address;
-                let source = c.source;
-                match c.attrs {
-                    None => {
-                        let (u, deleted) = t.routing.remove(c.family, c.nlri, source.clone());
-                        if let Some(u) = u {
-                            t.broadcast(u).await;
-                        }
-                        if deleted {
-                            if let Some(session) = t.bgp_sessions.get_mut(&address) {
-                                session.update_accepted(c.family, -1);
-                            }
-                        }
-                        for tx in t.bmp_sessions.values() {
-                            let g = global.lock().await;
-                            let payload = bgp::UpdateMessage::bytes(Vec::new(), vec![c.nlri], Vec::new()).unwrap();
-                                let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
-                                peer_header: g.peers.get(&source.address).unwrap().to_bmp_ph(),
-                                payload,
-                            });
-                            let _ = tx.send(m);
-                        }
+    match event {
+        FromPeerEvent::Established(source) => {
+            let mut t = table.lock().await;
+            let g = global.lock().await;
+            let addr = source.address;
+            let mut session = t.bgp_sessions.remove(&addr).unwrap();
+            session.source = source.clone();
+            let families: Vec<bgp::Family> = session.families.iter().cloned().collect();
+            t.bgp_sessions.insert(addr, session);
+
+            for (_, tx) in t.bmp_sessions.iter_mut() {
+                let p = g.peers.get(&addr).unwrap();
+                let _ = tx.send(bmp::Message::PeerUpNotification(
+                    p.to_bmp_up(g.id, source.address),
+                ));
+            }
+
+            if !t.routing.disable_best_path_selection {
+                let mut v = Vec::new();
+                for family in families {
+                    for route in t.routing.iter_destination(false, family) {
+                        v.push(RoutingTableUpdate::new(
+                            route.1.entry[0].source.clone(),
+                            family,
+                            *route.0,
+                            Some(route.1.entry[0].attrs.clone()),
+                            Some(route.1.entry[0].nexthop),
+                        ));
                     }
-                    Some(attrs) => {
-                        t.policy.global_import.apply(source.address, attrs.clone());
-                        let (u, added) = t.routing.insert(c.family, c.nlri, source.clone(), c.nexthop.unwrap(), attrs.clone());
-                        if let Some(u) = u {
-                            t.broadcast(u).await;
+                }
+                for rtu in v {
+                    t.unicast(addr, rtu).await;
+                }
+            }
+        }
+        FromPeerEvent::Disconnected(p) => match p {
+            DisconnectedProto::Bgp(source, sockaddr) => {
+                let addr = source.address;
+                {
+                    let mut t = table.lock().await;
+                    t.bgp_sessions.remove(&addr);
+                    for u in t.routing.clear(source.clone()) {
+                        t.broadcast(u).await;
+                    }
+                }
+                {
+                    let t = table.lock().await;
+                    let mut g = global.lock().await;
+                    for tx in t.bmp_sessions.values() {
+                        let peer = g.peers.get_mut(&addr).unwrap();
+                        let _ = tx.send(bmp::Message::PeerDownNotification(
+                            peer.to_bmp_down(bmp::PeerDownNotification::REASON_UNKNOWN),
+                        ));
+                    }
+                    let peer = g.peers.get_mut(&addr).unwrap();
+                    if peer.delete_on_disconnected {
+                        if let Some(key) = &peer.expiration_key {
+                            dq.remove(key);
                         }
-                        if added {
-                            if let Some(session) = t.bgp_sessions.get_mut(&address) {
-                                session.update_accepted(c.family, 1);
-                            }
-                        }
-
-                        for tx in t.bmp_sessions.values() {
-                            let g = global.lock().await;
-                            let p = Path::new(source.clone(), c.nexthop.unwrap(), attrs.clone());
-
-                            let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
-                                peer_header: g.peers.get(&p.source.address).unwrap().to_bmp_ph(),
-                                payload: p.to_payload(c.nlri),
+                        g.peers.remove(&addr);
+                    } else {
+                        peer.reset();
+                        if !peer.passive && !peer.admin_down {
+                            let _ = g.server_event_tx.send(SrvEvent::EnableActive {
+                                proto: Proto::Bgp,
+                                sockaddr,
                             });
-                            let _ = tx.send(m);
                         }
                     }
                 }
             }
-        }
+            DisconnectedProto::Bmp(sockaddr) => {
+                let mut t = table.lock().await;
+                t.bmp_sessions.remove(&sockaddr);
+                dq.insert((Proto::Bmp, sockaddr), Duration::from_secs(5));
+            }
+            DisconnectedProto::Rtr(sockaddr) => {
+                let t = table.lock().await;
+                if t.rtr_sessions.contains_key(&sockaddr) {
+                    dq.insert((Proto::Rtr, sockaddr), Duration::from_secs(5));
+                }
+            }
+        },
+        FromPeerEvent::Update(update) => match update.attrs {
+            None => {
+                let mut t = table.lock().await;
+                let address = update.source.address;
+                let source = update.source;
+                let (u, deleted) = t.routing.remove(update.family, update.nlri, source.clone());
+                if let Some(u) = u {
+                    t.broadcast(u).await;
+                }
+                if deleted {
+                    if let Some(session) = t.bgp_sessions.get_mut(&address) {
+                        session.update_accepted(update.family, -1);
+                    }
+                }
+                for tx in t.bmp_sessions.values() {
+                    let g = global.lock().await;
+                    let payload =
+                        bgp::UpdateMessage::bytes(Vec::new(), vec![update.nlri], Vec::new())
+                            .unwrap();
+                    let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
+                        peer_header: g.peers.get(&source.address).unwrap().to_bmp_ph(),
+                        payload,
+                    });
+                    let _ = tx.send(m);
+                }
+            }
+            Some(attrs) => {
+                let mut t = table.lock().await;
+                let address = update.source.address;
+                let source = update.source;
+                t.policy.global_import.apply(source.address, attrs.clone());
+                let (u, added) = t.routing.insert(
+                    update.family,
+                    update.nlri,
+                    source.clone(),
+                    update.nexthop.unwrap(),
+                    attrs.clone(),
+                );
+                if let Some(u) = u {
+                    t.broadcast(u).await;
+                }
+                if added {
+                    if let Some(session) = t.bgp_sessions.get_mut(&address) {
+                        session.update_accepted(update.family, 1);
+                    }
+                }
+
+                for tx in t.bmp_sessions.values() {
+                    let g = global.lock().await;
+                    let path = Path::new(source.clone(), update.nexthop.unwrap(), attrs.clone());
+
+                    let m = bmp::Message::RouteMonitoring(bmp::RouteMonitoring {
+                        peer_header: g.peers.get(&path.source.address).unwrap().to_bmp_ph(),
+                        payload: path.to_payload(update.nlri),
+                    });
+                    let _ = tx.send(m);
+                }
+            }
+        },
     }
 }
 
@@ -3527,14 +3632,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TcpListener::bind(format!("[::]:{}", global.lock().await.listen_port)).await?;
 
     let (table_tx, mut table_rx) = mpsc::unbounded_channel();
-    {
-        let t = table.clone();
-        let g = global.clone();
-        tokio::spawn(async move {
-            handle_table_update(g, t, &mut table_rx).await;
-        });
-    }
-
     let mut expirations: DelayQueue<(Proto, SocketAddr)> = DelayQueue::new();
     let mut incoming = listener.incoming();
     loop {
@@ -3556,6 +3653,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(_) =>continue,
                 }
+            }
+            Some(msg) = table_rx.next().fuse() => {
+                handle_table_update(global.clone(), table.clone(), msg, &mut expirations).await;
+                continue;
             }
             Some(v) = expirations.next().fuse() => {
                     match v {
@@ -3593,54 +3694,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     }
-                    SrvEvent::Disconnected(p) =>{
-                        match p {
-                            DisconnectedProto::Bgp(source, sockaddr) => {
-                                let addr = source.address;
-                                {
-                                    let mut t = table.lock().await;
-                                    t.bgp_sessions.remove(&addr);
-                                    for u in t.routing.clear(source.clone()) {
-                                        t.broadcast(u).await;
-                                    }
-                                }
-                                {
-                                    let t = table.lock().await;
-                                    let mut g = global.lock().await;
-                                    for tx in t.bmp_sessions.values() {
-                                        let peer = g.peers.get_mut(&addr).unwrap();
-                                        let _ = tx.send(bmp::Message::PeerDownNotification(peer.to_bmp_down(bmp::PeerDownNotification::REASON_UNKNOWN)));
-                                    }
-                                    let peer = g.peers.get_mut(&addr).unwrap();
-                                    if peer.delete_on_disconnected {
-                                        if let Some(key) = &peer.expiration_key {
-                                            expirations.remove(key);
-                                        }
-                                        g.peers.remove(&addr);
-                                    } else {
-                                        peer.reset();
-                                        if !peer.passive && !peer.admin_down {
-                                            let _ = g.server_event_tx.send(
-                                                SrvEvent::EnableActive{proto: Proto::Bgp, sockaddr}
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            DisconnectedProto::Bmp(sockaddr) =>{
-                                let mut t = table.lock().await;
-                                t.bmp_sessions.remove(&sockaddr);
-                                expirations.insert((Proto::Bmp, sockaddr), Duration::from_secs(5));
-                            }
-                            DisconnectedProto::Rtr(sockaddr) => {
-                                let t = table.lock().await;
-                                if t.rtr_sessions.contains_key(&sockaddr) {
-                                    expirations.insert((Proto::Rtr, sockaddr), Duration::from_secs(5));
-                                }
-                            }
-                        }
-                        continue;
-                    }
                     SrvEvent::Deconfigured(addr) =>{
                         let t = table.lock().await;
                         let mut g = global.lock().await;
@@ -3652,7 +3705,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 if let Some(session) = t.bgp_sessions.get(&addr) {
                                     peer.delete_on_disconnected = true;
-                                    let _= session.tx.send(PeerEvent::Notification(
+                                    let _= session.tx.send(ToPeerEvent::Notification(
                                         bgp::NotificationMessage::new(
                                             bgp::NotificationCode::PeerDeconfigured,
                                         )
@@ -3677,7 +3730,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Some(peer) => {
                                 peer.admin_down = true;
                                 if let Some(session) = t.bgp_sessions.get(&addr) {
-                                    let _= session.tx.send(PeerEvent::Notification(
+                                    let _= session.tx.send(ToPeerEvent::Notification(
                                         bgp::NotificationMessage::new(
                                             bgp::NotificationCode::AdministrativeShutdown,
                                         )
@@ -3751,12 +3804,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             t.bmp_sessions.insert(sock, tx);
+            let table_tx = table_tx.clone();
             tokio::spawn(async move {
-                handle_bmp_session(global.clone(), &mut rx, stream, sock).await;
+                handle_bmp_session(table_tx, &mut rx, stream, sock).await;
             });
             continue;
         } else if proto == Proto::Rtr {
-            let global = Arc::clone(&global);
             let table = Arc::clone(&table);
             {
                 let mut t = table.lock().await;
@@ -3769,8 +3822,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => continue,
                 }
             }
+            let table_tx = table_tx.clone();
             tokio::spawn(async move {
-                handle_rtr_session(Arc::clone(&global), Arc::clone(&table), stream, sock).await;
+                handle_rtr_session(table_tx, Arc::clone(&table), stream, sock).await;
             });
             continue;
         }
@@ -3870,7 +3924,7 @@ impl Decoder for Bgp {
     }
 }
 
-pub enum PeerEvent {
+pub enum ToPeerEvent {
     Update(RoutingTableUpdate),
     Notification(bgp::NotificationMessage),
 }
@@ -4002,7 +4056,7 @@ pub struct Source {
 
 #[derive(Clone)]
 pub struct BgpSession {
-    tx: Sender<PeerEvent>,
+    tx: Sender<ToPeerEvent>,
     source: Arc<Source>,
     accepted: HashMap<bgp::Family, u64>,
     // enabled families
@@ -4010,7 +4064,7 @@ pub struct BgpSession {
 }
 
 impl BgpSession {
-    fn new(tx: Sender<PeerEvent>, source: Arc<Source>) -> Self {
+    fn new(tx: Sender<ToPeerEvent>, source: Arc<Source>) -> Self {
         BgpSession {
             tx,
             source,
@@ -4078,8 +4132,8 @@ async fn send_update(
 async fn handle_bgp_session(
     global: Arc<Mutex<Global>>,
     table: Arc<Mutex<Table>>,
-    table_tx: Sender<RoutingTableUpdate>,
-    peer_event_rx: &mut Receiver<PeerEvent>,
+    table_tx: Sender<FromPeerEvent>,
+    peer_event_rx: &mut Receiver<ToPeerEvent>,
     stream: TcpStream,
     sock: SocketAddr,
     local_addr: IpAddr,
@@ -4136,7 +4190,7 @@ async fn handle_bgp_session(
             }
             Some(msg) = peer_event_rx.next().fuse() =>{
                 match msg {
-                    PeerEvent::Update(msg) => {
+                    ToPeerEvent::Update(msg) => {
                        match send_update(source.clone(), &mut lines, vec![msg]).await {
                             Ok((update, prefix)) => {
                                 let peers = &mut global.lock().await.peers;
@@ -4151,7 +4205,7 @@ async fn handle_bgp_session(
                             }
                         }
                     }
-                    PeerEvent::Notification(n) => {
+                    ToPeerEvent::Notification(n) => {
                         let msg = bgp::Message::Notification(n);
                         {
                             let peers = &mut global.lock().await.peers;
@@ -4261,26 +4315,26 @@ async fn handle_bgp_session(
 
                                 for nlri in update.routes {
                                     let _ = table_tx.send(
-                                        RoutingTableUpdate::new(
+                                        FromPeerEvent::Update(RoutingTableUpdate::new(
                                             source.clone(),
                                             bgp::Family::Ipv4Uc,
                                             nlri,
                                             Some(pa.clone()),
                                             Some(update.nexthop),
-                                        )
+                                        ))
                                     );
                                 }
 
                                 if let Some((family, mp_routes, nexthop)) = update.mp_routes {
                                     for nlri in mp_routes {
                                         let _ = table_tx.send(
-                                            RoutingTableUpdate::new(
+                                            FromPeerEvent::Update(RoutingTableUpdate::new(
                                                 source.clone(),
                                                 family,
                                                 nlri,
                                                 Some(pa.clone()),
                                                 Some(nexthop),
-                                            )
+                                            ))
                                         );
                                     }
                                 }
@@ -4288,13 +4342,13 @@ async fn handle_bgp_session(
 
                             for (family, nlri) in update.withdrawns {
                                 let _ = table_tx.send(
-                                    RoutingTableUpdate::new(
+                                    FromPeerEvent::Update(RoutingTableUpdate::new(
                                         source.clone(),
                                         family,
                                         nlri,
                                         None,
                                         None,
-                                    )
+                                    ))
                                 );
                             }
                         }
@@ -4317,49 +4371,12 @@ async fn handle_bgp_session(
                                         ibgp: peer.local_as == peer.remote_as,
                                         state: bgp::State::Established,
                                     });
+                                    let _ = table_tx.send(FromPeerEvent::Established(source.clone()));
                                 }
 
                                 delay.reset(
                                     Instant::now() + Duration::from_secs(keepalive_interval as u64),
                                 );
-                                let mut v = Vec::new();
-                                {
-                                    let mut t = table.lock().await;
-                                    let g = global.lock().await;
-                                    let mut session = t.bgp_sessions.remove(&addr).unwrap();
-                                    session.source = source.clone();
-                                    let families:Vec<bgp::Family> = session.families.iter().cloned().collect();
-                                    t.bgp_sessions.insert(addr, session);
-
-                                    for (_, tx) in t.bmp_sessions.iter_mut() {
-                                        let p = g.peers.get(&addr).unwrap();
-                                        let _ = tx.send(bmp::Message::PeerUpNotification(
-                                        p.to_bmp_up(g.id, source.address)));
-                                    }
-
-                                    if !t.routing.disable_best_path_selection {
-                                        for family in families {
-                                            for route in t.routing.iter_destination(false, family) {
-                                                let u = RoutingTableUpdate::new(
-                                                    source.clone(),
-                                                    family,
-                                                    *route.0,
-                                                    Some(route.1.entry[0].attrs.clone()),
-                                                    Some(route.1.entry[0].nexthop),
-                                                );
-                                                v.push(u);
-                                            }
-                                        }
-                                    }
-                                }
-                                let delta = v.len() as u64;
-                                if send_update(source.clone(), &mut lines, v).await.is_err() {
-                                    break;
-                                }
-                                let peers = &mut global.lock().await.peers;
-                                let peer = peers.get_mut(&addr).unwrap();
-                                peer.counter_tx.update += delta;
-                                peer.counter_tx.total += delta;
                             }
                         }
                         bgp::Message::RouteRefresh(m) => println!("{:?}", m.family),
@@ -4372,14 +4389,13 @@ async fn handle_bgp_session(
     }
 
     println!("disconnected {}", addr);
-    let g = &mut global.lock().await;
-    let _ = g
-        .server_event_tx
-        .send(SrvEvent::Disconnected(DisconnectedProto::Bgp(source, sock)));
+    let _ = table_tx.send(FromPeerEvent::Disconnected(DisconnectedProto::Bgp(
+        source, sock,
+    )));
 }
 
 async fn handle_bmp_session(
-    global: Arc<Mutex<Global>>,
+    table_tx: Sender<FromPeerEvent>,
     rx: &mut Receiver<bmp::Message>,
     stream: TcpStream,
     sockaddr: SocketAddr,
@@ -4405,10 +4421,9 @@ async fn handle_bmp_session(
         }
     }
     println!("bmp disconnected {:?}", sockaddr);
-    let g = &mut global.lock().await;
-    let _ = g
-        .server_event_tx
-        .send(SrvEvent::Disconnected(DisconnectedProto::Bmp(sockaddr)));
+    let _ = table_tx.send(FromPeerEvent::Disconnected(DisconnectedProto::Bmp(
+        sockaddr,
+    )));
 }
 
 struct Rtr {}
@@ -4441,7 +4456,7 @@ impl Decoder for Rtr {
 
 #[allow(clippy::modulo_one)]
 async fn handle_rtr_session(
-    global: Arc<Mutex<Global>>,
+    table_tx: Sender<FromPeerEvent>,
     table: Arc<Mutex<Table>>,
     stream: TcpStream,
     sockaddr: SocketAddr,
@@ -4494,8 +4509,7 @@ async fn handle_rtr_session(
         }
     }
     println!("rpki disconnected {:?}", sockaddr);
-    let g = &mut global.lock().await;
-    let _ = g
-        .server_event_tx
-        .send(SrvEvent::Disconnected(DisconnectedProto::Rtr(sockaddr)));
+    let _ = table_tx.send(FromPeerEvent::Disconnected(DisconnectedProto::Rtr(
+        sockaddr,
+    )));
 }
