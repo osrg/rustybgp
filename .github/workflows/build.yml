@@ -18,3 +18,4 @@ jobs:
           cd /home/runner/work/rustybgp/rustybgp
           cargo clippy -- -D warnings
           cargo test --verbose --all
+          cargo fmt -- --check
