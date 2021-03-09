@@ -115,7 +115,7 @@ impl Message {
                 let prefix_len = c.read_u8()?;
                 let max_length = c.read_u8()?;
                 let _ = c.read_u8()?;
-                let mut octets = [0 as u8; 4];
+                let mut octets = [0_u8; 4];
                 for i in 0..4 {
                     octets[i as usize] = c.read_u8()?;
                 }
@@ -138,7 +138,7 @@ impl Message {
                 let prefix_len = c.read_u8()?;
                 let max_length = c.read_u8()?;
                 let _ = c.read_u8()?;
-                let mut octets = [0 as u8; 16];
+                let mut octets = [0_u8; 16];
                 for i in 0..16 {
                     octets[i as usize] = c.read_u8()?;
                 }

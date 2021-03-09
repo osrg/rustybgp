@@ -34,22 +34,19 @@ pub struct IpNet {
 
 impl IpNet {
     pub fn is_v6(&self) -> bool {
-        match self.addr {
-            IpAddr::V4(_) => false,
-            IpAddr::V6(_) => true,
-        }
+        self.addr.is_ipv6()
     }
 
     pub fn from_bytes(c: &mut Cursor<&[u8]>, is_v6: bool) -> Result<IpNet, Error> {
         let bit_len = c.read_u8()?;
         if is_v6 {
-            let mut addr = [0 as u8; 16];
+            let mut addr = [0_u8; 16];
             for i in 0..(bit_len + 7) / 8 {
                 addr[i as usize] = c.read_u8()?;
             }
             Ok(IpNet::new(addr, bit_len))
         } else {
-            let mut addr = [0 as u8; 4];
+            let mut addr = [0_u8; 4];
             for i in 0..(bit_len + 7) / 8 {
                 addr[i as usize] = c.read_u8()?;
             }
@@ -190,6 +187,7 @@ impl fmt::Display for IpNet {
 }
 
 pub trait IpNetNew<T>: Sized {
+    #[allow(clippy::new_ret_no_self)]
     fn new(_: T, mask: u8) -> IpNet;
 }
 
@@ -246,10 +244,7 @@ pub enum Nlri {
 impl Nlri {
     pub fn is_mp(self) -> bool {
         let Nlri::Ip(net) = self;
-        match net.addr {
-            IpAddr::V4(_) => false,
-            _ => true,
-        }
+        !matches!(net.addr, IpAddr::V4(_))
     }
 }
 
@@ -347,10 +342,10 @@ impl OpenMessage {
     pub fn get_as_number(&self) -> u32 {
         if self.as_number == AS_TRANS {
             for param in &self.params {
-                if let OpenParam::CapabilityParam(cap) = param {
-                    if let Capability::FourOctetAsNumber { as_number } = cap {
-                        return *as_number;
-                    }
+                if let OpenParam::CapabilityParam(Capability::FourOctetAsNumber { as_number }) =
+                    param
+                {
+                    return *as_number;
                 }
             }
         }
@@ -372,9 +367,9 @@ impl OpenMessage {
 
         let mut param_len = 0;
         for param in &self.params {
-            param.to_bytes(c).and_then(|n| {
+            param.to_bytes(c).map(|n| {
                 param_len += n;
-                Ok(n)
+                n
             })?;
         }
 

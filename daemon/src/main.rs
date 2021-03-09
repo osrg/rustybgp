@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::{Stream, StreamExt};
+use std::pin::Pin;
 use std::{
     collections::{hash_map::Entry::Occupied, hash_map::Entry::Vacant, HashMap, HashSet},
     convert::TryFrom,
@@ -24,22 +26,19 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use tokio::{
-    io::AsyncWriteExt,
-    net::{TcpListener, TcpStream},
-    stream::StreamExt,
-    sync::{mpsc, Barrier, Mutex},
-    time::{delay_for, delay_queue, DelayQueue, Instant},
-};
-use tokio_util::codec::{BytesCodec, Decoder, Encoder, Framed};
-
 use bytes::{BufMut, BytesMut};
 use clap::{App, Arg};
 use fnv::FnvHashMap;
 use futures::{FutureExt, SinkExt};
 use patricia_tree::PatriciaMap;
-use prost;
 use regex::Regex;
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, Barrier, Mutex},
+};
+use tokio_util::codec::{BytesCodec, Decoder, Encoder, Framed};
+use tokio_util::time::{delay_queue, DelayQueue};
 
 mod api {
     tonic::include_proto!("gobgpapi");
@@ -1367,6 +1366,7 @@ impl RoutingPolicy {
         Default::default()
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn add_assignment(&mut self, assignment: api::PolicyAssignment) -> Result<(), ()> {
         if let Some(dir) = api::PolicyDirection::from_i32(assignment.direction) {
             if dir == api::PolicyDirection::Unknown {
@@ -1402,6 +1402,7 @@ impl RoutingPolicy {
         Err(())
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn add_policy(&mut self, name: String, statements: Vec<api::Statement>) -> Result<(), ()> {
         let mut v = Vec::new();
         for s in statements {
@@ -1423,6 +1424,7 @@ impl RoutingPolicy {
         Ok(())
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn add_defined_set(&mut self, name: String, set: api::DefinedSet) -> Result<(), ()> {
         if let Some(t) = api::DefinedType::from_i32(set.defined_type) {
             match t {
@@ -1510,6 +1512,7 @@ impl RoutingPolicy {
         Err(())
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn add_statement(
         &mut self,
         name: String,
@@ -1558,7 +1561,7 @@ impl RoutingPolicy {
             let nexthops: Vec<bgp::IpNet> = conditions
                 .next_hop_in_list
                 .iter()
-                .filter_map(|p| bgp::IpNet::from_str(p).map_or(None, Some))
+                .filter_map(|p| bgp::IpNet::from_str(p).ok())
                 .collect();
             if !nexthops.is_empty() {
                 if nexthops.len() != conditions.next_hop_in_list.len() {
@@ -1835,9 +1838,7 @@ impl Peer {
             remote_cap: Vec::new(),
             local_cap: vec![
                 bgp::Capability::RouteRefresh,
-                bgp::Capability::FourOctetAsNumber {
-                    as_number: as_number,
-                },
+                bgp::Capability::FourOctetAsNumber { as_number },
             ],
             expiration_key: None,
         }
@@ -2286,10 +2287,7 @@ impl GobgpApi for Service {
         &self,
         request: tonic::Request<api::StartBgpRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        let global = request
-            .into_inner()
-            .global
-            .ok_or_else(|| Error::EmptyArgument)?;
+        let global = request.into_inner().global.ok_or(Error::EmptyArgument)?;
 
         let g = &mut self.global.lock().await;
         if g.as_number != 0 {
@@ -2336,11 +2334,8 @@ impl GobgpApi for Service {
         &self,
         request: tonic::Request<api::AddPeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        let peer = request
-            .into_inner()
-            .peer
-            .ok_or_else(|| Error::EmptyArgument)?;
-        let conf = peer.conf.clone().ok_or_else(|| Error::EmptyArgument)?;
+        let peer = request.into_inner().peer.ok_or(Error::EmptyArgument)?;
+        let conf = peer.conf.clone().ok_or(Error::EmptyArgument)?;
         if let Ok(addr) = IpAddr::from_str(&conf.neighbor_address) {
             let as_number = {
                 let local = peer.get_local_as();
@@ -2409,7 +2404,11 @@ impl GobgpApi for Service {
             "invalid peer address",
         ))
     }
-    type ListPeerStream = mpsc::Receiver<Result<api::ListPeerResponse, tonic::Status>>;
+    type ListPeerStream = Pin<
+        Box<
+            dyn Stream<Item = Result<api::ListPeerResponse, tonic::Status>> + Send + Sync + 'static,
+        >,
+    >;
     async fn list_peer(
         &self,
         request: tonic::Request<api::ListPeerRequest>,
@@ -2417,7 +2416,7 @@ impl GobgpApi for Service {
         let request = request.into_inner();
         let addr = IpAddr::from_str(&request.address);
 
-        let (mut tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(1024);
         let table = self.table.clone();
         let global = self.global.clone();
 
@@ -2441,7 +2440,9 @@ impl GobgpApi for Service {
                 let _ = tx.send(Ok(rsp)).await;
             }
         });
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn update_peer(
         &self,
@@ -2513,7 +2514,14 @@ impl GobgpApi for Service {
         ))
     }
 
-    type MonitorPeerStream = mpsc::Receiver<Result<api::MonitorPeerResponse, tonic::Status>>;
+    type MonitorPeerStream = Pin<
+        Box<
+            dyn Stream<Item = Result<api::MonitorPeerResponse, tonic::Status>>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >;
     async fn monitor_peer(
         &self,
         _request: tonic::Request<api::MonitorPeerRequest>,
@@ -2527,8 +2535,8 @@ impl GobgpApi for Service {
         let pg = request
             .into_inner()
             .peer_group
-            .ok_or_else(|| Error::EmptyArgument)?;
-        let conf = pg.conf.ok_or_else(|| Error::EmptyArgument)?;
+            .ok_or(Error::EmptyArgument)?;
+        let conf = pg.conf.ok_or(Error::EmptyArgument)?;
         match self
             .global
             .lock()
@@ -2569,7 +2577,7 @@ impl GobgpApi for Service {
         let dynamic = request
             .into_inner()
             .dynamic_neighbor
-            .ok_or_else(|| Error::EmptyArgument)?;
+            .ok_or(Error::EmptyArgument)?;
 
         let prefix = bgp::IpNet::from_str(&dynamic.prefix)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
@@ -2598,16 +2606,13 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
         let r = request.into_inner();
 
-        let api_path = r.path.ok_or_else(|| Error::EmptyArgument)?;
+        let api_path = r.path.ok_or(Error::EmptyArgument)?;
 
-        let family = api_path
-            .family
-            .ok_or_else(|| Error::EmptyArgument)?
-            .to_proto();
+        let family = api_path.family.ok_or(Error::EmptyArgument)?.to_proto();
 
         let nlri = api_path
             .nlri
-            .ok_or_else(|| Error::EmptyArgument)?
+            .ok_or(Error::EmptyArgument)?
             .to_proto()
             .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "unknown nlri"))?;
 
@@ -2636,16 +2641,13 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let r = request.into_inner();
 
-        let api_path = r.path.ok_or_else(|| Error::EmptyArgument)?;
+        let api_path = r.path.ok_or(Error::EmptyArgument)?;
 
-        let family = api_path
-            .family
-            .ok_or_else(|| Error::EmptyArgument)?
-            .to_proto();
+        let family = api_path.family.ok_or(Error::EmptyArgument)?.to_proto();
 
         let nlri = api_path
             .nlri
-            .ok_or_else(|| Error::EmptyArgument)?
+            .ok_or(Error::EmptyArgument)?
             .to_proto()
             .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "unknown nlri"))?;
 
@@ -2658,7 +2660,11 @@ impl GobgpApi for Service {
         }
         Ok(tonic::Response::new(()))
     }
-    type ListPathStream = mpsc::Receiver<Result<api::ListPathResponse, tonic::Status>>;
+    type ListPathStream = Pin<
+        Box<
+            dyn Stream<Item = Result<api::ListPathResponse, tonic::Status>> + Send + Sync + 'static,
+        >,
+    >;
     async fn list_path(
         &self,
         request: tonic::Request<api::ListPathRequest>,
@@ -2690,7 +2696,7 @@ impl GobgpApi for Service {
                 ));
             };
 
-        let (mut tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(1024);
         let table = self.table.clone();
         tokio::spawn(async move {
             let mut v = Vec::new();
@@ -2775,7 +2781,9 @@ impl GobgpApi for Service {
                 let _ = tx.send(Ok(r)).await;
             }
         });
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn add_path_stream(
         &self,
@@ -2783,7 +2791,7 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let mut stream = request.into_inner();
 
-        let (mut tx, mut rx) = mpsc::channel(1024);
+        let (tx, mut rx) = mpsc::channel(1024);
         tokio::spawn(async move {
             while let Some(req) = stream.next().await {
                 if let Ok(req) = req {
@@ -2794,15 +2802,12 @@ impl GobgpApi for Service {
             }
         });
 
-        while let Some(api_path) = rx.next().await {
-            let family = api_path
-                .family
-                .ok_or_else(|| Error::EmptyArgument)?
-                .to_proto();
+        while let Some(api_path) = rx.recv().await {
+            let family = api_path.family.ok_or(Error::EmptyArgument)?.to_proto();
 
             let nlri = api_path
                 .nlri
-                .ok_or_else(|| Error::EmptyArgument)?
+                .ok_or(Error::EmptyArgument)?
                 .to_proto()
                 .ok_or_else(|| tonic::Status::new(tonic::Code::InvalidArgument, "unknown nlri"))?;
 
@@ -2852,7 +2857,14 @@ impl GobgpApi for Service {
             num_accepted: 0,
         }))
     }
-    type MonitorTableStream = mpsc::Receiver<Result<api::MonitorTableResponse, tonic::Status>>;
+    type MonitorTableStream = Pin<
+        Box<
+            dyn Stream<Item = Result<api::MonitorTableResponse, tonic::Status>>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >;
     async fn monitor_table(
         &self,
         _request: tonic::Request<api::MonitorTableRequest>,
@@ -2871,7 +2883,9 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
-    type ListVrfStream = mpsc::Receiver<Result<api::ListVrfResponse, tonic::Status>>;
+    type ListVrfStream = Pin<
+        Box<dyn Stream<Item = Result<api::ListVrfResponse, tonic::Status>> + Send + Sync + 'static>,
+    >;
     async fn list_vrf(
         &self,
         _request: tonic::Request<api::ListVrfRequest>,
@@ -2901,12 +2915,19 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
-    type ListPolicyStream = mpsc::Receiver<Result<api::ListPolicyResponse, tonic::Status>>;
+    type ListPolicyStream = Pin<
+        Box<
+            dyn Stream<Item = Result<api::ListPolicyResponse, tonic::Status>>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >;
     async fn list_policy(
         &self,
         request: tonic::Request<api::ListPolicyRequest>,
     ) -> Result<tonic::Response<Self::ListPolicyStream>, tonic::Status> {
-        let (mut tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(1024);
         let table = self.table.clone();
 
         tokio::spawn(async move {
@@ -2926,7 +2947,9 @@ impl GobgpApi for Service {
                     .await;
             }
         });
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn set_policies(
         &self,
@@ -2959,17 +2982,24 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
-    type ListDefinedSetStream = mpsc::Receiver<Result<api::ListDefinedSetResponse, tonic::Status>>;
+    type ListDefinedSetStream = Pin<
+        Box<
+            dyn Stream<Item = Result<api::ListDefinedSetResponse, tonic::Status>>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >;
     async fn list_defined_set(
         &self,
         _request: tonic::Request<api::ListDefinedSetRequest>,
     ) -> Result<tonic::Response<Self::ListDefinedSetStream>, tonic::Status> {
-        let (mut tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(1024);
         let table = self.table.clone();
         tokio::spawn(async move {
             let mut v = Vec::new();
             {
-                let mut t = table.lock().await;
+                let t = table.lock().await;
                 v.append(
                     &mut t
                         .policy
@@ -3011,16 +3041,15 @@ impl GobgpApi for Service {
                     .await;
             }
         });
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn add_statement(
         &self,
         request: tonic::Request<api::AddStatementRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        let statement = request
-            .into_inner()
-            .statement
-            .ok_or_else(|| Error::EmptyArgument)?;
+        let statement = request.into_inner().statement.ok_or(Error::EmptyArgument)?;
         let mut table = self.table.lock().await;
         let name = statement.name.clone();
         if table
@@ -3042,12 +3071,19 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
-    type ListStatementStream = mpsc::Receiver<Result<api::ListStatementResponse, tonic::Status>>;
+    type ListStatementStream = Pin<
+        Box<
+            dyn Stream<Item = Result<api::ListStatementResponse, tonic::Status>>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >;
     async fn list_statement(
         &self,
         request: tonic::Request<api::ListStatementRequest>,
     ) -> Result<tonic::Response<Self::ListStatementStream>, tonic::Status> {
-        let (mut tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(1024);
         let table = self.table.clone();
         tokio::spawn(async move {
             let mut v = Vec::new();
@@ -3066,7 +3102,9 @@ impl GobgpApi for Service {
                     .await;
             }
         });
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn add_policy_assignment(
         &self,
@@ -3075,7 +3113,7 @@ impl GobgpApi for Service {
         let assignment = request
             .into_inner()
             .assignment
-            .ok_or_else(|| Error::EmptyArgument)?;
+            .ok_or(Error::EmptyArgument)?;
         let mut table = self.table.lock().await;
         if table.policy.add_assignment(assignment).is_err() {
             return Err(tonic::Status::new(
@@ -3091,13 +3129,19 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
-    type ListPolicyAssignmentStream =
-        mpsc::Receiver<Result<api::ListPolicyAssignmentResponse, tonic::Status>>;
+    type ListPolicyAssignmentStream = Pin<
+        Box<
+            dyn Stream<Item = Result<api::ListPolicyAssignmentResponse, tonic::Status>>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >;
     async fn list_policy_assignment(
         &self,
         request: tonic::Request<api::ListPolicyAssignmentRequest>,
     ) -> Result<tonic::Response<Self::ListPolicyAssignmentStream>, tonic::Status> {
-        let (mut tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(1024);
         let table = self.table.clone();
         tokio::spawn(async move {
             let mut v = Vec::new();
@@ -3125,7 +3169,9 @@ impl GobgpApi for Service {
                     .await;
             }
         });
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn set_policy_assignment(
         &self,
@@ -3173,12 +3219,16 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
-    type ListRpkiStream = mpsc::Receiver<Result<api::ListRpkiResponse, tonic::Status>>;
+    type ListRpkiStream = Pin<
+        Box<
+            dyn Stream<Item = Result<api::ListRpkiResponse, tonic::Status>> + Send + Sync + 'static,
+        >,
+    >;
     async fn list_rpki(
         &self,
         _request: tonic::Request<api::ListRpkiRequest>,
     ) -> Result<tonic::Response<Self::ListRpkiStream>, tonic::Status> {
-        let (mut tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(1024);
 
         let table = self.table.clone();
         tokio::spawn(async move {
@@ -3211,7 +3261,9 @@ impl GobgpApi for Service {
                 let _ = tx.send(Ok(r)).await;
             }
         });
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn enable_rpki(
         &self,
@@ -3231,7 +3283,14 @@ impl GobgpApi for Service {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
-    type ListRpkiTableStream = mpsc::Receiver<Result<api::ListRpkiTableResponse, tonic::Status>>;
+    type ListRpkiTableStream = Pin<
+        Box<
+            dyn Stream<Item = Result<api::ListRpkiTableResponse, tonic::Status>>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >;
     async fn list_rpki_table(
         &self,
         request: tonic::Request<api::ListRpkiTableRequest>,
@@ -3248,7 +3307,7 @@ impl GobgpApi for Service {
                 .collect(),
         };
 
-        let (mut tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(1024);
 
         let table = self.table.clone();
         tokio::spawn(async move {
@@ -3258,7 +3317,7 @@ impl GobgpApi for Service {
 
                 if family.contains(&bgp::Family::Ipv4Uc) {
                     for (net, entry) in t.roa.v4.iter() {
-                        let mut octets = [0 as u8; 4];
+                        let mut octets = [0_u8; 4];
                         octets.clone_from_slice(&net[..4]);
                         let n = bgp::IpNet {
                             addr: IpAddr::from(octets),
@@ -3274,7 +3333,7 @@ impl GobgpApi for Service {
 
                 if family.contains(&bgp::Family::Ipv6Uc) {
                     for (net, entry) in t.roa.v6.iter() {
-                        let mut octets = [0 as u8; 16];
+                        let mut octets = [0_u8; 16];
                         octets.clone_from_slice(&net[..16]);
                         let n = bgp::IpNet {
                             addr: IpAddr::from(octets),
@@ -3292,7 +3351,9 @@ impl GobgpApi for Service {
                 let _ = tx.send(Ok(r)).await;
             }
         });
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn enable_zebra(
         &self,
@@ -3628,12 +3689,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         init_tx.wait().await;
     }
 
-    let mut listener =
-        TcpListener::bind(format!("[::]:{}", global.lock().await.listen_port)).await?;
+    let listener = TcpListener::bind(format!("[::]:{}", global.lock().await.listen_port)).await?;
 
     let (table_tx, mut table_rx) = mpsc::unbounded_channel();
     let mut expirations: DelayQueue<(Proto, SocketAddr)> = DelayQueue::new();
-    let mut incoming = listener.incoming();
+    let mut incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     loop {
         let (proto, stream, sock) = tokio::select! {
             Some(stream) = incoming.next().fuse() => {
@@ -3654,7 +3714,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) =>continue,
                 }
             }
-            Some(msg) = table_rx.next().fuse() => {
+            Some(msg) = table_rx.recv().fuse() => {
                 handle_table_update(global.clone(), table.clone(), msg, &mut expirations).await;
                 continue;
             }
@@ -3682,7 +3742,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
             }
-            Some(event) = srv_event_rx.next().fuse() =>{
+            Some(event) = srv_event_rx.recv().fuse() =>{
                 match event {
                     SrvEvent::EnableActive{proto, sockaddr} => {
                         let key = expirations.insert((proto, sockaddr), Duration::from_secs(5));
@@ -4169,12 +4229,12 @@ async fn handle_bgp_session(
         let session = t.bgp_sessions.get(&addr).unwrap();
         session.source.clone()
     };
-    let mut delay = delay_for(Duration::from_secs(0));
 
+    let mut delay = tokio::time::interval(Duration::new(u64::MAX, 0));
     loop {
         tokio::select! {
-            _ = &mut delay => {
-                delay.reset(Instant::now() + Duration::from_secs(keepalive_interval as u64));
+            _ = delay.tick() => {
+                delay = tokio::time::interval(Duration::from_secs(keepalive_interval as u64));
 
                 if state == bgp::State::Established {
                     let msg = bgp::Message::Keepalive;
@@ -4188,7 +4248,7 @@ async fn handle_bgp_session(
                     }
                 }
             }
-            Some(msg) = peer_event_rx.next().fuse() =>{
+            Some(msg) = peer_event_rx.recv().fuse() =>{
                 match msg {
                     ToPeerEvent::Update(msg) => {
                        match send_update(source.clone(), &mut lines, vec![msg]).await {
@@ -4304,8 +4364,7 @@ async fn handle_bgp_session(
                             if lines.send(msg).await.is_err() {
                                 break;
                             }
-                            delay
-                                .reset(Instant::now() + Duration::from_secs(keepalive_interval as u64));
+                            delay = tokio::time::interval(Duration::from_secs(keepalive_interval as u64));
                         }
                         bgp::Message::Update(update) => {
                             if !update.attrs.is_empty() {
@@ -4365,7 +4424,7 @@ async fn handle_bgp_session(
                                     peer.uptime = SystemTime::now();
 
                                     source = Arc::new(Source {
-                                        local_addr: local_addr,
+                                        local_addr,
                                         local_as: peer.local_as,
                                         address: addr,
                                         ibgp: peer.local_as == peer.remote_as,
@@ -4374,8 +4433,8 @@ async fn handle_bgp_session(
                                     let _ = table_tx.send(FromPeerEvent::Established(source.clone()));
                                 }
 
-                                delay.reset(
-                                    Instant::now() + Duration::from_secs(keepalive_interval as u64),
+                                delay = tokio::time::interval(
+                                    Duration::from_secs(keepalive_interval as u64),
                                 );
                             }
                         }
@@ -4403,7 +4462,7 @@ async fn handle_bmp_session(
     let mut lines = Framed::new(stream, BytesCodec::new());
     loop {
         tokio::select! {
-            Some(msg) = rx.next().fuse() => {
+            Some(msg) = rx.recv().fuse() => {
                 match msg.to_bytes() {
                     Ok(buf) => {
                         if lines.get_mut().write_all(&buf).await.is_err() {
