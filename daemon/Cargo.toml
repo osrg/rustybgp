@@ -7,13 +7,14 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tonic = "0.2"
-bytes = "0.5"
-prost = "0.6"
-prost-types = "0.6"
-prost-derive = "0.6"
-tokio = { version = "0.2", features = ["full"] }
-tokio-util = { version = "0.3" }
+tonic = "0.4"
+bytes = "1.0"
+prost = "0.7"
+prost-types = "0.7"
+prost-derive = "0.7"
+tokio = { version = "1.0.1", features = ["full"] }
+tokio-util = { version = "0.6", features = ["codec","time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 clap = "2.33"
 futures = "0.3"
 patricia_tree = "0.1"
