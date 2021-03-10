@@ -24,4 +24,4 @@ fnv = "1.0"
 proto = { path = "../proto" }
 
 [build-dependencies]
-tonic-build = "0.2"
+tonic-build = "0.4"
