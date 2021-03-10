@@ -2,6 +2,8 @@
 
 cd `dirname $0`
 
+DEFAULT_GOBGP_IMAGE="ghcr.io/fujita/gobgp-for-rustybgp-ci"
+
 rm_containers() {
     ids=($(docker ps -a -q -f "label=rustybgp-ci"))
     if [ $ids ]; then
@@ -37,7 +39,7 @@ EOF
         for name in ${tests[@]}
         do
             rm_containers
-            GOBGP_IMAGE_NAME=tomo/gobgp go test ./... -v -count 1 -run $name
+            GOBGP_IMAGE_NAME=${DEFAULT_GOBGP_IMAGE} go test ./... -v -count 1 -run $name
             if [ $? -ne 0 ]; then
                 exit 1
             fi
@@ -51,7 +53,7 @@ EOF
         fi
         name=$(grep "func Test" $2|gawk -F " " '{ print gensub("\\(t", "", 1, $2) }')
         rm_containers
-        GOBGP_IMAGE_NAME=tomo/gobgp go test ./... -v -count 1 -run $name
+        GOBGP_IMAGE_NAME=${DEFAULT_GOBGP_IMAGE} go test ./... -v -count 1 -run $name
     ;;
 
     stop)
