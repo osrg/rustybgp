@@ -36,7 +36,7 @@ func gobgpImageName() string {
 	if n := os.Getenv(imageNameEnv); n != "" {
 		return n
 	}
-	return "docker.pkg.github.com/fujita/gobgp/gobgp-daemon"
+	return "ghcr.io/fujita/gobgp-for-rustybgp-ci"
 }
 
 type peer struct {

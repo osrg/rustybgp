@@ -56,13 +56,9 @@ jobs:
     steps:
       - uses: actions/checkout@master
 
-      - name: Login GitHub Registry
-        run: |
-          echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
-
       - name: pull gobgp image
         run: |
-          docker pull docker.pkg.github.com/fujita/gobgp/gobgp-daemon
+          docker pull ghcr.io/fujita/gobgp-for-rustybgp-ci
 
       - name: download rustybgp image
         uses: actions/download-artifact@v1
@@ -84,13 +80,9 @@ jobs:
     steps:
       - uses: actions/checkout@master
 
-      - name: Login GitHub Registry
-        run: |
-          echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
-
       - name: pull gobgp image
         run: |
-          docker pull docker.pkg.github.com/fujita/gobgp/gobgp-daemon
+          docker pull ghcr.io/fujita/gobgp-for-rustybgp-ci
 
       - name: download rustybgp image
         uses: actions/download-artifact@v1
@@ -112,13 +104,9 @@ jobs:
     steps:
       - uses: actions/checkout@master
 
-      - name: Login GitHub Registry
-        run: |
-          echo ${{ secrets.GITHUB_TOKEN }} | docker login docker.pkg.github.com -u owner --password-stdin
-
       - name: pull gobgp image
         run: |
-          docker pull docker.pkg.github.com/fujita/gobgp/gobgp-daemon
+          docker pull ghcr.io/fujita/gobgp-for-rustybgp-ci
 
       - name: download rustybgp image
         uses: actions/download-artifact@v1
