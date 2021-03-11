@@ -1,27 +1,31 @@
 [package]
-name = "daemon"
-version = "0.1.0"
+name = "rustybgpd"
+version = "0.2.0"
 authors = ["FUJITA Tomonori <fujita.tomonori@gmail.com>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tonic = "0.4"
+tonic = "0.4.2"
 bytes = "1.0"
 prost = "0.7"
 prost-types = "0.7"
 prost-derive = "0.7"
-tokio = { version = "1.0.1", features = ["full"] }
+tokio = { version = "1.5", features = ["full"] }
 tokio-util = { version = "0.6", features = ["codec","time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 clap = "2.33"
 futures = "0.3"
-patricia_tree = "0.1"
+futures-util = {version="0.3", features=["alloc"]}
+patricia_tree = "0.3"
 regex = "1"
 fnv = "1.0"
-
-proto = { path = "../proto" }
+num_cpus = "1.0"
+socket2 = { version="0.4", features = ["all"]}
+byteorder = "1.3.2"
+once_cell = "1"
+thiserror = "1"
 
 [build-dependencies]
-tonic-build = "0.4"
+tonic-build = "0.4.2"

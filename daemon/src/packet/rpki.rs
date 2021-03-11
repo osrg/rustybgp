@@ -1,4 +1,4 @@
-// Copyright (C) 2020 The RustyBGP Authors.
+// Copyright (C) 2020-2021 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,67 +13,62 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::bgp::IpNet;
-use super::error::Error;
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
+use bytes::{BufMut, BytesMut};
 use std::io::Cursor;
 use std::net::IpAddr;
+use tokio_util::codec::{Decoder, Encoder};
 
-pub struct CommonHeader {
-    pub version: u8,
-    pub message_type: u8,
-    pub session_id: u16,
-    pub lenght: u32,
-    pub serial_number: u32,
+use crate::error::Error;
+use crate::packet::IpNet;
+
+pub(crate) struct Prefix {
+    pub(crate) net: IpNet,
+    pub(crate) flags: u8,
+    pub(crate) max_length: u8,
+    pub(crate) as_number: u32,
 }
 
-pub struct Prefix {
-    pub net: IpNet,
-    pub flags: u8,
-    pub max_length: u8,
-    pub as_number: u32,
-}
-
-pub enum Message {
+#[allow(dead_code)]
+pub(crate) enum Message {
     SerialNotify { serial_number: u32 },
     SerialQuery { serial_number: u32 },
     ResetQuery,
     CacheResponse,
-    Ipv4Prefix(Prefix),
-    Ipv6Prefix(Prefix),
+    IpPrefix(Prefix),
     EndOfData { serial_number: u32 },
     CacheReset,
     ErrorReport,
 }
 
 impl Message {
-    pub const SERIAL_NOTIFY: u8 = 0;
-    pub const SERIAL_QUERY: u8 = 1;
-    pub const RESET_QUERY: u8 = 2;
-    pub const CACHE_RESPONSE: u8 = 3;
-    pub const IPV4_PREFIX: u8 = 4;
-    pub const IPV6_PREFIX: u8 = 6;
-    pub const END_OF_DATA: u8 = 7;
-    pub const CACHE_RESET: u8 = 8;
-    pub const ERROR_REPORT: u8 = 10;
+    pub(crate) const SERIAL_NOTIFY: u8 = 0;
+    pub(crate) const SERIAL_QUERY: u8 = 1;
+    pub(crate) const RESET_QUERY: u8 = 2;
+    pub(crate) const CACHE_RESPONSE: u8 = 3;
+    pub(crate) const IPV4_PREFIX: u8 = 4;
+    pub(crate) const IPV6_PREFIX: u8 = 6;
+    pub(crate) const END_OF_DATA: u8 = 7;
+    pub(crate) const CACHE_RESET: u8 = 8;
+    pub(crate) const ERROR_REPORT: u8 = 10;
 
-    //const HEADER_LENGTH: u32 = 6;
-
-    pub fn message_type(&self) -> u8 {
+    pub(crate) fn code(&self) -> u8 {
         match self {
             Message::SerialNotify { .. } => Message::SERIAL_NOTIFY,
             Message::SerialQuery { .. } => Message::SERIAL_QUERY,
             Message::ResetQuery { .. } => Message::RESET_QUERY,
             Message::CacheResponse => Message::CACHE_RESPONSE,
-            Message::Ipv4Prefix(_) => Message::IPV4_PREFIX,
-            Message::Ipv6Prefix(_) => Message::IPV6_PREFIX,
+            Message::IpPrefix(prefix) => match prefix.net {
+                IpNet::V4(_) => Message::IPV4_PREFIX,
+                IpNet::V6(_) => Message::IPV6_PREFIX,
+            },
             Message::EndOfData { .. } => Message::END_OF_DATA,
             Message::CacheReset => Message::CACHE_RESET,
             Message::ErrorReport => Message::ERROR_REPORT,
         }
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+    fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let buf: Vec<u8> = Vec::new();
         let mut c = Cursor::new(buf);
 
@@ -86,7 +81,7 @@ impl Message {
         Ok(c.into_inner())
     }
 
-    pub fn from_bytes(buf: &[u8]) -> Result<(Message, usize), Error> {
+    fn from_bytes(buf: &[u8]) -> Result<(Message, usize), Error> {
         let buflen = buf.len();
         let mut c = Cursor::new(buf);
 
@@ -96,7 +91,11 @@ impl Message {
         let length = c.read_u32::<NetworkEndian>()? as usize;
 
         if length > buflen {
-            return Err(Error::InvalidFormat);
+            return Err(Error::InvalidMessageFormat {
+                code: 0,
+                subcode: 0,
+                data: buf.to_owned(),
+            });
         }
 
         match message_type {
@@ -121,11 +120,8 @@ impl Message {
                 }
                 let as_number = c.read_u32::<NetworkEndian>()?;
                 Ok((
-                    Message::Ipv4Prefix(Prefix {
-                        net: IpNet {
-                            addr: IpAddr::from(octets),
-                            mask: prefix_len,
-                        },
+                    Message::IpPrefix(Prefix {
+                        net: IpNet::new(IpAddr::from(octets), prefix_len),
                         flags,
                         max_length,
                         as_number,
@@ -144,11 +140,8 @@ impl Message {
                 }
                 let as_number = c.read_u32::<NetworkEndian>()?;
                 Ok((
-                    Message::Ipv6Prefix(Prefix {
-                        net: IpNet {
-                            addr: IpAddr::from(octets),
-                            mask: prefix_len,
-                        },
+                    Message::IpPrefix(Prefix {
+                        net: IpNet::new(IpAddr::from(octets), prefix_len),
                         flags,
                         max_length,
                         as_number,
@@ -162,7 +155,45 @@ impl Message {
             }
             Message::CACHE_RESET => Ok((Message::CacheReset, length)),
             Message::ERROR_REPORT => Ok((Message::ErrorReport, length)),
-            _ => Err(Error::InvalidFormat),
+            _ => Err(Error::InvalidMessageFormat {
+                code: 0,
+                subcode: 0,
+                data: buf.to_owned(),
+            }),
+        }
+    }
+}
+
+pub(crate) struct RtrCodec {}
+
+impl RtrCodec {
+    pub(crate) fn new() -> Self {
+        RtrCodec {}
+    }
+}
+
+impl Encoder<&Message> for RtrCodec {
+    type Error = Error;
+
+    fn encode(&mut self, item: &Message, dst: &mut BytesMut) -> Result<(), Error> {
+        let buf = item.to_bytes().unwrap();
+        dst.reserve(buf.len());
+        dst.put_slice(&buf);
+        Ok(())
+    }
+}
+
+impl Decoder for RtrCodec {
+    type Item = Message;
+    type Error = Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        match Message::from_bytes(src) {
+            Ok((m, len)) => {
+                let _ = src.split_to(len);
+                Ok(Some(m))
+            }
+            Err(_) => Ok(None),
         }
     }
 }

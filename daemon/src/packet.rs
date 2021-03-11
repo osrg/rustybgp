@@ -1,4 +1,4 @@
-// Copyright (C) 2019 The RustyBGP Authors.
+// Copyright (C) 2019-2021 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod bgp;
-pub mod bmp;
-pub mod error;
-pub mod rtr;
+pub(crate) mod bgp;
+pub(crate) use self::bgp::{Attribute, Capability, Family, FamilyCapability, IpNet, Message, Net};
+
+pub(crate) mod rpki;
