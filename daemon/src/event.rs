@@ -2437,7 +2437,7 @@ impl Handler {
                                 }
                             }
                             if ready.is_writable() && !pending.is_empty() || pending_txbuf.is_some() {
-                                for _ in 0..std::cmp::min(pending.len(), 8) {
+                                for _ in 0..std::cmp::min(pending.len(), 32) {
                                     let mut txbuf = match pending_txbuf.take() {
                                         Some(txbuf) => txbuf,
                                         None => {
