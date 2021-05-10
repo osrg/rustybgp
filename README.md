@@ -12,15 +12,15 @@ You can easily build RusyBGP on any system that has Docker running. You don't ne
 $ git clone https://github.com/osrg/rustybgp.git
 $ cd rustybgp
 $ docker run --rm -it -v "$(pwd)":/home/rust/src ekidd/rust-musl-builder cargo build --release
-$ ls -hl target/x86_64-unknown-linux-musl/release/daemon
--rwxr-xr-x 2 fujita fujita 8.1M Dec  6 12:26 target/x86_64-unknown-linux-musl/release/daemon
+$ ls -lh target/x86_64-unknown-linux-musl/release/rustybgpd
+-rwxr-xr-x 2 ubuntu ubuntu 12M May 10 14:52 target/x86_64-unknown-linux-musl/release/rustybgpd
 ```
 
 No configuration file support; only via the gRPC API. You can use GoBGP's CLI command.
 
 ```bash
-$ sudo ./target/debug/daemon
-Hello, RustyBGP!
+$ sudo ./target/x86_64-unknown-linux-musl/release/rustybgpd
+Hello, RustyBGP (32 cpus)!
 ```
 
 Then you can manage the daemon on a different terminal.
@@ -36,8 +36,8 @@ Peer        AS Up/Down State       |#Received  Accepted
 If you just want to check out the performance, start the daemon with `--any-peers` option. The daemon accepts any peers without configuration.
 
 ```bash
-$ sudo ./target/debug/daemon --as-number 65001 --router-id 1.1.1.1 --any-peers
-Hello, RustyBGP!
+$ sudo ./target/x86_64-unknown-linux-musl/release/rustybgpd --as-number 65001 --router-id 1.1.1.1 --any-peers
+Hello, RustyBGP (32 cpus)!
 ```
 
 ## Supported Features
