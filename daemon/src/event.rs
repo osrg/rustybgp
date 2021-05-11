@@ -2121,7 +2121,7 @@ impl Handler {
             ),
             stream: Some(stream),
             source: None,
-            table_tx: Vec::new(),
+            table_tx: Vec::with_capacity(*NUM_TABLES),
             peer_event_tx: Vec::new(),
             holdtimer_renewed: Instant::now(),
             shutdown: None,
@@ -2285,12 +2285,19 @@ impl Handler {
                     )));
 
                     let d = dealer(&self.peer_addr);
+                    let mut reach: Vec<table::Change> = Vec::new();
                     for i in 0..*NUM_TABLES {
                         let mut t = TABLE[i].lock().await;
                         for f in self.family_cap.keys() {
-                            pending.append(
-                                &mut t.rtable.best(f).into_iter().map(|x| x.into()).collect(),
-                            );
+                            if f == &packet::Family::IPV4 {
+                                reach.append(
+                                    &mut t.rtable.best(f).into_iter().map(|x| x.into()).collect(),
+                                );
+                            } else {
+                                pending.append(
+                                    &mut t.rtable.best(f).into_iter().map(|x| x.into()).collect(),
+                                );
+                            }
                         }
                         t.peer_event_tx
                             .insert(self.peer_addr, self.peer_event_tx.remove(0));
@@ -2298,6 +2305,10 @@ impl Handler {
                         let tx = t.table_event_tx[d].clone();
                         self.table_tx.push(tx);
                     }
+                    pending.append(&mut table::Change::squash(
+                        reach,
+                        self.source.as_ref().unwrap().clone(),
+                    ));
                 }
                 Ok(())
             }
