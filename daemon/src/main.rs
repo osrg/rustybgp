@@ -17,6 +17,7 @@
 mod api {
     tonic::include_proto!("gobgpapi");
 }
+mod config;
 mod error;
 mod event;
 mod net;
@@ -28,8 +29,15 @@ use clap::{App, Arg};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
-fn main() {
+fn main() -> Result<(), std::io::Error> {
     let args = App::new("rustybgpd")
+        .arg(
+            Arg::with_name("config")
+                .short("f")
+                .long("config-file")
+                .takes_value(true)
+                .help("specifying a config file"),
+        )
         .arg(
             Arg::with_name("asn")
                 .long("as-number")
@@ -54,18 +62,47 @@ fn main() {
         )
         .get_matches();
 
-    let as_number = if let Some(asn) = args.value_of("asn") {
-        asn.parse().unwrap()
+    let conf = if let Some(conf) = args.value_of("config") {
+        let conf: config::Bgp = toml::from_str(&(std::fs::read_to_string(conf)?))?;
+        if let Err(e) = conf.validate() {
+            panic!("invalid configuraiton {:?}", e);
+        }
+        Some(conf)
     } else {
-        0
-    };
-    let router_id = if let Some(id) = args.value_of("id") {
-        Ipv4Addr::from_str(id).unwrap()
-    } else {
-        Ipv4Addr::new(0, 0, 0, 0)
+        let as_number = if let Some(asn) = args.value_of("asn") {
+            asn.parse().unwrap()
+        } else {
+            0
+        };
+        let router_id = if let Some(id) = args.value_of("id") {
+            Ipv4Addr::from_str(id).unwrap();
+            Some(id.to_string())
+        } else {
+            if as_number != 0 {
+                panic!("both as number and router-id must be specified");
+            }
+            None
+        };
+        if as_number != 0 {
+            let conf = config::Bgp {
+                global: Some(config::Global {
+                    config: Some(config::GlobalConfig {
+                        r#as: Some(as_number),
+                        router_id,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            Some(conf)
+        } else {
+            None
+        }
     };
 
     println!("Hello, RustyBGPd ({} cpus)!", num_cpus::get());
 
-    event::main(as_number, router_id, args.is_present("any"));
+    event::main(conf, args.is_present("any"));
+    Ok(())
 }

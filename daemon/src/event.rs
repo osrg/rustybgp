@@ -36,6 +36,7 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 use api::gobgp_api_server::{GobgpApi, GobgpApiServer};
 
 use crate::api;
+use crate::config;
 use crate::error::Error;
 use crate::net;
 use crate::packet;
@@ -1946,7 +1947,28 @@ async fn handle_table_update(idx: usize, mut v: Vec<UnboundedReceiverStream<Tabl
     }
 }
 
-async fn serve(as_number: u32, router_id: Ipv4Addr, any_peer: bool) {
+async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
+    let global_config = if let Some(bgp) = bgp
+        .as_ref()
+        .and_then(|x| x.global.as_ref())
+        .and_then(|x| x.config.as_ref())
+    {
+        Some(bgp)
+    } else {
+        None
+    };
+
+    let as_number = if let Some(asn) = global_config.as_ref().and_then(|x| x.r#as) {
+        asn
+    } else {
+        0
+    };
+    let router_id =
+        if let Some(router_id) = global_config.as_ref().and_then(|x| x.router_id.as_ref()) {
+            router_id.parse().unwrap()
+        } else {
+            Ipv4Addr::new(0, 0, 0, 0)
+        };
     let notify = Arc::new(tokio::sync::Notify::new());
     if as_number != 0 {
         notify.clone().notify_one();
@@ -1954,6 +1976,17 @@ async fn serve(as_number: u32, router_id: Ipv4Addr, any_peer: bool) {
         let global = &mut GLOBAL.write().await;
         global.as_number = as_number;
         global.router_id = router_id;
+    }
+
+    if let Some(peers) = bgp.and_then(|x| x.neighbors) {
+        let mut server = GLOBAL.write().await;
+        for p in peers {
+            let c = p.config.as_ref().unwrap();
+            let peer = Peer::new(c.neighbor_address.as_ref().unwrap().parse().unwrap())
+                .remote_as(c.peer_as.unwrap())
+                .passive(true);
+            server.add_peer(peer).unwrap();
+        }
     }
 
     if any_peer {
@@ -2028,12 +2061,12 @@ async fn serve(as_number: u32, router_id: Ipv4Addr, any_peer: bool) {
     }
 }
 
-pub(crate) fn main(as_number: u32, router_id: Ipv4Addr, any_peer: bool) {
+pub(crate) fn main(bgp: Option<config::Bgp>, any_peer: bool) {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(serve(as_number, router_id, any_peer));
+        .block_on(serve(bgp, any_peer));
 }
 
 struct Handler {

@@ -2,7 +2,7 @@
 
 The mission is to develop a high-performance, low-memory-footprint, and safe BGP implementation; an experiment to implement aged and rusty BGP protocol in a modern language.
 
-RustyBGP supports the gRPC APIs same as GoBGP; your code to manage GoBGP via the APIs should work with RustyBGP. If you need CLI, GoBGP's CLI command allows you to manage RustyBGP.
+RustyBGP supports the gRPC APIs same as GoBGP; your code to manage GoBGP via the APIs should work with RustyBGP. If you need CLI, GoBGP's CLI command allows you to manage RustyBGP. RustyBGP also supports the same configuration file format as GoBGP (only toml for now).
 
 ## Get Started
 
@@ -16,18 +16,14 @@ $ ls -lh target/x86_64-unknown-linux-musl/release/rustybgpd
 -rwxr-xr-x 2 ubuntu ubuntu 12M May 10 14:52 target/x86_64-unknown-linux-musl/release/rustybgpd
 ```
 
-No configuration file support; only via the gRPC API. You can use GoBGP's CLI command.
-
 ```bash
-$ sudo ./target/x86_64-unknown-linux-musl/release/rustybgpd
+$ sudo ./target/x86_64-unknown-linux-musl/release/rustybgpd -f gobgpd.conf
 Hello, RustyBGP (32 cpus)!
 ```
 
-Then you can manage the daemon on a different terminal.
+Then you can manage the daemon on a different terminal with GoBGP's CLI command.
 
 ```bash
-$ gobgp global as 65001 router-id 1.1.1.1
-$ gobgp neighbor add 10.0.0.2 as 65002
 $ gobgp neighbor
 Peer        AS Up/Down State       |#Received  Accepted
 10.0.0.2 65002   never Idle        |        0         0

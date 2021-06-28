@@ -34,6 +34,8 @@ pub(crate) enum Error {
         subcode: u8,
         data: Vec<u8>,
     },
+    #[error("invalid configuration")]
+    InvalidConfiguration(String),
     #[error("std::io::Error")]
     StdIoErr(#[from] std::io::Error),
 }

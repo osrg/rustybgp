@@ -17,3 +17,5 @@ tests/integration/functional/gobgp
 tests/integration/functional/gobgp_2.11.0_linux_amd64.tar.gz
 tests/integration/functional/gobgpd
 tests/integration/functional/rustybgpd
+
+**/*.pyc
