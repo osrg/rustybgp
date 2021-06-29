@@ -51,11 +51,6 @@ fn main() -> Result<(), std::io::Error> {
                 .help("specify router id"),
         )
         .arg(
-            Arg::with_name("collector")
-                .long("disable-best")
-                .help("disable best path selection"),
-        )
-        .arg(
             Arg::with_name("any")
                 .long("any-peers")
                 .help("accept any peers"),
