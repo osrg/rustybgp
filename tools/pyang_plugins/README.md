@@ -1,33 +1,34 @@
-## What's this ?
+# What's this ?
 
 This is a pyang plugin to generate config/gen.rs from
-openconfig yang files (see https://github.com/openconfig/public).
+[OpenConfig YANG files](https://github.com/openconfig/public).
 
 ## How to use
-You must use Python 2.7 versions. Set the environment variables for this tool::
+
+You must use Python 2.7 versions. Set the environment variables for this tool:
 
 ```bash
 $ SOURCE=$HOME/git
 $ RUSTYBGP=$SOURCE/rustybgp
 ```
 
-Clone the required resources by using Git::
+Clone the required resources by using git:
 
 ```bash
 $ cd $SOURCE
 $ git clone https://github.com/osrg/public
-$ git clone https://github.com/YangModels/yang
-$ git clone https://github.com/mbj4668/pyang
+$ git clone https://github.com/osrg/yang
+$ git clone https://github.com/osrg/pyang
 ```
 
-Setup environments for pyang::
+Setup environments for pyang:
 
 ```bash
 $ cd $SOURCE/pyang
 $ source ./env.sh
 ```
 
-Generate config/gen.rs from yang files::
+Generate config/gen.rs from yang files:
 
 ```bash
 $ PYTHONPATH=. ./bin/pyang \
@@ -39,5 +40,6 @@ $ PYTHONPATH=. ./bin/pyang \
 -f rust \
 $SOURCE/public/release/models/bgp/openconfig-bgp.yang \
 $SOURCE/public/release/models/policy/openconfig-routing-policy.yang \
-$RUSTYBGP/tools/pyang_plugins/gobgp.yang > $RUSTYBGP/daemon/src/config/gen.rs
+$RUSTYBGP/tools/pyang_plugins/gobgp.yang > \
+$RUSTYBGP/daemon/src/config/gen.rs
 ```
