@@ -190,6 +190,8 @@ struct Peer {
     remote_cap: Vec<packet::Capability>,
     local_cap: Vec<packet::Capability>,
 
+    route_server_client: bool,
+
     mgmt_tx: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
 }
 
@@ -227,6 +229,7 @@ impl Peer {
             accepted: FnvHashMap::default(),
             remote_cap: Vec::new(),
             local_cap: Vec::new(),
+            route_server_client: false,
             mgmt_tx: None,
         }
     }
@@ -277,6 +280,11 @@ impl Peer {
 
     fn passive(mut self, passive: bool) -> Self {
         self.passive = passive;
+        self
+    }
+
+    fn rs_client(mut self, rs: bool) -> Self {
+        self.route_server_client = rs;
         self
     }
 
@@ -383,7 +391,10 @@ impl From<&Peer> for api::Peer {
             conf: Some(Default::default()),
             timers: Some(tm),
             route_reflector: Some(Default::default()),
-            route_server: Some(Default::default()),
+            route_server: Some(api::RouteServer {
+                route_server_client: p.route_server_client,
+                secondary_route: false,
+            }),
             afi_safis: afisafis,
             ..Default::default()
         }
@@ -412,6 +423,11 @@ impl TryFrom<&api::Peer> for Peer {
                     .collect(),
             )
             .passive(p.transport.as_ref().map_or(false, |x| x.passive_mode))
+            .rs_client(
+                p.route_server
+                    .as_ref()
+                    .map_or(false, |x| x.route_server_client),
+            )
             .hold_time(
                 p.timers
                     .as_ref()
@@ -425,6 +441,44 @@ impl TryFrom<&api::Peer> for Peer {
                     .map_or(0, |x| x.as_ref().map_or(0, |x| x.connect_retry)),
             )
             .admin_down(conf.admin_down))
+    }
+}
+
+// assumes that config::Neighbor is valified so use From instead of TryFrom
+impl From<&config::Neighbor> for Peer {
+    fn from(n: &config::Neighbor) -> Peer {
+        let c = n.config.as_ref().unwrap();
+        let peer = Peer::new(c.neighbor_address.as_ref().unwrap().parse().unwrap())
+            .local_as(c.local_as.map_or(0, |x| x))
+            .remote_as(c.peer_as.unwrap())
+            .remote_port(n.transport.as_ref().map_or(0, |t| {
+                t.config
+                    .as_ref()
+                    .map_or(0, |t| t.remote_port.map_or(0, |n| n))
+            }))
+            .passive(n.transport.as_ref().map_or(false, |t| {
+                t.config
+                    .as_ref()
+                    .map_or(false, |t| t.passive_mode.map_or(false, |t| t))
+            }))
+            .rs_client(n.route_server.as_ref().map_or(false, |r| {
+                r.config
+                    .as_ref()
+                    .map_or(false, |r| r.route_server_client.map_or(false, |r| r))
+            }))
+            .hold_time(n.timers.as_ref().map_or(0, |c| {
+                c.config
+                    .as_ref()
+                    .map_or(0, |c| c.hold_time.map_or(0, |c| c as u64))
+            }))
+            .connect_retry_time(n.timers.as_ref().map_or(0, |c| {
+                c.config
+                    .as_ref()
+                    .map_or(0, |c| c.connect_retry.map_or(0, |c| c as u64))
+            }))
+            .admin_down(c.admin_down.map_or(false, |c| c));
+
+        peer
     }
 }
 
@@ -452,6 +506,19 @@ struct DynamicPeer {
 struct PeerGroup {
     as_number: u32,
     dynamic_peers: Vec<DynamicPeer>,
+    // passive: bool,
+    route_server_client: bool,
+}
+
+impl From<api::PeerGroup> for PeerGroup {
+    fn from(p: api::PeerGroup) -> PeerGroup {
+        PeerGroup {
+            as_number: p.conf.map_or(0, |c| c.peer_as),
+            dynamic_peers: Vec::new(),
+            // passive: p.transport.map_or(false, |c| c.passive_mode),
+            route_server_client: p.route_server.map_or(false, |c| c.route_server_client),
+        }
+    }
 }
 
 struct GrpcService {
@@ -771,9 +838,14 @@ impl GobgpApi for GrpcService {
             .into_inner()
             .peer_group
             .ok_or(Error::EmptyArgument)?;
-        let conf = pg.conf.ok_or(Error::EmptyArgument)?;
+        let conf = pg.conf.as_ref().ok_or(Error::EmptyArgument)?;
 
-        match GLOBAL.write().await.peer_group.entry(conf.peer_group_name) {
+        match GLOBAL
+            .write()
+            .await
+            .peer_group
+            .entry(conf.peer_group_name.clone())
+        {
             Occupied(_) => {
                 return Err(tonic::Status::new(
                     tonic::Code::AlreadyExists,
@@ -781,11 +853,7 @@ impl GobgpApi for GrpcService {
                 ));
             }
             Vacant(v) => {
-                let p = PeerGroup {
-                    as_number: conf.peer_as,
-                    dynamic_peers: Vec::new(),
-                };
-                v.insert(p);
+                v.insert(PeerGroup::from(pg));
                 return Ok(tonic::Response::new(()));
             }
         }
@@ -1811,12 +1879,14 @@ async fn accept_connection(stream: TcpStream) -> std::io::Result<()> {
         }
         None => {
             let mut is_dynamic = false;
+            let mut rs_client = false;
             let mut remote_as = 0;
             for p in &global.peer_group {
                 for d in &p.1.dynamic_peers {
                     if d.prefix.contains(&peer_addr) {
                         remote_as = p.1.as_number;
                         is_dynamic = true;
+                        rs_client = p.1.route_server_client;
                         break;
                     }
                 }
@@ -1834,6 +1904,7 @@ async fn accept_connection(stream: TcpStream) -> std::io::Result<()> {
                     .state(State::Active)
                     .remote_as(remote_as)
                     .delete_on_disconnected(true)
+                    .rs_client(rs_client)
                     .mgmt_channel(tx),
             );
             let peer = global.peers.get(&peer_addr).unwrap();
@@ -1978,14 +2049,51 @@ async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
         global.router_id = router_id;
     }
 
-    if let Some(peers) = bgp.and_then(|x| x.neighbors) {
+    if let Some(groups) = bgp.as_ref().and_then(|x| x.peer_groups.as_ref()) {
+        let mut server = GLOBAL.write().await;
+        for pg in groups {
+            if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {
+                server.peer_group.insert(
+                    name,
+                    PeerGroup {
+                        as_number: pg.config.as_ref().map_or(0, |x| x.peer_as.map_or(0, |x| x)),
+                        dynamic_peers: Vec::new(),
+                        route_server_client: pg.route_server.as_ref().map_or(false, |x| {
+                            x.config
+                                .as_ref()
+                                .map_or(false, |x| x.route_server_client.map_or(false, |x| x))
+                        }),
+                        // passive: pg.transport.as_ref().map_or(false, |x| {
+                        //     x.config
+                        //         .as_ref()
+                        //         .map_or(false, |x| x.passive_mode.map_or(false, |x| x))
+                        // }),
+                    },
+                );
+            }
+        }
+    }
+
+    if let Some(neighbors) = bgp.as_ref().and_then(|x| x.dynamic_neighbors.as_ref()) {
+        let mut server = GLOBAL.write().await;
+        for n in neighbors {
+            if let Some(prefix) = n.config.as_ref().and_then(|x| x.prefix.as_ref()) {
+                if let Ok(prefix) = packet::IpNet::from_str(prefix) {
+                    if let Some(name) = n.config.as_ref().and_then(|x| x.peer_group.as_ref()) {
+                        server
+                            .peer_group
+                            .entry(name.to_string())
+                            .and_modify(|e| e.dynamic_peers.push(DynamicPeer { prefix }));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
         let mut server = GLOBAL.write().await;
         for p in peers {
-            let c = p.config.as_ref().unwrap();
-            let peer = Peer::new(c.neighbor_address.as_ref().unwrap().parse().unwrap())
-                .remote_as(c.peer_as.unwrap())
-                .passive(true);
-            server.add_peer(peer).unwrap();
+            server.add_peer(Peer::from(p)).unwrap();
         }
     }
 
@@ -2003,6 +2111,8 @@ async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
                         prefix: packet::IpNet::from_str("::/0").unwrap(),
                     },
                 ],
+                // passive: true,
+                route_server_client: false,
             },
         );
     }
