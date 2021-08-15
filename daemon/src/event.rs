@@ -508,6 +508,7 @@ struct PeerGroup {
     dynamic_peers: Vec<DynamicPeer>,
     // passive: bool,
     route_server_client: bool,
+    holdtime: Option<u64>,
 }
 
 impl From<api::PeerGroup> for PeerGroup {
@@ -517,6 +518,7 @@ impl From<api::PeerGroup> for PeerGroup {
             dynamic_peers: Vec::new(),
             // passive: p.transport.map_or(false, |c| c.passive_mode),
             route_server_client: p.route_server.map_or(false, |c| c.route_server_client),
+            holdtime: None,
         }
     }
 }
@@ -1881,12 +1883,14 @@ async fn accept_connection(stream: TcpStream) -> std::io::Result<()> {
             let mut is_dynamic = false;
             let mut rs_client = false;
             let mut remote_as = 0;
+            let mut holdtime = None;
             for p in &global.peer_group {
                 for d in &p.1.dynamic_peers {
                     if d.prefix.contains(&peer_addr) {
                         remote_as = p.1.as_number;
                         is_dynamic = true;
                         rs_client = p.1.route_server_client;
+                        holdtime = p.1.holdtime;
                         break;
                     }
                 }
@@ -1899,14 +1903,16 @@ async fn accept_connection(stream: TcpStream) -> std::io::Result<()> {
                 return Ok(());
             }
             let (tx, rx) = mpsc::unbounded_channel();
-            let _ = global.add_peer(
-                Peer::new(peer_addr)
-                    .state(State::Active)
-                    .remote_as(remote_as)
-                    .delete_on_disconnected(true)
-                    .rs_client(rs_client)
-                    .mgmt_channel(tx),
-            );
+            let mut p = Peer::new(peer_addr)
+                .state(State::Active)
+                .remote_as(remote_as)
+                .delete_on_disconnected(true)
+                .rs_client(rs_client)
+                .mgmt_channel(tx);
+            if let Some(holdtime) = holdtime {
+                p = p.hold_time(holdtime);
+            }
+            let _ = global.add_peer(p);
             let peer = global.peers.get(&peer_addr).unwrap();
             (
                 peer.local_as,
@@ -2063,6 +2069,11 @@ async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
                                 .as_ref()
                                 .map_or(false, |x| x.route_server_client.map_or(false, |x| x))
                         }),
+                        holdtime: pg.timers.as_ref().map_or(None, |x| {
+                            x.config.as_ref().map_or(None, |x| {
+                                x.hold_time.as_ref().map_or(None, |x| Some(*x as u64))
+                            })
+                        }),
                         // passive: pg.transport.as_ref().map_or(false, |x| {
                         //     x.config
                         //         .as_ref()
@@ -2113,6 +2124,7 @@ async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
                 ],
                 // passive: true,
                 route_server_client: false,
+                holdtime: None,
             },
         );
     }
