@@ -1002,10 +1002,16 @@ impl Attribute {
         local_as: u32,
         local_addr: IpAddr,
         is_mp: bool,
+        keep_aspath: bool,
+        keep_nexthop: bool,
     ) -> (u16, Option<Attribute>) {
         match code {
             Attribute::AS_PATH => {
-                let n = self.as_path_prepend(local_as);
+                let n = if keep_aspath {
+                    self.clone()
+                } else {
+                    self.as_path_prepend(local_as)
+                };
                 let l = if let Some(dst) = dst {
                     n.encode(dst).unwrap()
                 } else {
@@ -1017,7 +1023,11 @@ impl Attribute {
                 if is_mp {
                     return (0, None);
                 }
-                let n = self.nexthop_update(local_addr);
+                let n = if keep_nexthop {
+                    self.clone()
+                } else {
+                    self.nexthop_update(local_addr)
+                };
                 let l = if let Some(dst) = dst {
                     n.encode(dst).unwrap()
                 } else {
@@ -1456,6 +1466,8 @@ pub(crate) struct BgpCodec {
     local_as: u32,
     remote_as: u32,
     local_addr: IpAddr,
+    keep_aspath: bool,
+    keep_nexthop: bool,
 }
 
 impl BgpCodec {
@@ -1465,6 +1477,8 @@ impl BgpCodec {
             local_as: 0,
             remote_as: 0,
             local_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            keep_aspath: false,
+            keep_nexthop: false,
         }
     }
 
@@ -1475,6 +1489,16 @@ impl BgpCodec {
 
     pub(crate) fn local_addr(mut self, local_addr: IpAddr) -> Self {
         self.local_addr = local_addr;
+        self
+    }
+
+    pub(crate) fn keep_aspath(mut self, y: bool) -> Self {
+        self.keep_aspath = y;
+        self
+    }
+
+    pub(crate) fn keep_nexthop(mut self, y: bool) -> Self {
+        self.keep_nexthop = y;
         self
     }
 
@@ -1632,8 +1656,15 @@ impl Encoder<&Message> for BgpCodec {
                                 .unwrap();
                             mp_unreach_done = true;
                         }
-                        let (n, _) =
-                            a.export(code, Some(dst), self.local_as, self.local_addr, is_mp);
+                        let (n, _) = a.export(
+                            code,
+                            Some(dst),
+                            self.local_as,
+                            self.local_addr,
+                            is_mp,
+                            self.keep_aspath,
+                            self.keep_nexthop,
+                        );
                         attr_len += n;
                     }
                 }

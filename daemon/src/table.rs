@@ -286,6 +286,7 @@ pub(crate) struct Source {
     peer_type: PeerType,
     local_addr: IpAddr,
     local_as: u32,
+    rs_client: bool,
 }
 
 impl Hash for Source {
@@ -301,6 +302,7 @@ impl Source {
         peer_type: PeerType,
         local_addr: IpAddr,
         local_as: u32,
+        rs_client: bool,
     ) -> Self {
         Source {
             peer_addr,
@@ -308,6 +310,7 @@ impl Source {
             peer_type,
             local_addr,
             local_as,
+            rs_client,
         }
     }
 }
@@ -423,6 +426,8 @@ impl RoutingTable {
                                             p.source.local_as,
                                             p.source.local_addr,
                                             false,
+                                            p.source.rs_client,
+                                            p.source.rs_client,
                                         );
                                         if let Some(m) = m {
                                             m
@@ -735,6 +740,7 @@ fn drop() {
         PeerType::Ebgp,
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
         1,
+        false,
     ));
     let s2 = Arc::new(Source::new(
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
@@ -742,6 +748,7 @@ fn drop() {
         PeerType::Ebgp,
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
         1,
+        false,
     ));
 
     let n1 = packet::Net::V4(packet::bgp::Ipv4Net {

@@ -540,6 +540,7 @@ impl GrpcService {
                 table::PeerType::Ibgp,
                 IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
                 0,
+                false,
             )),
         }
     }
@@ -1853,80 +1854,82 @@ async fn accept_connection(stream: TcpStream) -> std::io::Result<()> {
     let peer_addr = stream.peer_addr()?.ip();
     let mut global = GLOBAL.write().await;
     let router_id = global.router_id;
-    let (local_as, remote_as, local_cap, holdtime, mgmt_rx) = match global.peers.get_mut(&peer_addr)
-    {
-        Some(peer) => {
-            if peer.admin_down {
-                println!(
-                    "admin down; ignore a new passive connection from {}",
-                    peer_addr
-                );
-                return Ok(());
-            }
-            if peer.mgmt_tx.is_some() {
-                println!("already has connection {}", peer_addr);
-                return Ok(());
-            }
-            peer.state = State::Active;
-            let (tx, rx) = mpsc::unbounded_channel();
-            peer.mgmt_tx = Some(tx);
+    let (local_as, remote_as, local_cap, holdtime, rs_client, mgmt_rx) =
+        match global.peers.get_mut(&peer_addr) {
+            Some(peer) => {
+                if peer.admin_down {
+                    println!(
+                        "admin down; ignore a new passive connection from {}",
+                        peer_addr
+                    );
+                    return Ok(());
+                }
+                if peer.mgmt_tx.is_some() {
+                    println!("already has connection {}", peer_addr);
+                    return Ok(());
+                }
+                peer.state = State::Active;
+                let (tx, rx) = mpsc::unbounded_channel();
+                peer.mgmt_tx = Some(tx);
 
-            (
-                peer.local_as,
-                peer.remote_as,
-                peer.local_cap.to_owned(),
-                peer.holdtime,
-                rx,
-            )
-        }
-        None => {
-            let mut is_dynamic = false;
-            let mut rs_client = false;
-            let mut remote_as = 0;
-            let mut holdtime = None;
-            for p in &global.peer_group {
-                for d in &p.1.dynamic_peers {
-                    if d.prefix.contains(&peer_addr) {
-                        remote_as = p.1.as_number;
-                        is_dynamic = true;
-                        rs_client = p.1.route_server_client;
-                        holdtime = p.1.holdtime;
-                        break;
+                (
+                    peer.local_as,
+                    peer.remote_as,
+                    peer.local_cap.to_owned(),
+                    peer.holdtime,
+                    peer.route_server_client,
+                    rx,
+                )
+            }
+            None => {
+                let mut is_dynamic = false;
+                let mut rs_client = false;
+                let mut remote_as = 0;
+                let mut holdtime = None;
+                for p in &global.peer_group {
+                    for d in &p.1.dynamic_peers {
+                        if d.prefix.contains(&peer_addr) {
+                            remote_as = p.1.as_number;
+                            is_dynamic = true;
+                            rs_client = p.1.route_server_client;
+                            holdtime = p.1.holdtime;
+                            break;
+                        }
                     }
                 }
+                if !is_dynamic {
+                    println!(
+                        "can't find configuration a new passive connection {}",
+                        peer_addr
+                    );
+                    return Ok(());
+                }
+                let (tx, rx) = mpsc::unbounded_channel();
+                let mut p = Peer::new(peer_addr)
+                    .state(State::Active)
+                    .remote_as(remote_as)
+                    .delete_on_disconnected(true)
+                    .rs_client(rs_client)
+                    .mgmt_channel(tx);
+                if let Some(holdtime) = holdtime {
+                    p = p.hold_time(holdtime);
+                }
+                let _ = global.add_peer(p);
+                let peer = global.peers.get(&peer_addr).unwrap();
+                (
+                    peer.local_as,
+                    peer.remote_as,
+                    peer.local_cap.to_owned(),
+                    peer.holdtime,
+                    peer.route_server_client,
+                    rx,
+                )
             }
-            if !is_dynamic {
-                println!(
-                    "can't find configuration a new passive connection {}",
-                    peer_addr
-                );
-                return Ok(());
-            }
-            let (tx, rx) = mpsc::unbounded_channel();
-            let mut p = Peer::new(peer_addr)
-                .state(State::Active)
-                .remote_as(remote_as)
-                .delete_on_disconnected(true)
-                .rs_client(rs_client)
-                .mgmt_channel(tx);
-            if let Some(holdtime) = holdtime {
-                p = p.hold_time(holdtime);
-            }
-            let _ = global.add_peer(p);
-            let peer = global.peers.get(&peer_addr).unwrap();
-            (
-                peer.local_as,
-                peer.remote_as,
-                peer.local_cap.to_owned(),
-                peer.holdtime,
-                rx,
-            )
-        }
-    };
+        };
 
     tokio::spawn(async move {
         let session = if let Some(mut handler) = Handler::new(
-            stream, peer_addr, local_as, remote_as, router_id, local_cap, holdtime,
+            stream, peer_addr, local_as, remote_as, router_id, local_cap, holdtime, rs_client,
         ) {
             Some(handler.run(mgmt_rx).await)
         } else {
@@ -2211,6 +2214,7 @@ struct Handler {
     remote_cap: Vec<packet::Capability>,
 
     holdtime: u64,
+    rs_client: bool,
 
     family_cap: FnvHashMap<packet::Family, packet::FamilyCapability>,
 
@@ -2251,6 +2255,7 @@ impl Handler {
         local_router_id: Ipv4Addr,
         local_cap: Vec<packet::Capability>,
         holdtime: u64,
+        rs_client: bool,
     ) -> Option<Self> {
         let local_addr = stream.local_addr().ok()?.ip();
         Some(Handler {
@@ -2268,6 +2273,7 @@ impl Handler {
             remote_cap: Vec::new(),
             local_cap,
             holdtime,
+            rs_client,
             family_cap: FnvHashMap::default(),
 
             keepalive_timer: tokio::time::interval_at(
@@ -2437,6 +2443,7 @@ impl Handler {
                         t,
                         self.local_addr,
                         self.local_as,
+                        self.rs_client,
                     )));
 
                     let d = dealer(&self.peer_addr);
@@ -2476,6 +2483,9 @@ impl Handler {
         let mut codec = packet::bgp::BgpCodec::new()
             .local_as(self.local_as)
             .local_addr(self.local_addr);
+        if self.rs_client {
+            codec = codec.keep_aspath(true).keep_nexthop(true);
+        }
 
         let mut peer_event_rx = Vec::new();
         for _ in 0..*NUM_TABLES {
