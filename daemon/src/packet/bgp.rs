@@ -1948,6 +1948,17 @@ impl Decoder for BgpCodec {
                     }
                 }
 
+                if attr_len == 0 && withdrawn_len == 0 && c.position() == buf.len() as u64 {
+                    return Ok(Some(Message::Update {
+                        reach: Vec::new(),
+                        unreach: Vec::new(),
+                        attr: Arc::new(Vec::new()),
+                        mp_reach: None,
+                        mp_attr: Arc::new(Vec::new()),
+                        mp_unreach: None,
+                    }));
+                }
+
                 if !seen.contains_key(&Attribute::ORIGIN) || !seen.contains_key(&Attribute::AS_PATH)
                 {
                     error_withdraw = true;
