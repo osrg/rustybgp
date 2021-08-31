@@ -7,12 +7,12 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tonic = "0.4.2"
+tonic = "0.5.2"
 bytes = "1.0"
-prost = "0.7"
-prost-types = "0.7"
-prost-derive = "0.7"
-tokio = { version = "1.5", features = ["full"] }
+prost = "0.8"
+prost-types = "0.8"
+prost-derive = "0.8"
+tokio = { version = "1.10", features = ["full"] }
 tokio-util = { version = "0.6", features = ["codec","time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 clap = "2.33"
@@ -31,4 +31,4 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.5.7"
 
 [build-dependencies]
-tonic-build = "0.4.2"
+tonic-build = "0.5.2"
