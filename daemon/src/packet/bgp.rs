@@ -1575,12 +1575,13 @@ impl BgpCodec {
         (&mut dst.as_mut()[pos_bin..]).write_u8(mp_len - 3).unwrap();
         Ok(mp_len as u16)
     }
-}
 
-impl Encoder<&Message> for BgpCodec {
-    type Error = Error;
-
-    fn encode(&mut self, item: &Message, dst: &mut BytesMut) -> Result<(), Error> {
+    fn do_encode(
+        &mut self,
+        item: &Message,
+        dst: &mut BytesMut,
+        reach_idx: &mut usize,
+    ) -> Result<(), Error> {
         dst.reserve(dst.len() + self.max_message_length());
         let pos_head = dst.len();
         dst.put_u64(u64::MAX);
@@ -1643,8 +1644,13 @@ impl Encoder<&Message> for BgpCodec {
                 let pos_withdrawn_len = dst.len();
                 dst.put_u16(0);
                 let mut withdrawn_len = 0;
-                for n in unreach {
-                    withdrawn_len += n.encode(dst).unwrap();
+                for i in *reach_idx..unreach.len() {
+                    if pos_head + self.max_message_length() > dst.len() + 5 {
+                        withdrawn_len += unreach[i].encode(dst).unwrap();
+                        *reach_idx = i;
+                    } else {
+                        break;
+                    }
                 }
                 if withdrawn_len != 0 {
                     (&mut dst.as_mut()[pos_withdrawn_len..])
@@ -1695,8 +1701,13 @@ impl Encoder<&Message> for BgpCodec {
                     .write_u16::<NetworkEndian>(attr_len)
                     .unwrap();
 
-                for n in reach {
-                    let _ = n.encode(dst);
+                for i in *reach_idx..reach.len() {
+                    if pos_head + self.max_message_length() > dst.len() + 5 {
+                        let _ = reach[i].encode(dst);
+                        *reach_idx = i;
+                    } else {
+                        break;
+                    }
                 }
             }
             Message::Notification {
@@ -1725,6 +1736,31 @@ impl Encoder<&Message> for BgpCodec {
             .write_u16::<NetworkEndian>((pos_end - pos_head) as u16)?;
 
         Ok(())
+    }
+}
+
+impl Encoder<&Message> for BgpCodec {
+    type Error = Error;
+
+    fn encode(&mut self, item: &Message, dst: &mut BytesMut) -> Result<(), Error> {
+        let mut done_idx = 0;
+        match item {
+            Message::Update { reach, unreach, .. } => {
+                assert!(!(reach.len() > 0 && unreach.len() > 0));
+                let n = std::cmp::max(reach.len(), unreach.len());
+                loop {
+                    if let Err(e) = self.do_encode(item, dst, &mut done_idx) {
+                        return Err(e);
+                    }
+                    done_idx += 1;
+                    if n == 0 || done_idx == n {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            _ => self.do_encode(item, dst, &mut done_idx),
+        }
     }
 }
 
@@ -1972,22 +2008,26 @@ impl Decoder for BgpCodec {
                     }));
                 }
 
-                if !seen.contains_key(&Attribute::ORIGIN) || !seen.contains_key(&Attribute::AS_PATH)
-                {
-                    error_withdraw = true;
-                }
-
-                if !seen.contains_key(&Attribute::NEXTHOP) && attr_end < buf.len() as u64 {
-                    error_withdraw = true;
-                }
-
-                match attr[*seen.get(&Attribute::AS_PATH).unwrap()].as_path_count(self.local_as) {
-                    Ok(v) => {
-                        if v > 0 {
-                            error_withdraw = true
-                        }
+                if attr_len != 0 {
+                    if !seen.contains_key(&Attribute::ORIGIN)
+                        || !seen.contains_key(&Attribute::AS_PATH)
+                    {
+                        error_withdraw = true;
                     }
-                    Err(_) => error_withdraw = true,
+
+                    if !seen.contains_key(&Attribute::NEXTHOP) && attr_end < buf.len() as u64 {
+                        error_withdraw = true;
+                    }
+
+                    match attr[*seen.get(&Attribute::AS_PATH).unwrap()].as_path_count(self.local_as)
+                    {
+                        Ok(v) => {
+                            if v > 0 {
+                                error_withdraw = true
+                            }
+                        }
+                        Err(_) => error_withdraw = true,
+                    }
                 }
 
                 if c.position() != attr_end {
@@ -2015,7 +2055,7 @@ impl Decoder for BgpCodec {
                     }
                 }
 
-                if !seen.contains_key(&Attribute::LOCAL_PREF) && self.is_ibgp() {
+                if attr_len > 0 && !seen.contains_key(&Attribute::LOCAL_PREF) && self.is_ibgp() {
                     unsorted = true;
                     attr.push(
                         Attribute::new_with_value(
@@ -2127,6 +2167,7 @@ impl Decoder for BgpCodec {
                 } else {
                     None
                 };
+
                 Ok(Some(Message::Update {
                     reach,
                     unreach,
@@ -2228,4 +2269,96 @@ fn parse_ipv6_update() {
         }
         _ => assert!(false),
     }
+}
+
+#[test]
+fn build_many_route() {
+    let mut net = Vec::new();
+    for i in 0..2000u16 {
+        net.push(Net::V4(Ipv4Net {
+            addr: Ipv4Addr::new(10, ((0xff00 & i) >> 8) as u8, (0xff & i) as u8, 1),
+            mask: 32,
+        }));
+    }
+
+    let reach: Vec<Net> = net.iter().cloned().collect();
+    let mut msg = Message::Update {
+        reach,
+        attr: Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
+            Attribute::new_with_bin(Attribute::NEXTHOP, vec![0, 0, 0, 0]).unwrap(),
+        ]),
+        unreach: Vec::new(),
+        mp_reach: None,
+        mp_attr: Arc::new(Vec::new()),
+        mp_unreach: None,
+    };
+    let mut set = fnv::FnvHashSet::default();
+    for n in &net {
+        set.insert(*n);
+    }
+
+    let mut codec = BgpCodec::new().keep_aspath(true);
+    let mut txbuf = bytes::BytesMut::with_capacity(4096);
+    codec.encode(&msg, &mut txbuf).unwrap();
+    let mut recv = Vec::new();
+    loop {
+        match codec.decode(&mut txbuf) {
+            Ok(m) => match m {
+                Some(m) => match m {
+                    Message::Update { mut reach, .. } => {
+                        recv.append(&mut reach);
+                    }
+                    _ => {}
+                },
+                None => break,
+            },
+            Err(_) => panic!("failed to decode"),
+        }
+    }
+    assert_eq!(recv.len(), net.len());
+
+    for n in &recv {
+        let b = set.remove(n);
+        assert!(b);
+    }
+    assert_eq!(set.len(), 0);
+
+    let unreach = net.iter().cloned().collect();
+    msg = Message::Update {
+        reach: Vec::new(),
+        attr: Arc::new(Vec::new()),
+        unreach,
+        mp_reach: None,
+        mp_attr: Arc::new(Vec::new()),
+        mp_unreach: None,
+    };
+
+    for n in &net {
+        set.insert(*n);
+    }
+
+    let mut withdrawn = Vec::new();
+    codec.encode(&msg, &mut txbuf).unwrap();
+    loop {
+        match codec.decode(&mut txbuf) {
+            Ok(m) => match m {
+                Some(m) => match m {
+                    Message::Update { mut unreach, .. } => {
+                        withdrawn.append(&mut unreach);
+                    }
+                    _ => {}
+                },
+                None => break,
+            },
+            Err(_) => panic!("failed to decode"),
+        }
+    }
+    assert_eq!(withdrawn.len(), net.len());
+    for n in &withdrawn {
+        let b = set.remove(n);
+        assert!(b);
+    }
+    assert_eq!(set.len(), 0);
 }

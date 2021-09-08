@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use fnv::{FnvHashMap, FnvHasher};
+use fnv::FnvHashMap;
 use patricia_tree::PatriciaMap;
 use regex::Regex;
 use std::collections::{hash_map::Entry::Occupied, hash_map::Entry::Vacant};
@@ -160,93 +160,6 @@ pub(crate) struct Change {
     pub(crate) family: packet::Family,
     pub(crate) net: packet::Net,
     pub(crate) attr: Arc<Vec<packet::Attribute>>,
-}
-
-struct Bucket {
-    nets: Vec<packet::Net>,
-    attr: Arc<Vec<packet::Attribute>>,
-}
-
-impl Change {
-    pub(crate) fn squash(changes: Vec<Change>, dst: Arc<Source>) -> Vec<packet::Message> {
-        if changes.len() < 8192 {
-            return changes.into_iter().map(|x| x.into()).collect();
-        }
-        let attr_hasher = |attr: &Arc<Vec<packet::Attribute>>, peer_type: &PeerType| -> u64 {
-            let mut hasher = FnvHasher::default();
-            for a in attr.iter() {
-                if peer_type == &PeerType::Ebgp && a.code() == packet::Attribute::NEXTHOP {
-                    continue;
-                }
-                a.hash(&mut hasher);
-            }
-            hasher.finish()
-        };
-        let mergeable =
-            |b: &Bucket, c: &Arc<Vec<packet::Attribute>>, peer_type: &PeerType| -> bool {
-                if b.nets.len() > 7 {
-                    return false;
-                }
-                if Arc::ptr_eq(&b.attr, c) {
-                    return true;
-                }
-                if b.attr.len() != c.len() {
-                    return false;
-                }
-                for i in 0..c.len() {
-                    if peer_type == &PeerType::Ebgp && c[i].code() == packet::Attribute::NEXTHOP {
-                        continue;
-                    }
-                    if b.attr[i] != c[i] {
-                        return false;
-                    }
-                }
-                true
-            };
-
-        let mut map: FnvHashMap<u64, Vec<Bucket>> = FnvHashMap::default();
-        for c in changes {
-            let h = attr_hasher(&c.attr, &dst.peer_type);
-
-            match map.entry(h) {
-                Occupied(mut o) => {
-                    let mut merged = false;
-                    for bucket in o.get_mut() {
-                        if mergeable(&bucket, &c.attr, &dst.peer_type) {
-                            bucket.nets.push(c.net);
-                            merged = true;
-                            break;
-                        }
-                    }
-                    if !merged {
-                        o.get_mut().push(Bucket {
-                            nets: vec![c.net],
-                            attr: c.attr,
-                        })
-                    }
-                }
-                Vacant(v) => {
-                    v.insert(vec![Bucket {
-                        nets: vec![c.net],
-                        attr: c.attr,
-                    }]);
-                }
-            }
-        }
-        map.into_iter()
-            .map(|(_, buckets)| buckets)
-            .flatten()
-            .into_iter()
-            .map(|b| packet::Message::Update {
-                reach: b.nets,
-                unreach: Vec::new(),
-                attr: b.attr,
-                mp_reach: None,
-                mp_attr: Arc::new(Vec::new()),
-                mp_unreach: None,
-            })
-            .collect()
-    }
 }
 
 impl From<Change> for packet::Message {

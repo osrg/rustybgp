@@ -29,6 +29,7 @@ thiserror = "1"
 libc = "0.2.94"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.5.7"
+nix = "0.22"
 
 [build-dependencies]
 tonic-build = "0.5.2"

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use fnv::{FnvHashMap, FnvHasher};
+use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
 use once_cell::sync::Lazy;
@@ -24,10 +24,12 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::AddAssign;
 use std::ops::Deref;
+use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -2432,7 +2434,7 @@ impl Handler {
     async fn rx_msg(
         &mut self,
         msg: packet::Message,
-        pending: &mut Vec<packet::Message>,
+        pending: &mut PendingTx,
     ) -> std::result::Result<(), Error> {
         match msg {
             packet::Message::Open {
@@ -2442,12 +2444,12 @@ impl Handler {
                 router_id,
                 capability,
             } => {
-                pending.push(packet::Message::Keepalive);
+                pending.urgent.push(packet::Message::Keepalive);
 
                 self.state = State::OpenConfirm;
                 self.remote_router_id = router_id;
                 if self.remote_as != 0 && self.remote_as != as_number {
-                    pending.insert(
+                    pending.urgent.insert(
                         0,
                         packet::Message::Notification {
                             code: 2,
@@ -2516,16 +2518,15 @@ impl Handler {
                     )));
 
                     let d = dealer(&self.peer_addr);
-                    let mut reach: Vec<table::Change> = Vec::new();
                     for i in 0..*NUM_TABLES {
                         let mut t = TABLE[i].lock().await;
                         for f in self.family_cap.keys() {
                             if f == &packet::Family::IPV4 {
-                                reach.append(
-                                    &mut t.rtable.best(f).into_iter().map(|x| x.into()).collect(),
-                                );
+                                for c in t.rtable.best(f).into_iter() {
+                                    pending.insert_change(c);
+                                }
                             } else {
-                                pending.append(
+                                pending.urgent.append(
                                     &mut t.rtable.best(f).into_iter().map(|x| x.into()).collect(),
                                 );
                             }
@@ -2536,10 +2537,6 @@ impl Handler {
                         let tx = t.table_event_tx[d].clone();
                         self.table_tx.push(tx);
                     }
-                    pending.append(&mut table::Change::squash(
-                        reach,
-                        self.source.as_ref().unwrap().clone(),
-                    ));
                 }
                 Ok(())
             }
@@ -2548,7 +2545,15 @@ impl Handler {
     }
 
     async fn run(&mut self, mut mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>) -> Session {
-        let stream = self.stream.take().unwrap();
+        let mut stream = self.stream.take().unwrap();
+        let rxbuf_size = 1 << 16;
+        let mut txbuf_size = 1 << 16;
+        if let Ok(r) =
+            nix::sys::socket::getsockopt(stream.as_raw_fd(), nix::sys::socket::sockopt::SndBuf)
+        {
+            txbuf_size = std::cmp::min(txbuf_size, r / 2);
+        }
+
         let mut codec = packet::bgp::BgpCodec::new()
             .local_as(self.local_as)
             .local_addr(self.local_addr);
@@ -2563,13 +2568,16 @@ impl Handler {
             peer_event_rx.push(UnboundedReceiverStream::new(rx));
         }
 
-        let mut pending = vec![packet::Message::Open {
-            version: 4,
-            as_number: self.local_as,
-            holdtime: self.holdtime as u16,
-            router_id: self.local_router_id,
-            capability: self.local_cap.to_owned(),
-        }];
+        let mut pending = PendingTx {
+            urgent: vec![packet::Message::Open {
+                version: 4,
+                as_number: self.local_as,
+                holdtime: self.holdtime as u16,
+                router_id: self.local_router_id,
+                capability: self.local_cap.to_owned(),
+            }],
+            ..Default::default()
+        };
 
         self.state = State::OpenSent;
         let mut holdtime_futures: FuturesUnordered<_> =
@@ -2579,28 +2587,26 @@ impl Handler {
 
         let mut state_update_timer = tokio::time::interval(Duration::from_secs(1));
         let state_table = dealer(&self.peer_addr);
-        let mut rxbuf = bytes::BytesMut::with_capacity(4096);
-        let mut pending_txbuf: Option<bytes::Bytes> = None;
+        let mut rxbuf = bytes::BytesMut::with_capacity(rxbuf_size);
         while self.shutdown.is_none() {
             let mut peer_event_futures: FuturesUnordered<_> =
                 peer_event_rx.iter_mut().map(|rx| rx.next()).collect();
-            let ready = if !pending.is_empty() || pending_txbuf.is_some() {
-                stream.ready(tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE)
+            let interest = if pending.is_empty() {
+                tokio::io::Interest::READABLE
             } else {
-                stream.ready(tokio::io::Interest::READABLE)
+                tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE
             };
-            let mut stream_ready_futures: FuturesUnordered<_> = vec![ready].into_iter().collect();
 
             let oldstate = self.state;
             futures::select_biased! {
                 _ = self.keepalive_timer.tick().fuse() => {
                     if self.state == State::Established {
-                        pending.insert(0, packet::Message::Keepalive);
+                        pending.urgent.insert(0, packet::Message::Keepalive);
                     }
                 }
                 msg = mgmt_rx.recv().fuse() => {
                     if let Some(PeerMgmtMsg::Notification(msg)) = msg {
-                        pending.insert(0, msg);
+                        pending.urgent.insert(0, msg);
                     }
                 }
                 _ = state_update_timer.tick().fuse() => {
@@ -2630,99 +2636,123 @@ impl Handler {
                                 if !self.family_cap.contains_key(&ri.family) {
                                     continue;
                                 }
-                                pending.push(ri.into());
+                                if ri.family == packet::Family::IPV4 {
+                                    pending.insert_change(ri);
+                                } else {
+                                    pending.urgent.push(ri.into());
+                                }
                             }
                         }
                     }
                 }
-                msg = stream_ready_futures.next().fuse() => {
-                    let msg = match msg {
-                        Some(msg) => msg,
-                        None => continue,
+                ready = stream.ready(interest).fuse() => {
+                    let ready = match ready {
+                        Ok(ready) => ready,
+                        Err(_) => continue,
                     };
-                    match msg {
-                        Ok(ready) => {
-                            if ready.is_readable() {
-                                rxbuf.reserve(4096);
-                                match stream.try_read_buf(&mut rxbuf) {
-                                    Ok(0) => {
-                                        self.shutdown = Some(Error::StdIoErr(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "")))
-                                    }
-                                    Ok(_) => loop {
-                                        match codec.decode(&mut rxbuf) {
-                                            Ok(msg) => match msg {
-                                                Some(msg) => {
-                                                    self.counter_rx.sync(&msg);
-                                                    let _ = self.rx_msg(msg, &mut pending).await;
-                                                }
-                                                None => {
-                                                    break;
-                                                },
-                                            }
-                                            Err(e) => {
-                                                if let Error::InvalidMessageFormat{code, subcode, data} = e {
-                                                    pending.insert(0,
-                                                        packet::Message::Notification{
-                                                            code,
-                                                            subcode,
-                                                            data
-                                                        }
-                                                    );
-                                                } else {
-                                                    self.shutdown = Some(e);
-                                                }
-                                                break;
-                                            },
+
+                    if ready.is_readable() {
+                        rxbuf.reserve(rxbuf_size);
+                        match stream.try_read_buf(&mut rxbuf) {
+                            Ok(0) => {
+                                self.shutdown = Some(Error::StdIoErr(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "")));
+                            }
+                            Ok(_) => loop {
+                                    match codec.decode(&mut rxbuf) {
+                                    Ok(msg) => match msg {
+                                        Some(msg) => {
+                                            self.counter_rx.sync(&msg);
+                                            let _ = self.rx_msg(msg, &mut pending).await;
                                         }
+                                        None => {
+                                            // partial read
+                                            break;
+                                        },
                                     }
-                                    Err (ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
                                     Err(e) => {
-                                        self.shutdown = Some(Error::StdIoErr(e));
-                                    }
+                                        if let Error::InvalidMessageFormat{code, subcode, data} = e {
+                                            pending.urgent.insert(0, packet::Message::Notification{code, subcode, data});
+                                        } else {
+                                            self.shutdown = Some(e);
+                                        }
+                                        break;
+                                    },
                                 }
                             }
-                            if ready.is_writable() && !pending.is_empty() || pending_txbuf.is_some() {
-                                for _ in 0..std::cmp::min(pending.len(), 32) {
-                                    let mut txbuf = match pending_txbuf.take() {
-                                        Some(txbuf) => txbuf,
-                                        None => {
-                                            let msg = &pending[0];
-                                            let mut buf = bytes::BytesMut::with_capacity(codec.max_message_length());
-                                            let _ = codec.encode(msg, &mut buf);
-                                            buf.freeze()
-                                        }
-                                    };
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+                            Err(e) => {
+                                self.shutdown = Some(Error::StdIoErr(e));
+                            }
+                        }
+                    }
 
-                                    let expected_len = txbuf.len();
-                                    match stream.try_write(&txbuf) {
-                                        Ok(n) => {
-                                            if n != expected_len {
-                                                let _ = txbuf.split_to(n);
-                                                pending_txbuf = Some(txbuf);
-                                                break;
-                                            } else {
-                                                let msg = pending.remove(0);
-                                                self.counter_tx.sync(&msg);
-                                            }
-                                        },
-                                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                            pending_txbuf = Some(txbuf);
-                                            break;
-                                        },
-                                        Err(e) => {
-                                            self.shutdown = Some(Error::StdIoErr(e));
-                                            break;
-                                        }
-                                    }
+                    if ready.is_writable() {
+                        let mut txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                        for _ in 0..pending.urgent.len() {
+                            let msg = pending.urgent.remove(0);
+                            let _ = codec.encode(&msg, &mut txbuf);
+                            self.counter_tx.sync(&msg);
+
+                            if txbuf.len() > txbuf_size {
+                                let buf = txbuf.freeze();
+                                txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                                if let Err(e) = stream.write_all(&buf).await {
+                                    self.shutdown = Some(Error::StdIoErr(e));
+                                    break;
                                 }
                             }
                         }
-                        Err(e) => {
-                            self.shutdown = Some(Error::StdIoErr(e));
+                        if txbuf.len() > 0 {
+                            if let Err(e) = stream.write_all(&txbuf.freeze()).await {
+                                self.shutdown = Some(Error::StdIoErr(e));
+                            }
+                        }
+
+                        txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                        let max_tx_count = 2048;
+                        let mut sent = Vec::with_capacity(max_tx_count);
+                        for (attr, reach) in pending.bucket.iter() {
+                            let msg = packet::Message::Update{
+                                reach: reach.iter().map(|x| *x).collect(),
+                                attr: attr.clone(),
+                                unreach: Vec::new(),
+                                mp_reach: None,
+                                mp_attr: Arc::new(Vec::new()),
+                                mp_unreach: None,
+                            };
+                            let _ = codec.encode(&msg, &mut txbuf);
+                            self.counter_tx.sync(&msg);
+                            sent.push(attr.clone());
+
+                            if txbuf.len() > txbuf_size {
+                                let buf = txbuf.freeze();
+                                txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                                if let Err(e) = stream.write_all(&buf).await {
+                                    self.shutdown = Some(Error::StdIoErr(e));
+                                    break;
+                                }
+                            }
+
+                            if sent.len() > max_tx_count {
+                                break;
+                            }
+                        }
+                        if txbuf.len() > 0 {
+                            if let Err(e) = stream.write_all(&txbuf.freeze()).await {
+                                self.shutdown = Some(Error::StdIoErr(e));
+                            }
+                        }
+
+                        for attr in sent.drain(..) {
+                            let mut bucket = pending.bucket.remove(&attr).unwrap();
+                            for net in bucket.drain() {
+                                let _ = pending.reach.remove(&net).unwrap();
+                            }
                         }
                     }
                 }
             }
+
             if oldstate == State::OpenSent && self.state == State::OpenConfirm && self.holdtime != 0
             {
                 holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(self.holdtime))]
@@ -2741,4 +2771,164 @@ impl Handler {
         }
         self.into()
     }
+}
+
+#[derive(Default)]
+struct PendingTx {
+    urgent: Vec<packet::Message>,
+    reach: FnvHashMap<packet::Net, Arc<Vec<packet::Attribute>>>,
+    unreach: FnvHashSet<packet::Net>,
+    bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<packet::Net>>,
+}
+
+impl PendingTx {
+    fn is_empty(&self) -> bool {
+        self.urgent.is_empty() && self.reach.is_empty() && self.unreach.is_empty()
+    }
+
+    fn insert_change(&mut self, change: table::Change) {
+        if change.attr.is_empty() {
+            if let Some(attr) = self.reach.remove(&change.net) {
+                let set = self.bucket.get_mut(&attr).unwrap();
+                let b = set.remove(&change.net);
+                assert!(b);
+                if set.len() == 0 {
+                    self.bucket.remove(&attr);
+                }
+            }
+            self.unreach.insert(change.net);
+        } else {
+            self.unreach.remove(&change.net);
+
+            // a) net doesn't exists in reach
+            // a-1) the attr exists in bucket (with other nets)
+            //  -> add the net to reach with the attr
+            //  -> add the net to the attr bucket
+            // a-2) the attr doesn't exist either in bucket
+            //  -> add the net to reach with the attr
+            //  -> create attr bucket and the net to add it
+            //
+            // b) net already exists in reach
+            // b-1) the old attr in reach same to the attr
+            //  -> nothing to do
+            // b-2) the old attr in reach not same to the attr
+            // b-2-1) the attr exists in bucket
+            //  -> update the net's attr in reach
+            //  -> remove the net from the old attr bucket
+            //  -> add the net to the attr bucket
+            // b-2-2) the attr doesn't exist in bucket
+            //  -> update the net's attr in reach
+            //  -> remove the net from the old attr bucket
+            //  -> create attr bucket add he net to it
+
+            if let Some(old_attr) = self.reach.insert(change.net, change.attr.clone()) {
+                // b-1)
+                if old_attr == change.attr {
+                    return;
+                }
+
+                // b-2-1) and b-2-2)
+                let old_bucket = self.bucket.get_mut(&old_attr).unwrap();
+                let b = old_bucket.remove(&change.net);
+                assert!(b);
+                if old_bucket.len() == 0 {
+                    self.bucket.remove(&old_attr);
+                }
+
+                let bucket = self
+                    .bucket
+                    .entry(change.attr)
+                    .or_insert_with(FnvHashSet::default);
+                bucket.insert(change.net);
+            } else {
+                // a-1) and a-2)
+                let bucket = self
+                    .bucket
+                    .entry(change.attr)
+                    .or_insert_with(FnvHashSet::default);
+                bucket.insert(change.net);
+            }
+        }
+    }
+}
+
+#[test]
+fn bucket() {
+    let src = Arc::new(table::Source::new(
+        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)),
+        Ipv4Addr::new(127, 0, 0, 1),
+        table::PeerType::Ebgp,
+        IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+        1,
+        false,
+    ));
+    let family = packet::Family::IPV4;
+
+    let net1 = packet::Net::from_str("10.0.0.0/24").unwrap();
+    let net2 = packet::Net::from_str("20.0.0.0/24").unwrap();
+
+    let attr1 = vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap()];
+
+    let mut pending = PendingTx::default();
+
+    pending.insert_change(table::Change {
+        source: src.clone(),
+        family,
+        net: net1,
+        attr: Arc::new(attr1.clone()),
+    });
+
+    pending.insert_change(table::Change {
+        source: src.clone(),
+        family: packet::Family::IPV4,
+        net: net2,
+        attr: Arc::new(vec![packet::Attribute::new_with_value(
+            packet::Attribute::ORIGIN,
+            0,
+        )
+        .unwrap()]),
+    });
+
+    // a-1) and a-2) properly marged?
+    assert_eq!(1, pending.bucket.len());
+    assert_eq!(
+        2,
+        pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()
+    );
+
+    // b-1)
+    pending.insert_change(table::Change {
+        source: src.clone(),
+        family,
+        net: net2,
+        attr: Arc::new(vec![packet::Attribute::new_with_value(
+            packet::Attribute::ORIGIN,
+            0,
+        )
+        .unwrap()]),
+    });
+    assert_eq!(1, pending.bucket.len());
+    assert_eq!(
+        2,
+        pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()
+    );
+
+    // b-2-2)
+    let attr2 = vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap()];
+    pending.insert_change(table::Change {
+        source: src.clone(),
+        family,
+        net: net2,
+        attr: Arc::new(vec![packet::Attribute::new_with_value(
+            packet::Attribute::ORIGIN,
+            1,
+        )
+        .unwrap()]),
+    });
+    assert_eq!(2, pending.bucket.len());
+    assert_eq!(&Arc::new(attr2), pending.reach.get(&net2).unwrap());
+    assert_eq!(
+        1,
+        pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()
+    );
 }
