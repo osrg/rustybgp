@@ -527,10 +527,14 @@ struct GrpcService {
     init: Arc<tokio::sync::Notify>,
     policy_assignment_sem: tokio::sync::Semaphore,
     local_source: Arc<table::Source>,
+    active_conn_tx: mpsc::UnboundedSender<TcpStream>,
 }
 
 impl GrpcService {
-    fn new(init: Arc<tokio::sync::Notify>) -> Self {
+    fn new(
+        init: Arc<tokio::sync::Notify>,
+        active_conn_tx: mpsc::UnboundedSender<TcpStream>,
+    ) -> Self {
         GrpcService {
             init,
             policy_assignment_sem: tokio::sync::Semaphore::new(1),
@@ -542,6 +546,7 @@ impl GrpcService {
                 0,
                 false,
             )),
+            active_conn_tx,
         }
     }
 
@@ -638,7 +643,10 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::AddPeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let peer = Peer::try_from(&request.into_inner().peer.ok_or(Error::EmptyArgument)?)?;
-        GLOBAL.write().await.add_peer(peer)?;
+        GLOBAL
+            .write()
+            .await
+            .add_peer(peer, Some(self.active_conn_tx.clone()))?;
         Ok(tonic::Response::new(()))
     }
     async fn delete_peer(
@@ -758,7 +766,7 @@ impl GobgpApi for GrpcService {
                 if addr == &peer_addr {
                     if p.admin_down {
                         p.admin_down = false;
-                        enable_active_connect(&p);
+                        enable_active_connect(&p, self.active_conn_tx.clone());
                         return Ok(tonic::Response::new(()));
                     } else {
                         return Err(tonic::Status::new(
@@ -1519,7 +1527,7 @@ enum PeerMgmtMsg {
     Notification(packet::Message),
 }
 
-fn enable_active_connect(peer: &Peer) {
+fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
     if peer.admin_down || peer.passive || peer.delete_on_disconnected {
         return;
     }
@@ -1535,7 +1543,7 @@ fn enable_active_connect(peer: &Peer) {
             )
             .await
             {
-                let _ = accept_connection(stream);
+                let _ = ch.send(stream);
                 return;
             }
             // FIXME: use configured idle time
@@ -1765,7 +1773,11 @@ impl Global {
         }
     }
 
-    fn add_peer(&mut self, mut peer: Peer) -> std::result::Result<(), Error> {
+    fn add_peer(
+        &mut self,
+        mut peer: Peer,
+        tx: Option<mpsc::UnboundedSender<TcpStream>>,
+    ) -> std::result::Result<(), Error> {
         if self.peers.contains_key(&peer.address) {
             return Err(Error::AlreadyExists(
                 "peer address already exists".to_string(),
@@ -1795,7 +1807,9 @@ impl Global {
         if peer.admin_down {
             peer.state = State::Connect;
         }
-        enable_active_connect(&peer);
+        if let Some(tx) = tx {
+            enable_active_connect(&peer, tx);
+        }
         self.peers.insert(peer.address, peer);
         Ok(())
     }
@@ -1850,8 +1864,10 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
     table
 });
 
-async fn accept_connection(stream: TcpStream) -> std::io::Result<()> {
-    let peer_addr = stream.peer_addr()?.ip();
+async fn accept_connection(
+    stream: TcpStream,
+) -> Option<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)> {
+    let peer_addr = stream.peer_addr().ok()?.ip();
     let mut global = GLOBAL.write().await;
     let router_id = global.router_id;
     let (local_as, remote_as, local_cap, holdtime, rs_client, mgmt_rx) =
@@ -1862,11 +1878,11 @@ async fn accept_connection(stream: TcpStream) -> std::io::Result<()> {
                         "admin down; ignore a new passive connection from {}",
                         peer_addr
                     );
-                    return Ok(());
+                    return None;
                 }
                 if peer.mgmt_tx.is_some() {
                     println!("already has connection {}", peer_addr);
-                    return Ok(());
+                    return None;
                 }
                 peer.state = State::Active;
                 let (tx, rx) = mpsc::unbounded_channel();
@@ -1902,7 +1918,7 @@ async fn accept_connection(stream: TcpStream) -> std::io::Result<()> {
                         "can't find configuration a new passive connection {}",
                         peer_addr
                     );
-                    return Ok(());
+                    return None;
                 }
                 let (tx, rx) = mpsc::unbounded_channel();
                 let mut p = Peer::new(peer_addr)
@@ -1914,7 +1930,7 @@ async fn accept_connection(stream: TcpStream) -> std::io::Result<()> {
                 if let Some(holdtime) = holdtime {
                     p = p.hold_time(holdtime);
                 }
-                let _ = global.add_peer(p);
+                let _ = global.add_peer(p, None);
                 let peer = global.peers.get(&peer_addr).unwrap();
                 (
                     peer.local_as,
@@ -1927,30 +1943,13 @@ async fn accept_connection(stream: TcpStream) -> std::io::Result<()> {
             }
         };
 
-    tokio::spawn(async move {
-        let session = if let Some(mut handler) = Handler::new(
-            stream, peer_addr, local_as, remote_as, router_id, local_cap, holdtime, rs_client,
-        ) {
-            Some(handler.run(mgmt_rx).await)
-        } else {
-            None
-        };
-
-        let mut server = GLOBAL.write().await;
-        if let Some(peer) = server.peers.get_mut(&peer_addr) {
-            if peer.delete_on_disconnected {
-                server.peers.remove(&peer_addr);
-            } else {
-                if let Some(session) = session {
-                    peer.update(&session);
-                }
-                peer.reset();
-                enable_active_connect(&peer);
-            }
-        }
-    });
-
-    Ok(())
+    if let Some(h) = Handler::new(
+        stream, peer_addr, local_as, remote_as, router_id, local_cap, holdtime, rs_client,
+    ) {
+        Some((h, mgmt_rx))
+    } else {
+        None
+    }
 }
 
 async fn handle_table_update(idx: usize, mut v: Vec<UnboundedReceiverStream<TableEvent>>) {
@@ -2027,7 +2026,13 @@ async fn handle_table_update(idx: usize, mut v: Vec<UnboundedReceiverStream<Tabl
     }
 }
 
-async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
+async fn serve(
+    bgp: Option<config::Bgp>,
+    any_peer: bool,
+    conn_tx: Vec<mpsc::UnboundedSender<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)>>,
+    active_tx: mpsc::UnboundedSender<TcpStream>,
+    mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
+) {
     let global_config = if let Some(bgp) = bgp
         .as_ref()
         .and_then(|x| x.global.as_ref())
@@ -2107,7 +2112,9 @@ async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
     if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
         let mut server = GLOBAL.write().await;
         for p in peers {
-            server.add_peer(Peer::from(p)).unwrap();
+            server
+                .add_peer(Peer::from(p), Some(active_tx.clone()))
+                .unwrap();
         }
     }
 
@@ -2132,22 +2139,11 @@ async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
         );
     }
 
-    for i in 0..*NUM_TABLES {
-        let mut t = TABLE[i].lock().await;
-        let mut v = Vec::new();
-        for _ in 0..*NUM_TABLES {
-            let (tx, rx) = mpsc::unbounded_channel();
-            t.table_event_tx.push(tx);
-            v.push(UnboundedReceiverStream::new(rx));
-        }
-        tokio::spawn(handle_table_update(i, v));
-    }
-
     let addr = "0.0.0.0:50051".parse().unwrap();
     let notify2 = notify.clone();
     tokio::spawn(async move {
         if let Err(e) = tonic::transport::Server::builder()
-            .add_service(GobgpApiServer::new(GrpcService::new(notify2)))
+            .add_service(GobgpApiServer::new(GrpcService::new(notify2, active_tx)))
             .serve(addr)
             .await
         {
@@ -2170,6 +2166,8 @@ async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
     .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
     assert_ne!(incomings.len(), 0);
 
+    let mut next_peer_taker = 0;
+    let nr_takers = conn_tx.len();
     loop {
         let mut bgp_listen_futures = FuturesUnordered::new();
         for incoming in &mut incomings {
@@ -2179,7 +2177,19 @@ async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
         futures::select_biased! {
             stream = bgp_listen_futures.next() => {
                 if let Some(Some(Ok(stream))) = stream {
-                    let _ = accept_connection(stream).await;
+                    if let Some(r) = accept_connection(stream).await {
+                        let _ = conn_tx[next_peer_taker].send(r);
+                        next_peer_taker = (next_peer_taker + 1) % nr_takers;
+                    }
+                }
+            }
+
+            stream = active_rx.recv().fuse() => {
+                if let Some(stream) = stream {
+                    if let Some(r) = accept_connection(stream).await {
+                        let _ = conn_tx[next_peer_taker].send(r);
+                        next_peer_taker = (next_peer_taker + 1) % nr_takers;
+                    }
                 }
             }
         }
@@ -2187,11 +2197,70 @@ async fn serve(bgp: Option<config::Bgp>, any_peer: bool) {
 }
 
 pub(crate) fn main(bgp: Option<config::Bgp>, any_peer: bool) {
-    tokio::runtime::Builder::new_multi_thread()
+    let mut handlers = Vec::new();
+    for i in 0..*NUM_TABLES {
+        let h = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut v = Vec::new();
+                    for _ in 0..*NUM_TABLES {
+                        let mut t = TABLE[i].lock().await;
+                        let (tx, rx) = mpsc::unbounded_channel();
+                        t.table_event_tx.push(tx);
+                        v.push(UnboundedReceiverStream::new(rx));
+                    }
+                    handle_table_update(i, v).await;
+                })
+        });
+        handlers.push(h);
+    }
+
+    let (active_tx, active_rx) = mpsc::unbounded_channel();
+    let mut conn_tx = Vec::new();
+    for _ in 0..*NUM_TABLES - 1 {
+        let (tx, mut rx) =
+            mpsc::unbounded_channel::<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)>();
+        conn_tx.push(tx);
+        let active_conn_tx = active_tx.clone();
+        let h = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    loop {
+                        if let Some((mut h, mgmt_rx)) = rx.recv().await {
+                            let active_conn_tx = active_conn_tx.clone();
+
+                            tokio::spawn(async move {
+                                let peer_addr = h.peer_addr;
+                                let session = h.run(mgmt_rx).await;
+                                let mut server = GLOBAL.write().await;
+                                if let Some(peer) = server.peers.get_mut(&peer_addr) {
+                                    if peer.delete_on_disconnected {
+                                        server.peers.remove(&peer_addr);
+                                    } else {
+                                        peer.update(&session);
+                                        peer.reset();
+                                        enable_active_connect(&peer, active_conn_tx.clone());
+                                    }
+                                }
+                            });
+                        }
+                    }
+                })
+        });
+        handlers.push(h);
+    }
+
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(serve(bgp, any_peer));
+        .block_on(serve(bgp, any_peer, conn_tx, active_tx, active_rx));
 }
 
 struct Handler {
