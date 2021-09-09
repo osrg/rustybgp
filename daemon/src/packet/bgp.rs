@@ -1048,20 +1048,33 @@ impl Attribute {
 
     fn encode(&self, dst: &mut BytesMut) -> Result<u16, ()> {
         let pos_head = dst.len();
-        dst.put_u8(self.flags);
-        dst.put_u8(self.code);
         match self.code {
             Attribute::ORIGIN => {
+                dst.put_u8(self.flags);
+                dst.put_u8(self.code);
                 dst.put_u8(1);
                 dst.put_u8(self.value().unwrap() as u8);
             }
             Attribute::MULTI_EXIT_DESC | Attribute::LOCAL_PREF | Attribute::ORIGINATOR_ID => {
+                dst.put_u8(self.flags);
+                dst.put_u8(self.code);
                 dst.put_u8(4);
                 dst.put_u32(self.value().unwrap());
             }
             _ => {
                 let bin = self.binary().unwrap();
-                dst.put_u8(bin.len() as u8);
+                let flags = if bin.len() > 255 {
+                    self.flags | Attribute::FLAG_EXTENDED
+                } else {
+                    self.flags
+                };
+                dst.put_u8(flags);
+                dst.put_u8(self.code);
+                if flags & Attribute::FLAG_EXTENDED > 0 {
+                    dst.put_u16(bin.len() as u16);
+                } else {
+                    dst.put_u8(bin.len() as u8);
+                }
                 dst.put_slice(bin);
             }
         }
