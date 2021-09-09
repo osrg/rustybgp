@@ -2709,6 +2709,24 @@ impl Handler {
                         }
 
                         txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                        let unreach = pending.unreach.drain().collect();
+                        let msg = packet::Message::Update{
+                            reach: Vec::new(),
+                            attr: Arc::new(Vec::new()),
+                            unreach,
+                            mp_reach: None,
+                            mp_attr: Arc::new(Vec::new()),
+                            mp_unreach: None,
+                        };
+                        let _ = codec.encode(&msg, &mut txbuf);
+                        self.counter_tx.sync(&msg);
+                        if txbuf.len() > 0 {
+                            if let Err(e) = stream.write_all(&txbuf.freeze()).await {
+                                self.shutdown = Some(Error::StdIoErr(e));
+                            }
+                        }
+
+                        txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                         let max_tx_count = 2048;
                         let mut sent = Vec::with_capacity(max_tx_count);
                         for (attr, reach) in pending.bucket.iter() {
