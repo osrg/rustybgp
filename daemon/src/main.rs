@@ -31,6 +31,7 @@ use std::str::FromStr;
 
 fn main() -> Result<(), std::io::Error> {
     let args = App::new("rustybgpd")
+        .version(format!("v{}-{}", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")).as_str())
         .arg(
             Arg::with_name("config")
                 .short("f")
