@@ -30,6 +30,10 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 
 fn main() -> Result<(), std::io::Error> {
+    if num_cpus::get() < 4 {
+        panic!("four local CPUs are necessary at least");
+    }
+
     let args = App::new("rustybgpd")
         .version(format!("v{}-{}", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")).as_str())
         .arg(
