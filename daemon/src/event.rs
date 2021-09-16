@@ -2029,7 +2029,7 @@ async fn handle_table_update(idx: usize, mut v: Vec<UnboundedReceiverStream<Tabl
 }
 
 async fn serve(
-    bgp: Option<config::Bgp>,
+    bgp: Option<config::BgpConfig>,
     any_peer: bool,
     conn_tx: Vec<mpsc::UnboundedSender<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)>>,
     active_tx: mpsc::UnboundedSender<TcpStream>,
@@ -2109,6 +2109,24 @@ async fn serve(
                 }
             }
         }
+    }
+    if let Some(defined_sets) = bgp.as_ref().and_then(|x| x.defined_sets.as_ref()) {
+        match Vec::<api::DefinedSet>::try_from(defined_sets) {
+            Ok(sets) => {
+                let mut server = GLOBAL.write().await;
+                for set in sets {
+                    if let Err(e) = server.ptable.add_defined_set(set) {
+                        panic!("{:?}", e);
+                    }
+                }
+            }
+            Err(e) => panic!("{:?}", e),
+        }
+        // if let Some(prefix_sets) = defined_sets.prefix_sets.as_ref() {
+        //     for p in prefix_sets {
+        //         if let Some(name) = &p.prefix_set_name {}
+        //     }
+        // }
     }
 
     if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
@@ -2198,7 +2216,7 @@ async fn serve(
     }
 }
 
-pub(crate) fn main(bgp: Option<config::Bgp>, any_peer: bool) {
+pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
     let mut handlers = Vec::new();
     for i in 0..*NUM_TABLES {
         let h = std::thread::spawn(move || {

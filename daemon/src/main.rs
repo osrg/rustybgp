@@ -63,7 +63,7 @@ fn main() -> Result<(), std::io::Error> {
         .get_matches();
 
     let conf = if let Some(conf) = args.value_of("config") {
-        let conf: config::Bgp = toml::from_str(&(std::fs::read_to_string(conf)?))?;
+        let conf: config::BgpConfig = toml::from_str(&(std::fs::read_to_string(conf)?))?;
         if let Err(e) = conf.validate() {
             panic!("invalid configuraiton {:?}", e);
         }
@@ -84,7 +84,7 @@ fn main() -> Result<(), std::io::Error> {
             None
         };
         if as_number != 0 {
-            let conf = config::Bgp {
+            let conf = config::BgpConfig {
                 global: Some(config::Global {
                     config: Some(config::GlobalConfig {
                         r#as: Some(as_number),
