@@ -1195,13 +1195,15 @@ impl GobgpApi for GrpcService {
     >;
     async fn list_defined_set(
         &self,
-        _request: tonic::Request<api::ListDefinedSetRequest>,
+        request: tonic::Request<api::ListDefinedSetRequest>,
     ) -> Result<tonic::Response<Self::ListDefinedSetStream>, tonic::Status> {
+        let req = request.into_inner();
         let v: Vec<api::ListDefinedSetResponse> = GLOBAL
             .read()
             .await
             .ptable
             .iter_defined_set_api()
+            .filter(|x| x.defined_type == req.defined_type)
             .map(|x| api::ListDefinedSetResponse {
                 defined_set: Some(x),
             })
