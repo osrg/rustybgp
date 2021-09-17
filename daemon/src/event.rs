@@ -2122,11 +2122,66 @@ async fn serve(
             }
             Err(e) => panic!("{:?}", e),
         }
-        // if let Some(prefix_sets) = defined_sets.prefix_sets.as_ref() {
-        //     for p in prefix_sets {
-        //         if let Some(name) = &p.prefix_set_name {}
-        //     }
-        // }
+    }
+    if let Some(policies) = bgp.as_ref().and_then(|x| x.policy_definitions.as_ref()) {
+        let mut server = GLOBAL.write().await;
+        for policy in policies {
+            if let Some(name) = &policy.name {
+                let mut s_names = Vec::new();
+                if let Some(statements) = &policy.statements {
+                    for s in statements {
+                        match api::Statement::try_from(s) {
+                            Ok(s) => {
+                                server
+                                    .ptable
+                                    .add_statement(&s.name, s.conditions, s.actions)
+                                    .unwrap();
+                                s_names.push(s.name);
+                            }
+                            Err(e) => panic!("{:?}", e),
+                        }
+                    }
+                }
+
+                if let Err(e) = server.ptable.add_policy(
+                    name,
+                    s_names
+                        .into_iter()
+                        .map(|x| api::Statement {
+                            name: x,
+                            ..Default::default()
+                        })
+                        .collect(),
+                ) {
+                    panic!("{:?}", e);
+                }
+            }
+        }
+    }
+
+    if let Some(g) = bgp.as_ref().and_then(|x| x.global.as_ref()) {
+        let mut server = GLOBAL.write().await;
+        if let Some(apply_policy) = g.apply_policy.as_ref() {
+            if let Some(config) = apply_policy.config.as_ref() {
+                if let Some(import) = config.import_policy_list.as_ref() {
+                    let pa = api::PolicyAssignment {
+                        name: "global".to_string(),
+                        direction: 1,
+                        policies: import
+                            .iter()
+                            .map(|x| api::Policy {
+                                name: x.to_string(),
+                                statements: Vec::new(),
+                            })
+                            .collect(),
+                        default_action: 0,
+                    };
+                    if let Err(e) = server.ptable.add_assignment(pa) {
+                        panic!("{:?}", e);
+                    }
+                }
+            }
+        }
     }
 
     if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {

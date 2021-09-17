@@ -870,6 +870,34 @@ impl From<&MatchOption> for i32 {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Comparison {
+    Eq,
+    Ge,
+    Le,
+}
+
+impl From<Comparison> for i32 {
+    fn from(c: Comparison) -> i32 {
+        match c {
+            Comparison::Eq => 0,
+            Comparison::Ge => 1,
+            Comparison::Le => 2,
+        }
+    }
+}
+
+impl From<i32> for Comparison {
+    fn from(l: i32) -> Self {
+        match l {
+            0 => Comparison::Eq,
+            1 => Comparison::Ge,
+            2 => Comparison::Le,
+            _ => Comparison::Eq,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum Condition {
     Prefix(String, MatchOption, Arc<PrefixSet>),
@@ -878,7 +906,7 @@ enum Condition {
     Community(String, MatchOption, Arc<CommunitySet>),
     Nexthop(Vec<IpAddr>),
     // ExtendedCommunity,
-    // AsPathLength,
+    AsPathLength(Comparison, u32),
     Rpki(api::validation::State),
     // RouteType(u32),
     // LargeCommunity,
@@ -933,6 +961,16 @@ pub(crate) enum Disposition {
     Pass,
     Accept,
     Reject,
+}
+
+impl From<Disposition> for i32 {
+    fn from(d: Disposition) -> i32 {
+        match d {
+            Disposition::Pass => 0,
+            Disposition::Accept => 1,
+            Disposition::Reject => 2,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1011,12 +1049,21 @@ impl From<&Statement> for api::Statement {
                 Condition::Rpki(v) => {
                     conditions.rpki_result = *v as i32;
                 }
+                Condition::AsPathLength(t, length) => {
+                    conditions.as_path_length = Some(api::AsPathLength {
+                        length_type: (*t).into(),
+                        length: *length,
+                    })
+                }
             }
         }
         s.conditions = Some(conditions);
-        s.actions = Some(api::Actions {
-            ..Default::default()
-        });
+        if let Some(a) = my.disposition {
+            s.actions = Some(api::Actions {
+                route_action: a.into(),
+                ..Default::default()
+            });
+        }
         s
     }
 }
@@ -1475,6 +1522,9 @@ impl PolicyTable {
                         )))
                     }
                 }
+            }
+            if let Some(m) = conditions.as_path_length {
+                v.push(Condition::AsPathLength(m.length_type.into(), m.length));
             }
             if let Some(m) = conditions.community_set {
                 let opt = MatchOption::try_from(m.match_type)?;
