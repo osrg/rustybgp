@@ -1279,15 +1279,7 @@ impl GobgpApi for GrpcService {
             .into_inner()
             .assignment
             .ok_or(Error::EmptyArgument)?;
-        let (dir, assingment) = GLOBAL.write().await.ptable.add_assignment(request)?;
-        for i in 0..*NUM_TABLES {
-            let mut t = TABLE[i].lock().await;
-            if dir == api::PolicyDirection::Import {
-                t.global_import_policy = Some(assingment.clone());
-            } else {
-                t.global_export_policy = Some(assingment.clone());
-            }
-        }
+        add_policy_assignment(request).await?;
         Ok(tonic::Response::new(()))
     }
     async fn delete_policy_assignment(
@@ -1521,6 +1513,19 @@ impl GobgpApi for GrpcService {
     ) -> Result<tonic::Response<()>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
+}
+
+async fn add_policy_assignment(req: api::PolicyAssignment) -> Result<(), Error> {
+    let (dir, assingment) = GLOBAL.write().await.ptable.add_assignment(req)?;
+    for i in 0..*NUM_TABLES {
+        let mut t = TABLE[i].lock().await;
+        if dir == api::PolicyDirection::Import {
+            t.global_import_policy = Some(assingment.clone());
+        } else {
+            t.global_export_policy = Some(assingment.clone());
+        }
+    }
+    Ok(())
 }
 
 enum ToPeerEvent {
@@ -1849,6 +1854,8 @@ struct Table {
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
     table_event_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
     sessions: FnvHashMap<IpAddr, Session>,
+
+    // global->ptable copies
     global_import_policy: Option<Arc<table::PolicyAssignment>>,
     global_export_policy: Option<Arc<table::PolicyAssignment>>,
 }
@@ -2154,7 +2161,6 @@ async fn serve(
     }
 
     if let Some(g) = bgp.as_ref().and_then(|x| x.global.as_ref()) {
-        let mut server = GLOBAL.write().await;
         let f = |direction: i32,
                  policy_list: Option<&Vec<String>>,
                  action: Option<&config::gen::DefaultPolicyType>|
@@ -2175,18 +2181,22 @@ async fn serve(
         };
 
         if let Some(Some(config)) = g.apply_policy.as_ref().map(|x| x.config.as_ref()) {
-            if let Err(e) = server.ptable.add_assignment(f(
+            if let Err(e) = add_policy_assignment(f(
                 1,
                 config.import_policy_list.as_ref(),
                 config.default_import_policy.as_ref(),
-            )) {
+            ))
+            .await
+            {
                 panic!("{:?}", e);
             }
-            if let Err(e) = server.ptable.add_assignment(f(
+            if let Err(e) = add_policy_assignment(f(
                 2,
                 config.export_policy_list.as_ref(),
                 config.default_export_policy.as_ref(),
-            )) {
+            ))
+            .await
+            {
                 panic!("{:?}", e);
             }
         }
