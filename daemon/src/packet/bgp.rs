@@ -1644,9 +1644,9 @@ impl BgpCodec {
                 let pos_withdrawn_len = dst.len();
                 dst.put_u16(0);
                 let mut withdrawn_len = 0;
-                for i in *reach_idx..unreach.len() {
+                for (i, item) in unreach.iter().enumerate().skip(*reach_idx) {
                     if pos_head + self.max_message_length() > dst.len() + 5 {
-                        withdrawn_len += unreach[i].encode(dst).unwrap();
+                        withdrawn_len += item.encode(dst).unwrap();
                         *reach_idx = i;
                     } else {
                         break;
@@ -1701,9 +1701,9 @@ impl BgpCodec {
                     .write_u16::<NetworkEndian>(attr_len)
                     .unwrap();
 
-                for i in *reach_idx..reach.len() {
+                for (i, item) in reach.iter().enumerate().skip(*reach_idx) {
                     if pos_head + self.max_message_length() > dst.len() + 5 {
-                        let _ = reach[i].encode(dst);
+                        let _ = item.encode(dst);
                         *reach_idx = i;
                     } else {
                         break;
@@ -1746,7 +1746,7 @@ impl Encoder<&Message> for BgpCodec {
         let mut done_idx = 0;
         match item {
             Message::Update { reach, unreach, .. } => {
-                assert!(!(reach.len() > 0 && unreach.len() > 0));
+                assert!(!(!reach.is_empty() && !unreach.is_empty()));
                 let n = std::cmp::max(reach.len(), unreach.len());
                 loop {
                     if let Err(e) = self.do_encode(item, dst, &mut done_idx) {

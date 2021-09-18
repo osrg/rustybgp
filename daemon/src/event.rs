@@ -1947,13 +1947,10 @@ async fn accept_connection(
             }
         };
 
-    if let Some(h) = Handler::new(
+    Handler::new(
         stream, peer_addr, local_as, remote_as, router_id, local_cap, holdtime, rs_client,
-    ) {
-        Some((h, mgmt_rx))
-    } else {
-        None
-    }
+    )
+    .map(|h| (h, mgmt_rx))
 }
 
 async fn handle_table_update(idx: usize, mut v: Vec<UnboundedReceiverStream<TableEvent>>) {
@@ -2037,15 +2034,10 @@ async fn serve(
     active_tx: mpsc::UnboundedSender<TcpStream>,
     mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
 ) {
-    let global_config = if let Some(bgp) = bgp
+    let global_config = bgp
         .as_ref()
         .and_then(|x| x.global.as_ref())
-        .and_then(|x| x.config.as_ref())
-    {
-        Some(bgp)
-    } else {
-        None
-    };
+        .and_then(|x| x.config.as_ref());
 
     let as_number = if let Some(asn) = global_config.as_ref().and_then(|x| x.r#as) {
         asn
@@ -2081,10 +2073,10 @@ async fn serve(
                                 .as_ref()
                                 .map_or(false, |x| x.route_server_client.map_or(false, |x| x))
                         }),
-                        holdtime: pg.timers.as_ref().map_or(None, |x| {
-                            x.config.as_ref().map_or(None, |x| {
-                                x.hold_time.as_ref().map_or(None, |x| Some(*x as u64))
-                            })
+                        holdtime: pg.timers.as_ref().and_then(|x| {
+                            x.config
+                                .as_ref()
+                                .and_then(|x| x.hold_time.as_ref().map(|x| *x as u64))
                         }),
                         // passive: pg.transport.as_ref().map_or(false, |x| {
                         //     x.config
@@ -2777,7 +2769,7 @@ impl Handler {
                                 }
                             }
                         }
-                        if txbuf.len() > 0 {
+                        if !txbuf.is_empty() {
                             if let Err(e) = stream.write_all(&txbuf.freeze()).await {
                                 self.shutdown = Some(Error::StdIoErr(e));
                             }
@@ -2795,7 +2787,7 @@ impl Handler {
                         };
                         let _ = codec.encode(&msg, &mut txbuf);
                         self.counter_tx.sync(&msg);
-                        if txbuf.len() > 0 {
+                        if !txbuf.is_empty() {
                             if let Err(e) = stream.write_all(&txbuf.freeze()).await {
                                 self.shutdown = Some(Error::StdIoErr(e));
                             }
@@ -2806,7 +2798,7 @@ impl Handler {
                         let mut sent = Vec::with_capacity(max_tx_count);
                         for (attr, reach) in pending.bucket.iter() {
                             let msg = packet::Message::Update{
-                                reach: reach.iter().map(|x| *x).collect(),
+                                reach: reach.iter().copied().collect(),
                                 attr: attr.clone(),
                                 unreach: Vec::new(),
                                 mp_reach: None,
@@ -2830,7 +2822,7 @@ impl Handler {
                                 break;
                             }
                         }
-                        if txbuf.len() > 0 {
+                        if !txbuf.is_empty() {
                             if let Err(e) = stream.write_all(&txbuf.freeze()).await {
                                 self.shutdown = Some(Error::StdIoErr(e));
                             }
@@ -2885,7 +2877,7 @@ impl PendingTx {
                 let set = self.bucket.get_mut(&attr).unwrap();
                 let b = set.remove(&change.net);
                 assert!(b);
-                if set.len() == 0 {
+                if set.is_empty() {
                     self.bucket.remove(&attr);
                 }
             }
@@ -2924,7 +2916,7 @@ impl PendingTx {
                 let old_bucket = self.bucket.get_mut(&old_attr).unwrap();
                 let b = old_bucket.remove(&change.net);
                 assert!(b);
-                if old_bucket.len() == 0 {
+                if old_bucket.is_empty() {
                     self.bucket.remove(&old_attr);
                 }
 

@@ -315,23 +315,20 @@ impl TryFrom<&Statement> for api::Statement {
             None
         };
 
-        let actions = if let Some(a) = &s.actions {
-            Some(api::Actions {
-                route_action: match a.route_disposition.as_ref() {
-                    Some(a) => a.into(),
-                    None => 0,
-                },
-                community: None,
-                med: None,
-                as_prepend: None,
-                ext_community: None,
-                nexthop: None,
-                local_pref: None,
-                large_community: None,
-            })
-        } else {
-            None
-        };
+        let actions = s.actions.as_ref().map(|a| api::Actions {
+            route_action: match a.route_disposition.as_ref() {
+                Some(a) => a.into(),
+                None => 0,
+            },
+            community: None,
+            med: None,
+            as_prepend: None,
+            ext_community: None,
+            nexthop: None,
+            local_pref: None,
+            large_community: None,
+        });
+
         Ok(api::Statement {
             name,
             conditions,
