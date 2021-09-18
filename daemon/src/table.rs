@@ -947,6 +947,23 @@ impl Condition {
                 }
                 return found;
             }
+            Condition::AsPathLength(c, v) => {
+                if let Some(a) = attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
+                    let l = a.as_path_length() as u32;
+                    match c {
+                        Comparison::Eq => {
+                            return l == *v;
+                        }
+                        Comparison::Ge => {
+                            return l >= *v;
+                        }
+                        Comparison::Le => {
+                            return l <= *v;
+                        }
+                    }
+                }
+                return false;
+            }
             Condition::Rpki(_) => {
                 return false;
             }
