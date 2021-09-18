@@ -336,3 +336,12 @@ impl TryFrom<&Statement> for api::Statement {
         })
     }
 }
+
+impl From<&DefaultPolicyType> for i32 {
+    fn from(t: &DefaultPolicyType) -> i32 {
+        match t {
+            DefaultPolicyType::AcceptRoute => 1,
+            DefaultPolicyType::RejectRoute => 2,
+        }
+    }
+}

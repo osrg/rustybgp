@@ -2155,25 +2155,39 @@ async fn serve(
 
     if let Some(g) = bgp.as_ref().and_then(|x| x.global.as_ref()) {
         let mut server = GLOBAL.write().await;
-        if let Some(apply_policy) = g.apply_policy.as_ref() {
-            if let Some(config) = apply_policy.config.as_ref() {
-                if let Some(import) = config.import_policy_list.as_ref() {
-                    let pa = api::PolicyAssignment {
-                        name: "global".to_string(),
-                        direction: 1,
-                        policies: import
-                            .iter()
-                            .map(|x| api::Policy {
-                                name: x.to_string(),
-                                statements: Vec::new(),
-                            })
-                            .collect(),
-                        default_action: 0,
-                    };
-                    if let Err(e) = server.ptable.add_assignment(pa) {
-                        panic!("{:?}", e);
-                    }
-                }
+        let f = |direction: i32,
+                 policy_list: Option<&Vec<String>>,
+                 action: Option<&config::gen::DefaultPolicyType>|
+         -> api::PolicyAssignment {
+            api::PolicyAssignment {
+                name: "global".to_string(),
+                direction,
+                policies: policy_list.map_or(Vec::new(), |x| {
+                    x.iter()
+                        .map(|x| api::Policy {
+                            name: x.to_string(),
+                            statements: Vec::new(),
+                        })
+                        .collect()
+                }),
+                default_action: action.map_or(1, |x| x.into()),
+            }
+        };
+
+        if let Some(Some(config)) = g.apply_policy.as_ref().map(|x| x.config.as_ref()) {
+            if let Err(e) = server.ptable.add_assignment(f(
+                1,
+                config.export_policy_list.as_ref(),
+                config.default_export_policy.as_ref(),
+            )) {
+                panic!("{:?}", e);
+            }
+            if let Err(e) = server.ptable.add_assignment(f(
+                2,
+                config.import_policy_list.as_ref(),
+                config.default_import_policy.as_ref(),
+            )) {
+                panic!("{:?}", e);
             }
         }
     }
