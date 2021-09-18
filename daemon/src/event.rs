@@ -2160,7 +2160,7 @@ async fn serve(
                  action: Option<&config::gen::DefaultPolicyType>|
          -> api::PolicyAssignment {
             api::PolicyAssignment {
-                name: "global".to_string(),
+                name: "".to_string(),
                 direction,
                 policies: policy_list.map_or(Vec::new(), |x| {
                     x.iter()
@@ -2177,15 +2177,15 @@ async fn serve(
         if let Some(Some(config)) = g.apply_policy.as_ref().map(|x| x.config.as_ref()) {
             if let Err(e) = server.ptable.add_assignment(f(
                 1,
-                config.export_policy_list.as_ref(),
-                config.default_export_policy.as_ref(),
+                config.import_policy_list.as_ref(),
+                config.default_import_policy.as_ref(),
             )) {
                 panic!("{:?}", e);
             }
             if let Err(e) = server.ptable.add_assignment(f(
                 2,
-                config.import_policy_list.as_ref(),
-                config.default_import_policy.as_ref(),
+                config.export_policy_list.as_ref(),
+                config.default_export_policy.as_ref(),
             )) {
                 panic!("{:?}", e);
             }

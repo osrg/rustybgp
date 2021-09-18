@@ -1214,13 +1214,11 @@ pub(crate) struct PolicyTable {
     statements: FnvHashMap<Arc<str>, Arc<Statement>>,
     policies: FnvHashMap<Arc<str>, Arc<Policy>>,
 
-    assignment_import: FnvHashMap<Arc<str>, Arc<PolicyAssignment>>,
-    assignment_export: FnvHashMap<Arc<str>, Arc<PolicyAssignment>>,
+    assignment_import: Option<Arc<PolicyAssignment>>,
+    assignment_export: Option<Arc<PolicyAssignment>>,
 }
 
 impl PolicyTable {
-    const GLOBAL_ASSIGNMENT_NAME: &'static str = "global";
-
     pub(crate) fn new() -> Self {
         Default::default()
     }
@@ -1234,11 +1232,6 @@ impl PolicyTable {
         if dir == api::PolicyDirection::Unknown {
             return Err(Error::InvalidArgument(
                 "invalid assignment direction".to_string(),
-            ));
-        }
-        if assignment.name != PolicyTable::GLOBAL_ASSIGNMENT_NAME {
-            return Err(Error::InvalidArgument(
-                "invalid assignment name".to_string(),
             ));
         }
 
@@ -1274,7 +1267,7 @@ impl PolicyTable {
         };
 
         let name: Arc<str> = Arc::from(assignment.name);
-        if let Some(old) = m.remove(&name) {
+        if let Some(old) = m.take() {
             for p0 in &old.policies {
                 if let Some(p) = v.iter().find(|p1| p0.name == p1.name) {
                     return Err(Error::InvalidArgument(format!(
@@ -1290,7 +1283,7 @@ impl PolicyTable {
             policies: v,
             disposition: dis,
         });
-        m.insert(name, n.clone());
+        m.replace(n.clone());
         Ok((dir, n))
     }
 
@@ -1298,14 +1291,17 @@ impl PolicyTable {
         &self,
         direction: i32,
     ) -> impl Iterator<Item = api::PolicyAssignment> + '_ {
-        self.assignment_import
-            .iter()
-            .map(|(_, a)| a.to_api(1))
-            .chain(self.assignment_export.iter().map(|(_, a)| a.to_api(2)))
-            .filter(move |a| match direction {
-                1 | 2 => a.direction == direction,
-                _ => true,
-            })
+        let mut v = Vec::with_capacity(2);
+        if direction != 2 {
+            if let Some(a) = self.assignment_import.as_ref() {
+                v.push(a.to_api(1));
+            }
+        } else if direction != 1 {
+            if let Some(a) = self.assignment_export.as_ref() {
+                v.push(a.to_api(2));
+            }
+        }
+        v.into_iter()
     }
 
     pub(crate) fn add_policy(
