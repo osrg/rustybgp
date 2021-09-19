@@ -30,7 +30,6 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::api;
 use crate::error::Error;
 use crate::proto;
-use crate::table;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub(crate) struct Family(u32);
@@ -732,6 +731,36 @@ pub(crate) fn family_capabilities(
     fc
 }
 
+pub(crate) struct AsPathIter<'a> {
+    cur: Cursor<&'a Vec<u8>>,
+    len: u64,
+}
+
+impl<'a> AsPathIter<'a> {
+    pub(crate) fn new(attr: &'a Attribute) -> AsPathIter<'a> {
+        AsPathIter {
+            cur: Cursor::new(attr.binary().unwrap()),
+            len: attr.binary().unwrap().len() as u64,
+        }
+    }
+}
+
+impl<'a> Iterator for AsPathIter<'a> {
+    type Item = Vec<u32>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cur.position() < self.len {
+            let _ = self.cur.read_u8().ok()?;
+            let n = self.cur.read_u8().ok()?;
+            let mut v = Vec::new();
+            for _ in 0..n {
+                v.push(self.cur.read_u32::<NetworkEndian>().ok()?);
+            }
+            return Some(v);
+        }
+        None
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 enum AttributeData {
     Val(u32),
@@ -909,74 +938,6 @@ impl Attribute {
         } else {
             None
         }
-    }
-
-    pub(crate) fn as_path_match(&self, m: &table::SingleAsPathMatch) -> bool {
-        assert_eq!(self.code, Attribute::AS_PATH);
-        let buf = self.binary().unwrap();
-        let len = buf.len() as u64;
-        let mut c = Cursor::new(buf);
-
-        if len < 2 {
-            return false;
-        }
-
-        match m {
-            table::SingleAsPathMatch::Include(val) => {
-                while c.position() < len {
-                    let _type = c.read_u8().unwrap();
-                    let l = c.read_u8().unwrap();
-                    for _ in 0..l {
-                        let n = c.read_u32::<NetworkEndian>().unwrap();
-                        if n == *val {
-                            return true;
-                        }
-                    }
-                }
-            }
-            table::SingleAsPathMatch::LeftMost(val) => {
-                while c.position() < len {
-                    let _type = c.read_u8().unwrap();
-                    let l = c.read_u8().unwrap();
-                    if l == 0 {
-                        return false;
-                    }
-                    let n = c.read_u32::<NetworkEndian>().unwrap();
-                    if n == *val {
-                        return true;
-                    }
-                }
-            }
-            table::SingleAsPathMatch::Origin(val) => {
-                let mut asn = 0;
-                while c.position() < len {
-                    let _type = c.read_u8().unwrap();
-                    let l = c.read_u8().unwrap();
-                    for i in 0..l {
-                        let n = c.read_u32::<NetworkEndian>().unwrap();
-                        if n == *val {
-                            return true;
-                        }
-                        if i == l - 1 {
-                            asn = n;
-                        }
-                    }
-                }
-                return asn == *val;
-            }
-            table::SingleAsPathMatch::Only(val) => {
-                let _type = c.read_u8().unwrap();
-                let l = c.read_u8().unwrap();
-                if l != 1 || len != 6 {
-                    return false;
-                }
-                let n = c.read_u32::<NetworkEndian>().unwrap();
-                if n == *val {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     pub(crate) fn nexthop_update(&self, addr: IpAddr) -> Attribute {
@@ -2253,7 +2214,7 @@ fn parse_ipv6_update() {
     match msg.unwrap() {
         Message::Update {
             reach: _,
-            attr: _,
+            attr,
             unreach: _,
             mp_reach,
             mp_attr: _,

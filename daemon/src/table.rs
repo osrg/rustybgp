@@ -699,7 +699,7 @@ struct Prefix {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub(crate) enum SingleAsPathMatch {
+enum SingleAsPathMatch {
     Include(u32),
     LeftMost(u32),
     Origin(u32),
@@ -742,6 +742,35 @@ impl SingleAsPathMatch {
         } else {
             None
         }
+    }
+
+    fn is_match(&self, attr: &Attribute) -> bool {
+        let mut i = packet::bgp::AsPathIter::new(attr);
+        match self {
+            SingleAsPathMatch::Include(val) => {
+                for v in i {
+                    for asn in v {
+                        if asn == *val {
+                            return true;
+                        }
+                    }
+                }
+            }
+            SingleAsPathMatch::LeftMost(val) => {
+                if let Some(v) = i.next() {
+                    return !v.is_empty() && v[0] == *val;
+                }
+            }
+            SingleAsPathMatch::Origin(val) => {
+                let v: Vec<Vec<u32>> = i.collect();
+                return !v.is_empty() && v[v.len() - 1][v[v.len() - 1].len() - 1] == *val;
+            }
+            SingleAsPathMatch::Only(val) => {
+                let v: Vec<Vec<u32>> = i.collect();
+                return v.len() == 1 && v[0].len() == 1 && v[0][0] == *val;
+            }
+        }
+        false
     }
 }
 
@@ -924,7 +953,7 @@ impl Condition {
             Condition::AsPath(_name, opt, set) => {
                 if let Some(a) = attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
                     for set in &set.single_sets {
-                        if a.as_path_match(set) {
+                        if set.is_match(a) {
                             if *opt == MatchOption::Any {
                                 return true;
                             }
@@ -1296,7 +1325,7 @@ impl PolicyTable {
             v.append(&mut old.policies.to_owned());
         }
         let n = Arc::new(PolicyAssignment {
-            name: name.clone(),
+            name,
             policies: v,
             disposition: dis,
         });
