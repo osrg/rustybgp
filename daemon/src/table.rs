@@ -14,6 +14,7 @@
 // limitations under the License.
 
 use fnv::FnvHashMap;
+use once_cell::sync::Lazy;
 use patricia_tree::PatriciaMap;
 use regex::Regex;
 use std::collections::{hash_map::Entry::Occupied, hash_map::Entry::Vacant};
@@ -698,50 +699,92 @@ struct Prefix {
     max_length: u8,
 }
 
+static SINGLE_MATCH_REGEX: Lazy<
+    Vec<(Regex, fn(s: &regex::Captures) -> Option<SingleAsPathMatch>)>,
+> = Lazy::new(|| {
+    vec![
+        (
+            Regex::new(r"^_([0-9]+)_$").unwrap(),
+            (|m| SingleAsPathMatch::parse_single(m).map(|n| SingleAsPathMatch::Include(n))),
+        ),
+        (
+            Regex::new(r"^\^([0-9]+)_$").unwrap(),
+            (|m| SingleAsPathMatch::parse_single(m).map(|n| SingleAsPathMatch::LeftMost(n))),
+        ),
+        (
+            Regex::new(r"^_([0-9]+)\$$").unwrap(),
+            (|m| SingleAsPathMatch::parse_single(m).map(|n| SingleAsPathMatch::Origin(n))),
+        ),
+        (
+            Regex::new(r"^\^([0-9]+)\$$").unwrap(),
+            (|m| SingleAsPathMatch::parse_single(m).map(|n| SingleAsPathMatch::Only(n))),
+        ),
+        (
+            Regex::new(r"^_([0-9]+)-([0-9]+)_$").unwrap(),
+            (|m| {
+                SingleAsPathMatch::parse_double(m)
+                    .map(|(a, b)| SingleAsPathMatch::RangeInclude(a, b))
+            }),
+        ),
+        (
+            Regex::new(r"^\^([0-9]+)-([0-9]+)_$").unwrap(),
+            (|m| {
+                SingleAsPathMatch::parse_double(m)
+                    .map(|(a, b)| SingleAsPathMatch::RangeLeftMost(a, b))
+            }),
+        ),
+        (
+            Regex::new(r"^_([0-9]+)-([0-9]+)\$$").unwrap(),
+            (|m| {
+                SingleAsPathMatch::parse_double(m)
+                    .map(|(a, b)| SingleAsPathMatch::RangeOrigin(a, b))
+            }),
+        ),
+        (
+            Regex::new(r"^\^([0-9]+)-([0-9]+)\$$").unwrap(),
+            (|m| {
+                SingleAsPathMatch::parse_double(m).map(|(a, b)| SingleAsPathMatch::RangeOnly(a, b))
+            }),
+        ),
+    ]
+});
+
 #[derive(Clone, PartialEq, Debug)]
 enum SingleAsPathMatch {
     Include(u32),
     LeftMost(u32),
     Origin(u32),
     Only(u32),
+    RangeInclude(u32, u32),
+    RangeLeftMost(u32, u32),
+    RangeOrigin(u32, u32),
+    RangeOnly(u32, u32),
 }
 
 impl SingleAsPathMatch {
     fn new(s: &str) -> Option<Self> {
-        let left_most = Regex::new(r"^\^([0-9]+)_$").unwrap();
-        let origin = Regex::new(r"^_([0-9]+)\$$").unwrap();
-        let include = Regex::new(r"^_([0-9]+)_$").unwrap();
-        let only = Regex::new(r"^\^([0-9]+)\$$").unwrap();
-
-        let f = |m: regex::Match| {
-            let (_, n) = m.as_str().split_at(1);
-            let (n, _) = n.split_at(n.len() - 1);
-            n.parse::<u32>()
-        };
-
-        if let Some(v) = left_most.find(s) {
-            match f(v) {
-                Ok(n) => Some(SingleAsPathMatch::LeftMost(n)),
-                Err(_) => None,
+        for (r, f) in &*SINGLE_MATCH_REGEX {
+            if let Some(c) = r.captures(s) {
+                return f(&c);
             }
-        } else if let Some(v) = origin.find(s) {
-            match f(v) {
-                Ok(n) => Some(SingleAsPathMatch::Origin(n)),
-                Err(_) => None,
-            }
-        } else if let Some(v) = include.find(s) {
-            match f(v) {
-                Ok(n) => Some(SingleAsPathMatch::Include(n)),
-                Err(_) => None,
-            }
-        } else if let Some(v) = only.find(s) {
-            match f(v) {
-                Ok(n) => Some(SingleAsPathMatch::Only(n)),
-                Err(_) => None,
-            }
-        } else {
-            None
         }
+        None
+    }
+
+    fn parse_single(caps: &regex::Captures) -> Option<u32> {
+        if caps.len() != 2 {
+            return None;
+        }
+        caps[1].parse::<u32>().ok()
+    }
+
+    fn parse_double(caps: &regex::Captures) -> Option<(u32, u32)> {
+        if caps.len() != 3 {
+            return None;
+        }
+        let a = caps[1].parse::<u32>().ok()?;
+        let b = caps[2].parse::<u32>().ok()?;
+        Some((a, b))
     }
 
     fn is_match(&self, attr: &Attribute) -> bool {
@@ -756,18 +799,42 @@ impl SingleAsPathMatch {
                     }
                 }
             }
+            SingleAsPathMatch::RangeInclude(min, max) => {
+                for v in i {
+                    for asn in v {
+                        if asn >= *min && asn <= *max {
+                            return true;
+                        }
+                    }
+                }
+            }
             SingleAsPathMatch::LeftMost(val) => {
                 if let Some(v) = i.next() {
                     return !v.is_empty() && v[0] == *val;
+                }
+            }
+            SingleAsPathMatch::RangeLeftMost(min, max) => {
+                if let Some(v) = i.next() {
+                    return !v.is_empty() && v[0] >= *min && v[0] <= *max;
                 }
             }
             SingleAsPathMatch::Origin(val) => {
                 let v: Vec<Vec<u32>> = i.collect();
                 return !v.is_empty() && v[v.len() - 1][v[v.len() - 1].len() - 1] == *val;
             }
+            SingleAsPathMatch::RangeOrigin(min, max) => {
+                let v: Vec<Vec<u32>> = i.collect();
+                return !v.is_empty()
+                    && v[v.len() - 1][v[v.len() - 1].len() - 1] >= *min
+                    && v[v.len() - 1][v[v.len() - 1].len() - 1] <= *max;
+            }
             SingleAsPathMatch::Only(val) => {
                 let v: Vec<Vec<u32>> = i.collect();
                 return v.len() == 1 && v[0].len() == 1 && v[0][0] == *val;
+            }
+            SingleAsPathMatch::RangeOnly(min, max) => {
+                let v: Vec<Vec<u32>> = i.collect();
+                return v.len() == 1 && v[0].len() == 1 && v[0][0] >= *min && v[0][0] <= *max;
             }
         }
         false
@@ -781,6 +848,10 @@ impl fmt::Display for SingleAsPathMatch {
             SingleAsPathMatch::LeftMost(v) => write!(f, "^{}_", v),
             SingleAsPathMatch::Origin(v) => write!(f, "_{}$", v),
             SingleAsPathMatch::Only(v) => write!(f, "^{}$", v),
+            SingleAsPathMatch::RangeInclude(min, max) => write!(f, "_{}-{}_", min, max),
+            SingleAsPathMatch::RangeLeftMost(min, max) => write!(f, "^{}-{}_", min, max),
+            SingleAsPathMatch::RangeOrigin(min, max) => write!(f, "_{}-{}$", min, max),
+            SingleAsPathMatch::RangeOnly(min, max) => write!(f, "^{}-{}$", min, max),
         }
     }
 }
