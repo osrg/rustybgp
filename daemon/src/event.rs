@@ -2125,19 +2125,27 @@ async fn serve(
         }
     }
     if let Some(policies) = bgp.as_ref().and_then(|x| x.policy_definitions.as_ref()) {
+        let mut h = HashSet::new();
         let mut server = GLOBAL.write().await;
         for policy in policies {
             if let Some(name) = &policy.name {
                 let mut s_names = Vec::new();
                 if let Some(statements) = &policy.statements {
                     for s in statements {
+                        if let Some(n) = s.name.as_ref() {
+                            if h.contains(n) {
+                                s_names.push(n.clone());
+                                continue;
+                            }
+                        }
                         match api::Statement::try_from(s) {
                             Ok(s) => {
                                 server
                                     .ptable
                                     .add_statement(&s.name, s.conditions, s.actions)
                                     .unwrap();
-                                s_names.push(s.name);
+                                s_names.push(s.name.clone());
+                                h.insert(s.name);
                             }
                             Err(e) => panic!("{:?}", e),
                         }
