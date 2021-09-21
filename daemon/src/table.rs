@@ -1014,7 +1014,7 @@ enum Condition {
 }
 
 impl Condition {
-    fn is_match(
+    fn evalute(
         &self,
         source: &Arc<Source>,
         _net: &packet::Net,
@@ -1069,11 +1069,11 @@ impl Condition {
             }
             _ => {}
         }
-        true
+        false
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 pub(crate) enum Disposition {
     Pass,
     Accept,
@@ -1100,20 +1100,22 @@ pub(crate) struct Statement {
 }
 
 impl Statement {
-    fn evaluate(
+    fn apply(
         &self,
         source: &Arc<Source>,
         net: &packet::Net,
         attr: &Arc<Vec<packet::Attribute>>,
     ) -> Disposition {
-        let mut matched = true;
+        let mut result = true;
+        // if any in the conditions returns false, this statement becomes false.
         for condition in &self.conditions {
-            if !condition.is_match(source, net, attr) {
-                matched = false;
+            if !condition.evalute(source, net, attr) {
+                result = false;
                 break;
             }
         }
-        if matched {
+
+        if result {
             if let Some(disposition) = &self.disposition {
                 return *disposition;
             }
@@ -1270,7 +1272,7 @@ impl Policy {
         attr: &Arc<Vec<packet::Attribute>>,
     ) -> Disposition {
         for statement in &self.statements {
-            let r = statement.evaluate(source, net, attr);
+            let r = statement.apply(source, net, attr);
             if r != Disposition::Pass {
                 return r;
             }
