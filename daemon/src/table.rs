@@ -26,6 +26,7 @@ use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
+use treebitmap::IpLookupTable;
 
 use crate::api;
 use crate::error::Error;
@@ -1017,18 +1018,34 @@ impl Condition {
     fn evalute(
         &self,
         source: &Arc<Source>,
-        _net: &packet::Net,
+        net: &packet::Net,
         attr: &Arc<Vec<packet::Attribute>>,
     ) -> bool {
         match self {
+            Condition::Prefix(_name, opt, set) => {
+                match net {
+                    packet::Net::V4(n) => {
+                        if let Some(zero) = set.zero {
+                            if zero.0 <= n.mask && n.mask <= zero.1 {
+                                println!("zero hit {}", net);
+                                return *opt == MatchOption::Any;
+                            }
+                        }
+                        if let Some((_, _, p)) = set.v4.longest_match(n.addr) {
+                            if p.min_length <= n.mask && p.max_length <= n.mask {
+                                return *opt == MatchOption::Any;
+                            }
+                        }
+                        return !(*opt == MatchOption::Any);
+                    }
+                    packet::Net::V6(_) => {}
+                };
+            }
             Condition::AsPath(_name, opt, set) => {
                 if let Some(a) = attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
                     for set in &set.single_sets {
                         if set.is_match(a) {
-                            if *opt == MatchOption::Any {
-                                return true;
-                            }
-                            return false;
+                            return *opt == MatchOption::Any;
                         }
                     }
                 }
@@ -1188,7 +1205,8 @@ impl From<&Statement> for api::Statement {
 }
 
 struct PrefixSet {
-    sets: Vec<Prefix>,
+    v4: IpLookupTable<Ipv4Addr, Prefix>,
+    zero: Option<(u8, u8)>,
 }
 
 impl PrefixSet {
@@ -1198,12 +1216,12 @@ impl PrefixSet {
             name: name.to_string(),
             list: Vec::new(),
             prefixes: self
-                .sets
+                .v4
                 .iter()
-                .map(|x| api::Prefix {
-                    ip_prefix: x.net.to_string(),
-                    mask_length_min: x.min_length as u32,
-                    mask_length_max: x.max_length as u32,
+                .map(|(_, _, v)| api::Prefix {
+                    ip_prefix: v.net.to_string(),
+                    mask_length_min: v.min_length as u32,
+                    mask_length_max: v.max_length as u32,
                 })
                 .collect(),
         }
@@ -1463,15 +1481,27 @@ impl PolicyTable {
         match t {
             api::DefinedType::Prefix => {
                 if let Vacant(e) = self.prefix_sets.entry(name) {
-                    let mut v = Vec::with_capacity(set.prefixes.len());
+                    let mut zero = None;
+                    let mut v = IpLookupTable::new();
                     for p in &set.prefixes {
                         match packet::IpNet::from_str(&p.ip_prefix) {
                             Ok(n) => {
-                                v.push(Prefix {
+                                let p = Prefix {
                                     net: n,
                                     min_length: p.mask_length_min as u8,
                                     max_length: p.mask_length_max as u8,
-                                });
+                                };
+
+                                match &p.net {
+                                    packet::IpNet::V4(net) => {
+                                        if net.addr == Ipv4Addr::new(0, 0, 0, 0) && net.mask == 0 {
+                                            zero = Some((p.min_length, p.max_length));
+                                        } else {
+                                            v.insert(net.addr, net.mask as u32, p);
+                                        }
+                                    }
+                                    packet::IpNet::V6(_) => {}
+                                }
                             }
                             Err(_) => {
                                 return Err(Error::InvalidArgument(format!(
@@ -1481,12 +1511,12 @@ impl PolicyTable {
                             }
                         }
                     }
-                    if v.is_empty() {
+                    if v.is_empty() && zero.is_none() {
                         return Err(Error::InvalidArgument(
                             "empty prefix defined-type".to_string(),
                         ));
                     } else {
-                        e.insert(Arc::new(PrefixSet { sets: v }));
+                        e.insert(Arc::new(PrefixSet { v4: v, zero }));
                         return Ok(());
                     }
                 }
