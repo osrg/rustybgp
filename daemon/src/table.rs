@@ -1027,7 +1027,6 @@ impl Condition {
                     packet::Net::V4(n) => {
                         if let Some(zero) = set.zero {
                             if zero.0 <= n.mask && n.mask <= zero.1 {
-                                println!("zero hit {}", net);
                                 return *opt == MatchOption::Any;
                             }
                         }
