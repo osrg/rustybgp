@@ -32,7 +32,7 @@ Peer        AS Up/Down State       |#Received  Accepted
 If you just want to check out the performance, start the daemon with `--any-peers` option. The daemon accepts any peers without configuration.
 
 ```bash
-$ sudo ./target/x86_64-unknown-linux-musl/release/rustybgpd --as-number 65001 --router-id 1.1.1.1 --any-peers
+$ sudo ./target/x86_64-unknown-linux-musl/release/rustybgpd --as-number 65001 --router-id 172.16.1.1 --any-peers
 Hello, RustyBGP (32 cpus)!
 ```
 
