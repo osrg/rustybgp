@@ -26,13 +26,13 @@ Then you can manage the daemon on a different terminal with GoBGP's CLI command.
 ```bash
 $ gobgp neighbor
 Peer        AS Up/Down State       |#Received  Accepted
-10.0.0.2 65002   never Idle        |        0         0
+198.51.100.2 65002   never Idle        |        0         0
 ```
 
 If you just want to check out the performance, start the daemon with `--any-peers` option. The daemon accepts any peers without configuration.
 
 ```bash
-$ sudo ./target/x86_64-unknown-linux-musl/release/rustybgpd --as-number 65001 --router-id 172.16.1.1 --any-peers
+$ sudo ./target/x86_64-unknown-linux-musl/release/rustybgpd --as-number 65001 --router-id 203.0.113.1 --any-peers
 Hello, RustyBGP (32 cpus)!
 ```
 
