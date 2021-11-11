@@ -2807,21 +2807,23 @@ impl Handler {
                             }
                         }
 
-                        txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                        let unreach = pending.unreach.drain().collect();
-                        let msg = packet::Message::Update{
-                            reach: Vec::new(),
-                            attr: Arc::new(Vec::new()),
-                            unreach,
-                            mp_reach: None,
-                            mp_attr: Arc::new(Vec::new()),
-                            mp_unreach: None,
-                        };
-                        let _ = codec.encode(&msg, &mut txbuf);
-                        self.counter_tx.sync(&msg);
-                        if !txbuf.is_empty() {
-                            if let Err(e) = stream.write_all(&txbuf.freeze()).await {
-                                self.shutdown = Some(Error::StdIoErr(e));
+                        let unreach: Vec<packet::Net> = pending.unreach.drain().collect();
+                        if !unreach.is_empty() {
+                            txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                            let msg = packet::Message::Update{
+                                reach: Vec::new(),
+                                attr: Arc::new(Vec::new()),
+                                unreach,
+                                mp_reach: None,
+                                mp_attr: Arc::new(Vec::new()),
+                                mp_unreach: None,
+                            };
+                            let _ = codec.encode(&msg, &mut txbuf);
+                            self.counter_tx.sync(&msg);
+                            if !txbuf.is_empty() {
+                                if let Err(e) = stream.write_all(&txbuf.freeze()).await {
+                                    self.shutdown = Some(Error::StdIoErr(e));
+                                }
                             }
                         }
 
