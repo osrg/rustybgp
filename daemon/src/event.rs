@@ -2636,6 +2636,7 @@ impl Handler {
                         let tx = t.table_event_tx[d].clone();
                         self.table_tx.push(tx);
                     }
+                    pending.sync = true;
                 }
                 Ok(())
             }
@@ -2868,6 +2869,18 @@ impl Handler {
                                 let _ = pending.reach.remove(&net).unwrap();
                             }
                         }
+
+                        if pending.sync && pending.is_empty() && self.state == State::Established {
+                            pending.sync = false;
+                            let mut b = bytes::BytesMut::with_capacity(txbuf_size);
+                            for msg in  self.family_cap.iter().map(|(k,_)| packet::Message::eor(*k)) {
+                                let _ = codec.encode(&msg, &mut b);
+                            }
+                            if let Err(e) = stream.write_all(&b.freeze()).await {
+                                self.shutdown = Some(Error::StdIoErr(e));
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -2898,6 +2911,7 @@ struct PendingTx {
     reach: FnvHashMap<packet::Net, Arc<Vec<packet::Attribute>>>,
     unreach: FnvHashSet<packet::Net>,
     bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<packet::Net>>,
+    sync: bool,
 }
 
 impl PendingTx {

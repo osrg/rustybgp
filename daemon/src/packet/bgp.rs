@@ -1433,6 +1433,28 @@ impl Message {
     const NOTIFICATION: u8 = 3;
     const KEEPALIVE: u8 = 4;
     const ROUTE_REFRESH: u8 = 5;
+
+    pub(crate) fn eor(family: Family) -> Message {
+        if family == Family::IPV4 {
+            Message::Update {
+                reach: Vec::new(),
+                attr: Arc::new(Vec::new()),
+                unreach: Vec::new(),
+                mp_reach: None,
+                mp_attr: Arc::new(Vec::new()),
+                mp_unreach: None,
+            }
+        } else {
+            Message::Update {
+                reach: Vec::new(),
+                attr: Arc::new(Vec::new()),
+                unreach: Vec::new(),
+                mp_reach: Some((family, Vec::new())),
+                mp_attr: Arc::new(Vec::new()),
+                mp_unreach: None,
+            }
+        }
+    }
 }
 
 pub(crate) struct BgpCodec {
