@@ -99,9 +99,11 @@ struct Path {
     source: Arc<Source>,
     pa: PathAttribute,
     timestamp: SystemTime,
+    flags: u8,
 }
 
 impl Path {
+    const FLAG_FILTERED: u8 = 1 << 0;
     fn to_api(
         &self,
         family: packet::Family,
@@ -116,6 +118,10 @@ impl Path {
             validation,
             ..Default::default()
         }
+    }
+
+    fn is_filtered(&self) -> bool {
+        self.flags & Path::FLAG_FILTERED != 0
     }
 }
 
@@ -232,7 +238,7 @@ impl Source {
 
 pub(crate) struct RoutingTable {
     global: FnvHashMap<packet::Family, FnvHashMap<packet::Net, Destination>>,
-    accepted: FnvHashMap<IpAddr, FnvHashMap<packet::Family, u64>>,
+    route_stats: FnvHashMap<IpAddr, FnvHashMap<packet::Family, (u64, u64)>>,
     rpki: RpkiTable,
 }
 
@@ -242,7 +248,7 @@ impl RoutingTable {
             global: vec![(packet::Family::EMPTY, FnvHashMap::default())]
                 .into_iter()
                 .collect(),
-            accepted: FnvHashMap::default(),
+            route_stats: FnvHashMap::default(),
             rpki: RpkiTable::new(),
         }
     }
@@ -281,11 +287,11 @@ impl RoutingTable {
         }
     }
 
-    pub(crate) fn num_accepted(
+    pub(crate) fn peer_stats(
         &self,
         peer_addr: &IpAddr,
-    ) -> Option<impl Iterator<Item = (packet::Family, u64)> + '_> {
-        self.accepted
+    ) -> Option<impl Iterator<Item = (packet::Family, (u64, u64))> + '_> {
+        self.route_stats
             .get(peer_addr)
             .map(|m| m.iter().map(|(x, y)| (*x, *y)))
     }
@@ -356,6 +362,7 @@ impl RoutingTable {
                                 source: p.source.clone(),
                                 pa: PathAttribute { attr: attr.clone() },
                                 timestamp: p.timestamp,
+                                flags: 0,
                             }
                             .to_api(
                                 family,
@@ -380,14 +387,18 @@ impl RoutingTable {
         family: packet::Family,
         net: packet::Net,
         attr: Arc<Vec<packet::Attribute>>,
+        filtered: bool,
     ) -> Option<Change> {
         let mut replaced = false;
         let mut best_changed = false;
+        let flags = if filtered { Path::FLAG_FILTERED } else { 0 };
+        let mut old_filtered = false;
 
         let path = Path {
             source: source.clone(),
             pa: PathAttribute::new(attr),
             timestamp: SystemTime::now(),
+            flags,
         };
 
         let rt = self
@@ -398,19 +409,29 @@ impl RoutingTable {
         for i in 0..dst.entry.len() {
             if Arc::ptr_eq(&dst.entry[i].source, &source) {
                 replaced = true;
-                dst.entry.remove(i);
+                old_filtered = dst.entry.remove(i).is_filtered();
                 best_changed = i == 0;
                 break;
             }
         }
-        if !replaced {
-            let num_accepted = self
-                .accepted
-                .entry(source.peer_addr)
-                .or_insert_with(FnvHashMap::default)
-                .entry(family)
-                .or_insert(0);
-            *num_accepted += 1;
+        let (received, accepted) = self
+            .route_stats
+            .entry(source.peer_addr)
+            .or_insert_with(FnvHashMap::default)
+            .entry(family)
+            .or_insert((0, 0));
+        if replaced {
+            if old_filtered && !filtered {
+                *accepted += 1;
+            }
+            if !old_filtered && filtered {
+                *accepted -= 1;
+            }
+        } else {
+            *received += 1;
+            if !filtered {
+                *accepted += 1;
+            }
         }
 
         let mut idx = 0;
@@ -446,9 +467,15 @@ impl RoutingTable {
             idx += 1;
         }
 
-        if idx == 0 {
-            best_changed = true;
+        for i in 0..dst.entry.len() {
+            if !dst.entry[i].is_filtered() {
+                if idx == i {
+                    best_changed = true;
+                }
+                break;
+            }
         }
+
         dst.entry.insert(idx, path);
         if best_changed {
             let best = &dst.entry[0];
@@ -470,16 +497,19 @@ impl RoutingTable {
     ) -> Option<Change> {
         let rt = self.global.get_mut(&family)?;
         let dst = rt.get_mut(&net)?;
+        let mut was_best = true;
         for i in 0..dst.entry.len() {
             if Arc::ptr_eq(&dst.entry[i].source, &source) {
-                dst.entry.remove(i);
-                let num_accepted = self
-                    .accepted
+                let (received, accepted) = self
+                    .route_stats
                     .get_mut(&source.peer_addr)
                     .unwrap()
                     .get_mut(&family)
                     .unwrap();
-                *num_accepted -= 1;
+                *received -= 1;
+                if !dst.entry.remove(i).is_filtered() {
+                    *accepted -= 1;
+                }
 
                 if dst.entry.is_empty() {
                     rt.remove(&net);
@@ -491,7 +521,7 @@ impl RoutingTable {
                         attr: Arc::new(Vec::new()),
                     });
                 }
-                if i == 0 {
+                if was_best {
                     let best = &dst.entry[0];
                     return Some(Change {
                         source: best.source.clone(),
@@ -502,13 +532,16 @@ impl RoutingTable {
                 }
                 break;
             }
+            if was_best && !dst.entry[i].is_filtered() {
+                was_best = false;
+            }
         }
         None
     }
 
     pub(crate) fn drop(&mut self, source: Arc<Source>) -> Vec<Change> {
         let mut advertise = Vec::new();
-        self.accepted.remove(&source.peer_addr);
+        self.route_stats.remove(&source.peer_addr);
         for (family, rt) in self.global.iter_mut() {
             rt.retain(|net, dst| {
                 for i in 0..dst.entry.len() {
@@ -683,10 +716,10 @@ fn drop() {
     let family = packet::Family::IPV4;
     let attrs = Arc::new(Vec::new());
 
-    rt.insert(s1.clone(), family, n1, attrs.clone());
-    rt.insert(s2, family, n1, attrs.clone());
-    rt.insert(s1.clone(), family, n2, attrs.clone());
-    rt.insert(s1.clone(), family, n3, attrs.clone());
+    rt.insert(s1.clone(), family, n1, attrs.clone(), false);
+    rt.insert(s2, family, n1, attrs.clone(), false);
+    rt.insert(s1.clone(), family, n2, attrs.clone(), false);
+    rt.insert(s1.clone(), family, n3, attrs.clone(), false);
 
     assert_eq!(rt.global.get(&family).unwrap().len(), 3);
     rt.drop(s1);

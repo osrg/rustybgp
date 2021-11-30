@@ -187,7 +187,8 @@ struct Peer {
     counter_tx: MessageCounter,
     counter_rx: MessageCounter,
 
-    accepted: FnvHashMap<packet::Family, u64>,
+    // received and accepted
+    route_stats: FnvHashMap<packet::Family, (u64, u64)>,
 
     remote_cap: Vec<packet::Capability>,
     local_cap: Vec<packet::Capability>,
@@ -228,7 +229,7 @@ impl Peer {
             downtime: SystemTime::UNIX_EPOCH,
             counter_tx: Default::default(),
             counter_rx: Default::default(),
-            accepted: FnvHashMap::default(),
+            route_stats: FnvHashMap::default(),
             remote_cap: Vec::new(),
             local_cap: Vec::new(),
             route_server_client: false,
@@ -250,9 +251,11 @@ impl Peer {
         self.local_cap = session.local_cap.to_owned();
     }
 
-    fn update_accepted(&mut self, rti: FnvHashMap<packet::Family, u64>) {
+    fn update_stats(&mut self, rti: FnvHashMap<packet::Family, (u64, u64)>) {
         for (f, v) in rti {
-            *self.accepted.entry(f).or_insert(0) += v;
+            let stats = self.route_stats.entry(f).or_insert((0, 0));
+            stats.0 += v.0;
+            stats.1 += v.1;
         }
     }
 
@@ -327,7 +330,7 @@ impl Peer {
     fn reset(&mut self) {
         self.state = State::Idle;
         self.downtime = SystemTime::now();
-        self.accepted = FnvHashMap::default();
+        self.route_stats = FnvHashMap::default();
         self.remote_cap = Vec::new();
         self.mgmt_tx = None;
     }
@@ -375,14 +378,14 @@ impl From<&Peer> for api::Peer {
             tm.state = Some(ts);
         }
         let afisafis = p
-            .accepted
+            .route_stats
             .iter()
-            .map(|x| api::AfiSafi {
+            .map(|(f, stats)| api::AfiSafi {
                 state: Some(api::AfiSafiState {
-                    family: Some((*x.0).into()),
+                    family: Some((*f).into()),
                     enabled: true,
-                    received: *x.1,
-                    accepted: *x.1,
+                    received: stats.0,
+                    accepted: stats.1,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -710,8 +713,8 @@ impl GobgpApi for GrpcService {
         for i in 0..*NUM_TABLES {
             let t = TABLE[i].lock().await;
             for (peer_addr, peer) in &mut peers {
-                if let Some(m) = t.rtable.num_accepted(peer_addr) {
-                    peer.update_accepted(m.collect());
+                if let Some(m) = t.rtable.peer_stats(peer_addr) {
+                    peer.update_stats(m.collect());
                 }
             }
             for (peer_addr, session) in &t.sessions {
@@ -1970,16 +1973,21 @@ async fn handle_table_update(idx: usize, mut v: Vec<UnboundedReceiverStream<Tabl
                     Some(attrs) => {
                         let mut t = TABLE[idx].lock().await;
                         for net in nets {
+                            let mut filtered = false;
                             if let Some(a) = t.global_import_policy.as_ref() {
                                 if t.rtable.apply_policy(a, &source, &net, &attrs)
                                     == table::Disposition::Reject
                                 {
-                                    continue;
+                                    filtered = true;
                                 }
                             }
-                            if let Some(ri) =
-                                t.rtable.insert(source.clone(), family, net, attrs.clone())
-                            {
+                            if let Some(ri) = t.rtable.insert(
+                                source.clone(),
+                                family,
+                                net,
+                                attrs.clone(),
+                                filtered,
+                            ) {
                                 if let Some(a) = t.global_export_policy.as_ref() {
                                     if t.rtable.apply_policy(a, &source, &net, &attrs)
                                         == table::Disposition::Reject
