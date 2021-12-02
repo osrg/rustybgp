@@ -12,12 +12,12 @@ bytes = "1.0"
 prost = "0.8"
 prost-types = "0.8"
 prost-derive = "0.8"
-tokio = { version = "1.10", features = ["full"] }
+tokio = { version = "=1.10.1", features = ["full"] }
 tokio-util = { version = "0.6", features = ["codec","time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 clap = "2.33"
-futures = "0.3.17"
-futures-util = {version="0.3", features=["alloc"]}
+futures = "=0.3.16"
+futures-core = "=0.3.16"
 patricia_tree = "0.3"
 regex = "1"
 fnv = "1.0"
