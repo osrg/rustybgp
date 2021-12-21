@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(dead_code)]
 use crate::api;
 use crate::config::*;
 use crate::error::Error;
