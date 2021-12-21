@@ -577,7 +577,7 @@ impl GrpcService {
             })?);
         }
         Ok((
-            dealer(&net),
+            Table::dealer(&net),
             TableEvent::PassUpdate(self.local_source.clone(), family, vec![net], {
                 if attr.is_empty() {
                     None
@@ -1693,7 +1693,7 @@ impl RpkiClient {
     fn try_connect(sockaddr: SocketAddr, configured_time: u64) {
         tokio::spawn(async move {
             let mut table_tx = Vec::with_capacity(*NUM_TABLES);
-            let d = dealer(&sockaddr);
+            let d = Table::dealer(&sockaddr);
             for i in 0..*NUM_TABLES {
                 let t = TABLE[i].lock().await;
                 table_tx.push(t.table_event_tx[d].clone());
@@ -1730,6 +1730,23 @@ impl RpkiClient {
         });
     }
 }
+
+static NUM_TABLES: Lazy<usize> = Lazy::new(|| num_cpus::get() / 2);
+static GLOBAL: Lazy<RwLock<Global>> = Lazy::new(|| RwLock::new(Global::new()));
+static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
+    let mut table = Vec::with_capacity(*NUM_TABLES);
+    for _ in 0..*NUM_TABLES {
+        table.push(Mutex::new(Table {
+            rtable: table::RoutingTable::new(),
+            peer_event_tx: FnvHashMap::default(),
+            table_event_tx: Vec::new(),
+            sessions: FnvHashMap::default(),
+            global_import_policy: None,
+            global_export_policy: None,
+        }));
+    }
+    table
+});
 
 struct Global {
     as_number: u32,
@@ -1821,17 +1838,340 @@ impl Global {
         self.peers.insert(peer.address, peer);
         Ok(())
     }
+
+    async fn accept_connection(
+        stream: TcpStream,
+    ) -> Option<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)> {
+        let peer_addr = stream.peer_addr().ok()?.ip();
+        let mut global = GLOBAL.write().await;
+        let router_id = global.router_id;
+        let (local_as, remote_as, local_cap, holdtime, rs_client, mgmt_rx) =
+            match global.peers.get_mut(&peer_addr) {
+                Some(peer) => {
+                    if peer.admin_down {
+                        println!(
+                            "admin down; ignore a new passive connection from {}",
+                            peer_addr
+                        );
+                        return None;
+                    }
+                    if peer.mgmt_tx.is_some() {
+                        println!("already has connection {}", peer_addr);
+                        return None;
+                    }
+                    peer.state = State::Active;
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    peer.mgmt_tx = Some(tx);
+                    (
+                        peer.local_as,
+                        peer.remote_as,
+                        peer.local_cap.to_owned(),
+                        peer.holdtime,
+                        peer.route_server_client,
+                        rx,
+                    )
+                }
+                None => {
+                    let mut is_dynamic = false;
+                    let mut rs_client = false;
+                    let mut remote_as = 0;
+                    let mut holdtime = None;
+                    for p in &global.peer_group {
+                        for d in &p.1.dynamic_peers {
+                            if d.prefix.contains(&peer_addr) {
+                                remote_as = p.1.as_number;
+                                is_dynamic = true;
+                                rs_client = p.1.route_server_client;
+                                holdtime = p.1.holdtime;
+                                break;
+                            }
+                        }
+                    }
+                    if !is_dynamic {
+                        println!(
+                            "can't find configuration a new passive connection {}",
+                            peer_addr
+                        );
+                        return None;
+                    }
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let mut p = Peer::new(peer_addr)
+                        .state(State::Active)
+                        .remote_as(remote_as)
+                        .delete_on_disconnected(true)
+                        .rs_client(rs_client)
+                        .mgmt_channel(tx);
+                    if let Some(holdtime) = holdtime {
+                        p = p.hold_time(holdtime);
+                    }
+                    let _ = global.add_peer(p, None);
+                    let peer = global.peers.get(&peer_addr).unwrap();
+                    (
+                        peer.local_as,
+                        peer.remote_as,
+                        peer.local_cap.to_owned(),
+                        peer.holdtime,
+                        peer.route_server_client,
+                        rx,
+                    )
+                }
+            };
+        Handler::new(
+            stream, peer_addr, local_as, remote_as, router_id, local_cap, holdtime, rs_client,
+        )
+        .map(|h| (h, mgmt_rx))
+    }
+
+    async fn serve(
+        bgp: Option<config::BgpConfig>,
+        any_peer: bool,
+        conn_tx: Vec<mpsc::UnboundedSender<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)>>,
+        active_tx: mpsc::UnboundedSender<TcpStream>,
+        mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
+    ) {
+        let global_config = bgp
+            .as_ref()
+            .and_then(|x| x.global.as_ref())
+            .and_then(|x| x.config.as_ref());
+        let as_number = if let Some(asn) = global_config.as_ref().and_then(|x| x.r#as) {
+            asn
+        } else {
+            0
+        };
+        let router_id =
+            if let Some(router_id) = global_config.as_ref().and_then(|x| x.router_id.as_ref()) {
+                router_id.parse().unwrap()
+            } else {
+                Ipv4Addr::new(0, 0, 0, 0)
+            };
+        let notify = Arc::new(tokio::sync::Notify::new());
+        if as_number != 0 {
+            notify.clone().notify_one();
+            let global = &mut GLOBAL.write().await;
+            global.as_number = as_number;
+            global.router_id = router_id;
+        }
+        if let Some(groups) = bgp.as_ref().and_then(|x| x.peer_groups.as_ref()) {
+            let mut server = GLOBAL.write().await;
+            for pg in groups {
+                if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {
+                    server.peer_group.insert(
+                        name,
+                        PeerGroup {
+                            as_number: pg.config.as_ref().map_or(0, |x| x.peer_as.map_or(0, |x| x)),
+                            dynamic_peers: Vec::new(),
+                            route_server_client: pg.route_server.as_ref().map_or(false, |x| {
+                                x.config
+                                    .as_ref()
+                                    .map_or(false, |x| x.route_server_client.map_or(false, |x| x))
+                            }),
+                            holdtime: pg.timers.as_ref().and_then(|x| {
+                                x.config
+                                    .as_ref()
+                                    .and_then(|x| x.hold_time.as_ref().map(|x| *x as u64))
+                            }),
+                            // passive: pg.transport.as_ref().map_or(false, |x| {
+                            //     x.config
+                            //         .as_ref()
+                            //         .map_or(false, |x| x.passive_mode.map_or(false, |x| x))
+                            // }),
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(neighbors) = bgp.as_ref().and_then(|x| x.dynamic_neighbors.as_ref()) {
+            let mut server = GLOBAL.write().await;
+            for n in neighbors {
+                if let Some(prefix) = n.config.as_ref().and_then(|x| x.prefix.as_ref()) {
+                    if let Ok(prefix) = packet::IpNet::from_str(prefix) {
+                        if let Some(name) = n.config.as_ref().and_then(|x| x.peer_group.as_ref()) {
+                            server
+                                .peer_group
+                                .entry(name.to_string())
+                                .and_modify(|e| e.dynamic_peers.push(DynamicPeer { prefix }));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(defined_sets) = bgp.as_ref().and_then(|x| x.defined_sets.as_ref()) {
+            match Vec::<api::DefinedSet>::try_from(defined_sets) {
+                Ok(sets) => {
+                    let mut server = GLOBAL.write().await;
+                    for set in sets {
+                        if let Err(e) = server.ptable.add_defined_set(set) {
+                            panic!("{:?}", e);
+                        }
+                    }
+                }
+                Err(e) => panic!("{:?}", e),
+            }
+        }
+        if let Some(policies) = bgp.as_ref().and_then(|x| x.policy_definitions.as_ref()) {
+            let mut h = HashSet::new();
+            let mut server = GLOBAL.write().await;
+            for policy in policies {
+                if let Some(name) = &policy.name {
+                    let mut s_names = Vec::new();
+                    if let Some(statements) = &policy.statements {
+                        for s in statements {
+                            if let Some(n) = s.name.as_ref() {
+                                if h.contains(n) {
+                                    s_names.push(n.clone());
+                                    continue;
+                                }
+                            }
+                            match api::Statement::try_from(s) {
+                                Ok(s) => {
+                                    server
+                                        .ptable
+                                        .add_statement(&s.name, s.conditions, s.actions)
+                                        .unwrap();
+                                    s_names.push(s.name.clone());
+                                    h.insert(s.name);
+                                }
+                                Err(e) => panic!("{:?}", e),
+                            }
+                        }
+                    }
+                    if let Err(e) = server.ptable.add_policy(
+                        name,
+                        s_names
+                            .into_iter()
+                            .map(|x| api::Statement {
+                                name: x,
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ) {
+                        panic!("{:?}", e);
+                    }
+                }
+            }
+        }
+        if let Some(g) = bgp.as_ref().and_then(|x| x.global.as_ref()) {
+            let f = |direction: i32,
+                     policy_list: Option<&Vec<String>>,
+                     action: Option<&config::gen::DefaultPolicyType>|
+             -> api::PolicyAssignment {
+                api::PolicyAssignment {
+                    name: "".to_string(),
+                    direction,
+                    policies: policy_list.map_or(Vec::new(), |x| {
+                        x.iter()
+                            .map(|x| api::Policy {
+                                name: x.to_string(),
+                                statements: Vec::new(),
+                            })
+                            .collect()
+                    }),
+                    default_action: action.map_or(1, |x| x.into()),
+                }
+            };
+            if let Some(Some(config)) = g.apply_policy.as_ref().map(|x| x.config.as_ref()) {
+                if let Err(e) = add_policy_assignment(f(
+                    1,
+                    config.import_policy_list.as_ref(),
+                    config.default_import_policy.as_ref(),
+                ))
+                .await
+                {
+                    panic!("{:?}", e);
+                }
+                if let Err(e) = add_policy_assignment(f(
+                    2,
+                    config.export_policy_list.as_ref(),
+                    config.default_export_policy.as_ref(),
+                ))
+                .await
+                {
+                    panic!("{:?}", e);
+                }
+            }
+        }
+        if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
+            let mut server = GLOBAL.write().await;
+            for p in peers {
+                server
+                    .add_peer(Peer::from(p), Some(active_tx.clone()))
+                    .unwrap();
+            }
+        }
+        if any_peer {
+            let mut server = GLOBAL.write().await;
+            server.peer_group.insert(
+                "any".to_string(),
+                PeerGroup {
+                    as_number: 0,
+                    dynamic_peers: vec![
+                        DynamicPeer {
+                            prefix: packet::IpNet::from_str("0.0.0.0/0").unwrap(),
+                        },
+                        DynamicPeer {
+                            prefix: packet::IpNet::from_str("::/0").unwrap(),
+                        },
+                    ],
+                    // passive: true,
+                    route_server_client: false,
+                    holdtime: None,
+                },
+            );
+        }
+        let addr = "0.0.0.0:50051".parse().unwrap();
+        let notify2 = notify.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(GobgpApiServer::new(GrpcService::new(notify2, active_tx)))
+                .serve(addr)
+                .await
+            {
+                panic!("failed to listen on grpc {}", e);
+            }
+        });
+        notify.notified().await;
+        let listen_port = GLOBAL.read().await.listen_port;
+        let mut incomings = vec![
+            net::create_listen_socket("0.0.0.0".to_string(), listen_port),
+            net::create_listen_socket("[::]".to_string(), listen_port),
+        ]
+        .into_iter()
+        .filter(|x| x.is_ok())
+        .map(|x| {
+            tokio_stream::wrappers::TcpListenerStream::new(
+                TcpListener::from_std(x.unwrap()).unwrap(),
+            )
+        })
+        .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
+        assert_ne!(incomings.len(), 0);
+        let mut next_peer_taker = 0;
+        let nr_takers = conn_tx.len();
+        loop {
+            let mut bgp_listen_futures = FuturesUnordered::new();
+            for incoming in &mut incomings {
+                bgp_listen_futures.push(incoming.next());
+            }
+            futures::select_biased! {
+                stream = bgp_listen_futures.next() => {
+                    if let Some(Some(Ok(stream))) = stream {
+                        if let Some(r) = Global::accept_connection(stream).await {
+                            let _ = conn_tx[next_peer_taker].send(r);
+                            next_peer_taker = (next_peer_taker + 1) % nr_takers;
+                        }
+                    }
+                }
+                stream = active_rx.recv().fuse() => {
+                    if let Some(stream) = stream {
+                        if let Some(r) = Global::accept_connection(stream).await {
+                            let _ = conn_tx[next_peer_taker].send(r);
+                            next_peer_taker = (next_peer_taker + 1) % nr_takers;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
-
-static NUM_TABLES: Lazy<usize> = Lazy::new(|| num_cpus::get() / 2);
-
-fn dealer<T: Hash>(a: T) -> usize {
-    let mut hasher = FnvHasher::default();
-    a.hash(&mut hasher);
-    hasher.finish() as usize % *NUM_TABLES
-}
-
-static GLOBAL: Lazy<RwLock<Global>> = Lazy::new(|| RwLock::new(Global::new()));
 
 enum TableEvent {
     // BGP events
@@ -1859,441 +2199,85 @@ struct Table {
     global_export_policy: Option<Arc<table::PolicyAssignment>>,
 }
 
-static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
-    let mut table = Vec::with_capacity(*NUM_TABLES);
-    for _ in 0..*NUM_TABLES {
-        table.push(Mutex::new(Table {
-            rtable: table::RoutingTable::new(),
-            peer_event_tx: FnvHashMap::default(),
-            table_event_tx: Vec::new(),
-            sessions: FnvHashMap::default(),
-            global_import_policy: None,
-            global_export_policy: None,
-        }));
+impl Table {
+    fn dealer<T: Hash>(a: T) -> usize {
+        let mut hasher = FnvHasher::default();
+        a.hash(&mut hasher);
+        hasher.finish() as usize % *NUM_TABLES
     }
-    table
-});
 
-async fn accept_connection(
-    stream: TcpStream,
-) -> Option<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)> {
-    let peer_addr = stream.peer_addr().ok()?.ip();
-    let mut global = GLOBAL.write().await;
-    let router_id = global.router_id;
-    let (local_as, remote_as, local_cap, holdtime, rs_client, mgmt_rx) =
-        match global.peers.get_mut(&peer_addr) {
-            Some(peer) => {
-                if peer.admin_down {
-                    println!(
-                        "admin down; ignore a new passive connection from {}",
-                        peer_addr
-                    );
-                    return None;
-                }
-                if peer.mgmt_tx.is_some() {
-                    println!("already has connection {}", peer_addr);
-                    return None;
-                }
-                peer.state = State::Active;
-                let (tx, rx) = mpsc::unbounded_channel();
-                peer.mgmt_tx = Some(tx);
-
-                (
-                    peer.local_as,
-                    peer.remote_as,
-                    peer.local_cap.to_owned(),
-                    peer.holdtime,
-                    peer.route_server_client,
-                    rx,
-                )
-            }
-            None => {
-                let mut is_dynamic = false;
-                let mut rs_client = false;
-                let mut remote_as = 0;
-                let mut holdtime = None;
-                for p in &global.peer_group {
-                    for d in &p.1.dynamic_peers {
-                        if d.prefix.contains(&peer_addr) {
-                            remote_as = p.1.as_number;
-                            is_dynamic = true;
-                            rs_client = p.1.route_server_client;
-                            holdtime = p.1.holdtime;
-                            break;
-                        }
-                    }
-                }
-                if !is_dynamic {
-                    println!(
-                        "can't find configuration a new passive connection {}",
-                        peer_addr
-                    );
-                    return None;
-                }
-                let (tx, rx) = mpsc::unbounded_channel();
-                let mut p = Peer::new(peer_addr)
-                    .state(State::Active)
-                    .remote_as(remote_as)
-                    .delete_on_disconnected(true)
-                    .rs_client(rs_client)
-                    .mgmt_channel(tx);
-                if let Some(holdtime) = holdtime {
-                    p = p.hold_time(holdtime);
-                }
-                let _ = global.add_peer(p, None);
-                let peer = global.peers.get(&peer_addr).unwrap();
-                (
-                    peer.local_as,
-                    peer.remote_as,
-                    peer.local_cap.to_owned(),
-                    peer.holdtime,
-                    peer.route_server_client,
-                    rx,
-                )
-            }
-        };
-
-    Handler::new(
-        stream, peer_addr, local_as, remote_as, router_id, local_cap, holdtime, rs_client,
-    )
-    .map(|h| (h, mgmt_rx))
-}
-
-async fn handle_table_update(idx: usize, mut v: Vec<UnboundedReceiverStream<TableEvent>>) {
-    loop {
-        let mut futures: FuturesUnordered<_> = v.iter_mut().map(|rx| rx.next()).collect();
-
-        if let Some(Some(msg)) = futures.next().await {
-            match msg {
-                TableEvent::PassUpdate(source, family, nets, attrs) => match attrs {
-                    Some(attrs) => {
-                        let mut t = TABLE[idx].lock().await;
-                        for net in nets {
-                            let mut filtered = false;
-                            if let Some(a) = t.global_import_policy.as_ref() {
-                                if t.rtable.apply_policy(a, &source, &net, &attrs)
-                                    == table::Disposition::Reject
-                                {
-                                    filtered = true;
-                                }
-                            }
-                            if let Some(ri) = t.rtable.insert(
-                                source.clone(),
-                                family,
-                                net,
-                                attrs.clone(),
-                                filtered,
-                            ) {
-                                if let Some(a) = t.global_export_policy.as_ref() {
+    async fn serve(idx: usize, mut v: Vec<UnboundedReceiverStream<TableEvent>>) {
+        loop {
+            let mut futures: FuturesUnordered<_> = v.iter_mut().map(|rx| rx.next()).collect();
+            if let Some(Some(msg)) = futures.next().await {
+                match msg {
+                    TableEvent::PassUpdate(source, family, nets, attrs) => match attrs {
+                        Some(attrs) => {
+                            let mut t = TABLE[idx].lock().await;
+                            for net in nets {
+                                let mut filtered = false;
+                                if let Some(a) = t.global_import_policy.as_ref() {
                                     if t.rtable.apply_policy(a, &source, &net, &attrs)
                                         == table::Disposition::Reject
                                     {
-                                        continue;
+                                        filtered = true;
                                     }
                                 }
-                                for c in t.peer_event_tx.values() {
-                                    let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
+                                if let Some(ri) = t.rtable.insert(
+                                    source.clone(),
+                                    family,
+                                    net,
+                                    attrs.clone(),
+                                    filtered,
+                                ) {
+                                    if let Some(a) = t.global_export_policy.as_ref() {
+                                        if t.rtable.apply_policy(a, &source, &net, &attrs)
+                                            == table::Disposition::Reject
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    for c in t.peer_event_tx.values() {
+                                        let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
+                                    }
                                 }
                             }
                         }
-                    }
-                    None => {
+                        None => {
+                            let mut t = TABLE[idx].lock().await;
+                            for net in nets {
+                                if let Some(ri) = t.rtable.remove(source.clone(), family, net) {
+                                    for c in t.peer_event_tx.values() {
+                                        let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    TableEvent::Disconnected(source) => {
                         let mut t = TABLE[idx].lock().await;
-                        for net in nets {
-                            if let Some(ri) = t.rtable.remove(source.clone(), family, net) {
-                                for c in t.peer_event_tx.values() {
-                                    let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
-                                }
+                        t.sessions.remove(&source.peer_addr);
+                        for change in t.rtable.drop(source) {
+                            for c in t.peer_event_tx.values() {
+                                let _ = c.send(ToPeerEvent::Advertise(change.clone()));
                             }
                         }
                     }
-                },
-                TableEvent::Disconnected(source) => {
-                    let mut t = TABLE[idx].lock().await;
-                    t.sessions.remove(&source.peer_addr);
-                    for change in t.rtable.drop(source) {
-                        for c in t.peer_event_tx.values() {
-                            let _ = c.send(ToPeerEvent::Advertise(change.clone()));
+                    TableEvent::SyncState(session) => {
+                        TABLE[idx]
+                            .lock()
+                            .await
+                            .sessions
+                            .insert(session.remote_addr, *session);
+                    }
+                    TableEvent::InsertRoa(v) => {
+                        let mut t = TABLE[idx].lock().await;
+                        for (net, roa) in v {
+                            t.rtable.roa_insert(net, roa);
                         }
                     }
-                }
-                TableEvent::SyncState(session) => {
-                    TABLE[idx]
-                        .lock()
-                        .await
-                        .sessions
-                        .insert(session.remote_addr, *session);
-                }
-                TableEvent::InsertRoa(v) => {
-                    let mut t = TABLE[idx].lock().await;
-                    for (net, roa) in v {
-                        t.rtable.roa_insert(net, roa);
-                    }
-                }
-                TableEvent::Drop(addr) => {
-                    TABLE[idx].lock().await.rtable.rpki_drop(addr);
-                }
-            }
-        }
-    }
-}
-
-async fn serve(
-    bgp: Option<config::BgpConfig>,
-    any_peer: bool,
-    conn_tx: Vec<mpsc::UnboundedSender<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)>>,
-    active_tx: mpsc::UnboundedSender<TcpStream>,
-    mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
-) {
-    let global_config = bgp
-        .as_ref()
-        .and_then(|x| x.global.as_ref())
-        .and_then(|x| x.config.as_ref());
-
-    let as_number = if let Some(asn) = global_config.as_ref().and_then(|x| x.r#as) {
-        asn
-    } else {
-        0
-    };
-    let router_id =
-        if let Some(router_id) = global_config.as_ref().and_then(|x| x.router_id.as_ref()) {
-            router_id.parse().unwrap()
-        } else {
-            Ipv4Addr::new(0, 0, 0, 0)
-        };
-    let notify = Arc::new(tokio::sync::Notify::new());
-    if as_number != 0 {
-        notify.clone().notify_one();
-
-        let global = &mut GLOBAL.write().await;
-        global.as_number = as_number;
-        global.router_id = router_id;
-    }
-
-    if let Some(groups) = bgp.as_ref().and_then(|x| x.peer_groups.as_ref()) {
-        let mut server = GLOBAL.write().await;
-        for pg in groups {
-            if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {
-                server.peer_group.insert(
-                    name,
-                    PeerGroup {
-                        as_number: pg.config.as_ref().map_or(0, |x| x.peer_as.map_or(0, |x| x)),
-                        dynamic_peers: Vec::new(),
-                        route_server_client: pg.route_server.as_ref().map_or(false, |x| {
-                            x.config
-                                .as_ref()
-                                .map_or(false, |x| x.route_server_client.map_or(false, |x| x))
-                        }),
-                        holdtime: pg.timers.as_ref().and_then(|x| {
-                            x.config
-                                .as_ref()
-                                .and_then(|x| x.hold_time.as_ref().map(|x| *x as u64))
-                        }),
-                        // passive: pg.transport.as_ref().map_or(false, |x| {
-                        //     x.config
-                        //         .as_ref()
-                        //         .map_or(false, |x| x.passive_mode.map_or(false, |x| x))
-                        // }),
-                    },
-                );
-            }
-        }
-    }
-
-    if let Some(neighbors) = bgp.as_ref().and_then(|x| x.dynamic_neighbors.as_ref()) {
-        let mut server = GLOBAL.write().await;
-        for n in neighbors {
-            if let Some(prefix) = n.config.as_ref().and_then(|x| x.prefix.as_ref()) {
-                if let Ok(prefix) = packet::IpNet::from_str(prefix) {
-                    if let Some(name) = n.config.as_ref().and_then(|x| x.peer_group.as_ref()) {
-                        server
-                            .peer_group
-                            .entry(name.to_string())
-                            .and_modify(|e| e.dynamic_peers.push(DynamicPeer { prefix }));
-                    }
-                }
-            }
-        }
-    }
-    if let Some(defined_sets) = bgp.as_ref().and_then(|x| x.defined_sets.as_ref()) {
-        match Vec::<api::DefinedSet>::try_from(defined_sets) {
-            Ok(sets) => {
-                let mut server = GLOBAL.write().await;
-                for set in sets {
-                    if let Err(e) = server.ptable.add_defined_set(set) {
-                        panic!("{:?}", e);
-                    }
-                }
-            }
-            Err(e) => panic!("{:?}", e),
-        }
-    }
-    if let Some(policies) = bgp.as_ref().and_then(|x| x.policy_definitions.as_ref()) {
-        let mut h = HashSet::new();
-        let mut server = GLOBAL.write().await;
-        for policy in policies {
-            if let Some(name) = &policy.name {
-                let mut s_names = Vec::new();
-                if let Some(statements) = &policy.statements {
-                    for s in statements {
-                        if let Some(n) = s.name.as_ref() {
-                            if h.contains(n) {
-                                s_names.push(n.clone());
-                                continue;
-                            }
-                        }
-                        match api::Statement::try_from(s) {
-                            Ok(s) => {
-                                server
-                                    .ptable
-                                    .add_statement(&s.name, s.conditions, s.actions)
-                                    .unwrap();
-                                s_names.push(s.name.clone());
-                                h.insert(s.name);
-                            }
-                            Err(e) => panic!("{:?}", e),
-                        }
-                    }
-                }
-
-                if let Err(e) = server.ptable.add_policy(
-                    name,
-                    s_names
-                        .into_iter()
-                        .map(|x| api::Statement {
-                            name: x,
-                            ..Default::default()
-                        })
-                        .collect(),
-                ) {
-                    panic!("{:?}", e);
-                }
-            }
-        }
-    }
-
-    if let Some(g) = bgp.as_ref().and_then(|x| x.global.as_ref()) {
-        let f = |direction: i32,
-                 policy_list: Option<&Vec<String>>,
-                 action: Option<&config::gen::DefaultPolicyType>|
-         -> api::PolicyAssignment {
-            api::PolicyAssignment {
-                name: "".to_string(),
-                direction,
-                policies: policy_list.map_or(Vec::new(), |x| {
-                    x.iter()
-                        .map(|x| api::Policy {
-                            name: x.to_string(),
-                            statements: Vec::new(),
-                        })
-                        .collect()
-                }),
-                default_action: action.map_or(1, |x| x.into()),
-            }
-        };
-
-        if let Some(Some(config)) = g.apply_policy.as_ref().map(|x| x.config.as_ref()) {
-            if let Err(e) = add_policy_assignment(f(
-                1,
-                config.import_policy_list.as_ref(),
-                config.default_import_policy.as_ref(),
-            ))
-            .await
-            {
-                panic!("{:?}", e);
-            }
-            if let Err(e) = add_policy_assignment(f(
-                2,
-                config.export_policy_list.as_ref(),
-                config.default_export_policy.as_ref(),
-            ))
-            .await
-            {
-                panic!("{:?}", e);
-            }
-        }
-    }
-
-    if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
-        let mut server = GLOBAL.write().await;
-        for p in peers {
-            server
-                .add_peer(Peer::from(p), Some(active_tx.clone()))
-                .unwrap();
-        }
-    }
-
-    if any_peer {
-        let mut server = GLOBAL.write().await;
-        server.peer_group.insert(
-            "any".to_string(),
-            PeerGroup {
-                as_number: 0,
-                dynamic_peers: vec![
-                    DynamicPeer {
-                        prefix: packet::IpNet::from_str("0.0.0.0/0").unwrap(),
-                    },
-                    DynamicPeer {
-                        prefix: packet::IpNet::from_str("::/0").unwrap(),
-                    },
-                ],
-                // passive: true,
-                route_server_client: false,
-                holdtime: None,
-            },
-        );
-    }
-
-    let addr = "0.0.0.0:50051".parse().unwrap();
-    let notify2 = notify.clone();
-    tokio::spawn(async move {
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(GobgpApiServer::new(GrpcService::new(notify2, active_tx)))
-            .serve(addr)
-            .await
-        {
-            panic!("failed to listen on grpc {}", e);
-        }
-    });
-
-    notify.notified().await;
-
-    let listen_port = GLOBAL.read().await.listen_port;
-    let mut incomings = vec![
-        net::create_listen_socket("0.0.0.0".to_string(), listen_port),
-        net::create_listen_socket("[::]".to_string(), listen_port),
-    ]
-    .into_iter()
-    .filter(|x| x.is_ok())
-    .map(|x| {
-        tokio_stream::wrappers::TcpListenerStream::new(TcpListener::from_std(x.unwrap()).unwrap())
-    })
-    .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
-    assert_ne!(incomings.len(), 0);
-
-    let mut next_peer_taker = 0;
-    let nr_takers = conn_tx.len();
-    loop {
-        let mut bgp_listen_futures = FuturesUnordered::new();
-        for incoming in &mut incomings {
-            bgp_listen_futures.push(incoming.next());
-        }
-
-        futures::select_biased! {
-            stream = bgp_listen_futures.next() => {
-                if let Some(Some(Ok(stream))) = stream {
-                    if let Some(r) = accept_connection(stream).await {
-                        let _ = conn_tx[next_peer_taker].send(r);
-                        next_peer_taker = (next_peer_taker + 1) % nr_takers;
-                    }
-                }
-            }
-
-            stream = active_rx.recv().fuse() => {
-                if let Some(stream) = stream {
-                    if let Some(r) = accept_connection(stream).await {
-                        let _ = conn_tx[next_peer_taker].send(r);
-                        next_peer_taker = (next_peer_taker + 1) % nr_takers;
+                    TableEvent::Drop(addr) => {
+                        TABLE[idx].lock().await.rtable.rpki_drop(addr);
                     }
                 }
             }
@@ -2317,7 +2301,7 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
                         t.table_event_tx.push(tx);
                         v.push(UnboundedReceiverStream::new(rx));
                     }
-                    handle_table_update(i, v).await;
+                    Table::serve(i, v).await;
                 })
         });
         handlers.push(h);
@@ -2365,7 +2349,7 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(serve(bgp, any_peer, conn_tx, active_tx, active_rx));
+        .block_on(Global::serve(bgp, any_peer, conn_tx, active_tx, active_rx));
 }
 
 struct Handler {
@@ -2476,7 +2460,7 @@ impl Handler {
         for net in reach {
             add.entry(packet::Family::IPV4)
                 .or_insert_with(FnvHashMap::default)
-                .entry(dealer(&net))
+                .entry(Table::dealer(&net))
                 .or_insert_with(Vec::new)
                 .push(net);
         }
@@ -2484,7 +2468,7 @@ impl Handler {
             for net in mp_reach {
                 add.entry(family)
                     .or_insert_with(FnvHashMap::default)
-                    .entry(dealer(&net))
+                    .entry(Table::dealer(&net))
                     .or_insert_with(Vec::new)
                     .push(net);
             }
@@ -2493,7 +2477,7 @@ impl Handler {
         for net in unreach {
             del.entry(packet::Family::IPV4)
                 .or_insert_with(FnvHashMap::default)
-                .entry(dealer(&net))
+                .entry(Table::dealer(&net))
                 .or_insert_with(Vec::new)
                 .push(net);
         }
@@ -2501,7 +2485,7 @@ impl Handler {
             for net in mp_unreach {
                 del.entry(family)
                     .or_insert_with(FnvHashMap::default)
-                    .entry(dealer(&net))
+                    .entry(Table::dealer(&net))
                     .or_insert_with(Vec::new)
                     .push(net);
             }
@@ -2620,7 +2604,7 @@ impl Handler {
                         self.rs_client,
                     )));
 
-                    let d = dealer(&self.peer_addr);
+                    let d = Table::dealer(&self.peer_addr);
                     for i in 0..*NUM_TABLES {
                         let mut t = TABLE[i].lock().await;
                         for f in self.family_cap.keys() {
@@ -2690,7 +2674,7 @@ impl Handler {
                 .collect();
 
         let mut state_update_timer = tokio::time::interval(Duration::from_secs(1));
-        let state_table = dealer(&self.peer_addr);
+        let state_table = Table::dealer(&self.peer_addr);
         let mut rxbuf = bytes::BytesMut::with_capacity(rxbuf_size);
         while self.shutdown.is_none() {
             let mut peer_event_futures: FuturesUnordered<_> =
