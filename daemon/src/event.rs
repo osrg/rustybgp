@@ -1352,7 +1352,7 @@ impl GobgpApi for GrpcService {
                 let client = RpkiClient::new();
                 let t = client.configured_time;
                 v.insert(client);
-                try_rpki_connect(sockaddr, t);
+                RpkiClient::try_connect(sockaddr, t);
             }
         }
         Ok(tonic::Response::new(()))
@@ -1579,143 +1579,6 @@ enum RpkiMgmtMsg {
     Deconfigured,
 }
 
-async fn rpki_client_serve(
-    stream: TcpStream,
-    rx: mpsc::UnboundedReceiver<RpkiMgmtMsg>,
-    txv: Vec<mpsc::UnboundedSender<TableEvent>>,
-) -> Result<(), Error> {
-    let remote_addr = stream.peer_addr()?.ip();
-    let remote_addr = Arc::new(remote_addr);
-    let mut lines = Framed::new(stream, packet::rpki::RtrCodec::new());
-    let _ = lines.send(&packet::rpki::Message::ResetQuery).await;
-    let mut rx_counter: FnvHashMap<u8, i64> = FnvHashMap::default();
-    let uptime = SystemTime::now();
-
-    let mut rx = UnboundedReceiverStream::new(rx);
-    let mut v = Vec::new();
-    let mut serial = 0;
-    let mut end_of_data = false;
-    loop {
-        tokio::select! {
-            msg = rx.next() => {
-                match msg {
-                    Some(RpkiMgmtMsg::State(tx)) => {
-                        let s = TABLE[0].lock().await.rtable.rpki_state(remote_addr.clone());
-                        let _ = tx.send(
-                            api::RpkiState {
-                                uptime: Some(uptime.to_api()),
-                                downtime: None,
-                                up: true,
-                                record_ipv4: s.num_records_v4,
-                                record_ipv6: s.num_records_v6,
-                                prefix_ipv4: s.num_prefixes_v4,
-                                prefix_ipv6: s.num_prefixes_v6,
-                                serial,
-                                serial_notify: *rx_counter.get(&packet::rpki::Message::SERIAL_NOTIFY).unwrap_or(&0),
-                                serial_query: *rx_counter.get(&packet::rpki::Message::SERIAL_NOTIFY).unwrap_or(&0),
-                                reset_query: *rx_counter.get(&packet::rpki::Message::RESET_QUERY).unwrap_or(&0),
-                                cache_response: *rx_counter.get(&packet::rpki::Message::CACHE_RESPONSE).unwrap_or(&0),
-                                received_ipv4: *rx_counter.get(&packet::rpki::Message::IPV4_PREFIX).unwrap_or(&0),
-                                received_ipv6: *rx_counter.get(&packet::rpki::Message::IPV6_PREFIX).unwrap_or(&0),
-                                end_of_data: *rx_counter.get(&packet::rpki::Message::END_OF_DATA).unwrap_or(&0),
-                                cache_reset: *rx_counter.get(&packet::rpki::Message::CACHE_RESET).unwrap_or(&0),
-                                error: *rx_counter.get(&packet::rpki::Message::ERROR_REPORT).unwrap_or(&0),
-                            }
-                        ).await;
-                    }
-                    Some(RpkiMgmtMsg::Deconfigured) => {
-                        break;
-                    }
-                    None => {}
-                }
-            }
-            msg = lines.next() => {
-                let msg = match msg {
-                    Some(msg) => match msg {
-                        Ok(msg) => msg,
-                        Err(_) => break,
-                    },
-                    None => break,
-                };
-
-                *rx_counter.entry(msg.code()).or_insert(0) += 1;
-
-                match msg {
-                    packet::rpki::Message::IpPrefix(prefix) => {
-                        if prefix.flags & 1 > 0 {
-                            let roa = Arc::new(table::Roa::new(prefix.max_length, prefix.as_number, remote_addr.clone()));
-                            if end_of_data {
-                                for tx in &txv {
-                                    let _ = tx.send(TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())]));
-                                }
-                            } else {
-                                v.push((
-                                    prefix.net,
-                                    roa,
-                                ));
-                            }
-                        }
-                    }
-                    packet::rpki::Message::EndOfData { serial_number } => {
-                        end_of_data = true;
-                        serial = serial_number;
-                        for tx in &txv {
-                            let _ = tx.send(TableEvent::Drop(remote_addr.clone()));
-                            let _ = tx.send(TableEvent::InsertRoa(v.to_owned()));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    for tx in &txv {
-        let _ = tx.send(TableEvent::Drop(remote_addr.clone()));
-    }
-    Ok(())
-}
-
-fn try_rpki_connect(sockaddr: SocketAddr, configured_time: u64) {
-    tokio::spawn(async move {
-        let mut table_tx = Vec::with_capacity(*NUM_TABLES);
-        let d = dealer(&sockaddr);
-        for i in 0..*NUM_TABLES {
-            let t = TABLE[i].lock().await;
-            table_tx.push(t.table_event_tx[d].clone());
-        }
-        loop {
-            if let Ok(Ok(stream)) = tokio::time::timeout(
-                tokio::time::Duration::from_secs(5),
-                TcpStream::connect(sockaddr),
-            )
-            .await
-            {
-                let (tx, rx) = mpsc::unbounded_channel();
-                if let Some(mut client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
-                    client.mgmt_tx = Some(tx);
-                } else {
-                    break;
-                }
-                let _ = rpki_client_serve(stream, rx, table_tx.to_vec()).await;
-            } else {
-                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            }
-
-            if let Some(mut client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
-                if client.configured_time != configured_time {
-                    break;
-                }
-                if client.mgmt_tx.is_some() {
-                    client.downtime = Some(SystemTime::now());
-                    client.mgmt_tx = None;
-                }
-            } else {
-                break;
-            }
-        }
-    });
-}
-
 struct RpkiClient {
     configured_time: u64,
     downtime: Option<SystemTime>,
@@ -1732,6 +1595,139 @@ impl RpkiClient {
             downtime: None,
             mgmt_tx: None,
         }
+    }
+
+    async fn serve(
+        stream: TcpStream,
+        rx: mpsc::UnboundedReceiver<RpkiMgmtMsg>,
+        txv: Vec<mpsc::UnboundedSender<TableEvent>>,
+    ) -> Result<(), Error> {
+        let remote_addr = stream.peer_addr()?.ip();
+        let remote_addr = Arc::new(remote_addr);
+        let mut lines = Framed::new(stream, packet::rpki::RtrCodec::new());
+        let _ = lines.send(&packet::rpki::Message::ResetQuery).await;
+        let mut rx_counter: FnvHashMap<u8, i64> = FnvHashMap::default();
+        let uptime = SystemTime::now();
+        let mut rx = UnboundedReceiverStream::new(rx);
+        let mut v = Vec::new();
+        let mut serial = 0;
+        let mut end_of_data = false;
+        loop {
+            tokio::select! {
+                msg = rx.next() => {
+                    match msg {
+                        Some(RpkiMgmtMsg::State(tx)) => {
+                            let s = TABLE[0].lock().await.rtable.rpki_state(remote_addr.clone());
+                            let _ = tx.send(
+                                api::RpkiState {
+                                    uptime: Some(uptime.to_api()),
+                                    downtime: None,
+                                    up: true,
+                                    record_ipv4: s.num_records_v4,
+                                    record_ipv6: s.num_records_v6,
+                                    prefix_ipv4: s.num_prefixes_v4,
+                                    prefix_ipv6: s.num_prefixes_v6,
+                                    serial,
+                                    serial_notify: *rx_counter.get(&packet::rpki::Message::SERIAL_NOTIFY).unwrap_or(&0),
+                                    serial_query: *rx_counter.get(&packet::rpki::Message::SERIAL_NOTIFY).unwrap_or(&0),
+                                    reset_query: *rx_counter.get(&packet::rpki::Message::RESET_QUERY).unwrap_or(&0),
+                                    cache_response: *rx_counter.get(&packet::rpki::Message::CACHE_RESPONSE).unwrap_or(&0),
+                                    received_ipv4: *rx_counter.get(&packet::rpki::Message::IPV4_PREFIX).unwrap_or(&0),
+                                    received_ipv6: *rx_counter.get(&packet::rpki::Message::IPV6_PREFIX).unwrap_or(&0),
+                                    end_of_data: *rx_counter.get(&packet::rpki::Message::END_OF_DATA).unwrap_or(&0),
+                                    cache_reset: *rx_counter.get(&packet::rpki::Message::CACHE_RESET).unwrap_or(&0),
+                                    error: *rx_counter.get(&packet::rpki::Message::ERROR_REPORT).unwrap_or(&0),
+                                }
+                            ).await;
+                        }
+                        Some(RpkiMgmtMsg::Deconfigured) => {
+                            break;
+                        }
+                        None => {}
+                    }
+                }
+                msg = lines.next() => {
+                    let msg = match msg {
+                        Some(msg) => match msg {
+                            Ok(msg) => msg,
+                            Err(_) => break,
+                        },
+                        None => break,
+                    };
+                    *rx_counter.entry(msg.code()).or_insert(0) += 1;
+                    match msg {
+                        packet::rpki::Message::IpPrefix(prefix) => {
+                            if prefix.flags & 1 > 0 {
+                                let roa = Arc::new(table::Roa::new(prefix.max_length, prefix.as_number, remote_addr.clone()));
+                                if end_of_data {
+                                    for tx in &txv {
+                                        let _ = tx.send(TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())]));
+                                    }
+                                } else {
+                                    v.push((
+                                        prefix.net,
+                                        roa,
+                                    ));
+                                }
+                            }
+                        }
+                        packet::rpki::Message::EndOfData { serial_number } => {
+                            end_of_data = true;
+                            serial = serial_number;
+                            for tx in &txv {
+                                let _ = tx.send(TableEvent::Drop(remote_addr.clone()));
+                                let _ = tx.send(TableEvent::InsertRoa(v.to_owned()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for tx in &txv {
+            let _ = tx.send(TableEvent::Drop(remote_addr.clone()));
+        }
+        Ok(())
+    }
+
+    fn try_connect(sockaddr: SocketAddr, configured_time: u64) {
+        tokio::spawn(async move {
+            let mut table_tx = Vec::with_capacity(*NUM_TABLES);
+            let d = dealer(&sockaddr);
+            for i in 0..*NUM_TABLES {
+                let t = TABLE[i].lock().await;
+                table_tx.push(t.table_event_tx[d].clone());
+            }
+            loop {
+                if let Ok(Ok(stream)) = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(sockaddr),
+                )
+                .await
+                {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    if let Some(mut client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
+                        client.mgmt_tx = Some(tx);
+                    } else {
+                        break;
+                    }
+                    let _ = RpkiClient::serve(stream, rx, table_tx.to_vec()).await;
+                } else {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                }
+                if let Some(mut client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
+                    if client.configured_time != configured_time {
+                        break;
+                    }
+                    if client.mgmt_tx.is_some() {
+                        client.downtime = Some(SystemTime::now());
+                        client.mgmt_tx = None;
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
     }
 }
 
