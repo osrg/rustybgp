@@ -1701,7 +1701,7 @@ impl BgpCodec {
                 dst.put_u8(Message::NOTIFICATION);
                 dst.put_u8(*code);
                 dst.put_u8(*subcode);
-                dst.put_slice(&data);
+                dst.put_slice(data);
             }
             Message::Keepalive => {
                 dst.put_u8(Message::KEEPALIVE);

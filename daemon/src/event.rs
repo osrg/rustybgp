@@ -771,7 +771,7 @@ impl GobgpApi for GrpcService {
                 if addr == &peer_addr {
                     if p.admin_down {
                         p.admin_down = false;
-                        enable_active_connect(&p, self.active_conn_tx.clone());
+                        enable_active_connect(p, self.active_conn_tx.clone());
                         return Ok(tonic::Response::new(()));
                     } else {
                         return Err(tonic::Status::new(
@@ -2354,7 +2354,7 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
                                     } else {
                                         peer.update(&session);
                                         peer.reset();
-                                        enable_active_connect(&peer, active_conn_tx.clone());
+                                        enable_active_connect(peer, active_conn_tx.clone());
                                     }
                                 }
                             });

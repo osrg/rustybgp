@@ -460,7 +460,7 @@ impl RoutingTable {
                 Some(v) => v,
                 None => p.source.router_id,
             };
-            if f(&path) < f(&a) {
+            if f(&path) < f(a) {
                 break;
             }
 
@@ -739,19 +739,19 @@ static SINGLE_MATCH_REGEX: Lazy<
     vec![
         (
             Regex::new(r"^_([0-9]+)_$").unwrap(),
-            (|m| SingleAsPathMatch::parse_single(m).map(|n| SingleAsPathMatch::Include(n))),
+            (|m| SingleAsPathMatch::parse_single(m).map(SingleAsPathMatch::Include)),
         ),
         (
             Regex::new(r"^\^([0-9]+)_$").unwrap(),
-            (|m| SingleAsPathMatch::parse_single(m).map(|n| SingleAsPathMatch::LeftMost(n))),
+            (|m| SingleAsPathMatch::parse_single(m).map(SingleAsPathMatch::LeftMost)),
         ),
         (
             Regex::new(r"^_([0-9]+)\$$").unwrap(),
-            (|m| SingleAsPathMatch::parse_single(m).map(|n| SingleAsPathMatch::Origin(n))),
+            (|m| SingleAsPathMatch::parse_single(m).map(SingleAsPathMatch::Origin)),
         ),
         (
             Regex::new(r"^\^([0-9]+)\$$").unwrap(),
-            (|m| SingleAsPathMatch::parse_single(m).map(|n| SingleAsPathMatch::Only(n))),
+            (|m| SingleAsPathMatch::parse_single(m).map(SingleAsPathMatch::Only)),
         ),
         (
             Regex::new(r"^_([0-9]+)-([0-9]+)_$").unwrap(),

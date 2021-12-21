@@ -144,7 +144,7 @@ impl TryFrom<&PrefixSet> for api::DefinedSet {
 
             let caps = Regex::new(r"^([0-9]+)\.\.([0-9]+)$")
                 .unwrap()
-                .captures(&range)
+                .captures(range)
                 .ok_or_else(|| Error::InvalidConfiguration("invalid mask format".to_string()))?;
 
             if caps.len() != 3 {
