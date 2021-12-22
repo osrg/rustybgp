@@ -41,7 +41,7 @@ use crate::api;
 use crate::config;
 use crate::error::Error;
 use crate::net;
-use crate::packet;
+use crate::packet::{self, bgp, rpki};
 use crate::proto::ToApi;
 use crate::table;
 
@@ -91,10 +91,10 @@ impl From<&MessageCounter> for api::Message {
 }
 
 impl MessageCounter {
-    fn sync(&mut self, msg: &packet::Message) -> bool {
+    fn sync(&mut self, msg: &bgp::Message) -> bool {
         match msg {
-            packet::Message::Open { .. } => self.open += 1,
-            packet::Message::Update {
+            bgp::Message::Open { .. } => self.open += 1,
+            bgp::Message::Update {
                 reach: _,
                 unreach,
                 attr: _,
@@ -113,12 +113,12 @@ impl MessageCounter {
                     self.withdraw_prefix += v.len() as u64;
                 }
             }
-            packet::Message::Notification { .. } => {
+            bgp::Message::Notification { .. } => {
                 self.notification += 1;
                 return true;
             }
-            packet::Message::Keepalive => self.keepalive += 1,
-            packet::Message::RouteRefresh { .. } => self.refresh += 1,
+            bgp::Message::Keepalive => self.keepalive += 1,
+            bgp::Message::RouteRefresh { .. } => self.refresh += 1,
         }
         self.total += 1;
         false
@@ -664,7 +664,7 @@ impl GobgpApi for GrpcService {
                     match &p.mgmt_tx {
                         Some(mgmt_tx) => {
                             let _ = mgmt_tx.send(PeerMgmtMsg::Notification(
-                                packet::Message::Notification {
+                                bgp::Message::Notification {
                                     code: 6,
                                     subcode: 3,
                                     data: Vec::new(),
@@ -808,7 +808,7 @@ impl GobgpApi for GrpcService {
                         match &p.mgmt_tx {
                             Some(mgmt_tx) => {
                                 let _ = mgmt_tx.send(PeerMgmtMsg::Notification(
-                                    packet::Message::Notification {
+                                    bgp::Message::Notification {
                                         code: 6,
                                         subcode: 2,
                                         data: Vec::new(),
@@ -1536,7 +1536,7 @@ enum ToPeerEvent {
 }
 
 enum PeerMgmtMsg {
-    Notification(packet::Message),
+    Notification(bgp::Message),
 }
 
 fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
@@ -1604,8 +1604,8 @@ impl RpkiClient {
     ) -> Result<(), Error> {
         let remote_addr = stream.peer_addr()?.ip();
         let remote_addr = Arc::new(remote_addr);
-        let mut lines = Framed::new(stream, packet::rpki::RtrCodec::new());
-        let _ = lines.send(&packet::rpki::Message::ResetQuery).await;
+        let mut lines = Framed::new(stream, rpki::RtrCodec::new());
+        let _ = lines.send(&rpki::Message::ResetQuery).await;
         let mut rx_counter: FnvHashMap<u8, i64> = FnvHashMap::default();
         let uptime = SystemTime::now();
         let mut rx = UnboundedReceiverStream::new(rx);
@@ -1628,15 +1628,15 @@ impl RpkiClient {
                                     prefix_ipv4: s.num_prefixes_v4,
                                     prefix_ipv6: s.num_prefixes_v6,
                                     serial,
-                                    serial_notify: *rx_counter.get(&packet::rpki::Message::SERIAL_NOTIFY).unwrap_or(&0),
-                                    serial_query: *rx_counter.get(&packet::rpki::Message::SERIAL_NOTIFY).unwrap_or(&0),
-                                    reset_query: *rx_counter.get(&packet::rpki::Message::RESET_QUERY).unwrap_or(&0),
-                                    cache_response: *rx_counter.get(&packet::rpki::Message::CACHE_RESPONSE).unwrap_or(&0),
-                                    received_ipv4: *rx_counter.get(&packet::rpki::Message::IPV4_PREFIX).unwrap_or(&0),
-                                    received_ipv6: *rx_counter.get(&packet::rpki::Message::IPV6_PREFIX).unwrap_or(&0),
-                                    end_of_data: *rx_counter.get(&packet::rpki::Message::END_OF_DATA).unwrap_or(&0),
-                                    cache_reset: *rx_counter.get(&packet::rpki::Message::CACHE_RESET).unwrap_or(&0),
-                                    error: *rx_counter.get(&packet::rpki::Message::ERROR_REPORT).unwrap_or(&0),
+                                    serial_notify: *rx_counter.get(&rpki::Message::SERIAL_NOTIFY).unwrap_or(&0),
+                                    serial_query: *rx_counter.get(&rpki::Message::SERIAL_NOTIFY).unwrap_or(&0),
+                                    reset_query: *rx_counter.get(&rpki::Message::RESET_QUERY).unwrap_or(&0),
+                                    cache_response: *rx_counter.get(&rpki::Message::CACHE_RESPONSE).unwrap_or(&0),
+                                    received_ipv4: *rx_counter.get(&rpki::Message::IPV4_PREFIX).unwrap_or(&0),
+                                    received_ipv6: *rx_counter.get(&rpki::Message::IPV6_PREFIX).unwrap_or(&0),
+                                    end_of_data: *rx_counter.get(&rpki::Message::END_OF_DATA).unwrap_or(&0),
+                                    cache_reset: *rx_counter.get(&rpki::Message::CACHE_RESET).unwrap_or(&0),
+                                    error: *rx_counter.get(&rpki::Message::ERROR_REPORT).unwrap_or(&0),
                                 }
                             ).await;
                         }
@@ -1656,7 +1656,7 @@ impl RpkiClient {
                     };
                     *rx_counter.entry(msg.code()).or_insert(0) += 1;
                     match msg {
-                        packet::rpki::Message::IpPrefix(prefix) => {
+                        rpki::Message::IpPrefix(prefix) => {
                             if prefix.flags & 1 > 0 {
                                 let roa = Arc::new(table::Roa::new(prefix.max_length, prefix.as_number, remote_addr.clone()));
                                 if end_of_data {
@@ -1671,7 +1671,7 @@ impl RpkiClient {
                                 }
                             }
                         }
-                        packet::rpki::Message::EndOfData { serial_number } => {
+                        rpki::Message::EndOfData { serial_number } => {
                             end_of_data = true;
                             serial = serial_number;
                             for tx in &txv {
@@ -2520,25 +2520,25 @@ impl Handler {
 
     async fn rx_msg(
         &mut self,
-        msg: packet::Message,
+        msg: bgp::Message,
         pending: &mut PendingTx,
     ) -> std::result::Result<(), Error> {
         match msg {
-            packet::Message::Open {
+            bgp::Message::Open {
                 version: _,
                 as_number,
                 holdtime,
                 router_id,
                 capability,
             } => {
-                pending.urgent.push(packet::Message::Keepalive);
+                pending.urgent.push(bgp::Message::Keepalive);
 
                 self.state = State::OpenConfirm;
                 self.remote_router_id = router_id;
                 if self.remote_as != 0 && self.remote_as != as_number {
                     pending.urgent.insert(
                         0,
-                        packet::Message::Notification {
+                        bgp::Message::Notification {
                             code: 2,
                             subcode: 2,
                             data: Vec::new(),
@@ -2557,7 +2557,7 @@ impl Handler {
                 }
                 Ok(())
             }
-            packet::Message::Update {
+            bgp::Message::Update {
                 reach,
                 attr,
                 unreach,
@@ -2577,7 +2577,7 @@ impl Handler {
                     .await;
                 Ok(())
             }
-            packet::Message::Notification {
+            bgp::Message::Notification {
                 code,
                 subcode,
                 data: _,
@@ -2585,7 +2585,7 @@ impl Handler {
                 println!("{}: notification {} {}", self.peer_addr, code, subcode);
                 Ok(())
             }
-            packet::Message::Keepalive => {
+            bgp::Message::Keepalive => {
                 self.holdtimer_renewed = Instant::now();
                 if self.state == State::OpenConfirm {
                     self.state = State::Established;
@@ -2628,7 +2628,7 @@ impl Handler {
                 }
                 Ok(())
             }
-            packet::Message::RouteRefresh { family: _ } => Ok(()),
+            bgp::Message::RouteRefresh { family: _ } => Ok(()),
         }
     }
 
@@ -2657,7 +2657,7 @@ impl Handler {
         }
 
         let mut pending = PendingTx {
-            urgent: vec![packet::Message::Open {
+            urgent: vec![bgp::Message::Open {
                 version: 4,
                 as_number: self.local_as,
                 holdtime: self.holdtime as u16,
@@ -2689,7 +2689,7 @@ impl Handler {
             futures::select_biased! {
                 _ = self.keepalive_timer.tick().fuse() => {
                     if self.state == State::Established {
-                        pending.urgent.insert(0, packet::Message::Keepalive);
+                        pending.urgent.insert(0, bgp::Message::Keepalive);
                     }
                 }
                 msg = mgmt_rx.recv().fuse() => {
@@ -2759,7 +2759,7 @@ impl Handler {
                                     }
                                     Err(e) => {
                                         if let Error::InvalidMessageFormat{code, subcode, data} = e {
-                                            pending.urgent.insert(0, packet::Message::Notification{code, subcode, data});
+                                            pending.urgent.insert(0, bgp::Message::Notification{code, subcode, data});
                                         } else {
                                             self.shutdown = Some(e);
                                         }
@@ -2799,7 +2799,7 @@ impl Handler {
                         let unreach: Vec<packet::Net> = pending.unreach.drain().collect();
                         if !unreach.is_empty() {
                             txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                            let msg = packet::Message::Update{
+                            let msg = bgp::Message::Update{
                                 reach: Vec::new(),
                                 attr: Arc::new(Vec::new()),
                                 unreach,
@@ -2820,7 +2820,7 @@ impl Handler {
                         let max_tx_count = 2048;
                         let mut sent = Vec::with_capacity(max_tx_count);
                         for (attr, reach) in pending.bucket.iter() {
-                            let msg = packet::Message::Update{
+                            let msg = bgp::Message::Update{
                                 reach: reach.iter().copied().collect(),
                                 attr: attr.clone(),
                                 unreach: Vec::new(),
@@ -2861,7 +2861,7 @@ impl Handler {
                         if pending.sync && pending.is_empty() && self.state == State::Established {
                             pending.sync = false;
                             let mut b = bytes::BytesMut::with_capacity(txbuf_size);
-                            for msg in  self.family_cap.iter().map(|(k,_)| packet::Message::eor(*k)) {
+                            for msg in  self.family_cap.iter().map(|(k,_)| bgp::Message::eor(*k)) {
                                 let _ = codec.encode(&msg, &mut b);
                             }
                             if let Err(e) = stream.write_all(&b.freeze()).await {
@@ -2895,7 +2895,7 @@ impl Handler {
 
 #[derive(Default)]
 struct PendingTx {
-    urgent: Vec<packet::Message>,
+    urgent: Vec<bgp::Message>,
     reach: FnvHashMap<packet::Net, Arc<Vec<packet::Attribute>>>,
     unreach: FnvHashSet<packet::Net>,
     bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<packet::Net>>,

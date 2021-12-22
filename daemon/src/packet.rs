@@ -14,6 +14,6 @@
 // limitations under the License.
 
 pub(crate) mod bgp;
-pub(crate) use self::bgp::{Attribute, Capability, Family, FamilyCapability, IpNet, Message, Net};
+pub(crate) use self::bgp::{Attribute, Capability, Family, FamilyCapability, IpNet, Net};
 
 pub(crate) mod rpki;

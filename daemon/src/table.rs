@@ -30,7 +30,7 @@ use treebitmap::IpLookupTable;
 
 use crate::api;
 use crate::error::Error;
-use crate::packet::{self, Attribute};
+use crate::packet::{self, bgp, Attribute};
 use crate::proto::ToApi;
 
 struct PathAttribute {
@@ -170,11 +170,11 @@ pub(crate) struct Change {
     pub(crate) attr: Arc<Vec<packet::Attribute>>,
 }
 
-impl From<Change> for packet::Message {
-    fn from(c: Change) -> packet::Message {
+impl From<Change> for bgp::Message {
+    fn from(c: Change) -> bgp::Message {
         // FIXME: handle extended nexthop
         if c.family == packet::Family::IPV4 {
-            packet::Message::Update {
+            bgp::Message::Update {
                 reach: vec![c.net],
                 unreach: Vec::new(),
                 attr: c.attr,
@@ -183,7 +183,7 @@ impl From<Change> for packet::Message {
                 mp_unreach: None,
             }
         } else {
-            packet::Message::Update {
+            bgp::Message::Update {
                 reach: Vec::new(),
                 unreach: Vec::new(),
                 attr: Arc::new(Vec::new()),
