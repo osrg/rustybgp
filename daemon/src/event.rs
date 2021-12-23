@@ -41,7 +41,7 @@ use crate::api;
 use crate::config;
 use crate::error::Error;
 use crate::net;
-use crate::packet::{self, bgp, rpki};
+use crate::packet::{self, bgp, bmp, rpki};
 use crate::proto::ToApi;
 use crate::table;
 
@@ -1500,9 +1500,28 @@ impl GobgpApi for GrpcService {
     }
     async fn add_bmp(
         &self,
-        _request: tonic::Request<api::AddBmpRequest>,
+        request: tonic::Request<api::AddBmpRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let request = request.into_inner();
+        let addr = IpAddr::from_str(&request.address)
+            .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
+
+        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        match GLOBAL.write().await.bmp_clients.entry(sockaddr) {
+            Occupied(_) => {
+                return Err(tonic::Status::new(
+                    tonic::Code::AlreadyExists,
+                    format!("bmp client {} already exists", sockaddr),
+                ));
+            }
+            Vacant(v) => {
+                let client = BmpClient::new();
+                let t = client.configured_time;
+                v.insert(client);
+                BmpClient::try_connect(sockaddr, t);
+            }
+        }
+        Ok(tonic::Response::new(()))
     }
     async fn delete_bmp(
         &self,
@@ -1572,6 +1591,90 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
             }
         }
     });
+}
+
+struct BmpClient {
+    configured_time: u64,
+}
+
+impl BmpClient {
+    fn new() -> Self {
+        BmpClient {
+            configured_time: SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        }
+    }
+
+    async fn serve(stream: TcpStream) {
+        let mut lines = Framed::new(stream, bmp::BmpCodec::new());
+        let sysname = hostname::get().unwrap_or(std::ffi::OsString::from("unknown"));
+        let _ = lines
+            .send(&bmp::Message::Initiation(vec![
+                (
+                    bmp::Message::INFO_TYPE_SYSDESCR,
+                    ascii::AsciiStr::from_ascii(
+                        format!(
+                            "RustyBGP v{}-{}",
+                            env!("CARGO_PKG_VERSION"),
+                            env!("GIT_HASH")
+                        )
+                        .as_str(),
+                    )
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+                ),
+                (
+                    bmp::Message::INFO_TYPE_SYSNAME,
+                    ascii::AsciiStr::from_ascii(sysname.to_ascii_lowercase().to_str().unwrap())
+                        .unwrap()
+                        .as_bytes()
+                        .to_vec(),
+                ),
+            ]))
+            .await;
+
+        loop {
+            tokio::select! {
+                msg = lines.next() => {
+                    let _msg = match msg {
+                        Some(msg) => match msg {
+                            Ok(msg) => msg,
+                            Err(_) => break,
+                        },
+                        None => break,
+                    };
+                }
+            }
+        }
+    }
+
+    fn try_connect(sockaddr: SocketAddr, configured_time: u64) {
+        tokio::spawn(async move {
+            loop {
+                if let Ok(Ok(stream)) = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(sockaddr),
+                )
+                .await
+                {
+                    let _ = BmpClient::serve(stream).await;
+                } else {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                }
+                if let Some(client) = GLOBAL.write().await.bmp_clients.get_mut(&sockaddr) {
+                    if client.configured_time != configured_time {
+                        break;
+                    }
+                } else {
+                    // de-configured
+                    break;
+                }
+            }
+        });
+    }
 }
 
 enum RpkiMgmtMsg {
@@ -1759,6 +1862,7 @@ struct Global {
     ptable: table::PolicyTable,
 
     rpki_clients: FnvHashMap<SocketAddr, RpkiClient>,
+    bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
 }
 
 impl From<&Global> for api::Global {
@@ -1795,6 +1899,7 @@ impl Global {
             ptable: table::PolicyTable::new(),
 
             rpki_clients: FnvHashMap::default(),
+            bmp_clients: FnvHashMap::default(),
         }
     }
 
