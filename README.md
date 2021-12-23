@@ -1,6 +1,8 @@
 # RustyBGP: BGP implementation in Rust
 
-The mission is to develop a high-performance, low-memory-footprint, and safe BGP implementation; an experiment to implement aged and rusty BGP protocol in a modern language.
+The mission is to develop a high-performance and safe BGP implementation; an experiment to implement aged and rusty BGP protocol in a modern language. RustyBGP is [much faster](https://elegantnetwork.github.io/posts/bgp-perf5-1000-internet-neighbors/) than other OSS implementations. One reason of the high peformance is that RustyBGP is designed to exploit multicore processors. Here is a CPU usage comparison with FRR during processing 32 peers with 800K prefixes each; RustyBGP (left) uses all the cores while FRR uses only few.
+
+![](.github/assets/htop.gif)
 
 RustyBGP supports the gRPC APIs same as GoBGP; your code to manage GoBGP via the APIs should work with RustyBGP. If you need CLI, GoBGP's CLI command allows you to manage RustyBGP. RustyBGP also supports the same configuration file format as GoBGP (only toml for now).
 
@@ -40,23 +42,23 @@ Hello, RustyBGP (32 cpus)!
 
 Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/passive connection, etc with the following gRPC APIs.
 
-|API           |Relevant CLI                                           | Note        |
-|--------------|-------------------------------------------------------|-------------|
-|start_bgp|`gobgp global as <VALUE> router-id <IP>`||
-|get_bgp|`gobgp global`||
-|add_peer|`gobgp neighbor add <IP> as <VALUE> router-id <IP>`| only v4/v6 families supported, no fancy capabilities like addpath|
-|delete_peer|`gobgp neighbor del <IP>`||
-|list_peer|`gobgp neighbor`/`gobgp neighbor <IP>`||
-|enable_peer|`gobgp neighbor <IP> enable`||
-|disable_peer|`gobgp neighbor <IP> disable`||
-|add_path|`gobgp global rib add <PREFIX>`||
-|delete_path|`gobgp global rib del <PREFIX>`||
-|list_path|`gobgp global rib`/`gobgp neighbor <IP> [adj-in\|adj-out]`||
-|add_path_stream|`gobgp mrt global inject [FILE]`||
-|get_table|`gobgp global rib summary`||
-|add_rpki|`gobgp rpki server <IP> add`||
-|list_rpki|`gobgp rpki server`||
-|list_rpki_table|`gobgp rpki table`||
+| API             | Relevant CLI                                               | Note                                                              |
+| --------------- | ---------------------------------------------------------- | ----------------------------------------------------------------- |
+| start_bgp       | `gobgp global as <VALUE> router-id <IP>`                   |                                                                   |
+| get_bgp         | `gobgp global`                                             |                                                                   |
+| add_peer        | `gobgp neighbor add <IP> as <VALUE> router-id <IP>`        | only v4/v6 families supported, no fancy capabilities like addpath |
+| delete_peer     | `gobgp neighbor del <IP>`                                  |                                                                   |
+| list_peer       | `gobgp neighbor`/`gobgp neighbor <IP>`                     |                                                                   |
+| enable_peer     | `gobgp neighbor <IP> enable`                               |                                                                   |
+| disable_peer    | `gobgp neighbor <IP> disable`                              |                                                                   |
+| add_path        | `gobgp global rib add <PREFIX>`                            |                                                                   |
+| delete_path     | `gobgp global rib del <PREFIX>`                            |                                                                   |
+| list_path       | `gobgp global rib`/`gobgp neighbor <IP> [adj-in\|adj-out]` |                                                                   |
+| add_path_stream | `gobgp mrt global inject [FILE]`                           |                                                                   |
+| get_table       | `gobgp global rib summary`                                 |                                                                   |
+| add_rpki        | `gobgp rpki server <IP> add`                               |                                                                   |
+| list_rpki       | `gobgp rpki server`                                        |                                                                   |
+| list_rpki_table | `gobgp rpki table`                                         |                                                                   |
 
 ## Community, discussion and support
 
