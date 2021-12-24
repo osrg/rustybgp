@@ -167,7 +167,6 @@ struct Peer {
     /// if a peer was removed and created again quickly,
     /// we could run multiple tasks for active connection
     configured_time: u64,
-    local_port: u16,
     remote_port: u16,
     router_id: Ipv4Addr,
     local_as: u32,
@@ -213,7 +212,6 @@ impl Peer {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            local_port: 0,
             remote_port: 0,
             remote_as: 0,
             router_id: Ipv4Addr::new(0, 0, 0, 0),
@@ -239,7 +237,7 @@ impl Peer {
 
     fn update(&mut self, session: &Session) {
         // FIXME: use configured time
-        self.router_id = session.router_id;
+        self.router_id = session.remote_router_id;
         self.remote_as = session.remote_as;
         self.counter_tx += session.counter_tx;
         self.counter_rx += session.counter_rx;
@@ -489,8 +487,15 @@ impl From<&config::Neighbor> for Peer {
 
 struct Session {
     remote_addr: IpAddr,
-    router_id: Ipv4Addr,
+    local_addr: IpAddr,
+    remote_router_id: Ipv4Addr,
+    local_router_id: Ipv4Addr,
     remote_as: u32,
+    local_as: u32,
+    remote_port: u16,
+    local_port: u16,
+    local_holdtime: u16,
+    remote_holdtime: u16,
 
     counter_tx: MessageCounter,
     counter_rx: MessageCounter,
@@ -1636,6 +1641,43 @@ impl BmpClient {
             ]))
             .await;
 
+        for i in 0..*NUM_TABLES {
+            let t = TABLE[i].lock().await;
+            for (_, s) in &t.sessions {
+                if s.state == State::Established {
+                    let m = bmp::Message::PeerUp {
+                        header: bmp::PerPeerHeader::new(
+                            s.remote_as,
+                            s.remote_router_id,
+                            0,
+                            s.remote_addr,
+                            s.uptime,
+                        ),
+                        local_addr: s.local_addr,
+                        local_port: s.local_port,
+                        remote_port: s.remote_port,
+                        remote_open: bgp::Message::Open {
+                            version: 4,
+                            as_number: s.remote_as,
+                            holdtime: s.remote_holdtime,
+                            router_id: s.remote_router_id,
+                            capability: s.remote_cap.to_owned(),
+                        },
+                        local_open: bgp::Message::Open {
+                            version: 4,
+                            as_number: s.local_as,
+                            holdtime: s.local_holdtime,
+                            router_id: s.local_router_id,
+                            capability: s.local_cap.to_owned(),
+                        },
+                    };
+                    if let Err(_) = lines.send(&m).await {
+                        return;
+                    }
+                }
+            }
+        }
+
         loop {
             tokio::select! {
                 msg = lines.next() => {
@@ -2460,6 +2502,9 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
 struct Handler {
     peer_addr: IpAddr,
     local_addr: IpAddr,
+    remote_port: u16,
+    local_port: u16,
+
     local_as: u32,
     remote_as: u32,
 
@@ -2476,7 +2521,9 @@ struct Handler {
     local_cap: Vec<packet::Capability>,
     remote_cap: Vec<packet::Capability>,
 
-    holdtime: u64,
+    local_holdtime: u64,
+    remote_holdtime: u16,
+    negotiated_holdtime: u64,
     rs_client: bool,
 
     family_cap: FnvHashMap<packet::Family, packet::FamilyCapability>,
@@ -2494,14 +2541,21 @@ impl From<&mut Handler> for Session {
     fn from(h: &mut Handler) -> Self {
         Session {
             remote_addr: h.peer_addr,
-            router_id: h.remote_router_id,
+            local_addr: h.local_addr,
+            remote_router_id: h.remote_router_id,
+            local_router_id: h.local_router_id,
             remote_as: h.remote_as,
+            local_as: h.local_as,
+            remote_port: h.remote_port,
+            local_port: h.local_port,
             counter_tx: h.counter_tx,
             counter_rx: h.counter_rx,
             state: h.state,
             uptime: h.uptime,
             downtime: h.downtime,
-            negotiated_holdtime: h.holdtime,
+            negotiated_holdtime: h.negotiated_holdtime,
+            local_holdtime: h.local_holdtime as u16,
+            remote_holdtime: h.remote_holdtime,
 
             remote_cap: h.remote_cap.to_owned(),
             local_cap: h.local_cap.to_owned(),
@@ -2517,13 +2571,16 @@ impl Handler {
         remote_as: u32,
         local_router_id: Ipv4Addr,
         local_cap: Vec<packet::Capability>,
-        holdtime: u64,
+        local_holdtime: u64,
         rs_client: bool,
     ) -> Option<Self> {
-        let local_addr = stream.local_addr().ok()?.ip();
+        let local_sockaddr = stream.local_addr().ok()?;
+        let remote_sockaddr = stream.peer_addr().ok()?;
         Some(Handler {
             peer_addr,
-            local_addr,
+            local_addr: local_sockaddr.ip(),
+            local_port: local_sockaddr.port(),
+            remote_port: remote_sockaddr.port(),
             remote_router_id: Ipv4Addr::new(0, 0, 0, 0),
             local_router_id,
             remote_as,
@@ -2535,7 +2592,9 @@ impl Handler {
             downtime: SystemTime::UNIX_EPOCH,
             remote_cap: Vec::new(),
             local_cap,
-            holdtime,
+            local_holdtime,
+            remote_holdtime: 0,
+            negotiated_holdtime: 0,
             rs_client,
             family_cap: FnvHashMap::default(),
 
@@ -2655,11 +2714,12 @@ impl Handler {
                 self.remote_cap = capability;
                 self.family_cap =
                     packet::bgp::family_capabilities(&self.local_cap, &self.remote_cap);
-                self.holdtime = std::cmp::min(self.holdtime, holdtime as u64);
-                if self.holdtime != 0 {
+                self.negotiated_holdtime = std::cmp::min(self.local_holdtime, holdtime as u64);
+                if self.negotiated_holdtime != 0 {
                     self.keepalive_timer =
-                        tokio::time::interval(Duration::from_secs(self.holdtime / 3));
+                        tokio::time::interval(Duration::from_secs(self.negotiated_holdtime / 3));
                 }
+                self.remote_holdtime = holdtime;
                 Ok(())
             }
             bgp::Message::Update {
@@ -2765,7 +2825,7 @@ impl Handler {
             urgent: vec![bgp::Message::Open {
                 version: 4,
                 as_number: self.local_as,
-                holdtime: self.holdtime as u16,
+                holdtime: self.local_holdtime as u16,
                 router_id: self.local_router_id,
                 capability: self.local_cap.to_owned(),
             }],
@@ -2810,11 +2870,11 @@ impl Handler {
                 }
                 _ = holdtime_futures.next() => {
                     let elapsed = self.holdtimer_renewed.elapsed().as_secs();
-                    if elapsed > self.holdtime + 20 {
+                    if elapsed > self.negotiated_holdtime + 20 {
                         println!("{}: holdtime expired {}", self.peer_addr, self.holdtimer_renewed.elapsed().as_secs());
                         break;
                     }
-                    holdtime_futures.push(tokio::time::sleep(Duration::from_secs(self.holdtime - elapsed + 10)));
+                    holdtime_futures.push(tokio::time::sleep(Duration::from_secs(self.negotiated_holdtime - elapsed + 10)));
                 }
                 msg = peer_event_futures.next().fuse() => {
                     if let Some(Some(msg)) = msg {
@@ -2978,11 +3038,15 @@ impl Handler {
                 }
             }
 
-            if oldstate == State::OpenSent && self.state == State::OpenConfirm && self.holdtime != 0
+            if oldstate == State::OpenSent
+                && self.state == State::OpenConfirm
+                && self.negotiated_holdtime != 0
             {
-                holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(self.holdtime))]
-                    .into_iter()
-                    .collect();
+                holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(
+                    self.negotiated_holdtime,
+                ))]
+                .into_iter()
+                .collect();
             }
         }
         if let Some(e) = &self.shutdown {
