@@ -16,7 +16,6 @@
 use byteorder::{NetworkEndian, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::SystemTime;
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::error::Error;
@@ -38,7 +37,7 @@ pub(crate) struct PerPeerHeader {
     id: Ipv4Addr,
     distinguisher: u64,
     remote_addr: IpAddr,
-    timestamp: SystemTime,
+    timestamp: u32,
 }
 
 impl PerPeerHeader {
@@ -47,7 +46,7 @@ impl PerPeerHeader {
         id: Ipv4Addr,
         distinguisher: u64,
         remote_addr: IpAddr,
-        timestamp: SystemTime,
+        timestamp: u32,
     ) -> Self {
         PerPeerHeader {
             asn,
@@ -71,12 +70,7 @@ impl PerPeerHeader {
         Message::encode_ip(c, &self.remote_addr);
         c.put_u32(self.asn);
         c.put_slice(&self.id.octets());
-        c.put_u32(
-            self.timestamp
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as u32,
-        );
+        c.put_u32(self.timestamp);
         c.put_u32(0);
         Ok(())
     }

@@ -17,16 +17,17 @@ use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
 use once_cell::sync::Lazy;
+use std::boxed::Box;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashSet;
 use std::convert::{From, TryFrom};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::ops::AddAssign;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
@@ -45,55 +46,42 @@ use crate::packet::{self, bgp, bmp, rpki};
 use crate::proto::ToApi;
 use crate::table;
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default)]
 struct MessageCounter {
-    open: u64,
-    update: u64,
-    notification: u64,
-    keepalive: u64,
-    refresh: u64,
-    discarded: u64,
-    total: u64,
-    withdraw_update: u64,
-    withdraw_prefix: u64,
-}
-
-impl AddAssign for MessageCounter {
-    fn add_assign(&mut self, other: Self) {
-        *self = Self {
-            open: self.open + other.open,
-            update: self.update + other.update,
-            notification: self.notification + other.notification,
-            keepalive: self.keepalive + other.keepalive,
-            refresh: self.refresh + other.refresh,
-            discarded: self.discarded + other.discarded,
-            total: self.total + other.total,
-            withdraw_update: self.withdraw_update + other.withdraw_update,
-            withdraw_prefix: self.withdraw_prefix + other.withdraw_prefix,
-        }
-    }
+    open: AtomicU64,
+    update: AtomicU64,
+    notification: AtomicU64,
+    keepalive: AtomicU64,
+    refresh: AtomicU64,
+    discarded: AtomicU64,
+    total: AtomicU64,
+    withdraw_update: AtomicU64,
+    withdraw_prefix: AtomicU64,
 }
 
 impl From<&MessageCounter> for api::Message {
     fn from(m: &MessageCounter) -> Self {
         api::Message {
-            open: m.open,
-            update: m.update,
-            notification: m.notification,
-            keepalive: m.keepalive,
-            refresh: m.refresh,
-            discarded: m.discarded,
-            total: m.total,
-            withdraw_update: m.withdraw_update,
-            withdraw_prefix: m.withdraw_prefix,
+            open: m.open.load(Ordering::Relaxed),
+            update: m.update.load(Ordering::Relaxed),
+            notification: m.notification.load(Ordering::Relaxed),
+            keepalive: m.keepalive.load(Ordering::Relaxed),
+            refresh: m.refresh.load(Ordering::Relaxed),
+            discarded: m.discarded.load(Ordering::Relaxed),
+            total: m.total.load(Ordering::Relaxed),
+            withdraw_update: m.withdraw_update.load(Ordering::Relaxed),
+            withdraw_prefix: m.withdraw_prefix.load(Ordering::Relaxed),
         }
     }
 }
 
 impl MessageCounter {
-    fn sync(&mut self, msg: &bgp::Message) -> bool {
+    fn sync(&self, msg: &bgp::Message) -> bool {
+        let mut ret = false;
         match msg {
-            bgp::Message::Open { .. } => self.open += 1,
+            bgp::Message::Open { .. } => {
+                let _ = self.open.fetch_add(1, Ordering::Relaxed);
+            }
             bgp::Message::Update {
                 reach: _,
                 unreach,
@@ -102,31 +90,36 @@ impl MessageCounter {
                 mp_attr: _,
                 mp_unreach,
             } => {
-                self.update += 1;
+                self.update.fetch_add(1, Ordering::Relaxed);
 
                 if !unreach.is_empty() {
-                    self.withdraw_update += 1;
-                    self.withdraw_prefix += unreach.len() as u64;
+                    self.withdraw_update.fetch_add(1, Ordering::Relaxed);
+                    self.withdraw_prefix.fetch_add(1, Ordering::Relaxed);
                 }
                 if let Some((_, v)) = mp_unreach {
-                    self.withdraw_update += 1;
-                    self.withdraw_prefix += v.len() as u64;
+                    self.withdraw_update.fetch_add(1, Ordering::Relaxed);
+                    self.withdraw_prefix
+                        .fetch_add(v.len() as u64, Ordering::Relaxed);
                 }
             }
             bgp::Message::Notification { .. } => {
-                self.notification += 1;
-                return true;
+                ret = true;
+                let _ = self.notification.fetch_add(1, Ordering::Relaxed);
             }
-            bgp::Message::Keepalive => self.keepalive += 1,
-            bgp::Message::RouteRefresh { .. } => self.refresh += 1,
+            bgp::Message::Keepalive => {
+                let _ = self.keepalive.fetch_add(1, Ordering::Relaxed);
+            }
+            bgp::Message::RouteRefresh { .. } => {
+                let _ = self.refresh.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        self.total += 1;
-        false
+        self.total.fetch_add(1, Ordering::SeqCst);
+        ret
     }
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum State {
+enum SessionState {
     Idle,
     Connect,
     Active,
@@ -135,61 +128,69 @@ enum State {
     Established,
 }
 
-impl From<State> for api::peer_state::SessionState {
-    fn from(s: State) -> Self {
-        match s {
-            State::Idle => api::peer_state::SessionState::Idle,
-            State::Connect => api::peer_state::SessionState::Connect,
-            State::Active => api::peer_state::SessionState::Active,
-            State::OpenSent => api::peer_state::SessionState::Opensent,
-            State::OpenConfirm => api::peer_state::SessionState::Openconfirm,
-            State::Established => api::peer_state::SessionState::Established,
+impl From<u8> for api::peer_state::SessionState {
+    fn from(v: u8) -> Self {
+        match v {
+            0 => api::peer_state::SessionState::Idle,
+            1 => api::peer_state::SessionState::Connect,
+            2 => api::peer_state::SessionState::Active,
+            3 => api::peer_state::SessionState::Opensent,
+            4 => api::peer_state::SessionState::Openconfirm,
+            5 => api::peer_state::SessionState::Established,
+            _ => panic!("unexpected session state {}", v),
         }
     }
 }
 
-impl From<State> for u8 {
-    fn from(s: State) -> Self {
+impl From<SessionState> for u8 {
+    fn from(s: SessionState) -> Self {
         match s {
-            State::Idle => 0,
-            State::Connect => 1,
-            State::Active => 2,
-            State::OpenSent => 3,
-            State::OpenConfirm => 4,
-            State::Established => 5,
+            SessionState::Idle => 0,
+            SessionState::Connect => 1,
+            SessionState::Active => 2,
+            SessionState::OpenSent => 3,
+            SessionState::OpenConfirm => 4,
+            SessionState::Established => 5,
         }
     }
+}
+
+struct PeerState {
+    fsm: AtomicU8,
+    uptime: AtomicU64,
+    downtime: AtomicU64,
+    remote_asn: AtomicU32,
+    remote_id: AtomicU32,
+    remote_holdtime: AtomicU16,
+    remote_cap: RwLock<Vec<packet::Capability>>,
 }
 
 #[derive(Clone)]
 struct Peer {
-    address: IpAddr,
     /// if a peer was removed and created again quickly,
     /// we could run multiple tasks for active connection
     configured_time: u64,
+
+    remote_addr: IpAddr,
+    local_addr: IpAddr,
+    local_port: u16,
     remote_port: u16,
-    router_id: Ipv4Addr,
     local_as: u32,
-    remote_as: u32,
     passive: bool,
     admin_down: bool,
     delete_on_disconnected: bool,
 
     holdtime: u64,
-    negotiated_holdtime: u64,
     connect_retry_time: u64,
 
-    state: State,
-    uptime: SystemTime,
-    downtime: SystemTime,
+    state: Arc<PeerState>,
 
-    counter_tx: MessageCounter,
-    counter_rx: MessageCounter,
+    counter_tx: Arc<MessageCounter>,
+    counter_rx: Arc<MessageCounter>,
 
     // received and accepted
     route_stats: FnvHashMap<packet::Family, (u64, u64)>,
 
-    remote_cap: Vec<packet::Capability>,
     local_cap: Vec<packet::Capability>,
 
     route_server_client: bool,
@@ -198,24 +199,6 @@ struct Peer {
 }
 
 impl Peer {
-    fn addr(&self) -> String {
-        self.address.to_string()
-    }
-
-    fn update(&mut self, session: &Session) {
-        // FIXME: use configured time
-        self.router_id = session.remote_router_id;
-        self.remote_as = session.remote_as;
-        self.counter_tx += session.counter_tx;
-        self.counter_rx += session.counter_rx;
-        self.state = session.state;
-        self.uptime = session.uptime;
-        self.downtime = session.downtime;
-        self.negotiated_holdtime = session.negotiated_holdtime;
-        self.remote_cap = session.remote_cap.to_owned();
-        self.local_cap = session.local_cap.to_owned();
-    }
-
     fn update_stats(&mut self, rti: FnvHashMap<packet::Family, (u64, u64)>) {
         for (f, v) in rti {
             let stats = self.route_stats.entry(f).or_insert((0, 0));
@@ -225,27 +208,47 @@ impl Peer {
     }
 
     fn reset(&mut self) {
-        self.state = State::Idle;
-        self.downtime = SystemTime::now();
+        self.state.downtime.store(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+        loop {
+            if let Ok(mut a) = self.state.remote_cap.try_write() {
+                a.clear();
+                break;
+            }
+        }
+        self.state.remote_id.store(0, Ordering::Relaxed);
+        self.state.remote_holdtime.store(0, Ordering::Relaxed);
+
+        self.state
+            .fsm
+            .store(SessionState::Idle as u8, Ordering::Relaxed);
         self.route_stats = FnvHashMap::default();
-        self.remote_cap = Vec::new();
         self.mgmt_tx = None;
+        self.local_port = 0;
+        self.remote_port = 0;
     }
 }
 
 struct PeerBuilder {
     remote_addr: IpAddr,
     remote_asn: u32,
-    local_cap: Vec<packet::Capability>,
-    local_asn: u32,
     remote_port: u16,
+    local_addr: IpAddr,
+    local_asn: u32,
+    local_port: u16,
+    local_cap: Vec<packet::Capability>,
     passive: bool,
     rs_client: bool,
     delete_on_disconnected: bool,
-    state: State,
+    admin_down: bool,
+    state: SessionState,
     holdtime: u64,
     connect_retry_time: u64,
-    admin_down: bool,
     ctrl_channel: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
 }
 
@@ -257,16 +260,18 @@ impl PeerBuilder {
         PeerBuilder {
             remote_addr,
             remote_asn: 0,
-            local_cap: Vec::new(),
+            remote_port: Global::BGP_PORT,
+            local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             local_asn: 0,
-            remote_port: 0,
+            local_port: 0,
+            local_cap: Vec::new(),
             passive: false,
             rs_client: false,
             delete_on_disconnected: false,
-            state: State::Idle,
+            admin_down: false,
+            state: SessionState::Idle,
             holdtime: Self::DEFAULT_HOLD_TIME,
             connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
-            admin_down: false,
             ctrl_channel: None,
         }
     }
@@ -285,11 +290,6 @@ impl PeerBuilder {
         self
     }
 
-    fn local_asn(&mut self, local_asn: u32) -> &mut Self {
-        self.local_asn = local_asn;
-        self
-    }
-
     fn remote_port(&mut self, remote_port: u16) -> &mut Self {
         self.remote_port = remote_port;
         self
@@ -297,6 +297,21 @@ impl PeerBuilder {
 
     fn remote_asn(&mut self, remote_asn: u32) -> &mut Self {
         self.remote_asn = remote_asn;
+        self
+    }
+
+    fn local_addr(&mut self, addr: IpAddr) -> &mut Self {
+        self.local_addr = addr;
+        self
+    }
+
+    fn local_port(&mut self, port: u16) -> &mut Self {
+        self.local_port = port;
+        self
+    }
+
+    fn local_asn(&mut self, local_asn: u32) -> &mut Self {
+        self.local_asn = local_asn;
         self
     }
 
@@ -315,7 +330,7 @@ impl PeerBuilder {
         self
     }
 
-    fn state(&mut self, state: State) -> &mut Self {
+    fn state(&mut self, state: SessionState) -> &mut Self {
         self.state = state;
         self
     }
@@ -341,52 +356,66 @@ impl PeerBuilder {
 
     fn build(&mut self) -> Peer {
         Peer {
-            address: self.remote_addr,
+            remote_addr: self.remote_addr,
+            local_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             configured_time: SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
             remote_port: self.remote_port,
-            remote_as: self.remote_asn,
-            router_id: Ipv4Addr::new(0, 0, 0, 0),
+            local_port: 0,
             local_as: self.local_asn,
             passive: self.passive,
             delete_on_disconnected: self.delete_on_disconnected,
             admin_down: self.admin_down,
             holdtime: self.holdtime,
-            negotiated_holdtime: 0,
             connect_retry_time: self.connect_retry_time,
-            state: self.state,
-            uptime: SystemTime::UNIX_EPOCH,
-            downtime: SystemTime::UNIX_EPOCH,
+            state: Arc::new(PeerState {
+                fsm: AtomicU8::new(self.state as u8),
+                uptime: AtomicU64::new(0),
+                downtime: AtomicU64::new(0),
+                remote_asn: AtomicU32::new(self.remote_asn),
+                remote_id: AtomicU32::new(0),
+                remote_holdtime: AtomicU16::new(0),
+                remote_cap: RwLock::new(Vec::new()),
+            }),
             route_stats: FnvHashMap::default(),
-            remote_cap: Vec::new(),
             local_cap: self.local_cap.split_off(0),
             route_server_client: self.rs_client,
             mgmt_tx: self.ctrl_channel.take(),
             counter_tx: Default::default(),
             counter_rx: Default::default(),
-            //            ..Default::default()
         }
     }
 }
 
 impl From<&Peer> for api::Peer {
     fn from(p: &Peer) -> Self {
+        let session_state = p.state.fsm.load(Ordering::Acquire);
+        let remote_cap = {
+            let mut v = Vec::new();
+            loop {
+                if let Ok(a) = p.state.remote_cap.try_read() {
+                    v.append(&mut a.iter().map(|c| c.into()).collect());
+                    break;
+                }
+            }
+            v
+        };
         let mut ps = api::PeerState {
-            neighbor_address: p.addr(),
-            peer_as: p.remote_as,
-            router_id: p.router_id.to_string(),
+            neighbor_address: p.remote_addr.to_string(),
+            peer_as: p.state.remote_asn.load(Ordering::Relaxed),
+            router_id: Ipv4Addr::from(p.state.remote_id.load(Ordering::Relaxed)).to_string(),
             messages: Some(api::Messages {
-                received: Some((&p.counter_rx).into()),
-                sent: Some((&p.counter_tx).into()),
+                received: Some((&*p.counter_rx).into()),
+                sent: Some((&*p.counter_tx).into()),
             }),
             queues: Some(Default::default()),
-            remote_cap: p.remote_cap.iter().map(|c| c.into()).collect(),
+            remote_cap,
             local_cap: p.local_cap.iter().map(|c| c.into()).collect(),
             ..Default::default()
         };
-        ps.session_state = api::peer_state::SessionState::from(p.state) as i32;
+        ps.session_state = api::peer_state::SessionState::from(session_state) as i32;
         ps.admin_state = if p.admin_down {
             api::peer_state::AdminState::Down as i32
         } else {
@@ -400,15 +429,27 @@ impl From<&Peer> for api::Peer {
             }),
             state: Some(Default::default()),
         };
-        if p.uptime != SystemTime::UNIX_EPOCH {
+        let uptime = p.state.uptime.load(Ordering::Relaxed);
+        if uptime != 0 {
+            let negotiated_holdtime = std::cmp::min(
+                p.holdtime,
+                p.state.remote_holdtime.load(Ordering::Relaxed) as u64,
+            );
             let mut ts = api::TimersState {
-                uptime: Some(p.uptime.to_api()),
-                negotiated_hold_time: p.negotiated_holdtime,
-                keepalive_interval: p.negotiated_holdtime / 3,
+                uptime: Some(prost_types::Timestamp {
+                    seconds: uptime as i64,
+                    nanos: 0,
+                }),
+                negotiated_hold_time: negotiated_holdtime,
+                keepalive_interval: negotiated_holdtime / 3,
                 ..Default::default()
             };
-            if p.downtime != SystemTime::UNIX_EPOCH {
-                ts.downtime = Some(p.downtime.to_api());
+            let downtime = p.state.downtime.load(Ordering::Relaxed);
+            if downtime != 0 {
+                ts.downtime = Some(prost_types::Timestamp {
+                    seconds: downtime as i64,
+                    nanos: 0,
+                });
             }
             tm.state = Some(ts);
         }
@@ -520,30 +561,6 @@ impl From<&config::Neighbor> for Peer {
             .admin_down(c.admin_down.map_or(false, |c| c))
             .build()
     }
-}
-
-struct Session {
-    remote_addr: IpAddr,
-    local_addr: IpAddr,
-    remote_router_id: Ipv4Addr,
-    local_router_id: Ipv4Addr,
-    remote_as: u32,
-    local_as: u32,
-    remote_port: u16,
-    local_port: u16,
-    local_holdtime: u16,
-    remote_holdtime: u16,
-
-    counter_tx: MessageCounter,
-    counter_rx: MessageCounter,
-
-    state: State,
-    uptime: SystemTime,
-    downtime: SystemTime,
-    negotiated_holdtime: u64,
-
-    remote_cap: Vec<packet::Capability>,
-    local_cap: Vec<packet::Capability>,
 }
 
 struct DynamicPeer {
@@ -757,11 +774,6 @@ impl GobgpApi for GrpcService {
             for (peer_addr, peer) in &mut peers {
                 if let Some(m) = t.rtable.peer_stats(peer_addr) {
                     peer.update_stats(m.collect());
-                }
-            }
-            for (peer_addr, session) in &t.sessions {
-                if let Some(peer) = peers.get_mut(peer_addr) {
-                    peer.update(session);
                 }
             }
         }
@@ -1604,7 +1616,7 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
     if peer.admin_down || peer.passive || peer.delete_on_disconnected {
         return;
     }
-    let peer_addr = peer.address;
+    let peer_addr = peer.remote_addr;
     let remote_port = peer.remote_port;
     let configured_time = peer.configured_time;
     let sockaddr = std::net::SocketAddr::new(peer_addr, remote_port);
@@ -1678,39 +1690,39 @@ impl BmpClient {
             ]))
             .await;
 
-        for i in 0..*NUM_TABLES {
-            let t = TABLE[i].lock().await;
-            for (_, s) in &t.sessions {
-                if s.state == State::Established {
-                    let m = bmp::Message::PeerUp {
-                        header: bmp::PerPeerHeader::new(
-                            s.remote_as,
-                            s.remote_router_id,
-                            0,
-                            s.remote_addr,
-                            s.uptime,
-                        ),
-                        local_addr: s.local_addr,
-                        local_port: s.local_port,
-                        remote_port: s.remote_port,
-                        remote_open: bgp::Message::Open {
-                            version: 4,
-                            as_number: s.remote_as,
-                            holdtime: s.remote_holdtime,
-                            router_id: s.remote_router_id,
-                            capability: s.remote_cap.to_owned(),
-                        },
-                        local_open: bgp::Message::Open {
-                            version: 4,
-                            as_number: s.local_as,
-                            holdtime: s.local_holdtime,
-                            router_id: s.local_router_id,
-                            capability: s.local_cap.to_owned(),
-                        },
-                    };
-                    if let Err(_) = lines.send(&m).await {
-                        return;
-                    }
+        let local_id = GLOBAL.read().await.router_id;
+        for (_, peer) in &GLOBAL.read().await.peers {
+            if peer.state.fsm.load(Ordering::Acquire) == SessionState::Established as u8 {
+                let remote_asn = peer.state.remote_asn.load(Ordering::Relaxed);
+                let remote_id = Ipv4Addr::from(peer.state.remote_id.load(Ordering::Relaxed));
+                let m = bmp::Message::PeerUp {
+                    header: bmp::PerPeerHeader::new(
+                        remote_asn,
+                        remote_id,
+                        0,
+                        peer.remote_addr,
+                        peer.state.uptime.load(Ordering::Relaxed) as u32,
+                    ),
+                    local_addr: peer.local_addr,
+                    local_port: peer.local_port,
+                    remote_port: peer.remote_port,
+                    remote_open: bgp::Message::Open {
+                        version: 4,
+                        as_number: peer.state.remote_asn.load(Ordering::Relaxed),
+                        holdtime: peer.state.remote_holdtime.load(Ordering::Relaxed),
+                        router_id: remote_id,
+                        capability: peer.state.remote_cap.read().await.to_owned(),
+                    },
+                    local_open: bgp::Message::Open {
+                        version: 4,
+                        as_number: peer.local_as,
+                        holdtime: peer.holdtime as u16,
+                        router_id: local_id,
+                        capability: peer.local_cap.to_owned(),
+                    },
+                };
+                if lines.send(&m).await.is_err() {
+                    return;
                 }
             }
         }
@@ -1922,7 +1934,6 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
             rtable: table::RoutingTable::new(),
             peer_event_tx: FnvHashMap::default(),
             table_event_tx: Vec::new(),
-            sessions: FnvHashMap::default(),
             global_import_policy: None,
             global_export_policy: None,
         }));
@@ -1987,16 +1998,13 @@ impl Global {
         mut peer: Peer,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
     ) -> std::result::Result<(), Error> {
-        if self.peers.contains_key(&peer.address) {
+        if self.peers.contains_key(&peer.remote_addr) {
             return Err(Error::AlreadyExists(
                 "peer address already exists".to_string(),
             ));
         }
         if peer.local_as == 0 {
             peer.local_as = self.as_number;
-        }
-        if peer.remote_port == 0 {
-            peer.remote_port = Global::BGP_PORT;
         }
         let mut caps = HashSet::new();
         for c in &peer.local_cap {
@@ -2006,7 +2014,7 @@ impl Global {
         if !caps.contains(&Into::<u8>::into(&c)) {
             peer.local_cap.push(c);
         }
-        let c = match peer.address {
+        let c = match peer.remote_addr {
             IpAddr::V4(_) => packet::Capability::MultiProtocol(packet::Family::IPV4),
             IpAddr::V6(_) => packet::Capability::MultiProtocol(packet::Family::IPV6),
         };
@@ -2014,56 +2022,68 @@ impl Global {
             peer.local_cap.push(c);
         }
         if peer.admin_down {
-            peer.state = State::Connect;
+            peer.state
+                .fsm
+                .store(SessionState::Connect as u8, Ordering::Relaxed);
         }
         if let Some(tx) = tx {
             enable_active_connect(&peer, tx);
         }
-        self.peers.insert(peer.address, peer);
+        self.peers.insert(peer.remote_addr, peer);
         Ok(())
     }
 
     async fn accept_connection(
         stream: TcpStream,
     ) -> Option<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)> {
-        let peer_addr = stream.peer_addr().ok()?.ip();
+        let local_sockaddr = stream.local_addr().ok()?;
+        let remote_sockaddr = stream.peer_addr().ok()?;
+        let remote_addr = remote_sockaddr.ip();
+        let remote_port = remote_sockaddr.port();
         let mut global = GLOBAL.write().await;
         let router_id = global.router_id;
-        let (local_as, remote_as, local_cap, holdtime, rs_client, mgmt_rx) =
-            match global.peers.get_mut(&peer_addr) {
+        let (local_as, local_cap, holdtime, rs_client, mgmt_rx, state, counter_tx, counter_rx) =
+            match global.peers.get_mut(&remote_addr) {
                 Some(peer) => {
                     if peer.admin_down {
                         println!(
                             "admin down; ignore a new passive connection from {}",
-                            peer_addr
+                            remote_addr
                         );
                         return None;
                     }
                     if peer.mgmt_tx.is_some() {
-                        println!("already has connection {}", peer_addr);
+                        println!("already has connection {}", remote_addr);
                         return None;
                     }
-                    peer.state = State::Active;
+                    peer.remote_port = remote_port;
+                    peer.local_port = local_sockaddr.port();
+                    peer.local_addr = local_sockaddr.ip();
+                    peer.state
+                        .fsm
+                        .store(SessionState::Active as u8, Ordering::Relaxed);
                     let (tx, rx) = mpsc::unbounded_channel();
                     peer.mgmt_tx = Some(tx);
                     (
                         peer.local_as,
-                        peer.remote_as,
                         peer.local_cap.to_owned(),
                         peer.holdtime,
                         peer.route_server_client,
                         rx,
+                        peer.state.clone(),
+                        peer.counter_tx.clone(),
+                        peer.counter_rx.clone(),
                     )
                 }
                 None => {
                     let mut is_dynamic = false;
                     let mut rs_client = false;
-                    let mut remote_as = 0;
+                    let mut remote_asn = 0;
                     let mut holdtime = None;
                     for p in &global.peer_group {
                         for d in &p.1.dynamic_peers {
-                            if d.prefix.contains(&peer_addr) {
-                                remote_as = p.1.as_number;
+                            if d.prefix.contains(&remote_addr) {
+                                remote_asn = p.1.as_number;
                                 is_dynamic = true;
                                 rs_client = p.1.route_server_client;
                                 holdtime = p.1.holdtime;
@@ -2074,35 +2094,49 @@ impl Global {
                     if !is_dynamic {
                         println!(
                             "can't find configuration a new passive connection {}",
-                            peer_addr
+                            remote_addr
                         );
                         return None;
                     }
                     let (tx, rx) = mpsc::unbounded_channel();
-                    let mut builder = PeerBuilder::new(peer_addr);
+                    let mut builder = PeerBuilder::new(remote_addr);
                     builder
-                        .state(State::Active)
-                        .remote_asn(remote_as)
+                        .state(SessionState::Active)
+                        .remote_asn(remote_asn)
                         .delete_on_disconnected(true)
                         .rs_client(rs_client)
+                        .remote_port(remote_port)
+                        .local_port(local_sockaddr.port())
+                        .local_addr(local_sockaddr.ip())
                         .ctrl_channel(tx);
                     if let Some(holdtime) = holdtime {
                         builder.holdtime(holdtime);
                     }
                     let _ = global.add_peer(builder.build(), None);
-                    let peer = global.peers.get(&peer_addr).unwrap();
+                    let peer = global.peers.get(&remote_addr).unwrap();
                     (
                         peer.local_as,
-                        peer.remote_as,
                         peer.local_cap.to_owned(),
                         peer.holdtime,
                         peer.route_server_client,
                         rx,
+                        peer.state.clone(),
+                        peer.counter_tx.clone(),
+                        peer.counter_rx.clone(),
                     )
                 }
             };
         Handler::new(
-            stream, peer_addr, local_as, remote_as, router_id, local_cap, holdtime, rs_client,
+            stream,
+            remote_addr,
+            local_as,
+            router_id,
+            local_cap,
+            holdtime,
+            rs_client,
+            state,
+            counter_tx,
+            counter_rx,
         )
         .map(|h| (h, mgmt_rx))
     }
@@ -2366,7 +2400,6 @@ enum TableEvent {
         Vec<packet::Net>,
         Option<Arc<Vec<packet::Attribute>>>,
     ),
-    SyncState(Box<Session>),
     Disconnected(Arc<table::Source>),
     // RPKI events
     InsertRoa(Vec<(packet::IpNet, Arc<table::Roa>)>),
@@ -2377,7 +2410,6 @@ struct Table {
     rtable: table::RoutingTable,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
     table_event_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
-    sessions: FnvHashMap<IpAddr, Session>,
 
     // global->ptable copies
     global_import_policy: Option<Arc<table::PolicyAssignment>>,
@@ -2441,19 +2473,11 @@ impl Table {
                     },
                     TableEvent::Disconnected(source) => {
                         let mut t = TABLE[idx].lock().await;
-                        t.sessions.remove(&source.peer_addr);
                         for change in t.rtable.drop(source) {
                             for c in t.peer_event_tx.values() {
                                 let _ = c.send(ToPeerEvent::Advertise(change.clone()));
                             }
                         }
-                    }
-                    TableEvent::SyncState(session) => {
-                        TABLE[idx]
-                            .lock()
-                            .await
-                            .sessions
-                            .insert(session.remote_addr, *session);
                     }
                     TableEvent::InsertRoa(v) => {
                         let mut t = TABLE[idx].lock().await;
@@ -2511,13 +2535,12 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
 
                             tokio::spawn(async move {
                                 let peer_addr = h.peer_addr;
-                                let session = h.run(mgmt_rx).await;
+                                h.run(mgmt_rx).await;
                                 let mut server = GLOBAL.write().await;
                                 if let Some(peer) = server.peers.get_mut(&peer_addr) {
                                     if peer.delete_on_disconnected {
                                         server.peers.remove(&peer_addr);
                                     } else {
-                                        peer.update(&session);
                                         peer.reset();
                                         enable_active_connect(peer, active_conn_tx.clone());
                                     }
@@ -2540,27 +2563,19 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
 struct Handler {
     peer_addr: IpAddr,
     local_addr: IpAddr,
-    remote_port: u16,
-    local_port: u16,
 
     local_as: u32,
-    remote_as: u32,
 
     local_router_id: Ipv4Addr,
-    remote_router_id: Ipv4Addr,
 
-    counter_tx: MessageCounter,
-    counter_rx: MessageCounter,
+    state: Arc<PeerState>,
 
-    state: State,
-    uptime: SystemTime,
-    downtime: SystemTime,
+    counter_tx: Arc<MessageCounter>,
+    counter_rx: Arc<MessageCounter>,
 
     local_cap: Vec<packet::Capability>,
-    remote_cap: Vec<packet::Capability>,
 
     local_holdtime: u64,
-    remote_holdtime: u16,
     negotiated_holdtime: u64,
     rs_client: bool,
 
@@ -2575,67 +2590,33 @@ struct Handler {
     shutdown: Option<Error>,
 }
 
-impl From<&mut Handler> for Session {
-    fn from(h: &mut Handler) -> Self {
-        Session {
-            remote_addr: h.peer_addr,
-            local_addr: h.local_addr,
-            remote_router_id: h.remote_router_id,
-            local_router_id: h.local_router_id,
-            remote_as: h.remote_as,
-            local_as: h.local_as,
-            remote_port: h.remote_port,
-            local_port: h.local_port,
-            counter_tx: h.counter_tx,
-            counter_rx: h.counter_rx,
-            state: h.state,
-            uptime: h.uptime,
-            downtime: h.downtime,
-            negotiated_holdtime: h.negotiated_holdtime,
-            local_holdtime: h.local_holdtime as u16,
-            remote_holdtime: h.remote_holdtime,
-
-            remote_cap: h.remote_cap.to_owned(),
-            local_cap: h.local_cap.to_owned(),
-        }
-    }
-}
-
 impl Handler {
     fn new(
         stream: TcpStream,
         peer_addr: IpAddr,
         local_as: u32,
-        remote_as: u32,
         local_router_id: Ipv4Addr,
         local_cap: Vec<packet::Capability>,
         local_holdtime: u64,
         rs_client: bool,
+        state: Arc<PeerState>,
+        counter_tx: Arc<MessageCounter>,
+        counter_rx: Arc<MessageCounter>,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
-        let remote_sockaddr = stream.peer_addr().ok()?;
         Some(Handler {
             peer_addr,
             local_addr: local_sockaddr.ip(),
-            local_port: local_sockaddr.port(),
-            remote_port: remote_sockaddr.port(),
-            remote_router_id: Ipv4Addr::new(0, 0, 0, 0),
             local_router_id,
-            remote_as,
             local_as,
-            counter_tx: Default::default(),
-            counter_rx: Default::default(),
-            state: State::Active,
-            uptime: SystemTime::UNIX_EPOCH,
-            downtime: SystemTime::UNIX_EPOCH,
-            remote_cap: Vec::new(),
+            state,
+            counter_tx,
+            counter_rx,
             local_cap,
             local_holdtime,
-            remote_holdtime: 0,
             negotiated_holdtime: 0,
             rs_client,
             family_cap: FnvHashMap::default(),
-
             keepalive_timer: tokio::time::interval_at(
                 tokio::time::Instant::now() + Duration::new(u32::MAX.into(), 0),
                 Duration::from_secs(3600),
@@ -2731,13 +2712,17 @@ impl Handler {
                 as_number,
                 holdtime,
                 router_id,
-                capability,
+                mut capability,
             } => {
                 pending.urgent.push(bgp::Message::Keepalive);
-
-                self.state = State::OpenConfirm;
-                self.remote_router_id = router_id;
-                if self.remote_as != 0 && self.remote_as != as_number {
+                self.state
+                    .remote_holdtime
+                    .store(holdtime, Ordering::Relaxed);
+                self.state
+                    .remote_id
+                    .store(router_id.into(), Ordering::Relaxed);
+                let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
+                if remote_asn != 0 && remote_asn != as_number {
                     pending.urgent.insert(
                         0,
                         bgp::Message::Notification {
@@ -2748,16 +2733,17 @@ impl Handler {
                     );
                     return Ok(());
                 }
-                self.remote_as = as_number;
-                self.remote_cap = capability;
-                self.family_cap =
-                    packet::bgp::family_capabilities(&self.local_cap, &self.remote_cap);
+                self.state.remote_asn.store(as_number, Ordering::Relaxed);
+                self.family_cap = packet::bgp::family_capabilities(&self.local_cap, &capability);
+                self.state.remote_cap.write().await.append(&mut capability);
                 self.negotiated_holdtime = std::cmp::min(self.local_holdtime, holdtime as u64);
                 if self.negotiated_holdtime != 0 {
                     self.keepalive_timer =
                         tokio::time::interval(Duration::from_secs(self.negotiated_holdtime / 3));
                 }
-                self.remote_holdtime = holdtime;
+                self.state
+                    .fsm
+                    .store(SessionState::OpenConfirm as u8, Ordering::Release);
                 Ok(())
             }
             bgp::Message::Update {
@@ -2768,10 +2754,11 @@ impl Handler {
                 mp_attr,
                 mp_unreach,
             } => {
-                if self.state != State::Established {
+                let session_state = self.state.fsm.load(Ordering::Relaxed);
+                if session_state != SessionState::Established as u8 {
                     return Err(Error::InvalidMessageFormat {
                         code: 5,
-                        subcode: self.state.into(),
+                        subcode: session_state,
                         data: Vec::new(),
                     });
                 }
@@ -2790,17 +2777,25 @@ impl Handler {
             }
             bgp::Message::Keepalive => {
                 self.holdtimer_renewed = Instant::now();
-                if self.state == State::OpenConfirm {
-                    self.state = State::Established;
-                    self.uptime = SystemTime::now();
-                    let t = if self.local_as == self.remote_as {
+                if self.state.fsm.load(Ordering::Relaxed) == SessionState::OpenConfirm as u8 {
+                    self.state.uptime.store(
+                        SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                        Ordering::Relaxed,
+                    );
+                    let t = if self.local_as == self.state.remote_asn.load(Ordering::Relaxed) {
                         table::PeerType::Ibgp
                     } else {
                         table::PeerType::Ebgp
                     };
+                    self.state
+                        .fsm
+                        .store(SessionState::Established as u8, Ordering::Release);
                     self.source = Some(Arc::new(table::Source::new(
                         self.peer_addr,
-                        self.remote_router_id,
+                        Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed)),
                         t,
                         self.local_addr,
                         self.local_as,
@@ -2835,7 +2830,7 @@ impl Handler {
         }
     }
 
-    async fn run(&mut self, mut mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>) -> Session {
+    async fn run(&mut self, mut mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>) {
         let mut stream = self.stream.take().unwrap();
         let rxbuf_size = 1 << 16;
         let mut txbuf_size = 1 << 16;
@@ -2870,14 +2865,14 @@ impl Handler {
             ..Default::default()
         };
 
-        self.state = State::OpenSent;
+        self.state
+            .fsm
+            .store(SessionState::OpenSent as u8, Ordering::Relaxed);
         let mut holdtime_futures: FuturesUnordered<_> =
             vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
                 .into_iter()
                 .collect();
 
-        let mut state_update_timer = tokio::time::interval(Duration::from_secs(1));
-        let state_table = Table::dealer(&self.peer_addr);
         let mut rxbuf = bytes::BytesMut::with_capacity(rxbuf_size);
         while self.shutdown.is_none() {
             let mut peer_event_futures: FuturesUnordered<_> =
@@ -2888,22 +2883,16 @@ impl Handler {
                 tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE
             };
 
-            let oldstate = self.state;
+            let oldstate = self.state.fsm.load(Ordering::Relaxed);
             futures::select_biased! {
                 _ = self.keepalive_timer.tick().fuse() => {
-                    if self.state == State::Established {
+                    if self.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
                         pending.urgent.insert(0, bgp::Message::Keepalive);
                     }
                 }
                 msg = mgmt_rx.recv().fuse() => {
                     if let Some(PeerMgmtMsg::Notification(msg)) = msg {
                         pending.urgent.insert(0, msg);
-                    }
-                }
-                _ = state_update_timer.tick().fuse() => {
-                    if self.state == State::Established {
-                        let session = self.into();
-                        let _ = self.table_tx[state_table].send(TableEvent::SyncState(Box::new(session)));
                     }
                 }
                 _ = holdtime_futures.next() => {
@@ -2918,7 +2907,7 @@ impl Handler {
                     if let Some(Some(msg)) = msg {
                         match msg {
                             ToPeerEvent::Advertise(ri) => {
-                                if self.state != State::Established {
+                                if self.state.fsm.load(Ordering::Relaxed) != SessionState::Established as u8 {
                                     continue;
                                 }
                                 if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
@@ -2952,7 +2941,7 @@ impl Handler {
                                     match codec.decode(&mut rxbuf) {
                                     Ok(msg) => match msg {
                                         Some(msg) => {
-                                            self.counter_rx.sync(&msg);
+                                            (*self.counter_rx).sync(&msg);
                                             let _ = self.rx_msg(msg, &mut pending).await;
                                         }
                                         None => {
@@ -2982,7 +2971,7 @@ impl Handler {
                         for _ in 0..pending.urgent.len() {
                             let msg = pending.urgent.remove(0);
                             let _ = codec.encode(&msg, &mut txbuf);
-                            self.counter_tx.sync(&msg);
+                            (*self.counter_tx).sync(&msg);
 
                             if txbuf.len() > txbuf_size {
                                 let buf = txbuf.freeze();
@@ -3061,7 +3050,7 @@ impl Handler {
                             }
                         }
 
-                        if pending.sync && pending.is_empty() && self.state == State::Established {
+                        if pending.sync && pending.is_empty() && self.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
                             pending.sync = false;
                             let mut b = bytes::BytesMut::with_capacity(txbuf_size);
                             for msg in  self.family_cap.iter().map(|(k,_)| bgp::Message::eor(*k)) {
@@ -3076,8 +3065,8 @@ impl Handler {
                 }
             }
 
-            if oldstate == State::OpenSent
-                && self.state == State::OpenConfirm
+            if oldstate == SessionState::OpenSent as u8
+                && self.state.fsm.load(Ordering::Relaxed) == SessionState::OpenConfirm as u8
                 && self.negotiated_holdtime != 0
             {
                 holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(
@@ -3096,7 +3085,6 @@ impl Handler {
                 let _ = self.table_tx[i].send(TableEvent::Disconnected(source.clone()));
             }
         }
-        self.into()
     }
 }
 
