@@ -2236,7 +2236,7 @@ fn parse_ipv6_update() {
     match msg.unwrap() {
         Message::Update {
             reach: _,
-            attr,
+            attr: _,
             unreach: _,
             mp_reach,
             mp_attr: _,
