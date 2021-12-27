@@ -198,41 +198,8 @@ struct Peer {
 }
 
 impl Peer {
-    const DEFAULT_HOLD_TIME: u64 = 180;
-    const DEFAULT_CONNECT_RETRY_TIME: u64 = 3;
-
     fn addr(&self) -> String {
         self.address.to_string()
-    }
-
-    fn new(address: IpAddr) -> Peer {
-        Peer {
-            address,
-            configured_time: SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            remote_port: 0,
-            remote_as: 0,
-            router_id: Ipv4Addr::new(0, 0, 0, 0),
-            local_as: 0,
-            passive: false,
-            delete_on_disconnected: false,
-            admin_down: false,
-            holdtime: Self::DEFAULT_HOLD_TIME,
-            negotiated_holdtime: 0,
-            connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
-            state: State::Idle,
-            uptime: SystemTime::UNIX_EPOCH,
-            downtime: SystemTime::UNIX_EPOCH,
-            counter_tx: Default::default(),
-            counter_rx: Default::default(),
-            route_stats: FnvHashMap::default(),
-            remote_cap: Vec::new(),
-            local_cap: Vec::new(),
-            route_server_client: false,
-            mgmt_tx: None,
-        }
     }
 
     fn update(&mut self, session: &Session) {
@@ -257,7 +224,63 @@ impl Peer {
         }
     }
 
-    fn families(mut self, families: Vec<packet::Family>) -> Self {
+    fn reset(&mut self) {
+        self.state = State::Idle;
+        self.downtime = SystemTime::now();
+        self.route_stats = FnvHashMap::default();
+        self.remote_cap = Vec::new();
+        self.mgmt_tx = None;
+    }
+}
+
+struct PeerBuilder {
+    remote_addr: IpAddr,
+
+    remote_asn: u32,
+    local_cap: Vec<packet::Capability>,
+    local_asn: u32,
+    remote_port: u16,
+    passive: bool,
+    rs_client: bool,
+    delete_on_disconnected: bool,
+    state: State,
+    holdtime: u64,
+    connect_retry_time: u64,
+    admin_down: bool,
+    ctrl_channel: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
+}
+
+impl Default for PeerBuilder {
+    fn default() -> Self {
+        Self {
+            remote_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            state: State::Idle,
+            ..Default::default()
+        }
+    }
+}
+
+impl PeerBuilder {
+    const DEFAULT_HOLD_TIME: u64 = 180;
+    const DEFAULT_CONNECT_RETRY_TIME: u64 = 3;
+
+    fn new(remote_addr: IpAddr) -> Self {
+        PeerBuilder {
+            remote_addr,
+            local_cap: Vec::new(),
+            connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
+            holdtime: Self::DEFAULT_HOLD_TIME,
+            state: State::Idle,
+            ..Default::default()
+        }
+    }
+
+    fn ctrl_channel(&mut self, tx: mpsc::UnboundedSender<PeerMgmtMsg>) -> &mut Self {
+        self.ctrl_channel = Some(tx);
+        self
+    }
+
+    fn families(&mut self, families: Vec<packet::Family>) -> &mut Self {
         let mut v: Vec<packet::Capability> = families
             .iter()
             .map(|family| packet::Capability::MultiProtocol(*family))
@@ -266,71 +289,89 @@ impl Peer {
         self
     }
 
-    fn local_as(mut self, local_as: u32) -> Self {
-        self.local_as = local_as;
+    fn local_asn(&mut self, local_asn: u32) -> &mut Self {
+        self.local_asn = local_asn;
         self
     }
 
-    fn remote_port(mut self, remote_port: u16) -> Self {
+    fn remote_port(&mut self, remote_port: u16) -> &mut Self {
         self.remote_port = remote_port;
         self
     }
 
-    fn remote_as(mut self, remote_as: u32) -> Self {
-        self.remote_as = remote_as;
+    fn remote_asn(&mut self, remote_asn: u32) -> &mut Self {
+        self.remote_asn = remote_asn;
         self
     }
 
-    fn passive(mut self, passive: bool) -> Self {
+    fn passive(&mut self, passive: bool) -> &mut Self {
         self.passive = passive;
         self
     }
 
-    fn rs_client(mut self, rs: bool) -> Self {
-        self.route_server_client = rs;
+    fn rs_client(&mut self, rs: bool) -> &mut Self {
+        self.rs_client = rs;
         self
     }
 
-    fn delete_on_disconnected(mut self, delete: bool) -> Self {
+    fn delete_on_disconnected(&mut self, delete: bool) -> &mut Self {
         self.delete_on_disconnected = delete;
         self
     }
 
-    fn mgmt_channel(mut self, tx: mpsc::UnboundedSender<PeerMgmtMsg>) -> Self {
-        self.mgmt_tx = Some(tx);
-        self
-    }
-
-    fn state(mut self, state: State) -> Self {
+    fn state(&mut self, state: State) -> &mut Self {
         self.state = state;
         self
     }
 
-    fn hold_time(mut self, t: u64) -> Self {
+    fn holdtime(&mut self, t: u64) -> &mut Self {
         if t != 0 {
             self.holdtime = t;
         }
         self
     }
 
-    fn connect_retry_time(mut self, t: u64) -> Self {
+    fn connect_retry_time(&mut self, t: u64) -> &mut Self {
         if t != 0 {
             self.connect_retry_time = t;
         }
         self
     }
 
-    fn admin_down(mut self, v: bool) -> Self {
-        self.admin_down = v;
+    fn admin_down(&mut self, b: bool) -> &mut Self {
+        self.admin_down = b;
         self
     }
 
-    fn reset(&mut self) {
-        self.state = State::Idle;
-        self.downtime = SystemTime::now();
-        self.route_stats = FnvHashMap::default();
-        self.remote_cap = Vec::new();
-        self.mgmt_tx = None;
+    fn build(&mut self) -> Peer {
+        Peer {
+            address: self.remote_addr,
+            configured_time: SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            remote_port: self.remote_port,
+            remote_as: self.remote_asn,
+            router_id: Ipv4Addr::new(0, 0, 0, 0),
+            local_as: self.local_asn,
+            passive: self.passive,
+            delete_on_disconnected: self.delete_on_disconnected,
+            admin_down: self.admin_down,
+            holdtime: self.holdtime,
+            negotiated_holdtime: 0,
+            connect_retry_time: self.connect_retry_time,
+            state: self.state,
+            uptime: SystemTime::UNIX_EPOCH,
+            downtime: SystemTime::UNIX_EPOCH,
+            route_stats: FnvHashMap::default(),
+            remote_cap: Vec::new(),
+            local_cap: self.local_cap.split_off(0),
+            route_server_client: self.rs_client,
+            mgmt_tx: self.ctrl_channel.take(),
+            counter_tx: Default::default(),
+            counter_rx: Default::default(),
+            //            ..Default::default()
+        }
     }
 }
 
@@ -412,9 +453,9 @@ impl TryFrom<&api::Peer> for Peer {
         let peer_addr = IpAddr::from_str(&conf.neighbor_address).map_err(|_| {
             Error::InvalidArgument(format!("invalid peer address: {}", conf.neighbor_address))
         })?;
-        Ok(Peer::new(peer_addr)
-            .local_as(conf.local_as)
-            .remote_as(conf.peer_as)
+        Ok(PeerBuilder::new(peer_addr)
+            .local_asn(conf.local_as)
+            .remote_asn(conf.peer_as)
             .remote_port(p.transport.as_ref().map_or(0, |x| x.remote_port as u16))
             .families(
                 p.afi_safis
@@ -431,7 +472,7 @@ impl TryFrom<&api::Peer> for Peer {
                     .as_ref()
                     .map_or(false, |x| x.route_server_client),
             )
-            .hold_time(
+            .holdtime(
                 p.timers
                     .as_ref()
                     .map(|x| &x.config)
@@ -443,7 +484,8 @@ impl TryFrom<&api::Peer> for Peer {
                     .map(|x| &x.config)
                     .map_or(0, |x| x.as_ref().map_or(0, |x| x.connect_retry)),
             )
-            .admin_down(conf.admin_down))
+            .admin_down(conf.admin_down)
+            .build())
     }
 }
 
@@ -451,9 +493,9 @@ impl TryFrom<&api::Peer> for Peer {
 impl From<&config::Neighbor> for Peer {
     fn from(n: &config::Neighbor) -> Peer {
         let c = n.config.as_ref().unwrap();
-        let peer = Peer::new(c.neighbor_address.as_ref().unwrap().parse().unwrap())
-            .local_as(c.local_as.map_or(0, |x| x))
-            .remote_as(c.peer_as.unwrap())
+        PeerBuilder::new(c.neighbor_address.as_ref().unwrap().parse().unwrap())
+            .local_asn(c.local_as.map_or(0, |x| x))
+            .remote_asn(c.peer_as.unwrap())
             .remote_port(n.transport.as_ref().map_or(0, |t| {
                 t.config
                     .as_ref()
@@ -469,7 +511,7 @@ impl From<&config::Neighbor> for Peer {
                     .as_ref()
                     .map_or(false, |r| r.route_server_client.map_or(false, |r| r))
             }))
-            .hold_time(n.timers.as_ref().map_or(0, |c| {
+            .holdtime(n.timers.as_ref().map_or(0, |c| {
                 c.config
                     .as_ref()
                     .map_or(0, |c| c.hold_time.map_or(0, |c| c as u64))
@@ -479,9 +521,8 @@ impl From<&config::Neighbor> for Peer {
                     .as_ref()
                     .map_or(0, |c| c.connect_retry.map_or(0, |c| c as u64))
             }))
-            .admin_down(c.admin_down.map_or(false, |c| c));
-
-        peer
+            .admin_down(c.admin_down.map_or(false, |c| c))
+            .build()
     }
 }
 
@@ -1571,6 +1612,7 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
     let remote_port = peer.remote_port;
     let configured_time = peer.configured_time;
     let sockaddr = std::net::SocketAddr::new(peer_addr, remote_port);
+    let retry_time = peer.connect_retry_time;
     tokio::spawn(async move {
         loop {
             if let Ok(Ok(stream)) = tokio::time::timeout(
@@ -1582,8 +1624,7 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
                 let _ = ch.send(stream);
                 return;
             }
-            // FIXME: use configured idle time
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(retry_time)).await;
             {
                 let server = GLOBAL.write().await;
                 if let Some(peer) = server.peers.get(&peer_addr) {
@@ -2042,16 +2083,17 @@ impl Global {
                         return None;
                     }
                     let (tx, rx) = mpsc::unbounded_channel();
-                    let mut p = Peer::new(peer_addr)
+                    let mut builder = PeerBuilder::new(peer_addr);
+                    builder
                         .state(State::Active)
-                        .remote_as(remote_as)
+                        .remote_asn(remote_as)
                         .delete_on_disconnected(true)
                         .rs_client(rs_client)
-                        .mgmt_channel(tx);
+                        .ctrl_channel(tx);
                     if let Some(holdtime) = holdtime {
-                        p = p.hold_time(holdtime);
+                        builder.holdtime(holdtime);
                     }
-                    let _ = global.add_peer(p, None);
+                    let _ = global.add_peer(builder.build(), None);
                     let peer = global.peers.get(&peer_addr).unwrap();
                     (
                         peer.local_as,
