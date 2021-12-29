@@ -235,7 +235,6 @@ impl Peer {
 
 struct PeerBuilder {
     remote_addr: IpAddr,
-
     remote_asn: u32,
     local_cap: Vec<packet::Capability>,
     local_asn: u32,
@@ -250,16 +249,6 @@ struct PeerBuilder {
     ctrl_channel: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
 }
 
-impl Default for PeerBuilder {
-    fn default() -> Self {
-        Self {
-            remote_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-            state: State::Idle,
-            ..Default::default()
-        }
-    }
-}
-
 impl PeerBuilder {
     const DEFAULT_HOLD_TIME: u64 = 180;
     const DEFAULT_CONNECT_RETRY_TIME: u64 = 3;
@@ -267,11 +256,18 @@ impl PeerBuilder {
     fn new(remote_addr: IpAddr) -> Self {
         PeerBuilder {
             remote_addr,
+            remote_asn: 0,
             local_cap: Vec::new(),
-            connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
-            holdtime: Self::DEFAULT_HOLD_TIME,
+            local_asn: 0,
+            remote_port: 0,
+            passive: false,
+            rs_client: false,
+            delete_on_disconnected: false,
             state: State::Idle,
-            ..Default::default()
+            holdtime: Self::DEFAULT_HOLD_TIME,
+            connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
+            admin_down: false,
+            ctrl_channel: None,
         }
     }
 
