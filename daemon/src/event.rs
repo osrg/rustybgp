@@ -357,7 +357,7 @@ impl PeerBuilder {
     fn build(&mut self) -> Peer {
         Peer {
             remote_addr: self.remote_addr,
-            local_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            local_addr: self.local_addr,
             configured_time: SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
