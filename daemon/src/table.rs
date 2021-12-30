@@ -203,11 +203,13 @@ pub(crate) enum PeerType {
 
 pub(crate) struct Source {
     pub(crate) peer_addr: IpAddr,
-    router_id: u32,
+    pub(crate) router_id: u32,
     peer_type: PeerType,
     local_addr: IpAddr,
+    pub(crate) remote_asn: u32,
     local_as: u32,
     rs_client: bool,
+    pub(crate) uptime: u64,
 }
 
 impl Hash for Source {
@@ -223,7 +225,9 @@ impl Source {
         peer_type: PeerType,
         local_addr: IpAddr,
         local_as: u32,
+        remote_asn: u32,
         rs_client: bool,
+        uptime: u64,
     ) -> Self {
         Source {
             peer_addr,
@@ -231,7 +235,9 @@ impl Source {
             peer_type,
             local_addr,
             local_as,
+            remote_asn,
             rs_client,
+            uptime,
         }
     }
 }
@@ -688,7 +694,9 @@ fn drop() {
         PeerType::Ebgp,
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
         1,
+        2,
         false,
+        0,
     ));
     let s2 = Arc::new(Source::new(
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
@@ -696,7 +704,9 @@ fn drop() {
         PeerType::Ebgp,
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
         1,
+        2,
         false,
+        0,
     ));
 
     let n1 = packet::Net::V4(packet::bgp::Ipv4Net {

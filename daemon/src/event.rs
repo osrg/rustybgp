@@ -608,7 +608,12 @@ impl GrpcService {
                 table::PeerType::Ibgp,
                 IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
                 0,
+                0,
                 false,
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
             )),
             active_conn_tx,
         }
@@ -2448,6 +2453,29 @@ impl Table {
                     TableEvent::PassUpdate(source, family, nets, attrs) => match attrs {
                         Some(attrs) => {
                             let mut t = TABLE[idx].lock().await;
+                            // FIXME: non ipv4
+                            if family == packet::Family::IPV4 {
+                                for bmp_tx in t.bmp_event_tx.values() {
+                                    let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
+                                        header: bmp::PerPeerHeader::new(
+                                            source.remote_asn,
+                                            Ipv4Addr::from(source.router_id),
+                                            0,
+                                            source.peer_addr,
+                                            source.uptime as u32,
+                                        ),
+                                        update: packet::bgp::Message::Update {
+                                            reach: nets.to_owned(),
+                                            unreach: Vec::new(),
+                                            attr: attrs.clone(),
+                                            mp_reach: None,
+                                            mp_attr: Arc::new(Vec::new()),
+                                            mp_unreach: None,
+                                        }
+                                        .into(),
+                                    });
+                                }
+                            }
                             for net in nets {
                                 let mut filtered = false;
                                 if let Some(a) = t.global_import_policy.as_ref() {
@@ -2479,6 +2507,29 @@ impl Table {
                         }
                         None => {
                             let mut t = TABLE[idx].lock().await;
+                            // FIXME: non ipv4
+                            if family == packet::Family::IPV4 {
+                                for bmp_tx in t.bmp_event_tx.values() {
+                                    let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
+                                        header: bmp::PerPeerHeader::new(
+                                            source.remote_asn,
+                                            Ipv4Addr::from(source.router_id),
+                                            0,
+                                            source.peer_addr,
+                                            source.uptime as u32,
+                                        ),
+                                        update: packet::bgp::Message::Update {
+                                            reach: Vec::new(),
+                                            unreach: nets.to_owned(),
+                                            attr: Arc::new(Vec::new()),
+                                            mp_reach: None,
+                                            mp_attr: Arc::new(Vec::new()),
+                                            mp_unreach: None,
+                                        }
+                                        .into(),
+                                    });
+                                }
+                            }
                             for net in nets {
                                 if let Some(ri) = t.rtable.remove(source.clone(), family, net) {
                                     for c in t.peer_event_tx.values() {
@@ -2817,7 +2868,9 @@ impl Handler {
                         t,
                         self.local_addr,
                         self.local_as,
+                        remote_asn,
                         self.rs_client,
+                        uptime,
                     )));
 
                     let d = Table::dealer(&self.peer_addr);
@@ -3244,7 +3297,9 @@ fn bucket() {
         table::PeerType::Ebgp,
         IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
         1,
+        2,
         false,
+        0,
     ));
     let family = packet::Family::IPV4;
 
