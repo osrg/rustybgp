@@ -32,6 +32,7 @@ impl Message {
     pub(crate) const ROUTE_MIRRORING: u8 = 7;
 }
 
+#[derive(Clone)]
 pub(crate) struct PerPeerHeader {
     asn: u32,
     id: Ipv4Addr,

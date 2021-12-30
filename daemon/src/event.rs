@@ -1696,13 +1696,20 @@ impl BmpClient {
             .await;
 
         let (tx, rx) = mpsc::unbounded_channel();
+        let mut adjin = FnvHashMap::default();
         for i in 0..*NUM_TABLES {
             let mut t = TABLE[i].lock().await;
             t.bmp_event_tx.insert(sockaddr.ip(), tx.clone());
+            for c in t.rtable.iter_change(packet::Family::IPV4) {
+                let e = adjin.entry(c.source.peer_addr).or_insert(Vec::new());
+                e.push(c);
+            }
         }
         let local_id = GLOBAL.read().await.router_id;
+        let mut established_peers = Vec::new();
         for peer in GLOBAL.read().await.peers.values() {
             if peer.state.fsm.load(Ordering::Acquire) == SessionState::Established as u8 {
+                established_peers.push(peer.remote_addr);
                 let remote_asn = peer.state.remote_asn.load(Ordering::Relaxed);
                 let remote_id = Ipv4Addr::from(peer.state.remote_id.load(Ordering::Relaxed));
                 let m = bmp::Message::PeerUp {
@@ -1732,6 +1739,55 @@ impl BmpClient {
                     },
                 };
                 if lines.send(&m).await.is_err() {
+                    return;
+                }
+            }
+        }
+        for addr in established_peers {
+            let mut header = None;
+            if let Some(v) = adjin.remove(&addr) {
+                for m in v {
+                    if header.is_none() {
+                        header = Some(bmp::PerPeerHeader::new(
+                            m.source.remote_asn,
+                            Ipv4Addr::from(m.source.router_id),
+                            0,
+                            m.source.peer_addr,
+                            m.source.uptime as u32,
+                        ));
+                    }
+                    if lines
+                        .send(&bmp::Message::RouteMonitoring {
+                            header: bmp::PerPeerHeader::new(
+                                m.source.remote_asn,
+                                Ipv4Addr::from(m.source.router_id),
+                                0,
+                                m.source.peer_addr,
+                                m.source.uptime as u32,
+                            ),
+                            update: m.into(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                if lines
+                    .send(&bmp::Message::RouteMonitoring {
+                        header: header.unwrap(),
+                        update: bgp::Message::Update {
+                            reach: vec![],
+                            unreach: vec![],
+                            attr: Arc::new(Vec::new()),
+                            mp_reach: None,
+                            mp_attr: Arc::new(Vec::new()),
+                            mp_unreach: None,
+                        },
+                    })
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }

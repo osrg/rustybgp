@@ -302,6 +302,22 @@ impl RoutingTable {
             .map(|m| m.iter().map(|(x, y)| (*x, *y)))
     }
 
+    pub(crate) fn iter_change(&self, family: packet::Family) -> impl Iterator<Item = Change> + '_ {
+        self.global
+            .get(&family)
+            .unwrap_or_else(|| self.global.get(&packet::Family::EMPTY).unwrap())
+            .iter()
+            .map(move |(net, dst)| {
+                dst.entry.iter().map(move |e| Change {
+                    source: e.source.clone(),
+                    family: family,
+                    net: *net,
+                    attr: e.pa.attr.clone(),
+                })
+            })
+            .flatten()
+    }
+
     pub(crate) fn iter_api(
         &self,
         table_type: api::TableType,
