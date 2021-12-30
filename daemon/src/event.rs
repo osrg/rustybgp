@@ -1661,7 +1661,7 @@ impl BmpClient {
         }
     }
 
-    async fn serve(stream: TcpStream) {
+    async fn serve(stream: TcpStream, sockaddr: SocketAddr) {
         let mut lines = Framed::new(stream, bmp::BmpCodec::new());
         let sysname = hostname::get().unwrap_or(std::ffi::OsString::from("unknown"));
         let _ = lines
@@ -1690,8 +1690,13 @@ impl BmpClient {
             ]))
             .await;
 
+        let (tx, rx) = mpsc::unbounded_channel();
+        for i in 0..*NUM_TABLES {
+            let mut t = TABLE[i].lock().await;
+            t.bmp_event_tx.insert(sockaddr.ip(), tx.clone());
+        }
         let local_id = GLOBAL.read().await.router_id;
-        for (_, peer) in &GLOBAL.read().await.peers {
+        for peer in GLOBAL.read().await.peers.values() {
             if peer.state.fsm.load(Ordering::Acquire) == SessionState::Established as u8 {
                 let remote_asn = peer.state.remote_asn.load(Ordering::Relaxed);
                 let remote_id = Ipv4Addr::from(peer.state.remote_id.load(Ordering::Relaxed));
@@ -1727,6 +1732,7 @@ impl BmpClient {
             }
         }
 
+        let mut rx = UnboundedReceiverStream::new(rx);
         loop {
             tokio::select! {
                 msg = lines.next() => {
@@ -1737,6 +1743,15 @@ impl BmpClient {
                         },
                         None => break,
                     };
+                }
+                msg = rx.next() => {
+                    if let Some(msg) = msg {
+                        if lines.send(&msg).await.is_err() {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -1751,7 +1766,7 @@ impl BmpClient {
                 )
                 .await
                 {
-                    let _ = BmpClient::serve(stream).await;
+                    let _ = BmpClient::serve(stream, sockaddr).await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 }
@@ -1934,6 +1949,7 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
             rtable: table::RoutingTable::new(),
             peer_event_tx: FnvHashMap::default(),
             table_event_tx: Vec::new(),
+            bmp_event_tx: FnvHashMap::default(),
             global_import_policy: None,
             global_export_policy: None,
         }));
@@ -2410,6 +2426,7 @@ struct Table {
     rtable: table::RoutingTable,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
     table_event_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
+    bmp_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<bmp::Message>>,
 
     // global->ptable copies
     global_import_policy: Option<Arc<table::PolicyAssignment>>,
@@ -2535,7 +2552,7 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
 
                             tokio::spawn(async move {
                                 let peer_addr = h.peer_addr;
-                                h.run(mgmt_rx).await;
+                                let _ = h.run(mgmt_rx).await;
                                 let mut server = GLOBAL.write().await;
                                 if let Some(peer) = server.peers.get_mut(&peer_addr) {
                                     if peer.delete_on_disconnected {
@@ -2703,6 +2720,8 @@ impl Handler {
 
     async fn rx_msg(
         &mut self,
+        local_sockaddr: SocketAddr,
+        remote_sockaddr: SocketAddr,
         msg: bgp::Message,
         pending: &mut PendingTx,
     ) -> std::result::Result<(), Error> {
@@ -2778,13 +2797,12 @@ impl Handler {
             bgp::Message::Keepalive => {
                 self.holdtimer_renewed = Instant::now();
                 if self.state.fsm.load(Ordering::Relaxed) == SessionState::OpenConfirm as u8 {
-                    self.state.uptime.store(
-                        SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        Ordering::Relaxed,
-                    );
+                    let uptime = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    self.state.uptime.store(uptime, Ordering::Relaxed);
+                    let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
                     let t = if self.local_as == self.state.remote_asn.load(Ordering::Relaxed) {
                         table::PeerType::Ibgp
                     } else {
@@ -2821,6 +2839,50 @@ impl Handler {
 
                         let tx = t.table_event_tx[d].clone();
                         self.table_tx.push(tx);
+
+                        if i == 0 {
+                            for bmp_tx in t.bmp_event_tx.values() {
+                                let bmp_msg = bmp::Message::PeerUp {
+                                    header: bmp::PerPeerHeader::new(
+                                        remote_asn,
+                                        Ipv4Addr::from(
+                                            self.state.remote_id.load(Ordering::Relaxed),
+                                        ),
+                                        0,
+                                        remote_sockaddr.ip(),
+                                        uptime as u32,
+                                    ),
+                                    local_addr: self.local_addr,
+                                    local_port: local_sockaddr.port(),
+                                    remote_port: remote_sockaddr.port(),
+                                    remote_open: bgp::Message::Open {
+                                        version: 4,
+                                        as_number: remote_asn,
+                                        holdtime: self
+                                            .state
+                                            .remote_holdtime
+                                            .load(Ordering::Relaxed),
+                                        router_id: Ipv4Addr::from(
+                                            self.state.remote_id.load(Ordering::Relaxed),
+                                        ),
+                                        capability: self.state.remote_cap.read().await.to_owned(),
+                                    },
+                                    local_open: bgp::Message::Open {
+                                        version: 4,
+                                        as_number: remote_asn,
+                                        holdtime: self
+                                            .state
+                                            .remote_holdtime
+                                            .load(Ordering::Relaxed),
+                                        router_id: Ipv4Addr::from(
+                                            self.state.remote_id.load(Ordering::Relaxed),
+                                        ),
+                                        capability: self.local_cap.to_owned(),
+                                    },
+                                };
+                                let _ = bmp_tx.send(bmp_msg);
+                            }
+                        }
                     }
                     pending.sync = true;
                 }
@@ -2830,8 +2892,13 @@ impl Handler {
         }
     }
 
-    async fn run(&mut self, mut mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>) {
+    async fn run(
+        &mut self,
+        mut mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>,
+    ) -> Result<(), Error> {
         let mut stream = self.stream.take().unwrap();
+        let remote_sockaddr = stream.peer_addr()?;
+        let local_sockaddr = stream.local_addr()?;
         let rxbuf_size = 1 << 16;
         let mut txbuf_size = 1 << 16;
         if let Ok(r) =
@@ -2942,7 +3009,7 @@ impl Handler {
                                     Ok(msg) => match msg {
                                         Some(msg) => {
                                             (*self.counter_rx).sync(&msg);
-                                            let _ = self.rx_msg(msg, &mut pending).await;
+                                            let _ = self.rx_msg(local_sockaddr, remote_sockaddr, msg, &mut pending).await;
                                         }
                                         None => {
                                             // partial read
@@ -3085,6 +3152,7 @@ impl Handler {
                 let _ = self.table_tx[i].send(TableEvent::Disconnected(source.clone()));
             }
         }
+        Ok(())
     }
 }
 
