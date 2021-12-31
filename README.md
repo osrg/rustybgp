@@ -27,7 +27,7 @@ Then you can manage the daemon on a different terminal with GoBGP's CLI command.
 
 ```bash
 $ gobgp neighbor
-Peer        AS Up/Down State       |#Received  Accepted
+Peer            AS Up/Down State       |#Received  Accepted
 198.51.100.2 65002   never Idle        |        0         0
 ```
 
@@ -59,6 +59,7 @@ Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/pas
 | add_rpki        | `gobgp rpki server <IP> add`                               |                                                                   |
 | list_rpki       | `gobgp rpki server`                                        |                                                                   |
 | list_rpki_table | `gobgp rpki table`                                         |                                                                   |
+| add_bmp         | `gobgp bmp add`                                            | routemonitoring is supported only with adjin                      |
 
 ## Community, discussion and support
 
