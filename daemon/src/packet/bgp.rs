@@ -1395,6 +1395,7 @@ static ATTR_DESCS: Lazy<FnvHashMap<u8, AttrDesc>> = Lazy::new(|| {
     .collect()
 });
 
+#[derive(Clone)]
 pub(crate) enum Message {
     Open {
         version: u8,

@@ -78,6 +78,7 @@ impl PerPeerHeader {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) enum PeerDownReason {
     LocalNotification(bgp::Message),
     LocalFsm(u16),

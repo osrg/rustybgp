@@ -2711,7 +2711,7 @@ struct Handler {
     table_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
     peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
     holdtimer_renewed: Instant,
-    shutdown: Option<Error>,
+    shutdown: Option<bmp::PeerDownReason>,
 }
 
 impl Handler {
@@ -2896,9 +2896,16 @@ impl Handler {
             bgp::Message::Notification {
                 code,
                 subcode,
-                data: _,
+                data,
             } => {
                 println!("{}: notification {} {}", self.peer_addr, code, subcode);
+                self.shutdown = Some(bmp::PeerDownReason::RemoteNotification(
+                    bgp::Message::Notification {
+                        code,
+                        subcode,
+                        data,
+                    },
+                ));
                 Ok(())
             }
             bgp::Message::Keepalive => {
@@ -3111,7 +3118,7 @@ impl Handler {
                         rxbuf.reserve(rxbuf_size);
                         match stream.try_read_buf(&mut rxbuf) {
                             Ok(0) => {
-                                self.shutdown = Some(Error::StdIoErr(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "")));
+                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                             }
                             Ok(_) => loop {
                                     match codec.decode(&mut rxbuf) {
@@ -3127,17 +3134,18 @@ impl Handler {
                                     }
                                     Err(e) => {
                                         if let Error::InvalidMessageFormat{code, subcode, data} = e {
-                                            pending.urgent.insert(0, bgp::Message::Notification{code, subcode, data});
+                                            pending.urgent.insert(0, bgp::Message::Notification{code, subcode, data: data.to_owned()});
+                                            self.shutdown = Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification{code, subcode, data}));
                                         } else {
-                                            self.shutdown = Some(e);
+                                            self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
                                         }
                                         break;
                                     },
                                 }
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
-                            Err(e) => {
-                                self.shutdown = Some(Error::StdIoErr(e));
+                            Err(_e) => {
+                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                             }
                         }
                     }
@@ -3152,15 +3160,15 @@ impl Handler {
                             if txbuf.len() > txbuf_size {
                                 let buf = txbuf.freeze();
                                 txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                                if let Err(e) = stream.write_all(&buf).await {
-                                    self.shutdown = Some(Error::StdIoErr(e));
+                                if stream.write_all(&buf).await.is_err() {
+                                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                                     break;
                                 }
                             }
                         }
                         if !txbuf.is_empty() {
-                            if let Err(e) = stream.write_all(&txbuf.freeze()).await {
-                                self.shutdown = Some(Error::StdIoErr(e));
+                            if stream.write_all(&txbuf.freeze()).await.is_err() {
+                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                             }
                         }
 
@@ -3178,8 +3186,8 @@ impl Handler {
                             let _ = codec.encode(&msg, &mut txbuf);
                             self.counter_tx.sync(&msg);
                             if !txbuf.is_empty() {
-                                if let Err(e) = stream.write_all(&txbuf.freeze()).await {
-                                    self.shutdown = Some(Error::StdIoErr(e));
+                                if stream.write_all(&txbuf.freeze()).await.is_err() {
+                                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                                 }
                             }
                         }
@@ -3203,8 +3211,8 @@ impl Handler {
                             if txbuf.len() > txbuf_size {
                                 let buf = txbuf.freeze();
                                 txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                                if let Err(e) = stream.write_all(&buf).await {
-                                    self.shutdown = Some(Error::StdIoErr(e));
+                                if stream.write_all(&buf).await.is_err() {
+                                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                                     break;
                                 }
                             }
@@ -3214,8 +3222,8 @@ impl Handler {
                             }
                         }
                         if !txbuf.is_empty() {
-                            if let Err(e) = stream.write_all(&txbuf.freeze()).await {
-                                self.shutdown = Some(Error::StdIoErr(e));
+                            if stream.write_all(&txbuf.freeze()).await.is_err() {
+                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                             }
                         }
 
@@ -3232,8 +3240,8 @@ impl Handler {
                             for msg in  self.family_cap.iter().map(|(k,_)| bgp::Message::eor(*k)) {
                                 let _ = codec.encode(&msg, &mut b);
                             }
-                            if let Err(e) = stream.write_all(&b.freeze()).await {
-                                self.shutdown = Some(Error::StdIoErr(e));
+                            if stream.write_all(&b.freeze()).await.is_err() {
+                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                                 break;
                             }
                         }
@@ -3252,13 +3260,30 @@ impl Handler {
                 .collect();
             }
         }
-        if let Some(e) = &self.shutdown {
-            println!("{}: down {}", self.peer_addr, e);
-        }
         if let Some(source) = self.source.take() {
             for i in 0..*NUM_TABLES {
-                TABLE[i].lock().await.peer_event_tx.remove(&self.peer_addr);
+                let mut t = TABLE[i].lock().await;
+                t.peer_event_tx.remove(&self.peer_addr);
                 let _ = self.table_tx[i].send(TableEvent::Disconnected(source.clone()));
+                let reason = self
+                    .shutdown
+                    .take()
+                    .unwrap_or(bmp::PeerDownReason::RemoteUnexpected);
+                if i == 0 {
+                    for bmp_tx in t.bmp_event_tx.values() {
+                        let m = bmp::Message::PeerDown {
+                            header: bmp::PerPeerHeader::new(
+                                source.remote_asn,
+                                Ipv4Addr::from(source.router_id),
+                                0,
+                                source.peer_addr,
+                                source.uptime as u32,
+                            ),
+                            reason: reason.clone(),
+                        };
+                        let _ = bmp_tx.send(m);
+                    }
+                }
             }
         }
         Ok(())
