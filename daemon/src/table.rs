@@ -310,7 +310,7 @@ impl RoutingTable {
             .map(move |(net, dst)| {
                 dst.entry.iter().map(move |e| Change {
                     source: e.source.clone(),
-                    family: family,
+                    family,
                     net: *net,
                     attr: e.pa.attr.clone(),
                 })

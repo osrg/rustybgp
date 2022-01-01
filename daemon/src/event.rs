@@ -1668,7 +1668,7 @@ impl BmpClient {
 
     async fn serve(stream: TcpStream, sockaddr: SocketAddr) {
         let mut lines = Framed::new(stream, bmp::BmpCodec::new());
-        let sysname = hostname::get().unwrap_or(std::ffi::OsString::from("unknown"));
+        let sysname = hostname::get().unwrap_or_else(|_| std::ffi::OsString::from("unknown"));
         let _ = lines
             .send(&bmp::Message::Initiation(vec![
                 (
@@ -1701,7 +1701,7 @@ impl BmpClient {
             let mut t = TABLE[i].lock().await;
             t.bmp_event_tx.insert(sockaddr.ip(), tx.clone());
             for c in t.rtable.iter_change(packet::Family::IPV4) {
-                let e = adjin.entry(c.source.peer_addr).or_insert(Vec::new());
+                let e = adjin.entry(c.source.peer_addr).or_insert_with(Vec::new);
                 e.push(c);
             }
         }
@@ -1776,14 +1776,7 @@ impl BmpClient {
                 if lines
                     .send(&bmp::Message::RouteMonitoring {
                         header: header.unwrap(),
-                        update: bgp::Message::Update {
-                            reach: vec![],
-                            unreach: vec![],
-                            attr: Arc::new(Vec::new()),
-                            mp_reach: None,
-                            mp_attr: Arc::new(Vec::new()),
-                            mp_unreach: None,
-                        },
+                        update: bgp::Message::eor(packet::Family::IPV4),
                     })
                     .await
                     .is_err()
@@ -2527,8 +2520,7 @@ impl Table {
                                             mp_reach: None,
                                             mp_attr: Arc::new(Vec::new()),
                                             mp_unreach: None,
-                                        }
-                                        .into(),
+                                        },
                                     });
                                 }
                             }
@@ -2581,8 +2573,7 @@ impl Table {
                                             mp_reach: None,
                                             mp_attr: Arc::new(Vec::new()),
                                             mp_unreach: None,
-                                        }
-                                        .into(),
+                                        },
                                     });
                                 }
                             }
@@ -3166,10 +3157,8 @@ impl Handler {
                                 }
                             }
                         }
-                        if !txbuf.is_empty() {
-                            if stream.write_all(&txbuf.freeze()).await.is_err() {
-                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                            }
+                        if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
+                            self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         }
 
                         let unreach: Vec<packet::Net> = pending.unreach.drain().collect();
@@ -3185,10 +3174,8 @@ impl Handler {
                             };
                             let _ = codec.encode(&msg, &mut txbuf);
                             self.counter_tx.sync(&msg);
-                            if !txbuf.is_empty() {
-                                if stream.write_all(&txbuf.freeze()).await.is_err() {
-                                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                                }
+                            if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
+                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                             }
                         }
 
@@ -3221,10 +3208,8 @@ impl Handler {
                                 break;
                             }
                         }
-                        if !txbuf.is_empty() {
-                            if stream.write_all(&txbuf.freeze()).await.is_err() {
-                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                            }
+                        if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
+                            self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         }
 
                         for attr in sent.drain(..) {
