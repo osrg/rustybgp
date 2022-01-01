@@ -1565,6 +1565,13 @@ impl GobgpApi for GrpcService {
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
 
+        if request.policy != api::add_bmp_request::MonitoringPolicy::Pre as i32 {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "unsupported policy (only pre-policy supporeted",
+            ));
+        }
+
         let sockaddr = SocketAddr::new(addr, request.port as u16);
         match GLOBAL.write().await.bmp_clients.entry(sockaddr) {
             Occupied(_) => {
