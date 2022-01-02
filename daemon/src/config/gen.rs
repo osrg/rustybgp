@@ -1,4 +1,4 @@
-// Copyright (C) 2021 The RustyBGP Authors.
+// Copyright (C) 2021,2022 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ type RrClusterIdType = String;
 // typedef for identity bgp-types:remove-private-as-option.
 // set of options for configuring how private AS path numbers
 // are removed from advertisements.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum RemovePrivateAsOption {
     All,
@@ -51,7 +51,7 @@ type BgpCommunityRegexpType = StdRegexp;
 // STANDARD: standard BGP community [rfc1997]
 // EXTENDED: extended BGP community [rfc4360]
 // BOTH: both standard and extended community.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum CommunityType {
     Standard,
@@ -79,7 +79,7 @@ type BgpStdCommunityType = String;
 // typedef for identity bgp-types:peer-type.
 // labels a peer or peer group as explicitly internal or
 // external.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum PeerType {
     Internal,
@@ -98,7 +98,7 @@ impl TryFrom<String> for PeerType {
 }
 // typedef for identity bgp-types:bgp-session-direction.
 // Type to describe the direction of NLRI transmission.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum BgpSessionDirection {
     Inbound,
@@ -117,7 +117,7 @@ impl TryFrom<String> for BgpSessionDirection {
 }
 // typedef for identity bgp-types:bgp-origin-attr-type.
 // Type definition for standard BGP origin attribute.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum BgpOriginAttrType {
     Igp,
@@ -138,7 +138,7 @@ impl TryFrom<String> for BgpOriginAttrType {
 }
 // typedef for identity bgp-types:afi-safi-type.
 // Base identity type for AFI,SAFI tuples for BGP-4.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum AfiSafiType {
     Ipv4Unicast,
@@ -201,7 +201,7 @@ impl TryFrom<String> for AfiSafiType {
 }
 // typedef for identity bgp-types:bgp-capability.
 // Base identity for a BGP capability.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum BgpCapability {
     Mpbgp,
@@ -228,7 +228,7 @@ impl TryFrom<String> for BgpCapability {
 // Reserved communities within the standard community space
 // defined by RFC1997. These communities must fall within the
 // range 0x00000000 to 0xFFFFFFFF.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum BgpWellKnownStdCommunity {
     NoExport,
@@ -257,7 +257,7 @@ impl TryFrom<String> for BgpWellKnownStdCommunity {
 // default behavior is ANY, i.e., the given value matches any
 // of the members of the defined set.  Note this type is a
 // restricted version of the match-set-options-type.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum MatchSetOptionsRestrictedType {
     Any,
@@ -281,7 +281,7 @@ impl TryFrom<String> for MatchSetOptionsRestrictedType {
 // Options that govern the behavior of a match statement.  The
 // default behavior is ANY, i.e., the given value matches any
 // of the members of the defined set.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum MatchSetOptionsType {
     Any,
@@ -305,7 +305,7 @@ type TagType = String;
 // typedef for identity ptypes:install-protocol-type.
 // Base type for protocols which can install prefixes into the
 // RIB.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum InstallProtocolType {
     Bgp,
@@ -335,7 +335,7 @@ impl TryFrom<String> for InstallProtocolType {
 // typedef for identity ptypes:attribute-comparison.
 // base type for supported comparison operators on route
 // attributes.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum AttributeComparison {
     AttributeEq,
@@ -363,7 +363,7 @@ impl TryFrom<String> for AttributeComparison {
 // typedef for identity rpol:route-disposition.
 // Select the final disposition for the route, either
 // accept or reject.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum RouteDisposition {
     None,
@@ -384,7 +384,7 @@ impl TryFrom<String> for RouteDisposition {
 }
 // typedef for identity rpol:route-type.
 // Condition to check the route type in the route update.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum RouteType {
     None,
@@ -408,7 +408,7 @@ impl TryFrom<String> for RouteType {
 // typedef for identity rpol:default-policy-type.
 // type used to specify default route disposition in
 // a policy chain.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum DefaultPolicyType {
     AcceptRoute,
@@ -427,7 +427,7 @@ impl TryFrom<String> for DefaultPolicyType {
 }
 // typedef for identity bgp:session-state.
 // Operational state of the BGP peer.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum SessionState {
     Idle,
@@ -453,7 +453,7 @@ impl TryFrom<String> for SessionState {
     }
 }
 // typedef for identity bgp:admin-state.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum AdminState {
     Up,
@@ -475,7 +475,7 @@ impl TryFrom<String> for AdminState {
 // typedef for identity bgp:mode.
 // Ths leaf indicates the mode of operation of BGP graceful
 // restart with the peer.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum Mode {
     HelperOnly,
@@ -503,7 +503,7 @@ type BgpSetMedType = String;
 // typedef for identity bgp-pol:bgp-set-community-option-type.
 // Type definition for options when setting the community
 // attribute in a policy action.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum BgpSetCommunityOptionType {
     Add,
@@ -526,7 +526,7 @@ impl TryFrom<String> for BgpSetCommunityOptionType {
     }
 }
 // typedef for identity gobgp:bmp-route-monitoring-policy-type.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum BmpRouteMonitoringPolicyType {
     PrePolicy,
@@ -553,7 +553,7 @@ impl TryFrom<String> for BmpRouteMonitoringPolicyType {
     }
 }
 // typedef for identity gobgp:mrt-type.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum MrtType {
     Updates,
@@ -572,7 +572,7 @@ impl TryFrom<String> for MrtType {
 }
 // typedef for identity gobgp:rpki-validation-result-type.
 // indicate the validation result of RPKI based on ROA.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum RpkiValidationResultType {
     None,

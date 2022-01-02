@@ -21,7 +21,7 @@ from collections import namedtuple
 from pyang import plugin
 
 _COPYRIGHT_NOTICE = """
-// Copyright (C) 2021 The RustyBGP Authors.
+// Copyright (C) 2021,2022 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -475,7 +475,7 @@ def emit_enum(prefix, name, stmt, substmts, fd):
     emit_description(stmt, fd)
 
     const_prefix = convert_const_prefix(type_name_org)
-    print('#[derive(Deserialize, Debug)]')
+    print('#[derive(Deserialize, Debug, PartialEq)]')
     print('#[serde(try_from = "String")]')
     print('pub(crate) enum %s {' % type_name, file=fd)
     m = {}
