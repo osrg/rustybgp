@@ -83,6 +83,46 @@ impl BgpConfig {
             }
         }
 
+        if let Some(bmp_servers) = self.bmp_servers.as_ref().take() {
+            for n in bmp_servers {
+                n.validate()?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl BmpServer {
+    fn validate(&self) -> Result<(), Error> {
+        let config = self.config.as_ref().take().ok_or_else(|| {
+            Error::InvalidConfiguration("empty bmp server configuration".to_string())
+        })?;
+        let addr = config
+            .address
+            .as_ref()
+            .take()
+            .ok_or_else(|| Error::InvalidConfiguration("empty bmp address".to_string()))?;
+        let _: std::net::IpAddr = addr
+            .parse()
+            .map_err(|_| Error::InvalidConfiguration("can't parse neighbor address".to_string()))?;
+        let port = config
+            .port
+            .as_ref()
+            .take()
+            .ok_or_else(|| Error::InvalidConfiguration("empty bmp port".to_string()))?;
+        if *port > u16::MAX as u32 {
+            return Err(Error::InvalidConfiguration(
+                "port number is too big".to_string(),
+            ));
+        }
+        if let Some(policy) = &config.route_monitoring_policy {
+            if policy != &BmpRouteMonitoringPolicyType::PrePolicy {
+                return Err(Error::InvalidConfiguration(
+                    "unsupported monitoring policy".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 }

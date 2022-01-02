@@ -2291,6 +2291,27 @@ impl Global {
                 }
             }
         }
+        if let Some(bmp_servers) = bgp.as_ref().and_then(|x| x.bmp_servers.as_ref()) {
+            let mut server = GLOBAL.write().await;
+            for s in bmp_servers {
+                let config = s.config.as_ref().unwrap();
+                let sockaddr = SocketAddr::new(
+                    config.address.as_ref().unwrap().parse().unwrap(),
+                    config.port.unwrap() as u16,
+                );
+                match server.bmp_clients.entry(sockaddr) {
+                    Occupied(_) => {
+                        panic!("duplicated bmp server {}", sockaddr);
+                    }
+                    Vacant(v) => {
+                        let client = BmpClient::new();
+                        let t = client.configured_time;
+                        v.insert(client);
+                        BmpClient::try_connect(sockaddr, t);
+                    }
+                }
+            }
+        }
         if let Some(defined_sets) = bgp.as_ref().and_then(|x| x.defined_sets.as_ref()) {
             match Vec::<api::DefinedSet>::try_from(defined_sets) {
                 Ok(sets) => {
