@@ -2119,101 +2119,82 @@ impl Global {
         let remote_port = remote_sockaddr.port();
         let mut global = GLOBAL.write().await;
         let router_id = global.router_id;
-        let (local_as, local_cap, holdtime, rs_client, mgmt_rx, state, counter_tx, counter_rx) =
-            match global.peers.get_mut(&remote_addr) {
-                Some(peer) => {
-                    if peer.admin_down {
-                        println!(
-                            "admin down; ignore a new passive connection from {}",
-                            remote_addr
-                        );
-                        return None;
-                    }
-                    if peer.mgmt_tx.is_some() {
-                        println!("already has connection {}", remote_addr);
-                        return None;
-                    }
-                    peer.remote_port = remote_port;
-                    peer.local_port = local_sockaddr.port();
-                    peer.local_addr = local_sockaddr.ip();
-                    peer.state
-                        .fsm
-                        .store(SessionState::Active as u8, Ordering::Relaxed);
-                    let (tx, rx) = mpsc::unbounded_channel();
-                    peer.mgmt_tx = Some(tx);
-                    (
-                        peer.local_as,
-                        peer.local_cap.to_owned(),
-                        peer.holdtime,
-                        peer.route_server_client,
-                        rx,
-                        peer.state.clone(),
-                        peer.counter_tx.clone(),
-                        peer.counter_rx.clone(),
-                    )
+        let (peer, mgmt_rx) = match global.peers.get_mut(&remote_addr) {
+            Some(peer) => {
+                if peer.admin_down {
+                    println!(
+                        "admin down; ignore a new passive connection from {}",
+                        remote_addr
+                    );
+                    return None;
                 }
-                None => {
-                    let mut is_dynamic = false;
-                    let mut rs_client = false;
-                    let mut remote_asn = 0;
-                    let mut holdtime = None;
-                    for p in &global.peer_group {
-                        for d in &p.1.dynamic_peers {
-                            if d.prefix.contains(&remote_addr) {
-                                remote_asn = p.1.as_number;
-                                is_dynamic = true;
-                                rs_client = p.1.route_server_client;
-                                holdtime = p.1.holdtime;
-                                break;
-                            }
+                if peer.mgmt_tx.is_some() {
+                    println!("already has connection {}", remote_addr);
+                    return None;
+                }
+                peer.remote_port = remote_port;
+                peer.local_port = local_sockaddr.port();
+                peer.local_addr = local_sockaddr.ip();
+                peer.state
+                    .fsm
+                    .store(SessionState::Active as u8, Ordering::Relaxed);
+                let (tx, rx) = mpsc::unbounded_channel();
+                peer.mgmt_tx = Some(tx);
+                (peer, rx)
+            }
+            None => {
+                let mut is_dynamic = false;
+                let mut rs_client = false;
+                let mut remote_asn = 0;
+                let mut holdtime = None;
+                for p in &global.peer_group {
+                    for d in &p.1.dynamic_peers {
+                        if d.prefix.contains(&remote_addr) {
+                            remote_asn = p.1.as_number;
+                            is_dynamic = true;
+                            rs_client = p.1.route_server_client;
+                            holdtime = p.1.holdtime;
+                            break;
                         }
                     }
-                    if !is_dynamic {
-                        println!(
-                            "can't find configuration a new passive connection {}",
-                            remote_addr
-                        );
-                        return None;
-                    }
-                    let (tx, rx) = mpsc::unbounded_channel();
-                    let mut builder = PeerBuilder::new(remote_addr);
-                    builder
-                        .state(SessionState::Active)
-                        .remote_asn(remote_asn)
-                        .delete_on_disconnected(true)
-                        .rs_client(rs_client)
-                        .remote_port(remote_port)
-                        .local_port(local_sockaddr.port())
-                        .local_addr(local_sockaddr.ip())
-                        .ctrl_channel(tx);
-                    if let Some(holdtime) = holdtime {
-                        builder.holdtime(holdtime);
-                    }
-                    let _ = global.add_peer(builder.build(), None);
-                    let peer = global.peers.get(&remote_addr).unwrap();
-                    (
-                        peer.local_as,
-                        peer.local_cap.to_owned(),
-                        peer.holdtime,
-                        peer.route_server_client,
-                        rx,
-                        peer.state.clone(),
-                        peer.counter_tx.clone(),
-                        peer.counter_rx.clone(),
-                    )
                 }
-            };
+                if !is_dynamic {
+                    println!(
+                        "can't find configuration a new passive connection {}",
+                        remote_addr
+                    );
+                    return None;
+                }
+                let (tx, rx) = mpsc::unbounded_channel();
+                let mut builder = PeerBuilder::new(remote_addr);
+                builder
+                    .state(SessionState::Active)
+                    .remote_asn(remote_asn)
+                    .delete_on_disconnected(true)
+                    .rs_client(rs_client)
+                    .remote_port(remote_port)
+                    .local_port(local_sockaddr.port())
+                    .local_addr(local_sockaddr.ip())
+                    .ctrl_channel(tx);
+                if let Some(holdtime) = holdtime {
+                    builder.holdtime(holdtime);
+                }
+                let _ = global.add_peer(builder.build(), None);
+                let peer = global.peers.get_mut(&remote_addr).unwrap();
+                (peer, rx)
+            }
+        };
         Handler::new(
             stream,
             remote_addr,
-            local_as,
+            peer.local_as,
             router_id,
-            local_cap,
-            holdtime,
-            rs_client,
-            state,
-            counter_tx,
-            counter_rx,
+            peer.local_cap.to_owned(),
+            peer.holdtime,
+            peer.route_server_client,
+            peer.state.clone(),
+            peer.counter_tx.clone(),
+            peer.counter_rx.clone(),
         )
         .map(|h| (h, mgmt_rx))
     }
