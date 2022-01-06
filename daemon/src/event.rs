@@ -194,6 +194,7 @@ struct Peer {
     local_cap: Vec<packet::Capability>,
 
     route_server_client: bool,
+    multihop_ttl: Option<u8>,
 
     mgmt_tx: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
 }
@@ -250,6 +251,7 @@ struct PeerBuilder {
     holdtime: u64,
     connect_retry_time: u64,
     ctrl_channel: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
+    multihop_ttl: Option<u8>,
 }
 
 impl PeerBuilder {
@@ -273,6 +275,7 @@ impl PeerBuilder {
             holdtime: Self::DEFAULT_HOLD_TIME,
             connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
             ctrl_channel: None,
+            multihop_ttl: None,
         }
     }
 
@@ -354,6 +357,15 @@ impl PeerBuilder {
         self
     }
 
+    fn multihop_ttl(&mut self, ttl: u8) -> &mut Self {
+        if ttl == 0 {
+            self.multihop_ttl = None;
+        } else {
+            self.multihop_ttl = Some(ttl);
+        }
+        self
+    }
+
     fn build(&mut self) -> Peer {
         Peer {
             remote_addr: self.remote_addr,
@@ -385,6 +397,7 @@ impl PeerBuilder {
             mgmt_tx: self.ctrl_channel.take(),
             counter_tx: Default::default(),
             counter_rx: Default::default(),
+            multihop_ttl: self.multihop_ttl.take(),
         }
     }
 }
@@ -522,6 +535,13 @@ impl TryFrom<&api::Peer> for Peer {
                     .map_or(0, |x| x.as_ref().map_or(0, |x| x.connect_retry)),
             )
             .admin_down(conf.admin_down)
+            .multihop_ttl(p.ebgp_multihop.as_ref().map_or(0, |x| {
+                if x.enabled {
+                    x.multihop_ttl as u8
+                } else {
+                    0
+                }
+            }))
             .build())
     }
 }
@@ -559,6 +579,15 @@ impl From<&config::Neighbor> for Peer {
                     .map_or(0, |c| c.connect_retry.map_or(0, |c| c as u64))
             }))
             .admin_down(c.admin_down.map_or(false, |c| c))
+            .multihop_ttl(n.ebgp_multihop.as_ref().map_or(0, |c| {
+                c.config.as_ref().map_or(0, |c| {
+                    if let Some(ttl) = c.multihop_ttl {
+                        c.enabled.map_or(0, |_c| ttl)
+                    } else {
+                        0
+                    }
+                })
+            }))
             .build()
     }
 }
@@ -2184,6 +2213,13 @@ impl Global {
                 (peer, rx)
             }
         };
+        if let Some(ttl) = peer.multihop_ttl {
+            if peer.state.remote_asn.load(Ordering::Relaxed) != peer.local_as {
+                let _ = stream.set_ttl(ttl.into());
+            }
+        } else {
+            let _ = stream.set_ttl(1);
+        }
         Handler::new(
             stream,
             remote_addr,
