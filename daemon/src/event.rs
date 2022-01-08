@@ -512,7 +512,11 @@ impl TryFrom<&api::Peer> for Peer {
         let peer_addr = IpAddr::from_str(&conf.neighbor_address).map_err(|_| {
             Error::InvalidArgument(format!("invalid peer address: {}", conf.neighbor_address))
         })?;
-        Ok(PeerBuilder::new(peer_addr)
+        let mut builder = PeerBuilder::new(peer_addr);
+        if !conf.auth_password.is_empty() {
+            builder.password(&conf.auth_password);
+        }
+        Ok(builder
             .local_asn(conf.local_as)
             .remote_asn(conf.peer_as)
             .remote_port(p.transport.as_ref().map_or(0, |x| x.remote_port as u16))
