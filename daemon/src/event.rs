@@ -195,6 +195,7 @@ struct Peer {
 
     route_server_client: bool,
     multihop_ttl: Option<u8>,
+    password: Option<String>,
 
     mgmt_tx: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
 }
@@ -252,6 +253,7 @@ struct PeerBuilder {
     connect_retry_time: u64,
     ctrl_channel: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
     multihop_ttl: Option<u8>,
+    password: Option<String>,
 }
 
 impl PeerBuilder {
@@ -276,6 +278,7 @@ impl PeerBuilder {
             connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
             ctrl_channel: None,
             multihop_ttl: None,
+            password: None,
         }
     }
 
@@ -357,6 +360,11 @@ impl PeerBuilder {
         self
     }
 
+    fn password(&mut self, password: &str) -> &mut Self {
+        self.password = Some(password.to_string());
+        self
+    }
+
     fn multihop_ttl(&mut self, ttl: u8) -> &mut Self {
         if ttl == 0 {
             self.multihop_ttl = None;
@@ -398,6 +406,7 @@ impl PeerBuilder {
             counter_tx: Default::default(),
             counter_rx: Default::default(),
             multihop_ttl: self.multihop_ttl.take(),
+            password: self.password.take(),
         }
     }
 }
@@ -550,13 +559,14 @@ impl TryFrom<&api::Peer> for Peer {
 impl From<&config::Neighbor> for Peer {
     fn from(n: &config::Neighbor) -> Peer {
         let c = n.config.as_ref().unwrap();
-        PeerBuilder::new(c.neighbor_address.as_ref().unwrap().parse().unwrap())
+        let mut builder = PeerBuilder::new(c.neighbor_address.as_ref().unwrap().parse().unwrap());
+        builder
             .local_asn(c.local_as.map_or(0, |x| x))
             .remote_asn(c.peer_as.unwrap())
-            .remote_port(n.transport.as_ref().map_or(0, |t| {
-                t.config
-                    .as_ref()
-                    .map_or(0, |t| t.remote_port.map_or(0, |n| n))
+            .remote_port(n.transport.as_ref().map_or(Global::BGP_PORT, |t| {
+                t.config.as_ref().map_or(Global::BGP_PORT, |t| {
+                    t.remote_port.map_or(Global::BGP_PORT, |n| n)
+                })
             }))
             .passive(n.transport.as_ref().map_or(false, |t| {
                 t.config
@@ -587,8 +597,11 @@ impl From<&config::Neighbor> for Peer {
                         0
                     }
                 })
-            }))
-            .build()
+            }));
+        if let Some(password) = c.auth_password.as_ref() {
+            builder.password(password);
+        }
+        builder.build()
     }
 }
 
@@ -1662,11 +1675,19 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
     let configured_time = peer.configured_time;
     let sockaddr = std::net::SocketAddr::new(peer_addr, remote_port);
     let retry_time = peer.connect_retry_time;
+    let password = peer.password.as_ref().map(|x| x.to_string());
     tokio::spawn(async move {
         loop {
+            let socket = match peer_addr {
+                IpAddr::V4(_) => tokio::net::TcpSocket::new_v4().unwrap(),
+                IpAddr::V6(_) => tokio::net::TcpSocket::new_v6().unwrap(),
+            };
+            if let Some(key) = password.as_ref() {
+                net::set_md5sig(socket.as_raw_fd(), &peer_addr, key);
+            }
             if let Ok(Ok(stream)) = tokio::time::timeout(
                 tokio::time::Duration::from_secs(5),
-                TcpStream::connect(sockaddr),
+                socket.connect(sockaddr),
             )
             .await
             {
@@ -2051,7 +2072,7 @@ struct Global {
     as_number: u32,
     router_id: Ipv4Addr,
     listen_port: u16,
-
+    //    listen_sockets: (Vec<RawFd>, Vec<RawFd>),
     peers: FnvHashMap<IpAddr, Peer>,
     peer_group: FnvHashMap<String, PeerGroup>,
 
@@ -2465,18 +2486,28 @@ impl Global {
         });
         notify.notified().await;
         let listen_port = GLOBAL.read().await.listen_port;
-        let mut incomings = vec![
+        let listen_sockets: Vec<std::net::TcpListener> = vec![
             net::create_listen_socket("0.0.0.0".to_string(), listen_port),
             net::create_listen_socket("[::]".to_string(), listen_port),
         ]
         .into_iter()
-        .filter(|x| x.is_ok())
-        .map(|x| {
-            tokio_stream::wrappers::TcpListenerStream::new(
-                TcpListener::from_std(x.unwrap()).unwrap(),
-            )
-        })
-        .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
+        .filter_map(|x| x.ok())
+        .collect();
+
+        for (addr, peer) in &GLOBAL.read().await.peers {
+            if let Some(password) = &peer.password {
+                for l in &listen_sockets {
+                    net::set_md5sig(l.as_raw_fd(), addr, password);
+                }
+            }
+        }
+
+        let mut incomings = listen_sockets
+            .into_iter()
+            .map(|x| {
+                tokio_stream::wrappers::TcpListenerStream::new(TcpListener::from_std(x).unwrap())
+            })
+            .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
         assert_ne!(incomings.len(), 0);
         let mut next_peer_taker = 0;
         let nr_takers = conn_tx.len();
