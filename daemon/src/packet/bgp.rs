@@ -28,6 +28,7 @@ use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::api;
+use crate::config;
 use crate::error::Error;
 use crate::proto;
 
@@ -66,6 +67,18 @@ impl From<Family> for api::Family {
         api::Family {
             afi: f.afi() as i32,
             safi: f.safi() as i32,
+        }
+    }
+}
+
+impl TryFrom<&config::gen::AfiSafiType> for Family {
+    type Error = ();
+
+    fn try_from(f: &config::gen::AfiSafiType) -> Result<Self, Self::Error> {
+        match f {
+            config::gen::AfiSafiType::Ipv4Unicast => Ok(Family::IPV4),
+            config::gen::AfiSafiType::Ipv6Unicast => Ok(Family::IPV6),
+            _ => Err(()),
         }
     }
 }
