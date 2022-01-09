@@ -1702,7 +1702,7 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
             {
                 let server = GLOBAL.write().await;
                 if let Some(peer) = server.peers.get(&peer_addr) {
-                    if peer.configured_time != configured_time {
+                    if peer.configured_time != configured_time || peer.mgmt_tx.is_some() {
                         return;
                     }
                 } else {
