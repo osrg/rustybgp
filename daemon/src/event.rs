@@ -42,7 +42,7 @@ use crate::api;
 use crate::config;
 use crate::error::Error;
 use crate::net;
-use crate::packet::{self, bgp, bmp, rpki};
+use crate::packet::{self, bgp, bmp, rpki, Family, FamilyCapability};
 use crate::proto::ToApi;
 use crate::table;
 
@@ -189,7 +189,7 @@ struct Peer {
     counter_rx: Arc<MessageCounter>,
 
     // received and accepted
-    route_stats: FnvHashMap<packet::Family, (u64, u64)>,
+    route_stats: FnvHashMap<Family, (u64, u64)>,
 
     local_cap: Vec<packet::Capability>,
 
@@ -201,7 +201,7 @@ struct Peer {
 }
 
 impl Peer {
-    fn update_stats(&mut self, rti: FnvHashMap<packet::Family, (u64, u64)>) {
+    fn update_stats(&mut self, rti: FnvHashMap<Family, (u64, u64)>) {
         for (f, v) in rti {
             let stats = self.route_stats.entry(f).or_insert((0, 0));
             stats.0 += v.0;
@@ -287,7 +287,7 @@ impl PeerBuilder {
         self
     }
 
-    fn families(&mut self, families: Vec<packet::Family>) -> &mut Self {
+    fn families(&mut self, families: Vec<Family>) -> &mut Self {
         let mut v: Vec<packet::Capability> = families
             .iter()
             .map(|family| packet::Capability::MultiProtocol(*family))
@@ -524,9 +524,7 @@ impl TryFrom<&api::Peer> for Peer {
                 p.afi_safis
                     .iter()
                     .filter(|x| x.config.as_ref().map_or(false, |x| x.family.is_some()))
-                    .map(|x| {
-                        packet::Family::from(x.config.as_ref().unwrap().family.as_ref().unwrap())
-                    })
+                    .map(|x| Family::from(x.config.as_ref().unwrap().family.as_ref().unwrap()))
                     .collect(),
             )
             .passive(p.transport.as_ref().map_or(false, |x| x.passive_mode))
@@ -675,8 +673,8 @@ impl GrpcService {
 
     fn local_path(&self, path: api::Path) -> Result<(usize, TableEvent), tonic::Status> {
         let family = match path.family {
-            Some(family) => packet::Family::from(&family),
-            None => packet::Family::IPV4,
+            Some(family) => Family::from(&family),
+            None => Family::IPV4,
         };
         let net = packet::Net::try_from(path.nlri.ok_or(Error::EmptyArgument)?)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
@@ -1087,8 +1085,8 @@ impl GobgpApi for GrpcService {
         self.is_available(false).await?;
         let request = request.into_inner();
         let family = match request.family {
-            Some(family) => packet::Family::from(&family),
-            None => packet::Family::IPV4,
+            Some(family) => Family::from(&family),
+            None => Family::IPV4,
         };
         let (table_type, peer_addr) = if let Some(t) = api::TableType::from_i32(request.table_type)
         {
@@ -1170,8 +1168,8 @@ impl GobgpApi for GrpcService {
     ) -> Result<tonic::Response<api::GetTableResponse>, tonic::Status> {
         self.is_available(true).await?;
         let family = match request.into_inner().family {
-            Some(family) => packet::Family::from(&family),
-            None => packet::Family::IPV4,
+            Some(family) => Family::from(&family),
+            None => Family::IPV4,
         };
         let mut info = table::RoutingTableState::default();
         for i in 0..*NUM_TABLES {
@@ -1562,8 +1560,8 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::ListRpkiTableRequest>,
     ) -> Result<tonic::Response<Self::ListRpkiTableStream>, tonic::Status> {
         let family = match request.into_inner().family {
-            Some(family) => packet::Family::from(&family),
-            None => packet::Family::IPV4,
+            Some(family) => Family::from(&family),
+            None => Family::IPV4,
         };
 
         let v: Vec<api::ListRpkiTableResponse> = TABLE[0]
@@ -1761,7 +1759,7 @@ impl BmpClient {
         for i in 0..*NUM_TABLES {
             let mut t = TABLE[i].lock().await;
             t.bmp_event_tx.insert(sockaddr.ip(), tx.clone());
-            for c in t.rtable.iter_change(packet::Family::IPV4) {
+            for c in t.rtable.iter_change(Family::IPV4) {
                 let e = adjin.entry(c.source.peer_addr).or_insert_with(Vec::new);
                 e.push(c);
             }
@@ -1837,7 +1835,7 @@ impl BmpClient {
                 if lines
                     .send(&bmp::Message::RouteMonitoring {
                         header: header.unwrap(),
-                        update: bgp::Message::eor(packet::Family::IPV4),
+                        update: bgp::Message::eor(Family::IPV4),
                     })
                     .await
                     .is_err()
@@ -2146,8 +2144,8 @@ impl Global {
             peer.local_cap.push(c);
         }
         let c = match peer.remote_addr {
-            IpAddr::V4(_) => packet::Capability::MultiProtocol(packet::Family::IPV4),
-            IpAddr::V6(_) => packet::Capability::MultiProtocol(packet::Family::IPV6),
+            IpAddr::V4(_) => packet::Capability::MultiProtocol(Family::IPV4),
+            IpAddr::V6(_) => packet::Capability::MultiProtocol(Family::IPV6),
         };
         if !caps.contains(&Into::<u8>::into(&c)) {
             peer.local_cap.push(c);
@@ -2546,7 +2544,7 @@ enum TableEvent {
     // BGP events
     PassUpdate(
         Arc<table::Source>,
-        packet::Family,
+        Family,
         Vec<packet::Net>,
         Option<Arc<Vec<packet::Attribute>>>,
     ),
@@ -2583,7 +2581,7 @@ impl Table {
                         Some(attrs) => {
                             let mut t = TABLE[idx].lock().await;
                             // FIXME: non ipv4
-                            if family == packet::Family::IPV4 {
+                            if family == Family::IPV4 {
                                 for bmp_tx in t.bmp_event_tx.values() {
                                     let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
                                         header: bmp::PerPeerHeader::new(
@@ -2636,7 +2634,7 @@ impl Table {
                         None => {
                             let mut t = TABLE[idx].lock().await;
                             // FIXME: non ipv4
-                            if family == packet::Family::IPV4 {
+                            if family == Family::IPV4 {
                                 for bmp_tx in t.bmp_event_tx.values() {
                                     let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
                                         header: bmp::PerPeerHeader::new(
@@ -2785,7 +2783,7 @@ struct Handler {
     negotiated_holdtime: u64,
     rs_client: bool,
 
-    family_cap: FnvHashMap<packet::Family, packet::FamilyCapability>,
+    family_cap: FnvHashMap<Family, FamilyCapability>,
 
     stream: Option<TcpStream>,
     keepalive_timer: tokio::time::Interval,
@@ -2841,13 +2839,13 @@ impl Handler {
         reach: Vec<packet::Net>,
         unreach: Vec<packet::Net>,
         attr: Arc<Vec<packet::Attribute>>,
-        mp_reach: Option<(packet::Family, Vec<packet::Net>)>,
+        mp_reach: Option<(Family, Vec<packet::Net>)>,
         mp_attr: Arc<Vec<packet::Attribute>>,
-        mp_unreach: Option<(packet::Family, Vec<packet::Net>)>,
+        mp_unreach: Option<(Family, Vec<packet::Net>)>,
     ) {
         let mut add = FnvHashMap::default();
         for net in reach {
-            add.entry(packet::Family::IPV4)
+            add.entry(Family::IPV4)
                 .or_insert_with(FnvHashMap::default)
                 .entry(Table::dealer(&net))
                 .or_insert_with(Vec::new)
@@ -2864,7 +2862,7 @@ impl Handler {
         }
         let mut del = FnvHashMap::default();
         for net in unreach {
-            del.entry(packet::Family::IPV4)
+            del.entry(Family::IPV4)
                 .or_insert_with(FnvHashMap::default)
                 .entry(Table::dealer(&net))
                 .or_insert_with(Vec::new)
@@ -2886,7 +2884,7 @@ impl Handler {
                     family,
                     nets,
                     {
-                        if family == packet::Family::IPV4 {
+                        if family == Family::IPV4 {
                             Some(attr.clone())
                         } else {
                             Some(mp_attr.clone())
@@ -3030,7 +3028,7 @@ impl Handler {
                                         continue;
                                     }
                                 }
-                                if f == &packet::Family::IPV4 {
+                                if f == &Family::IPV4 {
                                     pending.insert_change(c);
                                 } else {
                                     pending.urgent.push(c.into());
@@ -3186,7 +3184,7 @@ impl Handler {
                                 if !self.family_cap.contains_key(&ri.family) {
                                     continue;
                                 }
-                                if ri.family == packet::Family::IPV4 {
+                                if ri.family == Family::IPV4 {
                                     pending.insert_change(ri);
                                 } else {
                                     pending.urgent.push(ri.into());
@@ -3463,7 +3461,7 @@ fn bucket() {
         false,
         0,
     ));
-    let family = packet::Family::IPV4;
+    let family = Family::IPV4;
 
     let net1 = packet::Net::from_str("10.0.0.0/24").unwrap();
     let net2 = packet::Net::from_str("20.0.0.0/24").unwrap();
@@ -3481,7 +3479,7 @@ fn bucket() {
 
     pending.insert_change(table::Change {
         source: src.clone(),
-        family: packet::Family::IPV4,
+        family: Family::IPV4,
         net: net2,
         attr: Arc::new(vec![packet::Attribute::new_with_value(
             packet::Attribute::ORIGIN,

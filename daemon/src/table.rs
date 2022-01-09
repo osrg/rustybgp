@@ -30,7 +30,7 @@ use treebitmap::IpLookupTable;
 
 use crate::api;
 use crate::error::Error;
-use crate::packet::{self, bgp, Attribute};
+use crate::packet::{self, bgp, Attribute, Family};
 use crate::proto::ToApi;
 
 struct PathAttribute {
@@ -106,7 +106,7 @@ impl Path {
     const FLAG_FILTERED: u8 = 1 << 0;
     fn to_api(
         &self,
-        family: packet::Family,
+        family: Family,
         net: &packet::Net,
         validation: Option<api::Validation>,
     ) -> api::Path {
@@ -165,7 +165,7 @@ impl From<RoutingTableState> for api::GetTableResponse {
 #[derive(Clone)]
 pub(crate) struct Change {
     pub(crate) source: Arc<Source>,
-    pub(crate) family: packet::Family,
+    pub(crate) family: Family,
     pub(crate) net: packet::Net,
     pub(crate) attr: Arc<Vec<packet::Attribute>>,
 }
@@ -173,7 +173,7 @@ pub(crate) struct Change {
 impl From<Change> for bgp::Message {
     fn from(c: Change) -> bgp::Message {
         // FIXME: handle extended nexthop
-        if c.family == packet::Family::IPV4 {
+        if c.family == Family::IPV4 {
             bgp::Message::Update {
                 reach: vec![c.net],
                 unreach: Vec::new(),
@@ -243,15 +243,15 @@ impl Source {
 }
 
 pub(crate) struct RoutingTable {
-    global: FnvHashMap<packet::Family, FnvHashMap<packet::Net, Destination>>,
-    route_stats: FnvHashMap<IpAddr, FnvHashMap<packet::Family, (u64, u64)>>,
+    global: FnvHashMap<Family, FnvHashMap<packet::Net, Destination>>,
+    route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, (u64, u64)>>,
     rpki: RpkiTable,
 }
 
 impl RoutingTable {
     pub(crate) fn new() -> Self {
         RoutingTable {
-            global: vec![(packet::Family::EMPTY, FnvHashMap::default())]
+            global: vec![(Family::EMPTY, FnvHashMap::default())]
                 .into_iter()
                 .collect(),
             route_stats: FnvHashMap::default(),
@@ -259,7 +259,7 @@ impl RoutingTable {
         }
     }
 
-    pub(crate) fn best(&self, family: &packet::Family) -> Vec<Change> {
+    pub(crate) fn best(&self, family: &Family) -> Vec<Change> {
         match self.global.get(family) {
             Some(t) => {
                 let mut v = Vec::with_capacity(t.len());
@@ -278,7 +278,7 @@ impl RoutingTable {
         }
     }
 
-    pub(crate) fn state(&self, family: packet::Family) -> RoutingTableState {
+    pub(crate) fn state(&self, family: Family) -> RoutingTableState {
         match self.global.get(&family) {
             Some(t) => {
                 let num_path = t.values().map(|x| x.entry.iter()).flatten().count();
@@ -296,16 +296,16 @@ impl RoutingTable {
     pub(crate) fn peer_stats(
         &self,
         peer_addr: &IpAddr,
-    ) -> Option<impl Iterator<Item = (packet::Family, (u64, u64))> + '_> {
+    ) -> Option<impl Iterator<Item = (Family, (u64, u64))> + '_> {
         self.route_stats
             .get(peer_addr)
             .map(|m| m.iter().map(|(x, y)| (*x, *y)))
     }
 
-    pub(crate) fn iter_change(&self, family: packet::Family) -> impl Iterator<Item = Change> + '_ {
+    pub(crate) fn iter_change(&self, family: Family) -> impl Iterator<Item = Change> + '_ {
         self.global
             .get(&family)
-            .unwrap_or_else(|| self.global.get(&packet::Family::EMPTY).unwrap())
+            .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
             .iter()
             .map(move |(net, dst)| {
                 dst.entry.iter().map(move |e| Change {
@@ -321,13 +321,13 @@ impl RoutingTable {
     pub(crate) fn iter_api(
         &self,
         table_type: api::TableType,
-        family: packet::Family,
+        family: Family,
         peer_addr: Option<IpAddr>,
         prefixes: Vec<packet::Net>,
     ) -> impl Iterator<Item = api::Destination> + '_ {
         self.global
             .get(&family)
-            .unwrap_or_else(|| self.global.get(&packet::Family::EMPTY).unwrap())
+            .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
             .iter()
             .filter(move |(net, _dst)| {
                 prefixes.is_empty() || {
@@ -406,7 +406,7 @@ impl RoutingTable {
     pub(crate) fn insert(
         &mut self,
         source: Arc<Source>,
-        family: packet::Family,
+        family: Family,
         net: packet::Net,
         attr: Arc<Vec<packet::Attribute>>,
         filtered: bool,
@@ -514,7 +514,7 @@ impl RoutingTable {
     pub(crate) fn remove(
         &mut self,
         source: Arc<Source>,
-        family: packet::Family,
+        family: Family,
         net: packet::Net,
     ) -> Option<Change> {
         let rt = self.global.get_mut(&family)?;
@@ -596,10 +596,7 @@ impl RoutingTable {
         advertise
     }
 
-    pub(crate) fn iter_roa_api(
-        &self,
-        family: packet::Family,
-    ) -> impl Iterator<Item = api::Roa> + '_ {
+    pub(crate) fn iter_roa_api(&self, family: Family) -> impl Iterator<Item = api::Roa> + '_ {
         self.rpki
             .roas
             .get(&family)
@@ -628,11 +625,11 @@ impl RoutingTable {
                 }
             }
             match *family {
-                packet::Family::IPV4 => {
+                Family::IPV4 => {
                     state.num_records_v4 += records;
                     state.num_prefixes_v4 += prefixes;
                 }
-                packet::Family::IPV6 => {
+                Family::IPV6 => {
                     state.num_records_v6 += records;
                     state.num_prefixes_v6 += prefixes;
                 }
@@ -665,8 +662,8 @@ impl RoutingTable {
 
     pub(crate) fn roa_insert(&mut self, net: packet::IpNet, roa: Arc<Roa>) {
         let (family, mut key, mask) = match net {
-            packet::IpNet::V4(net) => (packet::Family::IPV4, net.addr.octets().to_vec(), net.mask),
-            packet::IpNet::V6(net) => (packet::Family::IPV6, net.addr.octets().to_vec(), net.mask),
+            packet::IpNet::V4(net) => (Family::IPV4, net.addr.octets().to_vec(), net.mask),
+            packet::IpNet::V6(net) => (Family::IPV6, net.addr.octets().to_vec(), net.mask),
         };
         key.push(mask);
         match self.rpki.roas.get_mut(&family).unwrap().get_mut(&key) {
@@ -739,7 +736,7 @@ fn drop() {
     });
 
     let mut rt = RoutingTable::new();
-    let family = packet::Family::IPV4;
+    let family = Family::IPV4;
     let attrs = Arc::new(Vec::new());
 
     rt.insert(s1.clone(), family, n1, attrs.clone(), false);
@@ -1846,14 +1843,14 @@ pub(crate) struct RpkiTableState {
 
 #[derive(Default)]
 pub(crate) struct RpkiTable {
-    roas: FnvHashMap<packet::Family, PatriciaMap<Vec<Arc<Roa>>>>,
+    roas: FnvHashMap<Family, PatriciaMap<Vec<Arc<Roa>>>>,
 }
 
 impl RpkiTable {
     fn new() -> Self {
-        let roas: FnvHashMap<packet::Family, PatriciaMap<_>> = vec![
-            (packet::Family::IPV4, PatriciaMap::default()),
-            (packet::Family::IPV6, PatriciaMap::default()),
+        let roas: FnvHashMap<Family, PatriciaMap<_>> = vec![
+            (Family::IPV4, PatriciaMap::default()),
+            (Family::IPV6, PatriciaMap::default()),
         ]
         .drain(..)
         .collect();
@@ -1880,7 +1877,7 @@ impl RpkiTable {
 
     fn validate(
         &self,
-        family: packet::Family,
+        family: Family,
         source: &Arc<Source>,
         net: &packet::Net,
         attr: &Arc<Vec<packet::Attribute>>,
