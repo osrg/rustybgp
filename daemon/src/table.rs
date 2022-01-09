@@ -489,6 +489,7 @@ impl RoutingTable {
             idx += 1;
         }
 
+        dst.entry.insert(idx, path);
         for i in 0..dst.entry.len() {
             if !dst.entry[i].is_filtered() {
                 if idx == i {
@@ -498,7 +499,6 @@ impl RoutingTable {
             }
         }
 
-        dst.entry.insert(idx, path);
         if best_changed {
             let best = &dst.entry[0];
             return Some(Change {
