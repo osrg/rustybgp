@@ -3011,14 +3011,19 @@ impl Handler {
                     for i in 0..*NUM_TABLES {
                         let mut t = TABLE[i].lock().await;
                         for f in self.family_cap.keys() {
-                            if f == &packet::Family::IPV4 {
-                                for c in t.rtable.best(f).into_iter() {
-                                    pending.insert_change(c);
+                            for c in t.rtable.best(f).into_iter() {
+                                if let Some(a) = t.global_export_policy.as_ref() {
+                                    if t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
+                                        == table::Disposition::Reject
+                                    {
+                                        continue;
+                                    }
                                 }
-                            } else {
-                                pending.urgent.append(
-                                    &mut t.rtable.best(f).into_iter().map(|x| x.into()).collect(),
-                                );
+                                if f == &packet::Family::IPV4 {
+                                    pending.insert_change(c);
+                                } else {
+                                    pending.urgent.push(c.into());
+                                }
                             }
                         }
                         t.peer_event_tx
