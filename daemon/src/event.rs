@@ -2660,6 +2660,17 @@ impl Table {
                             for net in nets {
                                 if let Some(ri) = t.rtable.remove(source.clone(), family, net) {
                                     for c in t.peer_event_tx.values() {
+                                        if let Some(a) = t.global_export_policy.as_ref() {
+                                            if t.rtable.apply_policy(
+                                                a,
+                                                &source,
+                                                &net,
+                                                &Arc::new(Vec::new()),
+                                            ) == table::Disposition::Reject
+                                            {
+                                                continue;
+                                            }
+                                        }
                                         let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
                                     }
                                 }
