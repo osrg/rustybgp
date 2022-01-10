@@ -1125,15 +1125,50 @@ impl GobgpApi for GrpcService {
         let mut v = Vec::new();
         for i in 0..*NUM_TABLES {
             let t = TABLE[i].lock().await;
-            v.append(
-                &mut t
-                    .rtable
-                    .iter_api(table_type, family, peer_addr, prefixes.clone())
-                    .map(|x| api::ListPathResponse {
-                        destination: Some(x),
+            for mut d in t
+                .rtable
+                .iter_api(table_type, family, peer_addr, prefixes.clone())
+            {
+                if table_type == api::TableType::AdjOut {
+                    if let Some(a) = t.global_export_policy.as_ref() {
+                        // drain_filter() still in unstable
+                        let mut i = 0;
+                        while i < d.paths.len() {
+                            let (source, attrs, _, _) = &d.paths[i];
+                            if t.rtable.apply_policy(a, source, &d.net, attrs)
+                                == table::Disposition::Reject
+                            {
+                                let _ = d.paths.remove(i);
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                let paths: Vec<api::Path> = d
+                    .paths
+                    .iter()
+                    .map(|x| api::Path {
+                        nlri: Some((&d.net).into()),
+                        family: Some(family.into()),
+                        age: Some(x.2.to_api()),
+                        pattrs: x.1.iter().map(prost_types::Any::from).collect(),
+                        validation: x.3.clone(),
+                        ..Default::default()
                     })
-                    .collect(),
-            );
+                    .collect();
+
+                if paths.is_empty() {
+                    continue;
+                }
+
+                v.push(api::ListPathResponse {
+                    destination: Some(api::Destination {
+                        prefix: d.net.to_string(),
+                        paths,
+                    }),
+                });
+            }
         }
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(async move {

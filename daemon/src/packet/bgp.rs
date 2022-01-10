@@ -1657,13 +1657,13 @@ impl BgpCodec {
                         let code = a.code();
                         if code > Attribute::MP_REACH && family != Family::IPV4 {
                             if let Some(reach) = reach {
-                                attr_len += self.mp_reach_encode(dst, &reach).unwrap();
+                                attr_len += self.mp_reach_encode(dst, reach).unwrap();
                                 mp_reach_done = true;
                             }
                         }
                         if code > Attribute::MP_UNREACH && family != Family::IPV4 {
                             if let Some(unreach) = unreach {
-                                attr_len += self.mp_unreach_encode(dst, &unreach).unwrap();
+                                attr_len += self.mp_unreach_encode(dst, unreach).unwrap();
                                 mp_unreach_done = true;
                             }
                         }

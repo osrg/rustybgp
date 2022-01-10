@@ -31,7 +31,6 @@ use treebitmap::IpLookupTable;
 use crate::api;
 use crate::error::Error;
 use crate::packet::{self, bgp, Attribute, Family};
-use crate::proto::ToApi;
 
 struct PathAttribute {
     attr: Arc<Vec<Attribute>>,
@@ -104,21 +103,6 @@ struct Path {
 
 impl Path {
     const FLAG_FILTERED: u8 = 1 << 0;
-    fn to_api(
-        &self,
-        family: Family,
-        net: &packet::Net,
-        validation: Option<api::Validation>,
-    ) -> api::Path {
-        api::Path {
-            nlri: Some(net.into()),
-            family: Some(family.into()),
-            age: Some(self.timestamp.to_api()),
-            pattrs: self.pa.attr.iter().map(prost_types::Any::from).collect(),
-            validation,
-            ..Default::default()
-        }
-    }
 
     fn is_filtered(&self) -> bool {
         self.flags & Path::FLAG_FILTERED != 0
@@ -160,6 +144,20 @@ impl From<RoutingTableState> for api::GetTableResponse {
             num_accepted: i.num_accepted as u64,
         }
     }
+}
+
+// hacky; invent better
+pub(crate) struct ApiDestination {
+    pub(crate) net: packet::Net,
+    pub(crate) paths: Vec<(
+        Arc<Source>,
+        Arc<Vec<packet::Attribute>>,
+        SystemTime,
+        Option<api::Validation>,
+    )>,
+    // pub(crate) attr: Arc<Vec<packet::Attribute>>,
+    // pub(crate) timestamp: SystemTime,
+    // pub(crate) validation: Option<api::Validation>,
 }
 
 #[derive(Clone)]
@@ -310,7 +308,7 @@ impl RoutingTable {
         family: Family,
         peer_addr: Option<IpAddr>,
         prefixes: Vec<packet::Net>,
-    ) -> impl Iterator<Item = api::Destination> + '_ {
+    ) -> impl Iterator<Item = ApiDestination> + '_ {
         self.global
             .get(&family)
             .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
@@ -327,8 +325,8 @@ impl RoutingTable {
                     found
                 }
             })
-            .map(move |(net, dst)| api::Destination {
-                prefix: net.to_string(),
+            .map(move |(net, dst)| ApiDestination {
+                net: *net,
                 paths: dst
                     .entry
                     .iter()
@@ -366,23 +364,51 @@ impl RoutingTable {
                                     })
                                     .collect::<Vec<packet::Attribute>>(),
                             );
-                            Path {
-                                source: p.source.clone(),
-                                pa: PathAttribute { attr: attr.clone() },
-                                timestamp: p.timestamp,
-                                flags: 0,
-                            }
-                            .to_api(
-                                family,
-                                net,
+                            (
+                                p.source.clone(),
+                                attr.clone(),
+                                p.timestamp,
                                 self.rpki.validate(family, &p.source, net, &attr),
                             )
+                            // ApiPath {
+                            //     source: p.source.clone(),
+                            //     family,
+                            //     net: *net,
+                            //     attr: attr.clone(),
+                            //     timestamp: p.timestamp,
+                            //     validation: self.rpki.validate(family, &p.source, net, &attr),
+                            // }
+                            // Path {
+                            //     source: p.source.clone(),
+                            //     pa: PathAttribute { attr: attr.clone() },
+                            //     timestamp: p.timestamp,
+                            //     flags: 0,
+                            // }
+                            // .to_api(
+                            //     family,
+                            //     net,
+                            //     self.rpki.validate(family, &p.source, net, &attr),
+                            // )
                         } else {
-                            p.to_api(
-                                family,
-                                net,
+                            (
+                                p.source.clone(),
+                                p.pa.attr.clone(),
+                                p.timestamp,
                                 self.rpki.validate(family, &p.source, net, &p.pa.attr),
                             )
+                            // ApiPath {
+                            //     source: p.source.clone(),
+                            //     family,
+                            //     net: *net,
+                            //     attr: p.pa.attr.clone(),
+                            //     timestamp: p.timestamp,
+                            //     validation: self.rpki.validate(family, &p.source, net, &p.pa.attr),
+                            // }
+                            // p.to_api(
+                            //     family,
+                            //     net,
+                            //     self.rpki.validate(family, &p.source, net, &p.pa.attr),
+                            // )
                         }
                     })
                     .collect(),
