@@ -1789,9 +1789,11 @@ impl BmpClient {
         for i in 0..*NUM_TABLES {
             let mut t = TABLE[i].lock().await;
             t.bmp_event_tx.insert(sockaddr.ip(), tx.clone());
-            for c in t.rtable.iter_change(Family::IPV4) {
-                let e = adjin.entry(c.source.peer_addr).or_insert_with(Vec::new);
-                e.push(c);
+            for f in &[Family::IPV4, Family::IPV6] {
+                for c in t.rtable.iter_change(*f) {
+                    let e = adjin.entry(c.source.peer_addr).or_insert_with(Vec::new);
+                    e.push(c);
+                }
             }
         }
         let local_id = GLOBAL.read().await.router_id;

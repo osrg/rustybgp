@@ -1515,7 +1515,12 @@ impl BgpCodec {
         self.local_as == self.remote_as
     }
 
-    fn mp_reach_encode(&self, dst: &mut BytesMut, reach: &(Family, Vec<Net>)) -> Result<u16, ()> {
+    fn mp_reach_encode(
+        &self,
+        attrs: Arc<Vec<Attribute>>,
+        dst: &mut BytesMut,
+        reach: &(Family, Vec<Net>),
+    ) -> Result<u16, ()> {
         let (family, nets) = reach;
         let desc = ATTR_DESCS.get(&Attribute::MP_REACH).unwrap();
         let pos_head = dst.len();
@@ -1525,12 +1530,32 @@ impl BgpCodec {
         dst.put_u8(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
-        let addr = match self.local_addr {
-            IpAddr::V6(addr) => addr.octets(),
-            _ => panic!(""),
-        };
-        dst.put_u8(addr.len() as u8);
-        dst.put_slice(&addr);
+        if self.keep_nexthop {
+            let mut addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).octets();
+            for a in &*attrs {
+                if a.code() == Attribute::NEXTHOP {
+                    if let Some(b) = a.binary() {
+                        addr[0..b.len()].clone_from_slice(&b[..]);
+                    }
+                    break;
+                }
+            }
+            dst.put_u8(addr.len() as u8);
+            dst.put_slice(&addr);
+        } else {
+            match self.local_addr {
+                IpAddr::V6(addr) => {
+                    let addr = addr.octets();
+                    dst.put_u8(addr.len() as u8);
+                    dst.put_slice(&addr);
+                }
+                IpAddr::V4(addr) => {
+                    let addr = addr.octets();
+                    dst.put_u8(addr.len() as u8);
+                    dst.put_slice(&addr);
+                }
+            };
+        }
         // padding
         dst.put_u8(0);
         for net in nets {
@@ -1544,6 +1569,7 @@ impl BgpCodec {
 
     fn mp_unreach_encode(
         &self,
+        _: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
         unreach: &(Family, Vec<Net>),
     ) -> Result<u16, ()> {
@@ -1657,13 +1683,14 @@ impl BgpCodec {
                         let code = a.code();
                         if code > Attribute::MP_REACH && family != Family::IPV4 {
                             if let Some(reach) = reach {
-                                attr_len += self.mp_reach_encode(dst, reach).unwrap();
+                                attr_len += self.mp_reach_encode(attr.clone(), dst, reach).unwrap();
                                 mp_reach_done = true;
                             }
                         }
                         if code > Attribute::MP_UNREACH && family != Family::IPV4 {
                             if let Some(unreach) = unreach {
-                                attr_len += self.mp_unreach_encode(dst, unreach).unwrap();
+                                attr_len +=
+                                    self.mp_unreach_encode(attr.clone(), dst, unreach).unwrap();
                                 mp_unreach_done = true;
                             }
                         }
@@ -1682,12 +1709,12 @@ impl BgpCodec {
                 if family != Family::IPV4 {
                     if let Some(reach) = reach {
                         if !mp_reach_done {
-                            attr_len += self.mp_reach_encode(dst, reach).unwrap();
+                            attr_len += self.mp_reach_encode(attr.clone(), dst, reach).unwrap();
                         }
                     }
                     if let Some(unreach) = unreach {
                         if !mp_unreach_done {
-                            attr_len += self.mp_unreach_encode(dst, unreach).unwrap();
+                            attr_len += self.mp_unreach_encode(attr.clone(), dst, unreach).unwrap();
                         }
                     }
                 }
