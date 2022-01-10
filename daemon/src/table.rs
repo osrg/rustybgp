@@ -173,24 +173,10 @@ pub(crate) struct Change {
 impl From<Change> for bgp::Message {
     fn from(c: Change) -> bgp::Message {
         // FIXME: handle extended nexthop
-        if c.family == Family::IPV4 {
-            bgp::Message::Update {
-                reach: vec![c.net],
-                unreach: Vec::new(),
-                attr: c.attr,
-                mp_reach: None,
-                mp_attr: Arc::new(Vec::new()),
-                mp_unreach: None,
-            }
-        } else {
-            bgp::Message::Update {
-                reach: Vec::new(),
-                unreach: Vec::new(),
-                attr: Arc::new(Vec::new()),
-                mp_reach: Some((c.family, vec![c.net])),
-                mp_attr: c.attr,
-                mp_unreach: None,
-            }
+        bgp::Message::Update {
+            reach: Some((c.family, vec![c.net])),
+            unreach: None,
+            attr: c.attr,
         }
     }
 }

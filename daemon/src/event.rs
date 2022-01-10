@@ -86,20 +86,13 @@ impl MessageCounter {
                 reach: _,
                 unreach,
                 attr: _,
-                mp_reach: _,
-                mp_attr: _,
-                mp_unreach,
             } => {
                 self.update.fetch_add(1, Ordering::Relaxed);
 
-                if !unreach.is_empty() {
-                    self.withdraw_update.fetch_add(1, Ordering::Relaxed);
-                    self.withdraw_prefix.fetch_add(1, Ordering::Relaxed);
-                }
-                if let Some((_, v)) = mp_unreach {
+                if let Some((_, unreach)) = unreach {
                     self.withdraw_update.fetch_add(1, Ordering::Relaxed);
                     self.withdraw_prefix
-                        .fetch_add(v.len() as u64, Ordering::Relaxed);
+                        .fetch_add(unreach.len() as u64, Ordering::Relaxed);
                 }
             }
             bgp::Message::Notification { .. } => {
@@ -2593,27 +2586,21 @@ impl Table {
                     TableEvent::PassUpdate(source, family, nets, attrs) => match attrs {
                         Some(attrs) => {
                             let mut t = TABLE[idx].lock().await;
-                            // FIXME: non ipv4
-                            if family == Family::IPV4 {
-                                for bmp_tx in t.bmp_event_tx.values() {
-                                    let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
-                                        header: bmp::PerPeerHeader::new(
-                                            source.remote_asn,
-                                            Ipv4Addr::from(source.router_id),
-                                            0,
-                                            source.peer_addr,
-                                            source.uptime as u32,
-                                        ),
-                                        update: packet::bgp::Message::Update {
-                                            reach: nets.to_owned(),
-                                            unreach: Vec::new(),
-                                            attr: attrs.clone(),
-                                            mp_reach: None,
-                                            mp_attr: Arc::new(Vec::new()),
-                                            mp_unreach: None,
-                                        },
-                                    });
-                                }
+                            for bmp_tx in t.bmp_event_tx.values() {
+                                let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
+                                    header: bmp::PerPeerHeader::new(
+                                        source.remote_asn,
+                                        Ipv4Addr::from(source.router_id),
+                                        0,
+                                        source.peer_addr,
+                                        source.uptime as u32,
+                                    ),
+                                    update: packet::bgp::Message::Update {
+                                        reach: Some((family, nets.to_owned())),
+                                        attr: attrs.clone(),
+                                        unreach: None,
+                                    },
+                                });
                             }
                             for net in nets {
                                 let mut filtered = false;
@@ -2646,27 +2633,21 @@ impl Table {
                         }
                         None => {
                             let mut t = TABLE[idx].lock().await;
-                            // FIXME: non ipv4
-                            if family == Family::IPV4 {
-                                for bmp_tx in t.bmp_event_tx.values() {
-                                    let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
-                                        header: bmp::PerPeerHeader::new(
-                                            source.remote_asn,
-                                            Ipv4Addr::from(source.router_id),
-                                            0,
-                                            source.peer_addr,
-                                            source.uptime as u32,
-                                        ),
-                                        update: packet::bgp::Message::Update {
-                                            reach: Vec::new(),
-                                            unreach: nets.to_owned(),
-                                            attr: Arc::new(Vec::new()),
-                                            mp_reach: None,
-                                            mp_attr: Arc::new(Vec::new()),
-                                            mp_unreach: None,
-                                        },
-                                    });
-                                }
+                            for bmp_tx in t.bmp_event_tx.values() {
+                                let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
+                                    header: bmp::PerPeerHeader::new(
+                                        source.remote_asn,
+                                        Ipv4Addr::from(source.router_id),
+                                        0,
+                                        source.peer_addr,
+                                        source.uptime as u32,
+                                    ),
+                                    update: packet::bgp::Message::Update {
+                                        reach: None,
+                                        attr: Arc::new(Vec::new()),
+                                        unreach: Some((family, nets.to_owned())),
+                                    },
+                                });
                             }
                             for net in nets {
                                 if let Some(ri) = t.rtable.remove(source.clone(), family, net) {
@@ -2849,69 +2830,28 @@ impl Handler {
 
     async fn rx_update(
         &mut self,
-        reach: Vec<packet::Net>,
-        unreach: Vec<packet::Net>,
+        reach: Option<(Family, Vec<packet::Net>)>,
+        unreach: Option<(Family, Vec<packet::Net>)>,
         attr: Arc<Vec<packet::Attribute>>,
-        mp_reach: Option<(Family, Vec<packet::Net>)>,
-        mp_attr: Arc<Vec<packet::Attribute>>,
-        mp_unreach: Option<(Family, Vec<packet::Net>)>,
     ) {
-        let mut add = FnvHashMap::default();
-        for net in reach {
-            add.entry(Family::IPV4)
-                .or_insert_with(FnvHashMap::default)
-                .entry(Table::dealer(&net))
-                .or_insert_with(Vec::new)
-                .push(net);
-        }
-        if let Some((family, mp_reach)) = mp_reach {
-            for net in mp_reach {
-                add.entry(family)
-                    .or_insert_with(FnvHashMap::default)
-                    .entry(Table::dealer(&net))
-                    .or_insert_with(Vec::new)
-                    .push(net);
-            }
-        }
-        let mut del = FnvHashMap::default();
-        for net in unreach {
-            del.entry(Family::IPV4)
-                .or_insert_with(FnvHashMap::default)
-                .entry(Table::dealer(&net))
-                .or_insert_with(Vec::new)
-                .push(net);
-        }
-        if let Some((family, mp_unreach)) = mp_unreach {
-            for net in mp_unreach {
-                del.entry(family)
-                    .or_insert_with(FnvHashMap::default)
-                    .entry(Table::dealer(&net))
-                    .or_insert_with(Vec::new)
-                    .push(net);
-            }
-        }
-        for (family, v) in add {
-            for (idx, nets) in v {
+        if let Some((family, reach)) = reach {
+            for net in reach {
+                let idx = Table::dealer(&net);
                 let _ = self.table_tx[idx].send(TableEvent::PassUpdate(
                     self.source.as_ref().unwrap().clone(),
                     family,
-                    nets,
-                    {
-                        if family == Family::IPV4 {
-                            Some(attr.clone())
-                        } else {
-                            Some(mp_attr.clone())
-                        }
-                    },
+                    vec![net],
+                    Some(attr.clone()),
                 ));
             }
         }
-        for (family, v) in del {
-            for (idx, nets) in v {
+        if let Some((family, unreach)) = unreach {
+            for net in unreach {
+                let idx = Table::dealer(&net);
                 let _ = self.table_tx[idx].send(TableEvent::PassUpdate(
                     self.source.as_ref().unwrap().clone(),
                     family,
-                    nets,
+                    vec![net],
                     None,
                 ));
             }
@@ -2969,9 +2909,6 @@ impl Handler {
                 reach,
                 attr,
                 unreach,
-                mp_reach,
-                mp_attr,
-                mp_unreach,
             } => {
                 let session_state = self.state.fsm.load(Ordering::Relaxed);
                 if session_state != SessionState::Established as u8 {
@@ -2982,8 +2919,7 @@ impl Handler {
                     });
                 }
                 self.holdtimer_renewed = Instant::now();
-                self.rx_update(reach, unreach, attr, mp_reach, mp_attr, mp_unreach)
-                    .await;
+                self.rx_update(reach, unreach, attr).await;
                 Ok(())
             }
             bgp::Message::Notification {
@@ -3272,12 +3208,9 @@ impl Handler {
                         if !unreach.is_empty() {
                             txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                             let msg = bgp::Message::Update{
-                                reach: Vec::new(),
+                                reach: None,
                                 attr: Arc::new(Vec::new()),
-                                unreach,
-                                mp_reach: None,
-                                mp_attr: Arc::new(Vec::new()),
-                                mp_unreach: None,
+                                unreach: Some((Family::IPV4, unreach)),
                             };
                             let _ = codec.encode(&msg, &mut txbuf);
                             self.counter_tx.sync(&msg);
@@ -3291,12 +3224,9 @@ impl Handler {
                         let mut sent = Vec::with_capacity(max_tx_count);
                         for (attr, reach) in pending.bucket.iter() {
                             let msg = bgp::Message::Update{
-                                reach: reach.iter().copied().collect(),
+                                reach: Some((Family::IPV4, reach.iter().copied().collect())),
                                 attr: attr.clone(),
-                                unreach: Vec::new(),
-                                mp_reach: None,
-                                mp_attr: Arc::new(Vec::new()),
-                                mp_unreach: None,
+                                unreach: None,
                             };
                             let _ = codec.encode(&msg, &mut txbuf);
                             self.counter_tx.sync(&msg);
