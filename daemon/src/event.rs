@@ -24,7 +24,7 @@ use std::convert::{From, TryFrom};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -760,10 +760,13 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::AddPeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let peer = Peer::try_from(&request.into_inner().peer.ok_or(Error::EmptyArgument)?)?;
-        GLOBAL
-            .write()
-            .await
-            .add_peer(peer, Some(self.active_conn_tx.clone()))?;
+        let mut global = GLOBAL.write().await;
+        if let Some(password) = peer.password.as_ref() {
+            for fd in &global.listen_sockets {
+                net::set_md5sig(*fd, &peer.remote_addr, password);
+            }
+        }
+        global.add_peer(peer, Some(self.active_conn_tx.clone()))?;
         Ok(tonic::Response::new(()))
     }
     async fn delete_peer(
@@ -2078,7 +2081,7 @@ struct Global {
     as_number: u32,
     router_id: Ipv4Addr,
     listen_port: u16,
-    //    listen_sockets: (Vec<RawFd>, Vec<RawFd>),
+    listen_sockets: Vec<RawFd>,
     peers: FnvHashMap<IpAddr, Peer>,
     peer_group: FnvHashMap<String, PeerGroup>,
 
@@ -2115,6 +2118,7 @@ impl Global {
             as_number: 0,
             router_id: Ipv4Addr::new(0, 0, 0, 0),
             listen_port: Global::BGP_PORT,
+            listen_sockets: Vec::new(),
 
             peers: FnvHashMap::default(),
             peer_group: FnvHashMap::default(),
@@ -2499,6 +2503,11 @@ impl Global {
         .into_iter()
         .filter_map(|x| x.ok())
         .collect();
+        GLOBAL
+            .write()
+            .await
+            .listen_sockets
+            .append(&mut listen_sockets.iter().map(|x| x.as_raw_fd()).collect());
 
         for (addr, peer) in &GLOBAL.read().await.peers {
             if let Some(password) = &peer.password {
