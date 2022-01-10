@@ -17,4 +17,5 @@ pub(crate) mod bgp;
 pub(crate) use self::bgp::{Attribute, Capability, Family, FamilyCapability, IpNet, Net};
 
 pub(crate) mod bmp;
+pub(crate) mod mrt;
 pub(crate) mod rpki;

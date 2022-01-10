@@ -29,10 +29,11 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -42,7 +43,7 @@ use crate::api;
 use crate::config;
 use crate::error::Error;
 use crate::net;
-use crate::packet::{self, bgp, bmp, rpki, Family, FamilyCapability};
+use crate::packet::{self, bgp, bmp, mrt, rpki, Family, FamilyCapability};
 use crate::proto::ToApi;
 use crate::table;
 
@@ -1741,6 +1742,68 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
     });
 }
 
+struct MrtDumper {
+    filename: String,
+    interval: u64,
+}
+
+impl MrtDumper {
+    fn new(filename: &str, interval: u64) -> Self {
+        MrtDumper {
+            filename: filename.to_string(),
+            interval,
+        }
+    }
+
+    fn pathname(&self) -> String {
+        if self.interval != 0 {
+            chrono::Utc::now().format(&self.filename).to_string()
+        } else {
+            self.filename.clone()
+        }
+    }
+
+    async fn serve(&mut self) {
+        let mut file = tokio::fs::File::create(std::path::Path::new(&self.pathname()))
+            .await
+            .unwrap();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        for i in 0..*NUM_TABLES {
+            let mut t = TABLE[i].lock().await;
+            t.mrt_event_tx = Some(tx.clone());
+        }
+
+        let mut codec = mrt::MrtCodec::new();
+        let mut rx = UnboundedReceiverStream::new(rx);
+        let interval = if self.interval == 0 {
+            60 * 24 * 60 * 365 * 100
+        } else {
+            self.interval
+        };
+        let start = Instant::now() + Duration::from_secs(interval);
+        let mut timer = tokio::time::interval_at(start, Duration::from_secs(interval));
+        loop {
+            tokio::select! {
+                msg = rx.next() => {
+                    if let Some(msg) = msg {
+                        let mut buf = bytes::BytesMut::with_capacity(8192);
+                        codec.encode(&msg, &mut buf).unwrap();
+                        let _ = file.write_all(&buf).await;
+                    }
+                }
+                _ = timer.tick().fuse() => {
+                    if self.interval != 0 {
+                        file = tokio::fs::File::create(std::path::Path::new(&self.pathname()))
+                        .await
+                        .unwrap();
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct BmpClient {
     configured_time: u64,
 }
@@ -2095,6 +2158,7 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
             peer_event_tx: FnvHashMap::default(),
             table_event_tx: Vec::new(),
             bmp_event_tx: FnvHashMap::default(),
+            mrt_event_tx: None,
             global_import_policy: None,
             global_export_policy: None,
         }));
@@ -2319,6 +2383,28 @@ impl Global {
             let global = &mut GLOBAL.write().await;
             global.as_number = as_number;
             global.router_id = router_id;
+        }
+        if let Some(mrt) = bgp.as_ref().and_then(|x| x.mrt_dump.as_ref()) {
+            for m in mrt {
+                if let Some(config) = m.config.as_ref() {
+                    if let Some(dump_type) = config.dump_type.as_ref() {
+                        if dump_type != &config::gen::MrtType::Updates {
+                            println!("only update dump is supported");
+                            continue;
+                        }
+                        if let Some(filename) = config.file_name.as_ref() {
+                            let interval = config.rotation_interval.as_ref().map_or(0, |x| *x);
+                            let filename = filename.clone();
+                            tokio::spawn(async move {
+                                let mut d = MrtDumper::new(&filename, interval);
+                                d.serve().await;
+                            });
+                        } else {
+                            println!("mrt dump filename needs to be specified");
+                        }
+                    }
+                }
+            }
         }
         if let Some(groups) = bgp.as_ref().and_then(|x| x.peer_groups.as_ref()) {
             let mut server = GLOBAL.write().await;
@@ -2597,6 +2683,7 @@ struct Table {
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
     table_event_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
     bmp_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<bmp::Message>>,
+    mrt_event_tx: Option<mpsc::UnboundedSender<mrt::Message>>,
 
     // global->ptable copies
     global_import_policy: Option<Arc<table::PolicyAssignment>>,
@@ -2627,13 +2714,32 @@ impl Table {
                                         source.peer_addr,
                                         source.uptime as u32,
                                     ),
-                                    update: packet::bgp::Message::Update {
+                                    update: bgp::Message::Update {
                                         reach: Some((family, nets.to_owned())),
                                         attr: attrs.clone(),
                                         unreach: None,
                                     },
                                 });
                             }
+                            if let Some(mrt_tx) = t.mrt_event_tx.as_ref() {
+                                let msg = mrt::Message::Mp {
+                                    header: mrt::MpHeader::new(
+                                        source.remote_asn,
+                                        source.local_as,
+                                        0,
+                                        source.peer_addr,
+                                        source.local_addr,
+                                        true,
+                                    ),
+                                    body: bgp::Message::Update {
+                                        reach: Some((family, nets.to_owned())),
+                                        attr: attrs.clone(),
+                                        unreach: None,
+                                    },
+                                };
+                                let _ = mrt_tx.send(msg);
+                            }
+
                             for net in nets {
                                 let mut filtered = false;
                                 if let Some(a) = t.global_import_policy.as_ref() {
@@ -2680,6 +2786,24 @@ impl Table {
                                         unreach: Some((family, nets.to_owned())),
                                     },
                                 });
+                            }
+                            if let Some(mrt_tx) = t.mrt_event_tx.as_ref() {
+                                let msg = mrt::Message::Mp {
+                                    header: mrt::MpHeader::new(
+                                        source.remote_asn,
+                                        source.local_as,
+                                        0,
+                                        source.peer_addr,
+                                        source.local_addr,
+                                        true,
+                                    ),
+                                    body: bgp::Message::Update {
+                                        reach: None,
+                                        attr: Arc::new(Vec::new()),
+                                        unreach: Some((family, nets.to_owned())),
+                                    },
+                                };
+                                let _ = mrt_tx.send(msg);
                             }
                             for net in nets {
                                 if let Some(ri) = t.rtable.remove(source.clone(), family, net) {

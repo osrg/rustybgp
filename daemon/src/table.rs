@@ -189,9 +189,9 @@ pub(crate) struct Source {
     pub(crate) peer_addr: IpAddr,
     pub(crate) router_id: u32,
     peer_type: PeerType,
-    local_addr: IpAddr,
+    pub(crate) local_addr: IpAddr,
     pub(crate) remote_asn: u32,
-    local_as: u32,
+    pub(crate) local_as: u32,
     rs_client: bool,
     pub(crate) uptime: u64,
 }

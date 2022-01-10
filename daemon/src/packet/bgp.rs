@@ -47,11 +47,11 @@ impl Family {
     pub(crate) const IPV6: Family =
         Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_UNICAST as u32);
 
-    fn afi(&self) -> u16 {
+    pub(crate) fn afi(&self) -> u16 {
         (self.0 >> 16) as u16
     }
 
-    fn safi(&self) -> u8 {
+    pub(crate) fn safi(&self) -> u8 {
         (self.0 & 0xff) as u8
     }
 }
