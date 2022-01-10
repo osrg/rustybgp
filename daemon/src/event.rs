@@ -382,7 +382,11 @@ impl PeerBuilder {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            remote_port: self.remote_port,
+            remote_port: if self.remote_port != 0 {
+                self.remote_port
+            } else {
+                Global::BGP_PORT
+            },
             local_port: 0,
             local_as: self.local_asn,
             passive: self.passive,
