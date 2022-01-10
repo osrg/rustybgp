@@ -767,13 +767,19 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::DeletePeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            if let Some(p) = GLOBAL.write().await.peers.remove(&peer_addr) {
+            let mut global = GLOBAL.write().await;
+            if let Some(p) = global.peers.remove(&peer_addr) {
                 if let Some(mgmt_tx) = &p.mgmt_tx {
                     let _ = mgmt_tx.send(PeerMgmtMsg::Notification(bgp::Message::Notification {
                         code: 6,
                         subcode: 3,
                         data: Vec::new(),
                     }));
+                }
+                if p.password.is_some() {
+                    for fd in &global.listen_sockets {
+                        net::set_md5sig(*fd, &peer_addr, "");
+                    }
                 }
                 return Ok(tonic::Response::new(()));
             } else {
