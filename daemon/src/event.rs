@@ -767,32 +767,21 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::DeletePeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            for (addr, p) in &GLOBAL.write().await.peers {
-                if addr == &peer_addr {
-                    match &p.mgmt_tx {
-                        Some(mgmt_tx) => {
-                            let _ = mgmt_tx.send(PeerMgmtMsg::Notification(
-                                bgp::Message::Notification {
-                                    code: 6,
-                                    subcode: 3,
-                                    data: Vec::new(),
-                                },
-                            ));
-                            return Ok(tonic::Response::new(()));
-                        }
-                        None => {
-                            return Err(tonic::Status::new(
-                                tonic::Code::NotFound,
-                                "peer isn't not active",
-                            ));
-                        }
-                    }
+            if let Some(p) = GLOBAL.write().await.peers.remove(&peer_addr) {
+                if let Some(mgmt_tx) = &p.mgmt_tx {
+                    let _ = mgmt_tx.send(PeerMgmtMsg::Notification(bgp::Message::Notification {
+                        code: 6,
+                        subcode: 3,
+                        data: Vec::new(),
+                    }));
                 }
+                return Ok(tonic::Response::new(()));
+            } else {
+                return Err(tonic::Status::new(
+                    tonic::Code::AlreadyExists,
+                    "peer address doesn't exists",
+                ));
             }
-            return Err(tonic::Status::new(
-                tonic::Code::AlreadyExists,
-                "peer address doesn't exists",
-            ));
         }
         Err(tonic::Status::new(
             tonic::Code::InvalidArgument,
