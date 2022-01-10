@@ -174,11 +174,14 @@ impl Message {
     }
 }
 
-pub(crate) struct BmpCodec {}
+pub(crate) struct BmpCodec {
+    codec: bgp::BgpCodec,
+}
 
 impl BmpCodec {
     pub(crate) fn new() -> Self {
-        BmpCodec {}
+        let codec = bgp::BgpCodec::new().keep_aspath(true).keep_nexthop(true);
+        BmpCodec { codec }
     }
 }
 
@@ -196,7 +199,7 @@ impl Encoder<&Message> for BmpCodec {
             Message::RouteMonitoring { header, update } => {
                 header.encode(c).unwrap();
                 let mut buf = bytes::BytesMut::with_capacity(4096);
-                bgp::BgpCodec::new().encode(update, &mut buf).unwrap();
+                self.codec.encode(update, &mut buf).unwrap();
                 c.put_slice(buf.as_ref());
             }
             Message::StatsReports { .. } => {}
@@ -217,9 +220,8 @@ impl Encoder<&Message> for BmpCodec {
                 c.put_u16(*local_port);
                 c.put_u16(*remote_port);
                 let mut buf = bytes::BytesMut::with_capacity(4096 * 2);
-                let mut codec = bgp::BgpCodec::new();
-                codec.encode(remote_open, &mut buf).unwrap();
-                codec.encode(local_open, &mut buf).unwrap();
+                self.codec.encode(remote_open, &mut buf).unwrap();
+                self.codec.encode(local_open, &mut buf).unwrap();
                 c.put_slice(buf.as_ref());
             }
             Message::Initiation(tlv) => {
