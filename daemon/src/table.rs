@@ -180,7 +180,7 @@ impl From<Change> for bgp::Message {
 }
 
 #[derive(PartialEq)]
-pub(crate) enum PeerType {
+enum PeerType {
     Ibgp,
     Ebgp,
 }
