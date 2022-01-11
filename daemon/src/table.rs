@@ -186,42 +186,47 @@ pub(crate) enum PeerType {
 }
 
 pub(crate) struct Source {
-    pub(crate) peer_addr: IpAddr,
-    pub(crate) router_id: u32,
-    peer_type: PeerType,
+    pub(crate) remote_addr: IpAddr,
     pub(crate) local_addr: IpAddr,
     pub(crate) remote_asn: u32,
-    pub(crate) local_as: u32,
-    rs_client: bool,
+    pub(crate) local_asn: u32,
+    pub(crate) router_id: u32,
     pub(crate) uptime: u64,
+    rs_client: bool,
 }
 
 impl Hash for Source {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.peer_addr.hash(state);
+        self.remote_addr.hash(state);
     }
 }
 
 impl Source {
     pub(crate) fn new(
-        peer_addr: IpAddr,
-        router_id: Ipv4Addr,
-        peer_type: PeerType,
+        remote_addr: IpAddr,
         local_addr: IpAddr,
-        local_as: u32,
         remote_asn: u32,
-        rs_client: bool,
+        local_asn: u32,
+        router_id: Ipv4Addr,
         uptime: u64,
+        rs_client: bool,
     ) -> Self {
         Source {
-            peer_addr,
-            router_id: router_id.into(),
-            peer_type,
+            remote_addr,
             local_addr,
-            local_as,
             remote_asn,
-            rs_client,
+            local_asn,
+            router_id: router_id.into(),
             uptime,
+            rs_client,
+        }
+    }
+
+    fn peer_type(&self) -> PeerType {
+        if self.remote_asn == self.local_asn {
+            PeerType::Ibgp
+        } else {
+            PeerType::Ebgp
         }
     }
 }
@@ -333,9 +338,9 @@ impl RoutingTable {
                     .enumerate()
                     .filter(|(i, p)| {
                         if table_type == api::TableType::AdjIn {
-                            return p.source.peer_addr == peer_addr.unwrap();
+                            return p.source.remote_addr == peer_addr.unwrap();
                         } else if table_type == api::TableType::AdjOut {
-                            return *i == 0 && p.source.peer_addr != peer_addr.unwrap();
+                            return *i == 0 && p.source.remote_addr != peer_addr.unwrap();
                         }
                         true
                     })
@@ -350,7 +355,7 @@ impl RoutingTable {
                                         let (_, m) = a.export(
                                             a.code(),
                                             None,
-                                            p.source.local_as,
+                                            p.source.local_asn,
                                             p.source.local_addr,
                                             false,
                                             p.source.rs_client,
@@ -370,25 +375,6 @@ impl RoutingTable {
                                 p.timestamp,
                                 self.rpki.validate(family, &p.source, net, &attr),
                             )
-                            // ApiPath {
-                            //     source: p.source.clone(),
-                            //     family,
-                            //     net: *net,
-                            //     attr: attr.clone(),
-                            //     timestamp: p.timestamp,
-                            //     validation: self.rpki.validate(family, &p.source, net, &attr),
-                            // }
-                            // Path {
-                            //     source: p.source.clone(),
-                            //     pa: PathAttribute { attr: attr.clone() },
-                            //     timestamp: p.timestamp,
-                            //     flags: 0,
-                            // }
-                            // .to_api(
-                            //     family,
-                            //     net,
-                            //     self.rpki.validate(family, &p.source, net, &attr),
-                            // )
                         } else {
                             (
                                 p.source.clone(),
@@ -396,19 +382,6 @@ impl RoutingTable {
                                 p.timestamp,
                                 self.rpki.validate(family, &p.source, net, &p.pa.attr),
                             )
-                            // ApiPath {
-                            //     source: p.source.clone(),
-                            //     family,
-                            //     net: *net,
-                            //     attr: p.pa.attr.clone(),
-                            //     timestamp: p.timestamp,
-                            //     validation: self.rpki.validate(family, &p.source, net, &p.pa.attr),
-                            // }
-                            // p.to_api(
-                            //     family,
-                            //     net,
-                            //     self.rpki.validate(family, &p.source, net, &p.pa.attr),
-                            // )
                         }
                     })
                     .collect(),
@@ -450,7 +423,7 @@ impl RoutingTable {
         }
         let (received, accepted) = self
             .route_stats
-            .entry(source.peer_addr)
+            .entry(source.remote_addr)
             .or_insert_with(FnvHashMap::default)
             .entry(family)
             .or_insert((0, 0));
@@ -486,7 +459,7 @@ impl RoutingTable {
             }
 
             // external prefer
-            if path.source.peer_type == PeerType::Ebgp && a.source.peer_type == PeerType::Ibgp {
+            if path.source.peer_type() == PeerType::Ebgp && a.source.peer_type() == PeerType::Ibgp {
                 break;
             }
 
@@ -536,7 +509,7 @@ impl RoutingTable {
             if Arc::ptr_eq(&dst.entry[i].source, &source) {
                 let (received, accepted) = self
                     .route_stats
-                    .get_mut(&source.peer_addr)
+                    .get_mut(&source.remote_addr)
                     .unwrap()
                     .get_mut(&family)
                     .unwrap();
@@ -575,7 +548,7 @@ impl RoutingTable {
 
     pub(crate) fn drop(&mut self, source: Arc<Source>) -> Vec<Change> {
         let mut advertise = Vec::new();
-        self.route_stats.remove(&source.peer_addr);
+        self.route_stats.remove(&source.remote_addr);
         for (family, rt) in self.global.iter_mut() {
             rt.retain(|net, dst| {
                 for i in 0..dst.entry.len() {
@@ -715,23 +688,21 @@ impl RoutingTable {
 fn drop() {
     let s1 = Arc::new(Source::new(
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-        Ipv4Addr::new(1, 1, 1, 1),
-        PeerType::Ebgp,
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
         1,
         2,
-        false,
+        Ipv4Addr::new(1, 1, 1, 1),
         0,
+        false,
     ));
     let s2 = Arc::new(Source::new(
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
-        Ipv4Addr::new(1, 1, 1, 2),
-        PeerType::Ebgp,
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
         1,
         2,
-        false,
+        Ipv4Addr::new(1, 1, 1, 2),
         0,
+        false,
     ));
 
     let n1 = packet::Net::V4(packet::bgp::Ipv4Net {
@@ -1121,7 +1092,7 @@ impl Condition {
             Condition::Neighbor(_name, opt, set) => {
                 let mut found = false;
                 for n in &set.sets {
-                    if n.contains(&source.peer_addr) {
+                    if n.contains(&source.remote_addr) {
                         found = true;
                         break;
                     }
@@ -1911,10 +1882,10 @@ impl RpkiTable {
                     if let Some(a) = attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
                         match a.as_path_origin() {
                             Some(asn) => asn,
-                            None => source.local_as,
+                            None => source.local_asn,
                         }
                     } else {
-                        source.local_as
+                        source.local_asn
                     };
                 let (mut addr, mask) = match net {
                     packet::Net::V4(net) => (net.addr.octets().to_vec(), net.mask),

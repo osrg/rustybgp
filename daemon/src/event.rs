@@ -646,16 +646,15 @@ impl GrpcService {
             policy_assignment_sem: tokio::sync::Semaphore::new(1),
             local_source: Arc::new(table::Source::new(
                 IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-                Ipv4Addr::new(0, 0, 0, 0),
-                table::PeerType::Ibgp,
                 IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
                 0,
                 0,
-                false,
+                Ipv4Addr::new(0, 0, 0, 0),
                 SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
+                false,
             )),
             active_conn_tx,
         }
@@ -1854,7 +1853,7 @@ impl BmpClient {
             t.bmp_event_tx.insert(sockaddr.ip(), tx.clone());
             for f in &[Family::IPV4, Family::IPV6] {
                 for c in t.rtable.iter_change(*f) {
-                    let e = adjin.entry(c.source.peer_addr).or_insert_with(Vec::new);
+                    let e = adjin.entry(c.source.remote_addr).or_insert_with(Vec::new);
                     e.push(c);
                 }
             }
@@ -1906,7 +1905,7 @@ impl BmpClient {
                             m.source.remote_asn,
                             Ipv4Addr::from(m.source.router_id),
                             0,
-                            m.source.peer_addr,
+                            m.source.remote_addr,
                             m.source.uptime as u32,
                         ));
                     }
@@ -1916,7 +1915,7 @@ impl BmpClient {
                                 m.source.remote_asn,
                                 Ipv4Addr::from(m.source.router_id),
                                 0,
-                                m.source.peer_addr,
+                                m.source.remote_addr,
                                 m.source.uptime as u32,
                             ),
                             update: m.into(),
@@ -2711,7 +2710,7 @@ impl Table {
                                         source.remote_asn,
                                         Ipv4Addr::from(source.router_id),
                                         0,
-                                        source.peer_addr,
+                                        source.remote_addr,
                                         source.uptime as u32,
                                     ),
                                     update: bgp::Message::Update {
@@ -2725,9 +2724,9 @@ impl Table {
                                 let msg = mrt::Message::Mp {
                                     header: mrt::MpHeader::new(
                                         source.remote_asn,
-                                        source.local_as,
+                                        source.local_asn,
                                         0,
-                                        source.peer_addr,
+                                        source.remote_addr,
                                         source.local_addr,
                                         true,
                                     ),
@@ -2777,7 +2776,7 @@ impl Table {
                                         source.remote_asn,
                                         Ipv4Addr::from(source.router_id),
                                         0,
-                                        source.peer_addr,
+                                        source.remote_addr,
                                         source.uptime as u32,
                                     ),
                                     update: packet::bgp::Message::Update {
@@ -2791,9 +2790,9 @@ impl Table {
                                 let msg = mrt::Message::Mp {
                                     header: mrt::MpHeader::new(
                                         source.remote_asn,
-                                        source.local_as,
+                                        source.local_asn,
                                         0,
-                                        source.peer_addr,
+                                        source.remote_addr,
                                         source.local_addr,
                                         true,
                                     ),
@@ -3102,23 +3101,17 @@ impl Handler {
                         .as_secs();
                     self.state.uptime.store(uptime, Ordering::Relaxed);
                     let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
-                    let t = if self.local_as == self.state.remote_asn.load(Ordering::Relaxed) {
-                        table::PeerType::Ibgp
-                    } else {
-                        table::PeerType::Ebgp
-                    };
                     self.state
                         .fsm
                         .store(SessionState::Established as u8, Ordering::Release);
                     self.source = Some(Arc::new(table::Source::new(
                         self.peer_addr,
-                        Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed)),
-                        t,
                         self.local_addr,
-                        self.local_as,
                         remote_asn,
-                        self.rs_client,
+                        self.local_as,
+                        Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed)),
                         uptime,
+                        self.rs_client,
                     )));
 
                     let d = Table::dealer(&self.peer_addr);
@@ -3454,7 +3447,7 @@ impl Handler {
                                 source.remote_asn,
                                 Ipv4Addr::from(source.router_id),
                                 0,
-                                source.peer_addr,
+                                source.remote_addr,
                                 source.uptime as u32,
                             ),
                             reason: reason.clone(),
@@ -3552,13 +3545,12 @@ impl PendingTx {
 fn bucket() {
     let src = Arc::new(table::Source::new(
         IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)),
-        Ipv4Addr::new(127, 0, 0, 1),
-        table::PeerType::Ebgp,
         IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
         1,
         2,
-        false,
+        Ipv4Addr::new(127, 0, 0, 1),
         0,
+        false,
     ));
     let family = Family::IPV4;
 
