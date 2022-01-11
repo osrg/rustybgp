@@ -1757,7 +1757,7 @@ impl MrtDumper {
 
     fn pathname(&self) -> String {
         if self.interval != 0 {
-            chrono::Utc::now().format(&self.filename).to_string()
+            chrono::Local::now().format(&self.filename).to_string()
         } else {
             self.filename.clone()
         }
