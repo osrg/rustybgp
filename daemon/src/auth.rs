@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 The RustyBGP Authors.
+// Copyright (C) 2022 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,35 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::os::unix::io::RawFd;
-
-pub(crate) fn create_listen_socket(
-    addr: String,
-    port: u16,
-) -> std::io::Result<std::net::TcpListener> {
-    let addr: std::net::SocketAddr = format!("{}:{}", addr, port).parse().unwrap();
-
-    let sock = socket2::Socket::new(
-        match addr {
-            SocketAddr::V4(_) => socket2::Domain::IPV4,
-            SocketAddr::V6(_) => socket2::Domain::IPV6,
-        },
-        socket2::Type::STREAM,
-        None,
-    )?;
-    if addr.is_ipv6() {
-        sock.set_only_v6(true)?;
-    }
-
-    sock.set_reuse_address(true)?;
-    sock.set_reuse_port(true)?;
-    sock.set_nonblocking(true)?;
-    sock.bind(&addr.into())?;
-    sock.listen(4096)?;
-
-    Ok(sock.into())
-}
 
 #[repr(C)]
 struct TcpMd5sig {
@@ -81,6 +54,7 @@ impl TcpMd5sig {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn set_md5sig(rawfd: RawFd, addr: &IpAddr, key: &str) {
     let s = TcpMd5sig::new(addr, key.to_string());
     unsafe {
@@ -95,3 +69,8 @@ pub(crate) fn set_md5sig(rawfd: RawFd, addr: &IpAddr, key: &str) {
         );
     }
 }
+
+// use file per target os when you add *bsd support
+// for now, let's keep things simple
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn set_md5sig(_rawfd: RawFd, _addr: &IpAddr, _key: &str) {}

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021 The RustyBGP Authors.
+// Copyright (C) 2019-2022 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,9 +40,9 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 use api::gobgp_api_server::{GobgpApi, GobgpApiServer};
 
 use crate::api;
+use crate::auth;
 use crate::config;
 use crate::error::Error;
-use crate::net;
 use crate::packet::{self, bgp, bmp, mrt, rpki, Family, FamilyCapability};
 use crate::proto::ToApi;
 use crate::table;
@@ -756,7 +756,7 @@ impl GobgpApi for GrpcService {
         let mut global = GLOBAL.write().await;
         if let Some(password) = peer.password.as_ref() {
             for fd in &global.listen_sockets {
-                net::set_md5sig(*fd, &peer.remote_addr, password);
+                auth::set_md5sig(*fd, &peer.remote_addr, password);
             }
         }
         global.add_peer(peer, Some(self.active_conn_tx.clone()))?;
@@ -778,7 +778,7 @@ impl GobgpApi for GrpcService {
                 }
                 if p.password.is_some() {
                     for fd in &global.listen_sockets {
-                        net::set_md5sig(*fd, &peer_addr, "");
+                        auth::set_md5sig(*fd, &peer_addr, "");
                     }
                 }
                 return Ok(tonic::Response::new(()));
@@ -1715,7 +1715,7 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>) {
                 IpAddr::V6(_) => tokio::net::TcpSocket::new_v6().unwrap(),
             };
             if let Some(key) = password.as_ref() {
-                net::set_md5sig(socket.as_raw_fd(), &peer_addr, key);
+                auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key);
             }
             if let Ok(Ok(stream)) = tokio::time::timeout(
                 tokio::time::Duration::from_secs(5),
@@ -2145,6 +2145,30 @@ impl RpkiClient {
             }
         });
     }
+}
+
+fn create_listen_socket(addr: String, port: u16) -> std::io::Result<std::net::TcpListener> {
+    let addr: std::net::SocketAddr = format!("{}:{}", addr, port).parse().unwrap();
+
+    let sock = socket2::Socket::new(
+        match addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        },
+        socket2::Type::STREAM,
+        None,
+    )?;
+    if addr.is_ipv6() {
+        sock.set_only_v6(true)?;
+    }
+
+    sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(4096)?;
+
+    Ok(sock.into())
 }
 
 static NUM_TABLES: Lazy<usize> = Lazy::new(|| num_cpus::get() / 2);
@@ -2607,8 +2631,8 @@ impl Global {
         notify.notified().await;
         let listen_port = GLOBAL.read().await.listen_port;
         let listen_sockets: Vec<std::net::TcpListener> = vec![
-            net::create_listen_socket("0.0.0.0".to_string(), listen_port),
-            net::create_listen_socket("[::]".to_string(), listen_port),
+            create_listen_socket("0.0.0.0".to_string(), listen_port),
+            create_listen_socket("[::]".to_string(), listen_port),
         ]
         .into_iter()
         .filter_map(|x| x.ok())
@@ -2622,7 +2646,7 @@ impl Global {
         for (addr, peer) in &GLOBAL.read().await.peers {
             if let Some(password) = &peer.password {
                 for l in &listen_sockets {
-                    net::set_md5sig(l.as_raw_fd(), addr, password);
+                    auth::set_md5sig(l.as_raw_fd(), addr, password);
                 }
             }
         }

@@ -18,10 +18,10 @@ mod api {
     #![allow(clippy::all)]
     tonic::include_proto!("gobgpapi");
 }
+mod auth;
 mod config;
 mod error;
 mod event;
-mod net;
 mod packet;
 mod proto;
 mod table;
