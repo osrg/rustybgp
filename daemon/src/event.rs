@@ -27,7 +27,9 @@ use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
@@ -1519,33 +1521,26 @@ impl GobgpApi for GrpcService {
         _request: tonic::Request<api::ListRpkiRequest>,
     ) -> Result<tonic::Response<Self::ListRpkiStream>, tonic::Status> {
         let mut v = FnvHashMap::default();
-        let mut mgmt = FnvHashMap::default();
+
         for (sockaddr, client) in &GLOBAL.read().await.rpki_clients {
-            if let Some(tx) = &client.mgmt_tx {
-                mgmt.insert(sockaddr.ip(), tx.clone());
-            }
-            let mut r = api::Rpki {
+            let r = api::Rpki {
                 conf: Some(api::RpkiConf {
                     address: sockaddr.ip().to_string(),
                     remote_port: sockaddr.port() as u32,
                 }),
-                state: Some(Default::default()),
+                state: Some((&*client.state).into()),
             };
-            if let Some(downtime) = client.downtime {
-                let mut s = r.state.take().unwrap();
-                s.downtime = Some(downtime.to_api());
-                r.state = Some(s);
-            }
             v.insert(sockaddr.ip(), r);
         }
 
-        for (addr, mgmt_tx) in mgmt {
-            let (tx, mut rx) = mpsc::channel(1);
-            let _ = mgmt_tx.send(RpkiMgmtMsg::State(tx));
-            if let Some(state) = rx.recv().await {
-                if let Some(r) = v.get_mut(&addr) {
-                    r.state = Some(state);
-                }
+        {
+            let t = TABLE[0].lock().await;
+            for (addr, r) in v.iter_mut() {
+                let s = t.rtable.rpki_state(addr);
+                r.state.as_mut().unwrap().record_ipv4 = s.num_records_v4;
+                r.state.as_mut().unwrap().record_ipv6 = s.num_records_v6;
+                r.state.as_mut().unwrap().prefix_ipv4 = s.num_prefixes_v4;
+                r.state.as_mut().unwrap().prefix_ipv6 = s.num_prefixes_v6;
             }
         }
 
@@ -1990,14 +1985,98 @@ impl BmpClient {
     }
 }
 
+#[derive(Default)]
+struct RpkiState {
+    uptime: AtomicU64,
+    downtime: AtomicU64,
+    up: AtomicBool,
+    serial: AtomicU32,
+    received_ipv4: AtomicI64,
+    received_ipv6: AtomicI64,
+    serial_notify: AtomicI64,
+    cache_reset: AtomicI64,
+    cache_response: AtomicI64,
+    end_of_data: AtomicI64,
+    error: AtomicI64,
+    serial_query: AtomicI64,
+    reset_query: AtomicI64,
+}
+
+impl RpkiState {
+    fn update(&self, msg: &rpki::Message) {
+        match msg {
+            rpki::Message::SerialNotify { .. } => {
+                self.serial_notify.fetch_add(1, Ordering::Relaxed);
+            }
+            rpki::Message::SerialQuery { .. } => {
+                let _ = self.serial_query.fetch_add(1, Ordering::Relaxed);
+            }
+            rpki::Message::ResetQuery { .. } => {
+                let _ = self.reset_query.fetch_add(1, Ordering::Relaxed);
+            }
+            rpki::Message::CacheResponse => {
+                let _ = self.cache_response.fetch_add(1, Ordering::Relaxed);
+            }
+            rpki::Message::IpPrefix(prefix) => match prefix.net {
+                packet::IpNet::V4(_) => {
+                    let _ = self.received_ipv4.fetch_add(1, Ordering::Relaxed);
+                }
+                packet::IpNet::V6(_) => {
+                    let _ = self.received_ipv6.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            rpki::Message::EndOfData { .. } => {
+                let _ = self.end_of_data.fetch_add(1, Ordering::Relaxed);
+            }
+            rpki::Message::CacheReset => {
+                let _ = self.cache_reset.fetch_add(1, Ordering::Relaxed);
+            }
+            rpki::Message::ErrorReport => {
+                let _ = self.error.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl From<&RpkiState> for api::RpkiState {
+    fn from(s: &RpkiState) -> Self {
+        let uptime = s.uptime.load(Ordering::Relaxed);
+        let downtime = s.downtime.load(Ordering::Relaxed);
+        api::RpkiState {
+            uptime: Some(prost_types::Timestamp {
+                seconds: uptime as i64,
+                nanos: 0,
+            }),
+            downtime: Some(prost_types::Timestamp {
+                seconds: downtime as i64,
+                nanos: 0,
+            }),
+            up: s.up.load(Ordering::Relaxed),
+            record_ipv4: 0,
+            record_ipv6: 0,
+            prefix_ipv4: 0,
+            prefix_ipv6: 0,
+            serial: s.serial.load(Ordering::Relaxed),
+            received_ipv4: s.received_ipv4.load(Ordering::Relaxed),
+            received_ipv6: s.received_ipv6.load(Ordering::Relaxed),
+            serial_notify: s.serial_notify.load(Ordering::Relaxed),
+            cache_reset: s.cache_reset.load(Ordering::Relaxed),
+            cache_response: s.cache_response.load(Ordering::Relaxed),
+            end_of_data: s.end_of_data.load(Ordering::Relaxed),
+            error: s.error.load(Ordering::Relaxed),
+            serial_query: s.serial_query.load(Ordering::Relaxed),
+            reset_query: s.reset_query.load(Ordering::Relaxed),
+        }
+    }
+}
+
 enum RpkiMgmtMsg {
-    State(mpsc::Sender<api::RpkiState>),
     Deconfigured,
 }
 
 struct RpkiClient {
     configured_time: u64,
-    downtime: Option<SystemTime>,
+    state: Arc<RpkiState>,
     mgmt_tx: Option<mpsc::UnboundedSender<RpkiMgmtMsg>>,
 }
 
@@ -2008,7 +2087,7 @@ impl RpkiClient {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            downtime: None,
+            state: Arc::new(RpkiState::default()),
             mgmt_tx: None,
         }
     }
@@ -2017,49 +2096,28 @@ impl RpkiClient {
         stream: TcpStream,
         rx: mpsc::UnboundedReceiver<RpkiMgmtMsg>,
         txv: Vec<mpsc::UnboundedSender<TableEvent>>,
+        state: Arc<RpkiState>,
     ) -> Result<(), Error> {
         let remote_addr = stream.peer_addr()?.ip();
         let remote_addr = Arc::new(remote_addr);
         let mut lines = Framed::new(stream, rpki::RtrCodec::new());
         let _ = lines.send(&rpki::Message::ResetQuery).await;
-        let mut rx_counter: FnvHashMap<u8, i64> = FnvHashMap::default();
-        let uptime = SystemTime::now();
+        state.uptime.store(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+        state.up.store(true, Ordering::Relaxed);
         let mut rx = UnboundedReceiverStream::new(rx);
         let mut v = Vec::new();
-        let mut serial = 0;
         let mut end_of_data = false;
         loop {
             tokio::select! {
                 msg = rx.next() => {
-                    match msg {
-                        Some(RpkiMgmtMsg::State(tx)) => {
-                            let s = TABLE[0].lock().await.rtable.rpki_state(remote_addr.clone());
-                            let _ = tx.send(
-                                api::RpkiState {
-                                    uptime: Some(uptime.to_api()),
-                                    downtime: None,
-                                    up: true,
-                                    record_ipv4: s.num_records_v4,
-                                    record_ipv6: s.num_records_v6,
-                                    prefix_ipv4: s.num_prefixes_v4,
-                                    prefix_ipv6: s.num_prefixes_v6,
-                                    serial,
-                                    serial_notify: *rx_counter.get(&rpki::Message::SERIAL_NOTIFY).unwrap_or(&0),
-                                    serial_query: *rx_counter.get(&rpki::Message::SERIAL_NOTIFY).unwrap_or(&0),
-                                    reset_query: *rx_counter.get(&rpki::Message::RESET_QUERY).unwrap_or(&0),
-                                    cache_response: *rx_counter.get(&rpki::Message::CACHE_RESPONSE).unwrap_or(&0),
-                                    received_ipv4: *rx_counter.get(&rpki::Message::IPV4_PREFIX).unwrap_or(&0),
-                                    received_ipv6: *rx_counter.get(&rpki::Message::IPV6_PREFIX).unwrap_or(&0),
-                                    end_of_data: *rx_counter.get(&rpki::Message::END_OF_DATA).unwrap_or(&0),
-                                    cache_reset: *rx_counter.get(&rpki::Message::CACHE_RESET).unwrap_or(&0),
-                                    error: *rx_counter.get(&rpki::Message::ERROR_REPORT).unwrap_or(&0),
-                                }
-                            ).await;
-                        }
-                        Some(RpkiMgmtMsg::Deconfigured) => {
+                    if let Some(RpkiMgmtMsg::Deconfigured) = msg {
                             break;
-                        }
-                        None => {}
                     }
                 }
                 msg = lines.next() => {
@@ -2070,7 +2128,7 @@ impl RpkiClient {
                         },
                         None => break,
                     };
-                    *rx_counter.entry(msg.code()).or_insert(0) += 1;
+                    state.update(&msg);
                     match msg {
                         rpki::Message::IpPrefix(prefix) => {
                             if prefix.flags & 1 > 0 {
@@ -2089,7 +2147,7 @@ impl RpkiClient {
                         }
                         rpki::Message::EndOfData { serial_number } => {
                             end_of_data = true;
-                            serial = serial_number;
+                            state.serial.store(serial_number, Ordering::Relaxed);
                             for tx in &txv {
                                 let _ = tx.send(TableEvent::Drop(remote_addr.clone()));
                                 let _ = tx.send(TableEvent::InsertRoa(v.to_owned()));
@@ -2100,6 +2158,13 @@ impl RpkiClient {
                 }
             }
         }
+        state.downtime.store(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
         for tx in &txv {
             let _ = tx.send(TableEvent::Drop(remote_addr.clone()));
         }
@@ -2122,12 +2187,15 @@ impl RpkiClient {
                 .await
                 {
                     let (tx, rx) = mpsc::unbounded_channel();
-                    if let Some(mut client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
+                    let state = if let Some(mut client) =
+                        GLOBAL.write().await.rpki_clients.get_mut(&sockaddr)
+                    {
                         client.mgmt_tx = Some(tx);
+                        client.state.clone()
                     } else {
                         break;
-                    }
-                    let _ = RpkiClient::serve(stream, rx, table_tx.to_vec()).await;
+                    };
+                    let _ = RpkiClient::serve(stream, rx, table_tx.to_vec(), state).await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 }
@@ -2136,7 +2204,6 @@ impl RpkiClient {
                         break;
                     }
                     if client.mgmt_tx.is_some() {
-                        client.downtime = Some(SystemTime::now());
                         client.mgmt_tx = None;
                     }
                 } else {

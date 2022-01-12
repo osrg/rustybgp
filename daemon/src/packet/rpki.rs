@@ -52,22 +52,6 @@ impl Message {
     pub(crate) const CACHE_RESET: u8 = 8;
     pub(crate) const ERROR_REPORT: u8 = 10;
 
-    pub(crate) fn code(&self) -> u8 {
-        match self {
-            Message::SerialNotify { .. } => Message::SERIAL_NOTIFY,
-            Message::SerialQuery { .. } => Message::SERIAL_QUERY,
-            Message::ResetQuery { .. } => Message::RESET_QUERY,
-            Message::CacheResponse => Message::CACHE_RESPONSE,
-            Message::IpPrefix(prefix) => match prefix.net {
-                IpNet::V4(_) => Message::IPV4_PREFIX,
-                IpNet::V6(_) => Message::IPV6_PREFIX,
-            },
-            Message::EndOfData { .. } => Message::END_OF_DATA,
-            Message::CacheReset => Message::CACHE_RESET,
-            Message::ErrorReport => Message::ERROR_REPORT,
-        }
-    }
-
     fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let buf: Vec<u8> = Vec::new();
         let mut c = Cursor::new(buf);

@@ -594,14 +594,14 @@ impl RoutingTable {
             .flatten()
     }
 
-    pub(crate) fn rpki_state(&self, source: Arc<IpAddr>) -> RpkiTableState {
+    pub(crate) fn rpki_state(&self, addr: &IpAddr) -> RpkiTableState {
         let mut state = RpkiTableState::default();
         for (family, roas) in self.rpki.roas.iter() {
             let mut records = 0;
             let mut prefixes = 0;
             for (_, e) in roas.iter() {
                 for r in e {
-                    if Arc::ptr_eq(&r.source, &source) {
+                    if &*r.source == addr {
                         prefixes += 1;
                     }
                 }
