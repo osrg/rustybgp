@@ -1616,9 +1616,22 @@ impl GobgpApi for GrpcService {
     }
     async fn enable_mrt(
         &self,
-        _request: tonic::Request<api::EnableMrtRequest>,
+        request: tonic::Request<api::EnableMrtRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let request = request.into_inner();
+        if request.dump_type != config::gen::MrtType::Updates as i32 {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "only update dump is supported",
+            ));
+        }
+        let interval = request.rotation_interval;
+        let filename = request.filename.clone();
+        tokio::spawn(async move {
+            let mut d = MrtDumper::new(&filename, interval);
+            d.serve().await;
+        });
+        Ok(tonic::Response::new(()))
     }
     async fn disable_mrt(
         &self,
