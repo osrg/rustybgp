@@ -167,9 +167,9 @@ struct Peer {
 
     remote_addr: IpAddr,
     local_addr: IpAddr,
-    local_port: u16,
+    local_asn: u32,
     remote_port: u16,
-    local_as: u32,
+    local_port: u16,
     passive: bool,
     admin_down: bool,
     delete_on_disconnected: bool,
@@ -382,7 +382,7 @@ impl PeerBuilder {
                 Global::BGP_PORT
             },
             local_port: 0,
-            local_as: self.local_asn,
+            local_asn: self.local_asn,
             passive: self.passive,
             delete_on_disconnected: self.delete_on_disconnected,
             admin_down: self.admin_down,
@@ -662,7 +662,7 @@ impl GrpcService {
 
     async fn is_available(&self, need_active: bool) -> Result<(), Error> {
         let global = &GLOBAL.read().await;
-        if need_active && global.as_number == 0 {
+        if need_active && global.asn == 0 {
             return Err(Error::NotStarted);
         }
         Ok(())
@@ -715,13 +715,13 @@ impl GobgpApi for GrpcService {
         }
 
         let global = &mut GLOBAL.write().await;
-        if global.as_number != 0 {
+        if global.asn != 0 {
             return Err(tonic::Status::new(
                 tonic::Code::InvalidArgument,
                 "already started",
             ));
         }
-        global.as_number = g.r#as;
+        global.asn = g.r#as;
         global.listen_port = if g.listen_port > 0 {
             g.listen_port as u16
         } else {
@@ -1885,7 +1885,7 @@ impl BmpClient {
                     },
                     local_open: bgp::Message::Open {
                         version: 4,
-                        as_number: peer.local_as,
+                        as_number: peer.local_asn,
                         holdtime: peer.holdtime as u16,
                         router_id: local_id,
                         capability: peer.local_cap.to_owned(),
@@ -2190,7 +2190,7 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
 });
 
 struct Global {
-    as_number: u32,
+    asn: u32,
     router_id: Ipv4Addr,
     listen_port: u16,
     listen_sockets: Vec<RawFd>,
@@ -2206,7 +2206,7 @@ struct Global {
 impl From<&Global> for api::Global {
     fn from(g: &Global) -> Self {
         api::Global {
-            r#as: g.as_number,
+            r#as: g.asn,
             router_id: g.router_id.to_string(),
             listen_port: g.listen_port as i32,
             listen_addresses: Vec::new(),
@@ -2227,7 +2227,7 @@ impl Global {
 
     fn new() -> Global {
         Global {
-            as_number: 0,
+            asn: 0,
             router_id: Ipv4Addr::new(0, 0, 0, 0),
             listen_port: Global::BGP_PORT,
             listen_sockets: Vec::new(),
@@ -2252,14 +2252,14 @@ impl Global {
                 "peer address already exists".to_string(),
             ));
         }
-        if peer.local_as == 0 {
-            peer.local_as = self.as_number;
+        if peer.local_asn == 0 {
+            peer.local_asn = self.asn;
         }
         let mut caps = HashSet::new();
         for c in &peer.local_cap {
             caps.insert(Into::<u8>::into(c));
         }
-        let c = packet::Capability::FourOctetAsNumber(peer.local_as);
+        let c = packet::Capability::FourOctetAsNumber(peer.local_asn);
         if !caps.contains(&Into::<u8>::into(&c)) {
             peer.local_cap.push(c);
         }
@@ -2357,7 +2357,7 @@ impl Global {
             }
         };
         if let Some(ttl) = peer.multihop_ttl {
-            if peer.state.remote_asn.load(Ordering::Relaxed) != peer.local_as {
+            if peer.state.remote_asn.load(Ordering::Relaxed) != peer.local_asn {
                 let _ = stream.set_ttl(ttl.into());
             }
         } else {
@@ -2366,7 +2366,7 @@ impl Global {
         Handler::new(
             stream,
             remote_addr,
-            peer.local_as,
+            peer.local_asn,
             router_id,
             peer.local_cap.to_owned(),
             peer.holdtime,
@@ -2404,7 +2404,7 @@ impl Global {
         if as_number != 0 {
             notify.clone().notify_one();
             let global = &mut GLOBAL.write().await;
-            global.as_number = as_number;
+            global.asn = as_number;
             global.router_id = router_id;
         }
         if let Some(mrt) = bgp.as_ref().and_then(|x| x.mrt_dump.as_ref()) {
@@ -2911,7 +2911,7 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
                             let active_conn_tx = active_conn_tx.clone();
 
                             tokio::spawn(async move {
-                                let peer_addr = h.peer_addr;
+                                let peer_addr = h.remote_addr;
                                 let _ = h.run(mgmt_rx).await;
                                 let mut server = GLOBAL.write().await;
                                 if let Some(peer) = server.peers.get_mut(&peer_addr) {
@@ -2938,10 +2938,10 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
 }
 
 struct Handler {
-    peer_addr: IpAddr,
+    remote_addr: IpAddr,
     local_addr: IpAddr,
 
-    local_as: u32,
+    local_asn: u32,
 
     local_router_id: Ipv4Addr,
 
@@ -2970,8 +2970,8 @@ struct Handler {
 impl Handler {
     fn new(
         stream: TcpStream,
-        peer_addr: IpAddr,
-        local_as: u32,
+        remote_addr: IpAddr,
+        local_asn: u32,
         local_router_id: Ipv4Addr,
         local_cap: Vec<packet::Capability>,
         local_holdtime: u64,
@@ -2982,10 +2982,10 @@ impl Handler {
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         Some(Handler {
-            peer_addr,
+            remote_addr,
             local_addr: local_sockaddr.ip(),
             local_router_id,
-            local_as,
+            local_asn,
             state,
             counter_tx,
             counter_rx,
@@ -3106,7 +3106,7 @@ impl Handler {
                 subcode,
                 data,
             } => {
-                println!("{}: notification {} {}", self.peer_addr, code, subcode);
+                println!("{}: notification {} {}", self.remote_addr, code, subcode);
                 self.shutdown = Some(bmp::PeerDownReason::RemoteNotification(
                     bgp::Message::Notification {
                         code,
@@ -3129,16 +3129,16 @@ impl Handler {
                         .fsm
                         .store(SessionState::Established as u8, Ordering::Release);
                     self.source = Some(Arc::new(table::Source::new(
-                        self.peer_addr,
+                        self.remote_addr,
                         self.local_addr,
                         remote_asn,
-                        self.local_as,
+                        self.local_asn,
                         Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed)),
                         uptime,
                         self.rs_client,
                     )));
 
-                    let d = Table::dealer(&self.peer_addr);
+                    let d = Table::dealer(&self.remote_addr);
                     for i in 0..*NUM_TABLES {
                         let mut t = TABLE[i].lock().await;
                         for f in self.family_cap.keys() {
@@ -3158,7 +3158,7 @@ impl Handler {
                             }
                         }
                         t.peer_event_tx
-                            .insert(self.peer_addr, self.peer_event_tx.remove(0));
+                            .insert(self.remote_addr, self.peer_event_tx.remove(0));
 
                         let tx = t.table_event_tx[d].clone();
                         self.table_tx.push(tx);
@@ -3231,7 +3231,7 @@ impl Handler {
         }
 
         let mut codec = packet::bgp::BgpCodec::new()
-            .local_as(self.local_as)
+            .local_as(self.local_asn)
             .local_addr(self.local_addr);
         if self.rs_client {
             codec = codec.keep_aspath(true).keep_nexthop(true);
@@ -3247,7 +3247,7 @@ impl Handler {
         let mut pending = PendingTx {
             urgent: vec![bgp::Message::Open {
                 version: 4,
-                as_number: self.local_as,
+                as_number: self.local_asn,
                 holdtime: self.local_holdtime as u16,
                 router_id: self.local_router_id,
                 capability: self.local_cap.to_owned(),
@@ -3288,7 +3288,7 @@ impl Handler {
                 _ = holdtime_futures.next() => {
                     let elapsed = self.holdtimer_renewed.elapsed().as_secs();
                     if elapsed > self.negotiated_holdtime + 20 {
-                        println!("{}: holdtime expired {}", self.peer_addr, self.holdtimer_renewed.elapsed().as_secs());
+                        println!("{}: holdtime expired {}", self.remote_addr, self.holdtimer_renewed.elapsed().as_secs());
                         break;
                     }
                     holdtime_futures.push(tokio::time::sleep(Duration::from_secs(self.negotiated_holdtime - elapsed + 10)));
@@ -3458,7 +3458,7 @@ impl Handler {
         if let Some(source) = self.source.take() {
             for i in 0..*NUM_TABLES {
                 let mut t = TABLE[i].lock().await;
-                t.peer_event_tx.remove(&self.peer_addr);
+                t.peer_event_tx.remove(&self.remote_addr);
                 let _ = self.table_tx[i].send(TableEvent::Disconnected(source.clone()));
                 let reason = self
                     .shutdown
