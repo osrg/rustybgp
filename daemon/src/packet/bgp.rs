@@ -369,6 +369,7 @@ pub(crate) enum Capability {
     AddPath(Vec<(Family, u8)>),
     EnhanshedRouteRefresh,
     LongLivedGracefulRestart(Vec<(Family, u8, u32)>),
+    Fqdn(String, String),
     Unknown { code: u8, bin: Vec<u8> },
 }
 
@@ -382,6 +383,7 @@ impl Capability {
     const ADD_PATH: u8 = 69;
     const ENHANCED_ROUTE_REFRESH: u8 = 70;
     const LONG_LIVED_GRACEFUL_RESTART: u8 = 71;
+    const FQDN: u8 = 73;
 
     const TRANS_ASN: u16 = 23456;
 }
@@ -397,6 +399,7 @@ impl From<&Capability> for u8 {
             Capability::AddPath(_) => Capability::ADD_PATH,
             Capability::EnhanshedRouteRefresh => Capability::ENHANCED_ROUTE_REFRESH,
             Capability::LongLivedGracefulRestart(_) => Capability::LONG_LIVED_GRACEFUL_RESTART,
+            Capability::Fqdn(..) => Capability::FQDN,
             Capability::Unknown { code, bin: _ } => *code,
         }
     }
@@ -479,6 +482,15 @@ impl From<&Capability> for prost_types::Any {
                 },
                 name,
             ),
+            Capability::Fqdn(host, domain) => proto::to_any(
+                api::FqdnCapability {
+                    host_name: host.to_string(),
+                    host_name_len: host.len() as u32,
+                    domain_name: domain.to_string(),
+                    domain_name_len: domain.len() as u32,
+                },
+                name,
+            ),
             Capability::Unknown { code, bin } => proto::to_any(
                 api::UnknownCapability {
                     code: (*code as u32),
@@ -544,6 +556,21 @@ impl Capability {
                     c.put_u8(*flags);
                     c.put_u32(*time);
                 }
+            }
+            Capability::Fqdn(host, domain) => {
+                c.put_u8((2 + host.len() + domain.len()) as u8);
+                c.put_u8(host.len() as u8);
+                c.put_slice(
+                    ascii::AsciiStr::from_ascii(&host.to_ascii_lowercase())
+                        .unwrap()
+                        .as_bytes(),
+                );
+                c.put_u8(domain.len() as u8);
+                c.put_slice(
+                    ascii::AsciiStr::from_ascii(&domain.to_ascii_lowercase())
+                        .unwrap()
+                        .as_bytes(),
+                );
             }
             Capability::Unknown { code: _, bin } => {
                 c.put_u8(bin.len() as u8);
@@ -685,6 +712,29 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
                     v.push((Family(afi << 16 | safi), flags, time));
                 }
                 Ok(Capability::LongLivedGracefulRestart(v))
+            }),
+        },
+        CapDesc {
+            code: Capability::FQDN,
+            url: "FQDNCapability",
+            decode: (|_s, c, len| {
+                if len < 1 {
+                    return Err(());
+                }
+                let hostlen = c.read_u8().unwrap();
+                let mut h = Vec::new();
+                for _ in 0..hostlen {
+                    h.push(c.read_u8().unwrap());
+                }
+                let host = ascii::AsciiString::from_ascii(h).unwrap().to_string();
+
+                let domainlen = c.read_u8().unwrap();
+                let mut d = Vec::new();
+                for _ in 0..domainlen {
+                    d.push(c.read_u8().unwrap());
+                }
+                let domain = ascii::AsciiString::from_ascii(d).unwrap().to_string();
+                Ok(Capability::Fqdn(host, domain))
             }),
         },
     ]
