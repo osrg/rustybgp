@@ -539,10 +539,10 @@ impl Capability {
             }
             Capability::AddPath(v) => {
                 c.put_u8(v.len() as u8 * 4);
-                for (family, flag) in v {
+                for (family, mode) in v {
                     c.put_u16(family.afi());
                     c.put_u8(family.safi());
-                    c.put_u8(*flag);
+                    c.put_u8(*mode);
                 }
             }
             Capability::EnhanshedRouteRefresh => {

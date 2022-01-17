@@ -370,6 +370,13 @@ impl PeerBuilder {
         self
     }
 
+    fn addpath(&mut self, families: Vec<packet::Family>) -> &mut Self {
+        self.local_cap.push(packet::Capability::AddPath(
+            families.iter().map(|family| (*family, 1)).collect(),
+        ));
+        self
+    }
+
     fn build(&mut self) -> Peer {
         Peer {
             remote_addr: self.remote_addr,
@@ -561,6 +568,35 @@ impl TryFrom<&api::Peer> for Peer {
 impl From<&config::Neighbor> for Peer {
     fn from(n: &config::Neighbor) -> Peer {
         let c = n.config.as_ref().unwrap();
+        let addpath_families: Vec<packet::Family> = n
+            .afi_safis
+            .as_ref()
+            .map_or(Vec::new().iter(), |x| x.iter())
+            .filter(|x| {
+                x.config.as_ref().map_or(false, |x| {
+                    if let Some(f) = x.afi_safi_name.as_ref() {
+                        f == &config::gen::AfiSafiType::Ipv4Unicast
+                            || f == &config::gen::AfiSafiType::Ipv6Unicast
+                    } else {
+                        false
+                    }
+                })
+            })
+            .filter_map(|x| {
+                x.add_paths.as_ref().and_then(|c| {
+                    c.config.as_ref().and_then(|c| {
+                        c.receive.as_ref().and_then(|r| {
+                            if *r {
+                                Some(x.config.as_ref().unwrap().afi_safi_name.as_ref().unwrap())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                })
+            })
+            .map(|x| packet::Family::try_from(x).unwrap())
+            .collect();
         let mut builder = PeerBuilder::new(c.neighbor_address.as_ref().unwrap().parse().unwrap());
         builder
             .local_asn(c.local_as.map_or(0, |x| x))
@@ -602,6 +638,9 @@ impl From<&config::Neighbor> for Peer {
             }));
         if let Some(password) = c.auth_password.as_ref() {
             builder.password(password);
+        }
+        if !addpath_families.is_empty() {
+            builder.addpath(addpath_families);
         }
         builder.build()
     }
