@@ -3158,6 +3158,7 @@ impl Handler {
 
     async fn rx_msg(
         &mut self,
+        codec: &mut packet::bgp::BgpCodec,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
         msg: bgp::Message,
@@ -3192,6 +3193,13 @@ impl Handler {
                 }
                 self.state.remote_asn.store(as_number, Ordering::Relaxed);
                 self.family_cap = packet::bgp::family_capabilities(&self.local_cap, &capability);
+                codec.addpath_rx(
+                    self.family_cap
+                        .iter()
+                        .filter_map(|(f, c)| if c.addpath_rx() { Some(*f) } else { None })
+                        .collect(),
+                );
+
                 self.state.remote_cap.write().await.append(&mut capability);
                 self.negotiated_holdtime = std::cmp::min(self.local_holdtime, holdtime as u64);
                 if self.negotiated_holdtime != 0 {
@@ -3451,7 +3459,7 @@ impl Handler {
                                     Ok(msg) => match msg {
                                         Some(msg) => {
                                             (*self.counter_rx).sync(&msg);
-                                            let _ = self.rx_msg(local_sockaddr, remote_sockaddr, msg, &mut pending).await;
+                                            let _ = self.rx_msg(&mut codec, local_sockaddr, remote_sockaddr, msg, &mut pending).await;
                                         }
                                         None => {
                                             // partial read

@@ -15,7 +15,7 @@
 
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use once_cell::sync::Lazy;
 use prost::Message as ProstMessage;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
@@ -749,6 +749,12 @@ pub(crate) struct FamilyCapability {
     extended_nexthop: bool,
 }
 
+impl FamilyCapability {
+    pub(crate) fn addpath_rx(&self) -> bool {
+        self.addpath & 0x1 > 0
+    }
+}
+
 pub(crate) fn family_capabilities(
     local: &[Capability],
     remote: &[Capability],
@@ -785,7 +791,11 @@ pub(crate) fn family_capabilities(
             fc.insert(
                 f,
                 FamilyCapability {
-                    addpath: lc.addpath & rc.addpath,
+                    addpath: if lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0 {
+                        0x1
+                    } else {
+                        0
+                    },
                     extended_nexthop: lc.extended_nexthop & rc.extended_nexthop,
                 },
             );
@@ -1519,6 +1529,7 @@ pub(crate) struct BgpCodec {
     local_addr: IpAddr,
     keep_aspath: bool,
     keep_nexthop: bool,
+    addpath_rx: FnvHashSet<Family>,
 }
 
 impl BgpCodec {
@@ -1530,6 +1541,7 @@ impl BgpCodec {
             local_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             keep_aspath: false,
             keep_nexthop: false,
+            addpath_rx: FnvHashSet::default(),
         }
     }
 
@@ -1558,6 +1570,12 @@ impl BgpCodec {
             Message::MAX_EXTENDED_LENGTH
         } else {
             Message::MAX_LENGTH
+        }
+    }
+
+    pub(crate) fn addpath_rx(&mut self, families: Vec<Family>) {
+        for f in families {
+            self.addpath_rx.insert(f);
         }
     }
 
@@ -1816,6 +1834,40 @@ impl BgpCodec {
             .write_u16::<NetworkEndian>((pos_end - pos_head) as u16)?;
 
         Ok(())
+    }
+
+    fn decode_nlri<T: io::Read>(
+        &self,
+        family: Family,
+        c: &mut T,
+        mut len: usize,
+    ) -> Result<(u32, Net), Error> {
+        let malformed = Error::InvalidMessageFormat {
+            code: 3,
+            subcode: 1,
+            data: vec![],
+        };
+        let id = if self.addpath_rx.contains(&family) {
+            if let Ok(id) = c.read_u32::<NetworkEndian>() {
+                len -= 4;
+                id
+            } else {
+                return Err(malformed);
+            }
+        } else {
+            0
+        };
+        match family {
+            Family::IPV4 => match Ipv4Net::decode(c, len) {
+                Ok(net) => Ok((id, Net::V4(net))),
+                Err(err) => Err(err),
+            },
+            Family::IPV6 => match Ipv6Net::decode(c, len) {
+                Ok(net) => Ok((id, Net::V6(net))),
+                Err(err) => Err(err),
+            },
+            _ => Err(malformed),
+        }
     }
 }
 
@@ -2131,9 +2183,9 @@ impl Decoder for BgpCodec {
                 }
 
                 while (c.position() as usize) < buf.len() {
-                    let pos = c.position() as usize;
-                    match Ipv4Net::decode(&mut c, buf.len() - pos) {
-                        Ok(net) => reach.push(Net::V4(net)),
+                    let rest = buf.len() - c.position() as usize;
+                    match self.decode_nlri(Family::IPV4, &mut c, rest) {
+                        Ok((_, net)) => reach.push(net),
                         Err(err) => return Err(err),
                     }
                 }
@@ -2142,9 +2194,9 @@ impl Decoder for BgpCodec {
                     c.set_position(Message::HEADER_LENGTH as u64 + 2);
                     let withdrawn_end = c.position() + withdrawn_len as u64;
                     while c.position() < withdrawn_end {
-                        let pos = c.position();
-                        match Ipv4Net::decode(&mut c, (withdrawn_end - pos) as usize) {
-                            Ok(net) => unreach.push(Net::V4(net)),
+                        let rest = withdrawn_end - c.position();
+                        match self.decode_nlri(Family::IPV4, &mut c, rest as usize) {
+                            Ok((_, net)) => unreach.push(net),
                             Err(err) => return Err(err),
                         }
                     }
@@ -2208,9 +2260,9 @@ impl Decoder for BgpCodec {
                     }
                     c.read_u8().unwrap();
                     while c.position() < buf.len() as u64 {
-                        let pos = c.position() as usize;
-                        match Ipv6Net::decode(&mut c, buf.len() - pos) {
-                            Ok(net) => reach.push(Net::V6(net)),
+                        let rest = buf.len() - c.position() as usize;
+                        match self.decode_nlri(reach_family, &mut c, rest) {
+                            Ok((_, net)) => reach.push(net),
                             Err(err) => return Err(err),
                         }
                     }
@@ -2234,11 +2286,10 @@ impl Decoder for BgpCodec {
                     }
                     let safi = c.read_u8().unwrap();
                     unreach_family = Family((afi as u32) << 16 | safi as u32);
-                    let mut v = Vec::new();
                     while c.position() < buf.len() as u64 {
-                        let pos = c.position() as usize;
-                        match Ipv6Net::decode(&mut c, buf.len() - pos) {
-                            Ok(net) => v.push(Net::V6(net)),
+                        let rest = buf.len() - c.position() as usize;
+                        match self.decode_nlri(unreach_family, &mut c, rest) {
+                            Ok((_, net)) => unreach.push(net),
                             Err(err) => return Err(err),
                         }
                     }
