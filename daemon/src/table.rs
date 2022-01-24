@@ -174,7 +174,7 @@ impl From<Change> for bgp::Message {
     fn from(c: Change) -> bgp::Message {
         // FIXME: handle extended nexthop
         bgp::Message::Update {
-            reach: Some((c.family, vec![(c.net, 0)])),
+            reach: Some((c.family, vec![(c.net, None)])),
             unreach: None,
             attr: c.attr,
         }

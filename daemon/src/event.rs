@@ -727,7 +727,7 @@ impl GrpcService {
             TableEvent::PassUpdate(
                 self.local_source.clone(),
                 family,
-                vec![(net, path.identifier)],
+                vec![(net, Some(path.identifier))],
                 {
                     if attr.is_empty() {
                         None
@@ -2821,7 +2821,7 @@ enum TableEvent {
     PassUpdate(
         Arc<table::Source>,
         Family,
-        Vec<(packet::Net, u32)>,
+        Vec<(packet::Net, Option<u32>)>,
         Option<Arc<Vec<packet::Attribute>>>,
     ),
     Disconnected(Arc<table::Source>),
@@ -2905,7 +2905,7 @@ impl Table {
                                     source.clone(),
                                     family,
                                     net.0,
-                                    net.1,
+                                    net.1.map_or(0, |x| x),
                                     attrs.clone(),
                                     filtered,
                                 ) {
@@ -2959,9 +2959,12 @@ impl Table {
                                 let _ = mrt_tx.send(msg);
                             }
                             for net in nets {
-                                if let Some(ri) =
-                                    t.rtable.remove(source.clone(), family, net.0, net.1)
-                                {
+                                if let Some(ri) = t.rtable.remove(
+                                    source.clone(),
+                                    family,
+                                    net.0,
+                                    net.1.map_or(0, |x| x),
+                                ) {
                                     for c in t.peer_event_tx.values() {
                                         if let Some(a) = t.global_export_policy.as_ref() {
                                             if t.rtable.apply_policy(
@@ -3141,8 +3144,8 @@ impl Handler {
 
     async fn rx_update(
         &mut self,
-        reach: Option<(Family, Vec<(packet::Net, u32)>)>,
-        unreach: Option<(Family, Vec<(packet::Net, u32)>)>,
+        reach: Option<(Family, Vec<(packet::Net, Option<u32>)>)>,
+        unreach: Option<(Family, Vec<(packet::Net, Option<u32>)>)>,
         attr: Arc<Vec<packet::Attribute>>,
     ) {
         if let Some((family, reach)) = reach {
@@ -3517,7 +3520,7 @@ impl Handler {
                             self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         }
 
-                        let unreach: Vec<(packet::Net, u32)> = pending.unreach.drain().map(|n| (n, 0)).collect();
+                        let unreach: Vec<(packet::Net, Option<u32>)> = pending.unreach.drain().map(|n| (n, None)).collect();
                         if !unreach.is_empty() {
                             txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                             let msg = bgp::Message::Update{
@@ -3537,7 +3540,7 @@ impl Handler {
                         let mut sent = Vec::with_capacity(max_tx_count);
                         for (attr, reach) in pending.bucket.iter() {
                             let msg = bgp::Message::Update{
-                                reach: Some((Family::IPV4, reach.iter().copied().map(|n| (n, 0)).collect())),
+                                reach: Some((Family::IPV4, reach.iter().copied().map(|n| (n, None)).collect())),
                                 attr: attr.clone(),
                                 unreach: None,
                             };

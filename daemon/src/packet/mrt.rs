@@ -30,6 +30,9 @@ struct Header {
 }
 
 impl Header {
+    const SUBTYPE_AS4: u16 = 4;
+    const SUBTYPE_AS4_ADDPATH: u16 = 8;
+
     fn encode(&self, dst: &mut BytesMut) -> Result<(), Error> {
         dst.put_u32(self.timestamp);
         dst.put_u16(self.code);
@@ -127,10 +130,29 @@ impl Encoder<&Message> for MrtCodec {
 
         match item {
             Message::Mp { header, body } => {
+                let mut subtype = Header::SUBTYPE_AS4;
+                if let bgp::Message::Update {
+                    reach,
+                    unreach,
+                    attr: _,
+                } = body
+                {
+                    if let Some(reach) = reach {
+                        if !reach.1.is_empty() && reach.1[0].1.is_some() {
+                            subtype = Header::SUBTYPE_AS4_ADDPATH;
+                        }
+                    }
+                    if let Some(unreach) = unreach {
+                        if !unreach.1.is_empty() && unreach.1[0].1.is_some() {
+                            subtype = Header::SUBTYPE_AS4_ADDPATH;
+                        }
+                    }
+                }
+
                 let h = Header {
                     timestamp,
                     code: 16,
-                    subtype: 4,
+                    subtype,
                     len: 0,
                 };
                 h.encode(dst).unwrap();
