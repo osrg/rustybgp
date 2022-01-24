@@ -1478,8 +1478,8 @@ pub(crate) enum Message {
         capability: Vec<Capability>,
     },
     Update {
-        reach: Option<(Family, Vec<Net>)>,
-        unreach: Option<(Family, Vec<Net>)>,
+        reach: Option<(Family, Vec<(Net, u32)>)>,
+        unreach: Option<(Family, Vec<(Net, u32)>)>,
         attr: Arc<Vec<Attribute>>,
     },
     Notification {
@@ -1587,7 +1587,7 @@ impl BgpCodec {
         &self,
         attrs: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
-        reach: &(Family, Vec<Net>),
+        reach: &(Family, Vec<(Net, u32)>),
     ) -> Result<u16, ()> {
         let (family, nets) = reach;
         let desc = ATTR_DESCS.get(&Attribute::MP_REACH).unwrap();
@@ -1626,7 +1626,7 @@ impl BgpCodec {
         }
         // padding
         dst.put_u8(0);
-        for net in nets {
+        for (net, _) in nets {
             net.encode(dst).unwrap();
         }
         let mp_len = (dst.len() - pos_head) as u8;
@@ -1639,7 +1639,7 @@ impl BgpCodec {
         &self,
         _: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
-        unreach: &(Family, Vec<Net>),
+        unreach: &(Family, Vec<(Net, u32)>),
     ) -> Result<u16, ()> {
         let (family, nets) = unreach;
         let desc = ATTR_DESCS.get(&Attribute::MP_UNREACH).unwrap();
@@ -1650,7 +1650,7 @@ impl BgpCodec {
         dst.put_u8(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
-        for net in nets {
+        for (net, _) in nets {
             net.encode(dst).unwrap();
         }
         let mp_len = (dst.len() - pos_head) as u8;
@@ -1730,7 +1730,7 @@ impl BgpCodec {
                     if let Some(unreach) = unreach {
                         for (i, item) in unreach.1.iter().enumerate().skip(*reach_idx) {
                             if pos_head + self.max_message_length() > dst.len() + 5 {
-                                withdrawn_len += item.encode(dst).unwrap();
+                                withdrawn_len += item.0.encode(dst).unwrap();
                                 *reach_idx = i;
                             } else {
                                 break;
@@ -1800,7 +1800,7 @@ impl BgpCodec {
                         .skip(*reach_idx)
                     {
                         if pos_head + self.max_message_length() > dst.len() + 5 {
-                            let _ = item.encode(dst);
+                            let _ = item.0.encode(dst);
                             *reach_idx = i;
                         } else {
                             break;
@@ -1841,7 +1841,7 @@ impl BgpCodec {
         family: Family,
         c: &mut T,
         mut len: usize,
-    ) -> Result<(u32, Net), Error> {
+    ) -> Result<(Net, u32), Error> {
         let malformed = Error::InvalidMessageFormat {
             code: 3,
             subcode: 1,
@@ -1859,11 +1859,11 @@ impl BgpCodec {
         };
         match family {
             Family::IPV4 => match Ipv4Net::decode(c, len) {
-                Ok(net) => Ok((id, Net::V4(net))),
+                Ok(net) => Ok((Net::V4(net), id)),
                 Err(err) => Err(err),
             },
             Family::IPV6 => match Ipv6Net::decode(c, len) {
-                Ok(net) => Ok((id, Net::V6(net))),
+                Ok(net) => Ok((Net::V6(net), id)),
                 Err(err) => Err(err),
             },
             _ => Err(malformed),
@@ -2185,7 +2185,7 @@ impl Decoder for BgpCodec {
                 while (c.position() as usize) < buf.len() {
                     let rest = buf.len() - c.position() as usize;
                     match self.decode_nlri(Family::IPV4, &mut c, rest) {
-                        Ok((_, net)) => reach.push(net),
+                        Ok(net) => reach.push(net),
                         Err(err) => return Err(err),
                     }
                 }
@@ -2196,7 +2196,7 @@ impl Decoder for BgpCodec {
                     while c.position() < withdrawn_end {
                         let rest = withdrawn_end - c.position();
                         match self.decode_nlri(Family::IPV4, &mut c, rest as usize) {
-                            Ok((_, net)) => unreach.push(net),
+                            Ok(net) => unreach.push(net),
                             Err(err) => return Err(err),
                         }
                     }
@@ -2262,7 +2262,7 @@ impl Decoder for BgpCodec {
                     while c.position() < buf.len() as u64 {
                         let rest = buf.len() - c.position() as usize;
                         match self.decode_nlri(reach_family, &mut c, rest) {
-                            Ok((_, net)) => reach.push(net),
+                            Ok(net) => reach.push(net),
                             Err(err) => return Err(err),
                         }
                     }
@@ -2289,7 +2289,7 @@ impl Decoder for BgpCodec {
                     while c.position() < buf.len() as u64 {
                         let rest = buf.len() - c.position() as usize;
                         match self.decode_nlri(unreach_family, &mut c, rest) {
-                            Ok((_, net)) => unreach.push(net),
+                            Ok(net) => unreach.push(net),
                             Err(err) => return Err(err),
                         }
                     }
@@ -2423,7 +2423,7 @@ fn build_many_v4_route() {
         }));
     }
 
-    let reach: Vec<Net> = net.iter().cloned().collect();
+    let reach: Vec<(Net, u32)> = net.iter().cloned().map(|n| (n, 0)).collect();
     let mut msg = Message::Update {
         reach: Some((Family::IPV4, reach)),
         attr: Arc::new(vec![
@@ -2435,7 +2435,7 @@ fn build_many_v4_route() {
     };
     let mut set = fnv::FnvHashSet::default();
     for n in &net {
-        set.insert(*n);
+        set.insert((*n, 0));
     }
 
     let mut codec = BgpCodec::new().keep_aspath(true);
@@ -2464,7 +2464,7 @@ fn build_many_v4_route() {
     }
     assert_eq!(set.len(), 0);
 
-    let unreach = net.iter().cloned().collect();
+    let unreach = net.iter().cloned().map(|n| (n, 0)).collect();
     msg = Message::Update {
         reach: None,
         attr: Arc::new(Vec::new()),
@@ -2472,7 +2472,7 @@ fn build_many_v4_route() {
     };
 
     for n in &net {
-        set.insert(*n);
+        set.insert((*n, 0));
     }
 
     let mut withdrawn = Vec::new();

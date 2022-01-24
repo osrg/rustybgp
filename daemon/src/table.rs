@@ -96,6 +96,7 @@ impl PathAttribute {
 
 struct Path {
     source: Arc<Source>,
+    id: u32,
     pa: PathAttribute,
     timestamp: SystemTime,
     flags: u8,
@@ -151,6 +152,7 @@ pub(crate) struct ApiDestination {
     pub(crate) net: packet::Net,
     pub(crate) paths: Vec<(
         Arc<Source>,
+        u32,
         Arc<Vec<packet::Attribute>>,
         SystemTime,
         Option<api::Validation>,
@@ -172,7 +174,7 @@ impl From<Change> for bgp::Message {
     fn from(c: Change) -> bgp::Message {
         // FIXME: handle extended nexthop
         bgp::Message::Update {
-            reach: Some((c.family, vec![c.net])),
+            reach: Some((c.family, vec![(c.net, 0)])),
             unreach: None,
             attr: c.attr,
         }
@@ -371,6 +373,7 @@ impl RoutingTable {
                             );
                             (
                                 p.source.clone(),
+                                0,
                                 attr.clone(),
                                 p.timestamp,
                                 self.rpki.validate(family, &p.source, net, &attr),
@@ -378,6 +381,7 @@ impl RoutingTable {
                         } else {
                             (
                                 p.source.clone(),
+                                p.id,
                                 p.pa.attr.clone(),
                                 p.timestamp,
                                 self.rpki.validate(family, &p.source, net, &p.pa.attr),
@@ -393,6 +397,7 @@ impl RoutingTable {
         source: Arc<Source>,
         family: Family,
         net: packet::Net,
+        remote_id: u32,
         attr: Arc<Vec<packet::Attribute>>,
         filtered: bool,
     ) -> Option<Change> {
@@ -403,6 +408,7 @@ impl RoutingTable {
 
         let path = Path {
             source: source.clone(),
+            id: remote_id,
             pa: PathAttribute::new(attr),
             timestamp: SystemTime::now(),
             flags,
@@ -414,7 +420,7 @@ impl RoutingTable {
             .or_insert_with(FnvHashMap::default);
         let dst = rt.entry(net).or_insert_with(Destination::new);
         for i in 0..dst.entry.len() {
-            if Arc::ptr_eq(&dst.entry[i].source, &source) {
+            if Arc::ptr_eq(&dst.entry[i].source, &source) && dst.entry[i].id == remote_id {
                 replaced = true;
                 old_filtered = dst.entry.remove(i).is_filtered();
                 best_changed = i == 0;
@@ -501,12 +507,13 @@ impl RoutingTable {
         source: Arc<Source>,
         family: Family,
         net: packet::Net,
+        remote_id: u32,
     ) -> Option<Change> {
         let rt = self.global.get_mut(&family)?;
         let dst = rt.get_mut(&net)?;
         let mut was_best = true;
         for i in 0..dst.entry.len() {
-            if Arc::ptr_eq(&dst.entry[i].source, &source) {
+            if Arc::ptr_eq(&dst.entry[i].source, &source) && dst.entry[i].id == remote_id {
                 let (received, accepted) = self
                     .route_stats
                     .get_mut(&source.remote_addr)
@@ -722,10 +729,10 @@ fn drop() {
     let family = Family::IPV4;
     let attrs = Arc::new(Vec::new());
 
-    rt.insert(s1.clone(), family, n1, attrs.clone(), false);
-    rt.insert(s2, family, n1, attrs.clone(), false);
-    rt.insert(s1.clone(), family, n2, attrs.clone(), false);
-    rt.insert(s1.clone(), family, n3, attrs.clone(), false);
+    rt.insert(s1.clone(), family, n1, 0, attrs.clone(), false);
+    rt.insert(s2, family, n1, 0, attrs.clone(), false);
+    rt.insert(s1.clone(), family, n2, 0, attrs.clone(), false);
+    rt.insert(s1.clone(), family, n3, 0, attrs.clone(), false);
 
     assert_eq!(rt.global.get(&family).unwrap().len(), 3);
     rt.drop(s1);

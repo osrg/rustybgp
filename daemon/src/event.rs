@@ -724,13 +724,18 @@ impl GrpcService {
         }
         Ok((
             Table::dealer(&net),
-            TableEvent::PassUpdate(self.local_source.clone(), family, vec![net], {
-                if attr.is_empty() {
-                    None
-                } else {
-                    Some(Arc::new(attr))
-                }
-            }),
+            TableEvent::PassUpdate(
+                self.local_source.clone(),
+                family,
+                vec![(net, path.identifier)],
+                {
+                    if attr.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(attr))
+                    }
+                },
+            ),
         ))
     }
 }
@@ -1170,7 +1175,7 @@ impl GobgpApi for GrpcService {
                         // drain_filter() still in unstable
                         let mut i = 0;
                         while i < d.paths.len() {
-                            let (source, attrs, _, _) = &d.paths[i];
+                            let (source, _, attrs, _, _) = &d.paths[i];
                             if t.rtable.apply_policy(a, source, &d.net, attrs)
                                 == table::Disposition::Reject
                             {
@@ -1187,9 +1192,14 @@ impl GobgpApi for GrpcService {
                     .map(|x| api::Path {
                         nlri: Some((&d.net).into()),
                         family: Some(family.into()),
-                        age: Some(x.2.to_api()),
-                        pattrs: x.1.iter().map(prost_types::Any::from).collect(),
-                        validation: x.3.clone(),
+                        identifier: if table_type == api::TableType::AdjOut {
+                            0
+                        } else {
+                            x.1
+                        },
+                        age: Some(x.3.to_api()),
+                        pattrs: x.2.iter().map(prost_types::Any::from).collect(),
+                        validation: x.4.clone(),
                         ..Default::default()
                     })
                     .collect();
@@ -2811,7 +2821,7 @@ enum TableEvent {
     PassUpdate(
         Arc<table::Source>,
         Family,
-        Vec<packet::Net>,
+        Vec<(packet::Net, u32)>,
         Option<Arc<Vec<packet::Attribute>>>,
     ),
     Disconnected(Arc<table::Source>),
@@ -2885,7 +2895,7 @@ impl Table {
                             for net in nets {
                                 let mut filtered = false;
                                 if let Some(a) = t.global_import_policy.as_ref() {
-                                    if t.rtable.apply_policy(a, &source, &net, &attrs)
+                                    if t.rtable.apply_policy(a, &source, &net.0, &attrs)
                                         == table::Disposition::Reject
                                     {
                                         filtered = true;
@@ -2894,12 +2904,13 @@ impl Table {
                                 if let Some(ri) = t.rtable.insert(
                                     source.clone(),
                                     family,
-                                    net,
+                                    net.0,
+                                    net.1,
                                     attrs.clone(),
                                     filtered,
                                 ) {
                                     if let Some(a) = t.global_export_policy.as_ref() {
-                                        if t.rtable.apply_policy(a, &source, &net, &attrs)
+                                        if t.rtable.apply_policy(a, &source, &net.0, &attrs)
                                             == table::Disposition::Reject
                                         {
                                             continue;
@@ -2948,13 +2959,15 @@ impl Table {
                                 let _ = mrt_tx.send(msg);
                             }
                             for net in nets {
-                                if let Some(ri) = t.rtable.remove(source.clone(), family, net) {
+                                if let Some(ri) =
+                                    t.rtable.remove(source.clone(), family, net.0, net.1)
+                                {
                                     for c in t.peer_event_tx.values() {
                                         if let Some(a) = t.global_export_policy.as_ref() {
                                             if t.rtable.apply_policy(
                                                 a,
                                                 &source,
-                                                &net,
+                                                &net.0,
                                                 &Arc::new(Vec::new()),
                                             ) == table::Disposition::Reject
                                             {
@@ -3128,13 +3141,13 @@ impl Handler {
 
     async fn rx_update(
         &mut self,
-        reach: Option<(Family, Vec<packet::Net>)>,
-        unreach: Option<(Family, Vec<packet::Net>)>,
+        reach: Option<(Family, Vec<(packet::Net, u32)>)>,
+        unreach: Option<(Family, Vec<(packet::Net, u32)>)>,
         attr: Arc<Vec<packet::Attribute>>,
     ) {
         if let Some((family, reach)) = reach {
             for net in reach {
-                let idx = Table::dealer(&net);
+                let idx = Table::dealer(&net.0);
                 let _ = self.table_tx[idx].send(TableEvent::PassUpdate(
                     self.source.as_ref().unwrap().clone(),
                     family,
@@ -3145,7 +3158,7 @@ impl Handler {
         }
         if let Some((family, unreach)) = unreach {
             for net in unreach {
-                let idx = Table::dealer(&net);
+                let idx = Table::dealer(&net.0);
                 let _ = self.table_tx[idx].send(TableEvent::PassUpdate(
                     self.source.as_ref().unwrap().clone(),
                     family,
@@ -3504,7 +3517,7 @@ impl Handler {
                             self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         }
 
-                        let unreach: Vec<packet::Net> = pending.unreach.drain().collect();
+                        let unreach: Vec<(packet::Net, u32)> = pending.unreach.drain().map(|n| (n, 0)).collect();
                         if !unreach.is_empty() {
                             txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                             let msg = bgp::Message::Update{
@@ -3524,7 +3537,7 @@ impl Handler {
                         let mut sent = Vec::with_capacity(max_tx_count);
                         for (attr, reach) in pending.bucket.iter() {
                             let msg = bgp::Message::Update{
-                                reach: Some((Family::IPV4, reach.iter().copied().collect())),
+                                reach: Some((Family::IPV4, reach.iter().copied().map(|n| (n, 0)).collect())),
                                 attr: attr.clone(),
                                 unreach: None,
                             };
