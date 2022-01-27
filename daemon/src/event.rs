@@ -45,7 +45,7 @@ use crate::api;
 use crate::auth;
 use crate::config;
 use crate::error::Error;
-use crate::packet::{self, bgp, bmp, mrt, rpki, Family, FamilyCapability};
+use crate::packet::{self, bgp, bmp, mrt, rpki, Family};
 use crate::proto::ToApi;
 use crate::table;
 
@@ -3091,8 +3091,6 @@ struct Handler {
     negotiated_holdtime: u64,
     rs_client: bool,
 
-    family_cap: FnvHashMap<Family, FamilyCapability>,
-
     stream: Option<TcpStream>,
     keepalive_timer: tokio::time::Interval,
     source: Option<Arc<table::Source>>,
@@ -3128,7 +3126,6 @@ impl Handler {
             local_holdtime,
             negotiated_holdtime: 0,
             rs_client,
-            family_cap: FnvHashMap::default(),
             keepalive_timer: tokio::time::interval_at(
                 tokio::time::Instant::now() + Duration::new(u32::MAX.into(), 0),
                 Duration::from_secs(3600),
@@ -3208,13 +3205,9 @@ impl Handler {
                     return Ok(());
                 }
                 self.state.remote_asn.store(as_number, Ordering::Relaxed);
-                self.family_cap = packet::bgp::family_capabilities(&self.local_cap, &capability);
-                codec.addpath_rx(
-                    self.family_cap
-                        .iter()
-                        .filter_map(|(f, c)| if c.addpath_rx() { Some(*f) } else { None })
-                        .collect(),
-                );
+                for (f, c) in bgp::create_channel(&self.local_cap, &capability) {
+                    codec.channel.insert(f, Arc::new(c));
+                }
 
                 self.state.remote_cap.write().await.append(&mut capability);
                 self.negotiated_holdtime = std::cmp::min(self.local_holdtime, holdtime as u64);
@@ -3284,7 +3277,7 @@ impl Handler {
                     let d = Table::dealer(&self.remote_addr);
                     for i in 0..*NUM_TABLES {
                         let mut t = TABLE[i].lock().await;
-                        for f in self.family_cap.keys() {
+                        for f in codec.channel.keys() {
                             for c in t.rtable.best(f).into_iter() {
                                 if let Some(a) = t.global_export_policy.as_ref() {
                                     if t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
@@ -3446,7 +3439,7 @@ impl Handler {
                                 if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
                                     continue;
                                 }
-                                if !self.family_cap.contains_key(&ri.family) {
+                                if !codec.channel.contains_key(&ri.family) {
                                     continue;
                                 }
                                 if ri.family == Family::IPV4 {
@@ -3575,7 +3568,8 @@ impl Handler {
                         if pending.sync && pending.is_empty() && self.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
                             pending.sync = false;
                             let mut b = bytes::BytesMut::with_capacity(txbuf_size);
-                            for msg in  self.family_cap.iter().map(|(k,_)| bgp::Message::eor(*k)) {
+                            let eor: Vec<bgp::Message> = codec.channel.keys().map(|f| bgp::Message::eor(*f)).collect();
+                            for msg in eor {
                                 let _ = codec.encode(&msg, &mut b);
                             }
                             if stream.write_all(&b.freeze()).await.is_err() {

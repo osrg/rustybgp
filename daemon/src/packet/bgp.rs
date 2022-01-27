@@ -15,7 +15,7 @@
 
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
-use fnv::{FnvHashMap, FnvHashSet};
+use fnv::FnvHashMap;
 use once_cell::sync::Lazy;
 use prost::Message as ProstMessage;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
@@ -743,67 +743,6 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
     .collect()
 });
 
-#[derive(Clone)]
-pub(crate) struct FamilyCapability {
-    addpath: u8,
-    extended_nexthop: bool,
-}
-
-impl FamilyCapability {
-    pub(crate) fn addpath_rx(&self) -> bool {
-        self.addpath & 0x1 > 0
-    }
-}
-
-pub(crate) fn family_capabilities(
-    local: &[Capability],
-    remote: &[Capability],
-) -> FnvHashMap<Family, FamilyCapability> {
-    let f = |v: &[Capability]| -> FnvHashMap<Family, FamilyCapability> {
-        let mut h = FnvHashMap::default();
-        for c in v {
-            if let Capability::MultiProtocol(f) = c {
-                h.insert(
-                    *f,
-                    FamilyCapability {
-                        addpath: 0,
-                        extended_nexthop: false,
-                    },
-                );
-            }
-        }
-        for c in v {
-            if let Capability::AddPath(v) = c {
-                for (f, mode) in v {
-                    if let Some(fc) = h.get_mut(f) {
-                        fc.addpath = *mode;
-                    }
-                }
-            }
-        }
-        h
-    };
-    let local_family = f(local);
-    let remote_family = f(remote);
-    let mut fc = FnvHashMap::default();
-    for (f, lc) in local_family {
-        if let Some(rc) = remote_family.get(&f) {
-            fc.insert(
-                f,
-                FamilyCapability {
-                    addpath: if lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0 {
-                        0x1
-                    } else {
-                        0
-                    },
-                    extended_nexthop: lc.extended_nexthop & rc.extended_nexthop,
-                },
-            );
-        }
-    }
-    fc
-}
-
 pub(crate) struct AsPathIter<'a> {
     cur: Cursor<&'a Vec<u8>>,
     len: u64,
@@ -1522,6 +1461,68 @@ impl Message {
     }
 }
 
+pub(crate) struct Channel {
+    family: Family,
+    addpath: u8,
+    extended_nexthop: bool,
+}
+
+impl Channel {
+    pub(crate) fn addpath_rx(&self) -> bool {
+        self.addpath & 0x1 > 0
+    }
+}
+
+pub(crate) fn create_channel(
+    local: &[Capability],
+    remote: &[Capability],
+) -> impl Iterator<Item = (Family, Channel)> {
+    let f = |v: &[Capability]| -> FnvHashMap<Family, Channel> {
+        let mut h = FnvHashMap::default();
+        for c in v {
+            if let Capability::MultiProtocol(f) = c {
+                h.insert(
+                    *f,
+                    Channel {
+                        family: *f,
+                        addpath: 0,
+                        extended_nexthop: false,
+                    },
+                );
+            }
+        }
+        for c in v {
+            if let Capability::AddPath(v) = c {
+                for (f, mode) in v {
+                    if let Some(fc) = h.get_mut(f) {
+                        fc.addpath = *mode;
+                    }
+                }
+            }
+        }
+        h
+    };
+    let mut l = f(local);
+    f(remote).into_iter().filter_map(move |(f, lc)| {
+        if let Some(rc) = l.remove(&f) {
+            Some((
+                f,
+                Channel {
+                    family: f,
+                    addpath: if lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0 {
+                        0x1
+                    } else {
+                        0
+                    },
+                    extended_nexthop: lc.extended_nexthop & rc.extended_nexthop,
+                },
+            ))
+        } else {
+            None
+        }
+    })
+}
+
 pub(crate) struct BgpCodec {
     extended_length: bool,
     local_as: u32,
@@ -1529,7 +1530,7 @@ pub(crate) struct BgpCodec {
     local_addr: IpAddr,
     keep_aspath: bool,
     keep_nexthop: bool,
-    addpath_rx: FnvHashSet<Family>,
+    pub(crate) channel: FnvHashMap<Family, Arc<Channel>>,
 }
 
 impl BgpCodec {
@@ -1541,7 +1542,7 @@ impl BgpCodec {
             local_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             keep_aspath: false,
             keep_nexthop: false,
-            addpath_rx: FnvHashSet::default(),
+            channel: FnvHashMap::default(),
         }
     }
 
@@ -1570,12 +1571,6 @@ impl BgpCodec {
             Message::MAX_EXTENDED_LENGTH
         } else {
             Message::MAX_LENGTH
-        }
-    }
-
-    pub(crate) fn addpath_rx(&mut self, families: Vec<Family>) {
-        for f in families {
-            self.addpath_rx.insert(f);
         }
     }
 
@@ -1852,7 +1847,7 @@ impl BgpCodec {
 
     fn decode_nlri<T: io::Read>(
         &self,
-        family: Family,
+        chan: &Arc<Channel>,
         c: &mut T,
         mut len: usize,
     ) -> Result<(Net, Option<u32>), Error> {
@@ -1861,7 +1856,7 @@ impl BgpCodec {
             subcode: 1,
             data: vec![],
         };
-        let id = if self.addpath_rx.contains(&family) {
+        let id = if chan.addpath_rx() {
             if let Ok(id) = c.read_u32::<NetworkEndian>() {
                 len -= 4;
                 Some(id)
@@ -1871,7 +1866,7 @@ impl BgpCodec {
         } else {
             None
         };
-        match family {
+        match chan.family {
             Family::IPV4 => match Ipv4Net::decode(c, len) {
                 Ok(net) => Ok((Net::V4(net), id)),
                 Err(err) => Err(err),
@@ -1881,6 +1876,14 @@ impl BgpCodec {
                 Err(err) => Err(err),
             },
             _ => Err(malformed),
+        }
+    }
+
+    fn channel(&self, family: &Family) -> Option<Arc<Channel>> {
+        if let Some(a) = self.channel.get(&family) {
+            Some(a.clone())
+        } else {
+            None
         }
     }
 }
@@ -2042,7 +2045,9 @@ impl Decoder for BgpCodec {
                     data: vec![],
                 };
                 let mut reach_family = Family::IPV4;
+                let mut reach_channel = None;
                 let mut unreach_family = Family::IPV4;
+                let mut unreach_channel = None;
                 let mut attr = Vec::new();
                 let mut reach = Vec::new();
                 let mut unreach = Vec::new();
@@ -2196,20 +2201,37 @@ impl Decoder for BgpCodec {
                     c.set_position(attr_end);
                 }
 
-                while (c.position() as usize) < buf.len() {
-                    let rest = buf.len() - c.position() as usize;
-                    match self.decode_nlri(Family::IPV4, &mut c, rest) {
-                        Ok(net) => reach.push(net),
-                        Err(err) => return Err(err),
+                if (c.position() as usize) < buf.len() {
+                    reach_channel = if let Some(c) = self.channel(&Family::IPV4) {
+                        Some(c)
+                    } else {
+                        return Err(malformed);
+                    };
+                    while (c.position() as usize) < buf.len() {
+                        let rest = buf.len() - c.position() as usize;
+
+                        match self.decode_nlri(reach_channel.as_ref().unwrap(), &mut c, rest) {
+                            Ok(net) => reach.push(net),
+                            Err(err) => return Err(err),
+                        }
                     }
                 }
 
                 if 0 < withdrawn_len {
+                    unreach_channel = if let Some(c) = self.channel(&Family::IPV4) {
+                        Some(c)
+                    } else {
+                        return Err(malformed);
+                    };
                     c.set_position(Message::HEADER_LENGTH as u64 + 2);
                     let withdrawn_end = c.position() + withdrawn_len as u64;
                     while c.position() < withdrawn_end {
                         let rest = withdrawn_end - c.position();
-                        match self.decode_nlri(Family::IPV4, &mut c, rest as usize) {
+                        match self.decode_nlri(
+                            unreach_channel.as_ref().unwrap(),
+                            &mut c,
+                            rest as usize,
+                        ) {
                             Ok(net) => unreach.push(net),
                             Err(err) => return Err(err),
                         }
@@ -2253,6 +2275,12 @@ impl Decoder for BgpCodec {
                     }
                     let safi = c.read_u8().unwrap();
                     reach_family = Family((afi as u32) << 16 | safi as u32);
+                    reach_channel =
+                        if let Some(c) = self.channel(&Family((afi as u32) << 16 | safi as u32)) {
+                            Some(c)
+                        } else {
+                            return Err(malformed);
+                        };
                     let nexthop_len = c.read_u8().unwrap();
                     if buf.len() < 5 + nexthop_len as usize {
                         return Err(err);
@@ -2275,7 +2303,7 @@ impl Decoder for BgpCodec {
                     c.read_u8().unwrap();
                     while c.position() < buf.len() as u64 {
                         let rest = buf.len() - c.position() as usize;
-                        match self.decode_nlri(reach_family, &mut c, rest) {
+                        match self.decode_nlri(reach_channel.as_ref().unwrap(), &mut c, rest) {
                             Ok(net) => reach.push(net),
                             Err(err) => return Err(err),
                         }
@@ -2300,9 +2328,15 @@ impl Decoder for BgpCodec {
                     }
                     let safi = c.read_u8().unwrap();
                     unreach_family = Family((afi as u32) << 16 | safi as u32);
+                    unreach_channel =
+                        if let Some(c) = self.channel(&Family((afi as u32) << 16 | safi as u32)) {
+                            Some(c)
+                        } else {
+                            return Err(malformed);
+                        };
                     while c.position() < buf.len() as u64 {
                         let rest = buf.len() - c.position() as usize;
-                        match self.decode_nlri(unreach_family, &mut c, rest) {
+                        match self.decode_nlri(unreach_channel.as_ref().unwrap(), &mut c, rest) {
                             Ok(net) => unreach.push(net),
                             Err(err) => return Err(err),
                         }
