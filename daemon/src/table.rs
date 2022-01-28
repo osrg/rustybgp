@@ -162,6 +162,23 @@ pub(crate) struct ApiDestination {
     // pub(crate) validation: Option<api::Validation>,
 }
 
+pub(crate) struct Reach {
+    pub(crate) source: Arc<Source>,
+    pub(crate) family: Family,
+    pub(crate) net: (packet::Net, u32),
+    pub(crate) attr: Arc<Vec<packet::Attribute>>,
+}
+
+impl From<Reach> for bgp::Message {
+    fn from(c: Reach) -> bgp::Message {
+        bgp::Message::Update {
+            reach: Some((c.family, vec![c.net])),
+            unreach: None,
+            attr: c.attr,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Change {
     pub(crate) source: Arc<Source>,
@@ -174,7 +191,7 @@ impl From<Change> for bgp::Message {
     fn from(c: Change) -> bgp::Message {
         // FIXME: handle extended nexthop
         bgp::Message::Update {
-            reach: Some((c.family, vec![(c.net, None)])),
+            reach: Some((c.family, vec![(c.net, 0)])),
             unreach: None,
             attr: c.attr,
         }
@@ -293,16 +310,16 @@ impl RoutingTable {
             .map(|m| m.iter().map(|(x, y)| (*x, *y)))
     }
 
-    pub(crate) fn iter_change(&self, family: Family) -> impl Iterator<Item = Change> + '_ {
+    pub(crate) fn iter_reach(&self, family: Family) -> impl Iterator<Item = Reach> + '_ {
         self.global
             .get(&family)
             .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
             .iter()
             .map(move |(net, dst)| {
-                dst.entry.iter().map(move |e| Change {
+                dst.entry.iter().map(move |e| Reach {
                     source: e.source.clone(),
                     family,
-                    net: *net,
+                    net: (*net, e.id),
                     attr: e.pa.attr.clone(),
                 })
             })

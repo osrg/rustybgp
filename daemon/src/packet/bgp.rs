@@ -1417,8 +1417,8 @@ pub(crate) enum Message {
         capability: Vec<Capability>,
     },
     Update {
-        reach: Option<(Family, Vec<(Net, Option<u32>)>)>,
-        unreach: Option<(Family, Vec<(Net, Option<u32>)>)>,
+        reach: Option<(Family, Vec<(Net, u32)>)>,
+        unreach: Option<(Family, Vec<(Net, u32)>)>,
         attr: Arc<Vec<Attribute>>,
     },
     Notification {
@@ -1471,6 +1471,25 @@ impl Channel {
     pub(crate) fn addpath_rx(&self) -> bool {
         self.addpath & 0x1 > 0
     }
+
+    pub(crate) fn addpath_tx(&self) -> bool {
+        self.addpath & 0x2 > 0
+    }
+
+    pub(crate) fn new(family: Family, rx: bool, tx: bool) -> Self {
+        let mut addpath = 0;
+        if rx {
+            addpath |= 0x1;
+        }
+        if tx {
+            addpath |= 0x2;
+        }
+        Channel {
+            family,
+            addpath,
+            extended_nexthop: false,
+        }
+    }
 }
 
 pub(crate) fn create_channel(
@@ -1503,9 +1522,9 @@ pub(crate) fn create_channel(
         h
     };
     let mut l = f(local);
-    f(remote).into_iter().filter_map(move |(f, lc)| {
-        if let Some(rc) = l.remove(&f) {
-            Some((
+    f(remote).into_iter().filter_map(move |(f, rc)| {
+        l.remove(&f).map(|lc| {
+            (
                 f,
                 Channel {
                     family: f,
@@ -1516,10 +1535,8 @@ pub(crate) fn create_channel(
                     },
                     extended_nexthop: lc.extended_nexthop & rc.extended_nexthop,
                 },
-            ))
-        } else {
-            None
-        }
+            )
+        })
     })
 }
 
@@ -1582,7 +1599,7 @@ impl BgpCodec {
         &self,
         attrs: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
-        reach: &(Family, Vec<(Net, Option<u32>)>),
+        reach: &(Family, Vec<(Net, u32)>),
     ) -> Result<u16, ()> {
         let (family, nets) = reach;
         let desc = ATTR_DESCS.get(&Attribute::MP_REACH).unwrap();
@@ -1621,8 +1638,9 @@ impl BgpCodec {
         }
         // padding
         dst.put_u8(0);
+        let addpath = self.channel(family).map_or(false, |c| c.addpath_tx());
         for (net, id) in nets {
-            if let Some(id) = id {
+            if addpath {
                 dst.put_u32(*id);
             }
             net.encode(dst).unwrap();
@@ -1637,7 +1655,7 @@ impl BgpCodec {
         &self,
         _: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
-        unreach: &(Family, Vec<(Net, Option<u32>)>),
+        unreach: &(Family, Vec<(Net, u32)>),
     ) -> Result<u16, ()> {
         let (family, nets) = unreach;
         let desc = ATTR_DESCS.get(&Attribute::MP_UNREACH).unwrap();
@@ -1648,8 +1666,9 @@ impl BgpCodec {
         dst.put_u8(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
+        let addpath = self.channel(family).map_or(false, |c| c.addpath_tx());
         for (net, id) in nets {
-            if let Some(id) = id {
+            if addpath {
                 dst.put_u32(*id);
             }
             net.encode(dst).unwrap();
@@ -1722,19 +1741,19 @@ impl BgpCodec {
                 } else {
                     unreach.as_ref().unwrap().0
                 };
-
+                let addpath = self.channel(&family).map_or(false, |c| c.addpath_tx());
                 dst.put_u8(Message::UPDATE);
                 let pos_withdrawn_len = dst.len();
                 dst.put_u16(0);
                 let mut withdrawn_len = 0;
                 if family == Family::IPV4 {
                     if let Some(unreach) = unreach {
+                        let max_len = 5 + if addpath { 4 } else { 0 };
                         for (i, item) in unreach.1.iter().enumerate().skip(*reach_idx) {
-                            let max_len = 5 + item.1.map_or(0, |_| 4);
-                            if let Some(id) = item.1 {
-                                dst.put_u32(id);
-                            }
                             if pos_head + self.max_message_length() > dst.len() + max_len {
+                                if addpath {
+                                    dst.put_u32(item.1);
+                                }
                                 withdrawn_len += item.0.encode(dst).unwrap();
                                 *reach_idx = i;
                             } else {
@@ -1797,6 +1816,7 @@ impl BgpCodec {
                     .unwrap();
 
                 if family == Family::IPV4 {
+                    let max_len = 5 + if addpath { 4 } else { 0 };
                     for (i, item) in reach
                         .as_ref()
                         .map_or(&Vec::new(), |(_, reach)| reach)
@@ -1804,10 +1824,9 @@ impl BgpCodec {
                         .enumerate()
                         .skip(*reach_idx)
                     {
-                        let max_len = 5 + item.1.map_or(0, |_| 4);
                         if pos_head + self.max_message_length() > dst.len() + max_len {
-                            if let Some(id) = item.1 {
-                                dst.put_u32(id);
+                            if addpath {
+                                dst.put_u32(item.1);
                             }
                             let _ = item.0.encode(dst);
                             *reach_idx = i;
@@ -1850,7 +1869,7 @@ impl BgpCodec {
         chan: &Arc<Channel>,
         c: &mut T,
         mut len: usize,
-    ) -> Result<(Net, Option<u32>), Error> {
+    ) -> Result<(Net, u32), Error> {
         let malformed = Error::InvalidMessageFormat {
             code: 3,
             subcode: 1,
@@ -1859,12 +1878,12 @@ impl BgpCodec {
         let id = if chan.addpath_rx() {
             if let Ok(id) = c.read_u32::<NetworkEndian>() {
                 len -= 4;
-                Some(id)
+                id
             } else {
                 return Err(malformed);
             }
         } else {
-            None
+            0
         };
         match chan.family {
             Family::IPV4 => match Ipv4Net::decode(c, len) {
@@ -1880,11 +1899,7 @@ impl BgpCodec {
     }
 
     fn channel(&self, family: &Family) -> Option<Arc<Channel>> {
-        if let Some(a) = self.channel.get(&family) {
-            Some(a.clone())
-        } else {
-            None
-        }
+        self.channel.get(family).cloned()
     }
 }
 
@@ -2045,9 +2060,7 @@ impl Decoder for BgpCodec {
                     data: vec![],
                 };
                 let mut reach_family = Family::IPV4;
-                let mut reach_channel = None;
                 let mut unreach_family = Family::IPV4;
-                let mut unreach_channel = None;
                 let mut attr = Vec::new();
                 let mut reach = Vec::new();
                 let mut unreach = Vec::new();
@@ -2202,15 +2215,15 @@ impl Decoder for BgpCodec {
                 }
 
                 if (c.position() as usize) < buf.len() {
-                    reach_channel = if let Some(c) = self.channel(&Family::IPV4) {
-                        Some(c)
+                    let channel = if let Some(c) = self.channel(&Family::IPV4) {
+                        c
                     } else {
                         return Err(malformed);
                     };
                     while (c.position() as usize) < buf.len() {
                         let rest = buf.len() - c.position() as usize;
 
-                        match self.decode_nlri(reach_channel.as_ref().unwrap(), &mut c, rest) {
+                        match self.decode_nlri(&channel, &mut c, rest) {
                             Ok(net) => reach.push(net),
                             Err(err) => return Err(err),
                         }
@@ -2218,8 +2231,8 @@ impl Decoder for BgpCodec {
                 }
 
                 if 0 < withdrawn_len {
-                    unreach_channel = if let Some(c) = self.channel(&Family::IPV4) {
-                        Some(c)
+                    let channel = if let Some(c) = self.channel(&Family::IPV4) {
+                        c
                     } else {
                         return Err(malformed);
                     };
@@ -2227,11 +2240,7 @@ impl Decoder for BgpCodec {
                     let withdrawn_end = c.position() + withdrawn_len as u64;
                     while c.position() < withdrawn_end {
                         let rest = withdrawn_end - c.position();
-                        match self.decode_nlri(
-                            unreach_channel.as_ref().unwrap(),
-                            &mut c,
-                            rest as usize,
-                        ) {
+                        match self.decode_nlri(&channel, &mut c, rest as usize) {
                             Ok(net) => unreach.push(net),
                             Err(err) => return Err(err),
                         }
@@ -2275,9 +2284,9 @@ impl Decoder for BgpCodec {
                     }
                     let safi = c.read_u8().unwrap();
                     reach_family = Family((afi as u32) << 16 | safi as u32);
-                    reach_channel =
+                    let channel =
                         if let Some(c) = self.channel(&Family((afi as u32) << 16 | safi as u32)) {
-                            Some(c)
+                            c
                         } else {
                             return Err(malformed);
                         };
@@ -2303,7 +2312,7 @@ impl Decoder for BgpCodec {
                     c.read_u8().unwrap();
                     while c.position() < buf.len() as u64 {
                         let rest = buf.len() - c.position() as usize;
-                        match self.decode_nlri(reach_channel.as_ref().unwrap(), &mut c, rest) {
+                        match self.decode_nlri(&channel, &mut c, rest) {
                             Ok(net) => reach.push(net),
                             Err(err) => return Err(err),
                         }
@@ -2328,15 +2337,15 @@ impl Decoder for BgpCodec {
                     }
                     let safi = c.read_u8().unwrap();
                     unreach_family = Family((afi as u32) << 16 | safi as u32);
-                    unreach_channel =
+                    let channel =
                         if let Some(c) = self.channel(&Family((afi as u32) << 16 | safi as u32)) {
-                            Some(c)
+                            c
                         } else {
                             return Err(malformed);
                         };
                     while c.position() < buf.len() as u64 {
                         let rest = buf.len() - c.position() as usize;
-                        match self.decode_nlri(unreach_channel.as_ref().unwrap(), &mut c, rest) {
+                        match self.decode_nlri(&channel, &mut c, rest) {
                             Ok(net) => unreach.push(net),
                             Err(err) => return Err(err),
                         }
@@ -2471,7 +2480,7 @@ fn build_many_v4_route() {
         }));
     }
 
-    let reach: Vec<(Net, Option<u32>)> = net.iter().cloned().map(|n| (n, None)).collect();
+    let reach: Vec<(Net, u32)> = net.iter().cloned().map(|n| (n, 0)).collect();
     let mut msg = Message::Update {
         reach: Some((Family::IPV4, reach)),
         attr: Arc::new(vec![
@@ -2483,7 +2492,7 @@ fn build_many_v4_route() {
     };
     let mut set = fnv::FnvHashSet::default();
     for n in &net {
-        set.insert((*n, None));
+        set.insert((*n, 0));
     }
 
     let mut codec = BgpCodec::new().keep_aspath(true);
@@ -2512,7 +2521,7 @@ fn build_many_v4_route() {
     }
     assert_eq!(set.len(), 0);
 
-    let unreach = net.iter().cloned().map(|n| (n, None)).collect();
+    let unreach = net.iter().cloned().map(|n| (n, 0)).collect();
     msg = Message::Update {
         reach: None,
         attr: Arc::new(Vec::new()),
@@ -2520,7 +2529,7 @@ fn build_many_v4_route() {
     };
 
     for n in &net {
-        set.insert((*n, None));
+        set.insert((*n, 0));
     }
 
     let mut withdrawn = Vec::new();

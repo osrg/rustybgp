@@ -16,6 +16,7 @@
 use byteorder::{NetworkEndian, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::error::Error;
@@ -126,6 +127,7 @@ pub(crate) enum Message {
     RouteMonitoring {
         header: PerPeerHeader,
         update: bgp::Message,
+        addpath: bool,
     },
     StatsReports,
     PeerDown {
@@ -196,9 +198,28 @@ impl Encoder<&Message> for BmpCodec {
         c.put_u8(item.code());
 
         match item {
-            Message::RouteMonitoring { header, update } => {
+            Message::RouteMonitoring {
+                header,
+                update,
+                addpath,
+            } => {
                 header.encode(c).unwrap();
                 let mut buf = bytes::BytesMut::with_capacity(4096);
+                if let bgp::Message::Update {
+                    reach,
+                    unreach,
+                    attr: _,
+                } = update
+                {
+                    let family = if let Some((f, _)) = reach {
+                        *f
+                    } else {
+                        unreach.as_ref().unwrap().0
+                    };
+                    self.codec
+                        .channel
+                        .insert(family, Arc::new(bgp::Channel::new(family, false, *addpath)));
+                }
                 self.codec.encode(update, &mut buf).unwrap();
                 c.put_slice(buf.as_ref());
             }

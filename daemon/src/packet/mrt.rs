@@ -16,6 +16,7 @@
 use byteorder::{NetworkEndian, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::SystemTime;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -104,6 +105,7 @@ pub(crate) enum Message {
     Mp {
         header: MpHeader,
         body: bgp::Message,
+        addpath: bool,
     },
 }
 
@@ -129,25 +131,31 @@ impl Encoder<&Message> for MrtCodec {
             .as_secs() as u32;
 
         match item {
-            Message::Mp { header, body } => {
-                let mut subtype = Header::SUBTYPE_AS4;
+            Message::Mp {
+                header,
+                body,
+                addpath,
+            } => {
                 if let bgp::Message::Update {
                     reach,
                     unreach,
                     attr: _,
                 } = body
                 {
-                    if let Some(reach) = reach {
-                        if !reach.1.is_empty() && reach.1[0].1.is_some() {
-                            subtype = Header::SUBTYPE_AS4_ADDPATH;
-                        }
-                    }
-                    if let Some(unreach) = unreach {
-                        if !unreach.1.is_empty() && unreach.1[0].1.is_some() {
-                            subtype = Header::SUBTYPE_AS4_ADDPATH;
-                        }
-                    }
+                    let family = if let Some((f, _)) = reach {
+                        *f
+                    } else {
+                        unreach.as_ref().unwrap().0
+                    };
+                    self.codec
+                        .channel
+                        .insert(family, Arc::new(bgp::Channel::new(family, false, *addpath)));
                 }
+                let subtype = if *addpath {
+                    Header::SUBTYPE_AS4_ADDPATH
+                } else {
+                    Header::SUBTYPE_AS4
+                };
 
                 let h = Header {
                     timestamp,

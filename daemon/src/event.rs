@@ -727,7 +727,7 @@ impl GrpcService {
             TableEvent::PassUpdate(
                 self.local_source.clone(),
                 family,
-                vec![(net, Some(path.identifier))],
+                vec![(net, path.identifier)],
                 {
                     if attr.is_empty() {
                         None
@@ -1909,9 +1909,14 @@ impl BmpClient {
             let mut t = TABLE[i].lock().await;
             t.bmp_event_tx.insert(sockaddr.ip(), tx.clone());
             for f in &[Family::IPV4, Family::IPV6] {
-                for c in t.rtable.iter_change(*f) {
+                for c in t.rtable.iter_reach(*f) {
                     let e = adjin.entry(c.source.remote_addr).or_insert_with(Vec::new);
-                    e.push(c);
+                    let addpath = if let Some(e) = t.addpath.get(&c.source.remote_addr) {
+                        e.contains(f)
+                    } else {
+                        false
+                    };
+                    e.push((c, addpath));
                 }
             }
         }
@@ -1956,7 +1961,7 @@ impl BmpClient {
         for addr in established_peers {
             let mut header = None;
             if let Some(v) = adjin.remove(&addr) {
-                for m in v {
+                for (m, addpath) in v {
                     if header.is_none() {
                         header = Some(bmp::PerPeerHeader::new(
                             m.source.remote_asn,
@@ -1976,6 +1981,7 @@ impl BmpClient {
                                 m.source.uptime as u32,
                             ),
                             update: m.into(),
+                            addpath,
                         })
                         .await
                         .is_err()
@@ -1987,6 +1993,7 @@ impl BmpClient {
                     .send(&bmp::Message::RouteMonitoring {
                         header: header.unwrap(),
                         update: bgp::Message::eor(Family::IPV4),
+                        addpath: false,
                     })
                     .await
                     .is_err()
@@ -2311,6 +2318,7 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
             table_event_tx: Vec::new(),
             bmp_event_tx: FnvHashMap::default(),
             mrt_event_tx: None,
+            addpath: FnvHashMap::default(),
             global_import_policy: None,
             global_export_policy: None,
         }));
@@ -2821,7 +2829,7 @@ enum TableEvent {
     PassUpdate(
         Arc<table::Source>,
         Family,
-        Vec<(packet::Net, Option<u32>)>,
+        Vec<(packet::Net, u32)>,
         Option<Arc<Vec<packet::Attribute>>>,
     ),
     Disconnected(Arc<table::Source>),
@@ -2836,6 +2844,7 @@ struct Table {
     table_event_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
     bmp_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<bmp::Message>>,
     mrt_event_tx: Option<mpsc::UnboundedSender<mrt::Message>>,
+    addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
 
     // global->ptable copies
     global_import_policy: Option<Arc<table::PolicyAssignment>>,
@@ -2858,6 +2867,11 @@ impl Table {
                         Some(attrs) => {
                             let mut t = TABLE[idx].lock().await;
                             for bmp_tx in t.bmp_event_tx.values() {
+                                let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
+                                    e.contains(&family)
+                                } else {
+                                    false
+                                };
                                 let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
                                     header: bmp::PerPeerHeader::new(
                                         source.remote_asn,
@@ -2871,9 +2885,15 @@ impl Table {
                                         attr: attrs.clone(),
                                         unreach: None,
                                     },
+                                    addpath,
                                 });
                             }
                             if let Some(mrt_tx) = t.mrt_event_tx.as_ref() {
+                                let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
+                                    e.contains(&family)
+                                } else {
+                                    false
+                                };
                                 let msg = mrt::Message::Mp {
                                     header: mrt::MpHeader::new(
                                         source.remote_asn,
@@ -2888,6 +2908,7 @@ impl Table {
                                         attr: attrs.clone(),
                                         unreach: None,
                                     },
+                                    addpath,
                                 };
                                 let _ = mrt_tx.send(msg);
                             }
@@ -2905,7 +2926,7 @@ impl Table {
                                     source.clone(),
                                     family,
                                     net.0,
-                                    net.1.map_or(0, |x| x),
+                                    net.1,
                                     attrs.clone(),
                                     filtered,
                                 ) {
@@ -2925,6 +2946,11 @@ impl Table {
                         None => {
                             let mut t = TABLE[idx].lock().await;
                             for bmp_tx in t.bmp_event_tx.values() {
+                                let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
+                                    e.contains(&family)
+                                } else {
+                                    false
+                                };
                                 let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
                                     header: bmp::PerPeerHeader::new(
                                         source.remote_asn,
@@ -2938,9 +2964,15 @@ impl Table {
                                         attr: Arc::new(Vec::new()),
                                         unreach: Some((family, nets.to_owned())),
                                     },
+                                    addpath,
                                 });
                             }
                             if let Some(mrt_tx) = t.mrt_event_tx.as_ref() {
+                                let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
+                                    e.contains(&family)
+                                } else {
+                                    false
+                                };
                                 let msg = mrt::Message::Mp {
                                     header: mrt::MpHeader::new(
                                         source.remote_asn,
@@ -2955,16 +2987,14 @@ impl Table {
                                         attr: Arc::new(Vec::new()),
                                         unreach: Some((family, nets.to_owned())),
                                     },
+                                    addpath,
                                 };
                                 let _ = mrt_tx.send(msg);
                             }
                             for net in nets {
-                                if let Some(ri) = t.rtable.remove(
-                                    source.clone(),
-                                    family,
-                                    net.0,
-                                    net.1.map_or(0, |x| x),
-                                ) {
+                                if let Some(ri) =
+                                    t.rtable.remove(source.clone(), family, net.0, net.1)
+                                {
                                     for c in t.peer_event_tx.values() {
                                         if let Some(a) = t.global_export_policy.as_ref() {
                                             if t.rtable.apply_policy(
@@ -3141,8 +3171,8 @@ impl Handler {
 
     async fn rx_update(
         &mut self,
-        reach: Option<(Family, Vec<(packet::Net, Option<u32>)>)>,
-        unreach: Option<(Family, Vec<(packet::Net, Option<u32>)>)>,
+        reach: Option<(Family, Vec<(packet::Net, u32)>)>,
+        unreach: Option<(Family, Vec<(packet::Net, u32)>)>,
         attr: Arc<Vec<packet::Attribute>>,
     ) {
         if let Some((family, reach)) = reach {
@@ -3273,6 +3303,12 @@ impl Handler {
                         uptime,
                         self.rs_client,
                     )));
+                    let mut addpath = FnvHashSet::default();
+                    for (family, c) in &codec.channel {
+                        if c.addpath_rx() {
+                            addpath.insert(*family);
+                        }
+                    }
 
                     let d = Table::dealer(&self.remote_addr);
                     for i in 0..*NUM_TABLES {
@@ -3295,6 +3331,9 @@ impl Handler {
                         }
                         t.peer_event_tx
                             .insert(self.remote_addr, self.peer_event_tx.remove(0));
+                        if !addpath.is_empty() {
+                            t.addpath.insert(self.remote_addr, addpath.clone());
+                        }
 
                         let tx = t.table_event_tx[d].clone();
                         self.table_tx.push(tx);
@@ -3513,7 +3552,7 @@ impl Handler {
                             self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         }
 
-                        let unreach: Vec<(packet::Net, Option<u32>)> = pending.unreach.drain().map(|n| (n, None)).collect();
+                        let unreach: Vec<(packet::Net, u32)> = pending.unreach.drain().map(|n| (n, 0)).collect();
                         if !unreach.is_empty() {
                             txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                             let msg = bgp::Message::Update{
@@ -3533,7 +3572,7 @@ impl Handler {
                         let mut sent = Vec::with_capacity(max_tx_count);
                         for (attr, reach) in pending.bucket.iter() {
                             let msg = bgp::Message::Update{
-                                reach: Some((Family::IPV4, reach.iter().copied().map(|n| (n, None)).collect())),
+                                reach: Some((Family::IPV4, reach.iter().copied().map(|n| (n, 0)).collect())),
                                 attr: attr.clone(),
                                 unreach: None,
                             };
@@ -3596,6 +3635,7 @@ impl Handler {
             for i in 0..*NUM_TABLES {
                 let mut t = TABLE[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
+                t.addpath.remove(&self.remote_addr);
                 let _ = self.table_tx[i].send(TableEvent::Disconnected(source.clone()));
                 let reason = self
                     .shutdown
