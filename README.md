@@ -40,13 +40,13 @@ Hello, RustyBGP (32 cpus)!
 
 ## Supported Features
 
-Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/passive connection, etc with the following gRPC APIs.
+Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/passive connection, RPKI, BMP (BGP monitoring protocol), MRT, etc with the following gRPC APIs.
 
 | API             | Relevant CLI                                               | Note                                                              |
 | --------------- | ---------------------------------------------------------- | ----------------------------------------------------------------- |
 | start_bgp       | `gobgp global as <VALUE> router-id <IP>`                   |                                                                   |
 | get_bgp         | `gobgp global`                                             |                                                                   |
-| add_peer        | `gobgp neighbor add <IP> as <VALUE> router-id <IP>`        | only v4/v6 families supported, no fancy capabilities like addpath |
+| add_peer        | `gobgp neighbor add <IP> as <VALUE> router-id <IP>`        | v4/v6 families and addpath (rx) supported|
 | delete_peer     | `gobgp neighbor del <IP>`                                  |                                                                   |
 | list_peer       | `gobgp neighbor`/`gobgp neighbor <IP>`                     |                                                                   |
 | enable_peer     | `gobgp neighbor <IP> enable`                               |                                                                   |
