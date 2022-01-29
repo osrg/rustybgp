@@ -2386,6 +2386,9 @@ fn ipv6_eor() {
     buf.append(&mut body);
     let mut b = BytesMut::from(&buf[..]);
     let mut codec = BgpCodec::new();
+    codec
+        .channel
+        .insert(Family::IPV6, Channel::new(Family::IPV6, false, false));
     let ret = codec.decode(&mut b);
     assert!(ret.is_ok());
 }
@@ -2398,7 +2401,7 @@ fn parse_ipv6_update() {
     let mut file = std::fs::File::open(filename).unwrap();
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).unwrap();
-    let nlri = vec![
+    let nlri: Vec<(Net, u32)> = vec![
         Net::V6(Ipv6Net {
             addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x127, 0, 0, 0, 0),
             mask: 64,
@@ -2415,9 +2418,15 @@ fn parse_ipv6_update() {
             addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x1ff, 0, 0, 0, 0x12),
             mask: 127,
         }),
-    ];
+    ]
+    .into_iter()
+    .map(|n| (n, 0))
+    .collect();
     let mut b = BytesMut::from(&buf[..]);
     let mut codec = BgpCodec::new();
+    codec
+        .channel
+        .insert(Family::IPV6, Channel::new(Family::IPV6, false, false));
     let msg = codec.decode(&mut b).unwrap();
     match msg.unwrap() {
         Message::Update {
@@ -2463,6 +2472,9 @@ fn build_many_v4_route() {
     }
 
     let mut codec = BgpCodec::new().keep_aspath(true);
+    codec
+        .channel
+        .insert(Family::IPV4, Channel::new(Family::IPV4, false, false));
     let mut txbuf = bytes::BytesMut::with_capacity(4096);
     codec.encode(&msg, &mut txbuf).unwrap();
     let mut recv = Vec::new();
