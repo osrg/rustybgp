@@ -972,18 +972,15 @@ impl Attribute {
         &self,
         code: u8,
         dst: Option<&mut BytesMut>,
-        local_as: u32,
-        local_addr: IpAddr,
-        is_mp: bool,
-        keep_aspath: bool,
-        keep_nexthop: bool,
+        family: Family,
+        codec: &BgpCodec,
     ) -> (u16, Option<Attribute>) {
         match code {
             Attribute::AS_PATH => {
-                let n = if keep_aspath {
+                let n = if codec.keep_aspath {
                     self.clone()
                 } else {
-                    self.as_path_prepend(local_as)
+                    self.as_path_prepend(codec.local_as)
                 };
                 let l = if let Some(dst) = dst {
                     n.encode(dst).unwrap()
@@ -993,13 +990,13 @@ impl Attribute {
                 (l, Some(n))
             }
             Attribute::NEXTHOP => {
-                if is_mp {
+                if family != Family::IPV4 {
                     return (0, None);
                 }
-                let n = if keep_nexthop {
+                let n = if codec.keep_nexthop {
                     self.clone()
                 } else {
-                    self.nexthop_update(local_addr)
+                    self.nexthop_update(codec.local_addr)
                 };
                 let l = if let Some(dst) = dst {
                     n.encode(dst).unwrap()
@@ -1786,15 +1783,7 @@ impl BgpCodec {
                                 mp_unreach_done = true;
                             }
                         }
-                        let (n, _) = a.export(
-                            code,
-                            Some(dst),
-                            self.local_as,
-                            self.local_addr,
-                            family != Family::IPV4,
-                            self.keep_aspath,
-                            self.keep_nexthop,
-                        );
+                        let (n, _) = a.export(code, Some(dst), family, self);
                         attr_len += n;
                     }
                 }

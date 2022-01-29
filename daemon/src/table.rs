@@ -365,21 +365,18 @@ impl RoutingTable {
                     })
                     .map(|(_, p)| {
                         if table_type == api::TableType::AdjOut {
+                            let codec = bgp::BgpCodec::new()
+                                .local_as(p.source.local_asn)
+                                .local_addr(p.source.local_addr)
+                                .keep_aspath(p.source.rs_client)
+                                .keep_nexthop(p.source.rs_client);
                             let attr = Arc::new(
                                 (*p).pa
                                     .attr
                                     .iter()
                                     .cloned()
                                     .map(|a| {
-                                        let (_, m) = a.export(
-                                            a.code(),
-                                            None,
-                                            p.source.local_asn,
-                                            p.source.local_addr,
-                                            false,
-                                            p.source.rs_client,
-                                            p.source.rs_client,
-                                        );
+                                        let (_, m) = a.export(a.code(), None, family, &codec);
                                         if let Some(m) = m {
                                             m
                                         } else {
