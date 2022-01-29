@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::too_many_arguments)]
+
 use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
@@ -1638,9 +1640,8 @@ impl GobgpApi for GrpcService {
             ));
         }
         let interval = request.rotation_interval;
-        let filename = request.filename.clone();
         tokio::spawn(async move {
-            let mut d = MrtDumper::new(&filename, interval);
+            let mut d = MrtDumper::new(&request.filename, interval);
             d.serve().await;
         });
         Ok(tonic::Response::new(()))

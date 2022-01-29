@@ -759,9 +759,9 @@ struct Prefix {
     max_length: u8,
 }
 
-static SINGLE_MATCH_REGEX: Lazy<
-    Vec<(Regex, fn(s: &regex::Captures) -> Option<SingleAsPathMatch>)>,
-> = Lazy::new(|| {
+type SingleMatchRegex = (Regex, fn(s: &regex::Captures) -> Option<SingleAsPathMatch>);
+
+static SINGLE_MATCH_REGEX: Lazy<Vec<SingleMatchRegex>> = Lazy::new(|| {
     vec![
         (
             Regex::new(r"^_([0-9]+)_$").unwrap(),

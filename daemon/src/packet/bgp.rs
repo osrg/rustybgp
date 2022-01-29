@@ -311,7 +311,7 @@ impl Ipv4Net {
 
 impl fmt::Display for Ipv4Net {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.addr.to_string(), self.mask)
+        write!(f, "{}/{}", self.addr, self.mask)
     }
 }
 
@@ -354,7 +354,7 @@ impl Ipv6Net {
 
 impl fmt::Display for Ipv6Net {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.addr.to_string(), self.mask)
+        write!(f, "{}/{}", self.addr, self.mask)
     }
 }
 
