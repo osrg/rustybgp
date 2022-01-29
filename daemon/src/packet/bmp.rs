@@ -16,7 +16,6 @@
 use byteorder::{NetworkEndian, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::error::Error;
@@ -218,7 +217,7 @@ impl Encoder<&Message> for BmpCodec {
                     };
                     self.codec
                         .channel
-                        .insert(family, Arc::new(bgp::Channel::new(family, false, *addpath)));
+                        .insert(family, bgp::Channel::new(family, false, *addpath));
                 }
                 self.codec.encode(update, &mut buf).unwrap();
                 c.put_slice(buf.as_ref());

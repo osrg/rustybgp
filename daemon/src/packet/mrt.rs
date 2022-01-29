@@ -16,7 +16,6 @@
 use byteorder::{NetworkEndian, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::SystemTime;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -149,7 +148,7 @@ impl Encoder<&Message> for MrtCodec {
                     };
                     self.codec
                         .channel
-                        .insert(family, Arc::new(bgp::Channel::new(family, false, *addpath)));
+                        .insert(family, bgp::Channel::new(family, false, *addpath));
                 }
                 let subtype = if *addpath {
                     Header::SUBTYPE_AS4_ADDPATH

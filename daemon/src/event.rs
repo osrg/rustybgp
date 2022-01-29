@@ -3236,7 +3236,7 @@ impl Handler {
                 }
                 self.state.remote_asn.store(as_number, Ordering::Relaxed);
                 for (f, c) in bgp::create_channel(&self.local_cap, &capability) {
-                    codec.channel.insert(f, Arc::new(c));
+                    codec.channel.insert(f, c);
                 }
 
                 self.state.remote_cap.write().await.append(&mut capability);

@@ -1547,7 +1547,7 @@ pub(crate) struct BgpCodec {
     local_addr: IpAddr,
     keep_aspath: bool,
     keep_nexthop: bool,
-    pub(crate) channel: FnvHashMap<Family, Arc<Channel>>,
+    pub(crate) channel: FnvHashMap<Family, Channel>,
 }
 
 impl BgpCodec {
@@ -1638,7 +1638,7 @@ impl BgpCodec {
         }
         // padding
         dst.put_u8(0);
-        let addpath = self.channel(family).map_or(false, |c| c.addpath_tx());
+        let addpath = self.channel.get(family).map_or(false, |c| c.addpath_tx());
         for (net, id) in nets {
             if addpath {
                 dst.put_u32(*id);
@@ -1666,7 +1666,7 @@ impl BgpCodec {
         dst.put_u8(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
-        let addpath = self.channel(family).map_or(false, |c| c.addpath_tx());
+        let addpath = self.channel.get(family).map_or(false, |c| c.addpath_tx());
         for (net, id) in nets {
             if addpath {
                 dst.put_u32(*id);
@@ -1741,7 +1741,7 @@ impl BgpCodec {
                 } else {
                     unreach.as_ref().unwrap().0
                 };
-                let addpath = self.channel(&family).map_or(false, |c| c.addpath_tx());
+                let addpath = self.channel.get(&family).map_or(false, |c| c.addpath_tx());
                 dst.put_u8(Message::UPDATE);
                 let pos_withdrawn_len = dst.len();
                 dst.put_u16(0);
@@ -1866,7 +1866,7 @@ impl BgpCodec {
 
     fn decode_nlri<T: io::Read>(
         &self,
-        chan: &Arc<Channel>,
+        chan: &Channel,
         c: &mut T,
         mut len: usize,
     ) -> Result<(Net, u32), Error> {
@@ -1896,10 +1896,6 @@ impl BgpCodec {
             },
             _ => Err(malformed),
         }
-    }
-
-    fn channel(&self, family: &Family) -> Option<Arc<Channel>> {
-        self.channel.get(family).cloned()
     }
 }
 
@@ -2054,7 +2050,7 @@ impl Decoder for BgpCodec {
             }
             Message::UPDATE => {
                 const MINIMUM_UPDATE_LENGTH: usize = 23;
-                let malformed = Error::InvalidMessageFormat {
+                let malformed = || Error::InvalidMessageFormat {
                     code: 3,
                     subcode: 1,
                     data: vec![],
@@ -2073,12 +2069,12 @@ impl Decoder for BgpCodec {
                 c.set_position(Message::HEADER_LENGTH.into());
                 let withdrawn_len = c.read_u16::<NetworkEndian>().unwrap();
                 if buf.len() < (withdrawn_len as usize + MINIMUM_UPDATE_LENGTH) {
-                    return Err(malformed);
+                    return Err(malformed());
                 }
                 c.set_position(c.position() + withdrawn_len as u64);
                 let attr_len = c.read_u16::<NetworkEndian>()?;
                 if buf.len() < (withdrawn_len + attr_len + MINIMUM_UPDATE_LENGTH as u16).into() {
-                    return Err(malformed);
+                    return Err(malformed());
                 }
                 let mut seen = FnvHashMap::default();
                 let attr_end = c.position() + attr_len as u64;
@@ -2114,7 +2110,7 @@ impl Decoder for BgpCodec {
                     match seen.entry(code) {
                         Occupied(_) => {
                             if code == Attribute::MP_REACH || code == Attribute::MP_UNREACH {
-                                return Err(malformed);
+                                return Err(malformed());
                             } else {
                                 c.set_position(c.position() + alen as u64);
                                 continue;
@@ -2171,7 +2167,7 @@ impl Decoder for BgpCodec {
                 if reach_len > 0 && mp_reach_attr.is_some()
                     || withdrawn_len > 0 && mp_unreach_attr.is_some()
                 {
-                    return Err(malformed);
+                    return Err(malformed());
                 }
 
                 // v4 eor
@@ -2215,15 +2211,11 @@ impl Decoder for BgpCodec {
                 }
 
                 if (c.position() as usize) < buf.len() {
-                    let channel = if let Some(c) = self.channel(&Family::IPV4) {
-                        c
-                    } else {
-                        return Err(malformed);
-                    };
+                    let chan = self.channel.get(&Family::IPV4).ok_or_else(malformed)?;
                     while (c.position() as usize) < buf.len() {
                         let rest = buf.len() - c.position() as usize;
 
-                        match self.decode_nlri(&channel, &mut c, rest) {
+                        match self.decode_nlri(chan, &mut c, rest) {
                             Ok(net) => reach.push(net),
                             Err(err) => return Err(err),
                         }
@@ -2231,16 +2223,12 @@ impl Decoder for BgpCodec {
                 }
 
                 if 0 < withdrawn_len {
-                    let channel = if let Some(c) = self.channel(&Family::IPV4) {
-                        c
-                    } else {
-                        return Err(malformed);
-                    };
+                    let chan = self.channel.get(&Family::IPV4).ok_or_else(malformed)?;
                     c.set_position(Message::HEADER_LENGTH as u64 + 2);
                     let withdrawn_end = c.position() + withdrawn_len as u64;
                     while c.position() < withdrawn_end {
                         let rest = withdrawn_end - c.position();
-                        match self.decode_nlri(&channel, &mut c, rest as usize) {
+                        match self.decode_nlri(chan, &mut c, rest as usize) {
                             Ok(net) => unreach.push(net),
                             Err(err) => return Err(err),
                         }
@@ -2284,12 +2272,7 @@ impl Decoder for BgpCodec {
                     }
                     let safi = c.read_u8().unwrap();
                     reach_family = Family((afi as u32) << 16 | safi as u32);
-                    let channel =
-                        if let Some(c) = self.channel(&Family((afi as u32) << 16 | safi as u32)) {
-                            c
-                        } else {
-                            return Err(malformed);
-                        };
+                    let chan = self.channel.get(&reach_family).ok_or_else(malformed)?;
                     let nexthop_len = c.read_u8().unwrap();
                     if buf.len() < 5 + nexthop_len as usize {
                         return Err(err);
@@ -2312,7 +2295,7 @@ impl Decoder for BgpCodec {
                     c.read_u8().unwrap();
                     while c.position() < buf.len() as u64 {
                         let rest = buf.len() - c.position() as usize;
-                        match self.decode_nlri(&channel, &mut c, rest) {
+                        match self.decode_nlri(chan, &mut c, rest) {
                             Ok(net) => reach.push(net),
                             Err(err) => return Err(err),
                         }
@@ -2337,15 +2320,10 @@ impl Decoder for BgpCodec {
                     }
                     let safi = c.read_u8().unwrap();
                     unreach_family = Family((afi as u32) << 16 | safi as u32);
-                    let channel =
-                        if let Some(c) = self.channel(&Family((afi as u32) << 16 | safi as u32)) {
-                            c
-                        } else {
-                            return Err(malformed);
-                        };
+                    let chan = self.channel.get(&unreach_family).ok_or_else(malformed)?;
                     while c.position() < buf.len() as u64 {
                         let rest = buf.len() - c.position() as usize;
-                        match self.decode_nlri(&channel, &mut c, rest) {
+                        match self.decode_nlri(chan, &mut c, rest) {
                             Ok(net) => unreach.push(net),
                             Err(err) => return Err(err),
                         }
