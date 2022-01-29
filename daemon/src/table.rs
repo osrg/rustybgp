@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::proto::ToApi;
 use fnv::FnvHashMap;
 use once_cell::sync::Lazy;
 use patricia_tree::PatriciaMap;
@@ -145,21 +146,6 @@ impl From<RoutingTableState> for api::GetTableResponse {
             num_accepted: i.num_accepted as u64,
         }
     }
-}
-
-// hacky; invent better
-pub(crate) struct ApiDestination {
-    pub(crate) net: packet::Net,
-    pub(crate) paths: Vec<(
-        Arc<Source>,
-        u32,
-        Arc<Vec<packet::Attribute>>,
-        SystemTime,
-        Option<api::Validation>,
-    )>,
-    // pub(crate) attr: Arc<Vec<packet::Attribute>>,
-    // pub(crate) timestamp: SystemTime,
-    // pub(crate) validation: Option<api::Validation>,
 }
 
 pub(crate) struct Reach {
@@ -332,7 +318,8 @@ impl RoutingTable {
         family: Family,
         peer_addr: Option<IpAddr>,
         prefixes: Vec<packet::Net>,
-    ) -> impl Iterator<Item = ApiDestination> + '_ {
+        export_policy: Option<Arc<PolicyAssignment>>,
+    ) -> impl Iterator<Item = api::Destination> + '_ {
         self.global
             .get(&family)
             .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
@@ -349,8 +336,8 @@ impl RoutingTable {
                     found
                 }
             })
-            .map(move |(net, dst)| ApiDestination {
-                net: *net,
+            .map(move |(net, dst)| api::Destination {
+                prefix: net.to_string(),
                 paths: dst
                     .entry
                     .iter()
@@ -363,7 +350,7 @@ impl RoutingTable {
                         }
                         true
                     })
-                    .map(|(_, p)| {
+                    .filter_map(|(_, p)| {
                         if table_type == api::TableType::AdjOut {
                             let codec = bgp::BgpCodec::new()
                                 .local_as(p.source.local_asn)
@@ -385,25 +372,37 @@ impl RoutingTable {
                                     })
                                     .collect::<Vec<packet::Attribute>>(),
                             );
-                            (
-                                p.source.clone(),
-                                0,
-                                attr.clone(),
-                                p.timestamp,
-                                self.rpki.validate(family, &p.source, net, &attr),
-                            )
+                            if let Some(pa) = &export_policy {
+                                if self.apply_policy(pa, &p.source, net, &attr)
+                                    == Disposition::Reject
+                                {
+                                    None
+                                } else {
+                                    Some((p, attr))
+                                }
+                            } else {
+                                Some((p, attr))
+                            }
                         } else {
-                            (
-                                p.source.clone(),
-                                p.id,
-                                p.pa.attr.clone(),
-                                p.timestamp,
-                                self.rpki.validate(family, &p.source, net, &p.pa.attr),
-                            )
+                            Some((p, p.pa.attr.clone()))
                         }
+                    })
+                    .map(|(p, attr)| api::Path {
+                        nlri: Some(net.into()),
+                        family: Some(family.into()),
+                        identifier: if table_type == api::TableType::AdjOut {
+                            0
+                        } else {
+                            p.id
+                        },
+                        age: Some(p.timestamp.to_api()),
+                        pattrs: attr.iter().map(prost_types::Any::from).collect(),
+                        validation: self.rpki.validate(family, &p.source, net, &attr),
+                        ..Default::default()
                     })
                     .collect(),
             })
+            .filter(|d| !d.paths.is_empty())
     }
 
     pub(crate) fn insert(

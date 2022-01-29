@@ -46,7 +46,6 @@ use crate::auth;
 use crate::config;
 use crate::error::Error;
 use crate::packet::{self, bgp, bmp, mrt, rpki, Family};
-use crate::proto::ToApi;
 use crate::table;
 
 #[derive(Default)]
@@ -1166,53 +1165,17 @@ impl GobgpApi for GrpcService {
         let mut v = Vec::new();
         for i in 0..*NUM_TABLES {
             let t = TABLE[i].lock().await;
-            for mut d in t
+            let pa = if table_type == api::TableType::AdjOut {
+                t.global_export_policy.as_ref().cloned()
+            } else {
+                None
+            };
+            for d in t
                 .rtable
-                .iter_api(table_type, family, peer_addr, prefixes.clone())
+                .iter_api(table_type, family, peer_addr, prefixes.clone(), pa)
             {
-                if table_type == api::TableType::AdjOut {
-                    if let Some(a) = t.global_export_policy.as_ref() {
-                        // drain_filter() still in unstable
-                        let mut i = 0;
-                        while i < d.paths.len() {
-                            let (source, _, attrs, _, _) = &d.paths[i];
-                            if t.rtable.apply_policy(a, source, &d.net, attrs)
-                                == table::Disposition::Reject
-                            {
-                                let _ = d.paths.remove(i);
-                            } else {
-                                i += 1;
-                            }
-                        }
-                    }
-                }
-                let paths: Vec<api::Path> = d
-                    .paths
-                    .iter()
-                    .map(|x| api::Path {
-                        nlri: Some((&d.net).into()),
-                        family: Some(family.into()),
-                        identifier: if table_type == api::TableType::AdjOut {
-                            0
-                        } else {
-                            x.1
-                        },
-                        age: Some(x.3.to_api()),
-                        pattrs: x.2.iter().map(prost_types::Any::from).collect(),
-                        validation: x.4.clone(),
-                        ..Default::default()
-                    })
-                    .collect();
-
-                if paths.is_empty() {
-                    continue;
-                }
-
                 v.push(api::ListPathResponse {
-                    destination: Some(api::Destination {
-                        prefix: d.net.to_string(),
-                        paths,
-                    }),
+                    destination: Some(d),
                 });
             }
         }
