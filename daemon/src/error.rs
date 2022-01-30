@@ -28,7 +28,7 @@ pub(crate) enum Error {
     #[error("feature isn't supported")]
     Unimplemented,
 
-    #[error("incorrect bgp format {code:?}")]
+    #[error("incorrect bgp format {code:?} {subcode:?}")]
     InvalidMessageFormat {
         code: u8,
         subcode: u8,

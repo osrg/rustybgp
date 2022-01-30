@@ -1594,17 +1594,20 @@ impl BgpCodec {
 
     fn mp_reach_encode(
         &self,
+        buf_head: usize,
         attrs: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
         reach: &(Family, Vec<(Net, u32)>),
+        reach_idx: &mut usize,
     ) -> Result<u16, ()> {
         let (family, nets) = reach;
         let desc = ATTR_DESCS.get(&Attribute::MP_REACH).unwrap();
         let pos_head = dst.len();
-        dst.put_u8(desc.flags);
+        // always use extended length
+        dst.put_u8(desc.flags | Attribute::FLAG_EXTENDED);
         dst.put_u8(desc.code);
         let pos_bin = dst.len();
-        dst.put_u8(0);
+        dst.put_u16(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
         if self.keep_nexthop {
@@ -1636,42 +1639,63 @@ impl BgpCodec {
         // padding
         dst.put_u8(0);
         let addpath = self.channel.get(family).map_or(false, |c| c.addpath_tx());
-        for (net, id) in nets {
-            if addpath {
-                dst.put_u32(*id);
+        let max_len = 1 + 16 + if addpath { 4 } else { 0 };
+        for (i, item) in nets.iter().enumerate().skip(*reach_idx) {
+            let (net, id) = item;
+            if buf_head + self.max_message_length() > dst.len() + max_len {
+                if addpath {
+                    dst.put_u32(*id);
+                }
+                net.encode(dst).unwrap();
+                *reach_idx = i;
+            } else {
+                break;
             }
-            net.encode(dst).unwrap();
         }
-        let mp_len = (dst.len() - pos_head) as u8;
-        (&mut dst.as_mut()[pos_bin..]).write_u8(mp_len - 3).unwrap();
+        let mp_len = (dst.len() - pos_head) as u16;
+        (&mut dst.as_mut()[pos_bin..])
+            .write_u16::<NetworkEndian>(mp_len - 4)
+            .unwrap();
 
         Ok(mp_len as u16)
     }
 
     fn mp_unreach_encode(
         &self,
+        buf_head: usize,
         _: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
         unreach: &(Family, Vec<(Net, u32)>),
+        unreach_idx: &mut usize,
     ) -> Result<u16, ()> {
         let (family, nets) = unreach;
         let desc = ATTR_DESCS.get(&Attribute::MP_UNREACH).unwrap();
         let pos_head = dst.len();
-        dst.put_u8(desc.flags);
+        // always use extended length
+        dst.put_u8(desc.flags | Attribute::FLAG_EXTENDED);
         dst.put_u8(desc.code);
         let pos_bin = dst.len();
-        dst.put_u8(0);
+        dst.put_u16(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
         let addpath = self.channel.get(family).map_or(false, |c| c.addpath_tx());
-        for (net, id) in nets {
-            if addpath {
-                dst.put_u32(*id);
+        let max_len = 1 + 16 + if addpath { 4 } else { 0 };
+        for (i, item) in nets.iter().enumerate().skip(*unreach_idx) {
+            let (net, id) = item;
+            if buf_head + self.max_message_length() > dst.len() + max_len {
+                if addpath {
+                    dst.put_u32(*id);
+                }
+                net.encode(dst).unwrap();
+                *unreach_idx = i;
+            } else {
+                break;
             }
-            net.encode(dst).unwrap();
         }
-        let mp_len = (dst.len() - pos_head) as u8;
-        (&mut dst.as_mut()[pos_bin..]).write_u8(mp_len - 3).unwrap();
+        let mp_len = (dst.len() - pos_head) as u16;
+        (&mut dst.as_mut()[pos_bin..])
+            .write_u16::<NetworkEndian>(mp_len - 4)
+            .unwrap();
         Ok(mp_len as u16)
     }
 
@@ -1730,8 +1754,6 @@ impl BgpCodec {
                 attr,
                 unreach,
             } => {
-                let mut mp_reach_done = false;
-                let mut mp_unreach_done = false;
                 let attrs = attr.clone();
                 let family = if let Some(reach) = reach {
                     reach.0
@@ -1766,37 +1788,26 @@ impl BgpCodec {
                 }
                 let pos_attr_len = dst.len();
                 dst.put_u16(0);
+                // like BIRD, for simplicity, MP_REACH/MP_UNREACH attribute ins't ordered.
+                // BIRD encodes MP_REACH/MP_UNREACH first and then the rest.
+                // RustyBGP encode MP_REACH/MP_UNREACH last.
                 let mut attr_len = 0;
                 for a in &*attrs {
                     if a.flags & Attribute::FLAG_TRANSITIVE > 0 {
                         let code = a.code();
-                        if code > Attribute::MP_REACH && family != Family::IPV4 {
-                            if let Some(reach) = reach {
-                                attr_len += self.mp_reach_encode(attr.clone(), dst, reach).unwrap();
-                                mp_reach_done = true;
-                            }
-                        }
-                        if code > Attribute::MP_UNREACH && family != Family::IPV4 {
-                            if let Some(unreach) = unreach {
-                                attr_len +=
-                                    self.mp_unreach_encode(attr.clone(), dst, unreach).unwrap();
-                                mp_unreach_done = true;
-                            }
-                        }
                         let (n, _) = a.export(code, Some(dst), family, self);
                         attr_len += n;
                     }
                 }
                 if family != Family::IPV4 {
                     if let Some(reach) = reach {
-                        if !mp_reach_done {
-                            attr_len += self.mp_reach_encode(attr.clone(), dst, reach).unwrap();
-                        }
-                    }
-                    if let Some(unreach) = unreach {
-                        if !mp_unreach_done {
-                            attr_len += self.mp_unreach_encode(attr.clone(), dst, unreach).unwrap();
-                        }
+                        attr_len += self
+                            .mp_reach_encode(pos_head, attr.clone(), dst, reach, reach_idx)
+                            .unwrap();
+                    } else if let Some(unreach) = unreach {
+                        attr_len += self
+                            .mp_unreach_encode(pos_head, attr.clone(), dst, unreach, reach_idx)
+                            .unwrap();
                     }
                 }
 
@@ -2529,6 +2540,116 @@ fn build_many_v4_route() {
     }
     assert_eq!(withdrawn.len(), net.len());
     for n in &withdrawn {
+        let b = set.remove(n);
+        assert!(b);
+    }
+    assert_eq!(set.len(), 0);
+}
+
+#[test]
+fn many_mp_reach() {
+    let net: Vec<Net> = (0..2000u128)
+        .map(|i| {
+            Net::V6(Ipv6Net {
+                addr: Ipv6Addr::from(i),
+                mask: 128,
+            })
+        })
+        .collect();
+
+    let reach = net.iter().cloned().map(|n| (n, 0)).collect();
+    let mut set = fnv::FnvHashSet::default();
+    for n in &net {
+        set.insert((*n, 0));
+    }
+
+    let msg = Message::Update {
+        reach: Some((Family::IPV6, reach)),
+        attr: Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
+            Attribute::new_with_bin(Attribute::NEXTHOP, (0..31).collect::<Vec<u8>>()).unwrap(),
+        ]),
+        unreach: None,
+    };
+
+    let mut codec = BgpCodec::new().keep_aspath(true);
+    codec
+        .channel
+        .insert(Family::IPV6, Channel::new(Family::IPV6, false, false));
+    let mut txbuf = bytes::BytesMut::with_capacity(4096);
+    codec.encode(&msg, &mut txbuf).unwrap();
+    let mut recv = Vec::new();
+    loop {
+        match codec.decode(&mut txbuf) {
+            Ok(m) => match m {
+                Some(m) => match m {
+                    Message::Update { reach, .. } => {
+                        recv.append(&mut reach.unwrap().1);
+                    }
+                    _ => {}
+                },
+                None => break,
+            },
+            Err(e) => panic!("failed to decode {}", e),
+        }
+    }
+    assert_eq!(recv.len(), net.len());
+
+    for n in &recv {
+        let b = set.remove(n);
+        assert!(b);
+    }
+    assert_eq!(set.len(), 0);
+}
+
+#[test]
+fn many_mp_unreach() {
+    let net: Vec<Net> = (0..2000u128)
+        .map(|i| {
+            Net::V6(Ipv6Net {
+                addr: Ipv6Addr::from(i),
+                mask: 128,
+            })
+        })
+        .collect();
+
+    let unreach = net.iter().cloned().map(|n| (n, 0)).collect();
+    let mut set = fnv::FnvHashSet::default();
+    for n in &net {
+        set.insert((*n, 0));
+    }
+
+    let msg = Message::Update {
+        reach: None,
+        attr: Arc::new(Vec::new()),
+        unreach: Some((Family::IPV6, unreach)),
+    };
+
+    let mut codec = BgpCodec::new().keep_aspath(true);
+    codec
+        .channel
+        .insert(Family::IPV6, Channel::new(Family::IPV6, false, false));
+    let mut txbuf = bytes::BytesMut::with_capacity(4096);
+    codec.encode(&msg, &mut txbuf).unwrap();
+    let mut recv = Vec::new();
+    loop {
+        match codec.decode(&mut txbuf) {
+            Ok(m) => match m {
+                Some(m) => match m {
+                    Message::Update { unreach, .. } => {
+                        recv.append(&mut unreach.unwrap().1);
+                    }
+                    _ => {}
+                },
+                None => break,
+            },
+            Err(e) => panic!("failed to decode {}", e),
+        }
+    }
+    assert_eq!(recv.len(), net.len());
+
+    for n in &recv {
         let b = set.remove(n);
         assert!(b);
     }
