@@ -1156,6 +1156,21 @@ impl From<&Attribute> for prost_types::Any {
                 }
                 proto::to_any(api::ClusterListAttribute { ids }, name)
             }
+            Attribute::LARGE_COMMUNITY => {
+                let mut c = Cursor::new(a.binary().unwrap());
+                let mut v = Vec::new();
+                for _ in 0..c.get_ref().len() / 12 {
+                    let global_admin = c.read_u32::<NetworkEndian>().unwrap();
+                    let local_data1 = c.read_u32::<NetworkEndian>().unwrap();
+                    let local_data2 = c.read_u32::<NetworkEndian>().unwrap();
+                    v.push(api::LargeCommunity {
+                        global_admin,
+                        local_data1,
+                        local_data2,
+                    });
+                }
+                proto::to_any(api::LargeCommunitiesAttribute { communities: v }, name)
+            }
             _ => proto::to_any(
                 api::UnknownAttribute {
                     flags: a.flags as u32,
@@ -1243,6 +1258,16 @@ impl TryFrom<prost_types::Any> for Attribute {
                 let _ = c.write_u32::<NetworkEndian>(addr.into());
             }
             Ok(Attribute::new_with_bin(Attribute::COMMUNITY, c.into_inner()).unwrap())
+        } else if a.type_url == proto::type_url("LargeCommunitiesAttribute") {
+            let a = api::LargeCommunitiesAttribute::decode(&*a.value)
+                .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+            let mut c = Cursor::new(Vec::new());
+            for v in a.communities {
+                let _ = c.write_u32::<NetworkEndian>(v.global_admin);
+                let _ = c.write_u32::<NetworkEndian>(v.local_data1);
+                let _ = c.write_u32::<NetworkEndian>(v.local_data2);
+            }
+            Ok(Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, c.into_inner()).unwrap())
         } else {
             Err(Error::InvalidArgument(format!(
                 "unknown type url {}",
