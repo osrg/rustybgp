@@ -1268,6 +1268,22 @@ impl TryFrom<prost_types::Any> for Attribute {
                 let _ = c.write_u32::<NetworkEndian>(v.local_data2);
             }
             Ok(Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, c.into_inner()).unwrap())
+        } else if a.type_url == proto::type_url("MpReachNLRIAttribute") {
+            let a = api::MpReachNlriAttribute::decode(&*a.value)
+                .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+            let mut v = Vec::new();
+            // FIXME: only simple nexthop is supported
+            if let Some(n) = a.next_hops.into_iter().next() {
+                if let Ok(n) = n.parse::<Ipv4Addr>() {
+                    v.append(&mut n.octets().to_vec());
+                } else if let Ok(n) = n.parse::<Ipv6Addr>() {
+                    v.append(&mut n.octets().to_vec());
+                } else {
+                    return Err(Error::InvalidArgument("invalid nexthop".to_string()));
+                }
+            }
+            if !v.is_empty() {}
+            Ok(Attribute::new_with_bin(Attribute::MP_REACH, v).unwrap())
         } else {
             Err(Error::InvalidArgument(format!(
                 "unknown type url {}",

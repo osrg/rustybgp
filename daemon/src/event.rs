@@ -719,9 +719,20 @@ impl GrpcService {
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
         let mut attr = Vec::new();
         for a in path.pattrs {
-            attr.push(packet::Attribute::try_from(a).map_err(|_| {
+            let a = packet::Attribute::try_from(a).map_err(|_| {
                 tonic::Status::new(tonic::Code::InvalidArgument, "invalid attribute")
-            })?);
+            })?;
+            if a.code() == bgp::Attribute::MP_REACH {
+                attr.push(
+                    bgp::Attribute::new_with_bin(
+                        bgp::Attribute::NEXTHOP,
+                        a.binary().unwrap().to_owned(),
+                    )
+                    .unwrap(),
+                );
+            } else {
+                attr.push(a);
+            }
         }
         Ok((
             Table::dealer(&net),
