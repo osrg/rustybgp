@@ -229,7 +229,6 @@ impl Peer {
         self.route_stats = FnvHashMap::default();
         self.mgmt_tx = None;
         self.local_port = 0;
-        self.remote_port = 0;
     }
 }
 
