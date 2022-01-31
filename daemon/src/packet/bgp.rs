@@ -1257,7 +1257,7 @@ impl TryFrom<prost_types::Any> for Attribute {
                     Ipv4Addr::from_str(&v).map_err(|e| Error::InvalidArgument(e.to_string()))?;
                 let _ = c.write_u32::<NetworkEndian>(addr.into());
             }
-            Ok(Attribute::new_with_bin(Attribute::COMMUNITY, c.into_inner()).unwrap())
+            Ok(Attribute::new_with_bin(Attribute::CLUSTER_LIST, c.into_inner()).unwrap())
         } else if a.type_url == proto::type_url("LargeCommunitiesAttribute") {
             let a = api::LargeCommunitiesAttribute::decode(&*a.value)
                 .map_err(|e| Error::InvalidArgument(e.to_string()))?;
