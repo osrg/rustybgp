@@ -281,7 +281,7 @@ pub(crate) struct Ipv4Net {
 impl Ipv4Net {
     fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Ipv4Net, Error> {
         let bit_len = c.read_u8()?;
-        if len < ((bit_len as usize + 7) / 8) {
+        if len < ((bit_len as usize + 7) / 8) || bit_len > 32 {
             return Err(Error::InvalidMessageFormat {
                 code: 3,
                 subcode: 1,
@@ -315,6 +315,16 @@ impl fmt::Display for Ipv4Net {
     }
 }
 
+#[test]
+fn parse_bogus_ipv4net() {
+    // try to ipv6 prefix
+    let mut buf = vec![128];
+    buf.append(&mut Ipv6Addr::from(139930210).octets().to_vec());
+    let len = buf.len();
+    let mut c = Cursor::new(buf);
+    assert!(Ipv4Net::decode(&mut c, len).is_err());
+}
+
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
 pub(crate) struct Ipv6Net {
     pub(crate) addr: Ipv6Addr,
@@ -324,7 +334,7 @@ pub(crate) struct Ipv6Net {
 impl Ipv6Net {
     fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Ipv6Net, Error> {
         let bit_len = c.read_u8()?;
-        if len < ((bit_len as usize + 7) / 8) {
+        if len < ((bit_len as usize + 7) / 8) || bit_len > 128 {
             return Err(Error::InvalidMessageFormat {
                 code: 3,
                 subcode: 1,
@@ -356,6 +366,17 @@ impl fmt::Display for Ipv6Net {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.addr, self.mask)
     }
+}
+
+#[test]
+fn parse_bogus_ipv6net() {
+    // try to ipv6 prefix
+    let mut buf = vec![192];
+    buf.append(&mut Ipv6Addr::from(139930210).octets().to_vec());
+    buf.append(&mut (0..8).collect::<Vec<u8>>());
+    let len = buf.len();
+    let mut c = Cursor::new(buf);
+    assert!(Ipv6Net::decode(&mut c, len).is_err());
 }
 
 #[derive(Debug, Clone)]
