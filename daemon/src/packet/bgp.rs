@@ -1282,7 +1282,6 @@ impl TryFrom<prost_types::Any> for Attribute {
                     return Err(Error::InvalidArgument("invalid nexthop".to_string()));
                 }
             }
-            if !v.is_empty() {}
             Ok(Attribute::new_with_bin(Attribute::MP_REACH, v).unwrap())
         } else {
             Err(Error::InvalidArgument(format!(
