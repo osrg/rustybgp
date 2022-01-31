@@ -3180,7 +3180,8 @@ impl Handler {
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
         msg: bgp::Message,
-        pending: &mut PendingTx,
+        urgent: &mut Vec<bgp::Message>,
+        pending: &mut FnvHashMap<Family, PendingTx>,
     ) -> std::result::Result<(), Error> {
         match msg {
             bgp::Message::Open {
@@ -3190,7 +3191,7 @@ impl Handler {
                 router_id,
                 mut capability,
             } => {
-                pending.urgent.push(bgp::Message::Keepalive);
+                urgent.push(bgp::Message::Keepalive);
                 self.state
                     .remote_holdtime
                     .store(holdtime, Ordering::Relaxed);
@@ -3199,7 +3200,7 @@ impl Handler {
                     .store(router_id.into(), Ordering::Relaxed);
                 let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
                 if remote_asn != 0 && remote_asn != as_number {
-                    pending.urgent.insert(
+                    urgent.insert(
                         0,
                         bgp::Message::Notification {
                             code: 2,
@@ -3283,6 +3284,13 @@ impl Handler {
                         if c.addpath_rx() {
                             addpath.insert(*family);
                         }
+                        pending.insert(
+                            *family,
+                            PendingTx {
+                                sync: true,
+                                ..Default::default()
+                            },
+                        );
                     }
 
                     let d = Table::dealer(&self.remote_addr);
@@ -3297,11 +3305,7 @@ impl Handler {
                                         continue;
                                     }
                                 }
-                                if f == &Family::IPV4 {
-                                    pending.insert_change(c);
-                                } else {
-                                    pending.urgent.push(c.into());
-                                }
+                                pending.get_mut(f).unwrap().insert_change(c);
                             }
                         }
                         t.peer_event_tx
@@ -3357,7 +3361,6 @@ impl Handler {
                             }
                         }
                     }
-                    pending.sync = true;
                 }
                 Ok(())
             }
@@ -3394,16 +3397,14 @@ impl Handler {
             peer_event_rx.push(UnboundedReceiverStream::new(rx));
         }
 
-        let mut pending = PendingTx {
-            urgent: vec![bgp::Message::Open {
-                version: 4,
-                as_number: self.local_asn,
-                holdtime: self.local_holdtime as u16,
-                router_id: self.local_router_id,
-                capability: self.local_cap.to_owned(),
-            }],
-            ..Default::default()
-        };
+        let mut pending_update: FnvHashMap<Family, PendingTx> = FnvHashMap::default();
+        let mut urgent = vec![bgp::Message::Open {
+            version: 4,
+            as_number: self.local_asn,
+            holdtime: self.local_holdtime as u16,
+            router_id: self.local_router_id,
+            capability: self.local_cap.to_owned(),
+        }];
 
         self.state
             .fsm
@@ -3417,8 +3418,16 @@ impl Handler {
         while self.shutdown.is_none() {
             let mut peer_event_futures: FuturesUnordered<_> =
                 peer_event_rx.iter_mut().map(|rx| rx.next()).collect();
-            let interest = if pending.is_empty() {
-                tokio::io::Interest::READABLE
+
+            let interest = if urgent.is_empty() {
+                let mut interest = tokio::io::Interest::READABLE;
+                for p in pending_update.values_mut() {
+                    if !p.is_empty() {
+                        interest |= tokio::io::Interest::WRITABLE;
+                        break;
+                    }
+                }
+                interest
             } else {
                 tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE
             };
@@ -3427,12 +3436,12 @@ impl Handler {
             futures::select_biased! {
                 _ = self.keepalive_timer.tick().fuse() => {
                     if self.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
-                        pending.urgent.insert(0, bgp::Message::Keepalive);
+                        urgent.insert(0, bgp::Message::Keepalive);
                     }
                 }
                 msg = mgmt_rx.recv().fuse() => {
                     if let Some(PeerMgmtMsg::Notification(msg)) = msg {
-                        pending.urgent.insert(0, msg);
+                        urgent.insert(0, msg);
                     }
                 }
                 _ = holdtime_futures.next() => {
@@ -3456,11 +3465,7 @@ impl Handler {
                                 if !codec.channel.contains_key(&ri.family) {
                                     continue;
                                 }
-                                if ri.family == Family::IPV4 {
-                                    pending.insert_change(ri);
-                                } else {
-                                    pending.urgent.push(ri.into());
-                                }
+                                pending_update.get_mut(&ri.family).unwrap().insert_change(ri);
                             }
                         }
                     }
@@ -3482,7 +3487,7 @@ impl Handler {
                                     Ok(msg) => match msg {
                                         Some(msg) => {
                                             (*self.counter_rx).sync(&msg);
-                                            let _ = self.rx_msg(&mut codec, local_sockaddr, remote_sockaddr, msg, &mut pending).await;
+                                            let _ = self.rx_msg(&mut codec, local_sockaddr, remote_sockaddr, msg, &mut urgent, &mut pending_update).await;
                                         }
                                         None => {
                                             // partial read
@@ -3491,7 +3496,7 @@ impl Handler {
                                     }
                                     Err(e) => {
                                         if let Error::InvalidMessageFormat{code, subcode, data} = e {
-                                            pending.urgent.insert(0, bgp::Message::Notification{code, subcode, data: data.to_owned()});
+                                            urgent.insert(0, bgp::Message::Notification{code, subcode, data: data.to_owned()});
                                             self.shutdown = Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification{code, subcode, data}));
                                         } else {
                                             self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
@@ -3509,8 +3514,8 @@ impl Handler {
 
                     if ready.is_writable() {
                         let mut txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                        for _ in 0..pending.urgent.len() {
-                            let msg = pending.urgent.remove(0);
+                        for _ in 0..urgent.len() {
+                            let msg = urgent.remove(0);
                             let _ = codec.encode(&msg, &mut txbuf);
                             (*self.counter_tx).sync(&msg);
 
@@ -3527,68 +3532,77 @@ impl Handler {
                             self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         }
 
-                        let unreach: Vec<(packet::Net, u32)> = pending.unreach.drain().map(|n| (n, 0)).collect();
-                        if !unreach.is_empty() {
-                            txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                            let msg = bgp::Message::Update{
-                                reach: None,
-                                attr: Arc::new(Vec::new()),
-                                unreach: Some((Family::IPV4, unreach)),
-                            };
-                            let _ = codec.encode(&msg, &mut txbuf);
-                            self.counter_tx.sync(&msg);
-                            if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
-                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                        for (family, p) in &mut pending_update {
+                            let unreach: Vec<(packet::Net, u32)> = p.unreach.drain().map(|n| (n, 0)).collect();
+                            if !unreach.is_empty() {
+                                txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                                let msg = bgp::Message::Update{
+                                    reach: None,
+                                    attr: Arc::new(Vec::new()),
+                                    unreach: Some((*family, unreach)),
+                                };
+                                let _ = codec.encode(&msg, &mut txbuf);
+                                self.counter_tx.sync(&msg);
+                                if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
+                                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                                }
                             }
                         }
 
                         txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                         let max_tx_count = 2048;
-                        let mut sent = Vec::with_capacity(max_tx_count);
-                        for (attr, reach) in pending.bucket.iter() {
-                            let msg = bgp::Message::Update{
-                                reach: Some((Family::IPV4, reach.iter().copied().map(|n| (n, 0)).collect())),
-                                attr: attr.clone(),
-                                unreach: None,
-                            };
-                            let _ = codec.encode(&msg, &mut txbuf);
-                            self.counter_tx.sync(&msg);
-                            sent.push(attr.clone());
+                        let mut sent = FnvHashMap::default();
+                        for (family, p) in &mut pending_update {
+                            for (attr, reach) in p.bucket.iter() {
+                                let msg = bgp::Message::Update{
+                                    reach: Some((*family, reach.iter().copied().map(|n| (n, 0)).collect())),
+                                    attr: attr.clone(),
+                                    unreach: None,
+                                };
+                                let _ = codec.encode(&msg, &mut txbuf);
+                                self.counter_tx.sync(&msg);
+                                sent.entry(*family).or_insert_with(|| Vec::with_capacity(max_tx_count)).push(attr.clone());
 
-                            if txbuf.len() > txbuf_size {
-                                let buf = txbuf.freeze();
-                                txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                                if stream.write_all(&buf).await.is_err() {
-                                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                                if txbuf.len() > txbuf_size {
+                                    let buf = txbuf.freeze();
+                                    txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                                    if stream.write_all(&buf).await.is_err() {
+                                        self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                                        break;
+                                    }
+                                }
+
+                                if sent.len() > max_tx_count {
                                     break;
                                 }
-                            }
-
-                            if sent.len() > max_tx_count {
-                                break;
                             }
                         }
                         if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
                             self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         }
 
-                        for attr in sent.drain(..) {
-                            let mut bucket = pending.bucket.remove(&attr).unwrap();
-                            for net in bucket.drain() {
-                                let _ = pending.reach.remove(&net).unwrap();
+                        for (family, mut s) in sent {
+                            for attr in s.drain(..) {
+                                let p = pending_update.get_mut(&family).unwrap();
+                                let mut bucket = p.bucket.remove(&attr).unwrap();
+                                for net in bucket.drain() {
+                                    let _ = p.reach.remove(&net).unwrap();
+                                }
                             }
                         }
 
-                        if pending.sync && pending.is_empty() && self.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
-                            pending.sync = false;
-                            let mut b = bytes::BytesMut::with_capacity(txbuf_size);
-                            let eor: Vec<bgp::Message> = codec.channel.keys().map(|f| bgp::Message::eor(*f)).collect();
-                            for msg in eor {
-                                let _ = codec.encode(&msg, &mut b);
-                            }
-                            if stream.write_all(&b.freeze()).await.is_err() {
-                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                                break;
+                        if self.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
+                            for (family, p) in &mut pending_update {
+                                if p.sync && p.is_empty() {
+                                    p.sync = false;
+                                    let mut b = bytes::BytesMut::with_capacity(txbuf_size);
+                                    let eor = bgp::Message::eor(*family);
+                                    let _ = codec.encode(&eor, &mut b);
+                                    if stream.write_all(&b.freeze()).await.is_err() {
+                                        self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -3639,7 +3653,6 @@ impl Handler {
 
 #[derive(Default)]
 struct PendingTx {
-    urgent: Vec<bgp::Message>,
     reach: FnvHashMap<packet::Net, Arc<Vec<packet::Attribute>>>,
     unreach: FnvHashSet<packet::Net>,
     bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<packet::Net>>,
@@ -3648,7 +3661,7 @@ struct PendingTx {
 
 impl PendingTx {
     fn is_empty(&self) -> bool {
-        self.urgent.is_empty() && self.reach.is_empty() && self.unreach.is_empty()
+        self.reach.is_empty() && self.unreach.is_empty()
     }
 
     fn insert_change(&mut self, change: table::Change) {
