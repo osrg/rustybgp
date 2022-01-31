@@ -169,13 +169,14 @@ struct Peer {
     configured_time: u64,
 
     remote_addr: IpAddr,
-    local_addr: IpAddr,
-    local_asn: u32,
     remote_port: u16,
-    local_port: u16,
+    local_asn: u32,
     passive: bool,
     admin_down: bool,
     delete_on_disconnected: bool,
+
+    remote_sockaddr: SocketAddr,
+    local_sockaddr: SocketAddr,
 
     holdtime: u64,
     connect_retry_time: u64,
@@ -228,18 +229,16 @@ impl Peer {
             .store(SessionState::Idle as u8, Ordering::Relaxed);
         self.route_stats = FnvHashMap::default();
         self.mgmt_tx = None;
-        self.local_port = 0;
-        self.remote_port = 0;
     }
 }
 
 struct PeerBuilder {
     remote_addr: IpAddr,
-    remote_asn: u32,
     remote_port: u16,
-    local_addr: IpAddr,
+    remote_asn: u32,
+    remote_sockaddr: SocketAddr,
+    local_sockaddr: SocketAddr,
     local_asn: u32,
-    local_port: u16,
     local_cap: Vec<packet::Capability>,
     passive: bool,
     rs_client: bool,
@@ -262,9 +261,9 @@ impl PeerBuilder {
             remote_addr,
             remote_asn: 0,
             remote_port: Global::BGP_PORT,
-            local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            remote_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0)), 0),
+            local_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0)), 0),
             local_asn: 0,
-            local_port: 0,
             local_cap: Vec::new(),
             passive: false,
             rs_client: false,
@@ -303,13 +302,13 @@ impl PeerBuilder {
         self
     }
 
-    fn local_addr(&mut self, addr: IpAddr) -> &mut Self {
-        self.local_addr = addr;
+    fn remote_sockaddr(&mut self, sockaddr: SocketAddr) -> &mut Self {
+        self.remote_sockaddr = sockaddr;
         self
     }
 
-    fn local_port(&mut self, port: u16) -> &mut Self {
-        self.local_port = port;
+    fn local_sockaddr(&mut self, sockaddr: SocketAddr) -> &mut Self {
+        self.local_sockaddr = sockaddr;
         self
     }
 
@@ -381,7 +380,6 @@ impl PeerBuilder {
     fn build(&mut self) -> Peer {
         Peer {
             remote_addr: self.remote_addr,
-            local_addr: self.local_addr,
             configured_time: SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -391,7 +389,8 @@ impl PeerBuilder {
             } else {
                 Global::BGP_PORT
             },
-            local_port: 0,
+            local_sockaddr: self.local_sockaddr,
+            remote_sockaddr: self.remote_sockaddr,
             local_asn: self.local_asn,
             passive: self.passive,
             delete_on_disconnected: self.delete_on_disconnected,
@@ -1910,9 +1909,9 @@ impl BmpClient {
                         peer.remote_addr,
                         peer.state.uptime.load(Ordering::Relaxed) as u32,
                     ),
-                    local_addr: peer.local_addr,
-                    local_port: peer.local_port,
-                    remote_port: peer.remote_port,
+                    local_addr: peer.local_sockaddr.ip(),
+                    local_port: peer.local_sockaddr.port(),
+                    remote_port: peer.remote_sockaddr.port(),
                     remote_open: bgp::Message::Open {
                         version: 4,
                         as_number: peer.state.remote_asn.load(Ordering::Relaxed),
@@ -2400,7 +2399,6 @@ impl Global {
         let local_sockaddr = stream.local_addr().ok()?;
         let remote_sockaddr = stream.peer_addr().ok()?;
         let remote_addr = remote_sockaddr.ip();
-        let remote_port = remote_sockaddr.port();
         let mut global = GLOBAL.write().await;
         let router_id = global.router_id;
         let (peer, mgmt_rx) = match global.peers.get_mut(&remote_addr) {
@@ -2416,9 +2414,8 @@ impl Global {
                     println!("already has connection {}", remote_addr);
                     return None;
                 }
-                peer.remote_port = remote_port;
-                peer.local_port = local_sockaddr.port();
-                peer.local_addr = local_sockaddr.ip();
+                peer.remote_sockaddr = remote_sockaddr;
+                peer.local_sockaddr = local_sockaddr;
                 peer.state
                     .fsm
                     .store(SessionState::Active as u8, Ordering::Relaxed);
@@ -2456,9 +2453,8 @@ impl Global {
                     .remote_asn(remote_asn)
                     .delete_on_disconnected(true)
                     .rs_client(rs_client)
-                    .remote_port(remote_port)
-                    .local_port(local_sockaddr.port())
-                    .local_addr(local_sockaddr.ip())
+                    .remote_sockaddr(remote_sockaddr)
+                    .local_sockaddr(local_sockaddr)
                     .ctrl_channel(tx);
                 if let Some(holdtime) = holdtime {
                     builder.holdtime(holdtime);
