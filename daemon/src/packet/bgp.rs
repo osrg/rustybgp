@@ -607,7 +607,7 @@ impl Capability {
 struct CapDesc {
     code: u8,
     url: &'static str,
-    decode: fn(s: &mut BgpCodec, c: &mut dyn io::Read, len: u8) -> Result<Capability, ()>,
+    decode: fn(s: &mut Codec, c: &mut dyn io::Read, len: u8) -> Result<Capability, ()>,
 }
 
 static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
@@ -681,7 +681,7 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
                     return Err(());
                 }
                 let remote_as = c.read_u32::<NetworkEndian>().unwrap();
-                s.remote_as = remote_as;
+                s.remote_asn = remote_as;
                 Ok(Capability::FourOctetAsNumber(remote_as))
             }),
         },
@@ -994,14 +994,14 @@ impl Attribute {
         code: u8,
         dst: Option<&mut BytesMut>,
         family: Family,
-        codec: &BgpCodec,
+        codec: &Codec,
     ) -> (u16, Option<Attribute>) {
         match code {
             Attribute::AS_PATH => {
                 let n = if codec.keep_aspath {
                     self.clone()
                 } else {
-                    self.as_path_prepend(codec.local_as)
+                    self.as_path_prepend(codec.local_asn)
                 };
                 let l = if let Some(dst) = dst {
                     n.encode(dst).unwrap()
@@ -1598,50 +1598,85 @@ pub(crate) fn create_channel(
     })
 }
 
-pub(crate) struct BgpCodec {
+pub(crate) struct CodecBuilder {
+    local_asn: u32,
+    remote_asn: u32,
+    local_addr: IpAddr,
     extended_length: bool,
-    local_as: u32,
-    remote_as: u32,
+    keep_aspath: bool,
+    keep_nexthop: bool,
+    family: Vec<Family>,
+}
+
+impl CodecBuilder {
+    pub(crate) fn new() -> Self {
+        CodecBuilder {
+            local_asn: 0,
+            remote_asn: 0,
+            local_addr: IpAddr::V4(Ipv4Addr::from(0)),
+            extended_length: false,
+            keep_aspath: false,
+            keep_nexthop: false,
+            family: Vec::new(),
+        }
+    }
+
+    pub(crate) fn build(&mut self) -> Codec {
+        let channel = self
+            .family
+            .iter()
+            .map(|f| (*f, Channel::new(*f, false, false)))
+            .collect();
+        Codec {
+            local_asn: self.local_asn,
+            remote_asn: self.remote_asn,
+            local_addr: self.local_addr,
+            extended_length: self.extended_length,
+            keep_aspath: self.keep_aspath,
+            keep_nexthop: self.keep_nexthop,
+            channel,
+        }
+    }
+
+    pub(crate) fn local_asn(&mut self, asn: u32) -> &mut Self {
+        self.local_asn = asn;
+        self
+    }
+
+    pub(crate) fn local_addr(&mut self, local_addr: IpAddr) -> &mut Self {
+        self.local_addr = local_addr;
+        self
+    }
+
+    pub(crate) fn keep_aspath(&mut self, y: bool) -> &mut Self {
+        self.keep_aspath = y;
+        self
+    }
+
+    pub(crate) fn keep_nexthop(&mut self, y: bool) -> &mut Self {
+        self.keep_nexthop = y;
+        self
+    }
+
+    #[cfg(test)]
+    fn families(&mut self, v: Vec<Family>) -> &mut Self {
+        self.family = v;
+        self
+    }
+}
+
+pub(crate) struct Codec {
+    extended_length: bool,
+    local_asn: u32,
+    remote_asn: u32,
     local_addr: IpAddr,
     keep_aspath: bool,
     keep_nexthop: bool,
     pub(crate) channel: FnvHashMap<Family, Channel>,
 }
 
-impl BgpCodec {
-    pub(crate) fn new() -> Self {
-        BgpCodec {
-            extended_length: false,
-            local_as: 0,
-            remote_as: 0,
-            local_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-            keep_aspath: false,
-            keep_nexthop: false,
-            channel: FnvHashMap::default(),
-        }
-    }
-
-    pub(crate) fn local_as(mut self, local_as: u32) -> Self {
-        self.local_as = local_as;
-        self
-    }
-
-    pub(crate) fn local_addr(mut self, local_addr: IpAddr) -> Self {
-        self.local_addr = local_addr;
-        self
-    }
-
-    pub(crate) fn keep_aspath(mut self, y: bool) -> Self {
-        self.keep_aspath = y;
-        self
-    }
-
-    pub(crate) fn keep_nexthop(mut self, y: bool) -> Self {
-        self.keep_nexthop = y;
-        self
-    }
-
-    pub(crate) fn max_message_length(&self) -> usize {
+impl Codec {
+    fn max_message_length(&self) -> usize {
         if self.extended_length {
             Message::MAX_EXTENDED_LENGTH
         } else {
@@ -1650,7 +1685,7 @@ impl BgpCodec {
     }
 
     fn is_ibgp(&self) -> bool {
-        self.local_as == self.remote_as
+        self.local_asn == self.remote_asn
     }
 
     fn mp_reach_encode(
@@ -1960,7 +1995,7 @@ impl BgpCodec {
     }
 }
 
-impl Encoder<&Message> for BgpCodec {
+impl Encoder<&Message> for Codec {
     type Error = Error;
 
     fn encode(&mut self, item: &Message, dst: &mut BytesMut) -> Result<(), Error> {
@@ -1988,7 +2023,7 @@ impl Encoder<&Message> for BgpCodec {
     }
 }
 
-impl Decoder for BgpCodec {
+impl Decoder for Codec {
     type Item = Message;
     type Error = Error;
 
@@ -2096,9 +2131,9 @@ impl Decoder for BgpCodec {
                     }
                 }
                 if as_number == Capability::TRANS_ASN as u32 {
-                    as_number = self.remote_as;
+                    as_number = self.remote_asn;
                 } else {
-                    self.remote_as = as_number;
+                    self.remote_asn = as_number;
                 }
 
                 Ok(Some(Message::Open {
@@ -2254,7 +2289,7 @@ impl Decoder for BgpCodec {
 
                     if !error_withdraw {
                         match attr[*seen.get(&Attribute::AS_PATH).unwrap()]
-                            .as_path_count(self.local_as)
+                            .as_path_count(self.local_asn)
                         {
                             Ok(v) => {
                                 if v > 0 {
@@ -2457,10 +2492,7 @@ fn ipv6_eor() {
     ];
     buf.append(&mut body);
     let mut b = BytesMut::from(&buf[..]);
-    let mut codec = BgpCodec::new();
-    codec
-        .channel
-        .insert(Family::IPV6, Channel::new(Family::IPV6, false, false));
+    let mut codec = CodecBuilder::new().families(vec![Family::IPV6]).build();
     let ret = codec.decode(&mut b);
     assert!(ret.is_ok());
 }
@@ -2495,10 +2527,7 @@ fn parse_ipv6_update() {
     .map(|n| (n, 0))
     .collect();
     let mut b = BytesMut::from(&buf[..]);
-    let mut codec = BgpCodec::new();
-    codec
-        .channel
-        .insert(Family::IPV6, Channel::new(Family::IPV6, false, false));
+    let mut codec = CodecBuilder::new().families(vec![Family::IPV6]).build();
     let msg = codec.decode(&mut b).unwrap();
     match msg.unwrap() {
         Message::Update {
@@ -2543,10 +2572,10 @@ fn build_many_v4_route() {
         set.insert((*n, 0));
     }
 
-    let mut codec = BgpCodec::new().keep_aspath(true);
-    codec
-        .channel
-        .insert(Family::IPV4, Channel::new(Family::IPV4, false, false));
+    let mut codec = CodecBuilder::new()
+        .families(vec![Family::IPV4])
+        .keep_aspath(true)
+        .build();
     let mut txbuf = bytes::BytesMut::with_capacity(4096);
     codec.encode(&msg, &mut txbuf).unwrap();
     let mut recv = Vec::new();
@@ -2634,10 +2663,7 @@ fn many_mp_reach() {
         unreach: None,
     };
 
-    let mut codec = BgpCodec::new().keep_aspath(true);
-    codec
-        .channel
-        .insert(Family::IPV6, Channel::new(Family::IPV6, false, false));
+    let mut codec = CodecBuilder::new().families(vec![Family::IPV6]).build();
     let mut txbuf = bytes::BytesMut::with_capacity(4096);
     codec.encode(&msg, &mut txbuf).unwrap();
     let mut recv = Vec::new();
@@ -2687,10 +2713,7 @@ fn many_mp_unreach() {
         unreach: Some((Family::IPV6, unreach)),
     };
 
-    let mut codec = BgpCodec::new().keep_aspath(true);
-    codec
-        .channel
-        .insert(Family::IPV6, Channel::new(Family::IPV6, false, false));
+    let mut codec = CodecBuilder::new().families(vec![Family::IPV6]).build();
     let mut txbuf = bytes::BytesMut::with_capacity(4096);
     codec.encode(&msg, &mut txbuf).unwrap();
     let mut recv = Vec::new();

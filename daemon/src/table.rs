@@ -352,11 +352,12 @@ impl RoutingTable {
                     })
                     .filter_map(|(_, p)| {
                         if table_type == api::TableType::AdjOut {
-                            let codec = bgp::BgpCodec::new()
-                                .local_as(p.source.local_asn)
+                            let codec = bgp::CodecBuilder::new()
+                                .local_asn(p.source.local_asn)
                                 .local_addr(p.source.local_addr)
                                 .keep_aspath(p.source.rs_client)
-                                .keep_nexthop(p.source.rs_client);
+                                .keep_nexthop(p.source.rs_client)
+                                .build();
                             let attr = Arc::new(
                                 (*p).pa
                                     .attr

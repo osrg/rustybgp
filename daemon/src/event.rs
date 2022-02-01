@@ -3172,7 +3172,7 @@ impl Handler {
 
     async fn rx_msg(
         &mut self,
-        codec: &mut packet::bgp::BgpCodec,
+        codec: &mut packet::bgp::Codec,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
         msg: bgp::Message,
@@ -3379,12 +3379,19 @@ impl Handler {
             txbuf_size = std::cmp::min(txbuf_size, r / 2);
         }
 
-        let mut codec = packet::bgp::BgpCodec::new()
-            .local_as(self.local_asn)
-            .local_addr(self.local_addr);
-        if self.rs_client {
-            codec = codec.keep_aspath(true).keep_nexthop(true);
-        }
+        let mut codec = if self.rs_client {
+            bgp::CodecBuilder::new()
+                .local_asn(self.local_asn)
+                .local_addr(self.local_addr)
+                .keep_aspath(true)
+                .keep_nexthop(true)
+                .build()
+        } else {
+            bgp::CodecBuilder::new()
+                .local_asn(self.local_asn)
+                .local_addr(self.local_addr)
+                .build()
+        };
 
         let mut peer_event_rx = Vec::new();
         for _ in 0..*NUM_TABLES {

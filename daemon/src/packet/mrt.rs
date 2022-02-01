@@ -109,13 +109,16 @@ pub(crate) enum Message {
 }
 
 pub(crate) struct MrtCodec {
-    codec: bgp::BgpCodec,
+    codec: bgp::Codec,
 }
 
 impl MrtCodec {
     pub(crate) fn new() -> Self {
         MrtCodec {
-            codec: bgp::BgpCodec::new().keep_aspath(true).keep_nexthop(true),
+            codec: bgp::CodecBuilder::new()
+                .keep_aspath(true)
+                .keep_nexthop(true)
+                .build(),
         }
     }
 }
