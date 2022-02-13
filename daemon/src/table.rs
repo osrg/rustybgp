@@ -1217,25 +1217,25 @@ impl From<&Statement> for api::Statement {
                 Condition::Prefix(name, opt, _set) => {
                     conditions.prefix_set = Some(api::MatchSet {
                         name: name.clone(),
-                        match_type: opt.into(),
+                        r#type: opt.into(),
                     });
                 }
                 Condition::Neighbor(name, opt, _set) => {
                     conditions.neighbor_set = Some(api::MatchSet {
                         name: name.clone(),
-                        match_type: opt.into(),
+                        r#type: opt.into(),
                     });
                 }
                 Condition::AsPath(name, opt, _set) => {
                     conditions.as_path_set = Some(api::MatchSet {
                         name: name.clone(),
-                        match_type: opt.into(),
+                        r#type: opt.into(),
                     });
                 }
                 Condition::Community(name, opt, _set) => {
                     conditions.community_set = Some(api::MatchSet {
                         name: name.clone(),
-                        match_type: opt.into(),
+                        r#type: opt.into(),
                     });
                 }
                 Condition::Nexthop(v) => {
@@ -1246,7 +1246,7 @@ impl From<&Statement> for api::Statement {
                 }
                 Condition::AsPathLength(t, length) => {
                     conditions.as_path_length = Some(api::AsPathLength {
-                        length_type: (*t).into(),
+                        r#type: (*t).into(),
                         length: *length,
                     })
                 }
@@ -1682,7 +1682,7 @@ impl PolicyTable {
         let mut v = Vec::new();
         if let Some(conditions) = conditions {
             if let Some(m) = conditions.prefix_set {
-                let opt = MatchOption::try_from(m.match_type)?;
+                let opt = MatchOption::try_from(m.r#type)?;
                 if opt == MatchOption::All {
                     return Err(Error::InvalidArgument(
                         "prefix-set can't have all match option".to_string(),
@@ -1699,7 +1699,7 @@ impl PolicyTable {
                 }
             }
             if let Some(m) = conditions.neighbor_set {
-                let opt = MatchOption::try_from(m.match_type)?;
+                let opt = MatchOption::try_from(m.r#type)?;
                 if opt == MatchOption::All {
                     return Err(Error::InvalidArgument(
                         "neighbor-set can't have all match option".to_string(),
@@ -1716,7 +1716,7 @@ impl PolicyTable {
                 }
             }
             if let Some(m) = conditions.as_path_set {
-                let opt = MatchOption::try_from(m.match_type)?;
+                let opt = MatchOption::try_from(m.r#type)?;
                 match self.aspath_sets.get(m.name.as_str()) {
                     Some(set) => v.push(Condition::AsPath(m.name, opt, set.clone())),
                     None => {
@@ -1728,10 +1728,10 @@ impl PolicyTable {
                 }
             }
             if let Some(m) = conditions.as_path_length {
-                v.push(Condition::AsPathLength(m.length_type.into(), m.length));
+                v.push(Condition::AsPathLength(m.r#type.into(), m.length));
             }
             if let Some(m) = conditions.community_set {
-                let opt = MatchOption::try_from(m.match_type)?;
+                let opt = MatchOption::try_from(m.r#type)?;
                 match self.community_sets.get(m.name.as_str()) {
                     Some(set) => v.push(Condition::Community(m.name, opt, set.clone())),
                     None => {
@@ -1825,7 +1825,7 @@ impl Roa {
         };
 
         api::Roa {
-            r#as: self.as_number,
+            asn: self.as_number,
             prefixlen: mask as u32,
             maxlen: self.max_length as u32,
             prefix,
@@ -1894,9 +1894,9 @@ impl RpkiTable {
                 }
                 let mut result = api::Validation {
                     state: api::validation::State::NotFound as i32,
-                    reason: api::validation::Reason::ReasotNone as i32,
+                    reason: api::validation::Reason::None as i32,
                     matched: Vec::new(),
-                    unmatched_as: Vec::new(),
+                    unmatched_asn: Vec::new(),
                     unmatched_length: Vec::new(),
                 };
                 let asn =
@@ -1920,7 +1920,7 @@ impl RpkiTable {
                             if roa.as_number != 0 && roa.as_number == asn {
                                 result.matched.push(roa.to_api(&ipnet));
                             } else {
-                                result.unmatched_as.push(roa.to_api(&ipnet));
+                                result.unmatched_asn.push(roa.to_api(&ipnet));
                             }
                         } else {
                             result.unmatched_length.push(roa.to_api(&ipnet));
@@ -1929,9 +1929,9 @@ impl RpkiTable {
                 }
                 if !result.matched.is_empty() {
                     result.state = api::validation::State::Valid as i32;
-                } else if !result.unmatched_as.is_empty() {
+                } else if !result.unmatched_asn.is_empty() {
                     result.state = api::validation::State::Invalid as i32;
-                    result.reason = api::validation::Reason::As as i32;
+                    result.reason = api::validation::Reason::Asn as i32;
                 } else if !result.unmatched_length.is_empty() {
                     result.state = api::validation::State::Invalid as i32;
                     result.reason = api::validation::Reason::Length as i32;

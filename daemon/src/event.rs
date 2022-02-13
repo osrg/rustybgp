@@ -433,7 +433,7 @@ impl From<&Peer> for api::Peer {
         };
         let mut ps = api::PeerState {
             neighbor_address: p.remote_addr.to_string(),
-            peer_as: p.state.remote_asn.load(Ordering::Relaxed),
+            peer_asn: p.state.remote_asn.load(Ordering::Relaxed),
             router_id: Ipv4Addr::from(p.state.remote_id.load(Ordering::Relaxed)).to_string(),
             messages: Some(api::Messages {
                 received: Some((&*p.counter_rx).into()),
@@ -524,8 +524,8 @@ impl TryFrom<&api::Peer> for Peer {
             builder.password(&conf.auth_password);
         }
         Ok(builder
-            .local_asn(conf.local_as)
-            .remote_asn(conf.peer_as)
+            .local_asn(conf.local_asn)
+            .remote_asn(conf.peer_asn)
             .remote_port(p.transport.as_ref().map_or(0, |x| x.remote_port as u16))
             .families(
                 p.afi_safis
@@ -661,7 +661,7 @@ struct PeerGroup {
 impl From<api::PeerGroup> for PeerGroup {
     fn from(p: api::PeerGroup) -> PeerGroup {
         PeerGroup {
-            as_number: p.conf.map_or(0, |c| c.peer_as),
+            as_number: p.conf.map_or(0, |c| c.peer_asn),
             dynamic_peers: Vec::new(),
             // passive: p.transport.map_or(false, |c| c.passive_mode),
             route_server_client: p.route_server.map_or(false, |c| c.route_server_client),
@@ -758,7 +758,7 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::StartBgpRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let g = request.into_inner().global.ok_or(Error::EmptyArgument)?;
-        if g.r#as == 0 {
+        if g.asn == 0 {
             return Err(tonic::Status::new(
                 tonic::Code::InvalidArgument,
                 "invalid as number",
@@ -778,7 +778,7 @@ impl GobgpApi for GrpcService {
                 "already started",
             ));
         }
-        global.asn = g.r#as;
+        global.asn = g.asn;
         global.listen_port = if g.listen_port > 0 {
             g.listen_port as u16
         } else {
@@ -987,18 +987,18 @@ impl GobgpApi for GrpcService {
             "invalid peer address",
         ))
     }
-    type MonitorPeerStream = Pin<
+    type WatchEventStream = Pin<
         Box<
-            dyn Stream<Item = Result<api::MonitorPeerResponse, tonic::Status>>
+            dyn Stream<Item = Result<api::WatchEventResponse, tonic::Status>>
                 + Send
                 + Sync
                 + 'static,
         >,
     >;
-    async fn monitor_peer(
+    async fn watch_event(
         &self,
-        _request: tonic::Request<api::MonitorPeerRequest>,
-    ) -> Result<tonic::Response<Self::MonitorPeerStream>, tonic::Status> {
+        _request: tonic::Request<api::WatchEventRequest>,
+    ) -> Result<tonic::Response<Self::WatchEventStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn add_peer_group(
@@ -1233,20 +1233,6 @@ impl GobgpApi for GrpcService {
             info += t.rtable.state(family);
         }
         Ok(tonic::Response::new(api::GetTableResponse::from(info)))
-    }
-    type MonitorTableStream = Pin<
-        Box<
-            dyn Stream<Item = Result<api::MonitorTableResponse, tonic::Status>>
-                + Send
-                + Sync
-                + 'static,
-        >,
-    >;
-    async fn monitor_table(
-        &self,
-        _request: tonic::Request<api::MonitorTableRequest>,
-    ) -> Result<tonic::Response<Self::MonitorTableStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn add_vrf(
         &self,
@@ -1643,7 +1629,7 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::EnableMrtRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let request = request.into_inner();
-        if request.dump_type != config::gen::MrtType::Updates as i32 {
+        if request.r#type != config::gen::MrtType::Updates as i32 {
             return Err(tonic::Status::new(
                 tonic::Code::InvalidArgument,
                 "only update dump is supported",
@@ -1698,6 +1684,15 @@ impl GobgpApi for GrpcService {
         &self,
         _request: tonic::Request<api::DeleteBmpRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not yet implemented"))
+    }
+    type ListBmpStream = Pin<
+        Box<dyn Stream<Item = Result<api::ListBmpResponse, tonic::Status>> + Send + Sync + 'static>,
+    >;
+    async fn list_bmp(
+        &self,
+        _request: tonic::Request<api::ListBmpRequest>,
+    ) -> Result<tonic::Response<Self::ListBmpStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn set_log_level(
@@ -2317,7 +2312,7 @@ struct Global {
 impl From<&Global> for api::Global {
     fn from(g: &Global) -> Self {
         api::Global {
-            r#as: g.asn,
+            asn: g.asn,
             router_id: g.router_id.to_string(),
             listen_port: g.listen_port as i32,
             listen_addresses: Vec::new(),

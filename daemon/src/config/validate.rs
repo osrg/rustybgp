@@ -310,7 +310,7 @@ impl TryFrom<&Conditions> for api::Conditions {
                 .as_ref()
                 .ok_or_else(|| Error::InvalidConfiguration("empty match option".to_string()))?;
             conditions.prefix_set = Some(api::MatchSet {
-                match_type: set_option.into(),
+                r#type: set_option.into(),
                 name,
             });
         }
@@ -323,7 +323,7 @@ impl TryFrom<&Conditions> for api::Conditions {
                 };
                 if let Some(name) = &set.as_path_set {
                     conditions.as_path_set = Some(api::MatchSet {
-                        match_type,
+                        r#type: match_type,
                         name: name.to_string(),
                     });
                 }
@@ -336,7 +336,7 @@ impl TryFrom<&Conditions> for api::Conditions {
                     Error::InvalidConfiguration("empty as path length".to_string())
                 })?;
                 conditions.as_path_length = Some(api::AsPathLength {
-                    length_type: op.into(),
+                    r#type: op.into(),
                     length,
                 });
             }

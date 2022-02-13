@@ -15,7 +15,7 @@
 
 use std::time::SystemTime;
 
-const TYPE_URL_PREFACE: &str = "type.googleapis.com/gobgpapi.";
+const TYPE_URL_PREFACE: &str = "type.googleapis.com/apipb.";
 
 pub(crate) fn to_any<T: prost::Message>(m: T, name: &str) -> prost_types::Any {
     let mut v = Vec::new();

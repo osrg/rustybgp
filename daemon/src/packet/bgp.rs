@@ -471,7 +471,7 @@ impl From<&Capability> for prost_types::Any {
                 name,
             ),
             Capability::FourOctetAsNumber(asn) => {
-                proto::to_any(api::FourOctetAsNumberCapability { r#as: *asn }, name)
+                proto::to_any(api::FourOctetAsnCapability { asn: *asn }, name)
             }
             Capability::AddPath(v) => proto::to_any(
                 api::AddPathCapability {
@@ -506,9 +506,7 @@ impl From<&Capability> for prost_types::Any {
             Capability::Fqdn(host, domain) => proto::to_any(
                 api::FqdnCapability {
                     host_name: host.to_string(),
-                    host_name_len: host.len() as u32,
                     domain_name: domain.to_string(),
-                    domain_name_len: domain.len() as u32,
                 },
                 name,
             ),
@@ -675,7 +673,7 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
         },
         CapDesc {
             code: Capability::FOUR_OCTET_AS_NUMBER,
-            url: "FourOctetASNumberCapability",
+            url: "FourOctetASNCapability",
             decode: (|s, c, len| {
                 if len != 4 {
                     return Err(());
@@ -737,7 +735,7 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
         },
         CapDesc {
             code: Capability::FQDN,
-            url: "FQDNCapability",
+            url: "FqdnCapability",
             decode: (|_s, c, len| {
                 if len < 1 {
                     return Err(());
@@ -1097,7 +1095,7 @@ impl From<&Attribute> for prost_types::Any {
                         num.push(c.read_u32::<NetworkEndian>().unwrap());
                     }
                     segments.push(api::AsSegment {
-                        r#type: code as u32,
+                        r#type: code as i32,
                         numbers: num,
                     });
                 }
@@ -1142,7 +1140,7 @@ impl From<&Attribute> for prost_types::Any {
                 };
                 proto::to_any(
                     api::AggregatorAttribute {
-                        r#as: asn,
+                        asn,
                         address: addr.to_string(),
                     },
                     name,
@@ -1250,7 +1248,7 @@ impl TryFrom<prost_types::Any> for Attribute {
             let mut c = Cursor::new(Vec::new());
             let addr = Ipv4Addr::from_str(&a.address)
                 .map_err(|e| Error::InvalidArgument(e.to_string()))?;
-            let _ = c.write_u32::<NetworkEndian>(a.r#as);
+            let _ = c.write_u32::<NetworkEndian>(a.asn);
             let _ = c.write_u32::<NetworkEndian>(addr.into());
             Ok(Attribute::new_with_bin(Attribute::AGGREGATOR, c.into_inner()).unwrap())
         } else if a.type_url == proto::type_url("CommunitiesAttribute") {
