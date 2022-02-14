@@ -1693,7 +1693,39 @@ impl GobgpApi for GrpcService {
         &self,
         _request: tonic::Request<api::ListBmpRequest>,
     ) -> Result<tonic::Response<Self::ListBmpStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let v = GLOBAL
+            .read()
+            .await
+            .bmp_clients
+            .iter()
+            .map(|(k, v)| api::ListBmpResponse {
+                station: Some(api::list_bmp_response::BmpStation {
+                    conf: Some(api::list_bmp_response::bmp_station::Conf {
+                        address: k.ip().to_string(),
+                        port: k.port() as u32,
+                    }),
+                    state: Some(api::list_bmp_response::bmp_station::State {
+                        uptime: Some(prost_types::Timestamp {
+                            seconds: v.uptime as i64,
+                            nanos: 0,
+                        }),
+                        downtime: Some(prost_types::Timestamp {
+                            seconds: v.downtime as i64,
+                            nanos: 0,
+                        }),
+                    }),
+                }),
+            })
+            .collect::<Vec<api::ListBmpResponse>>();
+        let (tx, rx) = mpsc::channel(1024);
+        tokio::spawn(async move {
+            for r in v {
+                let _ = tx.send(Ok(r)).await;
+            }
+        });
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn set_log_level(
         &self,
@@ -1829,8 +1861,11 @@ impl MrtDumper {
     }
 }
 
+#[derive(Default)]
 struct BmpClient {
     configured_time: u64,
+    uptime: u64,
+    downtime: u64,
 }
 
 impl BmpClient {
@@ -1840,6 +1875,7 @@ impl BmpClient {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            ..Default::default()
         }
     }
 
@@ -2006,10 +2042,25 @@ impl BmpClient {
                 )
                 .await
                 {
+                    if let Some(client) = GLOBAL.write().await.bmp_clients.get_mut(&sockaddr) {
+                        client.uptime = SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                    } else {
+                        break;
+                    }
                     let _ = BmpClient::serve(stream, sockaddr).await;
-                } else {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    if let Some(client) = GLOBAL.write().await.bmp_clients.get_mut(&sockaddr) {
+                        client.downtime = SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                    } else {
+                        break;
+                    }
                 }
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 if let Some(client) = GLOBAL.write().await.bmp_clients.get_mut(&sockaddr) {
                     if client.configured_time != configured_time {
                         break;
