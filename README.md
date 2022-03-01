@@ -4,7 +4,7 @@ The mission is to develop a high-performance and safe BGP implementation; an exp
 
 ![](.github/assets/htop.gif)
 
-RustyBGP supports the gRPC APIs same as GoBGP version 3; your code to manage GoBGP via the APIs should work with RustyBGP. If you need CLI, [GoBGP CLI tool](https://github.com/osrg/gobgp/releases/tag/v3.0.0-rc4) allows you to manage RustyBGP. RustyBGP also supports the same configuration file format as GoBGP (only toml for now).
+RustyBGP supports the gRPC APIs same as GoBGP; your code to manage GoBGP via the APIs should work with RustyBGP. If you need CLI, [GoBGP CLI tool](https://github.com/osrg/gobgp/releases/tag/v3.0.0) allows you to manage RustyBGP. RustyBGP also supports the same configuration file format as GoBGP (only toml for now).
 
 ## Get Started
 
@@ -42,36 +42,36 @@ Hello, RustyBGP (32 cpus)!
 
 Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/passive connection, RPKI, BMP (BGP monitoring protocol), MRT, etc with the following gRPC APIs.
 
-| API             | Relevant CLI                                               | Note                                                              |
-| --------------- | ---------------------------------------------------------- | ----------------------------------------------------------------- |
-| start_bgp       | `gobgp global as <VALUE> router-id <IP>`                   |                                                                   |
-| get_bgp         | `gobgp global`                                             |                                                                   |
-| add_peer        | `gobgp neighbor add <IP> as <VALUE> router-id <IP>`        | v4/v6 families and addpath (rx) supported                         |
-| delete_peer     | `gobgp neighbor del <IP>`                                  |                                                                   |
-| list_peer       | `gobgp neighbor`/`gobgp neighbor <IP>`                     |                                                                   |
-| enable_peer     | `gobgp neighbor <IP> enable`                               |                                                                   |
-| disable_peer    | `gobgp neighbor <IP> disable`                              |                                                                   |
-| add_peer_group  |                                                            |                                                                   |
-| add_dynamic_neighbor  |                                                            |                                                                   |
-| add_path        | `gobgp global rib add <PREFIX>`                            |                                                                   |
-| delete_path     | `gobgp global rib del <PREFIX>`                            |                                                                   |
-| list_path       | `gobgp global rib`/`gobgp neighbor <IP> [adj-in\|adj-out]` |                                                                   |
-| add_path_stream | `gobgp mrt global inject [FILE]`                           |                                                                   |
-| get_table       | `gobgp global rib summary`                                 |                                                                   |
-| add_policy      |                                                            |                                                                   |
-| list_policy     |                                                            |                                                                   |
-| add_defined_set |                                                            |                                                                   |
-| list_defined_set|                                                            |                                                                   |
-| add_statement   |                                                            |                                                                   |
-| list_statement  |                                                            |                                                                   |
-| add_policy_assignment |                                                            |                                                                   |
-| list_policy_assignment|                                                            |                                                                   |
-| add_rpki        | `gobgp rpki server <IP> add`                               |                                                                   |
-| list_rpki       | `gobgp rpki server`                                        |                                                                   |
-| list_rpki_table | `gobgp rpki table`                                         |                                                                   |
-| enable_mrt      |                                                            |                                                                   |
-| add_bmp         | `gobgp bmp add`                                            | routemonitoring is supported only with adjin                      |
-| list_bmp        | `gobgp bmp`                                                |                                                                   |
+| API                    | Relevant CLI                                               | Note                                         |
+| ---------------------- | ---------------------------------------------------------- | -------------------------------------------- |
+| start_bgp              | `gobgp global as <VALUE> router-id <IP>`                   |                                              |
+| get_bgp                | `gobgp global`                                             |                                              |
+| add_peer               | `gobgp neighbor add <IP> as <VALUE> router-id <IP>`        | v4/v6 families and addpath (rx) supported    |
+| delete_peer            | `gobgp neighbor del <IP>`                                  |                                              |
+| list_peer              | `gobgp neighbor`/`gobgp neighbor <IP>`                     |                                              |
+| enable_peer            | `gobgp neighbor <IP> enable`                               |                                              |
+| disable_peer           | `gobgp neighbor <IP> disable`                              |                                              |
+| add_peer_group         |                                                            |                                              |
+| add_dynamic_neighbor   |                                                            |                                              |
+| add_path               | `gobgp global rib add <PREFIX>`                            |                                              |
+| delete_path            | `gobgp global rib del <PREFIX>`                            |                                              |
+| list_path              | `gobgp global rib`/`gobgp neighbor <IP> [adj-in\|adj-out]` |                                              |
+| add_path_stream        | `gobgp mrt global inject [FILE]`                           |                                              |
+| get_table              | `gobgp global rib summary`                                 |                                              |
+| add_policy             |                                                            |                                              |
+| list_policy            |                                                            |                                              |
+| add_defined_set        |                                                            |                                              |
+| list_defined_set       |                                                            |                                              |
+| add_statement          |                                                            |                                              |
+| list_statement         |                                                            |                                              |
+| add_policy_assignment  |                                                            |                                              |
+| list_policy_assignment |                                                            |                                              |
+| add_rpki               | `gobgp rpki server <IP> add`                               |                                              |
+| list_rpki              | `gobgp rpki server`                                        |                                              |
+| list_rpki_table        | `gobgp rpki table`                                         |                                              |
+| enable_mrt             |                                                            |                                              |
+| add_bmp                | `gobgp bmp add`                                            | routemonitoring is supported only with adjin |
+| list_bmp               | `gobgp bmp`                                                |                                              |
 
 ## Community, discussion and support
 
