@@ -64,10 +64,7 @@ fn main() -> Result<(), std::io::Error> {
         .get_matches();
 
     let conf = if let Some(conf) = args.value_of("config") {
-        let conf: config::BgpConfig = toml::from_str(&(std::fs::read_to_string(conf)?))?;
-        if let Err(e) = conf.validate() {
-            panic!("invalid configuraiton {:?}", e);
-        }
+        let conf: config::BgpConfig = config::read_from_file(conf).expect("invalid configuration");
         Some(conf)
     } else {
         let as_number = if let Some(asn) = args.value_of("asn") {

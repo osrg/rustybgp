@@ -18,3 +18,17 @@ pub(crate) mod gen;
 pub(crate) use self::gen::*;
 pub(crate) mod validate;
 pub(crate) use self::validate::*;
+
+use std::error::Error;
+use std::ffi::OsStr;
+use std::path::Path;
+
+pub(crate) fn read_from_file<P: AsRef<Path>>(fname: P) -> Result<BgpConfig, Box<dyn Error>> {
+    let contents = std::fs::read_to_string(fname.as_ref())?;
+    let conf: BgpConfig = match fname.as_ref().extension().and_then(OsStr::to_str) {
+        Some("yaml") | Some("yml") => serde_yaml::from_str(&contents)?,
+        _ => toml::from_str(&contents)?,
+    };
+    conf.validate()?;
+    Ok(conf)
+}
