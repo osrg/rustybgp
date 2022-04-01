@@ -4,7 +4,7 @@ The mission is to develop a high-performance and safe BGP implementation; an exp
 
 ![](.github/assets/htop.gif)
 
-RustyBGP supports the gRPC APIs same as GoBGP; your code to manage GoBGP via the APIs should work with RustyBGP. If you need CLI, [GoBGP CLI tool](https://github.com/osrg/gobgp/releases/tag/v3.0.0) allows you to manage RustyBGP. RustyBGP also supports the same configuration file format as GoBGP (only toml for now).
+RustyBGP supports the gRPC APIs same as GoBGP; your code to manage GoBGP via the APIs should work with RustyBGP. If you need CLI, [GoBGP CLI tool](https://github.com/osrg/gobgp/releases/tag/v3.0.0) allows you to manage RustyBGP. RustyBGP also supports the same configuration file format as GoBGP (only toml and yaml for now).
 
 ## Get Started
 
