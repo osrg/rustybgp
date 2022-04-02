@@ -275,7 +275,7 @@ impl RoutingTable {
     pub(crate) fn state(&self, family: Family) -> RoutingTableState {
         match self.global.get(&family) {
             Some(t) => {
-                let num_path = t.values().map(|x| x.entry.iter()).flatten().count();
+                let num_path = t.values().flat_map(|x| x.entry.iter()).count();
                 RoutingTableState {
                     num_destination: t.len(),
                     num_path,
@@ -301,7 +301,7 @@ impl RoutingTable {
             .get(&family)
             .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
             .iter()
-            .map(move |(net, dst)| {
+            .flat_map(move |(net, dst)| {
                 dst.entry.iter().map(move |e| Reach {
                     source: e.source.clone(),
                     family,
@@ -309,7 +309,6 @@ impl RoutingTable {
                     attr: e.pa.attr.clone(),
                 })
             })
-            .flatten()
     }
 
     pub(crate) fn iter_api(
@@ -608,11 +607,10 @@ impl RoutingTable {
             .get(&family)
             .unwrap()
             .iter()
-            .map(|(n, e)| {
+            .flat_map(|(n, e)| {
                 let net = RpkiTable::key_to_addr(n);
                 e.iter().map(move |r| r.to_api(&net))
             })
-            .flatten()
     }
 
     pub(crate) fn rpki_state(&self, addr: &IpAddr) -> RpkiTableState {
@@ -1610,7 +1608,7 @@ impl PolicyTable {
                 for n in &set.list {
                     if let Some(n) = SingleAsPathMatch::new(n) {
                         v0.push(n);
-                    } else if let Ok(n) = Regex::new(&n.replace("_", "(^|[,{}() ]|$)")) {
+                    } else if let Ok(n) = Regex::new(&n.replace('_', "(^|[,{}() ]|$)")) {
                         v1.push(n);
                     } else {
                         return Err(Error::InvalidArgument(format!(

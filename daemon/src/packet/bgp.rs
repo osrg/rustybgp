@@ -120,18 +120,18 @@ impl IpNet {
         match addr {
             IpAddr::V4(addr) => {
                 let (prefix_octets, mask) = match self {
-                    IpNet::V4(net) => (net.addr.octets().iter().copied().collect(), net.mask),
+                    IpNet::V4(net) => (net.addr.octets().to_vec(), net.mask),
                     _ => return false,
                 };
-                let addr_octests: Vec<u8> = addr.octets().iter().copied().collect();
+                let addr_octests: Vec<u8> = addr.octets().to_vec();
                 f(&prefix_octets, &addr_octests, mask)
             }
             IpAddr::V6(addr) => {
                 let (prefix_octets, mask) = match self {
-                    IpNet::V6(net) => (net.addr.octets().iter().copied().collect(), net.mask),
+                    IpNet::V6(net) => (net.addr.octets().to_vec(), net.mask),
                     _ => return false,
                 };
-                let addr_octests: Vec<u8> = addr.octets().iter().copied().collect();
+                let addr_octests: Vec<u8> = addr.octets().to_vec();
                 f(&prefix_octets, &addr_octests, mask)
             }
         }
