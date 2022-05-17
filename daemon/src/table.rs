@@ -15,6 +15,7 @@
 
 use crate::proto::ToApi;
 use fnv::FnvHashMap;
+use ip_network_table_deps_treebitmap::IpLookupTable;
 use once_cell::sync::Lazy;
 use patricia_tree::PatriciaMap;
 use regex::Regex;
@@ -27,7 +28,6 @@ use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
-use treebitmap::IpLookupTable;
 
 use crate::api;
 use crate::error::Error;
