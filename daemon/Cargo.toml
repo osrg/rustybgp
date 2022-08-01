@@ -11,7 +11,7 @@ ascii = "1"
 tonic = "0.5.2"
 bytes = "1.0"
 chrono = "0.4"
-prost = "0.8"
+prost = "0.11"
 prost-types = "0.8"
 prost-derive = "0.8"
 tokio = { version = "=1.10.1", features = ["full"] }
