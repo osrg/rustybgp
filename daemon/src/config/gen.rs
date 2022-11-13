@@ -473,7 +473,7 @@ impl TryFrom<String> for AdminState {
     }
 }
 // typedef for identity bgp:mode.
-// Ths leaf indicates the mode of operation of BGP graceful
+// This leaf indicates the mode of operation of BGP graceful
 // restart with the peer.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
@@ -1484,7 +1484,7 @@ pub(crate) struct RouteReflectorState {
     pub(crate) route_reflector_client: Option<bool>,
 }
 // struct for container bgp:config.
-// Configuraton parameters relating to route reflection
+// Configuration parameters relating to route reflection
 // for the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
@@ -1508,7 +1508,7 @@ pub(crate) struct RouteReflectorConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RouteReflector {
     // original -> bgp:route-reflector-config
-    // Configuraton parameters relating to route reflection
+    // Configuration parameters relating to route reflection
     // for the BGP neighbor or group.
     pub(crate) config: Option<RouteReflectorConfig>,
     // original -> bgp:route-reflector-state
@@ -2922,7 +2922,7 @@ pub(crate) struct GracefulRestartState {
     #[serde(rename = "local-restarting")]
     pub(crate) local_restarting: Option<bool>,
     // original -> bgp-op:mode
-    // Ths leaf indicates the mode of operation of BGP graceful
+    // This leaf indicates the mode of operation of BGP graceful
     // restart with the peer.
     pub(crate) mode: Option<Mode>,
     // original -> gobgp:deferral-time

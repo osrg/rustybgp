@@ -1882,7 +1882,7 @@ impl Codec {
                 }
                 let pos_attr_len = dst.len();
                 dst.put_u16(0);
-                // like BIRD, for simplicity, MP_REACH/MP_UNREACH attribute ins't ordered.
+                // Like BIRD, for simplicity, MP_REACH/MP_UNREACH attribute isn't ordered.
                 // BIRD encodes MP_REACH/MP_UNREACH first and then the rest.
                 // RustyBGP encode MP_REACH/MP_UNREACH last.
                 let mut attr_len = 0;
