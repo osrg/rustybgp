@@ -1735,13 +1735,13 @@ impl GobgpApi for GrpcService {
 }
 
 async fn add_policy_assignment(req: api::PolicyAssignment) -> Result<(), Error> {
-    let (dir, assingment) = GLOBAL.write().await.ptable.add_assignment(req)?;
+    let (dir, assignment) = GLOBAL.write().await.ptable.add_assignment(req)?;
     for i in 0..*NUM_TABLES {
         let mut t = TABLE[i].lock().await;
         if dir == api::PolicyDirection::Import {
-            t.global_import_policy = Some(assingment.clone());
+            t.global_import_policy = Some(assignment.clone());
         } else {
-            t.global_export_policy = Some(assingment.clone());
+            t.global_export_policy = Some(assignment.clone());
         }
     }
     Ok(())
