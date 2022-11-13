@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021 The RustyBGP Authors.
+// Copyright (C) 2019-2022 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -358,8 +358,7 @@ impl RoutingTable {
                                 .keep_nexthop(p.source.rs_client)
                                 .build();
                             let attr = Arc::new(
-                                (*p).pa
-                                    .attr
+                                p.pa.attr
                                     .iter()
                                     .cloned()
                                     .map(|a| {
@@ -1517,9 +1516,7 @@ impl PolicyTable {
         }
         let name: Arc<str> = Arc::from(name);
         match self.policies.entry(name.clone()) {
-            Occupied(_) => {
-                return Err(Error::AlreadyExists(format!("{}", name)));
-            }
+            Occupied(_) => Err(Error::AlreadyExists(format!("{}", name))),
             Vacant(e) => {
                 e.insert(Arc::new(Policy {
                     name,

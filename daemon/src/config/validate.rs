@@ -1,4 +1,4 @@
-// Copyright (C) 2021 The RustyBGP Authors.
+// Copyright (C) 2021-2022 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -49,20 +49,19 @@ pub(crate) struct BgpConfig {
 
 impl BgpConfig {
     pub(crate) fn validate(&self) -> Result<(), Error> {
-        let g =
-            self.global.as_ref().take().ok_or_else(|| {
-                Error::InvalidConfiguration("empty global configuration".to_string())
-            })?;
+        let g = self
+            .global
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfiguration("empty global configuration".to_string()))?;
 
-        let global_config =
-            g.config.as_ref().take().ok_or_else(|| {
-                Error::InvalidConfiguration("empty global configuration".to_string())
-            })?;
+        let global_config = g
+            .config
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfiguration("empty global configuration".to_string()))?;
 
         let asn = global_config
             .r#as
             .as_ref()
-            .take()
             .ok_or_else(|| Error::InvalidConfiguration("empty global as number".to_string()))?;
         if *asn == 0 {
             return Err(Error::InvalidConfiguration("zero as number".to_string()));
@@ -71,19 +70,18 @@ impl BgpConfig {
         let router_id = global_config
             .router_id
             .as_ref()
-            .take()
             .ok_or_else(|| Error::InvalidConfiguration("empty router-id".to_string()))?;
         let _: std::net::Ipv4Addr = router_id
             .parse()
             .map_err(|_| Error::InvalidConfiguration("can't parse router-id".to_string()))?;
 
-        if let Some(peers) = self.neighbors.as_ref().take() {
+        if let Some(peers) = self.neighbors.as_ref() {
             for n in peers {
                 n.validate()?;
             }
         }
 
-        if let Some(bmp_servers) = self.bmp_servers.as_ref().take() {
+        if let Some(bmp_servers) = self.bmp_servers.as_ref() {
             for n in bmp_servers {
                 n.validate()?;
             }
@@ -95,13 +93,12 @@ impl BgpConfig {
 
 impl BmpServer {
     fn validate(&self) -> Result<(), Error> {
-        let config = self.config.as_ref().take().ok_or_else(|| {
+        let config = self.config.as_ref().ok_or_else(|| {
             Error::InvalidConfiguration("empty bmp server configuration".to_string())
         })?;
         let addr = config
             .address
             .as_ref()
-            .take()
             .ok_or_else(|| Error::InvalidConfiguration("empty bmp address".to_string()))?;
         let _: std::net::IpAddr = addr
             .parse()
@@ -109,7 +106,6 @@ impl BmpServer {
         let port = config
             .port
             .as_ref()
-            .take()
             .ok_or_else(|| Error::InvalidConfiguration("empty bmp port".to_string()))?;
         if *port > u16::MAX as u32 {
             return Err(Error::InvalidConfiguration(
@@ -129,15 +125,14 @@ impl BmpServer {
 
 impl Neighbor {
     fn validate(&self) -> Result<(), Error> {
-        let config =
-            self.config.as_ref().take().ok_or_else(|| {
-                Error::InvalidConfiguration("empty peer configuration".to_string())
-            })?;
+        let config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfiguration("empty peer configuration".to_string()))?;
 
         let asn = config
             .peer_as
             .as_ref()
-            .take()
             .ok_or_else(|| Error::InvalidConfiguration("empty peer as".to_string()))?;
         if *asn == 0 {
             return Err(Error::InvalidConfiguration("zero as number".to_string()));
@@ -146,7 +141,6 @@ impl Neighbor {
         let addr = config
             .neighbor_address
             .as_ref()
-            .take()
             .ok_or_else(|| Error::InvalidConfiguration("empty neighbor address".to_string()))?;
         let _: std::net::IpAddr = addr
             .parse()

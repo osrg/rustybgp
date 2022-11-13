@@ -734,7 +734,7 @@ impl GrpcService {
             }
         }
         Ok((
-            Table::dealer(&net),
+            Table::dealer(net),
             TableEvent::PassUpdate(
                 self.local_source.clone(),
                 family,
@@ -1170,8 +1170,7 @@ impl GobgpApi for GrpcService {
             .prefixes
             .iter()
             .map(|x| packet::Net::from_str(&x.prefix))
-            .filter(|x| x.is_ok())
-            .map(|x| x.unwrap())
+            .filter_map(|x| x.ok())
             .collect();
 
         let mut v = Vec::new();
@@ -2050,7 +2049,7 @@ impl BmpClient {
                     } else {
                         break;
                     }
-                    let _ = BmpClient::serve(stream, sockaddr).await;
+                    BmpClient::serve(stream, sockaddr).await;
                     if let Some(client) = GLOBAL.write().await.bmp_clients.get_mut(&sockaddr) {
                         client.downtime = SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -2263,7 +2262,7 @@ impl RpkiClient {
     fn try_connect(sockaddr: SocketAddr, configured_time: u64) {
         tokio::spawn(async move {
             let mut table_tx = Vec::with_capacity(*NUM_TABLES);
-            let d = Table::dealer(&sockaddr);
+            let d = Table::dealer(sockaddr);
             for i in 0..*NUM_TABLES {
                 let t = TABLE[i].lock().await;
                 table_tx.push(t.table_event_tx[d].clone());
@@ -3194,7 +3193,7 @@ impl Handler {
     ) {
         if let Some((family, reach)) = reach {
             for net in reach {
-                let idx = Table::dealer(&net.0);
+                let idx = Table::dealer(net.0);
                 let _ = self.table_tx[idx].send(TableEvent::PassUpdate(
                     self.source.as_ref().unwrap().clone(),
                     family,
@@ -3205,7 +3204,7 @@ impl Handler {
         }
         if let Some((family, unreach)) = unreach {
             for net in unreach {
-                let idx = Table::dealer(&net.0);
+                let idx = Table::dealer(net.0);
                 let _ = self.table_tx[idx].send(TableEvent::PassUpdate(
                     self.source.as_ref().unwrap().clone(),
                     family,
@@ -3335,7 +3334,7 @@ impl Handler {
                         );
                     }
 
-                    let d = Table::dealer(&self.remote_addr);
+                    let d = Table::dealer(self.remote_addr);
                     for i in 0..*NUM_TABLES {
                         let mut t = TABLE[i].lock().await;
                         for f in codec.channel.keys() {

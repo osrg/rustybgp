@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021 The RustyBGP Authors.
+// Copyright (C) 2019-2022 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -1584,11 +1584,7 @@ pub(crate) fn create_channel(
                 f,
                 Channel {
                     family: f,
-                    addpath: if lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0 {
-                        0x1
-                    } else {
-                        0
-                    },
+                    addpath: u8::from(lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0),
                     extended_nexthop: lc.extended_nexthop & rc.extended_nexthop,
                 },
             )
@@ -2006,9 +2002,7 @@ impl Encoder<&Message> for Codec {
                     unreach.as_ref().map_or(0, |(_, x)| x.len()),
                 );
                 loop {
-                    if let Err(e) = self.do_encode(item, dst, &mut done_idx) {
-                        return Err(e);
-                    }
+                    self.do_encode(item, dst, &mut done_idx)?;
                     done_idx += 1;
                     if n == 0 || done_idx == n {
                         break;
@@ -2037,7 +2031,7 @@ impl Decoder for Codec {
             return Err(Error::InvalidMessageFormat {
                 code: 1,
                 subcode: 2,
-                data: (&src[16..18]).to_vec(),
+                data: (src[16..18]).to_vec(),
             });
         }
 
@@ -2049,7 +2043,7 @@ impl Decoder for Codec {
         let header_len_error = Error::InvalidMessageFormat {
             code: 1,
             subcode: 2,
-            data: (&buf[16..18]).to_vec(),
+            data: (buf[16..18]).to_vec(),
         };
 
         match code {
@@ -2122,8 +2116,8 @@ impl Decoder for Codec {
                         return Err(Error::InvalidMessageFormat {
                             code: 2,
                             subcode: 4,
-                            data: (&buf[c.position() as usize - 2
-                                ..c.position() as usize + op_len as usize])
+                            data: buf[c.position() as usize - 2
+                                ..c.position() as usize + op_len as usize]
                                 .to_vec(),
                         });
                     }
