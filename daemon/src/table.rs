@@ -1785,14 +1785,14 @@ impl PolicyTable {
     ) -> impl Iterator<Item = api::Statement> + '_ {
         self.statements
             .iter()
-            .filter(move |(sname, _)| name.is_empty() || name.as_str() == &*sname.as_ref())
+            .filter(move |(sname, _)| name.is_empty() || name.as_str() == sname.as_ref())
             .map(|(_, s)| s.as_ref().into())
     }
 
     pub(crate) fn iter_policy_api(&self, name: String) -> impl Iterator<Item = api::Policy> + '_ {
         self.policies
             .iter()
-            .filter(move |(pname, _)| name.is_empty() || name.as_str() == &*pname.as_ref())
+            .filter(move |(pname, _)| name.is_empty() || name.as_str() == pname.as_ref())
             .map(|(_, p)| p.as_ref().into())
     }
 }
