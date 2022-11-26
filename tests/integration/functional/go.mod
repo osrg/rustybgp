@@ -19,7 +19,7 @@ require (
 	github.com/osrg/gobgp v0.0.0-20200219043526-659ef4bc371c
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.4.2 // indirect
-	github.com/stretchr/testify v1.5.1
+	github.com/stretchr/testify v1.8.1
 	golang.org/x/time v0.0.0-20191024005414-555d28b269f0 // indirect
 	google.golang.org/grpc v1.27.1
 	gotest.tools/v3 v3.0.2 // indirect
