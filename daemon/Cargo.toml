@@ -38,4 +38,4 @@ uuid = { version = "0.8", features = ["v4"] }
 ip_network_table-deps-treebitmap = "0.5.0"
 
 [build-dependencies]
-tonic-build = "0.5.2"
+tonic-build = "0.8.3"
