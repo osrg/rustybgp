@@ -1210,9 +1210,10 @@ impl GobgpApi for GrpcService {
         let mut stream = request.into_inner();
         while let Some(Ok(request)) = stream.next().await {
             for path in request.paths {
-                let u = self.local_path(path)?;
-                let chan = TABLE[u.0].lock().await.table_event_tx[0].clone();
-                let _ = chan.send(u.1);
+                if let Ok(u) = self.local_path(path) {
+                    let chan = TABLE[u.0].lock().await.table_event_tx[0].clone();
+                    let _ = chan.send(u.1);
+                }
             }
         }
         Ok(tonic::Response::new(()))
