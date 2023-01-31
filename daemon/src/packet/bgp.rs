@@ -496,7 +496,7 @@ impl From<&Capability> for prost_types::Any {
                             |(family, flags, time)| api::LongLivedGracefulRestartCapabilityTuple {
                                 family: Some((*family).into()),
                                 flags: *flags as u32,
-                                time: *time as u32,
+                                time: *time,
                             },
                         )
                         .collect(),
@@ -545,7 +545,7 @@ impl Capability {
             }
             Capability::GracefulRestart(flags, time, v) => {
                 c.put_u8(v.len() as u8 + 2);
-                c.put_u16((*flags as u16) << 12 | *time as u16);
+                c.put_u16((*flags as u16) << 12 | *time);
                 for (family, af_flags) in v {
                     c.put_u16(family.afi());
                     c.put_u8(family.safi());
@@ -1133,7 +1133,7 @@ impl From<&Attribute> for prost_types::Any {
                         Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()),
                     ),
                     8 => (
-                        c.read_u32::<NetworkEndian>().unwrap() as u32,
+                        c.read_u32::<NetworkEndian>().unwrap(),
                         Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()),
                     ),
                     _ => unreachable!("corrupted"),
@@ -1326,7 +1326,7 @@ impl AttrDesc {
         Ok(Attribute {
             code: self.code,
             flags: self.flags,
-            data: AttributeData::Val(c.read_u32::<NetworkEndian>().unwrap() as u32),
+            data: AttributeData::Val(c.read_u32::<NetworkEndian>().unwrap()),
         })
     }
 
@@ -1747,7 +1747,7 @@ impl Codec {
             .write_u16::<NetworkEndian>(mp_len - 4)
             .unwrap();
 
-        Ok(mp_len as u16)
+        Ok(mp_len)
     }
 
     fn mp_unreach_encode(
@@ -1786,7 +1786,7 @@ impl Codec {
         (&mut dst.as_mut()[pos_bin..])
             .write_u16::<NetworkEndian>(mp_len - 4)
             .unwrap();
-        Ok(mp_len as u16)
+        Ok(mp_len)
     }
 
     fn do_encode(
@@ -1833,7 +1833,7 @@ impl Codec {
                 }
 
                 (&mut dst.as_mut()[param_len_pos..])
-                    .write_u8(cap_len as u8)
+                    .write_u8(cap_len)
                     .unwrap();
                 (&mut dst.as_mut()[op_param_len_pos..])
                     .write_u8(cap_len + 2_u8)
