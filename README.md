@@ -13,9 +13,10 @@ You can easily build RusyBGP on any system that has Docker running. You don't ne
 ```bash
 $ git clone https://github.com/osrg/rustybgp.git
 $ cd rustybgp
-$ docker run --rm -it -v "$(pwd)":/home/rust/src ekidd/rust-musl-builder cargo build --release
-$ ls -lh target/x86_64-unknown-linux-musl/release/rustybgpd
--rwxr-xr-x 2 ubuntu ubuntu 12M May 10 14:52 target/x86_64-unknown-linux-musl/release/rustybgpd
+$ docker pull ghcr.io/rust-cross/rust-musl-cross:x86_64-unknown-linux-musl
+$ docker run --rm -it -v "$(pwd)":/home/rust/src ghcr.io/rust-cross/rust-musl-cross:x86_64-unknown-linux-musl cargo build --release
+$ ls target/x86_64-unknown-linux-musl/release/rustybgpd
+target/x86_64-unknown-linux-musl/release/rustybgpd
 ```
 
 ```bash
