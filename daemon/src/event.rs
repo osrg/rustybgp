@@ -1917,7 +1917,7 @@ impl BmpClient {
         let mut adjin = FnvHashMap::default();
         for i in 0..*NUM_TABLES {
             let mut t = TABLE[i].lock().await;
-            t.bmp_event_tx.insert(sockaddr.ip(), tx.clone());
+            t.bmp_event_tx.insert(sockaddr, tx.clone());
             for f in &[Family::IPV4, Family::IPV6] {
                 for c in t.rtable.iter_reach(*f) {
                     let e = adjin.entry(c.source.remote_addr).or_insert_with(Vec::new);
@@ -2012,7 +2012,6 @@ impl BmpClient {
                 }
             }
         }
-
         let mut rx = UnboundedReceiverStream::new(rx);
         loop {
             tokio::select! {
@@ -2035,6 +2034,10 @@ impl BmpClient {
                     }
                 }
             }
+        }
+        for i in 0..*NUM_TABLES {
+            let mut t = TABLE[i].lock().await;
+            let _ = t.bmp_event_tx.remove(&sockaddr);
         }
     }
 
@@ -2864,7 +2867,7 @@ struct Table {
     rtable: table::RoutingTable,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
     table_event_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
-    bmp_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<bmp::Message>>,
+    bmp_event_tx: FnvHashMap<SocketAddr, mpsc::UnboundedSender<bmp::Message>>,
     mrt_event_tx: Option<mpsc::UnboundedSender<mrt::Message>>,
     addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
 
