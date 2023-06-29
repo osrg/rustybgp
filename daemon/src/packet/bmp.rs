@@ -34,10 +34,10 @@ impl Message {
 
 #[derive(Clone)]
 pub(crate) struct PerPeerHeader {
-    asn: u32,
+    pub(crate) asn: u32,
     id: Ipv4Addr,
     distinguisher: u64,
-    remote_addr: IpAddr,
+    pub(crate) remote_addr: IpAddr,
     timestamp: u32,
 }
 

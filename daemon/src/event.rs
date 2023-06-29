@@ -1002,9 +1002,62 @@ impl GobgpApi for GrpcService {
     >;
     async fn watch_event(
         &self,
-        _request: tonic::Request<api::WatchEventRequest>,
+        request: tonic::Request<api::WatchEventRequest>,
     ) -> Result<tonic::Response<Self::WatchEventStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let (bmp_tx, bmp_rx) = mpsc::unbounded_channel();
+
+        if let Some(sockaddr) = request.remote_addr() {
+            for i in 0..*NUM_TABLES {
+                let mut t = TABLE[i].lock().await;
+                t.bmp_event_tx.insert(sockaddr, bmp_tx.clone());
+            }
+
+            let (tx, rx) = mpsc::channel(1024);
+            tokio::spawn(async move {
+                let mut bmp_rx = UnboundedReceiverStream::new(bmp_rx);
+                while let Some(msg) = bmp_rx.next().await {
+                    match &msg {
+                        bmp::Message::PeerUp { header, .. }
+                        | bmp::Message::PeerDown { header, .. } => {
+                            let state = match &msg {
+                                bmp::Message::PeerUp { .. } => 6,
+                                _ => 1,
+                            };
+
+                            let r = api::WatchEventResponse {
+                                event: Some(api::watch_event_response::Event::Peer(
+                                    api::watch_event_response::PeerEvent {
+                                        r#type: api::watch_event_response::peer_event::Type::State
+                                            .into(),
+                                        peer: Some(api::Peer {
+                                            conf: Some(api::PeerConf {
+                                                peer_asn: header.asn,
+                                                neighbor_address: header.remote_addr.to_string(),
+                                                ..Default::default()
+                                            }),
+                                            state: Some(api::PeerState {
+                                                session_state: state,
+                                                ..Default::default()
+                                            }),
+                                            ..Default::default()
+                                        }),
+                                    },
+                                )),
+                            };
+                            if tx.send(Ok(r)).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            Ok(tonic::Response::new(Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            )))
+        } else {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
     }
     async fn add_peer_group(
         &self,
