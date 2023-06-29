@@ -434,6 +434,7 @@ impl From<&Peer> for api::Peer {
         let mut ps = api::PeerState {
             neighbor_address: p.remote_addr.to_string(),
             peer_asn: p.state.remote_asn.load(Ordering::Relaxed),
+            local_asn: p.local_asn,
             router_id: Ipv4Addr::from(p.state.remote_id.load(Ordering::Relaxed)).to_string(),
             messages: Some(api::Messages {
                 received: Some((&*p.counter_rx).into()),
@@ -500,6 +501,10 @@ impl From<&Peer> for api::Peer {
             state: Some(ps),
             conf: Some(Default::default()),
             timers: Some(tm),
+            transport: Some(api::Transport {
+                local_address: p.local_sockaddr.ip().to_string(),
+                ..Default::default()
+            }),
             route_reflector: Some(Default::default()),
             route_server: Some(api::RouteServer {
                 route_server_client: p.route_server_client,
