@@ -1048,8 +1048,59 @@ impl GobgpApi for GrpcService {
                                 break;
                             }
                         }
+                        bmp::Message::RouteMonitoring {
+                            header: _, update, ..
+                        } => {
+                            let mut paths = Vec::new();
+                            match update {
+                                bgp::Message::Update {
+                                    reach,
+                                    unreach,
+                                    attr,
+                                } => {
+                                    if let Some((family, reach)) = reach {
+                                        for (net, id) in reach {
+                                            paths.push(api::Path {
+                                                nlri: Some(net.into()),
+                                                family: Some((*family).into()),
+                                                identifier: *id,
+                                                pattrs: attr
+                                                    .iter()
+                                                    .map(prost_types::Any::from)
+                                                    .collect(),
+                                                ..Default::default()
+                                            });
+                                        }
+                                    }
+                                    if let Some((family, unreach)) = unreach {
+                                        for (net, id) in unreach {
+                                            paths.push(api::Path {
+                                                nlri: Some(net.into()),
+                                                family: Some((*family).into()),
+                                                identifier: *id,
+                                                ..Default::default()
+                                            });
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+
+                            let r = api::WatchEventResponse {
+                                event: Some(api::watch_event_response::Event::Table(
+                                    api::watch_event_response::TableEvent { paths },
+                                )),
+                            };
+                            if tx.send(Ok(r)).await.is_err() {
+                                break;
+                            }
+                        }
                         _ => {}
                     }
+                }
+                for i in 0..*NUM_TABLES {
+                    let mut t = TABLE[i].lock().await;
+                    t.bmp_event_tx.remove(&sockaddr);
                 }
             });
             Ok(tonic::Response::new(Box::pin(
