@@ -145,6 +145,12 @@ impl Neighbor {
         let _: std::net::IpAddr = addr
             .parse()
             .map_err(|_| Error::InvalidConfiguration("can't parse neighbor address".to_string()))?;
+
+        if self.add_paths.is_some() {
+            return Err(Error::InvalidConfiguration(
+                "use per-family addpath config".to_string(),
+            ));
+        }
         Ok(())
     }
 }
