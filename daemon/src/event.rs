@@ -250,6 +250,7 @@ struct PeerBuilder {
     ctrl_channel: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
     multihop_ttl: Option<u8>,
     password: Option<String>,
+    families: FnvHashMap<Family, bool>,
 }
 
 impl PeerBuilder {
@@ -275,6 +276,7 @@ impl PeerBuilder {
             ctrl_channel: None,
             multihop_ttl: None,
             password: None,
+            families: Default::default(),
         }
     }
 
@@ -284,11 +286,9 @@ impl PeerBuilder {
     }
 
     fn families(&mut self, families: Vec<Family>) -> &mut Self {
-        let mut v: Vec<packet::Capability> = families
-            .iter()
-            .map(|family| packet::Capability::MultiProtocol(*family))
-            .collect();
-        self.local_cap.append(&mut v);
+        for f in families {
+            self.families.insert(f, false);
+        }
         self
     }
 
@@ -371,13 +371,24 @@ impl PeerBuilder {
     }
 
     fn addpath(&mut self, families: Vec<packet::Family>) -> &mut Self {
-        self.local_cap.push(packet::Capability::AddPath(
-            families.iter().map(|family| (*family, 1)).collect(),
-        ));
+        for f in families {
+            self.families.insert(f, true);
+        }
         self
     }
 
     fn build(&mut self) -> Peer {
+        let mut addpath = Vec::new();
+        for (f, v) in &self.families {
+            if *v {
+                addpath.push((*f, 1));
+            } else {
+                self.local_cap.push(packet::Capability::MultiProtocol(*f));
+            }
+        }
+        if !addpath.is_empty() {
+            self.local_cap.push(packet::Capability::AddPath(addpath));
+        }
         Peer {
             remote_addr: self.remote_addr,
             configured_time: SystemTime::now()
@@ -569,10 +580,11 @@ impl TryFrom<&api::Peer> for Peer {
     }
 }
 
-// assumes that config::Neighbor is valified so use From instead of TryFrom
+// assumes that config::Neighbor is validated so use From instead of TryFrom
 impl From<&config::Neighbor> for Peer {
     fn from(n: &config::Neighbor) -> Peer {
         let c = n.config.as_ref().unwrap();
+        let mut families = Vec::new();
         let addpath_families: Vec<packet::Family> = n
             .afi_safis
             .as_ref()
@@ -580,8 +592,14 @@ impl From<&config::Neighbor> for Peer {
             .filter(|x| {
                 x.config.as_ref().map_or(false, |x| {
                     if let Some(f) = x.afi_safi_name.as_ref() {
-                        f == &config::gen::AfiSafiType::Ipv4Unicast
+                        if f == &config::gen::AfiSafiType::Ipv4Unicast
                             || f == &config::gen::AfiSafiType::Ipv6Unicast
+                        {
+                            if let Ok(family) = packet::Family::try_from(f) {
+                                families.push(family);
+                            }
+                        }
+                        true
                     } else {
                         false
                     }
@@ -644,9 +662,10 @@ impl From<&config::Neighbor> for Peer {
         if let Some(password) = c.auth_password.as_ref() {
             builder.password(password);
         }
-        if !addpath_families.is_empty() {
-            builder.addpath(addpath_families);
-        }
+
+        builder.families(families);
+        builder.addpath(addpath_families);
+
         builder.build()
     }
 }
