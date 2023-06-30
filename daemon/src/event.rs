@@ -378,16 +378,23 @@ impl PeerBuilder {
     }
 
     fn build(&mut self) -> Peer {
-        let mut addpath = Vec::new();
-        for (f, v) in &self.families {
-            if *v {
-                addpath.push((*f, 1));
-            } else {
-                self.local_cap.push(packet::Capability::MultiProtocol(*f));
+        if self.families.is_empty() {
+            self.local_cap.push(match self.remote_addr {
+                IpAddr::V4(_) => packet::Capability::MultiProtocol(Family::IPV4),
+                IpAddr::V6(_) => packet::Capability::MultiProtocol(Family::IPV6),
+            });
+        } else {
+            let mut addpath = Vec::new();
+            for (f, v) in &self.families {
+                if *v {
+                    addpath.push((*f, 1));
+                } else {
+                    self.local_cap.push(packet::Capability::MultiProtocol(*f));
+                }
             }
-        }
-        if !addpath.is_empty() {
-            self.local_cap.push(packet::Capability::AddPath(addpath));
+            if !addpath.is_empty() {
+                self.local_cap.push(packet::Capability::AddPath(addpath));
+            }
         }
         Peer {
             remote_addr: self.remote_addr,
@@ -2548,13 +2555,6 @@ impl Global {
             caps.insert(Into::<u8>::into(c));
         }
         let c = packet::Capability::FourOctetAsNumber(peer.local_asn);
-        if !caps.contains(&Into::<u8>::into(&c)) {
-            peer.local_cap.push(c);
-        }
-        let c = match peer.remote_addr {
-            IpAddr::V4(_) => packet::Capability::MultiProtocol(Family::IPV4),
-            IpAddr::V6(_) => packet::Capability::MultiProtocol(Family::IPV6),
-        };
         if !caps.contains(&Into::<u8>::into(&c)) {
             peer.local_cap.push(c);
         }
