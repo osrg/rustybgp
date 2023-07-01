@@ -388,9 +388,8 @@ impl PeerBuilder {
             for (f, v) in &self.families {
                 if *v {
                     addpath.push((*f, 1));
-                } else {
-                    self.local_cap.push(packet::Capability::MultiProtocol(*f));
                 }
+                self.local_cap.push(packet::Capability::MultiProtocol(*f));
             }
             if !addpath.is_empty() {
                 self.local_cap.push(packet::Capability::AddPath(addpath));
