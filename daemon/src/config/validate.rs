@@ -379,7 +379,32 @@ impl TryFrom<&Statement> for api::Statement {
             med: None,
             as_prepend: None,
             ext_community: None,
-            nexthop: None,
+            nexthop: match a.bgp_actions.as_ref() {
+                Some(a) => {
+                    if let Some(s) = a.set_next_hop.as_ref() {
+                        match s.as_str() {
+                            "self" => Some(api::NexthopAction {
+                                self_: true,
+                                unchanged: false,
+                                address: String::new(),
+                            }),
+                            "unchanged" => Some(api::NexthopAction {
+                                self_: false,
+                                unchanged: true,
+                                address: String::new(),
+                            }),
+                            _ => Some(api::NexthopAction {
+                                self_: false,
+                                unchanged: false,
+                                address: s.to_string(),
+                            }),
+                        }
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            },
             local_pref: None,
             large_community: None,
         });
