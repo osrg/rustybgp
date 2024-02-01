@@ -773,7 +773,7 @@ impl GrpcService {
                     if attr.is_empty() {
                         None
                     } else {
-                        Some(Arc::new(attr))
+                        Some(attr)
                     }
                 },
             ),
@@ -952,7 +952,7 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::EnablePeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            for (addr, mut p) in &mut GLOBAL.write().await.peers {
+            for (addr, p) in &mut GLOBAL.write().await.peers {
                 if addr == &peer_addr {
                     if p.admin_down {
                         p.admin_down = false;
@@ -981,7 +981,7 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::DisablePeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            for (addr, mut p) in &mut GLOBAL.write().await.peers {
+            for (addr, p) in &mut GLOBAL.write().await.peers {
                 if addr == &peer_addr {
                     if p.admin_down {
                         return Err(tonic::Status::new(
@@ -2413,7 +2413,7 @@ impl RpkiClient {
                 .await
                 {
                     let (tx, rx) = mpsc::unbounded_channel();
-                    let state = if let Some(mut client) =
+                    let state = if let Some(client) =
                         GLOBAL.write().await.rpki_clients.get_mut(&sockaddr)
                     {
                         client.mgmt_tx = Some(tx);
@@ -2425,7 +2425,7 @@ impl RpkiClient {
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 }
-                if let Some(mut client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
+                if let Some(client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
                     if client.configured_time != configured_time {
                         break;
                     }
@@ -2977,7 +2977,7 @@ enum TableEvent {
         Arc<table::Source>,
         Family,
         Vec<(packet::Net, u32)>,
-        Option<Arc<Vec<packet::Attribute>>>,
+        Option<Vec<packet::Attribute>>,
     ),
     Disconnected(Arc<table::Source>),
     // RPKI events
@@ -3011,7 +3011,7 @@ impl Table {
             if let Some(Some(msg)) = futures.next().await {
                 match msg {
                     TableEvent::PassUpdate(source, family, nets, attrs) => match attrs {
-                        Some(attrs) => {
+                        Some(mut attrs) => {
                             let mut t = TABLE[idx].lock().await;
                             for bmp_tx in t.bmp_event_tx.values() {
                                 let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
@@ -3063,7 +3063,7 @@ impl Table {
                             for net in nets {
                                 let mut filtered = false;
                                 if let Some(a) = t.global_import_policy.as_ref() {
-                                    if t.rtable.apply_policy(a, &source, &net.0, &attrs)
+                                    if t.rtable.apply_policy(a, &source, &net.0, &mut attrs)
                                         == table::Disposition::Reject
                                     {
                                         filtered = true;
@@ -3078,7 +3078,7 @@ impl Table {
                                     filtered,
                                 ) {
                                     if let Some(a) = t.global_export_policy.as_ref() {
-                                        if t.rtable.apply_policy(a, &source, &net.0, &attrs)
+                                        if t.rtable.apply_policy(a, &source, &net.0, &mut attrs)
                                             == table::Disposition::Reject
                                         {
                                             continue;
@@ -3108,7 +3108,7 @@ impl Table {
                                     ),
                                     update: packet::bgp::Message::Update {
                                         reach: None,
-                                        attr: Arc::new(Vec::new()),
+                                        attr: Vec::new(),
                                         unreach: Some((family, nets.to_owned())),
                                     },
                                     addpath,
@@ -3131,7 +3131,7 @@ impl Table {
                                     ),
                                     body: bgp::Message::Update {
                                         reach: None,
-                                        attr: Arc::new(Vec::new()),
+                                        attr: Vec::new(),
                                         unreach: Some((family, nets.to_owned())),
                                     },
                                     addpath,
@@ -3148,7 +3148,7 @@ impl Table {
                                                 a,
                                                 &source,
                                                 &net.0,
-                                                &Arc::new(Vec::new()),
+                                                &mut Vec::new(),
                                             ) == table::Disposition::Reject
                                             {
                                                 continue;
@@ -3320,7 +3320,7 @@ impl Handler {
         &mut self,
         reach: Option<(Family, Vec<(packet::Net, u32)>)>,
         unreach: Option<(Family, Vec<(packet::Net, u32)>)>,
-        attr: Arc<Vec<packet::Attribute>>,
+        attr: Vec<packet::Attribute>,
     ) {
         if let Some((family, reach)) = reach {
             for net in reach {
@@ -3469,9 +3469,9 @@ impl Handler {
                     for i in 0..*NUM_TABLES {
                         let mut t = TABLE[i].lock().await;
                         for f in codec.channel.keys() {
-                            for c in t.rtable.best(f).into_iter() {
+                            for mut c in t.rtable.best(f).into_iter() {
                                 if let Some(a) = t.global_export_policy.as_ref() {
-                                    if t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
+                                    if t.rtable.apply_policy(a, &c.source, &c.net, &mut c.attr)
                                         == table::Disposition::Reject
                                     {
                                         continue;
@@ -3717,7 +3717,7 @@ impl Handler {
                                 txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                                 let msg = bgp::Message::Update{
                                     reach: None,
-                                    attr: Arc::new(Vec::new()),
+                                    attr: Vec::new(),
                                     unreach: Some((*family, unreach)),
                                 };
                                 let _ = codec.encode(&msg, &mut txbuf);
@@ -3832,9 +3832,9 @@ impl Handler {
 
 #[derive(Default)]
 struct PendingTx {
-    reach: FnvHashMap<packet::Net, Arc<Vec<packet::Attribute>>>,
+    reach: FnvHashMap<packet::Net, Vec<packet::Attribute>>,
     unreach: FnvHashSet<packet::Net>,
-    bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<packet::Net>>,
+    bucket: FnvHashMap<Vec<packet::Attribute>, FnvHashSet<packet::Net>>,
     sync: bool,
 }
 
@@ -3933,43 +3933,29 @@ fn bucket() {
         source: src.clone(),
         family,
         net: net1,
-        attr: Arc::new(attr1.clone()),
+        attr: attr1.clone(),
     });
 
     pending.insert_change(table::Change {
         source: src.clone(),
         family: Family::IPV4,
         net: net2,
-        attr: Arc::new(vec![packet::Attribute::new_with_value(
-            packet::Attribute::ORIGIN,
-            0,
-        )
-        .unwrap()]),
+        attr: vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap()],
     });
 
     // a-1) and a-2) properly marged?
     assert_eq!(1, pending.bucket.len());
-    assert_eq!(
-        2,
-        pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()
-    );
+    assert_eq!(2, pending.bucket.get(&attr1.clone()).unwrap().len());
 
     // b-1)
     pending.insert_change(table::Change {
         source: src.clone(),
         family,
         net: net2,
-        attr: Arc::new(vec![packet::Attribute::new_with_value(
-            packet::Attribute::ORIGIN,
-            0,
-        )
-        .unwrap()]),
+        attr: vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap()],
     });
     assert_eq!(1, pending.bucket.len());
-    assert_eq!(
-        2,
-        pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()
-    );
+    assert_eq!(2, pending.bucket.get(&attr1.clone()).unwrap().len());
 
     // b-2-2)
     let attr2 = vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap()];
@@ -3977,16 +3963,9 @@ fn bucket() {
         source: src.clone(),
         family,
         net: net2,
-        attr: Arc::new(vec![packet::Attribute::new_with_value(
-            packet::Attribute::ORIGIN,
-            1,
-        )
-        .unwrap()]),
+        attr: vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap()],
     });
     assert_eq!(2, pending.bucket.len());
-    assert_eq!(&Arc::new(attr2), pending.reach.get(&net2).unwrap());
-    assert_eq!(
-        1,
-        pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()
-    );
+    assert_eq!(&attr2, pending.reach.get(&net2).unwrap());
+    assert_eq!(1, pending.bucket.get(&attr1.clone()).unwrap().len());
 }

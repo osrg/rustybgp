@@ -23,7 +23,6 @@ use std::convert::{Into, TryFrom};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -1475,7 +1474,7 @@ pub(crate) enum Message {
     Update {
         reach: Option<(Family, Vec<(Net, u32)>)>,
         unreach: Option<(Family, Vec<(Net, u32)>)>,
-        attr: Arc<Vec<Attribute>>,
+        attr: Vec<Attribute>,
     },
     Notification {
         code: u8,
@@ -1504,13 +1503,13 @@ impl Message {
         if family == Family::IPV4 {
             Message::Update {
                 reach: Some((Family::IPV4, Vec::new())),
-                attr: Arc::new(Vec::new()),
+                attr: Vec::new(),
                 unreach: None,
             }
         } else {
             Message::Update {
                 reach: None,
-                attr: Arc::new(Vec::new()),
+                attr: Vec::new(),
                 unreach: Some((family, Vec::new())),
             }
         }
@@ -1685,7 +1684,7 @@ impl Codec {
     fn mp_reach_encode(
         &self,
         buf_head: usize,
-        attrs: Arc<Vec<Attribute>>,
+        attrs: Vec<Attribute>,
         dst: &mut BytesMut,
         reach: &(Family, Vec<(Net, u32)>),
         reach_idx: &mut usize,
@@ -1753,7 +1752,7 @@ impl Codec {
     fn mp_unreach_encode(
         &self,
         buf_head: usize,
-        _: Arc<Vec<Attribute>>,
+        _: Vec<Attribute>,
         dst: &mut BytesMut,
         unreach: &(Family, Vec<(Net, u32)>),
         unreach_idx: &mut usize,
@@ -2263,7 +2262,7 @@ impl Decoder for Codec {
                     return Ok(Some(Message::Update {
                         reach: Some((Family::IPV4, Vec::new())),
                         unreach: None,
-                        attr: Arc::new(Vec::new()),
+                        attr: Vec::new(),
                     }));
                 }
 
@@ -2424,7 +2423,7 @@ impl Decoder for Codec {
                     } else {
                         Some((reach_family, reach))
                     },
-                    attr: Arc::new(attr),
+                    attr: attr,
                     unreach: if unreach.is_empty() {
                         None
                     } else {
@@ -2552,11 +2551,11 @@ fn build_many_v4_route() {
     let reach: Vec<(Net, u32)> = net.iter().cloned().map(|n| (n, 0)).collect();
     let mut msg = Message::Update {
         reach: Some((Family::IPV4, reach)),
-        attr: Arc::new(vec![
+        attr: vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
             Attribute::new_with_bin(Attribute::NEXTHOP, vec![0, 0, 0, 0]).unwrap(),
-        ]),
+        ],
         unreach: None,
     };
     let mut set = fnv::FnvHashSet::default();
@@ -2596,7 +2595,7 @@ fn build_many_v4_route() {
     let unreach = net.iter().cloned().map(|n| (n, 0)).collect();
     msg = Message::Update {
         reach: None,
-        attr: Arc::new(Vec::new()),
+        attr: Vec::new(),
         unreach: Some((Family::IPV4, unreach)),
     };
 
@@ -2647,11 +2646,11 @@ fn many_mp_reach() {
 
     let msg = Message::Update {
         reach: Some((Family::IPV6, reach)),
-        attr: Arc::new(vec![
+        attr: vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
             Attribute::new_with_bin(Attribute::NEXTHOP, (0..31).collect::<Vec<u8>>()).unwrap(),
-        ]),
+        ],
         unreach: None,
     };
 
@@ -2701,7 +2700,7 @@ fn many_mp_unreach() {
 
     let msg = Message::Update {
         reach: None,
-        attr: Arc::new(Vec::new()),
+        attr: Vec::new(),
         unreach: Some((Family::IPV6, unreach)),
     };
 
