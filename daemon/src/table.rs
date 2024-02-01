@@ -17,7 +17,6 @@ use crate::proto::ToApi;
 use fnv::FnvHashMap;
 use ip_network_table_deps_treebitmap::IpLookupTable;
 use once_cell::sync::Lazy;
-use parking_lot::RwLock;
 use patricia_tree::PatriciaMap;
 use regex::Regex;
 use std::collections::{hash_map::Entry::Occupied, hash_map::Entry::Vacant};
@@ -93,27 +92,6 @@ impl PathAttribute {
             Some(attr) => attr.as_path_length(),
             None => 0,
         }
-    }
-}
-
-struct Attr(Arc<Vec<packet::Attribute>>);
-impl From<AttrRwLock> for Attr {
-    fn from(a: AttrRwLock) -> Self {
-        Attr(Arc::new(
-            a.0.iter()
-                .map(|a| a.read().to_owned())
-                .collect::<Vec<packet::Attribute>>(),
-        ))
-    }
-}
-struct AttrRwLock(Arc<Vec<RwLock<packet::Attribute>>>);
-impl From<Attr> for AttrRwLock {
-    fn from(a: Attr) -> Self {
-        AttrRwLock(Arc::new(
-            a.0.iter()
-                .map(|a| RwLock::new(a.to_owned()))
-                .collect::<Vec<RwLock<packet::Attribute>>>(),
-        ))
     }
 }
 
