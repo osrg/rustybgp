@@ -41,7 +41,7 @@ Hello, RustyBGP (32 cpus)!
 
 ## Supported Features
 
-Currently, the very basic BGP features are supported; eBGP and iBGP, acstive/passive connection, RPKI, BMP (BGP monitoring protocol), MRT, etc with the following gRPC APIs.
+Currently, the very basic BGP features are supported; eBGP and iBGP, active/passive connection, RPKI, BMP (BGP monitoring protocol), MRT, etc with the following gRPC APIs.
 
 | API                    | Relevant CLI                                               | Note                                         |
 | ---------------------- | ---------------------------------------------------------- | -------------------------------------------- |
