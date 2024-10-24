@@ -4,5 +4,6 @@
     "config:recommended"
   ],
   "assignees": ["MattKobayashi"],
+  "forkProcessing": "enabled",
   "recreateWhen": "never"
 }
