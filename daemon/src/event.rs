@@ -952,7 +952,7 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::EnablePeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            for (addr, mut p) in &mut GLOBAL.write().await.peers {
+            for (addr, p) in &mut GLOBAL.write().await.peers {
                 if addr == &peer_addr {
                     if p.admin_down {
                         p.admin_down = false;
@@ -981,7 +981,7 @@ impl GobgpApi for GrpcService {
         request: tonic::Request<api::DisablePeerRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            for (addr, mut p) in &mut GLOBAL.write().await.peers {
+            for (addr, p) in &mut GLOBAL.write().await.peers {
                 if addr == &peer_addr {
                     if p.admin_down {
                         return Err(tonic::Status::new(
@@ -1077,38 +1077,29 @@ impl GobgpApi for GrpcService {
                             header: _, update, ..
                         } => {
                             let mut paths = Vec::new();
-                            match update {
-                                bgp::Message::Update {
-                                    reach,
-                                    unreach,
-                                    attr,
-                                } => {
-                                    if let Some((family, reach)) = reach {
-                                        for (net, id) in reach {
-                                            paths.push(api::Path {
-                                                nlri: Some(net.into()),
-                                                family: Some((*family).into()),
-                                                identifier: *id,
-                                                pattrs: attr
-                                                    .iter()
-                                                    .map(prost_types::Any::from)
-                                                    .collect(),
-                                                ..Default::default()
-                                            });
-                                        }
-                                    }
-                                    if let Some((family, unreach)) = unreach {
-                                        for (net, id) in unreach {
-                                            paths.push(api::Path {
-                                                nlri: Some(net.into()),
-                                                family: Some((*family).into()),
-                                                identifier: *id,
-                                                ..Default::default()
-                                            });
-                                        }
-                                    }
+                            if let bgp::Message::Update {
+                                reach: Some((family, reach)),
+                                unreach: Some((_, unreach)),
+                                attr,
+                            } = update
+                            {
+                                for (net, id) in reach {
+                                    paths.push(api::Path {
+                                        nlri: Some(net.into()),
+                                        family: Some((*family).into()),
+                                        identifier: *id,
+                                        pattrs: attr.iter().map(prost_types::Any::from).collect(),
+                                        ..Default::default()
+                                    });
                                 }
-                                _ => {}
+                                for (net, id) in unreach {
+                                    paths.push(api::Path {
+                                        nlri: Some(net.into()),
+                                        family: Some((*family).into()),
+                                        identifier: *id,
+                                        ..Default::default()
+                                    });
+                                }
                             }
 
                             let r = api::WatchEventResponse {
@@ -2413,7 +2404,7 @@ impl RpkiClient {
                 .await
                 {
                     let (tx, rx) = mpsc::unbounded_channel();
-                    let state = if let Some(mut client) =
+                    let state = if let Some(client) =
                         GLOBAL.write().await.rpki_clients.get_mut(&sockaddr)
                     {
                         client.mgmt_tx = Some(tx);
@@ -2425,7 +2416,7 @@ impl RpkiClient {
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 }
-                if let Some(mut client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
+                if let Some(client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
                     if client.configured_time != configured_time {
                         break;
                     }
@@ -2673,11 +2664,10 @@ impl Global {
             .as_ref()
             .and_then(|x| x.global.as_ref())
             .and_then(|x| x.config.as_ref());
-        let as_number = if let Some(asn) = global_config.as_ref().and_then(|x| x.r#as) {
-            asn
-        } else {
-            0
-        };
+        let as_number = global_config
+            .as_ref()
+            .and_then(|x| x.r#as)
+            .unwrap_or_default();
         let router_id =
             if let Some(router_id) = global_config.as_ref().and_then(|x| x.router_id.as_ref()) {
                 router_id.parse().unwrap()
@@ -3892,17 +3882,11 @@ impl PendingTx {
                     self.bucket.remove(&old_attr);
                 }
 
-                let bucket = self
-                    .bucket
-                    .entry(change.attr)
-                    .or_insert_with(FnvHashSet::default);
+                let bucket = self.bucket.entry(change.attr).or_default();
                 bucket.insert(change.net);
             } else {
                 // a-1) and a-2)
-                let bucket = self
-                    .bucket
-                    .entry(change.attr)
-                    .or_insert_with(FnvHashSet::default);
+                let bucket = self.bucket.entry(change.attr).or_default();
                 bucket.insert(change.net);
             }
         }
