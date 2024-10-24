@@ -34,7 +34,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.8"
 toml = "0.5.7"
 nix = "0.22"
-uuid = { version = "0.8", features = ["v4"] }
+uuid = { version = "1.11", features = ["v4"] }
 ip_network_table-deps-treebitmap = "0.5.0"
 
 [build-dependencies]
