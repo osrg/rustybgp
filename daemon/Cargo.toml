@@ -32,7 +32,7 @@ thiserror = "1"
 libc = "0.2.94"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
-toml = "0.5.7"
+toml = "0.8.19"
 nix = "0.22"
 uuid = { version = "1.11", features = ["v4"] }
 ip_network_table-deps-treebitmap = "0.5.0"
