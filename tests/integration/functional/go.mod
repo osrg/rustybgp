@@ -4,11 +4,10 @@ go 1.13
 
 require (
 	github.com/Azure/go-ansiterm v0.0.0-20170929234023-d6e3b3328b78 // indirect
-	github.com/Microsoft/go-winio v0.4.14 // indirect
 	github.com/containerd/containerd v1.3.3 // indirect
 	github.com/docker/distribution v2.7.1+incompatible // indirect
 	github.com/docker/docker v1.4.2-0.20200214221943-d8772509d1a2
-	github.com/docker/go-connections v0.4.0
+	github.com/docker/go-connections v0.5.0
 	github.com/docker/go-units v0.4.0 // indirect
 	github.com/gogo/protobuf v1.3.1 // indirect
 	github.com/golang/protobuf v1.5.4
