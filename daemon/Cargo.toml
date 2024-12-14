@@ -18,8 +18,8 @@ tokio = { version = "=1.27", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec","time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 clap = "2.33"
-futures = "=0.3.16"
-futures-core = "=0.3.16"
+futures = "0.3.31"
+futures-core = "0.3.31"
 patricia_tree = "0.3"
 regex = "1"
 hostname = "0.3"
