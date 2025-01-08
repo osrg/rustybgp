@@ -34,11 +34,11 @@ use crate::error::Error;
 use crate::packet::{self, bgp, Attribute, Family};
 
 struct PathAttribute {
-    attr: Arc<Vec<Attribute>>,
+    attr: Vec<Attribute>,
 }
 
 impl PathAttribute {
-    fn new(attr: Arc<Vec<packet::Attribute>>) -> Self {
+    fn new(attr: Vec<packet::Attribute>) -> Self {
         PathAttribute { attr }
     }
 
@@ -152,7 +152,7 @@ pub(crate) struct Reach {
     pub(crate) source: Arc<Source>,
     pub(crate) family: Family,
     pub(crate) net: (packet::Net, u32),
-    pub(crate) attr: Arc<Vec<packet::Attribute>>,
+    pub(crate) attr: Vec<packet::Attribute>,
 }
 
 impl From<Reach> for bgp::Message {
@@ -170,7 +170,7 @@ pub(crate) struct Change {
     pub(crate) source: Arc<Source>,
     pub(crate) family: Family,
     pub(crate) net: packet::Net,
-    pub(crate) attr: Arc<Vec<packet::Attribute>>,
+    pub(crate) attr: Vec<packet::Attribute>,
 }
 
 impl From<Change> for bgp::Message {
@@ -357,7 +357,7 @@ impl RoutingTable {
                                 .keep_aspath(p.source.rs_client)
                                 .keep_nexthop(p.source.rs_client)
                                 .build();
-                            let attr = Arc::new(
+                            let mut attr =
                                 p.pa.attr
                                     .iter()
                                     .cloned()
@@ -369,10 +369,9 @@ impl RoutingTable {
                                             a
                                         }
                                     })
-                                    .collect::<Vec<packet::Attribute>>(),
-                            );
+                                    .collect::<Vec<packet::Attribute>>();
                             if let Some(pa) = &export_policy {
-                                if self.apply_policy(pa, &p.source, net, &attr)
+                                if self.apply_policy(pa, &p.source, net, &mut attr)
                                     == Disposition::Reject
                                 {
                                     None
@@ -410,7 +409,7 @@ impl RoutingTable {
         family: Family,
         net: packet::Net,
         remote_id: u32,
-        attr: Arc<Vec<packet::Attribute>>,
+        attr: Vec<packet::Attribute>,
         filtered: bool,
     ) -> Option<Change> {
         let mut replaced = false;
@@ -544,7 +543,7 @@ impl RoutingTable {
                         source: source.clone(),
                         family,
                         net,
-                        attr: Arc::new(Vec::new()),
+                        attr: Vec::new(),
                     });
                 }
                 if was_best {
@@ -591,7 +590,7 @@ impl RoutingTable {
                         source: source.clone(),
                         family: *family,
                         net: *net,
-                        attr: Arc::new(Vec::new()),
+                        attr: Vec::new(),
                     });
                 }
                 !dst.entry.is_empty()
@@ -696,7 +695,7 @@ impl RoutingTable {
         assignment: &PolicyAssignment,
         source: &Arc<Source>,
         net: &packet::Net,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &mut Vec<packet::Attribute>,
     ) -> Disposition {
         assignment.apply(&self.rpki, source, net, attr)
     }
@@ -738,7 +737,7 @@ fn drop() {
 
     let mut rt = RoutingTable::new();
     let family = Family::IPV4;
-    let attrs = Arc::new(Vec::new());
+    let attrs = Vec::new();
 
     rt.insert(s1.clone(), family, n1, 0, attrs.clone(), false);
     rt.insert(s2, family, n1, 0, attrs.clone(), false);
@@ -1076,7 +1075,7 @@ impl Condition {
         &self,
         source: &Arc<Source>,
         net: &packet::Net,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &Vec<packet::Attribute>,
     ) -> bool {
         match self {
             Condition::Prefix(_name, opt, set) => {
@@ -1100,7 +1099,7 @@ impl Condition {
             Condition::AsPath(_name, opt, set) => {
                 if let Some(a) = attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
                     for set in &set.single_sets {
-                        if set.is_match(a) {
+                        if set.is_match(&a) {
                             return *opt == MatchOption::Any;
                         }
                     }
@@ -1163,12 +1162,47 @@ impl From<Disposition> for i32 {
     }
 }
 
+pub trait Action {
+    //TODO(Kuroame): Should we return some kind of error?
+    fn apply(&self, source: &Arc<Source>, net: &packet::Net, attr: &mut Vec<packet::Attribute>);
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub(crate) enum NextHopAction {
+    Address(IpAddr),
+    Self_(bool),
+    Unchanged(bool),
+}
+
+impl Action for NextHopAction {
+    fn apply(&self, source: &Arc<Source>, _net: &packet::Net, attr: &mut Vec<packet::Attribute>) {
+        match self {
+            NextHopAction::Address(addr) => {
+                attr.iter_mut().for_each(|a| {
+                    if a.code() == packet::Attribute::NEXTHOP {
+                        *a = a.nexthop_update(addr.clone());
+                    }
+                });
+            }
+            NextHopAction::Self_(_) => {
+                attr.clone().iter_mut().for_each(|a| {
+                    if a.code() == packet::Attribute::NEXTHOP {
+                        *a = a.nexthop_update(source.local_addr.clone());
+                    }
+                });
+            }
+            NextHopAction::Unchanged(_) => {}
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Statement {
     name: Arc<str>,
     // ALL the conditions are matched, the action will be executed.
     conditions: Vec<Condition>,
     disposition: Option<Disposition>,
+    mod_actions: Vec<Arc<dyn Action + Send + Sync>>,
     // pub route_action: Action,
 }
 
@@ -1177,7 +1211,7 @@ impl Statement {
         &self,
         source: &Arc<Source>,
         net: &packet::Net,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &mut Vec<packet::Attribute>,
     ) -> Disposition {
         let mut result = true;
         // if any in the conditions returns false, this statement becomes false.
@@ -1187,11 +1221,16 @@ impl Statement {
                 break;
             }
         }
+        if !result {
+            return Disposition::Pass;
+        }
 
-        if result {
-            if let Some(disposition) = &self.disposition {
-                return *disposition;
-            }
+        for action in &self.mod_actions {
+            action.apply(source, net, attr);
+        }
+
+        if let Some(disposition) = &self.disposition {
+            return *disposition;
         }
         Disposition::Pass
     }
@@ -1343,7 +1382,7 @@ impl Policy {
         &self,
         source: &Arc<Source>,
         net: &packet::Net,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &mut Vec<packet::Attribute>,
     ) -> Disposition {
         for statement in &self.statements {
             let r = statement.apply(source, net, attr);
@@ -1376,7 +1415,7 @@ impl PolicyAssignment {
         _rpki: &RpkiTable,
         source: &Arc<Source>,
         net: &packet::Net,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &mut Vec<packet::Attribute>,
     ) -> Disposition {
         for policy in &self.policies {
             let r = policy.apply(source, net, attr);
@@ -1759,21 +1798,46 @@ impl PolicyTable {
                 }
             }
         }
+
         let mut disposition = None;
+        let mut mod_actions: Vec<
+            std::sync::Arc<(dyn Action + std::marker::Send + Sync + 'static)>,
+        > = Vec::new();
+
         if let Some(actions) = actions {
-            match api::RouteAction::from_i32(actions.route_action) {
-                Some(a) => match a {
+            if let Some(a) = api::RouteAction::from_i32(actions.route_action) {
+                match a {
                     api::RouteAction::Accept => disposition = Some(Disposition::Accept),
                     api::RouteAction::Reject => disposition = Some(Disposition::Reject),
                     _ => {}
-                },
-                None => return Err(Error::InvalidArgument("invalid action".to_string())),
+                }
+            } else {
+                return Err(Error::InvalidArgument("invalid route action".to_string()));
+            }
+
+            if let Some(a) = actions.nexthop {
+                if a.unchanged {
+                    mod_actions.push(Arc::new(NextHopAction::Unchanged(true)));
+                } else if a.self_ {
+                    mod_actions.push(Arc::new(NextHopAction::Self_(true)));
+                } else {
+                    match IpAddr::from_str(&a.address) {
+                        Ok(addr) => mod_actions.push(Arc::new(NextHopAction::Address(addr))),
+                        Err(_) => {
+                            return Err(Error::InvalidArgument(
+                                "invalid nexthop action".to_string(),
+                            ))
+                        }
+                    }
+                }
             }
         }
+
         let s = Statement {
             name: Arc::from(name),
             conditions: v,
             disposition,
+            mod_actions,
         };
         self.statements.insert(s.name.clone(), Arc::new(s));
         Ok(())
@@ -1879,7 +1943,7 @@ impl RpkiTable {
         family: Family,
         source: &Arc<Source>,
         net: &packet::Net,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &Vec<packet::Attribute>,
     ) -> Option<api::Validation> {
         match self.roas.get(&family) {
             None => None,
