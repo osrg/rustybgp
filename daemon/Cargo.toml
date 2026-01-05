@@ -2,19 +2,20 @@
 name = "rustybgpd"
 version = "0.2.0"
 authors = ["FUJITA Tomonori <fujita.tomonori@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 ascii = "1"
-tonic = "0.5.2"
+tonic = "0.14"
+tonic-prost = "0.14"
 bytes = "1.0"
 chrono = "0.4"
-prost = "0.8"
-prost-types = "0.8"
-prost-derive = "0.8"
-tokio = { version = "=1.27", features = ["full"] }
+prost = "0.14"
+prost-types = "0.14"
+prost-derive = "0.14"
+tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec","time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 clap = "2.33"
@@ -38,4 +39,4 @@ uuid = { version = "0.8", features = ["v4"] }
 ip_network_table-deps-treebitmap = "0.5.0"
 
 [build-dependencies]
-tonic-build = "0.5.2"
+tonic-prost-build = "0.14"

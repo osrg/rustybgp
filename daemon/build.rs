@@ -8,13 +8,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap();
     let git_hash = String::from_utf8(output.stdout).unwrap();
     println!("cargo:rustc-env=GIT_HASH={git_hash}");
-    tonic_build::configure().build_server(true).compile(
-        &[
-            "../api/gobgp.proto",
-            "../api/attribute.proto",
-            "../api/capability.proto",
-        ],
-        &["../api/"],
-    )?;
+    tonic_prost_build::configure()
+        .build_server(true)
+        .compile_protos(
+            &[
+                "../api/gobgp.proto",
+                "../api/attribute.proto",
+                "../api/capability.proto",
+            ],
+            &["../api/", "/usr/include/"],
+        )?;
     Ok(())
 }
