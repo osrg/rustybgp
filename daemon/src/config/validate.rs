@@ -382,6 +382,7 @@ impl TryFrom<&Statement> for api::Statement {
             nexthop: None,
             local_pref: None,
             large_community: None,
+            origin_action: None,
         });
 
         Ok(api::Statement {

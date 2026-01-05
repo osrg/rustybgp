@@ -16,7 +16,7 @@
 #![recursion_limit = "1024"]
 mod api {
     #![allow(clippy::all)]
-    tonic::include_proto!("apipb");
+    tonic::include_proto!("api");
 }
 mod auth;
 mod config;

@@ -395,7 +395,7 @@ impl RoutingTable {
                             p.id
                         },
                         age: Some(p.timestamp.to_api()),
-                        pattrs: attr.iter().map(prost_types::Any::from).collect(),
+                        pattrs: attr.iter().map(|a| a.into()).collect(),
                         validation: self.rpki.validate(family, &p.source, net, &attr),
                         ..Default::default()
                     })
@@ -1065,7 +1065,7 @@ enum Condition {
     Nexthop(Vec<IpAddr>),
     // ExtendedCommunity,
     AsPathLength(Comparison, u32),
-    Rpki(api::validation::State),
+    Rpki(api::ValidationState),
     // RouteType(u32),
     // LargeCommunity,
     // AfiSafiIn(Vec<bgp::Family>),
@@ -1420,16 +1420,16 @@ impl PolicyTable {
         &mut self,
         assignment: api::PolicyAssignment,
     ) -> Result<(api::PolicyDirection, Arc<PolicyAssignment>), Error> {
-        let dir = api::PolicyDirection::from_i32(assignment.direction)
-            .ok_or_else(|| Error::InvalidArgument("invalid assignment direction".to_string()))?;
-        if dir == api::PolicyDirection::Unknown {
+        let dir = api::PolicyDirection::try_from(assignment.direction)
+            .map_err(|_| Error::InvalidArgument("invalid assignment direction".to_string()))?;
+        if dir == api::PolicyDirection::Unspecified {
             return Err(Error::InvalidArgument(
                 "invalid assignment direction".to_string(),
             ));
         }
 
-        let action = api::RouteAction::from_i32(assignment.default_action)
-            .ok_or_else(|| Error::InvalidArgument("invalid action".to_string()))?;
+        let action = api::RouteAction::try_from(assignment.default_action)
+            .map_err(|_| Error::InvalidArgument("invalid action".to_string()))?;
 
         let mut v = Vec::new();
         for p in assignment.policies {
@@ -1446,13 +1446,13 @@ impl PolicyTable {
         let dis = match action {
             api::RouteAction::Accept => Disposition::Accept,
             api::RouteAction::Reject => Disposition::Reject,
-            api::RouteAction::None => Disposition::Pass,
+            api::RouteAction::Unspecified => Disposition::Pass,
         };
 
         let m = match dir {
             api::PolicyDirection::Import => &mut self.assignment_import,
             api::PolicyDirection::Export => &mut self.assignment_export,
-            api::PolicyDirection::Unknown => {
+            api::PolicyDirection::Unspecified => {
                 return Err(Error::InvalidArgument(
                     "invalid policy direction".to_string(),
                 ));
@@ -1528,8 +1528,8 @@ impl PolicyTable {
     }
 
     pub(crate) fn add_defined_set(&mut self, set: api::DefinedSet) -> Result<(), Error> {
-        let t = api::DefinedType::from_i32(set.defined_type)
-            .ok_or_else(|| Error::InvalidArgument("invalid defined-type".to_string()))?;
+        let t = api::DefinedType::try_from(set.defined_type)
+            .map_err(|_| Error::InvalidArgument("invalid defined-type".to_string()))?;
         let name: Arc<str> = Arc::from(set.name.as_str());
         let name1 = name.clone();
         match t {
@@ -1750,10 +1750,10 @@ impl PolicyTable {
                 }
                 v.push(Condition::Nexthop(nexthops));
             }
-            if conditions.rpki_result != api::validation::State::None as i32 {
-                match api::validation::State::from_i32(conditions.rpki_result) {
-                    Some(s) => v.push(Condition::Rpki(s)),
-                    None => {
+            if conditions.rpki_result != api::ValidationState::None as i32 {
+                match api::ValidationState::try_from(conditions.rpki_result) {
+                    Ok(s) => v.push(Condition::Rpki(s)),
+                    Err(_) => {
                         return Err(Error::InvalidArgument("invalid rpki condition".to_string()))
                     }
                 }
@@ -1761,13 +1761,13 @@ impl PolicyTable {
         }
         let mut disposition = None;
         if let Some(actions) = actions {
-            match api::RouteAction::from_i32(actions.route_action) {
-                Some(a) => match a {
+            match api::RouteAction::try_from(actions.route_action) {
+                Ok(a) => match a {
                     api::RouteAction::Accept => disposition = Some(Disposition::Accept),
                     api::RouteAction::Reject => disposition = Some(Disposition::Reject),
                     _ => {}
                 },
-                None => return Err(Error::InvalidArgument("invalid action".to_string())),
+                Err(_) => return Err(Error::InvalidArgument("invalid action".to_string())),
             }
         }
         let s = Statement {
@@ -1888,7 +1888,7 @@ impl RpkiTable {
                     return None;
                 }
                 let mut result = api::Validation {
-                    state: api::validation::State::NotFound as i32,
+                    state: api::ValidationState::NotFound as i32,
                     reason: api::validation::Reason::None as i32,
                     matched: Vec::new(),
                     unmatched_asn: Vec::new(),
@@ -1923,15 +1923,15 @@ impl RpkiTable {
                     }
                 }
                 if !result.matched.is_empty() {
-                    result.state = api::validation::State::Valid as i32;
+                    result.state = api::ValidationState::Valid as i32;
                 } else if !result.unmatched_asn.is_empty() {
-                    result.state = api::validation::State::Invalid as i32;
+                    result.state = api::ValidationState::Invalid as i32;
                     result.reason = api::validation::Reason::Asn as i32;
                 } else if !result.unmatched_length.is_empty() {
-                    result.state = api::validation::State::Invalid as i32;
+                    result.state = api::ValidationState::Invalid as i32;
                     result.reason = api::validation::Reason::Length as i32;
                 } else {
-                    result.state = api::validation::State::NotFound as i32;
+                    result.state = api::validation::Reason::None as i32;
                 }
 
                 Some(result)

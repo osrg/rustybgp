@@ -41,7 +41,7 @@ use tokio::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
-use api::gobgp_api_server::{GobgpApi, GobgpApiServer};
+use api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
 use crate::api;
 use crate::auth;
@@ -782,11 +782,11 @@ impl GrpcService {
 }
 
 #[tonic::async_trait]
-impl GobgpApi for GrpcService {
+impl GoBgpService for GrpcService {
     async fn start_bgp(
         &self,
         request: tonic::Request<api::StartBgpRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::StartBgpResponse>, tonic::Status> {
         let g = request.into_inner().global.ok_or(Error::EmptyArgument)?;
         if g.asn == 0 {
             return Err(tonic::Status::new(
@@ -817,12 +817,12 @@ impl GobgpApi for GrpcService {
         global.router_id = Ipv4Addr::from_str(&g.router_id).unwrap();
         self.init.notify_one();
 
-        Ok(tonic::Response::new(()))
+        Ok(tonic::Response::new(api::StartBgpResponse {}))
     }
     async fn stop_bgp(
         &self,
         _request: tonic::Request<api::StopBgpRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::StopBgpResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn get_bgp(
@@ -838,7 +838,7 @@ impl GobgpApi for GrpcService {
     async fn add_peer(
         &self,
         request: tonic::Request<api::AddPeerRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddPeerResponse>, tonic::Status> {
         let peer = Peer::try_from(&request.into_inner().peer.ok_or(Error::EmptyArgument)?)?;
         let mut global = GLOBAL.write().await;
         if let Some(password) = peer.password.as_ref() {
@@ -847,12 +847,12 @@ impl GobgpApi for GrpcService {
             }
         }
         global.add_peer(peer, Some(self.active_conn_tx.clone()))?;
-        Ok(tonic::Response::new(()))
+        Ok(tonic::Response::new(api::AddPeerResponse {}))
     }
     async fn delete_peer(
         &self,
         request: tonic::Request<api::DeletePeerRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeletePeerResponse>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
             let mut global = GLOBAL.write().await;
             if let Some(p) = global.peers.remove(&peer_addr) {
@@ -868,7 +868,7 @@ impl GobgpApi for GrpcService {
                         auth::set_md5sig(*fd, &peer_addr, "");
                     }
                 }
-                return Ok(tonic::Response::new(()));
+                return Ok(tonic::Response::new(api::DeletePeerResponse {}));
             } else {
                 return Err(tonic::Status::new(
                     tonic::Code::AlreadyExists,
@@ -938,26 +938,26 @@ impl GobgpApi for GrpcService {
     async fn reset_peer(
         &self,
         _request: tonic::Request<api::ResetPeerRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::ResetPeerResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn shutdown_peer(
         &self,
         _request: tonic::Request<api::ShutdownPeerRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::ShutdownPeerResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn enable_peer(
         &self,
         request: tonic::Request<api::EnablePeerRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::EnablePeerResponse>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            for (addr, mut p) in &mut GLOBAL.write().await.peers {
+            for (addr, p) in &mut GLOBAL.write().await.peers {
                 if addr == &peer_addr {
                     if p.admin_down {
                         p.admin_down = false;
                         enable_active_connect(p, self.active_conn_tx.clone());
-                        return Ok(tonic::Response::new(()));
+                        return Ok(tonic::Response::new(api::EnablePeerResponse {}));
                     } else {
                         return Err(tonic::Status::new(
                             tonic::Code::InvalidArgument,
@@ -979,9 +979,9 @@ impl GobgpApi for GrpcService {
     async fn disable_peer(
         &self,
         request: tonic::Request<api::DisablePeerRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DisablePeerResponse>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            for (addr, mut p) in &mut GLOBAL.write().await.peers {
+            for (addr, p) in &mut GLOBAL.write().await.peers {
                 if addr == &peer_addr {
                     if p.admin_down {
                         return Err(tonic::Status::new(
@@ -999,11 +999,11 @@ impl GobgpApi for GrpcService {
                                         data: Vec::new(),
                                     },
                                 ));
-                                return Ok(tonic::Response::new(()));
+                                return Ok(tonic::Response::new(api::DisablePeerResponse {}));
                             }
                             None => {}
                         }
-                        return Ok(tonic::Response::new(()));
+                        return Ok(tonic::Response::new(api::DisablePeerResponse {}));
                     }
                 }
             }
@@ -1091,7 +1091,7 @@ impl GobgpApi for GrpcService {
                                                 identifier: *id,
                                                 pattrs: attr
                                                     .iter()
-                                                    .map(prost_types::Any::from)
+                                                    .map(api::Attribute::from)
                                                     .collect(),
                                                 ..Default::default()
                                             });
@@ -1138,7 +1138,7 @@ impl GobgpApi for GrpcService {
     async fn add_peer_group(
         &self,
         request: tonic::Request<api::AddPeerGroupRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddPeerGroupResponse>, tonic::Status> {
         let pg = request
             .into_inner()
             .peer_group
@@ -1159,14 +1159,14 @@ impl GobgpApi for GrpcService {
             }
             Vacant(v) => {
                 v.insert(PeerGroup::from(pg));
-                return Ok(tonic::Response::new(()));
+                return Ok(tonic::Response::new(api::AddPeerGroupResponse {}));
             }
         }
     }
     async fn delete_peer_group(
         &self,
         _request: tonic::Request<api::DeletePeerGroupRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeletePeerGroupResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn update_peer_group(
@@ -1192,7 +1192,7 @@ impl GobgpApi for GrpcService {
     async fn add_dynamic_neighbor(
         &self,
         request: tonic::Request<api::AddDynamicNeighborRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddDynamicNeighborResponse>, tonic::Status> {
         let dynamic = request
             .into_inner()
             .dynamic_neighbor
@@ -1216,12 +1216,12 @@ impl GobgpApi for GrpcService {
             }
         }
         pg.dynamic_peers.push(DynamicPeer { prefix });
-        Ok(tonic::Response::new(()))
+        Ok(tonic::Response::new(api::AddDynamicNeighborResponse {}))
     }
     async fn delete_dynamic_neighbor(
         &self,
         _request: tonic::Request<api::DeleteDynamicNeighborRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeleteDynamicNeighborResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     type ListDynamicNeighborStream = Pin<
@@ -1253,11 +1253,11 @@ impl GobgpApi for GrpcService {
     async fn delete_path(
         &self,
         request: tonic::Request<api::DeletePathRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeletePathResponse>, tonic::Status> {
         let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
         let chan = TABLE[u.0].lock().await.table_event_tx[0].clone();
         let _ = chan.send(u.1);
-        Ok(tonic::Response::new(()))
+        Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
     type ListPathStream = Pin<
         Box<
@@ -1274,9 +1274,14 @@ impl GobgpApi for GrpcService {
             Some(family) => Family::from(&family),
             None => Family::IPV4,
         };
-        let (table_type, peer_addr) = if let Some(t) = api::TableType::from_i32(request.table_type)
-        {
+        let (table_type, peer_addr) = if let Ok(t) = api::TableType::try_from(request.table_type) {
             let s = match t {
+                api::TableType::Unspecified => {
+                    return Err(tonic::Status::new(
+                        tonic::Code::InvalidArgument,
+                        "table type unspecified",
+                    ));
+                }
                 api::TableType::Global => None,
                 api::TableType::Local | api::TableType::Vrf => {
                     return Err(tonic::Status::unimplemented("Not yet implemented"));
@@ -1340,7 +1345,7 @@ impl GobgpApi for GrpcService {
     async fn add_path_stream(
         &self,
         request: tonic::Request<tonic::Streaming<api::AddPathStreamRequest>>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddPathStreamResponse>, tonic::Status> {
         let mut stream = request.into_inner();
         while let Some(Ok(request)) = stream.next().await {
             for path in request.paths {
@@ -1350,7 +1355,7 @@ impl GobgpApi for GrpcService {
                 }
             }
         }
-        Ok(tonic::Response::new(()))
+        Ok(tonic::Response::new(api::AddPathStreamResponse {}))
     }
     async fn get_table(
         &self,
@@ -1371,13 +1376,13 @@ impl GobgpApi for GrpcService {
     async fn add_vrf(
         &self,
         _request: tonic::Request<api::AddVrfRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddVrfResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn delete_vrf(
         &self,
         _request: tonic::Request<api::DeleteVrfRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeleteVrfResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     type ListVrfStream = Pin<
@@ -1392,19 +1397,19 @@ impl GobgpApi for GrpcService {
     async fn add_policy(
         &self,
         request: tonic::Request<api::AddPolicyRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddPolicyResponse>, tonic::Status> {
         let policy = request.into_inner().policy.ok_or(Error::EmptyArgument)?;
         GLOBAL
             .write()
             .await
             .ptable
             .add_policy(&policy.name, policy.statements)
-            .map(|_| Ok(tonic::Response::new(())))?
+            .map(|_| Ok(tonic::Response::new(api::AddPolicyResponse {})))?
     }
     async fn delete_policy(
         &self,
         _request: tonic::Request<api::DeletePolicyRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeletePolicyResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     type ListPolicyStream = Pin<
@@ -1443,13 +1448,13 @@ impl GobgpApi for GrpcService {
     async fn set_policies(
         &self,
         _request: tonic::Request<api::SetPoliciesRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::SetPoliciesResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn add_defined_set(
         &self,
         request: tonic::Request<api::AddDefinedSetRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddDefinedSetResponse>, tonic::Status> {
         let set = request
             .into_inner()
             .defined_set
@@ -1459,12 +1464,12 @@ impl GobgpApi for GrpcService {
             .await
             .ptable
             .add_defined_set(set)
-            .map(|_| Ok(tonic::Response::new(())))?
+            .map(|_| Ok(tonic::Response::new(api::AddDefinedSetResponse {})))?
     }
     async fn delete_defined_set(
         &self,
         _request: tonic::Request<api::DeleteDefinedSetRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeleteDefinedSetResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     type ListDefinedSetStream = Pin<
@@ -1505,19 +1510,19 @@ impl GobgpApi for GrpcService {
     async fn add_statement(
         &self,
         request: tonic::Request<api::AddStatementRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddStatementResponse>, tonic::Status> {
         let statement = request.into_inner().statement.ok_or(Error::EmptyArgument)?;
         GLOBAL
             .write()
             .await
             .ptable
             .add_statement(&statement.name, statement.conditions, statement.actions)
-            .map(|_| Ok(tonic::Response::new(())))?
+            .map(|_| Ok(tonic::Response::new(api::AddStatementResponse {})))?
     }
     async fn delete_statement(
         &self,
         _request: tonic::Request<api::DeleteStatementRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeleteStatementResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     type ListStatementStream = Pin<
@@ -1555,19 +1560,19 @@ impl GobgpApi for GrpcService {
     async fn add_policy_assignment(
         &self,
         request: tonic::Request<api::AddPolicyAssignmentRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddPolicyAssignmentResponse>, tonic::Status> {
         let _ = self.policy_assignment_sem.acquire().await;
         let request = request
             .into_inner()
             .assignment
             .ok_or(Error::EmptyArgument)?;
         add_policy_assignment(request).await?;
-        Ok(tonic::Response::new(()))
+        Ok(tonic::Response::new(api::AddPolicyAssignmentResponse {}))
     }
     async fn delete_policy_assignment(
         &self,
         _request: tonic::Request<api::DeletePolicyAssignmentRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeletePolicyAssignmentResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     type ListPolicyAssignmentStream = Pin<
@@ -1608,13 +1613,13 @@ impl GobgpApi for GrpcService {
     async fn set_policy_assignment(
         &self,
         _request: tonic::Request<api::SetPolicyAssignmentRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::SetPolicyAssignmentResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn add_rpki(
         &self,
         request: tonic::Request<api::AddRpkiRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddRpkiResponse>, tonic::Status> {
         let request = request.into_inner();
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
@@ -1634,12 +1639,12 @@ impl GobgpApi for GrpcService {
                 RpkiClient::try_connect(sockaddr, t);
             }
         }
-        Ok(tonic::Response::new(()))
+        Ok(tonic::Response::new(api::AddRpkiResponse {}))
     }
     async fn delete_rpki(
         &self,
         request: tonic::Request<api::DeleteRpkiRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeleteRpkiResponse>, tonic::Status> {
         let request = request.into_inner();
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
@@ -1653,7 +1658,7 @@ impl GobgpApi for GrpcService {
         if let Some(tx) = tx {
             let _ = tx.send(RpkiMgmtMsg::Deconfigured);
         }
-        Ok(tonic::Response::new(()))
+        Ok(tonic::Response::new(api::DeleteRpkiResponse {}))
     }
     type ListRpkiStream = Pin<
         Box<
@@ -1701,19 +1706,19 @@ impl GobgpApi for GrpcService {
     async fn enable_rpki(
         &self,
         _request: tonic::Request<api::EnableRpkiRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::EnableRpkiResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn disable_rpki(
         &self,
         _request: tonic::Request<api::DisableRpkiRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DisableRpkiResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn reset_rpki(
         &self,
         _request: tonic::Request<api::ResetRpkiRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::ResetRpkiResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     type ListRpkiTableStream = Pin<
@@ -1755,15 +1760,15 @@ impl GobgpApi for GrpcService {
     async fn enable_zebra(
         &self,
         _request: tonic::Request<api::EnableZebraRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::EnableZebraResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn enable_mrt(
         &self,
         request: tonic::Request<api::EnableMrtRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::EnableMrtResponse>, tonic::Status> {
         let request = request.into_inner();
-        if request.r#type != config::gen::MrtType::Updates as i32 {
+        if request.dump_type != config::gen::MrtType::Updates as i32 {
             return Err(tonic::Status::new(
                 tonic::Code::InvalidArgument,
                 "only update dump is supported",
@@ -1774,18 +1779,18 @@ impl GobgpApi for GrpcService {
             let mut d = MrtDumper::new(&request.filename, interval);
             d.serve().await;
         });
-        Ok(tonic::Response::new(()))
+        Ok(tonic::Response::new(api::EnableMrtResponse {}))
     }
     async fn disable_mrt(
         &self,
         _request: tonic::Request<api::DisableMrtRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DisableMrtResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     async fn add_bmp(
         &self,
         request: tonic::Request<api::AddBmpRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::AddBmpResponse>, tonic::Status> {
         let request = request.into_inner();
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
@@ -1812,12 +1817,12 @@ impl GobgpApi for GrpcService {
                 BmpClient::try_connect(sockaddr, t);
             }
         }
-        Ok(tonic::Response::new(()))
+        Ok(tonic::Response::new(api::AddBmpResponse {}))
     }
     async fn delete_bmp(
         &self,
         _request: tonic::Request<api::DeleteBmpRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::DeleteBmpResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
     type ListBmpStream = Pin<
@@ -1864,7 +1869,7 @@ impl GobgpApi for GrpcService {
     async fn set_log_level(
         &self,
         _request: tonic::Request<api::SetLogLevelRequest>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
+    ) -> Result<tonic::Response<api::SetLogLevelResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
 }
@@ -2413,7 +2418,7 @@ impl RpkiClient {
                 .await
                 {
                     let (tx, rx) = mpsc::unbounded_channel();
-                    let state = if let Some(mut client) =
+                    let state = if let Some(client) =
                         GLOBAL.write().await.rpki_clients.get_mut(&sockaddr)
                     {
                         client.mgmt_tx = Some(tx);
@@ -2425,7 +2430,7 @@ impl RpkiClient {
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 }
-                if let Some(mut client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
+                if let Some(client) = GLOBAL.write().await.rpki_clients.get_mut(&sockaddr) {
                     if client.configured_time != configured_time {
                         break;
                     }
@@ -2510,7 +2515,6 @@ impl From<&Global> for api::Global {
             default_route_distance: None,
             confederation: None,
             graceful_restart: None,
-            apply_policy: None,
             bind_to_device: "".to_string(),
         }
     }
@@ -2905,7 +2909,9 @@ impl Global {
         let notify2 = notify.clone();
         tokio::spawn(async move {
             if let Err(e) = tonic::transport::Server::builder()
-                .add_service(GobgpApiServer::new(GrpcService::new(notify2, active_tx)))
+                .add_service(GoBgpServiceServer::new(GrpcService::new(
+                    notify2, active_tx,
+                )))
                 .serve(addr)
                 .await
             {

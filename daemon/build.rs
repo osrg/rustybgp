@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../api/attribute.proto",
                 "../api/capability.proto",
             ],
-            &["../api/", "/usr/include/"],
+            &["../", "../api/", "/usr/include/"],
         )?;
     Ok(())
 }
