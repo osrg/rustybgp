@@ -279,7 +279,7 @@ pub(crate) struct Ipv4Net {
 impl Ipv4Net {
     fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Ipv4Net, Error> {
         let bit_len = c.read_u8()?;
-        if len < ((bit_len as usize + 7) / 8) || bit_len > 32 {
+        if len < (bit_len as usize).div_ceil(8) || bit_len > 32 {
             return Err(Error::InvalidMessageFormat {
                 code: 3,
                 subcode: 1,
@@ -287,7 +287,7 @@ impl Ipv4Net {
             });
         }
         let mut addr = [0_u8; 4];
-        for i in 0..(bit_len + 7) / 8 {
+        for i in 0..bit_len.div_ceil(8) {
             addr[i as usize] = c.read_u8().unwrap();
         }
         Ok(Ipv4Net {
@@ -298,7 +298,7 @@ impl Ipv4Net {
 
     fn encode(&self, dst: &mut BytesMut) -> Result<u16, ()> {
         let head_pos = dst.len();
-        let prefix_len = (self.mask + 7) / 8;
+        let prefix_len = self.mask.div_ceil(8);
         dst.put_u8(self.mask);
         for i in 0..prefix_len {
             dst.put_u8(self.addr.octets()[i as usize]);
@@ -332,7 +332,7 @@ pub(crate) struct Ipv6Net {
 impl Ipv6Net {
     fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Ipv6Net, Error> {
         let bit_len = c.read_u8()?;
-        if len < ((bit_len as usize + 7) / 8) || bit_len > 128 {
+        if len < (bit_len as usize).div_ceil(8) || bit_len > 128 {
             return Err(Error::InvalidMessageFormat {
                 code: 3,
                 subcode: 1,
@@ -340,7 +340,7 @@ impl Ipv6Net {
             });
         }
         let mut addr = [0_u8; 16];
-        for i in 0..(bit_len + 7) / 8 {
+        for i in 0..bit_len.div_ceil(8) {
             addr[i as usize] = c.read_u8()?;
         }
         Ok(Ipv6Net {
@@ -351,7 +351,7 @@ impl Ipv6Net {
 
     fn encode(&self, dst: &mut BytesMut) -> Result<u16, ()> {
         let head_pos = dst.len();
-        let prefix_len = (self.mask + 7) / 8;
+        let prefix_len = self.mask.div_ceil(8);
         dst.put_u8(self.mask);
         for i in 0..prefix_len {
             dst.put_u8(self.addr.octets()[i as usize]);
@@ -1231,7 +1231,7 @@ impl TryFrom<api::Attribute> for Attribute {
                     let _ = c.write_u8(s.r#type as u8);
                     let _ = c.write_u8(s.numbers.len() as u8);
                     for n in s.numbers {
-                        let _ = c.write_u32::<NetworkEndian>(n).unwrap();
+                        c.write_u32::<NetworkEndian>(n).unwrap();
                     }
                 }
                 Attribute::new_with_bin(Attribute::AS_PATH, c.into_inner())
@@ -1262,15 +1262,15 @@ impl TryFrom<api::Attribute> for Attribute {
                 let mut c = Cursor::new(Vec::new());
                 let addr = Ipv4Addr::from_str(&ag.address)
                     .map_err(|e| Error::InvalidArgument(e.to_string()))?;
-                let _ = c.write_u32::<NetworkEndian>(ag.asn).unwrap();
-                let _ = c.write_u32::<NetworkEndian>(addr.into()).unwrap();
+                c.write_u32::<NetworkEndian>(ag.asn).unwrap();
+                c.write_u32::<NetworkEndian>(addr.into()).unwrap();
                 Attribute::new_with_bin(Attribute::AGGREGATOR, c.into_inner())
                     .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
             }
             api::attribute::Attr::Communities(cm) => {
                 let mut c = Cursor::new(Vec::new());
                 for v in cm.communities {
-                    let _ = c.write_u32::<NetworkEndian>(v).unwrap();
+                    c.write_u32::<NetworkEndian>(v).unwrap();
                 }
                 Attribute::new_with_bin(Attribute::COMMUNITY, c.into_inner())
                     .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
@@ -1286,7 +1286,7 @@ impl TryFrom<api::Attribute> for Attribute {
                 for id in cl.ids {
                     let addr = Ipv4Addr::from_str(&id)
                         .map_err(|e| Error::InvalidArgument(e.to_string()))?;
-                    let _ = c.write_u32::<NetworkEndian>(addr.into()).unwrap();
+                    c.write_u32::<NetworkEndian>(addr.into()).unwrap();
                 }
                 Attribute::new_with_bin(Attribute::CLUSTER_LIST, c.into_inner())
                     .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
@@ -1294,9 +1294,9 @@ impl TryFrom<api::Attribute> for Attribute {
             api::attribute::Attr::LargeCommunities(lc) => {
                 let mut c = Cursor::new(Vec::new());
                 for v in lc.communities {
-                    let _ = c.write_u32::<NetworkEndian>(v.global_admin).unwrap();
-                    let _ = c.write_u32::<NetworkEndian>(v.local_data1).unwrap();
-                    let _ = c.write_u32::<NetworkEndian>(v.local_data2).unwrap();
+                    c.write_u32::<NetworkEndian>(v.global_admin).unwrap();
+                    c.write_u32::<NetworkEndian>(v.local_data1).unwrap();
+                    c.write_u32::<NetworkEndian>(v.local_data2).unwrap();
                 }
                 Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, c.into_inner())
                     .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
@@ -1707,7 +1707,7 @@ impl Codec {
         }
         // padding
         dst.put_u8(0);
-        let addpath = self.channel.get(family).map_or(false, |c| c.addpath_tx());
+        let addpath = self.channel.get(family).is_some_and(|c| c.addpath_tx());
         let max_len = 1 + 16 + if addpath { 4 } else { 0 };
         for (i, item) in nets.iter().enumerate().skip(*reach_idx) {
             let (net, id) = item;
@@ -1747,7 +1747,7 @@ impl Codec {
         dst.put_u16(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
-        let addpath = self.channel.get(family).map_or(false, |c| c.addpath_tx());
+        let addpath = self.channel.get(family).is_some_and(|c| c.addpath_tx());
         let max_len = 1 + 16 + if addpath { 4 } else { 0 };
         for (i, item) in nets.iter().enumerate().skip(*unreach_idx) {
             let (net, id) = item;
@@ -1829,7 +1829,7 @@ impl Codec {
                 } else {
                     unreach.as_ref().unwrap().0
                 };
-                let addpath = self.channel.get(&family).map_or(false, |c| c.addpath_tx());
+                let addpath = self.channel.get(&family).is_some_and(|c| c.addpath_tx());
                 dst.put_u8(Message::UPDATE);
                 let pos_withdrawn_len = dst.len();
                 dst.put_u16(0);
@@ -2514,7 +2514,7 @@ fn parse_ipv6_update() {
                 assert_eq!(reach[i], nlri[i]);
             }
         }
-        _ => assert!(false),
+        _ => unreachable!(),
     }
 }
 
@@ -2552,15 +2552,11 @@ fn build_many_v4_route() {
     let mut recv = Vec::new();
     loop {
         match codec.decode(&mut txbuf) {
-            Ok(m) => match m {
-                Some(m) => match m {
-                    Message::Update { reach, .. } => {
-                        recv.append(&mut reach.unwrap().1);
-                    }
-                    _ => {}
-                },
-                None => break,
-            },
+            Ok(Some(Message::Update { reach, .. })) => {
+                recv.append(&mut reach.unwrap().1);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
             Err(_) => panic!("failed to decode"),
         }
     }
@@ -2587,15 +2583,11 @@ fn build_many_v4_route() {
     codec.encode(&msg, &mut txbuf).unwrap();
     loop {
         match codec.decode(&mut txbuf) {
-            Ok(m) => match m {
-                Some(m) => match m {
-                    Message::Update { unreach, .. } => {
-                        withdrawn.append(&mut unreach.unwrap().1);
-                    }
-                    _ => {}
-                },
-                None => break,
-            },
+            Ok(Some(Message::Update { unreach, .. })) => {
+                withdrawn.append(&mut unreach.unwrap().1);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
             Err(_) => panic!("failed to decode"),
         }
     }
@@ -2640,15 +2632,11 @@ fn many_mp_reach() {
     let mut recv = Vec::new();
     loop {
         match codec.decode(&mut txbuf) {
-            Ok(m) => match m {
-                Some(m) => match m {
-                    Message::Update { reach, .. } => {
-                        recv.append(&mut reach.unwrap().1);
-                    }
-                    _ => {}
-                },
-                None => break,
-            },
+            Ok(Some(Message::Update { reach, .. })) => {
+                recv.append(&mut reach.unwrap().1);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
             Err(e) => panic!("failed to decode {}", e),
         }
     }
@@ -2690,15 +2678,11 @@ fn many_mp_unreach() {
     let mut recv = Vec::new();
     loop {
         match codec.decode(&mut txbuf) {
-            Ok(m) => match m {
-                Some(m) => match m {
-                    Message::Update { unreach, .. } => {
-                        recv.append(&mut unreach.unwrap().1);
-                    }
-                    _ => {}
-                },
-                None => break,
-            },
+            Ok(Some(Message::Update { unreach, .. })) => {
+                recv.append(&mut unreach.unwrap().1);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
             Err(e) => panic!("failed to decode {}", e),
         }
     }

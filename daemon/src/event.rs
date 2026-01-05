@@ -552,15 +552,15 @@ impl TryFrom<&api::Peer> for Peer {
             .families(
                 p.afi_safis
                     .iter()
-                    .filter(|x| x.config.as_ref().map_or(false, |x| x.family.is_some()))
+                    .filter(|x| x.config.as_ref().is_some_and(|x| x.family.is_some()))
                     .map(|x| Family::from(x.config.as_ref().unwrap().family.as_ref().unwrap()))
                     .collect(),
             )
-            .passive(p.transport.as_ref().map_or(false, |x| x.passive_mode))
+            .passive(p.transport.as_ref().is_some_and(|x| x.passive_mode))
             .rs_client(
                 p.route_server
                     .as_ref()
-                    .map_or(false, |x| x.route_server_client),
+                    .is_some_and(|x| x.route_server_client),
             )
             .holdtime(
                 p.timers
@@ -596,7 +596,7 @@ impl From<&config::Neighbor> for Peer {
             .as_ref()
             .map_or(Vec::new().iter(), |x| x.iter())
             .filter(|x| {
-                x.config.as_ref().map_or(false, |x| {
+                x.config.as_ref().is_some_and(|x| {
                     if let Some(f) = x.afi_safi_name.as_ref() {
                         if f == &config::gen::AfiSafiType::Ipv4Unicast
                             || f == &config::gen::AfiSafiType::Ipv6Unicast
@@ -635,15 +635,15 @@ impl From<&config::Neighbor> for Peer {
                     t.remote_port.map_or(Global::BGP_PORT, |n| n)
                 })
             }))
-            .passive(n.transport.as_ref().map_or(false, |t| {
+            .passive(n.transport.as_ref().is_some_and(|t| {
                 t.config
                     .as_ref()
-                    .map_or(false, |t| t.passive_mode.map_or(false, |t| t))
+                    .is_some_and(|t| t.passive_mode.unwrap_or(false))
             }))
-            .rs_client(n.route_server.as_ref().map_or(false, |r| {
+            .rs_client(n.route_server.as_ref().is_some_and(|r| {
                 r.config
                     .as_ref()
-                    .map_or(false, |r| r.route_server_client.map_or(false, |r| r))
+                    .is_some_and(|r| r.route_server_client.unwrap_or(false))
             }))
             .holdtime(n.timers.as_ref().map_or(0, |c| {
                 c.config
@@ -655,7 +655,7 @@ impl From<&config::Neighbor> for Peer {
                     .as_ref()
                     .map_or(0, |c| c.connect_retry.map_or(0, |c| c as u64))
             }))
-            .admin_down(c.admin_down.map_or(false, |c| c))
+            .admin_down(c.admin_down.is_some_and(|c| c))
             .multihop_ttl(n.ebgp_multihop.as_ref().map_or(0, |c| {
                 c.config.as_ref().map_or(0, |c| {
                     if let Some(ttl) = c.multihop_ttl {
@@ -694,7 +694,7 @@ impl From<api::PeerGroup> for PeerGroup {
             as_number: p.conf.map_or(0, |c| c.peer_asn),
             dynamic_peers: Vec::new(),
             // passive: p.transport.map_or(false, |c| c.passive_mode),
-            route_server_client: p.route_server.map_or(false, |c| c.route_server_client),
+            route_server_client: p.route_server.is_some_and(|c| c.route_server_client),
             holdtime: None,
         }
     }
@@ -990,18 +990,15 @@ impl GoBgpService for GrpcService {
                         ));
                     } else {
                         p.admin_down = true;
-                        match &p.mgmt_tx {
-                            Some(mgmt_tx) => {
-                                let _ = mgmt_tx.send(PeerMgmtMsg::Notification(
-                                    bgp::Message::Notification {
-                                        code: 6,
-                                        subcode: 2,
-                                        data: Vec::new(),
-                                    },
-                                ));
-                                return Ok(tonic::Response::new(api::DisablePeerResponse {}));
-                            }
-                            None => {}
+                        if let Some(mgmt_tx) = &p.mgmt_tx {
+                            let _ = mgmt_tx.send(PeerMgmtMsg::Notification(
+                                bgp::Message::Notification {
+                                    code: 6,
+                                    subcode: 2,
+                                    data: Vec::new(),
+                                },
+                            ));
+                            return Ok(tonic::Response::new(api::DisablePeerResponse {}));
                         }
                         return Ok(tonic::Response::new(api::DisablePeerResponse {}));
                     }
@@ -1077,38 +1074,33 @@ impl GoBgpService for GrpcService {
                             header: _, update, ..
                         } => {
                             let mut paths = Vec::new();
-                            match update {
-                                bgp::Message::Update {
-                                    reach,
-                                    unreach,
-                                    attr,
-                                } => {
-                                    if let Some((family, reach)) = reach {
-                                        for (net, id) in reach {
-                                            paths.push(api::Path {
-                                                nlri: Some(net.into()),
-                                                family: Some((*family).into()),
-                                                identifier: *id,
-                                                pattrs: attr
-                                                    .iter()
-                                                    .map(api::Attribute::from)
-                                                    .collect(),
-                                                ..Default::default()
-                                            });
-                                        }
-                                    }
-                                    if let Some((family, unreach)) = unreach {
-                                        for (net, id) in unreach {
-                                            paths.push(api::Path {
-                                                nlri: Some(net.into()),
-                                                family: Some((*family).into()),
-                                                identifier: *id,
-                                                ..Default::default()
-                                            });
-                                        }
+                            if let bgp::Message::Update {
+                                reach,
+                                unreach,
+                                attr,
+                            } = update
+                            {
+                                if let Some((family, reach)) = reach {
+                                    for (net, id) in reach {
+                                        paths.push(api::Path {
+                                            nlri: Some(net.into()),
+                                            family: Some((*family).into()),
+                                            identifier: *id,
+                                            pattrs: attr.iter().map(api::Attribute::from).collect(),
+                                            ..Default::default()
+                                        });
                                     }
                                 }
-                                _ => {}
+                                if let Some((family, unreach)) = unreach {
+                                    for (net, id) in unreach {
+                                        paths.push(api::Path {
+                                            nlri: Some(net.into()),
+                                            family: Some((*family).into()),
+                                            identifier: *id,
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
                             }
 
                             let r = api::WatchEventResponse {
@@ -2242,7 +2234,7 @@ impl RpkiState {
             rpki::Message::SerialQuery { .. } => {
                 let _ = self.serial_query.fetch_add(1, Ordering::Relaxed);
             }
-            rpki::Message::ResetQuery { .. } => {
+            rpki::Message::ResetQuery => {
                 let _ = self.reset_query.fetch_add(1, Ordering::Relaxed);
             }
             rpki::Message::CacheResponse => {
@@ -2677,11 +2669,10 @@ impl Global {
             .as_ref()
             .and_then(|x| x.global.as_ref())
             .and_then(|x| x.config.as_ref());
-        let as_number = if let Some(asn) = global_config.as_ref().and_then(|x| x.r#as) {
-            asn
-        } else {
-            0
-        };
+        let as_number = global_config
+            .as_ref()
+            .and_then(|x| x.r#as)
+            .unwrap_or_default();
         let router_id =
             if let Some(router_id) = global_config.as_ref().and_then(|x| x.router_id.as_ref()) {
                 router_id.parse().unwrap()
@@ -2726,10 +2717,10 @@ impl Global {
                         PeerGroup {
                             as_number: pg.config.as_ref().map_or(0, |x| x.peer_as.map_or(0, |x| x)),
                             dynamic_peers: Vec::new(),
-                            route_server_client: pg.route_server.as_ref().map_or(false, |x| {
+                            route_server_client: pg.route_server.as_ref().is_some_and(|x| {
                                 x.config
                                     .as_ref()
-                                    .map_or(false, |x| x.route_server_client.map_or(false, |x| x))
+                                    .is_some_and(|x| x.route_server_client.unwrap_or(false))
                             }),
                             holdtime: pg.timers.as_ref().and_then(|x| {
                                 x.config
@@ -3898,17 +3889,11 @@ impl PendingTx {
                     self.bucket.remove(&old_attr);
                 }
 
-                let bucket = self
-                    .bucket
-                    .entry(change.attr)
-                    .or_insert_with(FnvHashSet::default);
+                let bucket = self.bucket.entry(change.attr).or_default();
                 bucket.insert(change.net);
             } else {
                 // a-1) and a-2)
-                let bucket = self
-                    .bucket
-                    .entry(change.attr)
-                    .or_insert_with(FnvHashSet::default);
+                let bucket = self.bucket.entry(change.attr).or_default();
                 bucket.insert(change.net);
             }
         }

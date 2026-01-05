@@ -166,6 +166,7 @@ impl TryFrom<&PrefixSet> for api::DefinedSet {
             .to_string();
 
         let mut prefixes = Vec::new();
+        let caps_re = Regex::new(r"^([0-9]+)\.\.([0-9]+)$").unwrap();
         for s in p
             .prefix_list
             .as_ref()
@@ -181,8 +182,7 @@ impl TryFrom<&PrefixSet> for api::DefinedSet {
                 .as_ref()
                 .ok_or_else(|| Error::InvalidConfiguration("empty mask".to_string()))?;
 
-            let caps = Regex::new(r"^([0-9]+)\.\.([0-9]+)$")
-                .unwrap()
+            let caps = caps_re
                 .captures(range)
                 .ok_or_else(|| Error::InvalidConfiguration("invalid mask format".to_string()))?;
 

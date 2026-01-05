@@ -426,10 +426,7 @@ impl RoutingTable {
             flags,
         };
 
-        let rt = self
-            .global
-            .entry(family)
-            .or_insert_with(FnvHashMap::default);
+        let rt = self.global.entry(family).or_default();
         let dst = rt.entry(net).or_insert_with(Destination::new);
         for i in 0..dst.entry.len() {
             if Arc::ptr_eq(&dst.entry[i].source, &source) && dst.entry[i].id == remote_id {
@@ -442,7 +439,7 @@ impl RoutingTable {
         let (received, accepted) = self
             .route_stats
             .entry(source.remote_addr)
-            .or_insert_with(FnvHashMap::default)
+            .or_default()
             .entry(family)
             .or_insert((0, 0));
         if replaced {
@@ -1907,7 +1904,7 @@ impl RpkiTable {
                     packet::Net::V4(net) => (net.addr.octets().to_vec(), net.mask),
                     packet::Net::V6(net) => (net.addr.octets().to_vec(), net.mask),
                 };
-                addr.drain(((mask + 7) / 8) as usize..);
+                addr.drain((mask.div_ceil(8)) as usize..);
                 for (ipnet, entry) in m.iter_prefix(&addr) {
                     let ipnet = RpkiTable::key_to_addr(ipnet);
                     for roa in entry {

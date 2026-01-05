@@ -156,12 +156,12 @@ impl Message {
     fn code(&self) -> u8 {
         match self {
             Message::RouteMonitoring { .. } => Message::ROUTE_MONITORING,
-            Message::StatsReports { .. } => Message::STATS_REPORTS,
+            Message::StatsReports => Message::STATS_REPORTS,
             Message::PeerDown { .. } => Message::PEER_DOWN,
             Message::PeerUp { .. } => Message::PEER_UP,
-            Message::Initiation { .. } => Message::INITIATION,
-            Message::Termination { .. } => Message::TERMINATION,
-            Message::RouteMirroring { .. } => Message::ROUTE_MIRRORING,
+            Message::Initiation(_) => Message::INITIATION,
+            Message::Termination => Message::TERMINATION,
+            Message::RouteMirroring => Message::ROUTE_MIRRORING,
         }
     }
 
@@ -227,7 +227,7 @@ impl Encoder<&Message> for BmpCodec {
                 self.codec.encode(update, &mut buf).unwrap();
                 c.put_slice(buf.as_ref());
             }
-            Message::StatsReports { .. } => {}
+            Message::StatsReports => {}
             Message::PeerDown { header, reason } => {
                 header.encode(c).unwrap();
                 reason.encode(c).unwrap();
@@ -256,8 +256,8 @@ impl Encoder<&Message> for BmpCodec {
                     c.put_slice(bin);
                 }
             }
-            Message::Termination { .. } => {}
-            Message::RouteMirroring { .. } => {}
+            Message::Termination => {}
+            Message::RouteMirroring => {}
         }
 
         let len = c.len() - pos_first;
