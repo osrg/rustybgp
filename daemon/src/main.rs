@@ -27,7 +27,7 @@ mod packet;
 mod proto;
 mod table;
 
-use clap::{App, Arg};
+use clap::{Arg, Command};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
@@ -36,44 +36,46 @@ fn main() -> Result<(), std::io::Error> {
         panic!("four local CPUs are necessary at least");
     }
 
-    let args = App::new("rustybgpd")
-        .version(format!("v{}-{}", env!("CARGO_PKG_VERSION"), env!("GIT_HASH")).as_str())
+    let version: &'static str = concat!("v", env!("CARGO_PKG_VERSION"), "-", env!("GIT_HASH"));
+    let args = Command::new("rustybgpd")
+        .version(version)
         .arg(
-            Arg::with_name("config")
-                .short("f")
+            Arg::new("config")
+                .short('f')
                 .long("config-file")
-                .takes_value(true)
+                .num_args(1)
                 .help("specifying a config file"),
         )
         .arg(
-            Arg::with_name("asn")
+            Arg::new("asn")
                 .long("as-number")
-                .takes_value(true)
+                .num_args(1)
                 .help("specify as number"),
         )
         .arg(
-            Arg::with_name("id")
+            Arg::new("id")
                 .long("router-id")
-                .takes_value(true)
+                .num_args(1)
                 .help("specify router id"),
         )
         .arg(
-            Arg::with_name("any")
+            Arg::new("any")
                 .long("any-peers")
+                .action(clap::ArgAction::SetTrue)
                 .help("accept any peers"),
         )
         .get_matches();
 
-    let conf = if let Some(conf) = args.value_of("config") {
+    let conf = if let Some(conf) = args.get_one::<String>("config") {
         let conf: config::BgpConfig = config::read_from_file(conf).expect("invalid configuration");
         Some(conf)
     } else {
-        let as_number = if let Some(asn) = args.value_of("asn") {
+        let as_number = if let Some(asn) = args.get_one::<String>("asn") {
             asn.parse().unwrap()
         } else {
             0
         };
-        let router_id = if let Some(id) = args.value_of("id") {
+        let router_id = if let Some(id) = args.get_one::<String>("id") {
             Ipv4Addr::from_str(id).unwrap();
             Some(id.to_string())
         } else {
@@ -102,6 +104,6 @@ fn main() -> Result<(), std::io::Error> {
 
     println!("Hello, RustyBGPd ({} cpus)!", num_cpus::get());
 
-    event::main(conf, args.is_present("any"));
+    event::main(conf, args.get_flag("any"));
     Ok(())
 }
