@@ -34,7 +34,7 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.8"
 toml = "0.5"
-nix = "0.22"
+nix = "0.30"
 uuid = { version = "0.8", features = ["v4"] }
 ip_network_table-deps-treebitmap = "0.5"
 
