@@ -113,11 +113,12 @@ impl BmpServer {
             ));
         }
         if let Some(policy) = &config.route_monitoring_policy
-            && policy != &BmpRouteMonitoringPolicyType::PrePolicy {
-                return Err(Error::InvalidConfiguration(
-                    "unsupported monitoring policy".to_string(),
-                ));
-            }
+            && policy != &BmpRouteMonitoringPolicyType::PrePolicy
+        {
+            return Err(Error::InvalidConfiguration(
+                "unsupported monitoring policy".to_string(),
+            ));
+        }
         Ok(())
     }
 }

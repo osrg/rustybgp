@@ -599,9 +599,10 @@ impl From<&config::Neighbor> for Peer {
                     if let Some(f) = x.afi_safi_name.as_ref() {
                         if (f == &config::generate::AfiSafiType::Ipv4Unicast
                             || f == &config::generate::AfiSafiType::Ipv6Unicast)
-                            && let Ok(family) = packet::Family::try_from(f) {
-                                families.push(family);
-                            }
+                            && let Ok(family) = packet::Family::try_from(f)
+                        {
+                            families.push(family);
+                        }
                         true
                     } else {
                         false
@@ -910,9 +911,10 @@ impl GoBgpService for GrpcService {
         tokio::spawn(async move {
             for (addr, peer) in &peers {
                 if let Ok(peer_addr) = peer_addr
-                    && &peer_addr != addr {
-                        continue;
-                    }
+                    && &peer_addr != addr
+                {
+                    continue;
+                }
                 let _ = tx
                     .send(Ok(api::ListPeerResponse {
                         peer: Some(peer.into()),
@@ -2685,22 +2687,23 @@ impl Global {
         if let Some(mrt) = bgp.as_ref().and_then(|x| x.mrt_dump.as_ref()) {
             for m in mrt {
                 if let Some(config) = m.config.as_ref()
-                    && let Some(dump_type) = config.dump_type.as_ref() {
-                        if dump_type != &config::generate::MrtType::Updates {
-                            println!("only update dump is supported");
-                            continue;
-                        }
-                        if let Some(filename) = config.file_name.as_ref() {
-                            let interval = config.rotation_interval.as_ref().map_or(0, |x| *x);
-                            let filename = filename.clone();
-                            tokio::spawn(async move {
-                                let mut d = MrtDumper::new(&filename, interval);
-                                d.serve().await;
-                            });
-                        } else {
-                            println!("mrt dump filename needs to be specified");
-                        }
+                    && let Some(dump_type) = config.dump_type.as_ref()
+                {
+                    if dump_type != &config::generate::MrtType::Updates {
+                        println!("only update dump is supported");
+                        continue;
                     }
+                    if let Some(filename) = config.file_name.as_ref() {
+                        let interval = config.rotation_interval.as_ref().map_or(0, |x| *x);
+                        let filename = filename.clone();
+                        tokio::spawn(async move {
+                            let mut d = MrtDumper::new(&filename, interval);
+                            d.serve().await;
+                        });
+                    } else {
+                        println!("mrt dump filename needs to be specified");
+                    }
+                }
             }
         }
         if let Some(groups) = bgp.as_ref().and_then(|x| x.peer_groups.as_ref()) {
@@ -2737,12 +2740,13 @@ impl Global {
             for n in neighbors {
                 if let Some(prefix) = n.config.as_ref().and_then(|x| x.prefix.as_ref())
                     && let Ok(prefix) = packet::IpNet::from_str(prefix)
-                        && let Some(name) = n.config.as_ref().and_then(|x| x.peer_group.as_ref()) {
-                            server
-                                .peer_group
-                                .entry(name.to_string())
-                                .and_modify(|e| e.dynamic_peers.push(DynamicPeer { prefix }));
-                        }
+                    && let Some(name) = n.config.as_ref().and_then(|x| x.peer_group.as_ref())
+                {
+                    server
+                        .peer_group
+                        .entry(name.to_string())
+                        .and_modify(|e| e.dynamic_peers.push(DynamicPeer { prefix }));
+                }
             }
         }
         if let Some(bmp_servers) = bgp.as_ref().and_then(|x| x.bmp_servers.as_ref()) {
@@ -2788,10 +2792,11 @@ impl Global {
                     if let Some(statements) = &policy.statements {
                         for s in statements {
                             if let Some(n) = s.name.as_ref()
-                                && h.contains(n) {
-                                    s_names.push(n.clone());
-                                    continue;
-                                }
+                                && h.contains(n)
+                            {
+                                s_names.push(n.clone());
+                                continue;
+                            }
                             match api::Statement::try_from(s) {
                                 Ok(s) => {
                                     server
@@ -3052,9 +3057,9 @@ impl Table {
                                 if let Some(a) = t.global_import_policy.as_ref()
                                     && t.rtable.apply_policy(a, &source, &net.0, &attrs)
                                         == table::Disposition::Reject
-                                    {
-                                        filtered = true;
-                                    }
+                                {
+                                    filtered = true;
+                                }
                                 if let Some(ri) = t.rtable.insert(
                                     source.clone(),
                                     family,
@@ -3066,9 +3071,9 @@ impl Table {
                                     if let Some(a) = t.global_export_policy.as_ref()
                                         && t.rtable.apply_policy(a, &source, &net.0, &attrs)
                                             == table::Disposition::Reject
-                                        {
-                                            continue;
-                                        }
+                                    {
+                                        continue;
+                                    }
                                     for c in t.peer_event_tx.values() {
                                         let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
                                     }
@@ -3135,9 +3140,9 @@ impl Table {
                                                 &net.0,
                                                 &Arc::new(Vec::new()),
                                             ) == table::Disposition::Reject
-                                            {
-                                                continue;
-                                            }
+                                        {
+                                            continue;
+                                        }
                                         let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
                                     }
                                 }
@@ -3457,9 +3462,9 @@ impl Handler {
                                 if let Some(a) = t.global_export_policy.as_ref()
                                     && t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
                                         == table::Disposition::Reject
-                                    {
-                                        continue;
-                                    }
+                                {
+                                    continue;
+                                }
                                 pending.get_mut(f).unwrap().insert_change(c);
                             }
                         }
