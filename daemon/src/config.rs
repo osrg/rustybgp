@@ -26,7 +26,7 @@ use std::path::Path;
 pub(crate) fn read_from_file<P: AsRef<Path>>(fname: P) -> Result<BgpConfig, Box<dyn Error>> {
     let contents = std::fs::read_to_string(fname.as_ref())?;
     let conf: BgpConfig = match fname.as_ref().extension().and_then(OsStr::to_str) {
-        Some("yaml") | Some("yml") => serde_yaml::from_str(&contents)?,
+        Some("yaml") | Some("yml") => serde_yaml_bw::from_str(&contents)?,
         _ => toml::from_str(&contents)?,
     };
     conf.validate()?;
