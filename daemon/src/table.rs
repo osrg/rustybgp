@@ -31,7 +31,7 @@ use std::time::SystemTime;
 
 use crate::api;
 use crate::error::Error;
-use crate::packet::{self, bgp, Attribute, Family};
+use crate::packet::{self, Attribute, Family, bgp};
 
 struct PathAttribute {
     attr: Arc<Vec<Attribute>>,
@@ -363,11 +363,7 @@ impl RoutingTable {
                                     .cloned()
                                     .map(|a| {
                                         let (_, m) = a.export(a.code(), None, family, &codec);
-                                        if let Some(m) = m {
-                                            m
-                                        } else {
-                                            a
-                                        }
+                                        if let Some(m) = m { m } else { a }
                                     })
                                     .collect::<Vec<packet::Attribute>>(),
                             );
@@ -1558,7 +1554,7 @@ impl PolicyTable {
                                 return Err(Error::InvalidArgument(format!(
                                     "invalid prefix format {:?}",
                                     p.ip_prefix
-                                )))
+                                )));
                             }
                         }
                     }
@@ -1686,7 +1682,7 @@ impl PolicyTable {
                         return Err(Error::InvalidArgument(format!(
                             "{} prefix-set isn't found",
                             m.name
-                        )))
+                        )));
                     }
                 }
             }
@@ -1703,7 +1699,7 @@ impl PolicyTable {
                         return Err(Error::InvalidArgument(format!(
                             "{} neighbor-set isn't found",
                             m.name
-                        )))
+                        )));
                     }
                 }
             }
@@ -1715,7 +1711,7 @@ impl PolicyTable {
                         return Err(Error::InvalidArgument(format!(
                             "{} aspath-set isn't found",
                             m.name
-                        )))
+                        )));
                     }
                 }
             }
@@ -1730,7 +1726,7 @@ impl PolicyTable {
                         return Err(Error::InvalidArgument(format!(
                             "{} community-set isn't found",
                             m.name
-                        )))
+                        )));
                     }
                 }
             }
@@ -1751,7 +1747,7 @@ impl PolicyTable {
                 match api::ValidationState::try_from(conditions.rpki_result) {
                     Ok(s) => v.push(Condition::Rpki(s)),
                     Err(_) => {
-                        return Err(Error::InvalidArgument("invalid rpki condition".to_string()))
+                        return Err(Error::InvalidArgument("invalid rpki condition".to_string()));
                     }
                 }
             }
