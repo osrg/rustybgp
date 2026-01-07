@@ -1834,8 +1834,8 @@ impl Codec {
                 let pos_withdrawn_len = dst.len();
                 dst.put_u16(0);
                 let mut withdrawn_len = 0;
-                if family == Family::IPV4 {
-                    if let Some(unreach) = unreach {
+                if family == Family::IPV4
+                    && let Some(unreach) = unreach {
                         let max_len = 5 + if addpath { 4 } else { 0 };
                         for (i, item) in unreach.1.iter().enumerate().skip(*reach_idx) {
                             if pos_head + self.max_message_length() > dst.len() + max_len {
@@ -1849,7 +1849,6 @@ impl Codec {
                             }
                         }
                     }
-                }
                 if withdrawn_len != 0 {
                     (&mut dst.as_mut()[pos_withdrawn_len..])
                         .write_u16::<NetworkEndian>(withdrawn_len)

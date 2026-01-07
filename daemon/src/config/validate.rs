@@ -112,13 +112,12 @@ impl BmpServer {
                 "port number is too big".to_string(),
             ));
         }
-        if let Some(policy) = &config.route_monitoring_policy {
-            if policy != &BmpRouteMonitoringPolicyType::PrePolicy {
+        if let Some(policy) = &config.route_monitoring_policy
+            && policy != &BmpRouteMonitoringPolicyType::PrePolicy {
                 return Err(Error::InvalidConfiguration(
                     "unsupported monitoring policy".to_string(),
                 ));
             }
-        }
         Ok(())
     }
 }

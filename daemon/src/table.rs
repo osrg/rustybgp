@@ -1075,16 +1075,14 @@ impl Condition {
             Condition::Prefix(_name, opt, set) => {
                 match net {
                     packet::Net::V4(n) => {
-                        if let Some(zero) = set.zero {
-                            if zero.0 <= n.mask && n.mask <= zero.1 {
+                        if let Some(zero) = set.zero
+                            && zero.0 <= n.mask && n.mask <= zero.1 {
                                 return *opt == MatchOption::Any;
                             }
-                        }
-                        if let Some((_, _, p)) = set.v4.longest_match(n.addr) {
-                            if p.min_length <= n.mask && p.max_length <= n.mask {
+                        if let Some((_, _, p)) = set.v4.longest_match(n.addr)
+                            && p.min_length <= n.mask && p.max_length <= n.mask {
                                 return *opt == MatchOption::Any;
                             }
-                        }
                         return !(*opt == MatchOption::Any);
                     }
                     packet::Net::V6(_) => {}
@@ -1181,11 +1179,10 @@ impl Statement {
             }
         }
 
-        if result {
-            if let Some(disposition) = &self.disposition {
+        if result
+            && let Some(disposition) = &self.disposition {
                 return *disposition;
             }
-        }
         Disposition::Pass
     }
 }
@@ -1482,11 +1479,10 @@ impl PolicyTable {
             if let Some(a) = self.assignment_import.as_ref() {
                 v.push(a.to_api(1));
             }
-        } else if direction != 1 {
-            if let Some(a) = self.assignment_export.as_ref() {
+        } else if direction != 1
+            && let Some(a) = self.assignment_export.as_ref() {
                 v.push(a.to_api(2));
             }
-        }
         v.into_iter()
     }
 
