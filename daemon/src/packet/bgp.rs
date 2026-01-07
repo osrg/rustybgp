@@ -69,13 +69,13 @@ impl From<Family> for api::Family {
     }
 }
 
-impl TryFrom<&config::gen::AfiSafiType> for Family {
+impl TryFrom<&config::generate::AfiSafiType> for Family {
     type Error = ();
 
-    fn try_from(f: &config::gen::AfiSafiType) -> Result<Self, Self::Error> {
+    fn try_from(f: &config::generate::AfiSafiType) -> Result<Self, Self::Error> {
         match f {
-            config::gen::AfiSafiType::Ipv4Unicast => Ok(Family::IPV4),
-            config::gen::AfiSafiType::Ipv6Unicast => Ok(Family::IPV6),
+            config::generate::AfiSafiType::Ipv4Unicast => Ok(Family::IPV4),
+            config::generate::AfiSafiType::Ipv6Unicast => Ok(Family::IPV6),
             _ => Err(()),
         }
     }

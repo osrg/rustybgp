@@ -14,8 +14,8 @@
 // limitations under the License.
 
 #[allow(dead_code)]
-pub(crate) mod gen;
-pub(crate) use self::gen::*;
+pub(crate) mod generate;
+pub(crate) use self::generate::*;
 pub(crate) mod validate;
 pub(crate) use self::validate::*;
 
