@@ -26,6 +26,7 @@ use std::convert::{From, TryFrom};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
+use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -3547,7 +3548,7 @@ impl Handler {
         let rxbuf_size = 1 << 16;
         let mut txbuf_size = 1 << 16;
         if let Ok(r) =
-            nix::sys::socket::getsockopt(stream.as_raw_fd(), nix::sys::socket::sockopt::SndBuf)
+            nix::sys::socket::getsockopt(&stream.as_fd(), nix::sys::socket::sockopt::SndBuf)
         {
             txbuf_size = std::cmp::min(txbuf_size, r / 2);
         }
