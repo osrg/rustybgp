@@ -1556,58 +1556,11 @@ impl Codec {
             _ => Err(malformed),
         }
     }
-}
-
-impl Encoder<&Message> for Codec {
-    type Error = Error;
-
-    fn encode(&mut self, item: &Message, dst: &mut BytesMut) -> Result<(), Error> {
-        let mut done_idx = 0;
-        match item {
-            Message::Update { reach, unreach, .. } => {
-                assert!(!(reach.is_some() && unreach.is_some()));
-                let n = std::cmp::max(
-                    reach.as_ref().map_or(0, |(_, x)| x.len()),
-                    unreach.as_ref().map_or(0, |(_, x)| x.len()),
-                );
-                loop {
-                    self.do_encode(item, dst, &mut done_idx)?;
-                    done_idx += 1;
-                    if n == 0 || done_idx == n {
-                        break;
-                    }
-                }
-                Ok(())
-            }
-            _ => self.do_encode(item, dst, &mut done_idx),
+    pub fn parse_message(&mut self, buf: &[u8]) -> Result<Message, Error> {
+        if buf.len() < Message::HEADER_LENGTH as usize {
+            return Err(BgpError::BadMessageLength { data: vec![] }.into());
         }
-    }
-}
-
-impl Decoder for Codec {
-    type Item = Message;
-    type Error = Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let buffer_len = src.len();
-        if buffer_len < Message::HEADER_LENGTH as usize {
-            return Ok(None);
-        }
-        let message_len = (&src[16..18]).read_u16::<NetworkEndian>().unwrap() as usize;
-        if (message_len < Message::HEADER_LENGTH as usize)
-            || (message_len > self.max_message_length())
-        {
-            return Err(BgpError::BadMessageLength {
-                data: (src[16..18]).to_vec(),
-            }
-            .into());
-        }
-
-        if buffer_len < message_len {
-            return Ok(None);
-        }
-        let code = src[18];
-        let buf = src.split_to(message_len).freeze();
+        let code = buf[18];
         let header_len_error: Error = BgpError::BadMessageLength {
             data: (buf[16..18]).to_vec(),
         }
@@ -1690,13 +1643,13 @@ impl Decoder for Codec {
                     self.remote_asn = as_number;
                 }
 
-                Ok(Some(Message::Open {
+                Ok(Message::Open {
                     version,
                     as_number,
                     holdtime,
                     router_id,
                     capability: cap,
-                }))
+                })
             }
             Message::UPDATE => {
                 const MINIMUM_UPDATE_LENGTH: usize = 23;
@@ -1818,11 +1771,11 @@ impl Decoder for Codec {
 
                 // v4 eor
                 if reach_len == 0 && attr_len == 0 && withdrawn_len == 0 {
-                    return Ok(Some(Message::Update {
+                    return Ok(Message::Update {
                         reach: Some((Family::IPV4, Vec::new())),
                         unreach: None,
                         attr: Arc::new(Vec::new()),
-                    }));
+                    });
                 }
 
                 if reach_len != 0 || mp_reach_attr.is_some() {
@@ -1968,7 +1921,7 @@ impl Decoder for Codec {
                     }
                 }
 
-                Ok(Some(Message::Update {
+                Ok(Message::Update {
                     reach: if reach.is_empty() {
                         None
                     } else {
@@ -1980,7 +1933,7 @@ impl Decoder for Codec {
                     } else {
                         Some((unreach_family, unreach))
                     },
-                }))
+                })
             }
             Message::NOTIFICATION => {
                 const MINIMUM_NOTIFICATION_LENGTH: usize = Message::HEADER_LENGTH as usize + 2;
@@ -1992,13 +1945,13 @@ impl Decoder for Codec {
                 let code = c.read_u8().unwrap();
                 let subcode = c.read_u8().unwrap();
 
-                Ok(Some(Message::Notification {
+                Ok(Message::Notification {
                     code,
                     subcode,
                     data: buf[c.position() as usize..].to_vec(),
-                }))
+                })
             }
-            Message::KEEPALIVE => Ok(Some(Message::Keepalive)),
+            Message::KEEPALIVE => Ok(Message::Keepalive),
             Message::ROUTE_REFRESH => {
                 const ROUTE_REFRESH_LENGTH: usize = Message::HEADER_LENGTH as usize + 4;
                 if buf.len() < ROUTE_REFRESH_LENGTH {
@@ -2009,12 +1962,68 @@ impl Decoder for Codec {
                 }
                 let mut c = Cursor::new(&buf);
                 c.set_position(Message::HEADER_LENGTH.into());
-                Ok(Some(Message::RouteRefresh {
+                Ok(Message::RouteRefresh {
                     family: Family(c.read_u32::<NetworkEndian>().unwrap()),
-                }))
+                })
             }
             _ => Err(BgpError::BadMessageType { data: vec![code] }.into()),
         }
+    }
+
+    pub fn encode_to(&mut self, msg: &Message, dst: &mut BytesMut) -> Result<(), Error> {
+        let mut done_idx = 0;
+        match msg {
+            Message::Update { reach, unreach, .. } => {
+                assert!(!(reach.is_some() && unreach.is_some()));
+                let n = std::cmp::max(
+                    reach.as_ref().map_or(0, |(_, x)| x.len()),
+                    unreach.as_ref().map_or(0, |(_, x)| x.len()),
+                );
+                loop {
+                    self.do_encode(msg, dst, &mut done_idx)?;
+                    done_idx += 1;
+                    if n == 0 || done_idx == n {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            _ => self.do_encode(msg, dst, &mut done_idx),
+        }
+    }
+}
+
+impl Encoder<&Message> for Codec {
+    type Error = Error;
+
+    fn encode(&mut self, item: &Message, dst: &mut BytesMut) -> Result<(), Error> {
+        self.encode_to(item, dst)
+    }
+}
+
+impl Decoder for Codec {
+    type Item = Message;
+    type Error = Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let buffer_len = src.len();
+        if buffer_len < Message::HEADER_LENGTH as usize {
+            return Ok(None);
+        }
+        let message_len = (&src[16..18]).read_u16::<NetworkEndian>().unwrap() as usize;
+        if (message_len < Message::HEADER_LENGTH as usize)
+            || (message_len > self.max_message_length())
+        {
+            return Err(BgpError::BadMessageLength {
+                data: (src[16..18]).to_vec(),
+            }
+            .into());
+        }
+        if buffer_len < message_len {
+            return Ok(None);
+        }
+        let buf = src.split_to(message_len);
+        Ok(Some(self.parse_message(&buf)?))
     }
 }
 
@@ -2025,10 +2034,8 @@ fn ipv6_eor() {
         0x00, 0x1e, 0x02, 0x00, 0x00, 0x00, 0x07, 0x90, 0x0f, 0x00, 0x03, 0x00, 0x02, 0x01,
     ];
     buf.append(&mut body);
-    let mut b = BytesMut::from(&buf[..]);
     let mut codec = CodecBuilder::new().families(vec![Family::IPV6]).build();
-    let ret = codec.decode(&mut b);
-    assert!(ret.is_ok());
+    assert!(codec.parse_message(&buf).is_ok());
 }
 
 #[test]
@@ -2060,10 +2067,9 @@ fn parse_ipv6_update() {
     .into_iter()
     .map(|n| (n, 0))
     .collect();
-    let mut b = BytesMut::from(&buf[..]);
     let mut codec = CodecBuilder::new().families(vec![Family::IPV6]).build();
-    let msg = codec.decode(&mut b).unwrap();
-    match msg.unwrap() {
+    let msg = codec.parse_message(&buf).unwrap();
+    match msg {
         Message::Update {
             reach,
             attr: _,
