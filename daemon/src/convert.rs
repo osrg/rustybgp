@@ -18,7 +18,7 @@ use std::io::Cursor;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
-use rustybgp_packet::{Family, Net, bgp::Attribute, bgp::Capability};
+use rustybgp_packet::{Family, Nlri, bgp::Attribute, bgp::Capability};
 
 use crate::api;
 use crate::config;
@@ -33,16 +33,16 @@ impl From<Family> for api::Family {
     }
 }
 
-impl From<&Net> for api::Nlri {
-    fn from(f: &Net) -> Self {
+impl From<&Nlri> for api::Nlri {
+    fn from(f: &Nlri) -> Self {
         match f {
-            Net::V4(n) => api::Nlri {
+            Nlri::V4(n) => api::Nlri {
                 nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
                     prefix: n.addr.to_string(),
                     prefix_len: n.mask as u32,
                 })),
             },
-            Net::V6(n) => api::Nlri {
+            Nlri::V6(n) => api::Nlri {
                 nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
                     prefix: n.addr.to_string(),
                     prefix_len: n.mask as u32,
@@ -309,10 +309,10 @@ pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Fa
     }
 }
 
-pub(crate) fn net_from_api(n: api::Nlri) -> Result<Net, Error> {
+pub(crate) fn net_from_api(n: api::Nlri) -> Result<Nlri, Error> {
     match n.nlri {
         Some(api::nlri::Nlri::Prefix(p)) => {
-            Net::from_str(&format!("{}/{}", p.prefix, p.prefix_len))
+            Nlri::from_str(&format!("{}/{}", p.prefix, p.prefix_len))
                 .map_err(|e| Error::InvalidArgument(e.to_string()))
         }
         _ => Err(Error::InvalidArgument("invalid NLRI".to_string())),
