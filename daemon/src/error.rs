@@ -28,12 +28,6 @@ pub(crate) enum Error {
     #[error("feature isn't supported")]
     Unimplemented,
 
-    #[error("incorrect bgp format {code:?} {subcode:?}")]
-    InvalidMessageFormat {
-        code: u8,
-        subcode: u8,
-        data: Vec<u8>,
-    },
     #[error("invalid configuration")]
     InvalidConfiguration(String),
     #[error("std::io::Error")]

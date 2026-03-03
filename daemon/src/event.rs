@@ -3400,11 +3400,12 @@ impl Handler {
             } => {
                 let session_state = self.state.fsm.load(Ordering::Relaxed);
                 if session_state != SessionState::Established as u8 {
-                    return Err(Error::InvalidMessageFormat {
-                        code: 5,
-                        subcode: session_state,
-                        data: Vec::new(),
-                    });
+                    return Err(Error::Packet(
+                        rustybgp_packet::BgpError::FsmUnexpectedState {
+                            state: session_state,
+                        }
+                        .into(),
+                    ));
                 }
                 self.holdtimer_renewed = Instant::now();
                 self.rx_update(reach, unreach, attr).await;
@@ -3668,9 +3669,12 @@ impl Handler {
                                         },
                                     }
                                     Err(e) => {
-                                        if let rustybgp_packet::error::Error::InvalidMessageFormat{code, subcode, data} = e {
-                                            urgent.insert(0, bgp::Message::Notification{code, subcode, data: data.to_owned()});
-                                            self.shutdown = Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification{code, subcode, data}));
+                                        if let rustybgp_packet::Error::Bgp(ref bgp_err) = e {
+                                            let code = bgp_err.notification_code();
+                                            let subcode = bgp_err.notification_subcode();
+                                            let data = bgp_err.notification_data().to_owned();
+                                            urgent.insert(0, bgp::Message::Notification { code, subcode, data: data.clone() });
+                                            self.shutdown = Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification { code, subcode, data }));
                                         } else {
                                             self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
                                         }
