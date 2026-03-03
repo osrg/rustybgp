@@ -105,7 +105,7 @@ impl PeerDownReason {
         match self {
             Self::LocalNotification(notification) => {
                 let mut buf = bytes::BytesMut::with_capacity(4096);
-                codec.encode(notification, &mut buf).unwrap();
+                codec.encode_to(notification, &mut buf).unwrap();
                 c.put_slice(buf.as_ref());
             }
             Self::LocalFsm(code) => {
@@ -113,7 +113,7 @@ impl PeerDownReason {
             }
             Self::RemoteNotification(notification) => {
                 let mut buf = bytes::BytesMut::with_capacity(4096);
-                codec.encode(notification, &mut buf).unwrap();
+                codec.encode_to(notification, &mut buf).unwrap();
                 c.put_slice(buf.as_ref());
             }
             _ => {}
@@ -224,7 +224,7 @@ impl Encoder<&Message> for BmpCodec {
                         .channel
                         .insert(family, bgp::Channel::new(family, false, *addpath));
                 }
-                self.codec.encode(update, &mut buf).unwrap();
+                self.codec.encode_to(update, &mut buf).unwrap();
                 c.put_slice(buf.as_ref());
             }
             Message::StatsReports => {}
@@ -245,8 +245,8 @@ impl Encoder<&Message> for BmpCodec {
                 c.put_u16(*local_port);
                 c.put_u16(*remote_port);
                 let mut buf = bytes::BytesMut::with_capacity(4096 * 2);
-                self.codec.encode(remote_open, &mut buf).unwrap();
-                self.codec.encode(local_open, &mut buf).unwrap();
+                self.codec.encode_to(remote_open, &mut buf).unwrap();
+                self.codec.encode_to(local_open, &mut buf).unwrap();
                 c.put_slice(buf.as_ref());
             }
             Message::Initiation(tlv) => {
