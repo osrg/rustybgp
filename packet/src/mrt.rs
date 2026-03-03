@@ -144,10 +144,10 @@ impl Encoder<&Message> for MrtCodec {
                     attr: _,
                 } = body
                 {
-                    let family = if let Some((f, _)) = reach {
-                        *f
+                    let family = if let Some(s) = reach {
+                        s.family
                     } else {
-                        unreach.as_ref().unwrap().0
+                        unreach.as_ref().unwrap().family
                     };
                     self.codec
                         .channel

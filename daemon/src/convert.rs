@@ -18,7 +18,7 @@ use std::io::Cursor;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
-use rustybgp_packet::{Family, Nlri, bgp::Attribute, bgp::Capability};
+use rustybgp_packet::{Family, Nlri, PathNlri, bgp::Attribute, bgp::Capability};
 
 use crate::api;
 use crate::config;
@@ -49,6 +49,12 @@ impl From<&Nlri> for api::Nlri {
                 })),
             },
         }
+    }
+}
+
+impl From<&PathNlri> for api::Nlri {
+    fn from(p: &PathNlri) -> Self {
+        api::Nlri::from(&p.nlri)
     }
 }
 

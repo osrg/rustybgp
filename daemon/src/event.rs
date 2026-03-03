@@ -96,10 +96,10 @@ impl MessageCounter {
             } => {
                 self.update.fetch_add(1, Ordering::Relaxed);
 
-                if let Some((_, unreach)) = unreach {
+                if let Some(s) = unreach {
                     self.withdraw_update.fetch_add(1, Ordering::Relaxed);
                     self.withdraw_prefix
-                        .fetch_add(unreach.len() as u64, Ordering::Relaxed);
+                        .fetch_add(s.entries.len() as u64, Ordering::Relaxed);
                 }
             }
             bgp::Message::Notification { .. } => {
@@ -772,7 +772,10 @@ impl GrpcService {
             TableEvent::PassUpdate(
                 self.local_source.clone(),
                 family,
-                vec![(net, path.identifier)],
+                vec![packet::PathNlri {
+                    path_id: path.identifier,
+                    nlri: net,
+                }],
                 {
                     if attr.is_empty() {
                         None
@@ -1084,23 +1087,23 @@ impl GoBgpService for GrpcService {
                                 attr,
                             } = update
                             {
-                                if let Some((family, reach)) = reach {
-                                    for (net, id) in reach {
+                                if let Some(s) = reach {
+                                    for net in &s.entries {
                                         paths.push(api::Path {
-                                            nlri: Some(net.into()),
-                                            family: Some((*family).into()),
-                                            identifier: *id,
+                                            nlri: Some((&net.nlri).into()),
+                                            family: Some(s.family.into()),
+                                            identifier: net.path_id,
                                             pattrs: attr.iter().map(api::Attribute::from).collect(),
                                             ..Default::default()
                                         });
                                     }
                                 }
-                                if let Some((family, unreach)) = unreach {
-                                    for (net, id) in unreach {
+                                if let Some(s) = unreach {
+                                    for net in &s.entries {
                                         paths.push(api::Path {
-                                            nlri: Some(net.into()),
-                                            family: Some((*family).into()),
-                                            identifier: *id,
+                                            nlri: Some((&net.nlri).into()),
+                                            family: Some(s.family.into()),
+                                            identifier: net.path_id,
                                             ..Default::default()
                                         });
                                     }
@@ -2974,7 +2977,7 @@ enum TableEvent {
     PassUpdate(
         Arc<table::Source>,
         Family,
-        Vec<(packet::Nlri, u32)>,
+        Vec<packet::PathNlri>,
         Option<Arc<Vec<packet::Attribute>>>,
     ),
     Disconnected(Arc<table::Source>),
@@ -3026,7 +3029,10 @@ impl Table {
                                         source.uptime as u32,
                                     ),
                                     update: bgp::Message::Update {
-                                        reach: Some((family, nets.to_owned())),
+                                        reach: Some(packet::bgp::NlriSet {
+                                            family,
+                                            entries: nets.to_owned(),
+                                        }),
                                         attr: attrs.clone(),
                                         unreach: None,
                                     },
@@ -3049,7 +3055,10 @@ impl Table {
                                         true,
                                     ),
                                     body: bgp::Message::Update {
-                                        reach: Some((family, nets.to_owned())),
+                                        reach: Some(packet::bgp::NlriSet {
+                                            family,
+                                            entries: nets.to_owned(),
+                                        }),
                                         attr: attrs.clone(),
                                         unreach: None,
                                     },
@@ -3061,7 +3070,7 @@ impl Table {
                             for net in nets {
                                 let mut filtered = false;
                                 if let Some(a) = t.global_import_policy.as_ref()
-                                    && t.rtable.apply_policy(a, &source, &net.0, &attrs)
+                                    && t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
                                         == table::Disposition::Reject
                                 {
                                     filtered = true;
@@ -3069,13 +3078,13 @@ impl Table {
                                 if let Some(ri) = t.rtable.insert(
                                     source.clone(),
                                     family,
-                                    net.0,
-                                    net.1,
+                                    net.nlri,
+                                    net.path_id,
                                     attrs.clone(),
                                     filtered,
                                 ) {
                                     if let Some(a) = t.global_export_policy.as_ref()
-                                        && t.rtable.apply_policy(a, &source, &net.0, &attrs)
+                                        && t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
                                             == table::Disposition::Reject
                                     {
                                         continue;
@@ -3105,7 +3114,10 @@ impl Table {
                                     update: packet::bgp::Message::Update {
                                         reach: None,
                                         attr: Arc::new(Vec::new()),
-                                        unreach: Some((family, nets.to_owned())),
+                                        unreach: Some(packet::bgp::NlriSet {
+                                            family,
+                                            entries: nets.to_owned(),
+                                        }),
                                     },
                                     addpath,
                                 });
@@ -3128,7 +3140,10 @@ impl Table {
                                     body: bgp::Message::Update {
                                         reach: None,
                                         attr: Arc::new(Vec::new()),
-                                        unreach: Some((family, nets.to_owned())),
+                                        unreach: Some(packet::bgp::NlriSet {
+                                            family,
+                                            entries: nets.to_owned(),
+                                        }),
                                     },
                                     addpath,
                                 };
@@ -3136,14 +3151,15 @@ impl Table {
                             }
                             for net in nets {
                                 if let Some(ri) =
-                                    t.rtable.remove(source.clone(), family, net.0, net.1)
+                                    t.rtable
+                                        .remove(source.clone(), family, net.nlri, net.path_id)
                                 {
                                     for c in t.peer_event_tx.values() {
                                         if let Some(a) = t.global_export_policy.as_ref()
                                             && t.rtable.apply_policy(
                                                 a,
                                                 &source,
-                                                &net.0,
+                                                &net.nlri,
                                                 &Arc::new(Vec::new()),
                                             ) == table::Disposition::Reject
                                         {
@@ -3313,13 +3329,14 @@ impl Handler {
 
     async fn rx_update(
         &mut self,
-        reach: Option<(Family, Vec<(packet::Nlri, u32)>)>,
-        unreach: Option<(Family, Vec<(packet::Nlri, u32)>)>,
+        reach: Option<packet::NlriSet>,
+        unreach: Option<packet::NlriSet>,
         attr: Arc<Vec<packet::Attribute>>,
     ) {
-        if let Some((family, reach)) = reach {
-            for net in reach {
-                let idx = Table::dealer(net.0);
+        if let Some(s) = reach {
+            let family = s.family;
+            for net in s.entries {
+                let idx = Table::dealer(net.nlri);
                 let _ = self.table_tx[idx].send(TableEvent::PassUpdate(
                     self.source.as_ref().unwrap().clone(),
                     family,
@@ -3328,9 +3345,10 @@ impl Handler {
                 ));
             }
         }
-        if let Some((family, unreach)) = unreach {
-            for net in unreach {
-                let idx = Table::dealer(net.0);
+        if let Some(s) = unreach {
+            let family = s.family;
+            for net in s.entries {
+                let idx = Table::dealer(net.nlri);
                 let _ = self.table_tx[idx].send(TableEvent::PassUpdate(
                     self.source.as_ref().unwrap().clone(),
                     family,
@@ -3710,13 +3728,13 @@ impl Handler {
                         }
 
                         for (family, p) in &mut pending_update {
-                            let unreach: Vec<(packet::Nlri, u32)> = p.unreach.drain().map(|n| (n, 0)).collect();
+                            let unreach: Vec<packet::PathNlri> = p.unreach.drain().map(packet::PathNlri::new).collect();
                             if !unreach.is_empty() {
                                 txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                                 let msg = bgp::Message::Update{
                                     reach: None,
                                     attr: Arc::new(Vec::new()),
-                                    unreach: Some((*family, unreach)),
+                                    unreach: Some(packet::NlriSet { family: *family, entries: unreach }),
                                 };
                                 let _ = framer.encode_to(&msg, &mut txbuf);
                                 self.counter_tx.sync(&msg);
@@ -3732,7 +3750,7 @@ impl Handler {
                         for (family, p) in &mut pending_update {
                             for (attr, reach) in p.bucket.iter() {
                                 let msg = bgp::Message::Update{
-                                    reach: Some((*family, reach.iter().copied().map(|n| (n, 0)).collect())),
+                                    reach: Some(packet::NlriSet { family: *family, entries: reach.iter().copied().map(packet::PathNlri::new).collect() }),
                                     attr: attr.clone(),
                                     unreach: None,
                                 };

@@ -14,7 +14,7 @@
 // limitations under the License.
 
 pub mod bgp;
-pub use self::bgp::{Attribute, Capability, Family, IpNet, Nlri};
+pub use self::bgp::{Attribute, Capability, Family, IpNet, Nlri, NlriSet, PathNlri};
 pub use self::error::{BgpError, Error};
 pub use self::frame::BgpFramer;
 

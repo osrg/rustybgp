@@ -152,14 +152,17 @@ impl From<RoutingTableState> for api::GetTableResponse {
 pub(crate) struct Reach {
     pub(crate) source: Arc<Source>,
     pub(crate) family: Family,
-    pub(crate) net: (packet::Nlri, u32),
+    pub(crate) net: packet::PathNlri,
     pub(crate) attr: Arc<Vec<packet::Attribute>>,
 }
 
 impl From<Reach> for bgp::Message {
     fn from(c: Reach) -> bgp::Message {
         bgp::Message::Update {
-            reach: Some((c.family, vec![c.net])),
+            reach: Some(packet::bgp::NlriSet {
+                family: c.family,
+                entries: vec![c.net],
+            }),
             unreach: None,
             attr: c.attr,
         }
@@ -178,7 +181,10 @@ impl From<Change> for bgp::Message {
     fn from(c: Change) -> bgp::Message {
         // FIXME: handle extended nexthop
         bgp::Message::Update {
-            reach: Some((c.family, vec![(c.net, 0)])),
+            reach: Some(packet::bgp::NlriSet {
+                family: c.family,
+                entries: vec![packet::bgp::PathNlri::new(c.net)],
+            }),
             unreach: None,
             attr: c.attr,
         }
@@ -306,7 +312,10 @@ impl RoutingTable {
                 dst.entry.iter().map(move |e| Reach {
                     source: e.source.clone(),
                     family,
-                    net: (*net, e.id),
+                    net: packet::bgp::PathNlri {
+                        nlri: *net,
+                        path_id: e.id,
+                    },
                     attr: e.pa.attr.clone(),
                 })
             })
