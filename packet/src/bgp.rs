@@ -440,7 +440,7 @@ impl Capability {
 
 struct CapDesc {
     code: u8,
-    decode: fn(s: &mut Codec, c: &mut dyn io::Read, len: u8) -> Result<Capability, ()>,
+    decode: fn(s: &mut PeerCodec, c: &mut dyn io::Read, len: u8) -> Result<Capability, ()>,
 }
 
 static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
@@ -822,7 +822,7 @@ impl Attribute {
         code: u8,
         dst: Option<&mut BytesMut>,
         family: Family,
-        codec: &Codec,
+        codec: &PeerCodec,
     ) -> (u16, Option<Attribute>) {
         match code {
             Attribute::AS_PATH => {
@@ -1165,7 +1165,7 @@ pub fn create_channel(
     })
 }
 
-pub struct CodecBuilder {
+pub struct PeerCodecBuilder {
     local_asn: u32,
     remote_asn: u32,
     local_addr: IpAddr,
@@ -1175,9 +1175,9 @@ pub struct CodecBuilder {
     family: Vec<Family>,
 }
 
-impl CodecBuilder {
+impl PeerCodecBuilder {
     pub fn new() -> Self {
-        CodecBuilder {
+        PeerCodecBuilder {
             local_asn: 0,
             remote_asn: 0,
             local_addr: IpAddr::V4(Ipv4Addr::from(0)),
@@ -1188,13 +1188,13 @@ impl CodecBuilder {
         }
     }
 
-    pub fn build(&mut self) -> Codec {
+    pub fn build(&mut self) -> PeerCodec {
         let channel = self
             .family
             .iter()
             .map(|f| (*f, Channel::new(*f, false, false)))
             .collect();
-        Codec {
+        PeerCodec {
             local_asn: self.local_asn,
             remote_asn: self.remote_asn,
             local_addr: self.local_addr,
@@ -1232,7 +1232,7 @@ impl CodecBuilder {
     }
 }
 
-pub struct Codec {
+pub struct PeerCodec {
     extended_length: bool,
     local_asn: u32,
     remote_asn: u32,
@@ -1242,7 +1242,7 @@ pub struct Codec {
     pub channel: FnvHashMap<Family, Channel>,
 }
 
-impl Codec {
+impl PeerCodec {
     fn max_message_length(&self) -> usize {
         if self.extended_length {
             Message::MAX_EXTENDED_LENGTH
@@ -1993,7 +1993,7 @@ impl Codec {
     }
 }
 
-impl Encoder<&Message> for Codec {
+impl Encoder<&Message> for PeerCodec {
     type Error = Error;
 
     fn encode(&mut self, item: &Message, dst: &mut BytesMut) -> Result<(), Error> {
@@ -2001,7 +2001,7 @@ impl Encoder<&Message> for Codec {
     }
 }
 
-impl Decoder for Codec {
+impl Decoder for PeerCodec {
     type Item = Message;
     type Error = Error;
 
@@ -2034,7 +2034,7 @@ fn ipv6_eor() {
         0x00, 0x1e, 0x02, 0x00, 0x00, 0x00, 0x07, 0x90, 0x0f, 0x00, 0x03, 0x00, 0x02, 0x01,
     ];
     buf.append(&mut body);
-    let mut codec = CodecBuilder::new().families(vec![Family::IPV6]).build();
+    let mut codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
     assert!(codec.parse_message(&buf).is_ok());
 }
 
@@ -2067,7 +2067,7 @@ fn parse_ipv6_update() {
     .into_iter()
     .map(|n| (n, 0))
     .collect();
-    let mut codec = CodecBuilder::new().families(vec![Family::IPV6]).build();
+    let mut codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
     let msg = codec.parse_message(&buf).unwrap();
     match msg {
         Message::Update {
@@ -2112,7 +2112,7 @@ fn build_many_v4_route() {
         set.insert((*n, 0));
     }
 
-    let mut codec = CodecBuilder::new()
+    let mut codec = PeerCodecBuilder::new()
         .families(vec![Family::IPV4])
         .keep_aspath(true)
         .build();
@@ -2195,7 +2195,7 @@ fn many_mp_reach() {
         unreach: None,
     };
 
-    let mut codec = CodecBuilder::new().families(vec![Family::IPV6]).build();
+    let mut codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
     let mut txbuf = bytes::BytesMut::with_capacity(4096);
     codec.encode(&msg, &mut txbuf).unwrap();
     let mut recv = Vec::new();
@@ -2241,7 +2241,7 @@ fn many_mp_unreach() {
         unreach: Some((Family::IPV6, unreach)),
     };
 
-    let mut codec = CodecBuilder::new().families(vec![Family::IPV6]).build();
+    let mut codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
     let mut txbuf = bytes::BytesMut::with_capacity(4096);
     codec.encode(&msg, &mut txbuf).unwrap();
     let mut recv = Vec::new();

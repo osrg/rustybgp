@@ -352,7 +352,7 @@ impl RoutingTable {
                     })
                     .filter_map(|(_, p)| {
                         if table_type == api::TableType::AdjOut {
-                            let codec = bgp::CodecBuilder::new()
+                            let codec = bgp::PeerCodecBuilder::new()
                                 .local_asn(p.source.local_asn)
                                 .local_addr(p.source.local_addr)
                                 .keep_aspath(p.source.rs_client)
