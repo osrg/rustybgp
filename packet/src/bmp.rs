@@ -101,7 +101,7 @@ impl PeerDownReason {
     fn encode(&self, c: &mut BytesMut) -> Result<(), Error> {
         c.put_u8(self.code());
         c.put_slice(&[0; 3]);
-        let mut codec = bgp::CodecBuilder::new().build();
+        let mut codec = bgp::PeerCodecBuilder::new().build();
         match self {
             Self::LocalNotification(notification) => {
                 let mut buf = bytes::BytesMut::with_capacity(4096);
@@ -177,13 +177,13 @@ impl Message {
 }
 
 pub struct BmpCodec {
-    codec: bgp::Codec,
+    codec: bgp::PeerCodec,
 }
 
 impl BmpCodec {
     pub fn new() -> Self {
         BmpCodec {
-            codec: bgp::CodecBuilder::new()
+            codec: bgp::PeerCodecBuilder::new()
                 .keep_aspath(true)
                 .keep_nexthop(true)
                 .build(),

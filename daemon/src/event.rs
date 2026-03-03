@@ -3343,7 +3343,7 @@ impl Handler {
 
     async fn rx_msg(
         &mut self,
-        codec: &mut packet::bgp::Codec,
+        codec: &mut packet::bgp::PeerCodec,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
         msg: bgp::Message,
@@ -3551,14 +3551,14 @@ impl Handler {
         }
 
         let mut codec = if self.rs_client {
-            bgp::CodecBuilder::new()
+            bgp::PeerCodecBuilder::new()
                 .local_asn(self.local_asn)
                 .local_addr(self.local_addr)
                 .keep_aspath(true)
                 .keep_nexthop(true)
                 .build()
         } else {
-            bgp::CodecBuilder::new()
+            bgp::PeerCodecBuilder::new()
                 .local_asn(self.local_asn)
                 .local_addr(self.local_addr)
                 .build()
