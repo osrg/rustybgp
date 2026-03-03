@@ -209,6 +209,36 @@ impl fmt::Display for Nlri {
     }
 }
 
+/// An NLRI entry with an optional AddPath path identifier (RFC 7911).
+/// `path_id` is 0 when AddPath is not negotiated for the address family.
+#[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
+pub struct PathNlri {
+    pub path_id: u32,
+    pub nlri: Nlri,
+}
+
+impl PathNlri {
+    pub fn new(nlri: Nlri) -> Self {
+        PathNlri { path_id: 0, nlri }
+    }
+}
+
+/// A set of NLRI entries sharing a common address family (AFI+SAFI).
+#[derive(Clone, Debug)]
+pub struct NlriSet {
+    pub family: Family,
+    pub entries: Vec<PathNlri>,
+}
+
+impl NlriSet {
+    pub fn new(family: Family) -> Self {
+        NlriSet {
+            family,
+            entries: Vec::new(),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
 pub struct Ipv4Net {
     pub addr: Ipv4Addr,
@@ -1044,8 +1074,8 @@ pub enum Message {
         capability: Vec<Capability>,
     },
     Update {
-        reach: Option<(Family, Vec<(Nlri, u32)>)>,
-        unreach: Option<(Family, Vec<(Nlri, u32)>)>,
+        reach: Option<NlriSet>,
+        unreach: Option<NlriSet>,
         attr: Arc<Vec<Attribute>>,
     },
     Notification {
@@ -1074,7 +1104,7 @@ impl Message {
     pub fn eor(family: Family) -> Message {
         if family == Family::IPV4 {
             Message::Update {
-                reach: Some((Family::IPV4, Vec::new())),
+                reach: Some(NlriSet::new(Family::IPV4)),
                 attr: Arc::new(Vec::new()),
                 unreach: None,
             }
@@ -1082,7 +1112,7 @@ impl Message {
             Message::Update {
                 reach: None,
                 attr: Arc::new(Vec::new()),
-                unreach: Some((family, Vec::new())),
+                unreach: Some(NlriSet::new(family)),
             }
         }
     }
@@ -1258,10 +1288,11 @@ impl PeerCodec {
         buf_head: usize,
         attrs: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
-        reach: &(Family, Vec<(Nlri, u32)>),
+        reach: &NlriSet,
         reach_idx: &mut usize,
     ) -> Result<u16, ()> {
-        let (family, nets) = reach;
+        let family = &reach.family;
+        let nets = &reach.entries;
         let desc = ATTR_DESCS.get(&Attribute::MP_REACH).unwrap();
         let pos_head = dst.len();
         // always use extended length
@@ -1302,7 +1333,10 @@ impl PeerCodec {
         let addpath = self.channel.get(family).is_some_and(|c| c.addpath_tx());
         let max_len = 1 + 16 + if addpath { 4 } else { 0 };
         for (i, item) in nets.iter().enumerate().skip(*reach_idx) {
-            let (net, id) = item;
+            let PathNlri {
+                nlri: net,
+                path_id: id,
+            } = item;
             if buf_head + self.max_message_length() > dst.len() + max_len {
                 if addpath {
                     dst.put_u32(*id);
@@ -1326,10 +1360,11 @@ impl PeerCodec {
         buf_head: usize,
         _: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
-        unreach: &(Family, Vec<(Nlri, u32)>),
+        unreach: &NlriSet,
         unreach_idx: &mut usize,
     ) -> Result<u16, ()> {
-        let (family, nets) = unreach;
+        let family = &unreach.family;
+        let nets = &unreach.entries;
         let desc = ATTR_DESCS.get(&Attribute::MP_UNREACH).unwrap();
         let pos_head = dst.len();
         // always use extended length
@@ -1342,7 +1377,10 @@ impl PeerCodec {
         let addpath = self.channel.get(family).is_some_and(|c| c.addpath_tx());
         let max_len = 1 + 16 + if addpath { 4 } else { 0 };
         for (i, item) in nets.iter().enumerate().skip(*unreach_idx) {
-            let (net, id) = item;
+            let PathNlri {
+                nlri: net,
+                path_id: id,
+            } = item;
             if buf_head + self.max_message_length() > dst.len() + max_len {
                 if addpath {
                     dst.put_u32(*id);
@@ -1417,9 +1455,9 @@ impl PeerCodec {
             } => {
                 let attrs = attr.clone();
                 let family = if let Some(reach) = reach {
-                    reach.0
+                    reach.family
                 } else {
-                    unreach.as_ref().unwrap().0
+                    unreach.as_ref().unwrap().family
                 };
                 let addpath = self.channel.get(&family).is_some_and(|c| c.addpath_tx());
                 dst.put_u8(Message::UPDATE);
@@ -1430,12 +1468,12 @@ impl PeerCodec {
                     && let Some(unreach) = unreach
                 {
                     let max_len = 5 + if addpath { 4 } else { 0 };
-                    for (i, item) in unreach.1.iter().enumerate().skip(*reach_idx) {
+                    for (i, item) in unreach.entries.iter().enumerate().skip(*reach_idx) {
                         if pos_head + self.max_message_length() > dst.len() + max_len {
                             if addpath {
-                                dst.put_u32(item.1);
+                                dst.put_u32(item.path_id);
                             }
-                            withdrawn_len += item.0.encode(dst).unwrap();
+                            withdrawn_len += item.nlri.encode(dst).unwrap();
                             *reach_idx = i;
                         } else {
                             break;
@@ -1480,16 +1518,16 @@ impl PeerCodec {
                     let max_len = 5 + if addpath { 4 } else { 0 };
                     for (i, item) in reach
                         .as_ref()
-                        .map_or(&Vec::new(), |(_, reach)| reach)
+                        .map_or(&Vec::new(), |s| &s.entries)
                         .iter()
                         .enumerate()
                         .skip(*reach_idx)
                     {
                         if pos_head + self.max_message_length() > dst.len() + max_len {
                             if addpath {
-                                dst.put_u32(item.1);
+                                dst.put_u32(item.path_id);
                             }
-                            let _ = item.0.encode(dst);
+                            let _ = item.nlri.encode(dst);
                             *reach_idx = i;
                         } else {
                             break;
@@ -1530,7 +1568,7 @@ impl PeerCodec {
         chan: &Channel,
         c: &mut T,
         mut len: usize,
-    ) -> Result<(Nlri, u32), Error> {
+    ) -> Result<PathNlri, Error> {
         let malformed: Error = BgpError::UpdateMalformedAttributeList.into();
         let id = if chan.addpath_rx() {
             if let Ok(id) = c.read_u32::<NetworkEndian>() {
@@ -1544,11 +1582,17 @@ impl PeerCodec {
         };
         match chan.family {
             Family::IPV4 => match Ipv4Net::decode(c, len) {
-                Ok(net) => Ok((Nlri::V4(net), id)),
+                Ok(net) => Ok(PathNlri {
+                    nlri: Nlri::V4(net),
+                    path_id: id,
+                }),
                 Err(err) => Err(err),
             },
             Family::IPV6 => match Ipv6Net::decode(c, len) {
-                Ok(net) => Ok((Nlri::V6(net), id)),
+                Ok(net) => Ok(PathNlri {
+                    nlri: Nlri::V6(net),
+                    path_id: id,
+                }),
                 Err(err) => Err(err),
             },
             _ => Err(malformed),
@@ -1770,7 +1814,7 @@ impl PeerCodec {
                 // v4 eor
                 if reach_len == 0 && attr_len == 0 && withdrawn_len == 0 {
                     return Ok(Message::Update {
-                        reach: Some((Family::IPV4, Vec::new())),
+                        reach: Some(NlriSet::new(Family::IPV4)),
                         unreach: None,
                         attr: Arc::new(Vec::new()),
                     });
@@ -1923,13 +1967,19 @@ impl PeerCodec {
                     reach: if reach.is_empty() {
                         None
                     } else {
-                        Some((reach_family, reach))
+                        Some(NlriSet {
+                            family: reach_family,
+                            entries: reach,
+                        })
                     },
                     attr: Arc::new(attr),
                     unreach: if unreach.is_empty() {
                         None
                     } else {
-                        Some((unreach_family, unreach))
+                        Some(NlriSet {
+                            family: unreach_family,
+                            entries: unreach,
+                        })
                     },
                 })
             }
@@ -1974,8 +2024,8 @@ impl PeerCodec {
             Message::Update { reach, unreach, .. } => {
                 assert!(!(reach.is_some() && unreach.is_some()));
                 let n = std::cmp::max(
-                    reach.as_ref().map_or(0, |(_, x)| x.len()),
-                    unreach.as_ref().map_or(0, |(_, x)| x.len()),
+                    reach.as_ref().map_or(0, |s| s.entries.len()),
+                    unreach.as_ref().map_or(0, |s| s.entries.len()),
                 );
                 loop {
                     self.do_encode(msg, dst, &mut done_idx)?;
@@ -2010,7 +2060,7 @@ fn parse_ipv6_update() {
     let mut file = std::fs::File::open(filename).unwrap();
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).unwrap();
-    let nlri: Vec<(Nlri, u32)> = vec![
+    let nlri: Vec<PathNlri> = vec![
         Nlri::V6(Ipv6Net {
             addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x127, 0, 0, 0, 0),
             mask: 64,
@@ -2029,7 +2079,7 @@ fn parse_ipv6_update() {
         }),
     ]
     .into_iter()
-    .map(|n| (n, 0))
+    .map(PathNlri::new)
     .collect();
     let mut codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
     let msg = codec.parse_message(&buf).unwrap();
@@ -2039,12 +2089,12 @@ fn parse_ipv6_update() {
             attr: _,
             unreach: _,
         } => {
-            let (family, reach) = reach.unwrap();
-            assert_eq!(family, Family::IPV6);
-            assert_eq!(nlri.len(), reach.len());
+            let s = reach.unwrap();
+            assert_eq!(s.family, Family::IPV6);
+            assert_eq!(nlri.len(), s.entries.len());
 
-            for i in 0..reach.len() {
-                assert_eq!(reach[i], nlri[i]);
+            for i in 0..s.entries.len() {
+                assert_eq!(s.entries[i], nlri[i]);
             }
         }
         _ => unreachable!(),
@@ -2061,9 +2111,12 @@ fn build_many_v4_route() {
         }));
     }
 
-    let reach: Vec<(Nlri, u32)> = net.iter().cloned().map(|n| (n, 0)).collect();
+    let reach: Vec<PathNlri> = net.iter().cloned().map(PathNlri::new).collect();
     let mut msg = Message::Update {
-        reach: Some((Family::IPV4, reach)),
+        reach: Some(NlriSet {
+            family: Family::IPV4,
+            entries: reach,
+        }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
@@ -2073,7 +2126,7 @@ fn build_many_v4_route() {
     };
     let mut set = fnv::FnvHashSet::default();
     for n in &net {
-        set.insert((*n, 0));
+        set.insert(PathNlri::new(*n));
     }
 
     let codec = PeerCodecBuilder::new()
@@ -2087,7 +2140,7 @@ fn build_many_v4_route() {
     loop {
         match framer.try_parse(&mut txbuf).expect("failed to decode") {
             Some(Message::Update { reach, .. }) => {
-                recv.append(&mut reach.unwrap().1);
+                recv.append(&mut reach.unwrap().entries);
             }
             Some(_) => {}
             None => break,
@@ -2101,15 +2154,18 @@ fn build_many_v4_route() {
     }
     assert_eq!(set.len(), 0);
 
-    let unreach = net.iter().cloned().map(|n| (n, 0)).collect();
+    let unreach = net.iter().cloned().map(PathNlri::new).collect();
     msg = Message::Update {
         reach: None,
         attr: Arc::new(Vec::new()),
-        unreach: Some((Family::IPV4, unreach)),
+        unreach: Some(NlriSet {
+            family: Family::IPV4,
+            entries: unreach,
+        }),
     };
 
     for n in &net {
-        set.insert((*n, 0));
+        set.insert(PathNlri::new(*n));
     }
 
     let mut withdrawn = Vec::new();
@@ -2117,7 +2173,7 @@ fn build_many_v4_route() {
     loop {
         match framer.try_parse(&mut txbuf).expect("failed to decode") {
             Some(Message::Update { unreach, .. }) => {
-                withdrawn.append(&mut unreach.unwrap().1);
+                withdrawn.append(&mut unreach.unwrap().entries);
             }
             Some(_) => {}
             None => break,
@@ -2142,14 +2198,17 @@ fn many_mp_reach() {
         })
         .collect();
 
-    let reach = net.iter().cloned().map(|n| (n, 0)).collect();
+    let reach = net.iter().cloned().map(PathNlri::new).collect();
     let mut set = fnv::FnvHashSet::default();
     for n in &net {
-        set.insert((*n, 0));
+        set.insert(PathNlri::new(*n));
     }
 
     let msg = Message::Update {
-        reach: Some((Family::IPV6, reach)),
+        reach: Some(NlriSet {
+            family: Family::IPV6,
+            entries: reach,
+        }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
@@ -2166,7 +2225,7 @@ fn many_mp_reach() {
     loop {
         match framer.try_parse(&mut txbuf).expect("failed to decode") {
             Some(Message::Update { reach, .. }) => {
-                recv.append(&mut reach.unwrap().1);
+                recv.append(&mut reach.unwrap().entries);
             }
             Some(_) => {}
             None => break,
@@ -2192,16 +2251,19 @@ fn many_mp_unreach() {
         })
         .collect();
 
-    let unreach = net.iter().cloned().map(|n| (n, 0)).collect();
+    let unreach = net.iter().cloned().map(PathNlri::new).collect();
     let mut set = fnv::FnvHashSet::default();
     for n in &net {
-        set.insert((*n, 0));
+        set.insert(PathNlri::new(*n));
     }
 
     let msg = Message::Update {
         reach: None,
         attr: Arc::new(Vec::new()),
-        unreach: Some((Family::IPV6, unreach)),
+        unreach: Some(NlriSet {
+            family: Family::IPV6,
+            entries: unreach,
+        }),
     };
 
     let codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
@@ -2212,7 +2274,7 @@ fn many_mp_unreach() {
     loop {
         match framer.try_parse(&mut txbuf).expect("failed to decode") {
             Some(Message::Update { unreach, .. }) => {
-                recv.append(&mut unreach.unwrap().1);
+                recv.append(&mut unreach.unwrap().entries);
             }
             Some(_) => {}
             None => break,
