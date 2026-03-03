@@ -152,7 +152,7 @@ impl From<RoutingTableState> for api::GetTableResponse {
 pub(crate) struct Reach {
     pub(crate) source: Arc<Source>,
     pub(crate) family: Family,
-    pub(crate) net: (packet::Net, u32),
+    pub(crate) net: (packet::Nlri, u32),
     pub(crate) attr: Arc<Vec<packet::Attribute>>,
 }
 
@@ -170,7 +170,7 @@ impl From<Reach> for bgp::Message {
 pub(crate) struct Change {
     pub(crate) source: Arc<Source>,
     pub(crate) family: Family,
-    pub(crate) net: packet::Net,
+    pub(crate) net: packet::Nlri,
     pub(crate) attr: Arc<Vec<packet::Attribute>>,
 }
 
@@ -238,7 +238,7 @@ impl Source {
 }
 
 pub(crate) struct RoutingTable {
-    global: FnvHashMap<Family, FnvHashMap<packet::Net, Destination>>,
+    global: FnvHashMap<Family, FnvHashMap<packet::Nlri, Destination>>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, (u64, u64)>>,
     rpki: RpkiTable,
 }
@@ -317,7 +317,7 @@ impl RoutingTable {
         table_type: api::TableType,
         family: Family,
         peer_addr: Option<IpAddr>,
-        prefixes: Vec<packet::Net>,
+        prefixes: Vec<packet::Nlri>,
         export_policy: Option<Arc<PolicyAssignment>>,
     ) -> impl Iterator<Item = api::Destination> + '_ {
         self.global
@@ -405,7 +405,7 @@ impl RoutingTable {
         &mut self,
         source: Arc<Source>,
         family: Family,
-        net: packet::Net,
+        net: packet::Nlri,
         remote_id: u32,
         attr: Arc<Vec<packet::Attribute>>,
         filtered: bool,
@@ -512,7 +512,7 @@ impl RoutingTable {
         &mut self,
         source: Arc<Source>,
         family: Family,
-        net: packet::Net,
+        net: packet::Nlri,
         remote_id: u32,
     ) -> Option<Change> {
         let rt = self.global.get_mut(&family)?;
@@ -689,7 +689,7 @@ impl RoutingTable {
         &self,
         assignment: &PolicyAssignment,
         source: &Arc<Source>,
-        net: &packet::Net,
+        net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
     ) -> Disposition {
         assignment.apply(&self.rpki, source, net, attr)
@@ -717,15 +717,15 @@ fn drop() {
         false,
     ));
 
-    let n1 = packet::Net::V4(packet::bgp::Ipv4Net {
+    let n1 = packet::Nlri::V4(packet::bgp::Ipv4Net {
         addr: Ipv4Addr::new(1, 0, 0, 0),
         mask: 24,
     });
-    let n2 = packet::Net::V4(packet::bgp::Ipv4Net {
+    let n2 = packet::Nlri::V4(packet::bgp::Ipv4Net {
         addr: Ipv4Addr::new(2, 0, 0, 0),
         mask: 24,
     });
-    let n3 = packet::Net::V4(packet::bgp::Ipv4Net {
+    let n3 = packet::Nlri::V4(packet::bgp::Ipv4Net {
         addr: Ipv4Addr::new(3, 0, 0, 0),
         mask: 24,
     });
@@ -1069,13 +1069,13 @@ impl Condition {
     fn evalute(
         &self,
         source: &Arc<Source>,
-        net: &packet::Net,
+        net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
     ) -> bool {
         match self {
             Condition::Prefix(_name, opt, set) => {
                 match net {
-                    packet::Net::V4(n) => {
+                    packet::Nlri::V4(n) => {
                         if let Some(zero) = set.zero
                             && zero.0 <= n.mask
                             && n.mask <= zero.1
@@ -1090,7 +1090,7 @@ impl Condition {
                         }
                         return !(*opt == MatchOption::Any);
                     }
-                    packet::Net::V6(_) => {}
+                    packet::Nlri::V6(_) => {}
                 };
             }
             Condition::AsPath(_name, opt, set) => {
@@ -1172,7 +1172,7 @@ impl Statement {
     fn apply(
         &self,
         source: &Arc<Source>,
-        net: &packet::Net,
+        net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
     ) -> Disposition {
         let mut result = true;
@@ -1336,7 +1336,7 @@ impl Policy {
     fn apply(
         &self,
         source: &Arc<Source>,
-        net: &packet::Net,
+        net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
     ) -> Disposition {
         for statement in &self.statements {
@@ -1369,7 +1369,7 @@ impl PolicyAssignment {
         &self,
         _rpki: &RpkiTable,
         source: &Arc<Source>,
-        net: &packet::Net,
+        net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
     ) -> Disposition {
         for policy in &self.policies {
@@ -1872,7 +1872,7 @@ impl RpkiTable {
         &self,
         family: Family,
         source: &Arc<Source>,
-        net: &packet::Net,
+        net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
     ) -> Option<api::Validation> {
         match self.roas.get(&family) {
@@ -1898,8 +1898,8 @@ impl RpkiTable {
                         source.local_asn
                     };
                 let (mut addr, mask) = match net {
-                    packet::Net::V4(net) => (net.addr.octets().to_vec(), net.mask),
-                    packet::Net::V6(net) => (net.addr.octets().to_vec(), net.mask),
+                    packet::Nlri::V4(net) => (net.addr.octets().to_vec(), net.mask),
+                    packet::Nlri::V6(net) => (net.addr.octets().to_vec(), net.mask),
                 };
                 addr.drain((mask.div_ceil(8)) as usize..);
                 for (ipnet, entry) in m.iter_prefix(&addr) {

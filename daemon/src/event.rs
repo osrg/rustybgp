@@ -1301,10 +1301,10 @@ impl GoBgpService for GrpcService {
             ));
         };
 
-        let prefixes: Vec<packet::Net> = request
+        let prefixes: Vec<packet::Nlri> = request
             .prefixes
             .iter()
-            .map(|x| packet::Net::from_str(&x.prefix))
+            .map(|x| packet::Nlri::from_str(&x.prefix))
             .filter_map(|x| x.ok())
             .collect();
 
@@ -2974,7 +2974,7 @@ enum TableEvent {
     PassUpdate(
         Arc<table::Source>,
         Family,
-        Vec<(packet::Net, u32)>,
+        Vec<(packet::Nlri, u32)>,
         Option<Arc<Vec<packet::Attribute>>>,
     ),
     Disconnected(Arc<table::Source>),
@@ -3313,8 +3313,8 @@ impl Handler {
 
     async fn rx_update(
         &mut self,
-        reach: Option<(Family, Vec<(packet::Net, u32)>)>,
-        unreach: Option<(Family, Vec<(packet::Net, u32)>)>,
+        reach: Option<(Family, Vec<(packet::Nlri, u32)>)>,
+        unreach: Option<(Family, Vec<(packet::Nlri, u32)>)>,
         attr: Arc<Vec<packet::Attribute>>,
     ) {
         if let Some((family, reach)) = reach {
@@ -3710,7 +3710,7 @@ impl Handler {
                         }
 
                         for (family, p) in &mut pending_update {
-                            let unreach: Vec<(packet::Net, u32)> = p.unreach.drain().map(|n| (n, 0)).collect();
+                            let unreach: Vec<(packet::Nlri, u32)> = p.unreach.drain().map(|n| (n, 0)).collect();
                             if !unreach.is_empty() {
                                 txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                                 let msg = bgp::Message::Update{
@@ -3830,9 +3830,9 @@ impl Handler {
 
 #[derive(Default)]
 struct PendingTx {
-    reach: FnvHashMap<packet::Net, Arc<Vec<packet::Attribute>>>,
-    unreach: FnvHashSet<packet::Net>,
-    bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<packet::Net>>,
+    reach: FnvHashMap<packet::Nlri, Arc<Vec<packet::Attribute>>>,
+    unreach: FnvHashSet<packet::Nlri>,
+    bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<packet::Nlri>>,
     sync: bool,
 }
 
@@ -3914,8 +3914,8 @@ fn bucket() {
     ));
     let family = Family::IPV4;
 
-    let net1 = packet::Net::from_str("10.0.0.0/24").unwrap();
-    let net2 = packet::Net::from_str("20.0.0.0/24").unwrap();
+    let net1 = packet::Nlri::from_str("10.0.0.0/24").unwrap();
+    let net2 = packet::Nlri::from_str("20.0.0.0/24").unwrap();
 
     let attr1 = vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap()];
 

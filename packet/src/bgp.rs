@@ -171,40 +171,40 @@ impl fmt::Display for IpNet {
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
-pub enum Net {
+pub enum Nlri {
     V4(Ipv4Net),
     V6(Ipv6Net),
     // add more Family here
 }
 
-impl Net {
+impl Nlri {
     fn encode(&self, dst: &mut BytesMut) -> Result<u16, ()> {
         match self {
-            Net::V4(net) => net.encode(dst),
-            Net::V6(net) => net.encode(dst),
+            Nlri::V4(net) => net.encode(dst),
+            Nlri::V6(net) => net.encode(dst),
         }
     }
 }
 
-impl FromStr for Net {
+impl FromStr for Nlri {
     type Err = Error;
 
-    fn from_str(s: &str) -> Result<Net, Error> {
+    fn from_str(s: &str) -> Result<Nlri, Error> {
         match IpNet::from_str(s) {
             Ok(n) => match n {
-                IpNet::V4(n) => Ok(Net::V4(n)),
-                IpNet::V6(n) => Ok(Net::V6(n)),
+                IpNet::V4(n) => Ok(Nlri::V4(n)),
+                IpNet::V6(n) => Ok(Nlri::V6(n)),
             },
             Err(e) => Err(e),
         }
     }
 }
 
-impl fmt::Display for Net {
+impl fmt::Display for Nlri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Net::V4(net) => net.fmt(f),
-            Net::V6(net) => net.fmt(f),
+            Nlri::V4(net) => net.fmt(f),
+            Nlri::V6(net) => net.fmt(f),
         }
     }
 }
@@ -1044,8 +1044,8 @@ pub enum Message {
         capability: Vec<Capability>,
     },
     Update {
-        reach: Option<(Family, Vec<(Net, u32)>)>,
-        unreach: Option<(Family, Vec<(Net, u32)>)>,
+        reach: Option<(Family, Vec<(Nlri, u32)>)>,
+        unreach: Option<(Family, Vec<(Nlri, u32)>)>,
         attr: Arc<Vec<Attribute>>,
     },
     Notification {
@@ -1258,7 +1258,7 @@ impl PeerCodec {
         buf_head: usize,
         attrs: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
-        reach: &(Family, Vec<(Net, u32)>),
+        reach: &(Family, Vec<(Nlri, u32)>),
         reach_idx: &mut usize,
     ) -> Result<u16, ()> {
         let (family, nets) = reach;
@@ -1326,7 +1326,7 @@ impl PeerCodec {
         buf_head: usize,
         _: Arc<Vec<Attribute>>,
         dst: &mut BytesMut,
-        unreach: &(Family, Vec<(Net, u32)>),
+        unreach: &(Family, Vec<(Nlri, u32)>),
         unreach_idx: &mut usize,
     ) -> Result<u16, ()> {
         let (family, nets) = unreach;
@@ -1530,7 +1530,7 @@ impl PeerCodec {
         chan: &Channel,
         c: &mut T,
         mut len: usize,
-    ) -> Result<(Net, u32), Error> {
+    ) -> Result<(Nlri, u32), Error> {
         let malformed: Error = BgpError::UpdateMalformedAttributeList.into();
         let id = if chan.addpath_rx() {
             if let Ok(id) = c.read_u32::<NetworkEndian>() {
@@ -1544,11 +1544,11 @@ impl PeerCodec {
         };
         match chan.family {
             Family::IPV4 => match Ipv4Net::decode(c, len) {
-                Ok(net) => Ok((Net::V4(net), id)),
+                Ok(net) => Ok((Nlri::V4(net), id)),
                 Err(err) => Err(err),
             },
             Family::IPV6 => match Ipv6Net::decode(c, len) {
-                Ok(net) => Ok((Net::V6(net), id)),
+                Ok(net) => Ok((Nlri::V6(net), id)),
                 Err(err) => Err(err),
             },
             _ => Err(malformed),
@@ -2010,20 +2010,20 @@ fn parse_ipv6_update() {
     let mut file = std::fs::File::open(filename).unwrap();
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).unwrap();
-    let nlri: Vec<(Net, u32)> = vec![
-        Net::V6(Ipv6Net {
+    let nlri: Vec<(Nlri, u32)> = vec![
+        Nlri::V6(Ipv6Net {
             addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x127, 0, 0, 0, 0),
             mask: 64,
         }),
-        Net::V6(Ipv6Net {
+        Nlri::V6(Ipv6Net {
             addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x124, 0, 0, 0, 0),
             mask: 64,
         }),
-        Net::V6(Ipv6Net {
+        Nlri::V6(Ipv6Net {
             addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x128, 0, 0, 0, 0),
             mask: 63,
         }),
-        Net::V6(Ipv6Net {
+        Nlri::V6(Ipv6Net {
             addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x1ff, 0, 0, 0, 0x12),
             mask: 127,
         }),
@@ -2055,13 +2055,13 @@ fn parse_ipv6_update() {
 fn build_many_v4_route() {
     let mut net = Vec::new();
     for i in 0..2000u16 {
-        net.push(Net::V4(Ipv4Net {
+        net.push(Nlri::V4(Ipv4Net {
             addr: Ipv4Addr::new(10, ((0xff00 & i) >> 8) as u8, (0xff & i) as u8, 1),
             mask: 32,
         }));
     }
 
-    let reach: Vec<(Net, u32)> = net.iter().cloned().map(|n| (n, 0)).collect();
+    let reach: Vec<(Nlri, u32)> = net.iter().cloned().map(|n| (n, 0)).collect();
     let mut msg = Message::Update {
         reach: Some((Family::IPV4, reach)),
         attr: Arc::new(vec![
@@ -2133,9 +2133,9 @@ fn build_many_v4_route() {
 
 #[test]
 fn many_mp_reach() {
-    let net: Vec<Net> = (0..2000u128)
+    let net: Vec<Nlri> = (0..2000u128)
         .map(|i| {
-            Net::V6(Ipv6Net {
+            Nlri::V6(Ipv6Net {
                 addr: Ipv6Addr::from(i),
                 mask: 128,
             })
@@ -2183,9 +2183,9 @@ fn many_mp_reach() {
 
 #[test]
 fn many_mp_unreach() {
-    let net: Vec<Net> = (0..2000u128)
+    let net: Vec<Nlri> = (0..2000u128)
         .map(|i| {
-            Net::V6(Ipv6Net {
+            Nlri::V6(Ipv6Net {
                 addr: Ipv6Addr::from(i),
                 mask: 128,
             })
