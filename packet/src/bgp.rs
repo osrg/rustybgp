@@ -18,7 +18,7 @@ use bytes::{BufMut, BytesMut};
 use fnv::FnvHashMap;
 use once_cell::sync::Lazy;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
-use std::convert::{Into, TryFrom};
+use std::convert::Into;
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -26,12 +26,10 @@ use std::sync::Arc;
 use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::api;
-use crate::config;
 use crate::error::Error;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub(crate) struct Family(u32);
+pub struct Family(u32);
 
 impl Family {
     const AFI_IP: u16 = 1;
@@ -39,63 +37,38 @@ impl Family {
 
     const SAFI_UNICAST: u8 = 1;
 
-    pub(crate) const EMPTY: Family = Family(0);
-    pub(crate) const IPV4: Family =
-        Family((Family::AFI_IP as u32) << 16 | Family::SAFI_UNICAST as u32);
-    pub(crate) const IPV6: Family =
-        Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_UNICAST as u32);
+    pub const EMPTY: Family = Family(0);
+    pub const IPV4: Family = Family((Family::AFI_IP as u32) << 16 | Family::SAFI_UNICAST as u32);
+    pub const IPV6: Family = Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_UNICAST as u32);
 
-    pub(crate) fn afi(&self) -> u16 {
+    pub fn new(v: u32) -> Self {
+        Family(v)
+    }
+
+    pub fn afi(&self) -> u16 {
         (self.0 >> 16) as u16
     }
 
-    pub(crate) fn safi(&self) -> u8 {
+    pub fn safi(&self) -> u8 {
         (self.0 & 0xff) as u8
     }
 }
 
-impl From<&api::Family> for Family {
-    fn from(f: &api::Family) -> Self {
-        Family((f.afi as u32) << 16 | f.safi as u32)
-    }
-}
-
-impl From<Family> for api::Family {
-    fn from(f: Family) -> Self {
-        api::Family {
-            afi: f.afi() as i32,
-            safi: f.safi() as i32,
-        }
-    }
-}
-
-impl TryFrom<&config::generate::AfiSafiType> for Family {
-    type Error = ();
-
-    fn try_from(f: &config::generate::AfiSafiType) -> Result<Self, Self::Error> {
-        match f {
-            config::generate::AfiSafiType::Ipv4Unicast => Ok(Family::IPV4),
-            config::generate::AfiSafiType::Ipv6Unicast => Ok(Family::IPV6),
-            _ => Err(()),
-        }
-    }
-}
-
 #[derive(Clone, PartialEq)]
-pub(crate) enum IpNet {
+pub enum IpNet {
     V4(Ipv4Net),
     V6(Ipv6Net),
 }
 
 impl IpNet {
-    pub(crate) fn new(prefix: IpAddr, mask: u8) -> Self {
+    pub fn new(prefix: IpAddr, mask: u8) -> Self {
         match prefix {
             IpAddr::V4(addr) => IpNet::V4(Ipv4Net { addr, mask }),
             IpAddr::V6(addr) => IpNet::V6(Ipv6Net { addr, mask }),
         }
     }
 
-    pub(crate) fn contains(&self, addr: &IpAddr) -> bool {
+    pub fn contains(&self, addr: &IpAddr) -> bool {
         let f = |a: &Vec<u8>, b: &Vec<u8>, mask: u8| {
             let div = (mask >> 3) as usize;
 
@@ -200,7 +173,7 @@ impl fmt::Display for IpNet {
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
-pub(crate) enum Net {
+pub enum Net {
     V4(Ipv4Net),
     V6(Ipv6Net),
     // add more Family here
@@ -238,42 +211,10 @@ impl fmt::Display for Net {
     }
 }
 
-impl From<&Net> for api::Nlri {
-    fn from(f: &Net) -> Self {
-        match f {
-            Net::V4(n) => api::Nlri {
-                nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
-                    prefix: n.addr.to_string(),
-                    prefix_len: n.mask as u32,
-                })),
-            },
-            Net::V6(n) => api::Nlri {
-                nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
-                    prefix: n.addr.to_string(),
-                    prefix_len: n.mask as u32,
-                })),
-            },
-        }
-    }
-}
-
-impl TryFrom<api::Nlri> for Net {
-    type Error = Error;
-
-    fn try_from(n: api::Nlri) -> Result<Self, Self::Error> {
-        match n.nlri {
-            Some(api::nlri::Nlri::Prefix(p)) => {
-                Net::from_str(&format!("{}/{}", p.prefix, p.prefix_len))
-            }
-            _ => Err(Error::InvalidArgument("invalid NLRI".to_string())),
-        }
-    }
-}
-
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
-pub(crate) struct Ipv4Net {
-    pub(crate) addr: Ipv4Addr,
-    pub(crate) mask: u8,
+pub struct Ipv4Net {
+    pub addr: Ipv4Addr,
+    pub mask: u8,
 }
 
 impl Ipv4Net {
@@ -324,9 +265,9 @@ fn parse_bogus_ipv4net() {
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
-pub(crate) struct Ipv6Net {
-    pub(crate) addr: Ipv6Addr,
-    pub(crate) mask: u8,
+pub struct Ipv6Net {
+    pub addr: Ipv6Addr,
+    pub mask: u8,
 }
 
 impl Ipv6Net {
@@ -378,7 +319,7 @@ fn parse_bogus_ipv6net() {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum Capability {
+pub enum Capability {
     MultiProtocol(Family),
     RouteRefresh,
     ExtendedNexthop(Vec<(Family, u16)>),
@@ -420,105 +361,6 @@ impl From<&Capability> for u8 {
             Capability::LongLivedGracefulRestart(_) => Capability::LONG_LIVED_GRACEFUL_RESTART,
             Capability::Fqdn(..) => Capability::FQDN,
             Capability::Unknown { code, bin: _ } => *code,
-        }
-    }
-}
-
-impl From<&Capability> for api::Capability {
-    fn from(cap: &Capability) -> Self {
-        match cap {
-            Capability::MultiProtocol(family) => api::Capability {
-                cap: Some(api::capability::Cap::MultiProtocol(
-                    api::MultiProtocolCapability {
-                        family: Some(api::Family::from(*family)),
-                    },
-                )),
-            },
-            Capability::RouteRefresh => api::Capability {
-                cap: Some(api::capability::Cap::RouteRefresh(
-                    api::RouteRefreshCapability {},
-                )),
-            },
-            Capability::ExtendedNexthop(v) => api::Capability {
-                cap: Some(api::capability::Cap::ExtendedNexthop(
-                    api::ExtendedNexthopCapability {
-                        tuples: v
-                            .iter()
-                            .map(|(family, afi)| api::ExtendedNexthopCapabilityTuple {
-                                nlri_family: Some((*family).into()),
-                                nexthop_family: Some(api::Family {
-                                    afi: *afi as i32,
-                                    safi: Family::SAFI_UNICAST as i32,
-                                }),
-                            })
-                            .collect(),
-                    },
-                )),
-            },
-            Capability::GracefulRestart(flags, time, v) => api::Capability {
-                cap: Some(api::capability::Cap::GracefulRestart(
-                    api::GracefulRestartCapability {
-                        flags: *flags as u32,
-                        time: *time as u32,
-                        tuples: v
-                            .iter()
-                            .map(|(family, flags)| api::GracefulRestartCapabilityTuple {
-                                flags: *flags as u32,
-                                family: Some((*family).into()),
-                            })
-                            .collect(),
-                    },
-                )),
-            },
-            Capability::FourOctetAsNumber(asn) => api::Capability {
-                cap: Some(api::capability::Cap::FourOctetAsn(
-                    api::FourOctetAsnCapability { asn: *asn },
-                )),
-            },
-            Capability::AddPath(v) => api::Capability {
-                cap: Some(api::capability::Cap::AddPath(api::AddPathCapability {
-                    tuples: v
-                        .iter()
-                        .map(|(family, mode)| api::AddPathCapabilityTuple {
-                            family: Some((*family).into()),
-                            mode: *mode as i32,
-                        })
-                        .collect(),
-                })),
-            },
-            Capability::EnhanshedRouteRefresh => api::Capability {
-                cap: Some(api::capability::Cap::EnhancedRouteRefresh(
-                    api::EnhancedRouteRefreshCapability {},
-                )),
-            },
-            Capability::LongLivedGracefulRestart(v) => api::Capability {
-                cap: Some(api::capability::Cap::LongLivedGracefulRestart(
-                    api::LongLivedGracefulRestartCapability {
-                        tuples: v
-                            .iter()
-                            .map(|(family, flags, time)| {
-                                api::LongLivedGracefulRestartCapabilityTuple {
-                                    family: Some((*family).into()),
-                                    flags: *flags as u32,
-                                    time: *time,
-                                }
-                            })
-                            .collect(),
-                    },
-                )),
-            },
-            Capability::Fqdn(host, domain) => api::Capability {
-                cap: Some(api::capability::Cap::Fqdn(api::FqdnCapability {
-                    host_name: host.to_string(),
-                    domain_name: domain.to_string(),
-                })),
-            },
-            Capability::Unknown { code, bin } => api::Capability {
-                cap: Some(api::capability::Cap::Unknown(api::UnknownCapability {
-                    code: (*code as u32),
-                    value: bin.to_owned(),
-                })),
-            },
         }
     }
 }
@@ -754,13 +596,13 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
     .collect()
 });
 
-pub(crate) struct AsPathIter<'a> {
+pub struct AsPathIter<'a> {
     cur: Cursor<&'a Vec<u8>>,
     len: u64,
 }
 
 impl<'a> AsPathIter<'a> {
-    pub(crate) fn new(attr: &'a Attribute) -> AsPathIter<'a> {
+    pub fn new(attr: &'a Attribute) -> AsPathIter<'a> {
         AsPathIter {
             cur: Cursor::new(attr.binary().unwrap()),
             len: attr.binary().unwrap().len() as u64,
@@ -791,49 +633,53 @@ enum AttributeData {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub(crate) struct Attribute {
+pub struct Attribute {
     code: u8,
     flags: u8,
     data: AttributeData,
 }
 
 impl Attribute {
-    pub(crate) const ORIGIN_INCOMPLETE: u8 = 2;
+    pub const ORIGIN_INCOMPLETE: u8 = 2;
     const FLAG_EXTENDED: u8 = 1 << 4;
     // const FLAG_PARTIAL: u8 = 1 << 5;
     const FLAG_TRANSITIVE: u8 = 1 << 6;
     const FLAG_OPTIONAL: u8 = 1 << 7;
 
-    pub(crate) const ORIGIN: u8 = 1;
-    pub(crate) const AS_PATH: u8 = 2;
-    pub(crate) const NEXTHOP: u8 = 3;
-    pub(crate) const MULTI_EXIT_DESC: u8 = 4;
-    pub(crate) const LOCAL_PREF: u8 = 5;
-    pub(crate) const ATOMIC_AGGREGATE: u8 = 6;
-    pub(crate) const AGGREGATOR: u8 = 7;
-    pub(crate) const COMMUNITY: u8 = 8;
-    pub(crate) const ORIGINATOR_ID: u8 = 9;
-    pub(crate) const CLUSTER_LIST: u8 = 10;
-    pub(crate) const MP_REACH: u8 = 14;
-    pub(crate) const MP_UNREACH: u8 = 15;
-    pub(crate) const EXTENDED_COMMUNITY: u8 = 16;
-    pub(crate) const AS4_PATH: u8 = 17;
-    pub(crate) const AS4_AGGREGATOR: u8 = 18;
-    pub(crate) const AIGP: u8 = 26;
-    pub(crate) const LARGE_COMMUNITY: u8 = 32;
+    pub const ORIGIN: u8 = 1;
+    pub const AS_PATH: u8 = 2;
+    pub const NEXTHOP: u8 = 3;
+    pub const MULTI_EXIT_DESC: u8 = 4;
+    pub const LOCAL_PREF: u8 = 5;
+    pub const ATOMIC_AGGREGATE: u8 = 6;
+    pub const AGGREGATOR: u8 = 7;
+    pub const COMMUNITY: u8 = 8;
+    pub const ORIGINATOR_ID: u8 = 9;
+    pub const CLUSTER_LIST: u8 = 10;
+    pub const MP_REACH: u8 = 14;
+    pub const MP_UNREACH: u8 = 15;
+    pub const EXTENDED_COMMUNITY: u8 = 16;
+    pub const AS4_PATH: u8 = 17;
+    pub const AS4_AGGREGATOR: u8 = 18;
+    pub const AIGP: u8 = 26;
+    pub const LARGE_COMMUNITY: u8 = 32;
 
-    pub(crate) const AS_PATH_TYPE_SET: u8 = 1;
-    pub(crate) const AS_PATH_TYPE_SEQ: u8 = 2;
-    pub(crate) const AS_PATH_TYPE_CONFED_SEQ: u8 = 3;
-    pub(crate) const AS_PATH_TYPE_CONFED_SET: u8 = 4;
+    pub const AS_PATH_TYPE_SET: u8 = 1;
+    pub const AS_PATH_TYPE_SEQ: u8 = 2;
+    pub const AS_PATH_TYPE_CONFED_SEQ: u8 = 3;
+    pub const AS_PATH_TYPE_CONFED_SET: u8 = 4;
 
-    pub(crate) const DEFAULT_LOCAL_PREF: u32 = 100;
+    pub const DEFAULT_LOCAL_PREF: u32 = 100;
 
-    pub(crate) fn code(&self) -> u8 {
+    pub fn code(&self) -> u8 {
         self.code
     }
 
-    pub(crate) fn new_with_value(code: u8, val: u32) -> Option<Self> {
+    pub fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    pub fn new_with_value(code: u8, val: u32) -> Option<Self> {
         ATTR_DESCS.get(&code).map(|desc| Attribute {
             code: desc.code,
             flags: desc.flags,
@@ -841,7 +687,7 @@ impl Attribute {
         })
     }
 
-    pub(crate) fn new_with_bin(code: u8, bin: Vec<u8>) -> Option<Self> {
+    pub fn new_with_bin(code: u8, bin: Vec<u8>) -> Option<Self> {
         ATTR_DESCS.get(&code).map(|desc| Attribute {
             code: desc.code,
             flags: desc.flags,
@@ -849,21 +695,21 @@ impl Attribute {
         })
     }
 
-    pub(crate) fn value(&self) -> Option<u32> {
+    pub fn value(&self) -> Option<u32> {
         match self.data {
             AttributeData::Val(v) => Some(v),
             AttributeData::Bin(_) => None,
         }
     }
 
-    pub(crate) fn binary(&self) -> Option<&Vec<u8>> {
+    pub fn binary(&self) -> Option<&Vec<u8>> {
         match &self.data {
             AttributeData::Val(_) => None,
             AttributeData::Bin(v) => Some(v),
         }
     }
 
-    pub(crate) fn as_path_length(&self) -> usize {
+    pub fn as_path_length(&self) -> usize {
         assert_eq!(self.code, Attribute::AS_PATH);
         let buf = self.binary().unwrap();
         let len = buf.len() as u64;
@@ -908,7 +754,7 @@ impl Attribute {
         Ok(num)
     }
 
-    pub(crate) fn as_path_prepend(&self, as_number: u32) -> Attribute {
+    pub fn as_path_prepend(&self, as_number: u32) -> Attribute {
         assert_eq!(self.code, Attribute::AS_PATH);
         let buf = self.binary().unwrap();
         let len = buf.len() as u64;
@@ -935,7 +781,7 @@ impl Attribute {
         }
     }
 
-    pub(crate) fn as_path_origin(&self) -> Option<u32> {
+    pub fn as_path_origin(&self) -> Option<u32> {
         let buf = self.binary().unwrap();
         let len = buf.len() as u64;
         let mut c = Cursor::new(buf);
@@ -963,7 +809,7 @@ impl Attribute {
         }
     }
 
-    pub(crate) fn nexthop_update(&self, addr: IpAddr) -> Attribute {
+    pub fn nexthop_update(&self, addr: IpAddr) -> Attribute {
         assert_eq!(self.code, Attribute::NEXTHOP);
         match addr {
             IpAddr::V4(addr) => Attribute {
@@ -979,7 +825,7 @@ impl Attribute {
         }
     }
 
-    pub(crate) fn export(
+    pub fn export(
         &self,
         code: u8,
         dst: Option<&mut BytesMut>,
@@ -1061,250 +907,6 @@ impl Attribute {
         }
 
         Ok((dst.len() - pos_head) as u16)
-    }
-}
-
-impl From<&Attribute> for api::Attribute {
-    fn from(a: &Attribute) -> Self {
-        match a.code {
-            Attribute::ORIGIN => api::Attribute {
-                attr: Some(api::attribute::Attr::Origin(api::OriginAttribute {
-                    origin: a.value().unwrap(),
-                })),
-            },
-            Attribute::AS_PATH => {
-                let mut c = Cursor::new(a.binary().unwrap());
-                let mut segments = Vec::new();
-                while c.position() < c.get_ref().len() as u64 {
-                    let code = c.read_u8().unwrap();
-                    let n = c.read_u8().unwrap();
-                    let mut nums = Vec::new();
-                    for _ in 0..n {
-                        nums.push(c.read_u32::<NetworkEndian>().unwrap());
-                    }
-                    segments.push(api::AsSegment {
-                        r#type: code as i32,
-                        numbers: nums,
-                    });
-                }
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::AsPath(api::AsPathAttribute {
-                        segments,
-                    })),
-                }
-            }
-            Attribute::NEXTHOP => {
-                let buf = a.binary().unwrap();
-                let buflen = buf.len();
-                let mut c = Cursor::new(buf);
-                let next_hop = if buflen == 16 {
-                    Ipv6Addr::from(c.read_u128::<NetworkEndian>().unwrap()).to_string()
-                } else {
-                    Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()).to_string()
-                };
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::NextHop(api::NextHopAttribute {
-                        next_hop,
-                    })),
-                }
-            }
-            Attribute::MULTI_EXIT_DESC => api::Attribute {
-                attr: Some(api::attribute::Attr::MultiExitDisc(
-                    api::MultiExitDiscAttribute {
-                        med: a.value().unwrap(),
-                    },
-                )),
-            },
-            Attribute::LOCAL_PREF => api::Attribute {
-                attr: Some(api::attribute::Attr::LocalPref(api::LocalPrefAttribute {
-                    local_pref: a.value().unwrap(),
-                })),
-            },
-            Attribute::ATOMIC_AGGREGATE => api::Attribute {
-                attr: Some(api::attribute::Attr::AtomicAggregate(
-                    api::AtomicAggregateAttribute {},
-                )),
-            },
-            Attribute::AGGREGATOR => {
-                let mut c = Cursor::new(a.binary().unwrap());
-                let (asn, addr) = match c.get_ref().len() {
-                    6 => (
-                        c.read_u16::<NetworkEndian>().unwrap() as u32,
-                        Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()),
-                    ),
-                    8 => (
-                        c.read_u32::<NetworkEndian>().unwrap(),
-                        Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()),
-                    ),
-                    _ => unreachable!("corrupted"),
-                };
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::Aggregator(api::AggregatorAttribute {
-                        asn,
-                        address: addr.to_string(),
-                    })),
-                }
-            }
-            Attribute::COMMUNITY => {
-                let buf = a.binary().unwrap();
-                let count = buf.len() / 4;
-                let mut c = Cursor::new(buf);
-                let mut values = Vec::with_capacity(count);
-                for _ in 0..count {
-                    values.push(c.read_u32::<NetworkEndian>().unwrap());
-                }
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::Communities(
-                        api::CommunitiesAttribute {
-                            communities: values,
-                        },
-                    )),
-                }
-            }
-            Attribute::ORIGINATOR_ID => api::Attribute {
-                attr: Some(api::attribute::Attr::OriginatorId(
-                    api::OriginatorIdAttribute {
-                        id: Ipv4Addr::from(a.value().unwrap()).to_string(),
-                    },
-                )),
-            },
-            Attribute::CLUSTER_LIST => {
-                let mut c = Cursor::new(a.binary().unwrap());
-                let mut ids = Vec::new();
-                for _ in 0..c.get_ref().len() / 4 {
-                    ids.push(Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()).to_string());
-                }
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::ClusterList(
-                        api::ClusterListAttribute { ids },
-                    )),
-                }
-            }
-            Attribute::LARGE_COMMUNITY => {
-                let mut c = Cursor::new(a.binary().unwrap());
-                let mut v = Vec::new();
-                for _ in 0..c.get_ref().len() / 12 {
-                    let global_admin = c.read_u32::<NetworkEndian>().unwrap();
-                    let local_data1 = c.read_u32::<NetworkEndian>().unwrap();
-                    let local_data2 = c.read_u32::<NetworkEndian>().unwrap();
-                    v.push(api::LargeCommunity {
-                        global_admin,
-                        local_data1,
-                        local_data2,
-                    });
-                }
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::LargeCommunities(
-                        api::LargeCommunitiesAttribute { communities: v },
-                    )),
-                }
-            }
-            _ => api::Attribute {
-                attr: Some(api::attribute::Attr::Unknown(api::UnknownAttribute {
-                    flags: a.flags as u32,
-                    r#type: a.code as u32,
-                    value: a.binary().unwrap().to_owned(),
-                })),
-            },
-        }
-    }
-}
-
-impl TryFrom<api::Attribute> for Attribute {
-    type Error = Error;
-
-    fn try_from(a: api::Attribute) -> Result<Self, Self::Error> {
-        let attr = a
-            .attr
-            .ok_or(Error::InvalidArgument("missing attribute".to_string()))?;
-
-        match attr {
-            api::attribute::Attr::Unknown(u) => Attribute::new_with_bin(u.r#type as u8, u.value)
-                .ok_or(Error::InvalidArgument("unknown attribute type".to_string())),
-            api::attribute::Attr::Origin(o) => {
-                Attribute::new_with_value(Attribute::ORIGIN, o.origin)
-                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
-            }
-            api::attribute::Attr::AsPath(p) => {
-                let mut c = Cursor::new(Vec::new());
-                for s in p.segments {
-                    let _ = c.write_u8(s.r#type as u8);
-                    let _ = c.write_u8(s.numbers.len() as u8);
-                    for n in s.numbers {
-                        c.write_u32::<NetworkEndian>(n).unwrap();
-                    }
-                }
-                Attribute::new_with_bin(Attribute::AS_PATH, c.into_inner())
-                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
-            }
-            api::attribute::Attr::NextHop(nh) => {
-                let mut c = Cursor::new(Vec::new());
-                if let Ok(addr) = Ipv4Addr::from_str(&nh.next_hop) {
-                    c.write_u32::<NetworkEndian>(addr.into()).unwrap();
-                } else if let Ok(addr) = Ipv6Addr::from_str(&nh.next_hop) {
-                    c.write_u128::<NetworkEndian>(addr.into()).unwrap();
-                }
-                Attribute::new_with_bin(Attribute::NEXTHOP, c.into_inner())
-                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
-            }
-            api::attribute::Attr::MultiExitDisc(m) => {
-                Attribute::new_with_value(Attribute::MULTI_EXIT_DESC, m.med)
-                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
-            }
-            api::attribute::Attr::LocalPref(l) => {
-                Attribute::new_with_value(Attribute::LOCAL_PREF, l.local_pref)
-                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
-            }
-            api::attribute::Attr::AtomicAggregate(_) => {
-                Ok(Attribute::new_with_bin(Attribute::ATOMIC_AGGREGATE, Vec::new()).unwrap())
-            }
-            api::attribute::Attr::Aggregator(ag) => {
-                let mut c = Cursor::new(Vec::new());
-                let addr = Ipv4Addr::from_str(&ag.address)
-                    .map_err(|e| Error::InvalidArgument(e.to_string()))?;
-                c.write_u32::<NetworkEndian>(ag.asn).unwrap();
-                c.write_u32::<NetworkEndian>(addr.into()).unwrap();
-                Attribute::new_with_bin(Attribute::AGGREGATOR, c.into_inner())
-                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
-            }
-            api::attribute::Attr::Communities(cm) => {
-                let mut c = Cursor::new(Vec::new());
-                for v in cm.communities {
-                    c.write_u32::<NetworkEndian>(v).unwrap();
-                }
-                Attribute::new_with_bin(Attribute::COMMUNITY, c.into_inner())
-                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
-            }
-            api::attribute::Attr::OriginatorId(o) => {
-                let addr =
-                    Ipv4Addr::from_str(&o.id).map_err(|e| Error::InvalidArgument(e.to_string()))?;
-                Attribute::new_with_value(Attribute::ORIGINATOR_ID, addr.into())
-                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
-            }
-            api::attribute::Attr::ClusterList(cl) => {
-                let mut c = Cursor::new(Vec::new());
-                for id in cl.ids {
-                    let addr = Ipv4Addr::from_str(&id)
-                        .map_err(|e| Error::InvalidArgument(e.to_string()))?;
-                    c.write_u32::<NetworkEndian>(addr.into()).unwrap();
-                }
-                Attribute::new_with_bin(Attribute::CLUSTER_LIST, c.into_inner())
-                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
-            }
-            api::attribute::Attr::LargeCommunities(lc) => {
-                let mut c = Cursor::new(Vec::new());
-                for v in lc.communities {
-                    c.write_u32::<NetworkEndian>(v.global_admin).unwrap();
-                    c.write_u32::<NetworkEndian>(v.local_data1).unwrap();
-                    c.write_u32::<NetworkEndian>(v.local_data2).unwrap();
-                }
-                Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, c.into_inner())
-                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
-            }
-            _ => Err(Error::InvalidArgument(
-                "attribute conversion not implemented".to_string(),
-            )),
-        }
     }
 }
 
@@ -1443,7 +1045,7 @@ static ATTR_DESCS: Lazy<FnvHashMap<u8, AttrDesc>> = Lazy::new(|| {
 });
 
 #[derive(Clone)]
-pub(crate) enum Message {
+pub enum Message {
     Open {
         version: u8,
         as_number: u32,
@@ -1479,7 +1081,7 @@ impl Message {
     const KEEPALIVE: u8 = 4;
     const ROUTE_REFRESH: u8 = 5;
 
-    pub(crate) fn eor(family: Family) -> Message {
+    pub fn eor(family: Family) -> Message {
         if family == Family::IPV4 {
             Message::Update {
                 reach: Some((Family::IPV4, Vec::new())),
@@ -1496,22 +1098,22 @@ impl Message {
     }
 }
 
-pub(crate) struct Channel {
+pub struct Channel {
     family: Family,
     addpath: u8,
     extended_nexthop: bool,
 }
 
 impl Channel {
-    pub(crate) fn addpath_rx(&self) -> bool {
+    pub fn addpath_rx(&self) -> bool {
         self.addpath & 0x1 > 0
     }
 
-    pub(crate) fn addpath_tx(&self) -> bool {
+    pub fn addpath_tx(&self) -> bool {
         self.addpath & 0x2 > 0
     }
 
-    pub(crate) fn new(family: Family, rx: bool, tx: bool) -> Self {
+    pub fn new(family: Family, rx: bool, tx: bool) -> Self {
         let mut addpath = 0;
         if rx {
             addpath |= 0x1;
@@ -1527,7 +1129,7 @@ impl Channel {
     }
 }
 
-pub(crate) fn create_channel(
+pub fn create_channel(
     local: &[Capability],
     remote: &[Capability],
 ) -> impl Iterator<Item = (Family, Channel)> {
@@ -1571,7 +1173,7 @@ pub(crate) fn create_channel(
     })
 }
 
-pub(crate) struct CodecBuilder {
+pub struct CodecBuilder {
     local_asn: u32,
     remote_asn: u32,
     local_addr: IpAddr,
@@ -1582,7 +1184,7 @@ pub(crate) struct CodecBuilder {
 }
 
 impl CodecBuilder {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         CodecBuilder {
             local_asn: 0,
             remote_asn: 0,
@@ -1594,7 +1196,7 @@ impl CodecBuilder {
         }
     }
 
-    pub(crate) fn build(&mut self) -> Codec {
+    pub fn build(&mut self) -> Codec {
         let channel = self
             .family
             .iter()
@@ -1611,22 +1213,22 @@ impl CodecBuilder {
         }
     }
 
-    pub(crate) fn local_asn(&mut self, asn: u32) -> &mut Self {
+    pub fn local_asn(&mut self, asn: u32) -> &mut Self {
         self.local_asn = asn;
         self
     }
 
-    pub(crate) fn local_addr(&mut self, local_addr: IpAddr) -> &mut Self {
+    pub fn local_addr(&mut self, local_addr: IpAddr) -> &mut Self {
         self.local_addr = local_addr;
         self
     }
 
-    pub(crate) fn keep_aspath(&mut self, y: bool) -> &mut Self {
+    pub fn keep_aspath(&mut self, y: bool) -> &mut Self {
         self.keep_aspath = y;
         self
     }
 
-    pub(crate) fn keep_nexthop(&mut self, y: bool) -> &mut Self {
+    pub fn keep_nexthop(&mut self, y: bool) -> &mut Self {
         self.keep_nexthop = y;
         self
     }
@@ -1638,14 +1240,14 @@ impl CodecBuilder {
     }
 }
 
-pub(crate) struct Codec {
+pub struct Codec {
     extended_length: bool,
     local_asn: u32,
     remote_asn: u32,
     local_addr: IpAddr,
     keep_aspath: bool,
     keep_nexthop: bool,
-    pub(crate) channel: FnvHashMap<Family, Channel>,
+    pub channel: FnvHashMap<Family, Channel>,
 }
 
 impl Codec {

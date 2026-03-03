@@ -18,31 +18,31 @@ use bytes::{BufMut, BytesMut};
 use std::net::{IpAddr, Ipv4Addr};
 use tokio_util::codec::{Decoder, Encoder};
 
+use crate::bgp;
 use crate::error::Error;
-use crate::packet::bgp;
 
 #[allow(dead_code)]
 impl Message {
-    pub(crate) const ROUTE_MONITORING: u8 = 0;
-    pub(crate) const STATS_REPORTS: u8 = 1;
-    pub(crate) const PEER_DOWN: u8 = 2;
-    pub(crate) const PEER_UP: u8 = 3;
-    pub(crate) const INITIATION: u8 = 4;
-    pub(crate) const TERMINATION: u8 = 6;
-    pub(crate) const ROUTE_MIRRORING: u8 = 7;
+    pub const ROUTE_MONITORING: u8 = 0;
+    pub const STATS_REPORTS: u8 = 1;
+    pub const PEER_DOWN: u8 = 2;
+    pub const PEER_UP: u8 = 3;
+    pub const INITIATION: u8 = 4;
+    pub const TERMINATION: u8 = 6;
+    pub const ROUTE_MIRRORING: u8 = 7;
 }
 
 #[derive(Clone)]
-pub(crate) struct PerPeerHeader {
-    pub(crate) asn: u32,
+pub struct PerPeerHeader {
+    pub asn: u32,
     id: Ipv4Addr,
     distinguisher: u64,
-    pub(crate) remote_addr: IpAddr,
+    pub remote_addr: IpAddr,
     timestamp: u32,
 }
 
 impl PerPeerHeader {
-    pub(crate) fn new(
+    pub fn new(
         asn: u32,
         id: Ipv4Addr,
         distinguisher: u64,
@@ -79,7 +79,7 @@ impl PerPeerHeader {
 
 #[allow(dead_code)]
 #[derive(Clone)]
-pub(crate) enum PeerDownReason {
+pub enum PeerDownReason {
     LocalNotification(bgp::Message),
     LocalFsm(u16),
     RemoteNotification(bgp::Message),
@@ -123,7 +123,7 @@ impl PeerDownReason {
 }
 
 #[allow(dead_code)]
-pub(crate) enum Message {
+pub enum Message {
     RouteMonitoring {
         header: PerPeerHeader,
         update: bgp::Message,
@@ -150,8 +150,8 @@ pub(crate) enum Message {
 impl Message {
     const VERSION: u8 = 3;
 
-    pub(crate) const INFO_TYPE_SYSDESCR: u16 = 1;
-    pub(crate) const INFO_TYPE_SYSNAME: u16 = 2;
+    pub const INFO_TYPE_SYSDESCR: u16 = 1;
+    pub const INFO_TYPE_SYSNAME: u16 = 2;
 
     fn code(&self) -> u8 {
         match self {
@@ -176,12 +176,12 @@ impl Message {
     }
 }
 
-pub(crate) struct BmpCodec {
+pub struct BmpCodec {
     codec: bgp::Codec,
 }
 
 impl BmpCodec {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         BmpCodec {
             codec: bgp::CodecBuilder::new()
                 .keep_aspath(true)

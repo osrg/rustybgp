@@ -29,9 +29,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use rustybgp_packet::{self as packet, Attribute, Family, bgp};
+
 use crate::api;
 use crate::error::Error;
-use crate::packet::{self, Attribute, Family, bgp};
 
 struct PathAttribute {
     attr: Arc<Vec<Attribute>>,

@@ -21,9 +21,9 @@ mod api {
 }
 mod auth;
 mod config;
+mod convert;
 mod error;
 mod event;
-mod packet;
 mod proto;
 mod table;
 

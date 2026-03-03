@@ -19,8 +19,8 @@ use std::net::IpAddr;
 use std::time::SystemTime;
 use tokio_util::codec::{Decoder, Encoder};
 
+use crate::bgp;
 use crate::error::Error;
-use crate::packet::bgp;
 
 struct Header {
     timestamp: u32,
@@ -42,7 +42,7 @@ impl Header {
     }
 }
 
-pub(crate) struct MpHeader {
+pub struct MpHeader {
     remote_asn: u32,
     local_asn: u32,
     interface_idx: u16,
@@ -52,7 +52,7 @@ pub(crate) struct MpHeader {
 }
 
 impl MpHeader {
-    pub(crate) fn new(
+    pub fn new(
         remote_asn: u32,
         local_asn: u32,
         interface_idx: u16,
@@ -100,7 +100,7 @@ impl MpHeader {
 }
 
 #[allow(dead_code)]
-pub(crate) enum Message {
+pub enum Message {
     Mp {
         header: MpHeader,
         body: bgp::Message,
@@ -108,12 +108,12 @@ pub(crate) enum Message {
     },
 }
 
-pub(crate) struct MrtCodec {
+pub struct MrtCodec {
     codec: bgp::Codec,
 }
 
 impl MrtCodec {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         MrtCodec {
             codec: bgp::CodecBuilder::new()
                 .keep_aspath(true)

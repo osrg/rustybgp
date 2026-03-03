@@ -1,0 +1,13 @@
+[package]
+name = "rustybgp-packet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ascii = "1"
+byteorder = "1"
+bytes = "1"
+fnv = "1"
+once_cell = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+thiserror = "2"

@@ -19,18 +19,18 @@ use std::io::Cursor;
 use std::net::IpAddr;
 use tokio_util::codec::{Decoder, Encoder};
 
+use crate::IpNet;
 use crate::error::Error;
-use crate::packet::IpNet;
 
-pub(crate) struct Prefix {
-    pub(crate) net: IpNet,
-    pub(crate) flags: u8,
-    pub(crate) max_length: u8,
-    pub(crate) as_number: u32,
+pub struct Prefix {
+    pub net: IpNet,
+    pub flags: u8,
+    pub max_length: u8,
+    pub as_number: u32,
 }
 
 #[allow(dead_code)]
-pub(crate) enum Message {
+pub enum Message {
     SerialNotify { serial_number: u32 },
     SerialQuery { serial_number: u32 },
     ResetQuery,
@@ -42,15 +42,15 @@ pub(crate) enum Message {
 }
 
 impl Message {
-    pub(crate) const SERIAL_NOTIFY: u8 = 0;
-    pub(crate) const SERIAL_QUERY: u8 = 1;
-    pub(crate) const RESET_QUERY: u8 = 2;
-    pub(crate) const CACHE_RESPONSE: u8 = 3;
-    pub(crate) const IPV4_PREFIX: u8 = 4;
-    pub(crate) const IPV6_PREFIX: u8 = 6;
-    pub(crate) const END_OF_DATA: u8 = 7;
-    pub(crate) const CACHE_RESET: u8 = 8;
-    pub(crate) const ERROR_REPORT: u8 = 10;
+    pub const SERIAL_NOTIFY: u8 = 0;
+    pub const SERIAL_QUERY: u8 = 1;
+    pub const RESET_QUERY: u8 = 2;
+    pub const CACHE_RESPONSE: u8 = 3;
+    pub const IPV4_PREFIX: u8 = 4;
+    pub const IPV6_PREFIX: u8 = 6;
+    pub const END_OF_DATA: u8 = 7;
+    pub const CACHE_RESET: u8 = 8;
+    pub const ERROR_REPORT: u8 = 10;
 
     fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let buf: Vec<u8> = Vec::new();
@@ -148,10 +148,10 @@ impl Message {
     }
 }
 
-pub(crate) struct RtrCodec {}
+pub struct RtrCodec {}
 
 impl RtrCodec {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         RtrCodec {}
     }
 }
