@@ -75,11 +75,9 @@ impl Message {
         let length = c.read_u32::<NetworkEndian>()? as usize;
 
         if length > buflen {
-            return Err(Error::InvalidMessageFormat {
-                code: 0,
-                subcode: 0,
-                data: buf.to_owned(),
-            });
+            return Err(Error::InvalidArgument(
+                "RPKI message length exceeds buffer".to_string(),
+            ));
         }
 
         match message_type {
@@ -139,11 +137,10 @@ impl Message {
             }
             Message::CACHE_RESET => Ok((Message::CacheReset, length)),
             Message::ERROR_REPORT => Ok((Message::ErrorReport, length)),
-            _ => Err(Error::InvalidMessageFormat {
-                code: 0,
-                subcode: 0,
-                data: buf.to_owned(),
-            }),
+            _ => Err(Error::InvalidArgument(format!(
+                "unknown RPKI message type: {}",
+                message_type
+            ))),
         }
     }
 }

@@ -15,7 +15,7 @@
 
 pub mod bgp;
 pub use self::bgp::{Attribute, Capability, Family, IpNet, Net};
-pub use self::error::Error;
+pub use self::error::{BgpError, Error};
 
 pub mod bmp;
 pub mod error;

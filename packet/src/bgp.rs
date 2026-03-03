@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::error::Error;
+use crate::error::{BgpError, Error};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Family(u32);
@@ -221,11 +221,7 @@ impl Ipv4Net {
     fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Ipv4Net, Error> {
         let bit_len = c.read_u8()?;
         if len < (bit_len as usize).div_ceil(8) || bit_len > 32 {
-            return Err(Error::InvalidMessageFormat {
-                code: 3,
-                subcode: 1,
-                data: Vec::new(),
-            });
+            return Err(BgpError::UpdateMalformedAttributeList.into());
         }
         let mut addr = [0_u8; 4];
         for i in 0..bit_len.div_ceil(8) {
@@ -274,11 +270,7 @@ impl Ipv6Net {
     fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Ipv6Net, Error> {
         let bit_len = c.read_u8()?;
         if len < (bit_len as usize).div_ceil(8) || bit_len > 128 {
-            return Err(Error::InvalidMessageFormat {
-                code: 3,
-                subcode: 1,
-                data: Vec::new(),
-            });
+            return Err(BgpError::UpdateMalformedAttributeList.into());
         }
         let mut addr = [0_u8; 16];
         for i in 0..bit_len.div_ceil(8) {
@@ -1541,11 +1533,7 @@ impl Codec {
         c: &mut T,
         mut len: usize,
     ) -> Result<(Net, u32), Error> {
-        let malformed = Error::InvalidMessageFormat {
-            code: 3,
-            subcode: 1,
-            data: vec![],
-        };
+        let malformed: Error = BgpError::UpdateMalformedAttributeList.into();
         let id = if chan.addpath_rx() {
             if let Ok(id) = c.read_u32::<NetworkEndian>() {
                 len -= 4;
@@ -1609,11 +1597,10 @@ impl Decoder for Codec {
         if (message_len < Message::HEADER_LENGTH as usize)
             || (message_len > self.max_message_length())
         {
-            return Err(Error::InvalidMessageFormat {
-                code: 1,
-                subcode: 2,
+            return Err(BgpError::BadMessageLength {
                 data: (src[16..18]).to_vec(),
-            });
+            }
+            .into());
         }
 
         if buffer_len < message_len {
@@ -1621,20 +1608,15 @@ impl Decoder for Codec {
         }
         let code = src[18];
         let buf = src.split_to(message_len).freeze();
-        let header_len_error = Error::InvalidMessageFormat {
-            code: 1,
-            subcode: 2,
+        let header_len_error: Error = BgpError::BadMessageLength {
             data: (buf[16..18]).to_vec(),
-        };
+        }
+        .into();
 
         match code {
             Message::OPEN => {
                 const MINIMUM_OPEN_LENGTH: usize = 29;
-                let malformed = Error::InvalidMessageFormat {
-                    code: 2,
-                    subcode: 0,
-                    data: vec![],
-                };
+                let malformed: Error = BgpError::OpenMalformed.into();
                 if buf.len() < MINIMUM_OPEN_LENGTH {
                     return Err(header_len_error);
                 }
@@ -1694,13 +1676,12 @@ impl Decoder for Codec {
                             }
                         }
                     } else {
-                        return Err(Error::InvalidMessageFormat {
-                            code: 2,
-                            subcode: 4,
+                        return Err(BgpError::OpenUnsupportedOptionalParameter {
                             data: buf[c.position() as usize - 2
                                 ..c.position() as usize + op_len as usize]
                                 .to_vec(),
-                        });
+                        }
+                        .into());
                     }
                 }
                 if as_number == Capability::TRANS_ASN as u32 {
@@ -1719,11 +1700,7 @@ impl Decoder for Codec {
             }
             Message::UPDATE => {
                 const MINIMUM_UPDATE_LENGTH: usize = 23;
-                let malformed = || Error::InvalidMessageFormat {
-                    code: 3,
-                    subcode: 1,
-                    data: vec![],
-                };
+                let malformed = || Error::from(BgpError::UpdateMalformedAttributeList);
                 let mut reach_family = Family::IPV4;
                 let mut unreach_family = Family::IPV4;
                 let mut attr = Vec::new();
@@ -1924,11 +1901,7 @@ impl Decoder for Codec {
                 }
 
                 if let Some(a) = mp_reach_attr {
-                    let err = Error::InvalidMessageFormat {
-                        code: 3,
-                        subcode: 9,
-                        data: vec![],
-                    };
+                    let err: Error = BgpError::UpdateOptionalAttributeError.into();
                     let buf = a.binary().unwrap();
                     if buf.len() < 5 {
                         return Err(err);
@@ -1972,11 +1945,7 @@ impl Decoder for Codec {
                 }
 
                 if let Some(a) = mp_unreach_attr {
-                    let err = Error::InvalidMessageFormat {
-                        code: 3,
-                        subcode: 9,
-                        data: vec![],
-                    };
+                    let err: Error = BgpError::UpdateOptionalAttributeError.into();
                     let buf = a.binary().unwrap();
                     if buf.len() < 3 {
                         return Err(err);
@@ -2036,11 +2005,7 @@ impl Decoder for Codec {
                     return Err(header_len_error);
                 }
                 if ROUTE_REFRESH_LENGTH < buf.len() {
-                    return Err(Error::InvalidMessageFormat {
-                        code: 7,
-                        subcode: 1,
-                        data: buf.to_vec(),
-                    });
+                    return Err(BgpError::RouteRefreshInvalidLength { data: buf.to_vec() }.into());
                 }
                 let mut c = Cursor::new(&buf);
                 c.set_position(Message::HEADER_LENGTH.into());
@@ -2048,11 +2013,7 @@ impl Decoder for Codec {
                     family: Family(c.read_u32::<NetworkEndian>().unwrap()),
                 }))
             }
-            _ => Err(Error::InvalidMessageFormat {
-                code: 1,
-                subcode: 3,
-                data: vec![code],
-            }),
+            _ => Err(BgpError::BadMessageType { data: vec![code] }.into()),
         }
     }
 }
