@@ -170,7 +170,7 @@ impl Encoder<&Message> for MrtCodec {
 
                 header.encode(dst).unwrap();
                 let mut buf = bytes::BytesMut::with_capacity(4096);
-                self.codec.encode(body, &mut buf).unwrap();
+                self.codec.encode_to(body, &mut buf).unwrap();
                 dst.put_slice(buf.as_ref());
                 let len = dst.len() - pos;
                 (&mut dst.as_mut()[(pos - 4)..])

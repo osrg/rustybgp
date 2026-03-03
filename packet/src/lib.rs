@@ -16,8 +16,10 @@
 pub mod bgp;
 pub use self::bgp::{Attribute, Capability, Family, IpNet, Net};
 pub use self::error::{BgpError, Error};
+pub use self::frame::BgpFramer;
 
 pub mod bmp;
 pub mod error;
+pub mod frame;
 pub mod mrt;
 pub mod rpki;

@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::error::{BgpError, Error};
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use fnv::FnvHashMap;
@@ -24,9 +25,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{fmt, io};
-use tokio_util::codec::{Decoder, Encoder};
-
-use crate::error::{BgpError, Error};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Family(u32);
@@ -1062,7 +1060,7 @@ pub enum Message {
 }
 
 impl Message {
-    const HEADER_LENGTH: u16 = 19;
+    pub(crate) const HEADER_LENGTH: u16 = 19;
 
     const MAX_LENGTH: usize = 4096;
     const MAX_EXTENDED_LENGTH: usize = 65535;
@@ -1243,7 +1241,7 @@ pub struct PeerCodec {
 }
 
 impl PeerCodec {
-    fn max_message_length(&self) -> usize {
+    pub fn max_message_length(&self) -> usize {
         if self.extended_length {
             Message::MAX_EXTENDED_LENGTH
         } else {
@@ -1993,40 +1991,6 @@ impl PeerCodec {
     }
 }
 
-impl Encoder<&Message> for PeerCodec {
-    type Error = Error;
-
-    fn encode(&mut self, item: &Message, dst: &mut BytesMut) -> Result<(), Error> {
-        self.encode_to(item, dst)
-    }
-}
-
-impl Decoder for PeerCodec {
-    type Item = Message;
-    type Error = Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let buffer_len = src.len();
-        if buffer_len < Message::HEADER_LENGTH as usize {
-            return Ok(None);
-        }
-        let message_len = (&src[16..18]).read_u16::<NetworkEndian>().unwrap() as usize;
-        if (message_len < Message::HEADER_LENGTH as usize)
-            || (message_len > self.max_message_length())
-        {
-            return Err(BgpError::BadMessageLength {
-                data: (src[16..18]).to_vec(),
-            }
-            .into());
-        }
-        if buffer_len < message_len {
-            return Ok(None);
-        }
-        let buf = src.split_to(message_len);
-        Ok(Some(self.parse_message(&buf)?))
-    }
-}
-
 #[test]
 fn ipv6_eor() {
     let mut buf = [0xff; 16].to_vec();
@@ -2112,21 +2076,21 @@ fn build_many_v4_route() {
         set.insert((*n, 0));
     }
 
-    let mut codec = PeerCodecBuilder::new()
+    let codec = PeerCodecBuilder::new()
         .families(vec![Family::IPV4])
         .keep_aspath(true)
         .build();
     let mut txbuf = bytes::BytesMut::with_capacity(4096);
-    codec.encode(&msg, &mut txbuf).unwrap();
+    let mut framer = crate::frame::BgpFramer::new(codec);
+    framer.encode_to(&msg, &mut txbuf).unwrap();
     let mut recv = Vec::new();
     loop {
-        match codec.decode(&mut txbuf) {
-            Ok(Some(Message::Update { reach, .. })) => {
+        match framer.try_parse(&mut txbuf).expect("failed to decode") {
+            Some(Message::Update { reach, .. }) => {
                 recv.append(&mut reach.unwrap().1);
             }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) => panic!("failed to decode"),
+            Some(_) => {}
+            None => break,
         }
     }
     assert_eq!(recv.len(), net.len());
@@ -2149,15 +2113,14 @@ fn build_many_v4_route() {
     }
 
     let mut withdrawn = Vec::new();
-    codec.encode(&msg, &mut txbuf).unwrap();
+    framer.encode_to(&msg, &mut txbuf).unwrap();
     loop {
-        match codec.decode(&mut txbuf) {
-            Ok(Some(Message::Update { unreach, .. })) => {
+        match framer.try_parse(&mut txbuf).expect("failed to decode") {
+            Some(Message::Update { unreach, .. }) => {
                 withdrawn.append(&mut unreach.unwrap().1);
             }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) => panic!("failed to decode"),
+            Some(_) => {}
+            None => break,
         }
     }
     assert_eq!(withdrawn.len(), net.len());
@@ -2195,18 +2158,18 @@ fn many_mp_reach() {
         unreach: None,
     };
 
-    let mut codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
+    let codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
     let mut txbuf = bytes::BytesMut::with_capacity(4096);
-    codec.encode(&msg, &mut txbuf).unwrap();
+    let mut framer = crate::frame::BgpFramer::new(codec);
+    framer.encode_to(&msg, &mut txbuf).unwrap();
     let mut recv = Vec::new();
     loop {
-        match codec.decode(&mut txbuf) {
-            Ok(Some(Message::Update { reach, .. })) => {
+        match framer.try_parse(&mut txbuf).expect("failed to decode") {
+            Some(Message::Update { reach, .. }) => {
                 recv.append(&mut reach.unwrap().1);
             }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(e) => panic!("failed to decode {}", e),
+            Some(_) => {}
+            None => break,
         }
     }
     assert_eq!(recv.len(), net.len());
@@ -2241,18 +2204,18 @@ fn many_mp_unreach() {
         unreach: Some((Family::IPV6, unreach)),
     };
 
-    let mut codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
+    let codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
     let mut txbuf = bytes::BytesMut::with_capacity(4096);
-    codec.encode(&msg, &mut txbuf).unwrap();
+    let mut framer = crate::frame::BgpFramer::new(codec);
+    framer.encode_to(&msg, &mut txbuf).unwrap();
     let mut recv = Vec::new();
     loop {
-        match codec.decode(&mut txbuf) {
-            Ok(Some(Message::Update { unreach, .. })) => {
+        match framer.try_parse(&mut txbuf).expect("failed to decode") {
+            Some(Message::Update { unreach, .. }) => {
                 recv.append(&mut unreach.unwrap().1);
             }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(e) => panic!("failed to decode {}", e),
+            Some(_) => {}
+            None => break,
         }
     }
     assert_eq!(recv.len(), net.len());

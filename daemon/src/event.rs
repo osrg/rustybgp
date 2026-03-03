@@ -40,11 +40,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::codec::{Encoder, Framed};
 
 use api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
-use rustybgp_packet::{self as packet, Family, bgp, bmp, mrt, rpki};
+use rustybgp_packet::{self as packet, BgpFramer, Family, bgp, bmp, mrt, rpki};
 
 use crate::api;
 use crate::auth;
@@ -3550,7 +3550,7 @@ impl Handler {
             txbuf_size = std::cmp::min(txbuf_size, r / 2);
         }
 
-        let mut codec = if self.rs_client {
+        let mut framer = BgpFramer::new(if self.rs_client {
             bgp::PeerCodecBuilder::new()
                 .local_asn(self.local_asn)
                 .local_addr(self.local_addr)
@@ -3562,7 +3562,7 @@ impl Handler {
                 .local_asn(self.local_asn)
                 .local_addr(self.local_addr)
                 .build()
-        };
+        });
 
         let mut peer_event_rx = Vec::new();
         for _ in 0..*NUM_TABLES {
@@ -3636,7 +3636,7 @@ impl Handler {
                                 if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
                                     continue;
                                 }
-                                if !codec.channel.contains_key(&ri.family) {
+                                if !framer.inner().channel.contains_key(&ri.family) {
                                     continue;
                                 }
                                 pending_update.get_mut(&ri.family).unwrap().insert_change(ri);
@@ -3657,11 +3657,11 @@ impl Handler {
                                 self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                             }
                             Ok(_) => loop {
-                                    match codec.decode(&mut rxbuf) {
+                                    match framer.try_parse(&mut rxbuf) {
                                     Ok(msg) => match msg {
                                         Some(msg) => {
                                             (*self.counter_rx).sync(&msg);
-                                            let _ = self.rx_msg(&mut codec, local_sockaddr, remote_sockaddr, msg, &mut urgent, &mut pending_update).await;
+                                            let _ = self.rx_msg(framer.inner_mut(), local_sockaddr, remote_sockaddr, msg, &mut urgent, &mut pending_update).await;
                                         }
                                         None => {
                                             // partial read
@@ -3693,7 +3693,7 @@ impl Handler {
                         let mut txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                         for _ in 0..urgent.len() {
                             let msg = urgent.remove(0);
-                            let _ = codec.encode(&msg, &mut txbuf);
+                            let _ = framer.encode_to(&msg, &mut txbuf);
                             (*self.counter_tx).sync(&msg);
 
                             if txbuf.len() > txbuf_size {
@@ -3718,7 +3718,7 @@ impl Handler {
                                     attr: Arc::new(Vec::new()),
                                     unreach: Some((*family, unreach)),
                                 };
-                                let _ = codec.encode(&msg, &mut txbuf);
+                                let _ = framer.encode_to(&msg, &mut txbuf);
                                 self.counter_tx.sync(&msg);
                                 if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
                                     self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
@@ -3736,7 +3736,7 @@ impl Handler {
                                     attr: attr.clone(),
                                     unreach: None,
                                 };
-                                let _ = codec.encode(&msg, &mut txbuf);
+                                let _ = framer.encode_to(&msg, &mut txbuf);
                                 self.counter_tx.sync(&msg);
                                 sent.entry(*family).or_insert_with(|| Vec::with_capacity(max_tx_count)).push(attr.clone());
 
@@ -3774,7 +3774,7 @@ impl Handler {
                                     p.sync = false;
                                     let mut b = bytes::BytesMut::with_capacity(txbuf_size);
                                     let eor = bgp::Message::eor(*family);
-                                    let _ = codec.encode(&eor, &mut b);
+                                    let _ = framer.encode_to(&eor, &mut b);
                                     if stream.write_all(&b.freeze()).await.is_err() {
                                         self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                                         break;
