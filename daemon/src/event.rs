@@ -44,11 +44,13 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 
 use api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
+use rustybgp_packet::{self as packet, Family, bgp, bmp, mrt, rpki};
+
 use crate::api;
 use crate::auth;
 use crate::config;
+use crate::convert;
 use crate::error::Error;
-use crate::packet::{self, Family, bgp, bmp, mrt, rpki};
 use crate::table;
 
 #[derive(Default)]
@@ -554,7 +556,11 @@ impl TryFrom<&api::Peer> for Peer {
                 p.afi_safis
                     .iter()
                     .filter(|x| x.config.as_ref().is_some_and(|x| x.family.is_some()))
-                    .map(|x| Family::from(x.config.as_ref().unwrap().family.as_ref().unwrap()))
+                    .map(|x| {
+                        convert::family_from_api(
+                            x.config.as_ref().unwrap().family.as_ref().unwrap(),
+                        )
+                    })
                     .collect(),
             )
             .passive(p.transport.as_ref().is_some_and(|x| x.passive_mode))
@@ -599,7 +605,7 @@ impl From<&config::Neighbor> for Peer {
                     if let Some(f) = x.afi_safi_name.as_ref() {
                         if (f == &config::generate::AfiSafiType::Ipv4Unicast
                             || f == &config::generate::AfiSafiType::Ipv6Unicast)
-                            && let Ok(family) = packet::Family::try_from(f)
+                            && let Ok(family) = convert::family_from_config(f)
                         {
                             families.push(family);
                         }
@@ -622,7 +628,7 @@ impl From<&config::Neighbor> for Peer {
                     })
                 })
             })
-            .map(|x| packet::Family::try_from(x).unwrap())
+            .map(|x| convert::family_from_config(x).unwrap())
             .collect();
         let mut builder = PeerBuilder::new(c.neighbor_address.as_ref().unwrap().parse().unwrap());
         builder
@@ -739,14 +745,14 @@ impl GrpcService {
 
     fn local_path(&self, path: api::Path) -> Result<(usize, TableEvent), tonic::Status> {
         let family = match path.family {
-            Some(family) => Family::from(&family),
+            Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
-        let net = packet::Net::try_from(path.nlri.ok_or(Error::EmptyArgument)?)
+        let net = convert::net_from_api(path.nlri.ok_or(Error::EmptyArgument)?)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
         let mut attr = Vec::new();
         for a in path.pattrs {
-            let a = packet::Attribute::try_from(a).map_err(|_| {
+            let a = convert::attr_from_api(a).map_err(|_| {
                 tonic::Status::new(tonic::Code::InvalidArgument, "invalid attribute")
             })?;
             if a.code() == bgp::Attribute::MP_REACH {
@@ -1261,7 +1267,7 @@ impl GoBgpService for GrpcService {
         self.is_available(false).await?;
         let request = request.into_inner();
         let family = match request.family {
-            Some(family) => Family::from(&family),
+            Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
         let (table_type, peer_addr) = if let Ok(t) = api::TableType::try_from(request.table_type) {
@@ -1353,7 +1359,7 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::GetTableResponse>, tonic::Status> {
         self.is_available(true).await?;
         let family = match request.into_inner().family {
-            Some(family) => Family::from(&family),
+            Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
         let mut info = table::RoutingTableState::default();
@@ -1724,7 +1730,7 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::ListRpkiTableRequest>,
     ) -> Result<tonic::Response<Self::ListRpkiTableStream>, tonic::Status> {
         let family = match request.into_inner().family {
-            Some(family) => Family::from(&family),
+            Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
 
@@ -3662,7 +3668,7 @@ impl Handler {
                                         },
                                     }
                                     Err(e) => {
-                                        if let Error::InvalidMessageFormat{code, subcode, data} = e {
+                                        if let rustybgp_packet::error::Error::InvalidMessageFormat{code, subcode, data} = e {
                                             urgent.insert(0, bgp::Message::Notification{code, subcode, data: data.to_owned()});
                                             self.shutdown = Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification{code, subcode, data}));
                                         } else {

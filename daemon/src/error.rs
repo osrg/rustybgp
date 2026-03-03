@@ -38,6 +38,8 @@ pub(crate) enum Error {
     InvalidConfiguration(String),
     #[error("std::io::Error")]
     StdIoErr(#[from] std::io::Error),
+    #[error("packet error")]
+    Packet(#[from] rustybgp_packet::Error),
 }
 
 impl From<Error> for tonic::Status {

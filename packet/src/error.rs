@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021 The RustyBGP Authors.
+// Copyright (C) 2019-2024 The RustyBGP Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,9 +13,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod bgp;
-pub(crate) use self::bgp::{Attribute, Capability, Family, IpNet, Net};
+use thiserror::Error;
 
-pub(crate) mod bmp;
-pub(crate) mod mrt;
-pub(crate) mod rpki;
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("incorrect bgp format {code:?} {subcode:?}")]
+    InvalidMessageFormat {
+        code: u8,
+        subcode: u8,
+        data: Vec<u8>,
+    },
+    #[error("argument is incorrect: {0}")]
+    InvalidArgument(String),
+    #[error("std::io::Error")]
+    StdIoErr(#[from] std::io::Error),
+}
