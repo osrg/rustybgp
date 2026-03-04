@@ -64,8 +64,9 @@ fn parse_ipv6_update() {
     let mut codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
     let msg = codec.parse_message(&buf).unwrap();
     match msg {
-        Message::Update { reach, .. } => {
-            let s = reach.unwrap();
+        Message::Update { mp_reach, .. } => {
+            // IPv6 NLRI arrives via MP_REACH_NLRI attribute
+            let s = mp_reach.unwrap();
             assert_eq!(s.family, Family::IPV6);
             assert_eq!(s.entries.len(), expected.len());
             for (got, want) in s.entries.iter().zip(expected.iter()) {
@@ -94,12 +95,14 @@ fn build_many_v4_route() {
             family: Family::IPV4,
             entries: net.iter().cloned().map(PathNlri::new).collect(),
         }),
+        mp_reach: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
             Attribute::new_with_bin(Attribute::NEXTHOP, vec![0, 0, 0, 0]).unwrap(),
         ]),
         unreach: None,
+        mp_unreach: None,
     };
 
     let codec = PeerCodecBuilder::new()
@@ -126,11 +129,13 @@ fn build_many_v4_route() {
 
     msg = Message::Update {
         reach: None,
+        mp_reach: None,
         attr: Arc::new(Vec::new()),
         unreach: Some(NlriSet {
             family: Family::IPV4,
             entries: net.iter().cloned().map(PathNlri::new).collect(),
         }),
+        mp_unreach: None,
     };
     for n in &net {
         set.insert(PathNlri::new(*n));
@@ -168,7 +173,8 @@ fn many_mp_reach() {
     let mut set: HashSet<PathNlri> = net.iter().cloned().map(PathNlri::new).collect();
 
     let msg = Message::Update {
-        reach: Some(NlriSet {
+        reach: None,
+        mp_reach: Some(NlriSet {
             family: Family::IPV6,
             entries: net.iter().cloned().map(PathNlri::new).collect(),
         }),
@@ -178,6 +184,7 @@ fn many_mp_reach() {
             Attribute::new_with_bin(Attribute::NEXTHOP, (0..31).collect::<Vec<u8>>()).unwrap(),
         ]),
         unreach: None,
+        mp_unreach: None,
     };
 
     let codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
@@ -188,7 +195,7 @@ fn many_mp_reach() {
     let mut recv = Vec::new();
     loop {
         match framer.try_parse(&mut txbuf).expect("failed to decode") {
-            Some(Message::Update { reach, .. }) => recv.append(&mut reach.unwrap().entries),
+            Some(Message::Update { mp_reach, .. }) => recv.append(&mut mp_reach.unwrap().entries),
             Some(_) => {}
             None => break,
         }
@@ -215,8 +222,10 @@ fn many_mp_unreach() {
 
     let msg = Message::Update {
         reach: None,
+        mp_reach: None,
         attr: Arc::new(Vec::new()),
-        unreach: Some(NlriSet {
+        unreach: None,
+        mp_unreach: Some(NlriSet {
             family: Family::IPV6,
             entries: net.iter().cloned().map(PathNlri::new).collect(),
         }),
@@ -230,7 +239,9 @@ fn many_mp_unreach() {
     let mut recv = Vec::new();
     loop {
         match framer.try_parse(&mut txbuf).expect("failed to decode") {
-            Some(Message::Update { unreach, .. }) => recv.append(&mut unreach.unwrap().entries),
+            Some(Message::Update { mp_unreach, .. }) => {
+                recv.append(&mut mp_unreach.unwrap().entries)
+            }
             Some(_) => {}
             None => break,
         }
