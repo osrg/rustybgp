@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use byteorder::{NetworkEndian, ReadBytesExt};
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 
 use crate::bgp;
 use crate::error::{BgpError, Error};
@@ -60,7 +60,11 @@ impl BgpFramer {
     }
 
     /// Encode a BGP message into `dst`.
-    pub fn encode_to(&mut self, msg: &bgp::Message, dst: &mut BytesMut) -> Result<(), Error> {
+    pub fn encode_to<B: BufMut + AsMut<[u8]>>(
+        &mut self,
+        msg: &bgp::Message,
+        dst: &mut B,
+    ) -> Result<(), Error> {
         self.0.encode_to(msg, dst)
     }
 }

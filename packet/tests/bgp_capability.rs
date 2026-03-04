@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bytes::BytesMut;
 use rustybgp_packet::bgp::{Capability, Message, Open, PeerCodecBuilder};
 use rustybgp_packet::{BgpError, BgpFramer, Family, HoldTime};
 use std::net::Ipv4Addr;
@@ -59,7 +58,7 @@ fn parse_open_caps(cap_bytes: &[u8]) -> Vec<Capability> {
 
 fn round_trip(msg: &Message) -> Message {
     let mut framer = BgpFramer::new(PeerCodecBuilder::new().build());
-    let mut buf = BytesMut::new();
+    let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
     framer.inner_mut().parse_message(&buf).unwrap()
 }

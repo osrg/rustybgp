@@ -29,6 +29,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use bytes::BytesMut;
 use rustybgp_packet::{self as packet, Attribute, Family, bgp};
 
 use crate::api;
@@ -376,7 +377,12 @@ impl RoutingTable {
                                     .iter()
                                     .cloned()
                                     .map(|a| {
-                                        let (_, m) = a.export(a.code(), None, family, &codec);
+                                        let (_, m) = a.export(
+                                            a.code(),
+                                            None::<&mut BytesMut>,
+                                            family,
+                                            &codec,
+                                        );
                                         if let Some(m) = m { m } else { a }
                                     })
                                     .collect::<Vec<packet::Attribute>>(),
