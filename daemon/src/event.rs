@@ -3766,13 +3766,26 @@ impl Handler {
                         let mut sent = FnvHashMap::default();
                         for (family, p) in &mut pending_update {
                             for (attr, reach) in p.bucket.iter() {
-                                let msg = bgp::Message::Update(bgp::Update {
-                                    reach: Some(packet::NlriSet { family: *family, entries: reach.iter().copied().map(packet::PathNlri::new).collect() }),
-                                    mp_reach: None,
-                                    attr: attr.clone(),
-                                    unreach: None,
-                                    mp_unreach: None,
-                                });
+                                let nlri_set = packet::NlriSet { family: *family, entries: reach.iter().copied().map(packet::PathNlri::new).collect() };
+                                // RFC 8950: use MP_REACH_NLRI for IPv4 when extended nexthop is negotiated
+                                let use_mp = framer.inner().channel.get(family).is_some_and(|c| c.extended_nexthop());
+                                let msg = if use_mp {
+                                    bgp::Message::Update(bgp::Update {
+                                        reach: None,
+                                        mp_reach: Some(nlri_set),
+                                        attr: attr.clone(),
+                                        unreach: None,
+                                        mp_unreach: None,
+                                    })
+                                } else {
+                                    bgp::Message::Update(bgp::Update {
+                                        reach: Some(nlri_set),
+                                        mp_reach: None,
+                                        attr: attr.clone(),
+                                        unreach: None,
+                                        mp_unreach: None,
+                                    })
+                                };
                                 let _ = framer.encode_to(&msg, &mut txbuf);
                                 self.counter_tx.sync(&msg);
                                 sent.entry(*family).or_insert_with(|| Vec::with_capacity(max_tx_count)).push(attr.clone());
