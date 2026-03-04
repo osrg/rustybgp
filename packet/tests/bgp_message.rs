@@ -36,7 +36,10 @@ fn ipv6_eor() {
 #[test]
 fn parse_ipv6_update() {
     use std::io::Read;
-    let filename = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/packet/ipv6-update.raw");
+    let filename = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ipv6-update.raw"
+    );
     let mut file = std::fs::File::open(filename).unwrap();
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).unwrap();
