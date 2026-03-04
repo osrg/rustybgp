@@ -1064,11 +1064,43 @@ static ATTR_DESCS: Lazy<FnvHashMap<u8, AttrDesc>> = Lazy::new(|| {
     .collect()
 });
 
+/// BGP Hold Time (RFC 4271 §4.2): must be zero (disabled) or at least three seconds.
+/// Values 1 and 2 are invalid per RFC 4271 §6.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HoldTime(u16);
+
+impl HoldTime {
+    /// Hold timer disabled (value 0).
+    pub const DISABLED: HoldTime = HoldTime(0);
+
+    /// Returns `Some(HoldTime)` if `secs` is 0 or ≥ 3, `None` for 1 or 2.
+    pub fn new(secs: u16) -> Option<Self> {
+        match secs {
+            1 | 2 => None,
+            _ => Some(HoldTime(secs)),
+        }
+    }
+
+    pub fn is_disabled(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn seconds(self) -> u16 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for HoldTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// BGP OPEN message body (RFC 4271 §4.2).
 #[derive(Clone)]
 pub struct Open {
     pub as_number: u32,
-    pub holdtime: u16,
+    pub holdtime: HoldTime,
     /// BGP Identifier (RFC 6286): a 32-bit value, not necessarily a valid IPv4 address.
     pub router_id: u32,
     pub capability: Vec<Capability>,
@@ -1442,7 +1474,7 @@ impl PeerCodec {
                 dst.put_u8(Message::OPEN);
                 dst.put_u8(4); // BGP version is always 4
                 dst.put_u16(trans_asn);
-                dst.put_u16(*holdtime);
+                dst.put_u16(holdtime.seconds());
                 dst.put_u32(*router_id);
                 let op_param_len_pos = dst.len();
                 dst.put_u8(0);
@@ -1634,7 +1666,11 @@ impl PeerCodec {
                     return Err(BgpError::OpenMalformed.into());
                 }
                 let mut as_number = c.read_u16::<NetworkEndian>().unwrap() as u32;
-                let holdtime = c.read_u16::<NetworkEndian>().unwrap();
+                let raw_holdtime = c.read_u16::<NetworkEndian>().unwrap();
+                let holdtime =
+                    HoldTime::new(raw_holdtime).ok_or(BgpError::OpenUnacceptableHoldTime {
+                        data: raw_holdtime.to_be_bytes().to_vec(),
+                    })?;
                 let router_id = c.read_u32::<NetworkEndian>().unwrap();
                 let param_len = c.read_u8().unwrap();
                 if buf.len() < MINIMUM_OPEN_LENGTH + param_len as usize {

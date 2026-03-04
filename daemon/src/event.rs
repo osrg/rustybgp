@@ -44,7 +44,7 @@ use tokio_util::codec::{Encoder, Framed};
 
 use api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
-use rustybgp_packet::{self as packet, BgpFramer, Family, bgp, bmp, mrt, rpki};
+use rustybgp_packet::{self as packet, BgpFramer, Family, HoldTime, bgp, bmp, mrt, rpki};
 
 use crate::api;
 use crate::auth;
@@ -2087,13 +2087,14 @@ impl BmpClient {
                     remote_port: peer.remote_sockaddr.port(),
                     remote_open: bgp::Message::Open(bgp::Open {
                         as_number: peer.state.remote_asn.load(Ordering::Relaxed),
-                        holdtime: peer.state.remote_holdtime.load(Ordering::Relaxed),
+                        holdtime: HoldTime::new(peer.state.remote_holdtime.load(Ordering::Relaxed))
+                            .unwrap_or(HoldTime::DISABLED),
                         router_id: u32::from(remote_id),
                         capability: peer.state.remote_cap.read().await.to_owned(),
                     }),
                     local_open: bgp::Message::Open(bgp::Open {
                         as_number: peer.local_asn,
-                        holdtime: peer.holdtime as u16,
+                        holdtime: HoldTime::new(peer.holdtime as u16).unwrap_or(HoldTime::DISABLED),
                         router_id: u32::from(local_id),
                         capability: peer.local_cap.to_owned(),
                     }),
@@ -3388,7 +3389,7 @@ impl Handler {
                 urgent.push(bgp::Message::Keepalive);
                 self.state
                     .remote_holdtime
-                    .store(holdtime, Ordering::Relaxed);
+                    .store(holdtime.seconds(), Ordering::Relaxed);
                 self.state
                     .remote_id
                     .store(router_id.into(), Ordering::Relaxed);
@@ -3410,7 +3411,8 @@ impl Handler {
                 }
 
                 self.state.remote_cap.write().await.append(&mut capability);
-                self.negotiated_holdtime = std::cmp::min(self.local_holdtime, holdtime as u64);
+                self.negotiated_holdtime =
+                    std::cmp::min(self.local_holdtime, holdtime.seconds() as u64);
                 if self.negotiated_holdtime != 0 {
                     self.keepalive_timer =
                         tokio::time::interval(Duration::from_secs(self.negotiated_holdtime / 3));
@@ -3526,19 +3528,19 @@ impl Handler {
                                     remote_port: remote_sockaddr.port(),
                                     remote_open: bgp::Message::Open(bgp::Open {
                                         as_number: remote_asn,
-                                        holdtime: self
-                                            .state
-                                            .remote_holdtime
-                                            .load(Ordering::Relaxed),
+                                        holdtime: HoldTime::new(
+                                            self.state.remote_holdtime.load(Ordering::Relaxed),
+                                        )
+                                        .unwrap_or(HoldTime::DISABLED),
                                         router_id: self.state.remote_id.load(Ordering::Relaxed),
                                         capability: self.state.remote_cap.read().await.to_owned(),
                                     }),
                                     local_open: bgp::Message::Open(bgp::Open {
                                         as_number: remote_asn,
-                                        holdtime: self
-                                            .state
-                                            .remote_holdtime
-                                            .load(Ordering::Relaxed),
+                                        holdtime: HoldTime::new(
+                                            self.state.remote_holdtime.load(Ordering::Relaxed),
+                                        )
+                                        .unwrap_or(HoldTime::DISABLED),
                                         router_id: self.state.remote_id.load(Ordering::Relaxed),
                                         capability: self.local_cap.to_owned(),
                                     }),
@@ -3593,7 +3595,7 @@ impl Handler {
         let mut pending_update: FnvHashMap<Family, PendingTx> = FnvHashMap::default();
         let mut urgent = vec![bgp::Message::Open(bgp::Open {
             as_number: self.local_asn,
-            holdtime: self.local_holdtime as u16,
+            holdtime: HoldTime::new(self.local_holdtime as u16).unwrap_or(HoldTime::DISABLED),
             router_id: u32::from(self.local_router_id),
             capability: self.local_cap.to_owned(),
         })];
