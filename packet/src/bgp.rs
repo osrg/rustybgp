@@ -29,8 +29,8 @@ use std::{fmt, io};
 pub struct Family(u32);
 
 impl Family {
-    const AFI_IP: u16 = 1;
-    const AFI_IP6: u16 = 2;
+    pub const AFI_IP: u16 = 1;
+    pub const AFI_IP6: u16 = 2;
 
     const SAFI_UNICAST: u8 = 1;
 
@@ -1079,6 +1079,18 @@ impl Channel {
         self.addpath & 0x2 > 0
     }
 
+    pub fn extended_nexthop(&self) -> bool {
+        self.extended_nexthop
+    }
+
+    pub fn set_extended_nexthop(&mut self, enabled: bool) {
+        assert!(
+            !enabled || self.family.afi() == Family::AFI_IP,
+            "extended nexthop only valid for IPv4 families"
+        );
+        self.extended_nexthop = enabled;
+    }
+
     pub fn new(family: Family, rx: bool, tx: bool) -> Self {
         let mut addpath = 0;
         if rx {
@@ -1118,6 +1130,21 @@ pub fn create_channel(
                 for (f, mode) in v {
                     if let Some(fc) = h.get_mut(f) {
                         fc.addpath = *mode;
+                    }
+                }
+            }
+        }
+        for c in v {
+            if let Capability::ExtendedNexthop(v) = c {
+                for (f, nexthop_afi) in v {
+                    assert!(
+                        f.afi() == Family::AFI_IP,
+                        "RFC 8950: extended nexthop only valid for IPv4 families"
+                    );
+                    if *nexthop_afi == Family::AFI_IP6
+                        && let Some(fc) = h.get_mut(f)
+                    {
+                        fc.extended_nexthop = true;
                     }
                 }
             }
@@ -1244,6 +1271,12 @@ impl PeerCodec {
     ) -> Result<u16, ()> {
         let family = &reach.family;
         let nets = &reach.entries;
+        let is_extended = self.channel.get(family).is_some_and(|c| c.extended_nexthop());
+        // RFC 8950: extended nexthop requires IPv6 local address
+        assert!(
+            !is_extended || matches!(self.local_addr, IpAddr::V6(_)) || self.keep_nexthop,
+            "extended nexthop requires IPv6 local address"
+        );
         let pos_head = dst.as_mut().len();
         // always use extended length
         dst.put_u8(
@@ -1450,6 +1483,10 @@ impl PeerCodec {
                 for a in &*attrs {
                     if a.flags & Attribute::FLAG_TRANSITIVE > 0 {
                         let code = a.code();
+                        // RFC 8950: nexthop is carried inside MP_REACH_NLRI
+                        if code == Attribute::NEXTHOP && mp_reach.is_some() {
+                            continue;
+                        }
                         let (n, _) = a.export(code, Some(dst), attr_family, self);
                         attr_len += n;
                     }
