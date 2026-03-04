@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustybgp_packet::bgp::{Capability, Message, Open, PeerCodecBuilder};
+use rustybgp_packet::bgp::{create_channel, Capability, Message, Open, PeerCodecBuilder};
 use rustybgp_packet::{BgpError, BgpFramer, Family, HoldTime};
 use std::net::Ipv4Addr;
 
@@ -317,4 +317,64 @@ fn capability_unknown_preserved() {
         Capability::Unknown { code: 200, bin }
         if bin == &[0xAB, 0xCD]
     ));
+}
+
+// ─── ExtendedNexthop (RFC 8950) ──────────────────────────────────────────────
+
+#[test]
+fn capability_extended_nexthop_round_trip() {
+    // IPv4 unicast with IPv6 nexthop
+    let original = open_with(vec![Capability::ExtendedNexthop(vec![(
+        Family::IPV4,
+        Family::AFI_IP6,
+    )])]);
+    match round_trip(&original) {
+        Message::Open(Open { capability, .. }) => {
+            assert_eq!(capability.len(), 1);
+            match &capability[0] {
+                Capability::ExtendedNexthop(v) => {
+                    assert_eq!(v.len(), 1);
+                    assert_eq!(v[0], (Family::IPV4, Family::AFI_IP6));
+                }
+                _ => panic!("expected ExtendedNexthop"),
+            }
+        }
+        _ => panic!("expected OPEN"),
+    }
+}
+
+#[test]
+fn create_channel_extended_nexthop_bilateral() {
+    // Both sides advertise ExtendedNexthop for IPv4 unicast
+    let local = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
+    ];
+    let remote = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
+    ];
+    let channels: Vec<_> = create_channel(&local, &remote).collect();
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].0, Family::IPV4);
+    assert!(
+        channels[0].1.extended_nexthop(),
+        "extended_nexthop must be true when both sides advertise"
+    );
+}
+
+#[test]
+fn create_channel_extended_nexthop_unilateral() {
+    // Only local advertises ExtendedNexthop — should NOT be active
+    let local = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
+    ];
+    let remote = vec![Capability::MultiProtocol(Family::IPV4)];
+    let channels: Vec<_> = create_channel(&local, &remote).collect();
+    assert_eq!(channels.len(), 1);
+    assert!(
+        !channels[0].1.extended_nexthop(),
+        "extended_nexthop must be false when only one side advertises"
+    );
 }

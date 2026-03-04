@@ -14,10 +14,10 @@
 // limitations under the License.
 
 use rustybgp_packet::bgp::{
-    Attribute, Ipv4Net, Ipv6Net, Message, NlriSet, PeerCodecBuilder, Update,
+    Attribute, Ipv4Net, Ipv6Net, Message, NlriSet, PeerCodec, PeerCodecBuilder, Update,
 };
 use rustybgp_packet::{BgpFramer, Family, Nlri, PathNlri};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -342,6 +342,102 @@ fn update_attr_med_dropped_on_encode() {
                     .is_none(),
                 "MED must be dropped on encode (non-transitive optional attribute)"
             );
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+// ─── RFC 8950: IPv4 NLRI with IPv6 Next Hop ─────────────────────────────────
+
+fn ipv4_extended_nexthop_codec() -> PeerCodec {
+    let mut codec = PeerCodecBuilder::new()
+        .local_asn(65001)
+        .keep_aspath(true)
+        .keep_nexthop(true)
+        .local_addr(IpAddr::V6("2001:db8::1".parse().unwrap()))
+        .families(vec![Family::IPV4])
+        .build();
+    // Enable extended nexthop on the IPv4 channel
+    if let Some(ch) = codec.channel.get_mut(&Family::IPV4) {
+        ch.set_extended_nexthop(true);
+    }
+    codec
+}
+
+#[test]
+fn update_ipv4_with_ipv6_nexthop() {
+    let prefix = ipv4_prefix("10.0.0.0", 8);
+    let nexthop_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let nexthop_bytes = nexthop_v6.octets().to_vec();
+
+    let msg = Message::Update(Update {
+        reach: None,
+        mp_reach: Some(NlriSet {
+            family: Family::IPV4,
+            entries: vec![prefix],
+        }),
+        attr: Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+            Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes.clone()).unwrap(),
+        ]),
+        unreach: None,
+        mp_unreach: None,
+    });
+
+    match round_trip(&msg, ipv4_extended_nexthop_codec()) {
+        Message::Update(Update {
+            reach,
+            mp_reach,
+            attr,
+            ..
+        }) => {
+            // IPv4 NLRI must come back via mp_reach (not traditional reach)
+            assert!(reach.is_none(), "reach must be None for extended nexthop");
+            let s = mp_reach.expect("mp_reach must be present");
+            assert_eq!(s.family, Family::IPV4);
+            assert_eq!(s.entries, vec![prefix]);
+            // Nexthop must be the IPv6 address (16 bytes)
+            let nh = attr
+                .iter()
+                .find(|a| a.code() == Attribute::NEXTHOP)
+                .expect("NEXTHOP attribute must be present");
+            let nh_bytes = nh.binary().unwrap();
+            assert_eq!(nh_bytes.len(), 16, "nexthop must be 16 bytes (IPv6)");
+            assert_eq!(&nh_bytes[..], &nexthop_v6.octets());
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+#[test]
+fn update_ipv4_extended_nexthop_withdraw() {
+    let prefix = ipv4_prefix("10.0.0.0", 8);
+    let msg = Message::Update(Update {
+        reach: None,
+        mp_reach: None,
+        attr: Arc::new(Vec::new()),
+        unreach: None,
+        mp_unreach: Some(NlriSet {
+            family: Family::IPV4,
+            entries: vec![prefix],
+        }),
+    });
+
+    match round_trip(&msg, ipv4_extended_nexthop_codec()) {
+        Message::Update(Update {
+            unreach,
+            mp_unreach,
+            ..
+        }) => {
+            assert!(unreach.is_none(), "traditional unreach must be None");
+            let s = mp_unreach.expect("mp_unreach must be present");
+            assert_eq!(s.family, Family::IPV4);
+            assert_eq!(s.entries, vec![prefix]);
         }
         _ => panic!("expected Update"),
     }
