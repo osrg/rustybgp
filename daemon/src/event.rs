@@ -86,15 +86,15 @@ impl MessageCounter {
     fn sync(&self, msg: &bgp::Message) -> bool {
         let mut ret = false;
         match msg {
-            bgp::Message::Open { .. } => {
+            bgp::Message::Open(bgp::Open { .. }) => {
                 let _ = self.open.fetch_add(1, Ordering::Relaxed);
             }
-            bgp::Message::Update {
+            bgp::Message::Update(bgp::Update {
                 reach: _,
                 unreach,
                 attr: _,
                 ..
-            } => {
+            }) => {
                 self.update.fetch_add(1, Ordering::Relaxed);
 
                 if let Some(s) = unreach {
@@ -103,7 +103,7 @@ impl MessageCounter {
                         .fetch_add(s.entries.len() as u64, Ordering::Relaxed);
                 }
             }
-            bgp::Message::Notification { .. } => {
+            bgp::Message::Notification(_) => {
                 ret = true;
                 let _ = self.notification.fetch_add(1, Ordering::Relaxed);
             }
@@ -865,11 +865,13 @@ impl GoBgpService for GrpcService {
             let mut global = GLOBAL.write().await;
             if let Some(p) = global.peers.remove(&peer_addr) {
                 if let Some(mgmt_tx) = &p.mgmt_tx {
-                    let _ = mgmt_tx.send(PeerMgmtMsg::Notification(bgp::Message::Notification {
-                        code: 6,
-                        subcode: 3,
-                        data: Vec::new(),
-                    }));
+                    let _ = mgmt_tx.send(PeerMgmtMsg::Notification(bgp::Message::Notification(
+                        rustybgp_packet::BgpError::Other {
+                            code: 6,
+                            subcode: 3,
+                            data: vec![],
+                        },
+                    )));
                 }
                 if p.password.is_some() {
                     for fd in &global.listen_sockets {
@@ -1000,11 +1002,11 @@ impl GoBgpService for GrpcService {
                         p.admin_down = true;
                         if let Some(mgmt_tx) = &p.mgmt_tx {
                             let _ = mgmt_tx.send(PeerMgmtMsg::Notification(
-                                bgp::Message::Notification {
+                                bgp::Message::Notification(rustybgp_packet::BgpError::Other {
                                     code: 6,
                                     subcode: 2,
-                                    data: Vec::new(),
-                                },
+                                    data: vec![],
+                                }),
                             ));
                             return Ok(tonic::Response::new(api::DisablePeerResponse {}));
                         }
@@ -1082,12 +1084,12 @@ impl GoBgpService for GrpcService {
                             header: _, update, ..
                         } => {
                             let mut paths = Vec::new();
-                            if let bgp::Message::Update {
+                            if let bgp::Message::Update(bgp::Update {
                                 reach,
                                 unreach,
                                 attr,
                                 ..
-                            } = update
+                            }) = update
                             {
                                 if let Some(s) = reach {
                                     for net in &s.entries {
@@ -2083,20 +2085,20 @@ impl BmpClient {
                     local_addr: peer.local_sockaddr.ip(),
                     local_port: peer.local_sockaddr.port(),
                     remote_port: peer.remote_sockaddr.port(),
-                    remote_open: bgp::Message::Open {
+                    remote_open: bgp::Message::Open(bgp::Open {
                         version: 4,
                         as_number: peer.state.remote_asn.load(Ordering::Relaxed),
                         holdtime: peer.state.remote_holdtime.load(Ordering::Relaxed),
                         router_id: remote_id,
                         capability: peer.state.remote_cap.read().await.to_owned(),
-                    },
-                    local_open: bgp::Message::Open {
+                    }),
+                    local_open: bgp::Message::Open(bgp::Open {
                         version: 4,
                         as_number: peer.local_asn,
                         holdtime: peer.holdtime as u16,
                         router_id: local_id,
                         capability: peer.local_cap.to_owned(),
-                    },
+                    }),
                 };
                 if lines.send(&m).await.is_err() {
                     return;
@@ -3030,7 +3032,7 @@ impl Table {
                                         source.remote_addr,
                                         source.uptime as u32,
                                     ),
-                                    update: bgp::Message::Update {
+                                    update: bgp::Message::Update(bgp::Update {
                                         reach: Some(packet::bgp::NlriSet {
                                             family,
                                             entries: nets.to_owned(),
@@ -3039,7 +3041,7 @@ impl Table {
                                         attr: attrs.clone(),
                                         unreach: None,
                                         mp_unreach: None,
-                                    },
+                                    }),
                                     addpath,
                                 });
                             }
@@ -3058,7 +3060,7 @@ impl Table {
                                         source.local_addr,
                                         true,
                                     ),
-                                    body: bgp::Message::Update {
+                                    body: bgp::Message::Update(bgp::Update {
                                         reach: Some(packet::bgp::NlriSet {
                                             family,
                                             entries: nets.to_owned(),
@@ -3067,7 +3069,7 @@ impl Table {
                                         attr: attrs.clone(),
                                         unreach: None,
                                         mp_unreach: None,
-                                    },
+                                    }),
                                     addpath,
                                 };
                                 let _ = mrt_tx.send(msg);
@@ -3117,7 +3119,7 @@ impl Table {
                                         source.remote_addr,
                                         source.uptime as u32,
                                     ),
-                                    update: packet::bgp::Message::Update {
+                                    update: packet::bgp::Message::Update(packet::bgp::Update {
                                         reach: None,
                                         mp_reach: None,
                                         attr: Arc::new(Vec::new()),
@@ -3126,7 +3128,7 @@ impl Table {
                                             family,
                                             entries: nets.to_owned(),
                                         }),
-                                    },
+                                    }),
                                     addpath,
                                 });
                             }
@@ -3145,7 +3147,7 @@ impl Table {
                                         source.local_addr,
                                         true,
                                     ),
-                                    body: bgp::Message::Update {
+                                    body: bgp::Message::Update(bgp::Update {
                                         reach: None,
                                         mp_reach: None,
                                         attr: Arc::new(Vec::new()),
@@ -3154,7 +3156,7 @@ impl Table {
                                             family,
                                             entries: nets.to_owned(),
                                         }),
-                                    },
+                                    }),
                                     addpath,
                                 };
                                 let _ = mrt_tx.send(msg);
@@ -3379,13 +3381,13 @@ impl Handler {
         pending: &mut FnvHashMap<Family, PendingTx>,
     ) -> std::result::Result<(), Error> {
         match msg {
-            bgp::Message::Open {
+            bgp::Message::Open(bgp::Open {
                 version: _,
                 as_number,
                 holdtime,
                 router_id,
                 mut capability,
-            } => {
+            }) => {
                 urgent.push(bgp::Message::Keepalive);
                 self.state
                     .remote_holdtime
@@ -3397,11 +3399,11 @@ impl Handler {
                 if remote_asn != 0 && remote_asn != as_number {
                     urgent.insert(
                         0,
-                        bgp::Message::Notification {
+                        bgp::Message::Notification(rustybgp_packet::BgpError::Other {
                             code: 2,
                             subcode: 2,
-                            data: Vec::new(),
-                        },
+                            data: vec![],
+                        }),
                     );
                     return Ok(());
                 }
@@ -3421,12 +3423,12 @@ impl Handler {
                     .store(SessionState::OpenConfirm as u8, Ordering::Release);
                 Ok(())
             }
-            bgp::Message::Update {
+            bgp::Message::Update(bgp::Update {
                 reach,
                 attr,
                 unreach,
                 ..
-            } => {
+            }) => {
                 let session_state = self.state.fsm.load(Ordering::Relaxed);
                 if session_state != SessionState::Established as u8 {
                     return Err(Error::Packet(
@@ -3440,18 +3442,15 @@ impl Handler {
                 self.rx_update(reach, unreach, attr).await;
                 Ok(())
             }
-            bgp::Message::Notification {
-                code,
-                subcode,
-                data,
-            } => {
-                println!("{}: notification {} {}", self.remote_addr, code, subcode);
+            bgp::Message::Notification(err) => {
+                println!(
+                    "{}: notification {} {}",
+                    self.remote_addr,
+                    err.notification_code(),
+                    err.notification_subcode()
+                );
                 self.shutdown = Some(bmp::PeerDownReason::RemoteNotification(
-                    bgp::Message::Notification {
-                        code,
-                        subcode,
-                        data,
-                    },
+                    bgp::Message::Notification(err),
                 ));
                 Ok(())
             }
@@ -3528,7 +3527,7 @@ impl Handler {
                                     local_addr: self.local_addr,
                                     local_port: local_sockaddr.port(),
                                     remote_port: remote_sockaddr.port(),
-                                    remote_open: bgp::Message::Open {
+                                    remote_open: bgp::Message::Open(bgp::Open {
                                         version: 4,
                                         as_number: remote_asn,
                                         holdtime: self
@@ -3539,8 +3538,8 @@ impl Handler {
                                             self.state.remote_id.load(Ordering::Relaxed),
                                         ),
                                         capability: self.state.remote_cap.read().await.to_owned(),
-                                    },
-                                    local_open: bgp::Message::Open {
+                                    }),
+                                    local_open: bgp::Message::Open(bgp::Open {
                                         version: 4,
                                         as_number: remote_asn,
                                         holdtime: self
@@ -3551,7 +3550,7 @@ impl Handler {
                                             self.state.remote_id.load(Ordering::Relaxed),
                                         ),
                                         capability: self.local_cap.to_owned(),
-                                    },
+                                    }),
                                 };
                                 let _ = bmp_tx.send(bmp_msg);
                             }
@@ -3601,13 +3600,13 @@ impl Handler {
         }
 
         let mut pending_update: FnvHashMap<Family, PendingTx> = FnvHashMap::default();
-        let mut urgent = vec![bgp::Message::Open {
+        let mut urgent = vec![bgp::Message::Open(bgp::Open {
             version: 4,
             as_number: self.local_asn,
             holdtime: self.local_holdtime as u16,
             router_id: self.local_router_id,
             capability: self.local_cap.to_owned(),
-        }];
+        })];
 
         self.state
             .fsm
@@ -3699,11 +3698,8 @@ impl Handler {
                                     }
                                     Err(e) => {
                                         if let rustybgp_packet::Error::Bgp(ref bgp_err) = e {
-                                            let code = bgp_err.notification_code();
-                                            let subcode = bgp_err.notification_subcode();
-                                            let data = bgp_err.notification_data().to_owned();
-                                            urgent.insert(0, bgp::Message::Notification { code, subcode, data: data.clone() });
-                                            self.shutdown = Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification { code, subcode, data }));
+                                            urgent.insert(0, bgp::Message::Notification(bgp_err.clone()));
+                                            self.shutdown = Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification(bgp_err.clone())));
                                         } else {
                                             self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
                                         }
@@ -3742,13 +3738,13 @@ impl Handler {
                             let unreach: Vec<packet::PathNlri> = p.unreach.drain().map(packet::PathNlri::new).collect();
                             if !unreach.is_empty() {
                                 txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                                let msg = bgp::Message::Update{
+                                let msg = bgp::Message::Update(bgp::Update {
                                     reach: None,
                                     mp_reach: None,
                                     attr: Arc::new(Vec::new()),
                                     unreach: None,
                                     mp_unreach: Some(packet::NlriSet { family: *family, entries: unreach }),
-                                };
+                                });
                                 let _ = framer.encode_to(&msg, &mut txbuf);
                                 self.counter_tx.sync(&msg);
                                 if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
@@ -3762,13 +3758,13 @@ impl Handler {
                         let mut sent = FnvHashMap::default();
                         for (family, p) in &mut pending_update {
                             for (attr, reach) in p.bucket.iter() {
-                                let msg = bgp::Message::Update{
+                                let msg = bgp::Message::Update(bgp::Update {
                                     reach: Some(packet::NlriSet { family: *family, entries: reach.iter().copied().map(packet::PathNlri::new).collect() }),
                                     mp_reach: None,
                                     attr: attr.clone(),
                                     unreach: None,
                                     mp_unreach: None,
-                                };
+                                });
                                 let _ = framer.encode_to(&msg, &mut txbuf);
                                 self.counter_tx.sync(&msg);
                                 sent.entry(*family).or_insert_with(|| Vec::with_capacity(max_tx_count)).push(attr.clone());

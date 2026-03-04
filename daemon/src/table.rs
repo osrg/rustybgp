@@ -158,7 +158,7 @@ pub(crate) struct Reach {
 
 impl From<Reach> for bgp::Message {
     fn from(c: Reach) -> bgp::Message {
-        bgp::Message::Update {
+        bgp::Message::Update(bgp::Update {
             reach: Some(packet::bgp::NlriSet {
                 family: c.family,
                 entries: vec![c.net],
@@ -167,7 +167,7 @@ impl From<Reach> for bgp::Message {
             attr: c.attr,
             unreach: None,
             mp_unreach: None,
-        }
+        })
     }
 }
 
@@ -182,7 +182,7 @@ pub(crate) struct Change {
 impl From<Change> for bgp::Message {
     fn from(c: Change) -> bgp::Message {
         // FIXME: handle extended nexthop
-        bgp::Message::Update {
+        bgp::Message::Update(bgp::Update {
             reach: Some(packet::bgp::NlriSet {
                 family: c.family,
                 entries: vec![packet::bgp::PathNlri::new(c.net)],
@@ -191,7 +191,7 @@ impl From<Change> for bgp::Message {
             attr: c.attr,
             unreach: None,
             mp_unreach: None,
-        }
+        })
     }
 }
 

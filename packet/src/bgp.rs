@@ -1064,31 +1064,37 @@ static ATTR_DESCS: Lazy<FnvHashMap<u8, AttrDesc>> = Lazy::new(|| {
     .collect()
 });
 
+/// BGP OPEN message body (RFC 4271 §4.2).
+#[derive(Clone)]
+pub struct Open {
+    pub version: u8,
+    pub as_number: u32,
+    pub holdtime: u16,
+    pub router_id: Ipv4Addr,
+    pub capability: Vec<Capability>,
+}
+
+/// BGP UPDATE message body (RFC 4271 §4.3, RFC 4760 §3).
+#[derive(Clone)]
+pub struct Update {
+    /// Traditional BGP NLRI field (IPv4 unicast via legacy encoding).
+    pub reach: Option<NlriSet>,
+    /// MP_REACH_NLRI attribute (non-IPv4, or IPv4 via RFC 8950 Extended Nexthop).
+    pub mp_reach: Option<NlriSet>,
+    /// Traditional Withdrawn Routes field (IPv4 unicast via legacy encoding).
+    pub unreach: Option<NlriSet>,
+    /// MP_UNREACH_NLRI attribute (non-IPv4, or IPv4 via RFC 8950 Extended Nexthop).
+    pub mp_unreach: Option<NlriSet>,
+    pub attr: Arc<Vec<Attribute>>,
+}
+
 #[derive(Clone)]
 pub enum Message {
-    Open {
-        version: u8,
-        as_number: u32,
-        holdtime: u16,
-        router_id: Ipv4Addr,
-        capability: Vec<Capability>,
-    },
-    Update {
-        /// Traditional BGP NLRI field (IPv4 unicast via legacy encoding).
-        reach: Option<NlriSet>,
-        /// MP_REACH_NLRI attribute (non-IPv4, or IPv4 via RFC 8950 Extended Nexthop).
-        mp_reach: Option<NlriSet>,
-        /// Traditional Withdrawn Routes field (IPv4 unicast via legacy encoding).
-        unreach: Option<NlriSet>,
-        /// MP_UNREACH_NLRI attribute (non-IPv4, or IPv4 via RFC 8950 Extended Nexthop).
-        mp_unreach: Option<NlriSet>,
-        attr: Arc<Vec<Attribute>>,
-    },
-    Notification {
-        code: u8,
-        subcode: u8,
-        data: Vec<u8>,
-    },
+    Open(Open),
+    Update(Update),
+    /// BGP NOTIFICATION message (RFC 4271 §4.5).
+    /// Uses the typed `BgpError` to represent the error code/subcode.
+    Notification(BgpError),
     Keepalive,
     RouteRefresh {
         family: Family,
@@ -1109,21 +1115,21 @@ impl Message {
 
     pub fn eor(family: Family) -> Message {
         if family == Family::IPV4 {
-            Message::Update {
+            Message::Update(Update {
                 reach: Some(NlriSet::new(Family::IPV4)),
                 mp_reach: None,
                 attr: Arc::new(Vec::new()),
                 unreach: None,
                 mp_unreach: None,
-            }
+            })
         } else {
-            Message::Update {
+            Message::Update(Update {
                 reach: None,
                 mp_reach: None,
                 attr: Arc::new(Vec::new()),
                 unreach: None,
                 mp_unreach: Some(NlriSet::new(family)),
-            }
+            })
         }
     }
 }
@@ -1422,13 +1428,13 @@ impl PeerCodec {
         dst.put_u16(Message::HEADER_LENGTH);
 
         match item {
-            Message::Open {
+            Message::Open(Open {
                 version,
                 as_number,
                 holdtime,
                 router_id,
                 capability,
-            } => {
+            }) => {
                 let trans_asn = if *as_number > u16::MAX as u32 {
                     Capability::TRANS_ASN
                 } else {
@@ -1457,13 +1463,13 @@ impl PeerCodec {
                     .write_u8(cap_len + 2_u8)
                     .unwrap();
             }
-            Message::Update {
+            Message::Update(Update {
                 reach,
                 mp_reach,
                 attr,
                 unreach,
                 mp_unreach,
-            } => {
+            }) => {
                 let attrs = attr.clone();
                 // Use family from whichever NlriSet is present for addpath lookup
                 let family = reach
@@ -1545,15 +1551,11 @@ impl PeerCodec {
                     }
                 }
             }
-            Message::Notification {
-                code,
-                subcode,
-                data,
-            } => {
+            Message::Notification(err) => {
                 dst.put_u8(Message::NOTIFICATION);
-                dst.put_u8(*code);
-                dst.put_u8(*subcode);
-                dst.put_slice(data);
+                dst.put_u8(err.notification_code());
+                dst.put_u8(err.notification_subcode());
+                dst.put_slice(err.notification_data());
             }
             Message::Keepalive => {
                 dst.put_u8(Message::KEEPALIVE);
@@ -1695,13 +1697,13 @@ impl PeerCodec {
                     self.remote_asn = as_number;
                 }
 
-                Ok(Message::Open {
+                Ok(Message::Open(Open {
                     version,
                     as_number,
                     holdtime,
                     router_id,
                     capability: cap,
-                })
+                }))
             }
             Message::UPDATE => {
                 const MINIMUM_UPDATE_LENGTH: usize = 23;
@@ -1820,13 +1822,13 @@ impl PeerCodec {
 
                 // v4 eor
                 if reach_len == 0 && attr_len == 0 && withdrawn_len == 0 {
-                    return Ok(Message::Update {
+                    return Ok(Message::Update(Update {
                         reach: Some(NlriSet::new(Family::IPV4)),
                         mp_reach: None,
                         attr: Arc::new(Vec::new()),
                         unreach: None,
                         mp_unreach: None,
-                    });
+                    }));
                 }
 
                 if reach_len != 0 || mp_reach_attr.is_some() {
@@ -1972,7 +1974,7 @@ impl PeerCodec {
                     }
                 }
 
-                Ok(Message::Update {
+                Ok(Message::Update(Update {
                     reach: if reach.is_empty() {
                         None
                     } else {
@@ -2006,7 +2008,7 @@ impl PeerCodec {
                             entries: mp_unreach_entries,
                         })
                     },
-                })
+                }))
             }
             Message::NOTIFICATION => {
                 const MINIMUM_NOTIFICATION_LENGTH: usize = Message::HEADER_LENGTH as usize + 2;
@@ -2018,11 +2020,11 @@ impl PeerCodec {
                 let code = c.read_u8().unwrap();
                 let subcode = c.read_u8().unwrap();
 
-                Ok(Message::Notification {
+                Ok(Message::Notification(BgpError::from_notification(
                     code,
                     subcode,
-                    data: buf[c.position() as usize..].to_vec(),
-                })
+                    buf[c.position() as usize..].to_vec(),
+                )))
             }
             Message::KEEPALIVE => Ok(Message::Keepalive),
             Message::ROUTE_REFRESH => {
@@ -2046,13 +2048,13 @@ impl PeerCodec {
     pub fn encode_to(&mut self, msg: &Message, dst: &mut BytesMut) -> Result<(), Error> {
         let mut done_idx = 0;
         match msg {
-            Message::Update {
+            Message::Update(Update {
                 reach,
                 mp_reach,
                 unreach,
                 mp_unreach,
                 ..
-            } => {
+            }) => {
                 // Determine the number of iterations needed for splitting large route sets.
                 // reach and unreach use the traditional IPv4 field and may need splitting.
                 // mp_reach and mp_unreach go into path attributes and are encoded as a whole.
