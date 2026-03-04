@@ -70,7 +70,10 @@ fn open_minimal_parse() {
             assert_eq!(version, 4);
             assert_eq!(as_number, 65001);
             assert_eq!(holdtime, 90);
-            assert_eq!(router_id, "192.0.2.1".parse::<Ipv4Addr>().unwrap());
+            assert_eq!(
+                router_id,
+                u32::from("192.0.2.1".parse::<Ipv4Addr>().unwrap())
+            );
             assert!(capability.is_empty());
         }
         _ => panic!("expected OPEN"),
@@ -186,7 +189,7 @@ fn open_round_trip_minimal() {
         version: 4,
         as_number: 65001,
         holdtime: 90,
-        router_id: "192.0.2.1".parse().unwrap(),
+        router_id: u32::from("192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()),
         capability: vec![],
     });
 
@@ -206,7 +209,10 @@ fn open_round_trip_minimal() {
             assert_eq!(version, 4);
             assert_eq!(as_number, 65001);
             assert_eq!(holdtime, 90);
-            assert_eq!(router_id, "192.0.2.1".parse::<Ipv4Addr>().unwrap());
+            assert_eq!(
+                router_id,
+                u32::from("192.0.2.1".parse::<Ipv4Addr>().unwrap())
+            );
             assert!(capability.is_empty());
         }
         _ => panic!("expected OPEN"),
@@ -219,7 +225,7 @@ fn open_round_trip_with_capabilities() {
         version: 4,
         as_number: 65001,
         holdtime: 180,
-        router_id: "10.0.0.1".parse().unwrap(),
+        router_id: u32::from("10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()),
         capability: vec![
             Capability::MultiProtocol(Family::IPV4),
             Capability::MultiProtocol(Family::IPV6),
