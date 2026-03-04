@@ -132,6 +132,10 @@ fn bgerror_from_notification_known_codes() {
         BgpError::OpenUnsupportedOptionalParameter { .. }
     ));
     assert!(matches!(
+        BgpError::from_notification(2, 6, vec![]),
+        BgpError::OpenUnacceptableHoldTime { .. }
+    ));
+    assert!(matches!(
         BgpError::from_notification(3, 1, vec![]),
         BgpError::UpdateMalformedAttributeList
     ));

@@ -39,6 +39,8 @@ pub enum BgpError {
     OpenMalformed,
     #[error("open error: unsupported optional parameter")]
     OpenUnsupportedOptionalParameter { data: Vec<u8> },
+    #[error("open error: unacceptable hold time")]
+    OpenUnacceptableHoldTime { data: Vec<u8> },
 
     // Code 3: UPDATE Message Error
     #[error("update error: malformed attribute list")]
@@ -68,7 +70,9 @@ impl BgpError {
     pub fn notification_code(&self) -> u8 {
         match self {
             Self::BadMessageLength { .. } | Self::BadMessageType { .. } => 1,
-            Self::OpenMalformed | Self::OpenUnsupportedOptionalParameter { .. } => 2,
+            Self::OpenMalformed
+            | Self::OpenUnsupportedOptionalParameter { .. }
+            | Self::OpenUnacceptableHoldTime { .. } => 2,
             Self::UpdateMalformedAttributeList | Self::UpdateOptionalAttributeError => 3,
             Self::FsmUnexpectedState { .. } => 5,
             Self::RouteRefreshInvalidLength { .. } => 7,
@@ -83,6 +87,7 @@ impl BgpError {
             Self::BadMessageType { .. } => 3,
             Self::OpenMalformed => 0,
             Self::OpenUnsupportedOptionalParameter { .. } => 4,
+            Self::OpenUnacceptableHoldTime { .. } => 6,
             Self::UpdateMalformedAttributeList => 1,
             Self::UpdateOptionalAttributeError => 9,
             Self::FsmUnexpectedState { state } => *state,
@@ -97,6 +102,7 @@ impl BgpError {
             Self::BadMessageLength { data }
             | Self::BadMessageType { data }
             | Self::OpenUnsupportedOptionalParameter { data }
+            | Self::OpenUnacceptableHoldTime { data }
             | Self::RouteRefreshInvalidLength { data }
             | Self::Other { data, .. } => data,
             _ => &[],
@@ -110,6 +116,7 @@ impl BgpError {
             (1, 3) => Self::BadMessageType { data },
             (2, 0) => Self::OpenMalformed,
             (2, 4) => Self::OpenUnsupportedOptionalParameter { data },
+            (2, 6) => Self::OpenUnacceptableHoldTime { data },
             (3, 1) => Self::UpdateMalformedAttributeList,
             (3, 9) => Self::UpdateOptionalAttributeError,
             (5, state) => Self::FsmUnexpectedState { state },

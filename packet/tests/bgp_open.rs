@@ -15,7 +15,7 @@
 
 use bytes::BytesMut;
 use rustybgp_packet::bgp::{Capability, Message, Open, PeerCodecBuilder};
-use rustybgp_packet::{BgpError, BgpFramer, Family};
+use rustybgp_packet::{BgpError, BgpFramer, Family, HoldTime};
 use std::net::Ipv4Addr;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ fn open_minimal_parse() {
             capability,
         }) => {
             assert_eq!(as_number, 65001);
-            assert_eq!(holdtime, 90);
+            assert_eq!(holdtime, HoldTime::new(90).unwrap());
             assert_eq!(
                 router_id,
                 u32::from("192.0.2.1".parse::<Ipv4Addr>().unwrap())
@@ -185,7 +185,7 @@ fn open_with_route_refresh() {
 fn open_round_trip_minimal() {
     let original = Message::Open(Open {
         as_number: 65001,
-        holdtime: 90,
+        holdtime: HoldTime::new(90).unwrap(),
         router_id: u32::from("192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()),
         capability: vec![],
     });
@@ -203,7 +203,7 @@ fn open_round_trip_minimal() {
             capability,
         }) => {
             assert_eq!(as_number, 65001);
-            assert_eq!(holdtime, 90);
+            assert_eq!(holdtime, HoldTime::new(90).unwrap());
             assert_eq!(
                 router_id,
                 u32::from("192.0.2.1".parse::<Ipv4Addr>().unwrap())
@@ -218,7 +218,7 @@ fn open_round_trip_minimal() {
 fn open_round_trip_with_capabilities() {
     let original = Message::Open(Open {
         as_number: 65001,
-        holdtime: 180,
+        holdtime: HoldTime::new(180).unwrap(),
         router_id: u32::from("10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()),
         capability: vec![
             Capability::MultiProtocol(Family::IPV4),
@@ -241,7 +241,7 @@ fn open_round_trip_with_capabilities() {
             ..
         }) => {
             assert_eq!(as_number, 65001);
-            assert_eq!(holdtime, 180);
+            assert_eq!(holdtime, HoldTime::new(180).unwrap());
             assert!(
                 capability
                     .iter()
@@ -279,6 +279,23 @@ fn open_too_short() {
         Err(rustybgp_packet::Error::Bgp(BgpError::BadMessageLength { .. })) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
+    }
+}
+
+#[test]
+fn open_unacceptable_holdtime() {
+    // RFC 4271 §6.2: hold time 1 or 2 is unacceptable
+    for bad_holdtime in [1u16, 2u16] {
+        let buf = bgp_msg(
+            1,
+            &open_body(65001, bad_holdtime, "192.0.2.1".parse().unwrap(), &[]),
+        );
+        let mut codec = default_codec().build();
+        match codec.parse_message(&buf) {
+            Err(rustybgp_packet::Error::Bgp(BgpError::OpenUnacceptableHoldTime { .. })) => {}
+            Ok(_) => panic!("expected error for holdtime={}", bad_holdtime),
+            Err(e) => panic!("unexpected error for holdtime={}: {}", bad_holdtime, e),
+        }
     }
 }
 
