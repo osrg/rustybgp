@@ -23,11 +23,11 @@ syntax = "proto3";
 
 package api;
 
-import "api/attribute.proto";
-import "api/capability.proto";
-import "api/common.proto";
-import "api/extcom.proto";
-import "api/nlri.proto";
+import "attribute.proto";
+import "capability.proto";
+import "common.proto";
+import "extcom.proto";
+import "nlri.proto";
 import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/osrg/gobgp/v4/api;api";

@@ -42,7 +42,7 @@ use tokio::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::{Encoder, Framed};
 
-use api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
+use crate::api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
 use rustybgp_packet::{self as packet, BgpFramer, Family, HoldTime, bgp, bmp, mrt, rpki};
 
@@ -129,17 +129,15 @@ enum SessionState {
     Established,
 }
 
-impl From<u8> for api::peer_state::SessionState {
-    fn from(v: u8) -> Self {
-        match v {
-            0 => api::peer_state::SessionState::Idle,
-            1 => api::peer_state::SessionState::Connect,
-            2 => api::peer_state::SessionState::Active,
-            3 => api::peer_state::SessionState::Opensent,
-            4 => api::peer_state::SessionState::Openconfirm,
-            5 => api::peer_state::SessionState::Established,
-            _ => panic!("unexpected session state {}", v),
-        }
+fn session_state_to_api(v: u8) -> api::peer_state::SessionState {
+    match v {
+        0 => api::peer_state::SessionState::Idle,
+        1 => api::peer_state::SessionState::Connect,
+        2 => api::peer_state::SessionState::Active,
+        3 => api::peer_state::SessionState::Opensent,
+        4 => api::peer_state::SessionState::Openconfirm,
+        5 => api::peer_state::SessionState::Established,
+        _ => panic!("unexpected session state {}", v),
     }
 }
 
@@ -446,7 +444,7 @@ impl From<&Peer> for api::Peer {
             let mut v = Vec::new();
             loop {
                 if let Ok(a) = p.state.remote_cap.try_read() {
-                    v.append(&mut a.iter().map(|c| c.into()).collect());
+                    v.append(&mut a.iter().map(convert::capability_to_api).collect());
                     break;
                 }
             }
@@ -463,10 +461,10 @@ impl From<&Peer> for api::Peer {
             }),
             queues: Some(Default::default()),
             remote_cap,
-            local_cap: p.local_cap.iter().map(|c| c.into()).collect(),
+            local_cap: p.local_cap.iter().map(convert::capability_to_api).collect(),
             ..Default::default()
         };
-        ps.session_state = api::peer_state::SessionState::from(session_state) as i32;
+        ps.session_state = session_state_to_api(session_state) as i32;
         ps.admin_state = if p.admin_down {
             api::peer_state::AdminState::Down as i32
         } else {
@@ -509,7 +507,7 @@ impl From<&Peer> for api::Peer {
             .iter()
             .map(|(f, stats)| api::AfiSafi {
                 state: Some(api::AfiSafiState {
-                    family: Some((*f).into()),
+                    family: Some(convert::family_to_api(*f)),
                     enabled: true,
                     received: stats.0,
                     accepted: stats.1,
@@ -1094,10 +1092,10 @@ impl GoBgpService for GrpcService {
                                 if let Some(s) = reach {
                                     for net in &s.entries {
                                         paths.push(api::Path {
-                                            nlri: Some((&net.nlri).into()),
-                                            family: Some(s.family.into()),
+                                            nlri: Some(convert::nlri_to_api(&net.nlri)),
+                                            family: Some(convert::family_to_api(s.family)),
                                             identifier: net.path_id,
-                                            pattrs: attr.iter().map(api::Attribute::from).collect(),
+                                            pattrs: attr.iter().map(convert::attr_to_api).collect(),
                                             ..Default::default()
                                         });
                                     }
@@ -1105,8 +1103,8 @@ impl GoBgpService for GrpcService {
                                 if let Some(s) = unreach {
                                     for net in &s.entries {
                                         paths.push(api::Path {
-                                            nlri: Some((&net.nlri).into()),
-                                            family: Some(s.family.into()),
+                                            nlri: Some(convert::nlri_to_api(&net.nlri)),
+                                            family: Some(convert::family_to_api(s.family)),
                                             identifier: net.path_id,
                                             ..Default::default()
                                         });

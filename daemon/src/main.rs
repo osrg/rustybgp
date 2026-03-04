@@ -14,11 +14,7 @@
 // limitations under the License.
 
 #![recursion_limit = "1024"]
-mod api {
-    #![allow(clippy::all)]
-    #![allow(dead_code)]
-    tonic::include_proto!("api");
-}
+pub(crate) use rustybgp_api as api;
 mod auth;
 mod config;
 mod convert;

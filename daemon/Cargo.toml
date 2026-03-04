@@ -7,6 +7,7 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+rustybgp-api = { path = "../api" }
 rustybgp-packet = { path = "../packet" }
 ascii = "1"
 tonic = "0.14"
@@ -38,6 +39,3 @@ nix = { version = "0.31", features = ["socket"] }
 uuid = { version = "1", features = ["v4"] }
 ip_network_table-deps-treebitmap = "0.5"
 serde_yaml_bw = "2.5.1"
-
-[build-dependencies]
-tonic-prost-build = "0.14"

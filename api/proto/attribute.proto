@@ -23,9 +23,9 @@ syntax = "proto3";
 
 package api;
 
-import "api/common.proto";
-import "api/extcom.proto";
-import "api/nlri.proto";
+import "common.proto";
+import "extcom.proto";
+import "nlri.proto";
 
 option go_package = "github.com/osrg/gobgp/v4/api;api";
 

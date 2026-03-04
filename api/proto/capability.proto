@@ -23,7 +23,7 @@ syntax = "proto3";
 
 package api;
 
-import "api/common.proto";
+import "common.proto";
 
 option go_package = "github.com/osrg/gobgp/v4/api;api";
 

@@ -18,292 +18,278 @@ use std::io::Cursor;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
-use rustybgp_packet::{Family, Nlri, PathNlri, bgp::Attribute, bgp::Capability};
+use rustybgp_packet::{Family, Nlri, bgp::Attribute, bgp::Capability};
 
 use crate::api;
 use crate::config;
 use crate::error::Error;
 
-impl From<Family> for api::Family {
-    fn from(f: Family) -> Self {
-        api::Family {
-            afi: f.afi() as i32,
-            safi: f.safi() as i32,
-        }
+pub(crate) fn family_to_api(f: Family) -> api::Family {
+    api::Family {
+        afi: f.afi() as i32,
+        safi: f.safi() as i32,
     }
 }
 
-impl From<&Nlri> for api::Nlri {
-    fn from(f: &Nlri) -> Self {
-        match f {
-            Nlri::V4(n) => api::Nlri {
-                nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
-                    prefix: n.addr.to_string(),
-                    prefix_len: n.mask as u32,
-                })),
-            },
-            Nlri::V6(n) => api::Nlri {
-                nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
-                    prefix: n.addr.to_string(),
-                    prefix_len: n.mask as u32,
-                })),
-            },
-        }
+pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
+    match f {
+        Nlri::V4(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
+                prefix: n.addr.to_string(),
+                prefix_len: n.mask as u32,
+            })),
+        },
+        Nlri::V6(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
+                prefix: n.addr.to_string(),
+                prefix_len: n.mask as u32,
+            })),
+        },
     }
 }
 
-impl From<&PathNlri> for api::Nlri {
-    fn from(p: &PathNlri) -> Self {
-        api::Nlri::from(&p.nlri)
-    }
-}
-
-impl From<&Capability> for api::Capability {
-    fn from(cap: &Capability) -> Self {
-        match cap {
-            Capability::MultiProtocol(family) => api::Capability {
-                cap: Some(api::capability::Cap::MultiProtocol(
-                    api::MultiProtocolCapability {
-                        family: Some(api::Family::from(*family)),
-                    },
-                )),
-            },
-            Capability::RouteRefresh => api::Capability {
-                cap: Some(api::capability::Cap::RouteRefresh(
-                    api::RouteRefreshCapability {},
-                )),
-            },
-            Capability::ExtendedNexthop(v) => api::Capability {
-                cap: Some(api::capability::Cap::ExtendedNexthop(
-                    api::ExtendedNexthopCapability {
-                        tuples: v
-                            .iter()
-                            .map(|(family, afi)| api::ExtendedNexthopCapabilityTuple {
-                                nlri_family: Some((*family).into()),
-                                nexthop_family: Some(api::Family {
-                                    afi: *afi as i32,
-                                    safi: 1, // SAFI_UNICAST
-                                }),
-                            })
-                            .collect(),
-                    },
-                )),
-            },
-            Capability::GracefulRestart {
-                flags,
-                restart_time,
-                families,
-            } => api::Capability {
-                cap: Some(api::capability::Cap::GracefulRestart(
-                    api::GracefulRestartCapability {
-                        flags: *flags as u32,
-                        time: *restart_time as u32,
-                        tuples: families
-                            .iter()
-                            .map(|(family, flags)| api::GracefulRestartCapabilityTuple {
-                                flags: *flags as u32,
-                                family: Some((*family).into()),
-                            })
-                            .collect(),
-                    },
-                )),
-            },
-            Capability::FourOctetAsNumber(asn) => api::Capability {
-                cap: Some(api::capability::Cap::FourOctetAsn(
-                    api::FourOctetAsnCapability { asn: *asn },
-                )),
-            },
-            Capability::AddPath(v) => api::Capability {
-                cap: Some(api::capability::Cap::AddPath(api::AddPathCapability {
+pub(crate) fn capability_to_api(cap: &Capability) -> api::Capability {
+    match cap {
+        Capability::MultiProtocol(family) => api::Capability {
+            cap: Some(api::capability::Cap::MultiProtocol(
+                api::MultiProtocolCapability {
+                    family: Some(family_to_api(*family)),
+                },
+            )),
+        },
+        Capability::RouteRefresh => api::Capability {
+            cap: Some(api::capability::Cap::RouteRefresh(
+                api::RouteRefreshCapability {},
+            )),
+        },
+        Capability::ExtendedNexthop(v) => api::Capability {
+            cap: Some(api::capability::Cap::ExtendedNexthop(
+                api::ExtendedNexthopCapability {
                     tuples: v
                         .iter()
-                        .map(|(family, mode)| api::AddPathCapabilityTuple {
-                            family: Some((*family).into()),
-                            mode: *mode as i32,
+                        .map(|(family, afi)| api::ExtendedNexthopCapabilityTuple {
+                            nlri_family: Some(family_to_api(*family)),
+                            nexthop_family: Some(api::Family {
+                                afi: *afi as i32,
+                                safi: 1, // SAFI_UNICAST
+                            }),
                         })
                         .collect(),
-                })),
-            },
-            Capability::EnhancedRouteRefresh => api::Capability {
-                cap: Some(api::capability::Cap::EnhancedRouteRefresh(
-                    api::EnhancedRouteRefreshCapability {},
-                )),
-            },
-            Capability::LongLivedGracefulRestart(v) => api::Capability {
-                cap: Some(api::capability::Cap::LongLivedGracefulRestart(
-                    api::LongLivedGracefulRestartCapability {
-                        tuples: v
-                            .iter()
-                            .map(|(family, flags, time)| {
-                                api::LongLivedGracefulRestartCapabilityTuple {
-                                    family: Some((*family).into()),
-                                    flags: *flags as u32,
-                                    time: *time,
-                                }
-                            })
-                            .collect(),
-                    },
-                )),
-            },
-            Capability::Fqdn { hostname, domain } => api::Capability {
-                cap: Some(api::capability::Cap::Fqdn(api::FqdnCapability {
-                    host_name: hostname.to_string(),
-                    domain_name: domain.to_string(),
-                })),
-            },
-            Capability::Unknown { code, bin } => api::Capability {
-                cap: Some(api::capability::Cap::Unknown(api::UnknownCapability {
-                    code: (*code as u32),
-                    value: bin.to_owned(),
-                })),
-            },
-        }
+                },
+            )),
+        },
+        Capability::GracefulRestart {
+            flags,
+            restart_time,
+            families,
+        } => api::Capability {
+            cap: Some(api::capability::Cap::GracefulRestart(
+                api::GracefulRestartCapability {
+                    flags: *flags as u32,
+                    time: *restart_time as u32,
+                    tuples: families
+                        .iter()
+                        .map(|(family, flags)| api::GracefulRestartCapabilityTuple {
+                            flags: *flags as u32,
+                            family: Some(family_to_api(*family)),
+                        })
+                        .collect(),
+                },
+            )),
+        },
+        Capability::FourOctetAsNumber(asn) => api::Capability {
+            cap: Some(api::capability::Cap::FourOctetAsn(
+                api::FourOctetAsnCapability { asn: *asn },
+            )),
+        },
+        Capability::AddPath(v) => api::Capability {
+            cap: Some(api::capability::Cap::AddPath(api::AddPathCapability {
+                tuples: v
+                    .iter()
+                    .map(|(family, mode)| api::AddPathCapabilityTuple {
+                        family: Some(family_to_api(*family)),
+                        mode: *mode as i32,
+                    })
+                    .collect(),
+            })),
+        },
+        Capability::EnhancedRouteRefresh => api::Capability {
+            cap: Some(api::capability::Cap::EnhancedRouteRefresh(
+                api::EnhancedRouteRefreshCapability {},
+            )),
+        },
+        Capability::LongLivedGracefulRestart(v) => api::Capability {
+            cap: Some(api::capability::Cap::LongLivedGracefulRestart(
+                api::LongLivedGracefulRestartCapability {
+                    tuples: v
+                        .iter()
+                        .map(
+                            |(family, flags, time)| api::LongLivedGracefulRestartCapabilityTuple {
+                                family: Some(family_to_api(*family)),
+                                flags: *flags as u32,
+                                time: *time,
+                            },
+                        )
+                        .collect(),
+                },
+            )),
+        },
+        Capability::Fqdn { hostname, domain } => api::Capability {
+            cap: Some(api::capability::Cap::Fqdn(api::FqdnCapability {
+                host_name: hostname.to_string(),
+                domain_name: domain.to_string(),
+            })),
+        },
+        Capability::Unknown { code, bin } => api::Capability {
+            cap: Some(api::capability::Cap::Unknown(api::UnknownCapability {
+                code: (*code as u32),
+                value: bin.to_owned(),
+            })),
+        },
     }
 }
 
-impl From<&Attribute> for api::Attribute {
-    fn from(a: &Attribute) -> Self {
-        match a.code() {
-            Attribute::ORIGIN => api::Attribute {
-                attr: Some(api::attribute::Attr::Origin(api::OriginAttribute {
-                    origin: a.value().unwrap(),
+pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
+    match a.code() {
+        Attribute::ORIGIN => api::Attribute {
+            attr: Some(api::attribute::Attr::Origin(api::OriginAttribute {
+                origin: a.value().unwrap(),
+            })),
+        },
+        Attribute::AS_PATH => {
+            let mut c = Cursor::new(a.binary().unwrap());
+            let mut segments = Vec::new();
+            while c.position() < c.get_ref().len() as u64 {
+                let code = c.read_u8().unwrap();
+                let n = c.read_u8().unwrap();
+                let mut nums = Vec::new();
+                for _ in 0..n {
+                    nums.push(c.read_u32::<NetworkEndian>().unwrap());
+                }
+                segments.push(api::AsSegment {
+                    r#type: code as i32,
+                    numbers: nums,
+                });
+            }
+            api::Attribute {
+                attr: Some(api::attribute::Attr::AsPath(api::AsPathAttribute {
+                    segments,
                 })),
-            },
-            Attribute::AS_PATH => {
-                let mut c = Cursor::new(a.binary().unwrap());
-                let mut segments = Vec::new();
-                while c.position() < c.get_ref().len() as u64 {
-                    let code = c.read_u8().unwrap();
-                    let n = c.read_u8().unwrap();
-                    let mut nums = Vec::new();
-                    for _ in 0..n {
-                        nums.push(c.read_u32::<NetworkEndian>().unwrap());
-                    }
-                    segments.push(api::AsSegment {
-                        r#type: code as i32,
-                        numbers: nums,
-                    });
-                }
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::AsPath(api::AsPathAttribute {
-                        segments,
-                    })),
-                }
             }
-            Attribute::NEXTHOP => {
-                let buf = a.binary().unwrap();
-                let buflen = buf.len();
-                let mut c = Cursor::new(buf);
-                let next_hop = if buflen == 16 {
-                    Ipv6Addr::from(c.read_u128::<NetworkEndian>().unwrap()).to_string()
-                } else {
-                    Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()).to_string()
-                };
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::NextHop(api::NextHopAttribute {
-                        next_hop,
-                    })),
-                }
-            }
-            Attribute::MULTI_EXIT_DESC => api::Attribute {
-                attr: Some(api::attribute::Attr::MultiExitDisc(
-                    api::MultiExitDiscAttribute {
-                        med: a.value().unwrap(),
-                    },
-                )),
-            },
-            Attribute::LOCAL_PREF => api::Attribute {
-                attr: Some(api::attribute::Attr::LocalPref(api::LocalPrefAttribute {
-                    local_pref: a.value().unwrap(),
-                })),
-            },
-            Attribute::ATOMIC_AGGREGATE => api::Attribute {
-                attr: Some(api::attribute::Attr::AtomicAggregate(
-                    api::AtomicAggregateAttribute {},
-                )),
-            },
-            Attribute::AGGREGATOR => {
-                let mut c = Cursor::new(a.binary().unwrap());
-                let (asn, addr) = match c.get_ref().len() {
-                    6 => (
-                        c.read_u16::<NetworkEndian>().unwrap() as u32,
-                        Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()),
-                    ),
-                    8 => (
-                        c.read_u32::<NetworkEndian>().unwrap(),
-                        Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()),
-                    ),
-                    _ => unreachable!("corrupted"),
-                };
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::Aggregator(api::AggregatorAttribute {
-                        asn,
-                        address: addr.to_string(),
-                    })),
-                }
-            }
-            Attribute::COMMUNITY => {
-                let buf = a.binary().unwrap();
-                let count = buf.len() / 4;
-                let mut c = Cursor::new(buf);
-                let mut values = Vec::with_capacity(count);
-                for _ in 0..count {
-                    values.push(c.read_u32::<NetworkEndian>().unwrap());
-                }
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::Communities(
-                        api::CommunitiesAttribute {
-                            communities: values,
-                        },
-                    )),
-                }
-            }
-            Attribute::ORIGINATOR_ID => api::Attribute {
-                attr: Some(api::attribute::Attr::OriginatorId(
-                    api::OriginatorIdAttribute {
-                        id: Ipv4Addr::from(a.value().unwrap()).to_string(),
-                    },
-                )),
-            },
-            Attribute::CLUSTER_LIST => {
-                let mut c = Cursor::new(a.binary().unwrap());
-                let mut ids = Vec::new();
-                for _ in 0..c.get_ref().len() / 4 {
-                    ids.push(Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()).to_string());
-                }
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::ClusterList(
-                        api::ClusterListAttribute { ids },
-                    )),
-                }
-            }
-            Attribute::LARGE_COMMUNITY => {
-                let mut c = Cursor::new(a.binary().unwrap());
-                let mut v = Vec::new();
-                for _ in 0..c.get_ref().len() / 12 {
-                    let global_admin = c.read_u32::<NetworkEndian>().unwrap();
-                    let local_data1 = c.read_u32::<NetworkEndian>().unwrap();
-                    let local_data2 = c.read_u32::<NetworkEndian>().unwrap();
-                    v.push(api::LargeCommunity {
-                        global_admin,
-                        local_data1,
-                        local_data2,
-                    });
-                }
-                api::Attribute {
-                    attr: Some(api::attribute::Attr::LargeCommunities(
-                        api::LargeCommunitiesAttribute { communities: v },
-                    )),
-                }
-            }
-            _ => api::Attribute {
-                attr: Some(api::attribute::Attr::Unknown(api::UnknownAttribute {
-                    flags: a.flags() as u32,
-                    r#type: a.code() as u32,
-                    value: a.binary().unwrap().to_owned(),
-                })),
-            },
         }
+        Attribute::NEXTHOP => {
+            let buf = a.binary().unwrap();
+            let buflen = buf.len();
+            let mut c = Cursor::new(buf);
+            let next_hop = if buflen == 16 {
+                Ipv6Addr::from(c.read_u128::<NetworkEndian>().unwrap()).to_string()
+            } else {
+                Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()).to_string()
+            };
+            api::Attribute {
+                attr: Some(api::attribute::Attr::NextHop(api::NextHopAttribute {
+                    next_hop,
+                })),
+            }
+        }
+        Attribute::MULTI_EXIT_DESC => api::Attribute {
+            attr: Some(api::attribute::Attr::MultiExitDisc(
+                api::MultiExitDiscAttribute {
+                    med: a.value().unwrap(),
+                },
+            )),
+        },
+        Attribute::LOCAL_PREF => api::Attribute {
+            attr: Some(api::attribute::Attr::LocalPref(api::LocalPrefAttribute {
+                local_pref: a.value().unwrap(),
+            })),
+        },
+        Attribute::ATOMIC_AGGREGATE => api::Attribute {
+            attr: Some(api::attribute::Attr::AtomicAggregate(
+                api::AtomicAggregateAttribute {},
+            )),
+        },
+        Attribute::AGGREGATOR => {
+            let mut c = Cursor::new(a.binary().unwrap());
+            let (asn, addr) = match c.get_ref().len() {
+                6 => (
+                    c.read_u16::<NetworkEndian>().unwrap() as u32,
+                    Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()),
+                ),
+                8 => (
+                    c.read_u32::<NetworkEndian>().unwrap(),
+                    Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()),
+                ),
+                _ => unreachable!("corrupted"),
+            };
+            api::Attribute {
+                attr: Some(api::attribute::Attr::Aggregator(api::AggregatorAttribute {
+                    asn,
+                    address: addr.to_string(),
+                })),
+            }
+        }
+        Attribute::COMMUNITY => {
+            let buf = a.binary().unwrap();
+            let count = buf.len() / 4;
+            let mut c = Cursor::new(buf);
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(c.read_u32::<NetworkEndian>().unwrap());
+            }
+            api::Attribute {
+                attr: Some(api::attribute::Attr::Communities(
+                    api::CommunitiesAttribute {
+                        communities: values,
+                    },
+                )),
+            }
+        }
+        Attribute::ORIGINATOR_ID => api::Attribute {
+            attr: Some(api::attribute::Attr::OriginatorId(
+                api::OriginatorIdAttribute {
+                    id: Ipv4Addr::from(a.value().unwrap()).to_string(),
+                },
+            )),
+        },
+        Attribute::CLUSTER_LIST => {
+            let mut c = Cursor::new(a.binary().unwrap());
+            let mut ids = Vec::new();
+            for _ in 0..c.get_ref().len() / 4 {
+                ids.push(Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap()).to_string());
+            }
+            api::Attribute {
+                attr: Some(api::attribute::Attr::ClusterList(
+                    api::ClusterListAttribute { ids },
+                )),
+            }
+        }
+        Attribute::LARGE_COMMUNITY => {
+            let mut c = Cursor::new(a.binary().unwrap());
+            let mut v = Vec::new();
+            for _ in 0..c.get_ref().len() / 12 {
+                let global_admin = c.read_u32::<NetworkEndian>().unwrap();
+                let local_data1 = c.read_u32::<NetworkEndian>().unwrap();
+                let local_data2 = c.read_u32::<NetworkEndian>().unwrap();
+                v.push(api::LargeCommunity {
+                    global_admin,
+                    local_data1,
+                    local_data2,
+                });
+            }
+            api::Attribute {
+                attr: Some(api::attribute::Attr::LargeCommunities(
+                    api::LargeCommunitiesAttribute { communities: v },
+                )),
+            }
+        }
+        _ => api::Attribute {
+            attr: Some(api::attribute::Attr::Unknown(api::UnknownAttribute {
+                flags: a.flags() as u32,
+                r#type: a.code() as u32,
+                value: a.binary().unwrap().to_owned(),
+            })),
+        },
     }
 }
 

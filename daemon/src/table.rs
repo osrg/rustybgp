@@ -33,6 +33,7 @@ use bytes::BytesMut;
 use rustybgp_packet::{self as packet, Attribute, Family, bgp};
 
 use crate::api;
+use crate::convert;
 use crate::error::Error;
 
 struct PathAttribute {
@@ -403,15 +404,15 @@ impl RoutingTable {
                         }
                     })
                     .map(|(p, attr)| api::Path {
-                        nlri: Some(net.into()),
-                        family: Some(family.into()),
+                        nlri: Some(convert::nlri_to_api(net)),
+                        family: Some(convert::family_to_api(family)),
                         identifier: if table_type == api::TableType::AdjOut {
                             0
                         } else {
                             p.id
                         },
                         age: Some(p.timestamp.to_api()),
-                        pattrs: attr.iter().map(|a| a.into()).collect(),
+                        pattrs: attr.iter().map(convert::attr_to_api).collect(),
                         validation: self.rpki.validate(family, &p.source, net, &attr),
                         ..Default::default()
                     })
