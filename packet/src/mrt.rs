@@ -142,6 +142,7 @@ impl Encoder<&Message> for MrtCodec {
                     reach,
                     unreach,
                     attr: _,
+                    ..
                 } = body
                 {
                     let family = if let Some(s) = reach {

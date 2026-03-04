@@ -93,6 +93,7 @@ impl MessageCounter {
                 reach: _,
                 unreach,
                 attr: _,
+                ..
             } => {
                 self.update.fetch_add(1, Ordering::Relaxed);
 
@@ -1085,6 +1086,7 @@ impl GoBgpService for GrpcService {
                                 reach,
                                 unreach,
                                 attr,
+                                ..
                             } = update
                             {
                                 if let Some(s) = reach {
@@ -3033,8 +3035,10 @@ impl Table {
                                             family,
                                             entries: nets.to_owned(),
                                         }),
+                                        mp_reach: None,
                                         attr: attrs.clone(),
                                         unreach: None,
+                                        mp_unreach: None,
                                     },
                                     addpath,
                                 });
@@ -3059,8 +3063,10 @@ impl Table {
                                             family,
                                             entries: nets.to_owned(),
                                         }),
+                                        mp_reach: None,
                                         attr: attrs.clone(),
                                         unreach: None,
+                                        mp_unreach: None,
                                     },
                                     addpath,
                                 };
@@ -3113,8 +3119,10 @@ impl Table {
                                     ),
                                     update: packet::bgp::Message::Update {
                                         reach: None,
+                                        mp_reach: None,
                                         attr: Arc::new(Vec::new()),
-                                        unreach: Some(packet::bgp::NlriSet {
+                                        unreach: None,
+                                        mp_unreach: Some(packet::bgp::NlriSet {
                                             family,
                                             entries: nets.to_owned(),
                                         }),
@@ -3139,8 +3147,10 @@ impl Table {
                                     ),
                                     body: bgp::Message::Update {
                                         reach: None,
+                                        mp_reach: None,
                                         attr: Arc::new(Vec::new()),
-                                        unreach: Some(packet::bgp::NlriSet {
+                                        unreach: None,
+                                        mp_unreach: Some(packet::bgp::NlriSet {
                                             family,
                                             entries: nets.to_owned(),
                                         }),
@@ -3415,6 +3425,7 @@ impl Handler {
                 reach,
                 attr,
                 unreach,
+                ..
             } => {
                 let session_state = self.state.fsm.load(Ordering::Relaxed);
                 if session_state != SessionState::Established as u8 {
@@ -3733,8 +3744,10 @@ impl Handler {
                                 txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                                 let msg = bgp::Message::Update{
                                     reach: None,
+                                    mp_reach: None,
                                     attr: Arc::new(Vec::new()),
-                                    unreach: Some(packet::NlriSet { family: *family, entries: unreach }),
+                                    unreach: None,
+                                    mp_unreach: Some(packet::NlriSet { family: *family, entries: unreach }),
                                 };
                                 let _ = framer.encode_to(&msg, &mut txbuf);
                                 self.counter_tx.sync(&msg);
@@ -3751,8 +3764,10 @@ impl Handler {
                             for (attr, reach) in p.bucket.iter() {
                                 let msg = bgp::Message::Update{
                                     reach: Some(packet::NlriSet { family: *family, entries: reach.iter().copied().map(packet::PathNlri::new).collect() }),
+                                    mp_reach: None,
                                     attr: attr.clone(),
                                     unreach: None,
+                                    mp_unreach: None,
                                 };
                                 let _ = framer.encode_to(&msg, &mut txbuf);
                                 self.counter_tx.sync(&msg);

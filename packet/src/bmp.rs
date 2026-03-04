@@ -213,6 +213,7 @@ impl Encoder<&Message> for BmpCodec {
                     reach,
                     unreach,
                     attr: _,
+                    ..
                 } = update
                 {
                     let family = if let Some(s) = reach {

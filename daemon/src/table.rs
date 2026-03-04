@@ -163,8 +163,10 @@ impl From<Reach> for bgp::Message {
                 family: c.family,
                 entries: vec![c.net],
             }),
-            unreach: None,
+            mp_reach: None,
             attr: c.attr,
+            unreach: None,
+            mp_unreach: None,
         }
     }
 }
@@ -185,8 +187,10 @@ impl From<Change> for bgp::Message {
                 family: c.family,
                 entries: vec![packet::bgp::PathNlri::new(c.net)],
             }),
-            unreach: None,
+            mp_reach: None,
             attr: c.attr,
+            unreach: None,
+            mp_unreach: None,
         }
     }
 }
