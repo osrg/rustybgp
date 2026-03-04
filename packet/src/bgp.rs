@@ -450,7 +450,9 @@ impl Capability {
                     c.put_u16(family.afi());
                     c.put_u8(family.safi());
                     c.put_u8(*flags);
-                    c.put_u32(*time);
+                    c.put_u8((*time >> 16) as u8);
+                    c.put_u8((*time >> 8) as u8);
+                    c.put_u8(*time as u8);
                 }
             }
             Capability::Fqdn { hostname, domain } => {
