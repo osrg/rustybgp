@@ -15,7 +15,7 @@
 
 use crate::error::{BgpError, Error};
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 use fnv::FnvHashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::Into;
@@ -177,7 +177,7 @@ pub enum Nlri {
 }
 
 impl Nlri {
-    fn encode(&self, dst: &mut BytesMut) -> Result<u16, ()> {
+    fn encode<B: BufMut>(&self, dst: &mut B) -> Result<u16, ()> {
         match self {
             Nlri::V4(net) => net.encode(dst),
             Nlri::V6(net) => net.encode(dst),
@@ -260,14 +260,13 @@ impl Ipv4Net {
         })
     }
 
-    fn encode(&self, dst: &mut BytesMut) -> Result<u16, ()> {
-        let head_pos = dst.len();
+    fn encode<B: BufMut>(&self, dst: &mut B) -> Result<u16, ()> {
         let prefix_len = self.mask.div_ceil(8);
         dst.put_u8(self.mask);
         for i in 0..prefix_len {
             dst.put_u8(self.addr.octets()[i as usize]);
         }
-        Ok((dst.len() - head_pos) as u16)
+        Ok(1 + prefix_len as u16)
     }
 }
 
@@ -309,14 +308,13 @@ impl Ipv6Net {
         })
     }
 
-    fn encode(&self, dst: &mut BytesMut) -> Result<u16, ()> {
-        let head_pos = dst.len();
+    fn encode<B: BufMut>(&self, dst: &mut B) -> Result<u16, ()> {
         let prefix_len = self.mask.div_ceil(8);
         dst.put_u8(self.mask);
         for i in 0..prefix_len {
             dst.put_u8(self.addr.octets()[i as usize]);
         }
-        Ok((dst.len() - head_pos) as u16)
+        Ok(1 + prefix_len as u16)
     }
 }
 
@@ -395,8 +393,8 @@ impl From<&Capability> for u8 {
 }
 
 impl Capability {
-    fn encode(&self, c: &mut BytesMut) -> Result<u8, ()> {
-        let head = c.len();
+    fn encode<B: BufMut + AsMut<[u8]>>(&self, c: &mut B) -> Result<u8, ()> {
+        let head = c.as_mut().len();
         c.put_u8(self.into());
         match self {
             Capability::MultiProtocol(family) => {
@@ -477,7 +475,7 @@ impl Capability {
                 }
             }
         }
-        Ok((c.len() - head) as u8)
+        Ok((c.as_mut().len() - head) as u8)
     }
 
     fn decode(code: u8, c: &mut dyn io::Read, len: u8) -> Result<Self, ()> {
@@ -887,10 +885,10 @@ impl Attribute {
         }
     }
 
-    pub fn export(
+    pub fn export<B: BufMut + AsMut<[u8]>>(
         &self,
         code: u8,
-        dst: Option<&mut BytesMut>,
+        dst: Option<&mut B>,
         family: Family,
         codec: &PeerCodec,
     ) -> (u16, Option<Attribute>) {
@@ -935,8 +933,8 @@ impl Attribute {
         }
     }
 
-    fn encode(&self, dst: &mut BytesMut) -> Result<u16, ()> {
-        let pos_head = dst.len();
+    fn encode<B: BufMut + AsMut<[u8]>>(&self, dst: &mut B) -> Result<u16, ()> {
+        let pos_head = dst.as_mut().len();
         match self.code {
             Attribute::ORIGIN => {
                 dst.put_u8(self.flags);
@@ -968,7 +966,7 @@ impl Attribute {
             }
         }
 
-        Ok((dst.len() - pos_head) as u16)
+        Ok((dst.as_mut().len() - pos_head) as u16)
     }
 }
 
@@ -1238,23 +1236,23 @@ impl PeerCodec {
         self.local_asn == self.remote_asn
     }
 
-    fn mp_reach_encode(
+    fn mp_reach_encode<B: BufMut + AsMut<[u8]>>(
         &self,
         buf_head: usize,
         attrs: Arc<Vec<Attribute>>,
-        dst: &mut BytesMut,
+        dst: &mut B,
         reach: &NlriSet,
         reach_idx: &mut usize,
     ) -> Result<u16, ()> {
         let family = &reach.family;
         let nets = &reach.entries;
-        let pos_head = dst.len();
+        let pos_head = dst.as_mut().len();
         // always use extended length
         dst.put_u8(
             Attribute::canonical_flags(Attribute::MP_REACH).unwrap() | Attribute::FLAG_EXTENDED,
         );
         dst.put_u8(Attribute::MP_REACH);
-        let pos_bin = dst.len();
+        let pos_bin = dst.as_mut().len();
         dst.put_u16(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
@@ -1293,7 +1291,7 @@ impl PeerCodec {
                 nlri: net,
                 path_id: id,
             } = item;
-            if buf_head + self.max_message_length() > dst.len() + max_len {
+            if buf_head + self.max_message_length() > dst.as_mut().len() + max_len {
                 if addpath {
                     dst.put_u32(*id);
                 }
@@ -1303,7 +1301,7 @@ impl PeerCodec {
                 break;
             }
         }
-        let mp_len = (dst.len() - pos_head) as u16;
+        let mp_len = (dst.as_mut().len() - pos_head) as u16;
         (&mut dst.as_mut()[pos_bin..])
             .write_u16::<NetworkEndian>(mp_len - 4)
             .unwrap();
@@ -1311,23 +1309,23 @@ impl PeerCodec {
         Ok(mp_len)
     }
 
-    fn mp_unreach_encode(
+    fn mp_unreach_encode<B: BufMut + AsMut<[u8]>>(
         &self,
         buf_head: usize,
         _: Arc<Vec<Attribute>>,
-        dst: &mut BytesMut,
+        dst: &mut B,
         unreach: &NlriSet,
         unreach_idx: &mut usize,
     ) -> Result<u16, ()> {
         let family = &unreach.family;
         let nets = &unreach.entries;
-        let pos_head = dst.len();
+        let pos_head = dst.as_mut().len();
         // always use extended length
         dst.put_u8(
             Attribute::canonical_flags(Attribute::MP_UNREACH).unwrap() | Attribute::FLAG_EXTENDED,
         );
         dst.put_u8(Attribute::MP_UNREACH);
-        let pos_bin = dst.len();
+        let pos_bin = dst.as_mut().len();
         dst.put_u16(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
@@ -1338,7 +1336,7 @@ impl PeerCodec {
                 nlri: net,
                 path_id: id,
             } = item;
-            if buf_head + self.max_message_length() > dst.len() + max_len {
+            if buf_head + self.max_message_length() > dst.as_mut().len() + max_len {
                 if addpath {
                     dst.put_u32(*id);
                 }
@@ -1348,25 +1346,24 @@ impl PeerCodec {
                 break;
             }
         }
-        let mp_len = (dst.len() - pos_head) as u16;
+        let mp_len = (dst.as_mut().len() - pos_head) as u16;
         (&mut dst.as_mut()[pos_bin..])
             .write_u16::<NetworkEndian>(mp_len - 4)
             .unwrap();
         Ok(mp_len)
     }
 
-    fn do_encode(
+    fn do_encode<B: BufMut + AsMut<[u8]>>(
         &mut self,
         item: &Message,
-        dst: &mut BytesMut,
+        dst: &mut B,
         reach_idx: &mut usize,
     ) -> Result<(), Error> {
-        dst.reserve(dst.len() + self.max_message_length());
-        let pos_head = dst.len();
+        let pos_head = dst.as_mut().len();
         dst.put_u64(u64::MAX);
         dst.put_u64(u64::MAX);
         // updated later
-        let pos_header_len = dst.len();
+        let pos_header_len = dst.as_mut().len();
         dst.put_u16(Message::HEADER_LENGTH);
 
         match item {
@@ -1386,10 +1383,10 @@ impl PeerCodec {
                 dst.put_u16(trans_asn);
                 dst.put_u16(holdtime.seconds());
                 dst.put_u32(*router_id);
-                let op_param_len_pos = dst.len();
+                let op_param_len_pos = dst.as_mut().len();
                 dst.put_u8(0);
                 dst.put_u8(2); // capability parameter type
-                let param_len_pos = dst.len();
+                let param_len_pos = dst.as_mut().len();
                 dst.put_u8(0);
 
                 let mut cap_len = 0;
@@ -1419,14 +1416,14 @@ impl PeerCodec {
                     .map_or(Family::IPV4, |s| s.family);
                 let addpath = self.channel.get(&family).is_some_and(|c| c.addpath_tx());
                 dst.put_u8(Message::UPDATE);
-                let pos_withdrawn_len = dst.len();
+                let pos_withdrawn_len = dst.as_mut().len();
                 dst.put_u16(0);
                 let mut withdrawn_len = 0;
                 // Traditional IPv4 withdrawn routes
                 if let Some(unreach) = unreach {
                     let max_len = 5 + if addpath { 4 } else { 0 };
                     for (i, item) in unreach.entries.iter().enumerate().skip(*reach_idx) {
-                        if pos_head + self.max_message_length() > dst.len() + max_len {
+                        if pos_head + self.max_message_length() > dst.as_mut().len() + max_len {
                             if addpath {
                                 dst.put_u32(item.path_id);
                             }
@@ -1442,7 +1439,7 @@ impl PeerCodec {
                         .write_u16::<NetworkEndian>(withdrawn_len)
                         .unwrap();
                 }
-                let pos_attr_len = dst.len();
+                let pos_attr_len = dst.as_mut().len();
                 dst.put_u16(0);
                 // Like BIRD, for simplicity, MP_REACH/MP_UNREACH attribute isn't ordered.
                 // BIRD encodes MP_REACH/MP_UNREACH first and then the rest.
@@ -1480,7 +1477,7 @@ impl PeerCodec {
                 if let Some(reach) = reach {
                     let max_len = 5 + if addpath { 4 } else { 0 };
                     for (i, item) in reach.entries.iter().enumerate().skip(*reach_idx) {
-                        if pos_head + self.max_message_length() > dst.len() + max_len {
+                        if pos_head + self.max_message_length() > dst.as_mut().len() + max_len {
                             if addpath {
                                 dst.put_u32(item.path_id);
                             }
@@ -1509,7 +1506,7 @@ impl PeerCodec {
             }
         }
 
-        let pos_end = dst.len();
+        let pos_end = dst.as_mut().len();
         (&mut dst.as_mut()[pos_header_len..])
             .write_u16::<NetworkEndian>((pos_end - pos_head) as u16)?;
 
@@ -1980,7 +1977,11 @@ impl PeerCodec {
         }
     }
 
-    pub fn encode_to(&mut self, msg: &Message, dst: &mut BytesMut) -> Result<(), Error> {
+    pub fn encode_to<B: BufMut + AsMut<[u8]>>(
+        &mut self,
+        msg: &Message,
+        dst: &mut B,
+    ) -> Result<(), Error> {
         let mut done_idx = 0;
         match msg {
             Message::Update(Update {

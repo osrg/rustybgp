@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bytes::BytesMut;
 use rustybgp_packet::bgp::{
     Attribute, Ipv4Net, Ipv6Net, Message, NlriSet, PeerCodecBuilder, Update,
 };
@@ -75,7 +74,7 @@ fn ipv6_prefix(addr: &str, mask: u8) -> PathNlri {
 /// Encode + parse a message and return the parsed result.
 fn round_trip(msg: &Message, codec: rustybgp_packet::bgp::PeerCodec) -> Message {
     let mut framer = BgpFramer::new(codec);
-    let mut buf = BytesMut::new();
+    let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
     framer.inner_mut().parse_message(&buf).unwrap()
 }

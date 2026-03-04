@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bytes::BytesMut;
 use rustybgp_packet::bgp::Ipv4Net;
 use rustybgp_packet::bgp::{Attribute, Message, NlriSet, PeerCodecBuilder, Update};
 use rustybgp_packet::{BgpFramer, Family, Nlri, PathNlri};
@@ -53,7 +52,7 @@ fn base_attrs(nexthop: Ipv4Addr) -> Vec<Attribute> {
 
 fn round_trip(msg: &Message) -> Message {
     let mut framer = BgpFramer::new(ipv4_codec());
-    let mut buf = BytesMut::new();
+    let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
     framer.inner_mut().parse_message(&buf).unwrap()
 }
