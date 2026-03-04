@@ -216,7 +216,8 @@ pub struct Change {
 
 impl From<Change> for bgp::Message {
     fn from(c: Change) -> bgp::Message {
-        // FIXME: handle extended nexthop
+        // Extended nexthop (RFC 8950) reach/mp_reach routing is handled
+        // at the daemon tx path, not in this conversion.
         bgp::Message::Update(bgp::Update {
             reach: Some(packet::bgp::NlriSet {
                 family: c.family,
