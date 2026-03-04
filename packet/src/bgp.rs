@@ -464,38 +464,24 @@ impl Capability {
         }
         Ok((c.len() - head) as u8)
     }
-}
 
-struct CapDesc {
-    code: u8,
-    decode: fn(s: &mut PeerCodec, c: &mut dyn io::Read, len: u8) -> Result<Capability, ()>,
-}
-
-static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
-    vec![
-        CapDesc {
-            code: Capability::MULTI_PROTOCOL,
-            decode: (|_s, c, len| {
+    fn decode(code: u8, c: &mut dyn io::Read, len: u8) -> Result<Self, ()> {
+        match code {
+            Self::MULTI_PROTOCOL => {
                 if len != 4 {
                     return Err(());
                 }
                 Ok(Capability::MultiProtocol(Family(
                     c.read_u32::<NetworkEndian>().unwrap(),
                 )))
-            }),
-        },
-        CapDesc {
-            code: Capability::ROUTE_REFRESH,
-            decode: (|_s, _c, len| {
+            }
+            Self::ROUTE_REFRESH => {
                 if len != 0 {
                     return Err(());
                 }
-                Ok(Capability::RouteRefresh {})
-            }),
-        },
-        CapDesc {
-            code: Capability::EXTENDED_NEXTHOP,
-            decode: (|_s, c, len| {
+                Ok(Capability::RouteRefresh)
+            }
+            Self::EXTENDED_NEXTHOP => {
                 if len % 6 != 0 {
                     return Err(());
                 }
@@ -509,11 +495,8 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
                     v.push((family, afi));
                 }
                 Ok(Capability::ExtendedNexthop(v))
-            }),
-        },
-        CapDesc {
-            code: Capability::GRACEFUL_RESTART,
-            decode: (|_s, c, len| {
+            }
+            Self::GRACEFUL_RESTART => {
                 if len % 4 != 2 {
                     return Err(());
                 }
@@ -528,22 +511,16 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
                     v.push((Family(afi << 16 | safi), af_flag));
                 }
                 Ok(Capability::GracefulRestart(flags, time, v))
-            }),
-        },
-        CapDesc {
-            code: Capability::FOUR_OCTET_AS_NUMBER,
-            decode: (|s, c, len| {
+            }
+            Self::FOUR_OCTET_AS_NUMBER => {
                 if len != 4 {
                     return Err(());
                 }
-                let remote_as = c.read_u32::<NetworkEndian>().unwrap();
-                s.remote_asn = remote_as;
-                Ok(Capability::FourOctetAsNumber(remote_as))
-            }),
-        },
-        CapDesc {
-            code: Capability::ADD_PATH,
-            decode: (|_s, c, len| {
+                Ok(Capability::FourOctetAsNumber(
+                    c.read_u32::<NetworkEndian>().unwrap(),
+                ))
+            }
+            Self::ADD_PATH => {
                 if len % 4 != 0 {
                     return Err(());
                 }
@@ -558,20 +535,14 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
                     v.push((Family(afi << 16 | safi), val));
                 }
                 Ok(Capability::AddPath(v))
-            }),
-        },
-        CapDesc {
-            code: Capability::ENHANCED_ROUTE_REFRESH,
-            decode: (|_s, _c, len| {
+            }
+            Self::ENHANCED_ROUTE_REFRESH => {
                 if len != 0 {
                     return Err(());
                 }
-                Ok(Capability::EnhanshedRouteRefresh {})
-            }),
-        },
-        CapDesc {
-            code: Capability::LONG_LIVED_GRACEFUL_RESTART,
-            decode: (|_s, c, len| {
+                Ok(Capability::EnhanshedRouteRefresh)
+            }
+            Self::LONG_LIVED_GRACEFUL_RESTART => {
                 if len % 7 != 0 {
                     return Err(());
                 }
@@ -586,11 +557,8 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
                     v.push((Family(afi << 16 | safi), flags, time));
                 }
                 Ok(Capability::LongLivedGracefulRestart(v))
-            }),
-        },
-        CapDesc {
-            code: Capability::FQDN,
-            decode: (|_s, c, len| {
+            }
+            Self::FQDN => {
                 if len < 1 {
                     return Err(());
                 }
@@ -600,7 +568,6 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
                     h.push(c.read_u8().unwrap());
                 }
                 let host = ascii::AsciiString::from_ascii(h).unwrap().to_string();
-
                 let domainlen = c.read_u8().unwrap();
                 let mut d = Vec::new();
                 for _ in 0..domainlen {
@@ -608,13 +575,17 @@ static CAP_DESCS: Lazy<FnvHashMap<u8, CapDesc>> = Lazy::new(|| {
                 }
                 let domain = ascii::AsciiString::from_ascii(d).unwrap().to_string();
                 Ok(Capability::Fqdn(host, domain))
-            }),
-        },
-    ]
-    .into_iter()
-    .map(|x| (x.code, x))
-    .collect()
-});
+            }
+            _ => {
+                let mut bin = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    bin.push(c.read_u8().unwrap());
+                }
+                Ok(Capability::Unknown { code, bin })
+            }
+        }
+    }
+}
 
 pub struct AsPathIter<'a> {
     cur: Cursor<&'a Vec<u8>>,
@@ -1699,25 +1670,15 @@ impl PeerCodec {
                             if op_end < c.position() + cap_len as u64 {
                                 return Err(malformed);
                             }
-                            match CAP_DESCS.get(&cap_type) {
-                                Some(desc) => {
-                                    let decode = desc.decode;
-                                    match decode(self, &mut c, cap_len) {
-                                        Ok(c) => cap.push(c),
-                                        Err(_) => {
-                                            return Err(malformed);
-                                        }
+                            match Capability::decode(cap_type, &mut c, cap_len) {
+                                Ok(decoded) => {
+                                    if let Capability::FourOctetAsNumber(asn) = &decoded {
+                                        self.remote_asn = *asn;
                                     }
+                                    cap.push(decoded);
                                 }
-                                None => {
-                                    let mut bin = Vec::with_capacity(cap_len as usize);
-                                    for _ in 0..cap_len {
-                                        bin.push(c.read_u8().unwrap());
-                                    }
-                                    cap.push(Capability::Unknown {
-                                        code: cap_type,
-                                        bin,
-                                    });
+                                Err(_) => {
+                                    return Err(malformed);
                                 }
                             }
                         }
