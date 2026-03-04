@@ -51,7 +51,7 @@ use crate::auth;
 use crate::config;
 use crate::convert;
 use crate::error::Error;
-use crate::table;
+use rustybgp_table as table;
 
 #[derive(Default)]
 struct MessageCounter {
@@ -1298,7 +1298,7 @@ impl GoBgpService for GrpcService {
                     }
                 }
             };
-            (t, s)
+            (convert::table_type_from_api(t), s)
         } else {
             return Err(tonic::Status::new(
                 tonic::Code::InvalidArgument,
@@ -1316,17 +1316,17 @@ impl GoBgpService for GrpcService {
         let mut v = Vec::new();
         for i in 0..*NUM_TABLES {
             let t = TABLE[i].lock().await;
-            let pa = if table_type == api::TableType::AdjOut {
+            let pa = if table_type == table::TableType::AdjOut {
                 t.global_export_policy.as_ref().cloned()
             } else {
                 None
             };
             for d in t
                 .rtable
-                .iter_api(table_type, family, peer_addr, prefixes.clone(), pa)
+                .iter_destinations(table_type, family, peer_addr, prefixes.clone(), pa)
             {
                 v.push(api::ListPathResponse {
-                    destination: Some(d),
+                    destination: Some(convert::destination_to_api(d, family)),
                 });
             }
         }
@@ -1372,7 +1372,9 @@ impl GoBgpService for GrpcService {
             let t = TABLE[i].lock().await;
             info += t.rtable.state(family);
         }
-        Ok(tonic::Response::new(api::GetTableResponse::from(info)))
+        Ok(tonic::Response::new(convert::routing_table_state_to_api(
+            info,
+        )))
     }
     async fn add_vrf(
         &self,
@@ -1404,7 +1406,11 @@ impl GoBgpService for GrpcService {
             .write()
             .await
             .ptable
-            .add_policy(&policy.name, policy.statements)
+            .add_policy(
+                &policy.name,
+                policy.statements.into_iter().map(|s| s.name).collect(),
+            )
+            .map_err(Error::from)
             .map(|_| Ok(tonic::Response::new(api::AddPolicyResponse {})))?
     }
     async fn delete_policy(
@@ -1430,8 +1436,10 @@ impl GoBgpService for GrpcService {
             .read()
             .await
             .ptable
-            .iter_policy_api(request.name)
-            .map(|p| api::ListPolicyResponse { policy: Some(p) })
+            .iter_policies(request.name)
+            .map(|p| api::ListPolicyResponse {
+                policy: Some(convert::policy_to_api(p)),
+            })
             .collect();
 
         let (tx, rx) = mpsc::channel(1024);
@@ -1460,11 +1468,13 @@ impl GoBgpService for GrpcService {
             .into_inner()
             .defined_set
             .ok_or(Error::EmptyArgument)?;
+        let set = convert::defined_set_from_api(set).map_err(Error::from)?;
         GLOBAL
             .write()
             .await
             .ptable
             .add_defined_set(set)
+            .map_err(Error::from)
             .map(|_| Ok(tonic::Response::new(api::AddDefinedSetResponse {})))?
     }
     async fn delete_defined_set(
@@ -1490,7 +1500,8 @@ impl GoBgpService for GrpcService {
             .read()
             .await
             .ptable
-            .iter_defined_set_api()
+            .iter_defined_sets()
+            .map(convert::defined_set_to_api)
             .filter(|x| x.defined_type == req.defined_type)
             .map(|x| api::ListDefinedSetResponse {
                 defined_set: Some(x),
@@ -1513,11 +1524,14 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddStatementRequest>,
     ) -> Result<tonic::Response<api::AddStatementResponse>, tonic::Status> {
         let statement = request.into_inner().statement.ok_or(Error::EmptyArgument)?;
+        let conditions = convert::conditions_from_api(statement.conditions).map_err(Error::from)?;
+        let disposition = convert::disposition_from_api(statement.actions).map_err(Error::from)?;
         GLOBAL
             .write()
             .await
             .ptable
-            .add_statement(&statement.name, statement.conditions, statement.actions)
+            .add_statement(&statement.name, conditions, disposition)
+            .map_err(Error::from)
             .map(|_| Ok(tonic::Response::new(api::AddStatementResponse {})))?
     }
     async fn delete_statement(
@@ -1543,8 +1557,10 @@ impl GoBgpService for GrpcService {
             .read()
             .await
             .ptable
-            .iter_statement_api(request.name)
-            .map(|s| api::ListStatementResponse { statement: Some(s) })
+            .iter_statements(request.name)
+            .map(|s| api::ListStatementResponse {
+                statement: Some(convert::statement_to_api(s)),
+            })
             .collect();
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(async move {
@@ -1593,9 +1609,9 @@ impl GoBgpService for GrpcService {
             .read()
             .await
             .ptable
-            .iter_assignment_api(request.direction)
-            .map(|x| api::ListPolicyAssignmentResponse {
-                assignment: Some(x),
+            .iter_assignments(request.direction)
+            .map(|(dir, pa)| api::ListPolicyAssignmentResponse {
+                assignment: Some(convert::policy_assignment_to_api(pa, dir)),
             })
             .collect();
 
@@ -1743,8 +1759,10 @@ impl GoBgpService for GrpcService {
             .lock()
             .await
             .rtable
-            .iter_roa_api(family)
-            .map(|roa| api::ListRpkiTableResponse { roa: Some(roa) })
+            .iter_roa(family)
+            .map(|(net, roa)| api::ListRpkiTableResponse {
+                roa: Some(convert::roa_to_api(&net, roa)),
+            })
             .collect();
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(async move {
@@ -1876,10 +1894,16 @@ impl GoBgpService for GrpcService {
 }
 
 async fn add_policy_assignment(req: api::PolicyAssignment) -> Result<(), Error> {
-    let (dir, assignment) = GLOBAL.write().await.ptable.add_assignment(req)?;
+    let (name, direction, default_action, policy_names) = convert::policy_assignment_from_api(req)?;
+    let (dir, assignment) = GLOBAL.write().await.ptable.add_assignment(
+        &name,
+        direction,
+        default_action,
+        policy_names,
+    )?;
     for i in 0..*NUM_TABLES {
         let mut t = TABLE[i].lock().await;
-        if dir == api::PolicyDirection::Import {
+        if dir == table::PolicyDirection::Import {
             t.global_import_policy = Some(assignment.clone());
         } else {
             t.global_export_policy = Some(assignment.clone());
@@ -2785,6 +2809,7 @@ impl Global {
                 Ok(sets) => {
                     let mut server = GLOBAL.write().await;
                     for set in sets {
+                        let set = convert::defined_set_from_api(set).unwrap();
                         if let Err(e) = server.ptable.add_defined_set(set) {
                             panic!("{:?}", e);
                         }
@@ -2809,9 +2834,13 @@ impl Global {
                             }
                             match api::Statement::try_from(s) {
                                 Ok(s) => {
+                                    let conditions =
+                                        convert::conditions_from_api(s.conditions).unwrap();
+                                    let disposition =
+                                        convert::disposition_from_api(s.actions).unwrap();
                                     server
                                         .ptable
-                                        .add_statement(&s.name, s.conditions, s.actions)
+                                        .add_statement(&s.name, conditions, disposition)
                                         .unwrap();
                                     s_names.push(s.name.clone());
                                     h.insert(s.name);
@@ -2820,16 +2849,7 @@ impl Global {
                             }
                         }
                     }
-                    if let Err(e) = server.ptable.add_policy(
-                        name,
-                        s_names
-                            .into_iter()
-                            .map(|x| api::Statement {
-                                name: x,
-                                ..Default::default()
-                            })
-                            .collect(),
-                    ) {
+                    if let Err(e) = server.ptable.add_policy(name, s_names) {
                         panic!("{:?}", e);
                     }
                 }

@@ -25,15 +25,14 @@ pub(crate) enum Error {
     InvalidArgument(String),
     #[error("entity already exists")]
     AlreadyExists(String),
-    #[error("feature isn't supported")]
-    Unimplemented,
-
     #[error("invalid configuration")]
     InvalidConfiguration(String),
     #[error("std::io::Error")]
     StdIoErr(#[from] std::io::Error),
     #[error("packet error")]
     Packet(#[from] rustybgp_packet::Error),
+    #[error("table error")]
+    Table(#[from] rustybgp_table::TableError),
 }
 
 impl From<Error> for tonic::Status {
@@ -45,7 +44,14 @@ impl From<Error> for tonic::Status {
             }
             Error::InvalidArgument(s) => tonic::Status::new(tonic::Code::InvalidArgument, s),
             Error::AlreadyExists(s) => tonic::Status::new(tonic::Code::AlreadyExists, s),
-            Error::Unimplemented => tonic::Status::unimplemented("Not yet implemented"),
+            Error::Table(e) => match e {
+                rustybgp_table::TableError::InvalidArgument(s) => {
+                    tonic::Status::new(tonic::Code::InvalidArgument, s)
+                }
+                rustybgp_table::TableError::AlreadyExists(s) => {
+                    tonic::Status::new(tonic::Code::AlreadyExists, s)
+                }
+            },
             _ => panic!("unsupported error code"),
         }
     }

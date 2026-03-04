@@ -18,7 +18,7 @@ use std::io::Cursor;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
-use rustybgp_packet::{Family, Nlri, bgp::Attribute, bgp::Capability};
+use rustybgp_packet::{Family, IpNet, Nlri, bgp::Attribute, bgp::Capability};
 
 use crate::api;
 use crate::config;
@@ -405,4 +405,390 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
             "attribute conversion not implemented".to_string(),
         )),
     }
+}
+
+pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement {
+    use rustybgp_table::{Comparison, Condition, RpkiValidationState};
+    let mut s = api::Statement {
+        name: my.name.to_string(),
+        conditions: None,
+        actions: None,
+    };
+    let mut conditions = api::Conditions {
+        rpki_result: -1, // hack for gobgp cli
+        ..Default::default()
+    };
+
+    for condition in &my.conditions {
+        match condition {
+            Condition::Prefix(name, opt, _set) => {
+                conditions.prefix_set = Some(api::MatchSet {
+                    name: name.clone(),
+                    r#type: match_option_to_i32(opt),
+                });
+            }
+            Condition::Neighbor(name, opt, _set) => {
+                conditions.neighbor_set = Some(api::MatchSet {
+                    name: name.clone(),
+                    r#type: match_option_to_i32(opt),
+                });
+            }
+            Condition::AsPath(name, opt, _set) => {
+                conditions.as_path_set = Some(api::MatchSet {
+                    name: name.clone(),
+                    r#type: match_option_to_i32(opt),
+                });
+            }
+            Condition::Community(name, opt, _set) => {
+                conditions.community_set = Some(api::MatchSet {
+                    name: name.clone(),
+                    r#type: match_option_to_i32(opt),
+                });
+            }
+            Condition::Nexthop(v) => {
+                conditions.next_hop_in_list = v.iter().map(|x| x.to_string()).collect();
+            }
+            Condition::Rpki(v) => {
+                conditions.rpki_result = match v {
+                    RpkiValidationState::NotFound => api::ValidationState::NotFound as i32,
+                    RpkiValidationState::Valid => api::ValidationState::Valid as i32,
+                    RpkiValidationState::Invalid => api::ValidationState::Invalid as i32,
+                };
+            }
+            Condition::AsPathLength(t, length) => {
+                conditions.as_path_length = Some(api::AsPathLength {
+                    r#type: match t {
+                        Comparison::Eq => 0,
+                        Comparison::Ge => 1,
+                        Comparison::Le => 2,
+                    },
+                    length: *length,
+                })
+            }
+        }
+    }
+    s.conditions = Some(conditions);
+    if let Some(a) = my.disposition {
+        s.actions = Some(api::Actions {
+            route_action: a as i32,
+            ..Default::default()
+        });
+    }
+    s
+}
+
+fn match_option_to_i32(opt: &rustybgp_table::MatchOption) -> i32 {
+    use rustybgp_table::MatchOption;
+    match opt {
+        MatchOption::Any => 0,
+        MatchOption::All => 1,
+        MatchOption::Invert => 2,
+    }
+}
+
+pub(crate) fn policy_to_api(p: &rustybgp_table::Policy) -> api::Policy {
+    api::Policy {
+        name: p.name.to_string(),
+        statements: p.statements.iter().map(|x| statement_to_api(x)).collect(),
+    }
+}
+
+pub(crate) fn policy_assignment_to_api(
+    pa: &rustybgp_table::PolicyAssignment,
+    dir: i32,
+) -> api::PolicyAssignment {
+    api::PolicyAssignment {
+        name: pa.name.to_string(),
+        policies: pa.policies.iter().map(|x| policy_to_api(x)).collect(),
+        direction: dir,
+        default_action: pa.disposition as i32,
+    }
+}
+
+pub(crate) fn defined_set_to_api(d: rustybgp_table::DefinedSetRef<'_>) -> api::DefinedSet {
+    use rustybgp_table::DefinedSetRef;
+    match d {
+        DefinedSetRef::Prefix(name, set) => api::DefinedSet {
+            defined_type: api::DefinedType::Prefix as i32,
+            name: name.to_string(),
+            list: Vec::new(),
+            prefixes: set
+                .v4
+                .iter()
+                .map(|(_, _, v)| api::Prefix {
+                    ip_prefix: v.net.to_string(),
+                    mask_length_min: v.min_length as u32,
+                    mask_length_max: v.max_length as u32,
+                })
+                .collect(),
+        },
+        DefinedSetRef::Neighbor(name, set) => api::DefinedSet {
+            defined_type: api::DefinedType::Neighbor as i32,
+            name: name.to_string(),
+            list: set.sets.iter().map(|x| x.to_string()).collect(),
+            prefixes: Vec::new(),
+        },
+        DefinedSetRef::AsPath(name, set) => {
+            let mut list: Vec<String> = set.single_sets.iter().map(|x| x.to_string()).collect();
+            list.append(&mut set.sets.iter().map(|x| x.to_string()).collect());
+            api::DefinedSet {
+                defined_type: api::DefinedType::AsPath as i32,
+                name: name.to_string(),
+                list,
+                prefixes: Vec::new(),
+            }
+        }
+        DefinedSetRef::Community(name, set) => api::DefinedSet {
+            defined_type: api::DefinedType::Community as i32,
+            name: name.to_string(),
+            list: set.sets.iter().map(|x| x.to_string()).collect(),
+            prefixes: Vec::new(),
+        },
+    }
+}
+
+pub(crate) fn conditions_from_api(
+    conditions: Option<api::Conditions>,
+) -> Result<Vec<rustybgp_table::ConditionConfig>, rustybgp_table::TableError> {
+    use rustybgp_table::{
+        Comparison, ConditionConfig, MatchOption, RpkiValidationState, TableError,
+    };
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    let Some(conditions) = conditions else {
+        return Ok(Vec::new());
+    };
+    let mut v = Vec::new();
+    if let Some(m) = conditions.prefix_set {
+        v.push(ConditionConfig::PrefixSet(
+            m.name,
+            MatchOption::try_from(m.r#type)?,
+        ));
+    }
+    if let Some(m) = conditions.neighbor_set {
+        v.push(ConditionConfig::NeighborSet(
+            m.name,
+            MatchOption::try_from(m.r#type)?,
+        ));
+    }
+    if let Some(m) = conditions.as_path_set {
+        v.push(ConditionConfig::AsPathSet(
+            m.name,
+            MatchOption::try_from(m.r#type)?,
+        ));
+    }
+    if let Some(m) = conditions.as_path_length {
+        v.push(ConditionConfig::AsPathLength(
+            Comparison::from(m.r#type),
+            m.length,
+        ));
+    }
+    if let Some(m) = conditions.community_set {
+        v.push(ConditionConfig::CommunitySet(
+            m.name,
+            MatchOption::try_from(m.r#type)?,
+        ));
+    }
+    let nexthops: Vec<IpAddr> = conditions
+        .next_hop_in_list
+        .iter()
+        .filter_map(|p| IpAddr::from_str(p).ok())
+        .collect();
+    if !nexthops.is_empty() {
+        if nexthops.len() != conditions.next_hop_in_list.len() {
+            return Err(TableError::InvalidArgument(
+                "invalid nexthop condition".to_string(),
+            ));
+        }
+        v.push(ConditionConfig::Nexthop(nexthops));
+    }
+    if conditions.rpki_result != api::ValidationState::None as i32 {
+        let s = match api::ValidationState::try_from(conditions.rpki_result) {
+            Ok(api::ValidationState::NotFound) => RpkiValidationState::NotFound,
+            Ok(api::ValidationState::Valid) => RpkiValidationState::Valid,
+            Ok(api::ValidationState::Invalid) => RpkiValidationState::Invalid,
+            _ => {
+                return Err(TableError::InvalidArgument(
+                    "invalid rpki condition".to_string(),
+                ));
+            }
+        };
+        v.push(ConditionConfig::Rpki(s));
+    }
+    Ok(v)
+}
+
+pub(crate) fn disposition_from_api(
+    actions: Option<api::Actions>,
+) -> Result<Option<rustybgp_table::Disposition>, rustybgp_table::TableError> {
+    use rustybgp_table::{Disposition, TableError};
+
+    let Some(actions) = actions else {
+        return Ok(None);
+    };
+    match api::RouteAction::try_from(actions.route_action) {
+        Ok(api::RouteAction::Accept) => Ok(Some(Disposition::Accept)),
+        Ok(api::RouteAction::Reject) => Ok(Some(Disposition::Reject)),
+        Ok(_) => Ok(None),
+        Err(_) => Err(TableError::InvalidArgument("invalid action".to_string())),
+    }
+}
+
+pub(crate) fn defined_set_from_api(
+    set: api::DefinedSet,
+) -> Result<rustybgp_table::DefinedSetConfig, rustybgp_table::TableError> {
+    use rustybgp_table::{DefinedSetConfig, PrefixConfig, TableError};
+
+    match api::DefinedType::try_from(set.defined_type) {
+        Ok(api::DefinedType::Prefix) => Ok(DefinedSetConfig::Prefix {
+            name: set.name,
+            prefixes: set
+                .prefixes
+                .into_iter()
+                .map(|p| PrefixConfig {
+                    ip_prefix: p.ip_prefix,
+                    mask_length_min: p.mask_length_min as u8,
+                    mask_length_max: p.mask_length_max as u8,
+                })
+                .collect(),
+        }),
+        Ok(api::DefinedType::Neighbor) => Ok(DefinedSetConfig::Neighbor {
+            name: set.name,
+            neighbors: set.list,
+        }),
+        Ok(api::DefinedType::AsPath) => Ok(DefinedSetConfig::AsPath {
+            name: set.name,
+            patterns: set.list,
+        }),
+        Ok(api::DefinedType::Community) => Ok(DefinedSetConfig::Community {
+            name: set.name,
+            patterns: set.list,
+        }),
+        _ => Err(TableError::InvalidArgument(
+            "unsupported defined set type".to_string(),
+        )),
+    }
+}
+
+pub(crate) fn policy_assignment_from_api(
+    req: api::PolicyAssignment,
+) -> Result<
+    (
+        String,
+        rustybgp_table::PolicyDirection,
+        rustybgp_table::Disposition,
+        Vec<String>,
+    ),
+    rustybgp_table::TableError,
+> {
+    use rustybgp_table::{Disposition, PolicyDirection, TableError};
+
+    let direction = match api::PolicyDirection::try_from(req.direction) {
+        Ok(api::PolicyDirection::Import) => PolicyDirection::Import,
+        Ok(api::PolicyDirection::Export) => PolicyDirection::Export,
+        _ => {
+            return Err(TableError::InvalidArgument(
+                "invalid policy direction".to_string(),
+            ));
+        }
+    };
+    let default_action = match api::RouteAction::try_from(req.default_action) {
+        Ok(api::RouteAction::Accept) => Disposition::Accept,
+        _ => Disposition::Reject,
+    };
+    let policy_names: Vec<String> = req.policies.into_iter().map(|p| p.name).collect();
+    Ok((req.name, direction, default_action, policy_names))
+}
+
+pub(crate) fn routing_table_state_to_api(
+    s: rustybgp_table::RoutingTableState,
+) -> api::GetTableResponse {
+    api::GetTableResponse {
+        num_destination: s.num_destination as u64,
+        num_path: s.num_path as u64,
+        num_accepted: s.num_accepted as u64,
+    }
+}
+
+pub(crate) fn table_type_from_api(t: api::TableType) -> rustybgp_table::TableType {
+    match t {
+        api::TableType::AdjIn => rustybgp_table::TableType::AdjIn,
+        api::TableType::AdjOut => rustybgp_table::TableType::AdjOut,
+        _ => rustybgp_table::TableType::Global,
+    }
+}
+
+pub(crate) fn destination_to_api(
+    d: rustybgp_table::DestinationEntry,
+    family: Family,
+) -> api::Destination {
+    use crate::proto::ToApi;
+    api::Destination {
+        prefix: d.net.to_string(),
+        paths: d
+            .paths
+            .into_iter()
+            .map(|p| api::Path {
+                nlri: Some(nlri_to_api(&d.net)),
+                family: Some(family_to_api(family)),
+                identifier: p.id,
+                age: Some(p.timestamp.to_api()),
+                pattrs: p.attr.iter().map(attr_to_api).collect(),
+                validation: p.validation.map(rpki_validation_to_api),
+                ..Default::default()
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn roa_to_api(net: &IpNet, roa: &rustybgp_table::Roa) -> api::Roa {
+    let (prefix, mask) = match net {
+        IpNet::V4(net) => (net.addr.to_string(), net.mask),
+        IpNet::V6(net) => (net.addr.to_string(), net.mask),
+    };
+    api::Roa {
+        asn: roa.as_number,
+        prefixlen: mask as u32,
+        maxlen: roa.max_length as u32,
+        prefix,
+        conf: Some(api::RpkiConf {
+            address: roa.source.to_string(),
+            remote_port: 0,
+        }),
+    }
+}
+
+pub(crate) fn rpki_validation_to_api(v: rustybgp_table::RpkiValidation) -> api::Validation {
+    let mut result = api::Validation {
+        state: match v.state {
+            rustybgp_table::RpkiValidationState::NotFound => api::ValidationState::NotFound as i32,
+            rustybgp_table::RpkiValidationState::Valid => api::ValidationState::Valid as i32,
+            rustybgp_table::RpkiValidationState::Invalid => api::ValidationState::Invalid as i32,
+        },
+        reason: match v.reason {
+            rustybgp_table::RpkiValidationReason::None => api::validation::Reason::None as i32,
+            rustybgp_table::RpkiValidationReason::Asn => api::validation::Reason::Asn as i32,
+            rustybgp_table::RpkiValidationReason::Length => api::validation::Reason::Length as i32,
+        },
+        matched: Vec::new(),
+        unmatched_asn: Vec::new(),
+        unmatched_length: Vec::new(),
+    };
+    result.matched = v
+        .matched
+        .iter()
+        .map(|(net, roa)| roa_to_api(net, roa))
+        .collect();
+    result.unmatched_asn = v
+        .unmatched_asn
+        .iter()
+        .map(|(net, roa)| roa_to_api(net, roa))
+        .collect();
+    result.unmatched_length = v
+        .unmatched_length
+        .iter()
+        .map(|(net, roa)| roa_to_api(net, roa))
+        .collect();
+    result
 }

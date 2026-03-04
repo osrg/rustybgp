@@ -21,7 +21,6 @@ mod convert;
 mod error;
 mod event;
 mod proto;
-mod table;
 
 use clap::{Arg, Command};
 use std::net::Ipv4Addr;

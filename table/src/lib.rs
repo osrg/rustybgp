@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::ToApi;
 use fnv::FnvHashMap;
 use ip_network_table_deps_treebitmap::IpLookupTable;
 use once_cell::sync::Lazy;
@@ -32,9 +31,53 @@ use std::time::SystemTime;
 use bytes::BytesMut;
 use rustybgp_packet::{self as packet, Attribute, Family, bgp};
 
-use crate::api;
-use crate::convert;
-use crate::error::Error;
+#[derive(Debug, thiserror::Error)]
+pub enum TableError {
+    #[error("argument is incorrect")]
+    InvalidArgument(String),
+    #[error("entity already exists")]
+    AlreadyExists(String),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum RpkiValidationState {
+    NotFound,
+    Valid,
+    Invalid,
+}
+
+pub enum RpkiValidationReason {
+    None,
+    Asn,
+    Length,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum TableType {
+    Global,
+    AdjIn,
+    AdjOut,
+}
+
+pub struct DestinationEntry {
+    pub net: packet::Nlri,
+    pub paths: Vec<PathEntry>,
+}
+
+pub struct PathEntry {
+    pub id: u32,
+    pub timestamp: SystemTime,
+    pub attr: Arc<Vec<packet::Attribute>>,
+    pub validation: Option<RpkiValidation>,
+}
+
+pub struct RpkiValidation {
+    pub state: RpkiValidationState,
+    pub reason: RpkiValidationReason,
+    pub matched: Vec<(packet::IpNet, Roa)>,
+    pub unmatched_asn: Vec<(packet::IpNet, Roa)>,
+    pub unmatched_length: Vec<(packet::IpNet, Roa)>,
+}
 
 struct PathAttribute {
     attr: Arc<Vec<Attribute>>,
@@ -125,10 +168,10 @@ impl Destination {
 }
 
 #[derive(Default, Clone, Debug)]
-pub(crate) struct RoutingTableState {
-    num_destination: usize,
-    num_path: usize,
-    pub(crate) num_accepted: usize,
+pub struct RoutingTableState {
+    pub num_destination: usize,
+    pub num_path: usize,
+    pub num_accepted: usize,
 }
 
 impl AddAssign for RoutingTableState {
@@ -141,21 +184,11 @@ impl AddAssign for RoutingTableState {
     }
 }
 
-impl From<RoutingTableState> for api::GetTableResponse {
-    fn from(i: RoutingTableState) -> Self {
-        api::GetTableResponse {
-            num_destination: i.num_destination as u64,
-            num_path: i.num_path as u64,
-            num_accepted: i.num_accepted as u64,
-        }
-    }
-}
-
-pub(crate) struct Reach {
-    pub(crate) source: Arc<Source>,
-    pub(crate) family: Family,
-    pub(crate) net: packet::PathNlri,
-    pub(crate) attr: Arc<Vec<packet::Attribute>>,
+pub struct Reach {
+    pub source: Arc<Source>,
+    pub family: Family,
+    pub net: packet::PathNlri,
+    pub attr: Arc<Vec<packet::Attribute>>,
 }
 
 impl From<Reach> for bgp::Message {
@@ -174,11 +207,11 @@ impl From<Reach> for bgp::Message {
 }
 
 #[derive(Clone)]
-pub(crate) struct Change {
-    pub(crate) source: Arc<Source>,
-    pub(crate) family: Family,
-    pub(crate) net: packet::Nlri,
-    pub(crate) attr: Arc<Vec<packet::Attribute>>,
+pub struct Change {
+    pub source: Arc<Source>,
+    pub family: Family,
+    pub net: packet::Nlri,
+    pub attr: Arc<Vec<packet::Attribute>>,
 }
 
 impl From<Change> for bgp::Message {
@@ -203,13 +236,13 @@ enum PeerType {
     Ebgp,
 }
 
-pub(crate) struct Source {
-    pub(crate) remote_addr: IpAddr,
-    pub(crate) local_addr: IpAddr,
-    pub(crate) remote_asn: u32,
-    pub(crate) local_asn: u32,
-    pub(crate) router_id: u32,
-    pub(crate) uptime: u64,
+pub struct Source {
+    pub remote_addr: IpAddr,
+    pub local_addr: IpAddr,
+    pub remote_asn: u32,
+    pub local_asn: u32,
+    pub router_id: u32,
+    pub uptime: u64,
     rs_client: bool,
 }
 
@@ -220,7 +253,7 @@ impl Hash for Source {
 }
 
 impl Source {
-    pub(crate) fn new(
+    pub fn new(
         remote_addr: IpAddr,
         local_addr: IpAddr,
         remote_asn: u32,
@@ -249,14 +282,20 @@ impl Source {
     }
 }
 
-pub(crate) struct RoutingTable {
+pub struct RoutingTable {
     global: FnvHashMap<Family, FnvHashMap<packet::Nlri, Destination>>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, (u64, u64)>>,
     rpki: RpkiTable,
 }
 
+impl Default for RoutingTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RoutingTable {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         RoutingTable {
             global: vec![(Family::EMPTY, FnvHashMap::default())]
                 .into_iter()
@@ -266,7 +305,7 @@ impl RoutingTable {
         }
     }
 
-    pub(crate) fn best(&self, family: &Family) -> Vec<Change> {
+    pub fn best(&self, family: &Family) -> Vec<Change> {
         match self.global.get(family) {
             Some(t) => {
                 let mut v = Vec::with_capacity(t.len());
@@ -285,7 +324,7 @@ impl RoutingTable {
         }
     }
 
-    pub(crate) fn state(&self, family: Family) -> RoutingTableState {
+    pub fn state(&self, family: Family) -> RoutingTableState {
         match self.global.get(&family) {
             Some(t) => {
                 let num_path = t.values().flat_map(|x| x.entry.iter()).count();
@@ -300,7 +339,7 @@ impl RoutingTable {
         }
     }
 
-    pub(crate) fn peer_stats(
+    pub fn peer_stats(
         &self,
         peer_addr: &IpAddr,
     ) -> Option<impl Iterator<Item = (Family, (u64, u64))> + '_> {
@@ -309,7 +348,7 @@ impl RoutingTable {
             .map(|m| m.iter().map(|(x, y)| (*x, *y)))
     }
 
-    pub(crate) fn iter_reach(&self, family: Family) -> impl Iterator<Item = Reach> + '_ {
+    pub fn iter_reach(&self, family: Family) -> impl Iterator<Item = Reach> + '_ {
         self.global
             .get(&family)
             .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
@@ -327,14 +366,14 @@ impl RoutingTable {
             })
     }
 
-    pub(crate) fn iter_api(
+    pub fn iter_destinations(
         &self,
-        table_type: api::TableType,
+        table_type: TableType,
         family: Family,
         peer_addr: Option<IpAddr>,
         prefixes: Vec<packet::Nlri>,
         export_policy: Option<Arc<PolicyAssignment>>,
-    ) -> impl Iterator<Item = api::Destination> + '_ {
+    ) -> impl Iterator<Item = DestinationEntry> + '_ {
         self.global
             .get(&family)
             .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
@@ -351,22 +390,22 @@ impl RoutingTable {
                     found
                 }
             })
-            .map(move |(net, dst)| api::Destination {
-                prefix: net.to_string(),
+            .map(move |(net, dst)| DestinationEntry {
+                net: *net,
                 paths: dst
                     .entry
                     .iter()
                     .enumerate()
                     .filter(|(i, p)| {
-                        if table_type == api::TableType::AdjIn {
+                        if table_type == TableType::AdjIn {
                             return p.source.remote_addr == peer_addr.unwrap();
-                        } else if table_type == api::TableType::AdjOut {
+                        } else if table_type == TableType::AdjOut {
                             return *i == 0 && p.source.remote_addr != peer_addr.unwrap();
                         }
                         true
                     })
                     .filter_map(|(_, p)| {
-                        if table_type == api::TableType::AdjOut {
+                        if table_type == TableType::AdjOut {
                             let codec = bgp::PeerCodecBuilder::new()
                                 .local_asn(p.source.local_asn)
                                 .local_addr(p.source.local_addr)
@@ -403,25 +442,25 @@ impl RoutingTable {
                             Some((p, p.pa.attr.clone()))
                         }
                     })
-                    .map(|(p, attr)| api::Path {
-                        nlri: Some(convert::nlri_to_api(net)),
-                        family: Some(convert::family_to_api(family)),
-                        identifier: if table_type == api::TableType::AdjOut {
-                            0
-                        } else {
-                            p.id
-                        },
-                        age: Some(p.timestamp.to_api()),
-                        pattrs: attr.iter().map(convert::attr_to_api).collect(),
-                        validation: self.rpki.validate(family, &p.source, net, &attr),
-                        ..Default::default()
+                    .map(|(p, attr)| {
+                        let validation = self.rpki.validate(family, &p.source, net, &attr);
+                        PathEntry {
+                            id: if table_type == TableType::AdjOut {
+                                0
+                            } else {
+                                p.id
+                            },
+                            timestamp: p.timestamp,
+                            attr,
+                            validation,
+                        }
                     })
                     .collect(),
             })
             .filter(|d| !d.paths.is_empty())
     }
 
-    pub(crate) fn insert(
+    pub fn insert(
         &mut self,
         source: Arc<Source>,
         family: Family,
@@ -528,7 +567,7 @@ impl RoutingTable {
         None
     }
 
-    pub(crate) fn remove(
+    pub fn remove(
         &mut self,
         source: Arc<Source>,
         family: Family,
@@ -579,7 +618,7 @@ impl RoutingTable {
         None
     }
 
-    pub(crate) fn drop(&mut self, source: Arc<Source>) -> Vec<Change> {
+    pub fn drop(&mut self, source: Arc<Source>) -> Vec<Change> {
         let mut advertise = Vec::new();
         self.route_stats.remove(&source.remote_addr);
         for (family, rt) in self.global.iter_mut() {
@@ -614,7 +653,7 @@ impl RoutingTable {
         advertise
     }
 
-    pub(crate) fn iter_roa_api(&self, family: Family) -> impl Iterator<Item = api::Roa> + '_ {
+    pub fn iter_roa(&self, family: Family) -> impl Iterator<Item = (packet::IpNet, &Roa)> + '_ {
         self.rpki
             .roas
             .get(&family)
@@ -622,11 +661,11 @@ impl RoutingTable {
             .iter()
             .flat_map(|(n, e)| {
                 let net = RpkiTable::key_to_addr(n);
-                e.iter().map(move |r| r.to_api(&net))
+                e.iter().map(move |r| (net.clone(), r.as_ref()))
             })
     }
 
-    pub(crate) fn rpki_state(&self, addr: &IpAddr) -> RpkiTableState {
+    pub fn rpki_state(&self, addr: &IpAddr) -> RpkiTableState {
         let mut state = RpkiTableState::default();
         for (family, roas) in self.rpki.roas.iter() {
             let mut records = 0;
@@ -655,7 +694,7 @@ impl RoutingTable {
         }
         state
     }
-    pub(crate) fn rpki_drop(&mut self, source: Arc<IpAddr>) {
+    pub fn rpki_drop(&mut self, source: Arc<IpAddr>) {
         for (_, roa) in self.rpki.roas.iter_mut() {
             let mut empty = Vec::new();
             for (n, e) in roa.iter_mut() {
@@ -677,7 +716,7 @@ impl RoutingTable {
         }
     }
 
-    pub(crate) fn roa_insert(&mut self, net: packet::IpNet, roa: Arc<Roa>) {
+    pub fn roa_insert(&mut self, net: packet::IpNet, roa: Arc<Roa>) {
         let (family, mut key, mask) = match net {
             packet::IpNet::V4(net) => (Family::IPV4, net.addr.octets().to_vec(), net.mask),
             packet::IpNet::V6(net) => (Family::IPV6, net.addr.octets().to_vec(), net.mask),
@@ -705,7 +744,7 @@ impl RoutingTable {
         }
     }
 
-    pub(crate) fn apply_policy(
+    pub fn apply_policy(
         &self,
         assignment: &PolicyAssignment,
         source: &Arc<Source>,
@@ -765,10 +804,10 @@ fn drop() {
 }
 
 #[derive(Clone)]
-struct Prefix {
-    net: packet::IpNet,
-    min_length: u8,
-    max_length: u8,
+pub struct Prefix {
+    pub net: packet::IpNet,
+    pub min_length: u8,
+    pub max_length: u8,
 }
 
 type SingleMatchRegex = (Regex, fn(s: &regex::Captures) -> Option<SingleAsPathMatch>);
@@ -822,7 +861,7 @@ static SINGLE_MATCH_REGEX: Lazy<Vec<SingleMatchRegex>> = Lazy::new(|| {
 });
 
 #[derive(Clone, PartialEq, Debug)]
-enum SingleAsPathMatch {
+pub enum SingleAsPathMatch {
     Include(u32),
     LeftMost(u32),
     Origin(u32),
@@ -961,7 +1000,7 @@ enum WellKnownCommunity {
 }
 
 impl FromStr for WellKnownCommunity {
-    type Err = Error;
+    type Err = TableError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "graceful-shutdown" => Ok(WellKnownCommunity::GracefulShutdown),
@@ -973,7 +1012,10 @@ impl FromStr for WellKnownCommunity {
             "no-advertise" => Ok(WellKnownCommunity::NoAdvertise),
             "no-export-subconfed" => Ok(WellKnownCommunity::NoExportSubconfed),
             "no-peer" => Ok(WellKnownCommunity::NoPeer),
-            _ => Err(Error::InvalidArgument(format!("unknown community {}", s))),
+            _ => Err(TableError::InvalidArgument(format!(
+                "unknown community {}",
+                s
+            ))),
         }
     }
 }
@@ -994,33 +1036,33 @@ impl From<WellKnownCommunity> for u32 {
     }
 }
 
-fn parse_community(s: &str) -> Result<Regex, Error> {
+fn parse_community(s: &str) -> Result<Regex, TableError> {
     if let Ok(v) = s.parse::<u32>() {
         return Regex::new(&format!("^{}:{}$", v >> 16, v & 0xffff))
-            .map_err(|_| Error::InvalidArgument(format!("invalid regex {}", s)));
+            .map_err(|_| TableError::InvalidArgument(format!("invalid regex {}", s)));
     }
     let r = Regex::new(r"(\d+.)*\d+:\d+").unwrap();
     if r.is_match(s) {
         return Regex::new(&format!("^{}$", s))
-            .map_err(|_| Error::InvalidArgument(format!("invalid regex {}", s)));
+            .map_err(|_| TableError::InvalidArgument(format!("invalid regex {}", s)));
     }
     if let Ok(c) = WellKnownCommunity::from_str(&s.to_string().to_lowercase()) {
         let v = c as u32;
         return Regex::new(&format!("^{}:{}$", v >> 16, v & 0xffff))
-            .map_err(|_| Error::InvalidArgument(format!("invalid regex {}", s)));
+            .map_err(|_| TableError::InvalidArgument(format!("invalid regex {}", s)));
     }
-    Regex::new(s).map_err(|_| Error::InvalidArgument(format!("invalid regex {}", s)))
+    Regex::new(s).map_err(|_| TableError::InvalidArgument(format!("invalid regex {}", s)))
 }
 
 #[derive(Clone, PartialEq)]
-enum MatchOption {
+pub enum MatchOption {
     Any,
     All,
     Invert,
 }
 
 impl TryFrom<i32> for MatchOption {
-    type Error = Error;
+    type Error = TableError;
     fn try_from(o: i32) -> Result<Self, Self::Error> {
         match o {
             0 => return Ok(MatchOption::Any),
@@ -1028,7 +1070,9 @@ impl TryFrom<i32> for MatchOption {
             2 => return Ok(MatchOption::Invert),
             _ => {}
         }
-        Err(Error::InvalidArgument("invalid match option".to_string()))
+        Err(TableError::InvalidArgument(
+            "invalid match option".to_string(),
+        ))
     }
 }
 
@@ -1043,7 +1087,7 @@ impl From<&MatchOption> for i32 {
 }
 
 #[derive(Clone, Copy)]
-enum Comparison {
+pub enum Comparison {
     Eq,
     Ge,
     Le,
@@ -1071,7 +1115,7 @@ impl From<i32> for Comparison {
 }
 
 #[derive(Clone)]
-enum Condition {
+pub enum Condition {
     Prefix(String, MatchOption, Arc<PrefixSet>),
     Neighbor(String, MatchOption, Arc<NeighborSet>),
     AsPath(String, MatchOption, Arc<AsPathSet>),
@@ -1079,7 +1123,7 @@ enum Condition {
     Nexthop(Vec<IpAddr>),
     // ExtendedCommunity,
     AsPathLength(Comparison, u32),
-    Rpki(api::ValidationState),
+    Rpki(RpkiValidationState),
     // RouteType(u32),
     // LargeCommunity,
     // AfiSafiIn(Vec<bgp::Family>),
@@ -1163,7 +1207,7 @@ impl Condition {
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
-pub(crate) enum Disposition {
+pub enum Disposition {
     Pass,
     Accept,
     Reject,
@@ -1180,11 +1224,11 @@ impl From<Disposition> for i32 {
 }
 
 #[derive(Clone)]
-pub(crate) struct Statement {
-    name: Arc<str>,
+pub struct Statement {
+    pub name: Arc<str>,
     // ALL the conditions are matched, the action will be executed.
-    conditions: Vec<Condition>,
-    disposition: Option<Disposition>,
+    pub conditions: Vec<Condition>,
+    pub disposition: Option<Disposition>,
     // pub route_action: Action,
 }
 
@@ -1211,145 +1255,70 @@ impl Statement {
     }
 }
 
-impl From<&Statement> for api::Statement {
-    fn from(my: &Statement) -> Self {
-        let mut s = api::Statement {
-            name: my.name.to_string(),
-            conditions: None,
-            actions: None,
-        };
-        let mut conditions = api::Conditions {
-            rpki_result: -1, // hack for gobgp cli
-            ..Default::default()
-        };
-
-        for condition in &my.conditions {
-            match condition {
-                Condition::Prefix(name, opt, _set) => {
-                    conditions.prefix_set = Some(api::MatchSet {
-                        name: name.clone(),
-                        r#type: opt.into(),
-                    });
-                }
-                Condition::Neighbor(name, opt, _set) => {
-                    conditions.neighbor_set = Some(api::MatchSet {
-                        name: name.clone(),
-                        r#type: opt.into(),
-                    });
-                }
-                Condition::AsPath(name, opt, _set) => {
-                    conditions.as_path_set = Some(api::MatchSet {
-                        name: name.clone(),
-                        r#type: opt.into(),
-                    });
-                }
-                Condition::Community(name, opt, _set) => {
-                    conditions.community_set = Some(api::MatchSet {
-                        name: name.clone(),
-                        r#type: opt.into(),
-                    });
-                }
-                Condition::Nexthop(v) => {
-                    conditions.next_hop_in_list = v.iter().map(|x| x.to_string()).collect();
-                }
-                Condition::Rpki(v) => {
-                    conditions.rpki_result = *v as i32;
-                }
-                Condition::AsPathLength(t, length) => {
-                    conditions.as_path_length = Some(api::AsPathLength {
-                        r#type: (*t).into(),
-                        length: *length,
-                    })
-                }
-            }
-        }
-        s.conditions = Some(conditions);
-        if let Some(a) = my.disposition {
-            s.actions = Some(api::Actions {
-                route_action: a.into(),
-                ..Default::default()
-            });
-        }
-        s
-    }
+pub struct PrefixConfig {
+    pub ip_prefix: String,
+    pub mask_length_min: u8,
+    pub mask_length_max: u8,
 }
 
-struct PrefixSet {
-    v4: IpLookupTable<Ipv4Addr, Prefix>,
-    zero: Option<(u8, u8)>,
+pub enum DefinedSetConfig {
+    Prefix {
+        name: String,
+        prefixes: Vec<PrefixConfig>,
+    },
+    Neighbor {
+        name: String,
+        neighbors: Vec<String>,
+    },
+    AsPath {
+        name: String,
+        patterns: Vec<String>,
+    },
+    Community {
+        name: String,
+        patterns: Vec<String>,
+    },
 }
 
-impl PrefixSet {
-    fn to_api(&self, name: &str) -> api::DefinedSet {
-        api::DefinedSet {
-            defined_type: api::DefinedType::Prefix as i32,
-            name: name.to_string(),
-            list: Vec::new(),
-            prefixes: self
-                .v4
-                .iter()
-                .map(|(_, _, v)| api::Prefix {
-                    ip_prefix: v.net.to_string(),
-                    mask_length_min: v.min_length as u32,
-                    mask_length_max: v.max_length as u32,
-                })
-                .collect(),
-        }
-    }
+pub enum ConditionConfig {
+    PrefixSet(String, MatchOption),
+    NeighborSet(String, MatchOption),
+    AsPathSet(String, MatchOption),
+    CommunitySet(String, MatchOption),
+    AsPathLength(Comparison, u32),
+    Nexthop(Vec<IpAddr>),
+    Rpki(RpkiValidationState),
 }
 
-struct NeighborSet {
-    sets: Vec<packet::IpNet>,
+pub enum DefinedSetRef<'a> {
+    Prefix(&'a str, &'a PrefixSet),
+    Neighbor(&'a str, &'a NeighborSet),
+    AsPath(&'a str, &'a AsPathSet),
+    Community(&'a str, &'a CommunitySet),
 }
 
-impl NeighborSet {
-    fn to_api(&self, name: &str) -> api::DefinedSet {
-        api::DefinedSet {
-            defined_type: api::DefinedType::Neighbor as i32,
-            name: name.to_string(),
-            list: self.sets.iter().map(|x| x.to_string()).collect(),
-            prefixes: Vec::new(),
-        }
-    }
+pub struct PrefixSet {
+    pub v4: IpLookupTable<Ipv4Addr, Prefix>,
+    pub zero: Option<(u8, u8)>,
 }
 
-struct AsPathSet {
-    single_sets: Vec<SingleAsPathMatch>,
-    sets: Vec<Regex>,
+pub struct NeighborSet {
+    pub sets: Vec<packet::IpNet>,
 }
 
-impl AsPathSet {
-    fn to_api(&self, name: &str) -> api::DefinedSet {
-        let mut list: Vec<String> = self.single_sets.iter().map(|x| x.to_string()).collect();
-        list.append(&mut self.sets.iter().map(|x| x.to_string()).collect());
-        api::DefinedSet {
-            defined_type: api::DefinedType::AsPath as i32,
-            name: name.to_string(),
-            list,
-            prefixes: Vec::new(),
-        }
-    }
+pub struct AsPathSet {
+    pub single_sets: Vec<SingleAsPathMatch>,
+    pub sets: Vec<Regex>,
 }
 
-struct CommunitySet {
-    sets: Vec<Regex>,
-}
-
-impl CommunitySet {
-    fn to_api(&self, name: &str) -> api::DefinedSet {
-        api::DefinedSet {
-            defined_type: api::DefinedType::Community as i32,
-            name: name.to_string(),
-            list: self.sets.iter().map(|x| x.to_string()).collect(),
-            prefixes: Vec::new(),
-        }
-    }
+pub struct CommunitySet {
+    pub sets: Vec<Regex>,
 }
 
 #[derive(Clone)]
-pub(crate) struct Policy {
-    name: Arc<str>,
-    statements: Vec<Arc<Statement>>,
+pub struct Policy {
+    pub name: Arc<str>,
+    pub statements: Vec<Arc<Statement>>,
 }
 
 impl Policy {
@@ -1369,19 +1338,10 @@ impl Policy {
     }
 }
 
-impl From<&Policy> for api::Policy {
-    fn from(my: &Policy) -> Self {
-        api::Policy {
-            name: my.name.to_string(),
-            statements: my.statements.iter().map(|x| x.as_ref().into()).collect(),
-        }
-    }
-}
-
-pub(crate) struct PolicyAssignment {
-    name: Arc<str>,
-    disposition: Disposition,
-    policies: Vec<Arc<Policy>>,
+pub struct PolicyAssignment {
+    pub name: Arc<str>,
+    pub disposition: Disposition,
+    pub policies: Vec<Arc<Policy>>,
 }
 
 impl PolicyAssignment {
@@ -1400,19 +1360,16 @@ impl PolicyAssignment {
         }
         self.disposition
     }
+}
 
-    fn to_api(&self, dir: i32) -> api::PolicyAssignment {
-        api::PolicyAssignment {
-            name: self.name.to_string(),
-            policies: self.policies.iter().map(|x| x.as_ref().into()).collect(),
-            direction: dir,
-            default_action: self.disposition as i32,
-        }
-    }
+#[derive(Clone, Copy, PartialEq)]
+pub enum PolicyDirection {
+    Import,
+    Export,
 }
 
 #[derive(Default)]
-pub(crate) struct PolicyTable {
+pub struct PolicyTable {
     prefix_sets: FnvHashMap<Arc<str>, Arc<PrefixSet>>,
     neighbor_sets: FnvHashMap<Arc<str>, Arc<NeighborSet>>,
     aspath_sets: FnvHashMap<Arc<str>, Arc<AsPathSet>>,
@@ -1426,58 +1383,40 @@ pub(crate) struct PolicyTable {
 }
 
 impl PolicyTable {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Default::default()
     }
 
-    pub(crate) fn add_assignment(
+    pub fn add_assignment(
         &mut self,
-        assignment: api::PolicyAssignment,
-    ) -> Result<(api::PolicyDirection, Arc<PolicyAssignment>), Error> {
-        let dir = api::PolicyDirection::try_from(assignment.direction)
-            .map_err(|_| Error::InvalidArgument("invalid assignment direction".to_string()))?;
-        if dir == api::PolicyDirection::Unspecified {
-            return Err(Error::InvalidArgument(
-                "invalid assignment direction".to_string(),
-            ));
-        }
-
-        let action = api::RouteAction::try_from(assignment.default_action)
-            .map_err(|_| Error::InvalidArgument("invalid action".to_string()))?;
-
+        name: &str,
+        direction: PolicyDirection,
+        default_action: Disposition,
+        policy_names: Vec<String>,
+    ) -> Result<(PolicyDirection, Arc<PolicyAssignment>), TableError> {
         let mut v = Vec::new();
-        for p in assignment.policies {
-            match self.policies.get(p.name.as_str()) {
+        for pname in &policy_names {
+            match self.policies.get(pname.as_str()) {
                 Some(p) => v.push(p.clone()),
                 None => {
-                    return Err(Error::InvalidArgument(format!(
+                    return Err(TableError::InvalidArgument(format!(
                         "{} policy isn't found",
-                        p.name
+                        pname
                     )));
                 }
             }
         }
-        let dis = match action {
-            api::RouteAction::Accept => Disposition::Accept,
-            api::RouteAction::Reject => Disposition::Reject,
-            api::RouteAction::Unspecified => Disposition::Pass,
+
+        let m = match direction {
+            PolicyDirection::Import => &mut self.assignment_import,
+            PolicyDirection::Export => &mut self.assignment_export,
         };
 
-        let m = match dir {
-            api::PolicyDirection::Import => &mut self.assignment_import,
-            api::PolicyDirection::Export => &mut self.assignment_export,
-            api::PolicyDirection::Unspecified => {
-                return Err(Error::InvalidArgument(
-                    "invalid policy direction".to_string(),
-                ));
-            }
-        };
-
-        let name: Arc<str> = Arc::from(assignment.name);
+        let name: Arc<str> = Arc::from(name);
         if let Some(old) = m.take() {
             for p0 in &old.policies {
                 if let Some(p) = v.iter().find(|p1| p0.name == p1.name) {
-                    return Err(Error::InvalidArgument(format!(
+                    return Err(TableError::InvalidArgument(format!(
                         "{} policy already exists",
                         p.name
                     )));
@@ -1488,49 +1427,49 @@ impl PolicyTable {
         let n = Arc::new(PolicyAssignment {
             name,
             policies: v,
-            disposition: dis,
+            disposition: default_action,
         });
         m.replace(n.clone());
-        Ok((dir, n))
+        Ok((direction, n))
     }
 
-    pub(crate) fn iter_assignment_api(
+    pub fn iter_assignments(
         &self,
         direction: i32,
-    ) -> impl Iterator<Item = api::PolicyAssignment> + '_ {
-        let mut v = Vec::with_capacity(2);
+    ) -> impl Iterator<Item = (i32, &PolicyAssignment)> + '_ {
+        let mut v: Vec<(i32, &PolicyAssignment)> = Vec::with_capacity(2);
         if direction != 2 {
             if let Some(a) = self.assignment_import.as_ref() {
-                v.push(a.to_api(1));
+                v.push((1, a));
             }
         } else if direction != 1
             && let Some(a) = self.assignment_export.as_ref()
         {
-            v.push(a.to_api(2));
+            v.push((2, a));
         }
         v.into_iter()
     }
 
-    pub(crate) fn add_policy(
+    pub fn add_policy(
         &mut self,
         name: &str,
-        statements: Vec<api::Statement>,
-    ) -> Result<(), Error> {
+        statement_names: Vec<String>,
+    ) -> Result<(), TableError> {
         let mut v = Vec::new();
-        for s in statements {
-            match self.statements.get(s.name.as_str()) {
+        for sname in &statement_names {
+            match self.statements.get(sname.as_str()) {
                 Some(st) => v.push(st.clone()),
                 None => {
-                    return Err(Error::InvalidArgument(format!(
+                    return Err(TableError::InvalidArgument(format!(
                         "{} statement isn't found",
-                        s.name
+                        sname
                     )));
                 }
             }
         }
         let name: Arc<str> = Arc::from(name);
         match self.policies.entry(name.clone()) {
-            Occupied(_) => Err(Error::AlreadyExists(format!("{}", name))),
+            Occupied(_) => Err(TableError::AlreadyExists(format!("{}", name))),
             Vacant(e) => {
                 e.insert(Arc::new(Policy {
                     name,
@@ -1541,38 +1480,35 @@ impl PolicyTable {
         }
     }
 
-    pub(crate) fn add_defined_set(&mut self, set: api::DefinedSet) -> Result<(), Error> {
-        let t = api::DefinedType::try_from(set.defined_type)
-            .map_err(|_| Error::InvalidArgument("invalid defined-type".to_string()))?;
-        let name: Arc<str> = Arc::from(set.name.as_str());
-        let name1 = name.clone();
-        match t {
-            api::DefinedType::Prefix => {
-                if let Vacant(e) = self.prefix_sets.entry(name) {
+    pub fn add_defined_set(&mut self, set: DefinedSetConfig) -> Result<(), TableError> {
+        match set {
+            DefinedSetConfig::Prefix { name, prefixes } => {
+                let arc_name: Arc<str> = Arc::from(name.as_str());
+                if let Vacant(e) = self.prefix_sets.entry(arc_name.clone()) {
                     let mut zero = None;
                     let mut v = IpLookupTable::new();
-                    for p in &set.prefixes {
+                    for p in &prefixes {
                         match packet::IpNet::from_str(&p.ip_prefix) {
                             Ok(n) => {
-                                let p = Prefix {
+                                let prefix = Prefix {
                                     net: n,
-                                    min_length: p.mask_length_min as u8,
-                                    max_length: p.mask_length_max as u8,
+                                    min_length: p.mask_length_min,
+                                    max_length: p.mask_length_max,
                                 };
 
-                                match &p.net {
+                                match &prefix.net {
                                     packet::IpNet::V4(net) => {
                                         if net.addr == Ipv4Addr::new(0, 0, 0, 0) && net.mask == 0 {
-                                            zero = Some((p.min_length, p.max_length));
+                                            zero = Some((prefix.min_length, prefix.max_length));
                                         } else {
-                                            v.insert(net.addr, net.mask as u32, p);
+                                            v.insert(net.addr, net.mask as u32, prefix);
                                         }
                                     }
                                     packet::IpNet::V6(_) => {}
                                 }
                             }
                             Err(_) => {
-                                return Err(Error::InvalidArgument(format!(
+                                return Err(TableError::InvalidArgument(format!(
                                     "invalid prefix format {:?}",
                                     p.ip_prefix
                                 )));
@@ -1580,7 +1516,7 @@ impl PolicyTable {
                         }
                     }
                     if v.is_empty() && zero.is_none() {
-                        return Err(Error::InvalidArgument(
+                        return Err(TableError::InvalidArgument(
                             "empty prefix defined-type".to_string(),
                         ));
                     } else {
@@ -1588,16 +1524,18 @@ impl PolicyTable {
                         return Ok(());
                     }
                 }
+                Err(TableError::AlreadyExists(name))
             }
-            api::DefinedType::Neighbor => {
-                let mut v = Vec::with_capacity(set.list.len());
-                for n in &set.list {
+            DefinedSetConfig::Neighbor { name, neighbors } => {
+                let arc_name: Arc<str> = Arc::from(name.as_str());
+                let mut v = Vec::with_capacity(neighbors.len());
+                for n in &neighbors {
                     match packet::IpNet::from_str(n) {
                         Ok(addr) => {
                             v.push(addr);
                         }
                         Err(_) => {
-                            return Err(Error::InvalidArgument(format!(
+                            return Err(TableError::InvalidArgument(format!(
                                 "invalid neighbor format {:?}",
                                 n
                             )));
@@ -1605,31 +1543,33 @@ impl PolicyTable {
                     }
                 }
                 if v.is_empty() {
-                    return Err(Error::InvalidArgument(
+                    return Err(TableError::InvalidArgument(
                         "empty neighbor defined-type".to_string(),
                     ));
-                } else if let Vacant(e) = self.neighbor_sets.entry(name) {
+                } else if let Vacant(e) = self.neighbor_sets.entry(arc_name) {
                     e.insert(Arc::new(NeighborSet { sets: v }));
                     return Ok(());
                 }
+                Err(TableError::AlreadyExists(name))
             }
-            api::DefinedType::AsPath => {
-                let mut v0 = Vec::with_capacity(set.list.len());
-                let mut v1 = Vec::with_capacity(set.list.len());
-                for n in &set.list {
+            DefinedSetConfig::AsPath { name, patterns } => {
+                let arc_name: Arc<str> = Arc::from(name.as_str());
+                let mut v0 = Vec::with_capacity(patterns.len());
+                let mut v1 = Vec::with_capacity(patterns.len());
+                for n in &patterns {
                     if let Some(n) = SingleAsPathMatch::new(n) {
                         v0.push(n);
                     } else if let Ok(n) = Regex::new(&n.replace('_', "(^|[,{}() ]|$)")) {
                         v1.push(n);
                     } else {
-                        return Err(Error::InvalidArgument(format!(
+                        return Err(TableError::InvalidArgument(format!(
                             "invalid aspath format {:?}",
                             n
                         )));
                     }
                 }
                 if !v0.is_empty() || !v1.is_empty() {
-                    if let Vacant(e) = self.aspath_sets.entry(name) {
+                    if let Vacant(e) = self.aspath_sets.entry(arc_name) {
                         e.insert(Arc::new(AsPathSet {
                             single_sets: v0,
                             sets: v1,
@@ -1637,151 +1577,134 @@ impl PolicyTable {
                         return Ok(());
                     }
                 } else {
-                    return Err(Error::InvalidArgument(
+                    return Err(TableError::InvalidArgument(
                         "empty aspath defined-type".to_string(),
                     ));
                 }
+                Err(TableError::AlreadyExists(name))
             }
-            api::DefinedType::Community => {
-                let mut v = Vec::with_capacity(set.list.len());
-                for n in &set.list {
+            DefinedSetConfig::Community { name, patterns } => {
+                let arc_name: Arc<str> = Arc::from(name.as_str());
+                let mut v = Vec::with_capacity(patterns.len());
+                for n in &patterns {
                     if let Ok(n) = parse_community(n) {
                         v.push(n);
                     } else {
-                        return Err(Error::InvalidArgument(format!(
+                        return Err(TableError::InvalidArgument(format!(
                             "invalid community format {:?}",
                             n
                         )));
                     }
                 }
                 if v.is_empty() {
-                    return Err(Error::InvalidArgument(
+                    return Err(TableError::InvalidArgument(
                         "empty community defined-type".to_string(),
                     ));
-                } else if let Vacant(e) = self.community_sets.entry(name) {
+                } else if let Vacant(e) = self.community_sets.entry(arc_name) {
                     e.insert(Arc::new(CommunitySet { sets: v }));
                     return Ok(());
                 }
-            }
-            _ => {
-                return Err(Error::Unimplemented);
+                Err(TableError::AlreadyExists(name))
             }
         }
-        Err(Error::AlreadyExists(format!("{}", name1)))
     }
 
-    pub(crate) fn iter_defined_set_api(&self) -> impl Iterator<Item = api::DefinedSet> + '_ {
+    pub fn iter_defined_sets(&self) -> impl Iterator<Item = DefinedSetRef<'_>> + '_ {
         self.prefix_sets
             .iter()
-            .map(|(name, s)| s.to_api(name))
-            .chain(self.neighbor_sets.iter().map(|(name, s)| s.to_api(name)))
-            .chain(self.aspath_sets.iter().map(|(name, s)| s.to_api(name)))
-            .chain(self.community_sets.iter().map(|(name, s)| s.to_api(name)))
+            .map(|(name, s)| DefinedSetRef::Prefix(name, s))
+            .chain(
+                self.neighbor_sets
+                    .iter()
+                    .map(|(name, s)| DefinedSetRef::Neighbor(name, s)),
+            )
+            .chain(
+                self.aspath_sets
+                    .iter()
+                    .map(|(name, s)| DefinedSetRef::AsPath(name, s)),
+            )
+            .chain(
+                self.community_sets
+                    .iter()
+                    .map(|(name, s)| DefinedSetRef::Community(name, s)),
+            )
     }
 
-    pub(crate) fn add_statement(
+    pub fn add_statement(
         &mut self,
         name: &str,
-        conditions: Option<api::Conditions>,
-        actions: Option<api::Actions>,
-    ) -> Result<(), Error> {
+        conditions: Vec<ConditionConfig>,
+        disposition: Option<Disposition>,
+    ) -> Result<(), TableError> {
         if self.statements.contains_key(name) {
-            return Err(Error::AlreadyExists(name.to_string()));
+            return Err(TableError::AlreadyExists(name.to_string()));
         }
         let mut v = Vec::new();
-        if let Some(conditions) = conditions {
-            if let Some(m) = conditions.prefix_set {
-                let opt = MatchOption::try_from(m.r#type)?;
-                if opt == MatchOption::All {
-                    return Err(Error::InvalidArgument(
-                        "prefix-set can't have all match option".to_string(),
-                    ));
-                }
-                match self.prefix_sets.get(m.name.as_str()) {
-                    Some(set) => v.push(Condition::Prefix(m.name, opt, set.clone())),
-                    None => {
-                        return Err(Error::InvalidArgument(format!(
-                            "{} prefix-set isn't found",
-                            m.name
-                        )));
+        for cond in conditions {
+            match cond {
+                ConditionConfig::PrefixSet(set_name, opt) => {
+                    if opt == MatchOption::All {
+                        return Err(TableError::InvalidArgument(
+                            "prefix-set can't have all match option".to_string(),
+                        ));
+                    }
+                    match self.prefix_sets.get(set_name.as_str()) {
+                        Some(set) => v.push(Condition::Prefix(set_name, opt, set.clone())),
+                        None => {
+                            return Err(TableError::InvalidArgument(format!(
+                                "{} prefix-set isn't found",
+                                set_name
+                            )));
+                        }
                     }
                 }
-            }
-            if let Some(m) = conditions.neighbor_set {
-                let opt = MatchOption::try_from(m.r#type)?;
-                if opt == MatchOption::All {
-                    return Err(Error::InvalidArgument(
-                        "neighbor-set can't have all match option".to_string(),
-                    ));
-                }
-                match self.neighbor_sets.get(m.name.as_str()) {
-                    Some(set) => v.push(Condition::Neighbor(m.name, opt, set.clone())),
-                    None => {
-                        return Err(Error::InvalidArgument(format!(
-                            "{} neighbor-set isn't found",
-                            m.name
-                        )));
+                ConditionConfig::NeighborSet(set_name, opt) => {
+                    if opt == MatchOption::All {
+                        return Err(TableError::InvalidArgument(
+                            "neighbor-set can't have all match option".to_string(),
+                        ));
+                    }
+                    match self.neighbor_sets.get(set_name.as_str()) {
+                        Some(set) => v.push(Condition::Neighbor(set_name, opt, set.clone())),
+                        None => {
+                            return Err(TableError::InvalidArgument(format!(
+                                "{} neighbor-set isn't found",
+                                set_name
+                            )));
+                        }
                     }
                 }
-            }
-            if let Some(m) = conditions.as_path_set {
-                let opt = MatchOption::try_from(m.r#type)?;
-                match self.aspath_sets.get(m.name.as_str()) {
-                    Some(set) => v.push(Condition::AsPath(m.name, opt, set.clone())),
-                    None => {
-                        return Err(Error::InvalidArgument(format!(
-                            "{} aspath-set isn't found",
-                            m.name
-                        )));
+                ConditionConfig::AsPathSet(set_name, opt) => {
+                    match self.aspath_sets.get(set_name.as_str()) {
+                        Some(set) => v.push(Condition::AsPath(set_name, opt, set.clone())),
+                        None => {
+                            return Err(TableError::InvalidArgument(format!(
+                                "{} aspath-set isn't found",
+                                set_name
+                            )));
+                        }
                     }
                 }
-            }
-            if let Some(m) = conditions.as_path_length {
-                v.push(Condition::AsPathLength(m.r#type.into(), m.length));
-            }
-            if let Some(m) = conditions.community_set {
-                let opt = MatchOption::try_from(m.r#type)?;
-                match self.community_sets.get(m.name.as_str()) {
-                    Some(set) => v.push(Condition::Community(m.name, opt, set.clone())),
-                    None => {
-                        return Err(Error::InvalidArgument(format!(
-                            "{} community-set isn't found",
-                            m.name
-                        )));
+                ConditionConfig::CommunitySet(set_name, opt) => {
+                    match self.community_sets.get(set_name.as_str()) {
+                        Some(set) => v.push(Condition::Community(set_name, opt, set.clone())),
+                        None => {
+                            return Err(TableError::InvalidArgument(format!(
+                                "{} community-set isn't found",
+                                set_name
+                            )));
+                        }
                     }
                 }
-            }
-            let nexthops: Vec<IpAddr> = conditions
-                .next_hop_in_list
-                .iter()
-                .filter_map(|p| IpAddr::from_str(p).ok())
-                .collect();
-            if !nexthops.is_empty() {
-                if nexthops.len() != conditions.next_hop_in_list.len() {
-                    return Err(Error::InvalidArgument(
-                        "invalid nexthop condition".to_string(),
-                    ));
+                ConditionConfig::AsPathLength(cmp, length) => {
+                    v.push(Condition::AsPathLength(cmp, length));
                 }
-                v.push(Condition::Nexthop(nexthops));
-            }
-            if conditions.rpki_result != api::ValidationState::None as i32 {
-                match api::ValidationState::try_from(conditions.rpki_result) {
-                    Ok(s) => v.push(Condition::Rpki(s)),
-                    Err(_) => {
-                        return Err(Error::InvalidArgument("invalid rpki condition".to_string()));
-                    }
+                ConditionConfig::Nexthop(nexthops) => {
+                    v.push(Condition::Nexthop(nexthops));
                 }
-            }
-        }
-        let mut disposition = None;
-        if let Some(actions) = actions {
-            match api::RouteAction::try_from(actions.route_action) {
-                Ok(a) => match a {
-                    api::RouteAction::Accept => disposition = Some(Disposition::Accept),
-                    api::RouteAction::Reject => disposition = Some(Disposition::Reject),
-                    _ => {}
-                },
-                Err(_) => return Err(Error::InvalidArgument("invalid action".to_string())),
+                ConditionConfig::Rpki(state) => {
+                    v.push(Condition::Rpki(state));
+                }
             }
         }
         let s = Statement {
@@ -1793,69 +1716,48 @@ impl PolicyTable {
         Ok(())
     }
 
-    pub(crate) fn iter_statement_api(
-        &self,
-        name: String,
-    ) -> impl Iterator<Item = api::Statement> + '_ {
+    pub fn iter_statements(&self, name: String) -> impl Iterator<Item = &Statement> + '_ {
         self.statements
             .iter()
             .filter(move |(sname, _)| name.is_empty() || name.as_str() == sname.as_ref())
-            .map(|(_, s)| s.as_ref().into())
+            .map(|(_, s)| s.as_ref())
     }
 
-    pub(crate) fn iter_policy_api(&self, name: String) -> impl Iterator<Item = api::Policy> + '_ {
+    pub fn iter_policies(&self, name: String) -> impl Iterator<Item = &Policy> + '_ {
         self.policies
             .iter()
             .filter(move |(pname, _)| name.is_empty() || name.as_str() == pname.as_ref())
-            .map(|(_, p)| p.as_ref().into())
+            .map(|(_, p)| p.as_ref())
     }
 }
 
 #[derive(Clone)]
 pub struct Roa {
-    max_length: u8,
-    as_number: u32,
-    source: Arc<IpAddr>,
+    pub max_length: u8,
+    pub as_number: u32,
+    pub source: Arc<IpAddr>,
 }
 
 impl Roa {
-    pub(crate) fn new(max_length: u8, as_number: u32, source: Arc<IpAddr>) -> Self {
+    pub fn new(max_length: u8, as_number: u32, source: Arc<IpAddr>) -> Self {
         Roa {
             max_length,
             as_number,
             source,
         }
     }
-
-    fn to_api(&self, net: &packet::IpNet) -> api::Roa {
-        let (prefix, mask) = match net {
-            packet::IpNet::V4(net) => (net.addr.to_string(), net.mask),
-            packet::IpNet::V6(net) => (net.addr.to_string(), net.mask),
-        };
-
-        api::Roa {
-            asn: self.as_number,
-            prefixlen: mask as u32,
-            maxlen: self.max_length as u32,
-            prefix,
-            conf: Some(api::RpkiConf {
-                address: self.source.to_string(),
-                remote_port: 0,
-            }),
-        }
-    }
 }
 
 #[derive(Default)]
-pub(crate) struct RpkiTableState {
-    pub(crate) num_records_v4: u32,
-    pub(crate) num_records_v6: u32,
-    pub(crate) num_prefixes_v4: u32,
-    pub(crate) num_prefixes_v6: u32,
+pub struct RpkiTableState {
+    pub num_records_v4: u32,
+    pub num_records_v6: u32,
+    pub num_prefixes_v4: u32,
+    pub num_prefixes_v6: u32,
 }
 
 #[derive(Default)]
-pub(crate) struct RpkiTable {
+pub struct RpkiTable {
     roas: FnvHashMap<Family, PatriciaMap<Vec<Arc<Roa>>>>,
 }
 
@@ -1894,16 +1796,16 @@ impl RpkiTable {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
-    ) -> Option<api::Validation> {
+    ) -> Option<RpkiValidation> {
         match self.roas.get(&family) {
             None => None,
             Some(m) => {
                 if m.is_empty() {
                     return None;
                 }
-                let mut result = api::Validation {
-                    state: api::ValidationState::NotFound as i32,
-                    reason: api::validation::Reason::None as i32,
+                let mut result = RpkiValidation {
+                    state: RpkiValidationState::NotFound,
+                    reason: RpkiValidationReason::None,
                     matched: Vec::new(),
                     unmatched_asn: Vec::new(),
                     unmatched_length: Vec::new(),
@@ -1927,25 +1829,27 @@ impl RpkiTable {
                     for roa in entry {
                         if mask <= roa.max_length {
                             if roa.as_number != 0 && roa.as_number == asn {
-                                result.matched.push(roa.to_api(&ipnet));
+                                result.matched.push((ipnet.clone(), roa.as_ref().clone()));
                             } else {
-                                result.unmatched_asn.push(roa.to_api(&ipnet));
+                                result
+                                    .unmatched_asn
+                                    .push((ipnet.clone(), roa.as_ref().clone()));
                             }
                         } else {
-                            result.unmatched_length.push(roa.to_api(&ipnet));
+                            result
+                                .unmatched_length
+                                .push((ipnet.clone(), roa.as_ref().clone()));
                         }
                     }
                 }
                 if !result.matched.is_empty() {
-                    result.state = api::ValidationState::Valid as i32;
+                    result.state = RpkiValidationState::Valid;
                 } else if !result.unmatched_asn.is_empty() {
-                    result.state = api::ValidationState::Invalid as i32;
-                    result.reason = api::validation::Reason::Asn as i32;
+                    result.state = RpkiValidationState::Invalid;
+                    result.reason = RpkiValidationReason::Asn;
                 } else if !result.unmatched_length.is_empty() {
-                    result.state = api::ValidationState::Invalid as i32;
-                    result.reason = api::validation::Reason::Length as i32;
-                } else {
-                    result.state = api::validation::Reason::None as i32;
+                    result.state = RpkiValidationState::Invalid;
+                    result.reason = RpkiValidationReason::Length;
                 }
 
                 Some(result)
