@@ -2089,14 +2089,14 @@ impl BmpClient {
                         version: 4,
                         as_number: peer.state.remote_asn.load(Ordering::Relaxed),
                         holdtime: peer.state.remote_holdtime.load(Ordering::Relaxed),
-                        router_id: remote_id,
+                        router_id: u32::from(remote_id),
                         capability: peer.state.remote_cap.read().await.to_owned(),
                     }),
                     local_open: bgp::Message::Open(bgp::Open {
                         version: 4,
                         as_number: peer.local_asn,
                         holdtime: peer.holdtime as u16,
-                        router_id: local_id,
+                        router_id: u32::from(local_id),
                         capability: peer.local_cap.to_owned(),
                     }),
                 };
@@ -3534,9 +3534,7 @@ impl Handler {
                                             .state
                                             .remote_holdtime
                                             .load(Ordering::Relaxed),
-                                        router_id: Ipv4Addr::from(
-                                            self.state.remote_id.load(Ordering::Relaxed),
-                                        ),
+                                        router_id: self.state.remote_id.load(Ordering::Relaxed),
                                         capability: self.state.remote_cap.read().await.to_owned(),
                                     }),
                                     local_open: bgp::Message::Open(bgp::Open {
@@ -3546,9 +3544,7 @@ impl Handler {
                                             .state
                                             .remote_holdtime
                                             .load(Ordering::Relaxed),
-                                        router_id: Ipv4Addr::from(
-                                            self.state.remote_id.load(Ordering::Relaxed),
-                                        ),
+                                        router_id: self.state.remote_id.load(Ordering::Relaxed),
                                         capability: self.local_cap.to_owned(),
                                     }),
                                 };
@@ -3604,7 +3600,7 @@ impl Handler {
             version: 4,
             as_number: self.local_asn,
             holdtime: self.local_holdtime as u16,
-            router_id: self.local_router_id,
+            router_id: u32::from(self.local_router_id),
             capability: self.local_cap.to_owned(),
         })];
 

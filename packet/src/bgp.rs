@@ -1070,7 +1070,8 @@ pub struct Open {
     pub version: u8,
     pub as_number: u32,
     pub holdtime: u16,
-    pub router_id: Ipv4Addr,
+    /// BGP Identifier (RFC 6286): a 32-bit value, not necessarily a valid IPv4 address.
+    pub router_id: u32,
     pub capability: Vec<Capability>,
 }
 
@@ -1444,7 +1445,7 @@ impl PeerCodec {
                 dst.put_u8(*version);
                 dst.put_u16(trans_asn);
                 dst.put_u16(*holdtime);
-                dst.put_u32(u32::from(*router_id));
+                dst.put_u32(*router_id);
                 let op_param_len_pos = dst.len();
                 dst.put_u8(0);
                 dst.put_u8(2); // capability parameter type
@@ -1632,7 +1633,7 @@ impl PeerCodec {
                 let version = c.read_u8().unwrap();
                 let mut as_number = c.read_u16::<NetworkEndian>().unwrap() as u32;
                 let holdtime = c.read_u16::<NetworkEndian>().unwrap();
-                let router_id: Ipv4Addr = From::from(c.read_u32::<NetworkEndian>().unwrap());
+                let router_id = c.read_u32::<NetworkEndian>().unwrap();
                 let param_len = c.read_u8().unwrap();
                 if buf.len() < MINIMUM_OPEN_LENGTH + param_len as usize {
                     return Err(malformed);
