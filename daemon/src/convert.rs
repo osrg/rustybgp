@@ -89,12 +89,16 @@ impl From<&Capability> for api::Capability {
                     },
                 )),
             },
-            Capability::GracefulRestart(flags, time, v) => api::Capability {
+            Capability::GracefulRestart {
+                flags,
+                restart_time,
+                families,
+            } => api::Capability {
                 cap: Some(api::capability::Cap::GracefulRestart(
                     api::GracefulRestartCapability {
                         flags: *flags as u32,
-                        time: *time as u32,
-                        tuples: v
+                        time: *restart_time as u32,
+                        tuples: families
                             .iter()
                             .map(|(family, flags)| api::GracefulRestartCapabilityTuple {
                                 flags: *flags as u32,
@@ -141,9 +145,9 @@ impl From<&Capability> for api::Capability {
                     },
                 )),
             },
-            Capability::Fqdn(host, domain) => api::Capability {
+            Capability::Fqdn { hostname, domain } => api::Capability {
                 cap: Some(api::capability::Cap::Fqdn(api::FqdnCapability {
-                    host_name: host.to_string(),
+                    host_name: hostname.to_string(),
                     domain_name: domain.to_string(),
                 })),
             },
