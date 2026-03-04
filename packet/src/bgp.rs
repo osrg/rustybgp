@@ -17,7 +17,6 @@ use crate::error::{BgpError, Error};
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use fnv::FnvHashMap;
-use once_cell::sync::Lazy;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::Into;
 use std::io::Cursor;
@@ -692,17 +691,17 @@ impl Attribute {
     }
 
     pub fn new_with_value(code: u8, val: u32) -> Option<Self> {
-        ATTR_DESCS.get(&code).map(|desc| Attribute {
-            code: desc.code,
-            flags: desc.flags,
+        Some(Attribute {
+            flags: Self::canonical_flags(code)?,
+            code,
             data: AttributeData::Val(val),
         })
     }
 
     pub fn new_with_bin(code: u8, bin: Vec<u8>) -> Option<Self> {
-        ATTR_DESCS.get(&code).map(|desc| Attribute {
-            code: desc.code,
-            flags: desc.flags,
+        Some(Attribute {
+            flags: Self::canonical_flags(code)?,
+            code,
             data: AttributeData::Bin(bin),
         })
     }
@@ -719,6 +718,55 @@ impl Attribute {
             AttributeData::Val(_) => None,
             AttributeData::Bin(v) => Some(v),
         }
+    }
+
+    /// Returns the RFC-specified flags for a well-known attribute code, or `None` for unknown codes.
+    pub fn canonical_flags(code: u8) -> Option<u8> {
+        match code {
+            Self::ORIGIN => Some(Self::FLAG_TRANSITIVE),
+            Self::AS_PATH => Some(Self::FLAG_TRANSITIVE),
+            Self::NEXTHOP => Some(Self::FLAG_TRANSITIVE),
+            Self::MULTI_EXIT_DESC => Some(Self::FLAG_OPTIONAL),
+            Self::LOCAL_PREF => Some(Self::FLAG_TRANSITIVE),
+            Self::ATOMIC_AGGREGATE => Some(Self::FLAG_TRANSITIVE),
+            Self::AGGREGATOR => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
+            Self::COMMUNITY => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
+            Self::ORIGINATOR_ID => Some(Self::FLAG_OPTIONAL),
+            Self::CLUSTER_LIST => Some(Self::FLAG_OPTIONAL),
+            Self::MP_REACH => Some(Self::FLAG_OPTIONAL),
+            Self::MP_UNREACH => Some(Self::FLAG_OPTIONAL),
+            Self::EXTENDED_COMMUNITY => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
+            Self::AS4_PATH => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
+            Self::AS4_AGGREGATOR => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
+            Self::AIGP => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
+            Self::LARGE_COMMUNITY => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
+            _ => None,
+        }
+    }
+
+    fn decode(code: u8, flags: u8, c: &mut dyn io::Read, len: u16) -> Result<Self, ()> {
+        let data = match code {
+            Self::ORIGIN => {
+                if len != 1 {
+                    return Err(());
+                }
+                AttributeData::Val(c.read_u8().unwrap() as u32)
+            }
+            Self::MULTI_EXIT_DESC | Self::LOCAL_PREF | Self::ORIGINATOR_ID => {
+                if len != 4 {
+                    return Err(());
+                }
+                AttributeData::Val(c.read_u32::<NetworkEndian>().unwrap())
+            }
+            _ => {
+                let mut b = Vec::with_capacity(len.into());
+                for _ in 0..len {
+                    b.push(c.read_u8().unwrap());
+                }
+                AttributeData::Bin(b)
+            }
+        };
+        Ok(Attribute { code, flags, data })
     }
 
     pub fn as_path_length(&self) -> usize {
@@ -921,140 +969,6 @@ impl Attribute {
         Ok((dst.len() - pos_head) as u16)
     }
 }
-
-struct AttrDesc {
-    code: u8,
-    flags: u8,
-    decode: fn(s: &AttrDesc, c: &mut dyn io::Read, len: u16) -> Result<Attribute, ()>,
-}
-
-impl AttrDesc {
-    fn decode_u32(&self, c: &mut dyn io::Read, len: u16) -> Result<Attribute, ()> {
-        if len != 4 {
-            return Err(());
-        }
-        Ok(Attribute {
-            code: self.code,
-            flags: self.flags,
-            data: AttributeData::Val(c.read_u32::<NetworkEndian>().unwrap()),
-        })
-    }
-
-    fn decode_binary(&self, c: &mut dyn io::Read, len: u16) -> Result<Attribute, ()> {
-        let mut b = Vec::with_capacity(len.into());
-        for _i in 0..len {
-            let v = c.read_u8().unwrap();
-            b.push(v);
-        }
-        Ok(Attribute {
-            code: self.code,
-            flags: self.flags,
-            data: AttributeData::Bin(b),
-        })
-    }
-}
-
-static ATTR_DESCS: Lazy<FnvHashMap<u8, AttrDesc>> = Lazy::new(|| {
-    vec![
-        AttrDesc {
-            code: Attribute::ORIGIN,
-            flags: Attribute::FLAG_TRANSITIVE,
-            decode: (|s, c, len| {
-                if len != 1 {
-                    return Err(());
-                }
-                Ok(Attribute {
-                    code: s.code,
-                    flags: s.flags,
-                    data: AttributeData::Val(c.read_u8().unwrap() as u32),
-                })
-            }),
-        },
-        AttrDesc {
-            code: Attribute::AS_PATH,
-            flags: Attribute::FLAG_TRANSITIVE,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::NEXTHOP,
-            flags: Attribute::FLAG_TRANSITIVE,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::MULTI_EXIT_DESC,
-            flags: Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_u32,
-        },
-        AttrDesc {
-            code: Attribute::LOCAL_PREF,
-            flags: Attribute::FLAG_TRANSITIVE,
-            decode: AttrDesc::decode_u32,
-        },
-        AttrDesc {
-            code: Attribute::ATOMIC_AGGREGATE,
-            flags: Attribute::FLAG_TRANSITIVE,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::AGGREGATOR,
-            flags: Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::COMMUNITY,
-            flags: Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::ORIGINATOR_ID,
-            flags: Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_u32,
-        },
-        AttrDesc {
-            code: Attribute::CLUSTER_LIST,
-            flags: Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::MP_REACH,
-            flags: Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::MP_UNREACH,
-            flags: Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::EXTENDED_COMMUNITY,
-            flags: Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::AS4_PATH,
-            flags: Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::AS4_AGGREGATOR,
-            flags: Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::AIGP,
-            flags: Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_binary,
-        },
-        AttrDesc {
-            code: Attribute::LARGE_COMMUNITY,
-            flags: Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL,
-            decode: AttrDesc::decode_binary,
-        },
-    ]
-    .into_iter()
-    .map(|x| (x.code, x))
-    .collect()
-});
 
 /// BGP Hold Time (RFC 4271 §4.2): must be zero (disabled) or at least three seconds.
 /// Values 1 and 2 are invalid per RFC 4271 §6.2.
@@ -1332,11 +1246,12 @@ impl PeerCodec {
     ) -> Result<u16, ()> {
         let family = &reach.family;
         let nets = &reach.entries;
-        let desc = ATTR_DESCS.get(&Attribute::MP_REACH).unwrap();
         let pos_head = dst.len();
         // always use extended length
-        dst.put_u8(desc.flags | Attribute::FLAG_EXTENDED);
-        dst.put_u8(desc.code);
+        dst.put_u8(
+            Attribute::canonical_flags(Attribute::MP_REACH).unwrap() | Attribute::FLAG_EXTENDED,
+        );
+        dst.put_u8(Attribute::MP_REACH);
         let pos_bin = dst.len();
         dst.put_u16(0);
         dst.put_u16(family.afi());
@@ -1404,11 +1319,12 @@ impl PeerCodec {
     ) -> Result<u16, ()> {
         let family = &unreach.family;
         let nets = &unreach.entries;
-        let desc = ATTR_DESCS.get(&Attribute::MP_UNREACH).unwrap();
         let pos_head = dst.len();
         // always use extended length
-        dst.put_u8(desc.flags | Attribute::FLAG_EXTENDED);
-        dst.put_u8(desc.code);
+        dst.put_u8(
+            Attribute::canonical_flags(Attribute::MP_UNREACH).unwrap() | Attribute::FLAG_EXTENDED,
+        );
+        dst.put_u8(Attribute::MP_UNREACH);
         let pos_bin = dst.len();
         dst.put_u16(0);
         dst.put_u16(family.afi());
@@ -1797,9 +1713,9 @@ impl PeerCodec {
                             v.insert(attr_idx);
                         }
                     }
-                    match ATTR_DESCS.get(&code) {
-                        Some(desc) => {
-                            if (flags ^ desc.flags)
+                    match Attribute::canonical_flags(code) {
+                        Some(expected_flags) => {
+                            if (flags ^ expected_flags)
                                 & (Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL)
                                 > 0
                             {
@@ -1809,8 +1725,7 @@ impl PeerCodec {
                                 continue;
                             } else {
                                 let cur = c.position();
-                                let f = desc.decode;
-                                match f(desc, &mut c, alen) {
+                                match Attribute::decode(code, flags, &mut c, alen) {
                                     Ok(a) => {
                                         if code == Attribute::MP_REACH {
                                             mp_reach_attr = Some(a);
@@ -1832,10 +1747,8 @@ impl PeerCodec {
                         None => {
                             if flags & Attribute::FLAG_OPTIONAL == 0 {
                                 error_withdraw = true;
-                                c.set_position(c.position() + alen as u64);
-                            } else {
-                                c.set_position(c.position() + alen as u64);
                             }
+                            c.set_position(c.position() + alen as u64);
                         }
                     }
                 }
@@ -1953,7 +1866,7 @@ impl PeerCodec {
                             }
                             let na = Attribute {
                                 code: Attribute::NEXTHOP,
-                                flags: ATTR_DESCS.get(&Attribute::NEXTHOP).unwrap().flags,
+                                flags: Attribute::canonical_flags(Attribute::NEXTHOP).unwrap(),
                                 data: AttributeData::Bin(data),
                             };
                             attr.insert(0, na);
