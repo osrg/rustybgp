@@ -69,14 +69,10 @@ fn notification_parse() {
     let buf = bgp_msg(3, body);
     let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
-        Message::Notification {
-            code,
-            subcode,
-            data,
-        } => {
-            assert_eq!(code, 1);
-            assert_eq!(subcode, 2);
-            assert_eq!(data, vec![0x00, 0x13]);
+        Message::Notification(err) => {
+            assert_eq!(err.notification_code(), 1);
+            assert_eq!(err.notification_subcode(), 2);
+            assert_eq!(err.notification_data(), &[0x00u8, 0x13]);
         }
         _ => panic!("expected Notification"),
     }
@@ -89,14 +85,10 @@ fn notification_parse_no_data() {
     let buf = bgp_msg(3, body);
     let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
-        Message::Notification {
-            code,
-            subcode,
-            data,
-        } => {
-            assert_eq!(code, 4);
-            assert_eq!(subcode, 0);
-            assert!(data.is_empty());
+        Message::Notification(err) => {
+            assert_eq!(err.notification_code(), 4);
+            assert_eq!(err.notification_subcode(), 0);
+            assert!(err.notification_data().is_empty());
         }
         _ => panic!("expected Notification"),
     }
@@ -104,20 +96,15 @@ fn notification_parse_no_data() {
 
 #[test]
 fn notification_round_trip() {
-    let original = Message::Notification {
-        code: 3,
-        subcode: 1,
+    // Use BadMessageLength (code=1, subcode=2) which preserves data in BgpError
+    let original = Message::Notification(BgpError::BadMessageLength {
         data: vec![0xDE, 0xAD, 0xBE, 0xEF],
-    };
+    });
     match round_trip(&original) {
-        Message::Notification {
-            code,
-            subcode,
-            data,
-        } => {
-            assert_eq!(code, 3);
-            assert_eq!(subcode, 1);
-            assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        Message::Notification(err) => {
+            assert_eq!(err.notification_code(), 1);
+            assert_eq!(err.notification_subcode(), 2);
+            assert_eq!(err.notification_data(), &[0xDEu8, 0xAD, 0xBE, 0xEF]);
         }
         _ => panic!("expected Notification"),
     }

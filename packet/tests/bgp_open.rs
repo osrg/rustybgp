@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use bytes::BytesMut;
-use rustybgp_packet::bgp::{Capability, Message, PeerCodecBuilder};
+use rustybgp_packet::bgp::{Capability, Message, Open, PeerCodecBuilder};
 use rustybgp_packet::{BgpError, BgpFramer, Family};
 use std::net::Ipv4Addr;
 
@@ -60,13 +60,13 @@ fn open_minimal_parse() {
     let buf = bgp_msg(1, &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &[]));
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
-        Message::Open {
+        Message::Open(Open {
             version,
             as_number,
             holdtime,
             router_id,
             capability,
-        } => {
+        }) => {
             assert_eq!(version, 4);
             assert_eq!(as_number, 65001);
             assert_eq!(holdtime, 90);
@@ -89,7 +89,7 @@ fn open_with_multiprotocol_ipv4() {
 
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
-        Message::Open { capability, .. } => {
+        Message::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
             assert!(matches!(
                 &capability[0],
@@ -112,7 +112,7 @@ fn open_with_multiprotocol_ipv6() {
 
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
-        Message::Open { capability, .. } => {
+        Message::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
             assert!(matches!(
                 &capability[0],
@@ -138,11 +138,11 @@ fn open_with_four_octet_asn() {
 
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
-        Message::Open {
+        Message::Open(Open {
             as_number,
             capability,
             ..
-        } => {
+        }) => {
             // When 2-byte AS = TRANS_ASN, the 4-byte ASN capability provides the real AS
             assert_eq!(as_number, four_byte_asn);
             assert!(
@@ -167,7 +167,7 @@ fn open_with_route_refresh() {
 
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
-        Message::Open { capability, .. } => {
+        Message::Open(Open { capability, .. }) => {
             assert!(
                 capability
                     .iter()
@@ -182,13 +182,13 @@ fn open_with_route_refresh() {
 
 #[test]
 fn open_round_trip_minimal() {
-    let original = Message::Open {
+    let original = Message::Open(Open {
         version: 4,
         as_number: 65001,
         holdtime: 90,
         router_id: "192.0.2.1".parse().unwrap(),
         capability: vec![],
-    };
+    });
 
     let mut framer = BgpFramer::new(default_codec().build());
     let mut buf = BytesMut::new();
@@ -196,13 +196,13 @@ fn open_round_trip_minimal() {
     let parsed = framer.inner_mut().parse_message(&buf).unwrap();
 
     match parsed {
-        Message::Open {
+        Message::Open(Open {
             version,
             as_number,
             holdtime,
             router_id,
             capability,
-        } => {
+        }) => {
             assert_eq!(version, 4);
             assert_eq!(as_number, 65001);
             assert_eq!(holdtime, 90);
@@ -215,7 +215,7 @@ fn open_round_trip_minimal() {
 
 #[test]
 fn open_round_trip_with_capabilities() {
-    let original = Message::Open {
+    let original = Message::Open(Open {
         version: 4,
         as_number: 65001,
         holdtime: 180,
@@ -226,7 +226,7 @@ fn open_round_trip_with_capabilities() {
             Capability::RouteRefresh,
             Capability::FourOctetAsNumber(65001),
         ],
-    };
+    });
 
     let mut framer = BgpFramer::new(default_codec().build());
     let mut buf = BytesMut::new();
@@ -234,12 +234,12 @@ fn open_round_trip_with_capabilities() {
     let parsed = framer.inner_mut().parse_message(&buf).unwrap();
 
     match parsed {
-        Message::Open {
+        Message::Open(Open {
             as_number,
             holdtime,
             capability,
             ..
-        } => {
+        }) => {
             assert_eq!(as_number, 65001);
             assert_eq!(holdtime, 180);
             assert!(
