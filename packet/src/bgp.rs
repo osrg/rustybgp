@@ -348,7 +348,7 @@ pub enum Capability {
     },
     FourOctetAsNumber(u32),
     AddPath(Vec<(Family, u8)>),
-    EnhanshedRouteRefresh,
+    EnhancedRouteRefresh,
     LongLivedGracefulRestart(Vec<(Family, u8, u32)>),
     Fqdn {
         hostname: String,
@@ -384,7 +384,7 @@ impl From<&Capability> for u8 {
             Capability::GracefulRestart { .. } => Capability::GRACEFUL_RESTART,
             Capability::FourOctetAsNumber(_) => Capability::FOUR_OCTET_AS_NUMBER,
             Capability::AddPath(_) => Capability::ADD_PATH,
-            Capability::EnhanshedRouteRefresh => Capability::ENHANCED_ROUTE_REFRESH,
+            Capability::EnhancedRouteRefresh => Capability::ENHANCED_ROUTE_REFRESH,
             Capability::LongLivedGracefulRestart(_) => Capability::LONG_LIVED_GRACEFUL_RESTART,
             Capability::Fqdn { .. } => Capability::FQDN,
             Capability::Unknown { code, bin: _ } => *code,
@@ -439,7 +439,7 @@ impl Capability {
                     c.put_u8(*mode);
                 }
             }
-            Capability::EnhanshedRouteRefresh => {
+            Capability::EnhancedRouteRefresh => {
                 c.put_u8(0);
             }
             Capability::LongLivedGracefulRestart(v) => {
@@ -557,7 +557,7 @@ impl Capability {
                 if len != 0 {
                     return Err(());
                 }
-                Ok(Capability::EnhanshedRouteRefresh)
+                Ok(Capability::EnhancedRouteRefresh)
             }
             Self::LONG_LIVED_GRACEFUL_RESTART => {
                 if len % 7 != 0 {

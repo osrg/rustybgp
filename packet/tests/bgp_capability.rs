@@ -226,13 +226,13 @@ fn capability_add_path_invalid_len() {
 
 #[test]
 fn capability_enhanced_route_refresh_round_trip() {
-    let original = open_with(vec![Capability::EnhanshedRouteRefresh]);
+    let original = open_with(vec![Capability::EnhancedRouteRefresh]);
     match round_trip(&original) {
         Message::Open(Open { capability, .. }) => {
             assert!(
                 capability
                     .iter()
-                    .any(|c| matches!(c, Capability::EnhanshedRouteRefresh))
+                    .any(|c| matches!(c, Capability::EnhancedRouteRefresh))
             );
         }
         _ => panic!("expected OPEN"),

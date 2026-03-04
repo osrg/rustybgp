@@ -124,7 +124,7 @@ impl From<&Capability> for api::Capability {
                         .collect(),
                 })),
             },
-            Capability::EnhanshedRouteRefresh => api::Capability {
+            Capability::EnhancedRouteRefresh => api::Capability {
                 cap: Some(api::capability::Cap::EnhancedRouteRefresh(
                     api::EnhancedRouteRefreshCapability {},
                 )),
