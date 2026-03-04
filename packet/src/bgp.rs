@@ -344,13 +344,23 @@ pub enum Capability {
     RouteRefresh,
     ExtendedNexthop(Vec<(Family, u16)>),
     //    ExtendedMessage,
-    GracefulRestart(u8, u16, Vec<(Family, u8)>),
+    GracefulRestart {
+        flags: u8,
+        restart_time: u16,
+        families: Vec<(Family, u8)>,
+    },
     FourOctetAsNumber(u32),
     AddPath(Vec<(Family, u8)>),
     EnhanshedRouteRefresh,
     LongLivedGracefulRestart(Vec<(Family, u8, u32)>),
-    Fqdn(String, String),
-    Unknown { code: u8, bin: Vec<u8> },
+    Fqdn {
+        hostname: String,
+        domain: String,
+    },
+    Unknown {
+        code: u8,
+        bin: Vec<u8>,
+    },
 }
 
 impl Capability {
@@ -374,12 +384,12 @@ impl From<&Capability> for u8 {
             Capability::MultiProtocol(_) => Capability::MULTI_PROTOCOL,
             Capability::RouteRefresh => Capability::ROUTE_REFRESH,
             Capability::ExtendedNexthop(_) => Capability::EXTENDED_NEXTHOP,
-            Capability::GracefulRestart(..) => Capability::GRACEFUL_RESTART,
+            Capability::GracefulRestart { .. } => Capability::GRACEFUL_RESTART,
             Capability::FourOctetAsNumber(_) => Capability::FOUR_OCTET_AS_NUMBER,
             Capability::AddPath(_) => Capability::ADD_PATH,
             Capability::EnhanshedRouteRefresh => Capability::ENHANCED_ROUTE_REFRESH,
             Capability::LongLivedGracefulRestart(_) => Capability::LONG_LIVED_GRACEFUL_RESTART,
-            Capability::Fqdn(..) => Capability::FQDN,
+            Capability::Fqdn { .. } => Capability::FQDN,
             Capability::Unknown { code, bin: _ } => *code,
         }
     }
@@ -407,10 +417,14 @@ impl Capability {
                     c.put_u16(*afi);
                 }
             }
-            Capability::GracefulRestart(flags, time, v) => {
-                c.put_u8(v.len() as u8 + 2);
-                c.put_u16((*flags as u16) << 12 | *time);
-                for (family, af_flags) in v {
+            Capability::GracefulRestart {
+                flags,
+                restart_time,
+                families,
+            } => {
+                c.put_u8(families.len() as u8 * 4 + 2);
+                c.put_u16((*flags as u16) << 12 | *restart_time);
+                for (family, af_flags) in families {
                     c.put_u16(family.afi());
                     c.put_u8(family.safi());
                     c.put_u8(*af_flags);
@@ -440,11 +454,11 @@ impl Capability {
                     c.put_u32(*time);
                 }
             }
-            Capability::Fqdn(host, domain) => {
-                c.put_u8((2 + host.len() + domain.len()) as u8);
-                c.put_u8(host.len() as u8);
+            Capability::Fqdn { hostname, domain } => {
+                c.put_u8((2 + hostname.len() + domain.len()) as u8);
+                c.put_u8(hostname.len() as u8);
                 c.put_slice(
-                    ascii::AsciiStr::from_ascii(&host.to_ascii_lowercase())
+                    ascii::AsciiStr::from_ascii(&hostname.to_ascii_lowercase())
                         .unwrap()
                         .as_bytes(),
                 );
@@ -510,7 +524,11 @@ impl Capability {
                     let af_flag = c.read_u8().unwrap();
                     v.push((Family(afi << 16 | safi), af_flag));
                 }
-                Ok(Capability::GracefulRestart(flags, time, v))
+                Ok(Capability::GracefulRestart {
+                    flags,
+                    restart_time: time,
+                    families: v,
+                })
             }
             Self::FOUR_OCTET_AS_NUMBER => {
                 if len != 4 {
@@ -574,7 +592,10 @@ impl Capability {
                     d.push(c.read_u8().unwrap());
                 }
                 let domain = ascii::AsciiString::from_ascii(d).unwrap().to_string();
-                Ok(Capability::Fqdn(host, domain))
+                Ok(Capability::Fqdn {
+                    hostname: host,
+                    domain,
+                })
             }
             _ => {
                 let mut bin = Vec::with_capacity(len as usize);
