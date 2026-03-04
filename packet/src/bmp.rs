@@ -180,6 +180,12 @@ pub struct BmpCodec {
     codec: bgp::PeerCodec,
 }
 
+impl Default for BmpCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BmpCodec {
     pub fn new() -> Self {
         BmpCodec {

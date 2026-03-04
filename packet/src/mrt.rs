@@ -112,6 +112,12 @@ pub struct MrtCodec {
     codec: bgp::PeerCodec,
 }
 
+impl Default for MrtCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MrtCodec {
     pub fn new() -> Self {
         MrtCodec {

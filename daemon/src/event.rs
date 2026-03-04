@@ -3390,9 +3390,7 @@ impl Handler {
                 self.state
                     .remote_holdtime
                     .store(holdtime.seconds(), Ordering::Relaxed);
-                self.state
-                    .remote_id
-                    .store(router_id.into(), Ordering::Relaxed);
+                self.state.remote_id.store(router_id, Ordering::Relaxed);
                 let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
                 if remote_asn != 0 && remote_asn != as_number {
                     urgent.insert(

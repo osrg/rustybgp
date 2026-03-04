@@ -487,7 +487,7 @@ impl Capability {
                 Ok(Capability::RouteRefresh)
             }
             Self::EXTENDED_NEXTHOP => {
-                if len % 6 != 0 {
+                if !len.is_multiple_of(6) {
                     return Err(());
                 }
                 let mut v = Vec::new();
@@ -530,7 +530,7 @@ impl Capability {
                 ))
             }
             Self::ADD_PATH => {
-                if len % 4 != 0 {
+                if !len.is_multiple_of(4) {
                     return Err(());
                 }
                 let mut v = Vec::new();
@@ -552,7 +552,7 @@ impl Capability {
                 Ok(Capability::EnhancedRouteRefresh)
             }
             Self::LONG_LIVED_GRACEFUL_RESTART => {
-                if len % 7 != 0 {
+                if !len.is_multiple_of(7) {
                     return Err(());
                 }
                 let mut v = Vec::new();
@@ -1147,6 +1147,12 @@ pub struct PeerCodecBuilder {
     keep_aspath: bool,
     keep_nexthop: bool,
     family: Vec<Family>,
+}
+
+impl Default for PeerCodecBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PeerCodecBuilder {

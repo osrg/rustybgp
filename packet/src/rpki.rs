@@ -147,6 +147,12 @@ impl Message {
 
 pub struct RtrCodec {}
 
+impl Default for RtrCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RtrCodec {
     pub fn new() -> Self {
         RtrCodec {}
