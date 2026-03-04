@@ -2086,14 +2086,12 @@ impl BmpClient {
                     local_port: peer.local_sockaddr.port(),
                     remote_port: peer.remote_sockaddr.port(),
                     remote_open: bgp::Message::Open(bgp::Open {
-                        version: 4,
                         as_number: peer.state.remote_asn.load(Ordering::Relaxed),
                         holdtime: peer.state.remote_holdtime.load(Ordering::Relaxed),
                         router_id: u32::from(remote_id),
                         capability: peer.state.remote_cap.read().await.to_owned(),
                     }),
                     local_open: bgp::Message::Open(bgp::Open {
-                        version: 4,
                         as_number: peer.local_asn,
                         holdtime: peer.holdtime as u16,
                         router_id: u32::from(local_id),
@@ -3382,7 +3380,6 @@ impl Handler {
     ) -> std::result::Result<(), Error> {
         match msg {
             bgp::Message::Open(bgp::Open {
-                version: _,
                 as_number,
                 holdtime,
                 router_id,
@@ -3528,7 +3525,6 @@ impl Handler {
                                     local_port: local_sockaddr.port(),
                                     remote_port: remote_sockaddr.port(),
                                     remote_open: bgp::Message::Open(bgp::Open {
-                                        version: 4,
                                         as_number: remote_asn,
                                         holdtime: self
                                             .state
@@ -3538,7 +3534,6 @@ impl Handler {
                                         capability: self.state.remote_cap.read().await.to_owned(),
                                     }),
                                     local_open: bgp::Message::Open(bgp::Open {
-                                        version: 4,
                                         as_number: remote_asn,
                                         holdtime: self
                                             .state
@@ -3597,7 +3592,6 @@ impl Handler {
 
         let mut pending_update: FnvHashMap<Family, PendingTx> = FnvHashMap::default();
         let mut urgent = vec![bgp::Message::Open(bgp::Open {
-            version: 4,
             as_number: self.local_asn,
             holdtime: self.local_holdtime as u16,
             router_id: u32::from(self.local_router_id),

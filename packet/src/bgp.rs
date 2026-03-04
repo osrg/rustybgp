@@ -1067,7 +1067,6 @@ static ATTR_DESCS: Lazy<FnvHashMap<u8, AttrDesc>> = Lazy::new(|| {
 /// BGP OPEN message body (RFC 4271 §4.2).
 #[derive(Clone)]
 pub struct Open {
-    pub version: u8,
     pub as_number: u32,
     pub holdtime: u16,
     /// BGP Identifier (RFC 6286): a 32-bit value, not necessarily a valid IPv4 address.
@@ -1430,7 +1429,6 @@ impl PeerCodec {
 
         match item {
             Message::Open(Open {
-                version,
                 as_number,
                 holdtime,
                 router_id,
@@ -1442,7 +1440,7 @@ impl PeerCodec {
                     *as_number as u16
                 };
                 dst.put_u8(Message::OPEN);
-                dst.put_u8(*version);
+                dst.put_u8(4); // BGP version is always 4
                 dst.put_u16(trans_asn);
                 dst.put_u16(*holdtime);
                 dst.put_u32(*router_id);
@@ -1631,6 +1629,10 @@ impl PeerCodec {
                 let mut c = Cursor::new(&buf);
                 c.set_position(Message::HEADER_LENGTH.into());
                 let version = c.read_u8().unwrap();
+                // BGP version must be 4 (RFC 4271 §4.2)
+                if version != 4 {
+                    return Err(BgpError::OpenMalformed.into());
+                }
                 let mut as_number = c.read_u16::<NetworkEndian>().unwrap() as u32;
                 let holdtime = c.read_u16::<NetworkEndian>().unwrap();
                 let router_id = c.read_u32::<NetworkEndian>().unwrap();
@@ -1699,7 +1701,6 @@ impl PeerCodec {
                 }
 
                 Ok(Message::Open(Open {
-                    version,
                     as_number,
                     holdtime,
                     router_id,

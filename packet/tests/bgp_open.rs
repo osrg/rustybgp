@@ -61,13 +61,11 @@ fn open_minimal_parse() {
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
         Message::Open(Open {
-            version,
             as_number,
             holdtime,
             router_id,
             capability,
         }) => {
-            assert_eq!(version, 4);
             assert_eq!(as_number, 65001);
             assert_eq!(holdtime, 90);
             assert_eq!(
@@ -186,7 +184,6 @@ fn open_with_route_refresh() {
 #[test]
 fn open_round_trip_minimal() {
     let original = Message::Open(Open {
-        version: 4,
         as_number: 65001,
         holdtime: 90,
         router_id: u32::from("192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()),
@@ -200,13 +197,11 @@ fn open_round_trip_minimal() {
 
     match parsed {
         Message::Open(Open {
-            version,
             as_number,
             holdtime,
             router_id,
             capability,
         }) => {
-            assert_eq!(version, 4);
             assert_eq!(as_number, 65001);
             assert_eq!(holdtime, 90);
             assert_eq!(
@@ -222,7 +217,6 @@ fn open_round_trip_minimal() {
 #[test]
 fn open_round_trip_with_capabilities() {
     let original = Message::Open(Open {
-        version: 4,
         as_number: 65001,
         holdtime: 180,
         router_id: u32::from("10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()),
