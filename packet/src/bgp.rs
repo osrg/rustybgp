@@ -456,17 +456,9 @@ impl Capability {
             Capability::Fqdn { hostname, domain } => {
                 c.put_u8((2 + hostname.len() + domain.len()) as u8);
                 c.put_u8(hostname.len() as u8);
-                c.put_slice(
-                    ascii::AsciiStr::from_ascii(&hostname.to_ascii_lowercase())
-                        .unwrap()
-                        .as_bytes(),
-                );
+                c.put_slice(hostname.to_ascii_lowercase().as_bytes());
                 c.put_u8(domain.len() as u8);
-                c.put_slice(
-                    ascii::AsciiStr::from_ascii(&domain.to_ascii_lowercase())
-                        .unwrap()
-                        .as_bytes(),
-                );
+                c.put_slice(domain.to_ascii_lowercase().as_bytes());
             }
             Capability::Unknown { code: _, bin } => {
                 c.put_u8(bin.len() as u8);
@@ -584,13 +576,13 @@ impl Capability {
                 for _ in 0..hostlen {
                     h.push(c.read_u8().unwrap());
                 }
-                let host = ascii::AsciiString::from_ascii(h).unwrap().to_string();
+                let host = String::from_utf8(h).unwrap_or_default();
                 let domainlen = c.read_u8().unwrap();
                 let mut d = Vec::new();
                 for _ in 0..domainlen {
                     d.push(c.read_u8().unwrap());
                 }
-                let domain = ascii::AsciiString::from_ascii(d).unwrap().to_string();
+                let domain = String::from_utf8(d).unwrap_or_default();
                 Ok(Capability::Fqdn {
                     hostname: host,
                     domain,
