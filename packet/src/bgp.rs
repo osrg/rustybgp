@@ -1172,7 +1172,11 @@ pub fn create_channel(
                 f,
                 Channel {
                     family: f,
-                    addpath: u8::from(lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0),
+                    addpath: {
+                        let rx = u8::from(lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0);
+                        let tx = u8::from(lc.addpath & 0x2 > 0 && rc.addpath & 0x1 > 0);
+                        rx | (tx << 1)
+                    },
                     extended_nexthop: lc.extended_nexthop & rc.extended_nexthop,
                 },
             )
