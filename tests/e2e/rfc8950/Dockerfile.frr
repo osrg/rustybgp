@@ -25,7 +25,9 @@ RUN addgroup -S frr && adduser -S -G frr frr && \
     addgroup -S frrvty && adduser frr frrvty
 
 ARG FRR_VERSION=10.2.1
+ARG FRR_SHA256=6cbf142d0b12fb8679f5dc95f7638ba6faf848a44f38fd45bf9caeee8c12097c
 ADD https://github.com/FRRouting/frr/archive/refs/tags/frr-${FRR_VERSION}.tar.gz /tmp/frr.tar.gz
+RUN echo "${FRR_SHA256}  /tmp/frr.tar.gz" | sha256sum -c -
 RUN tar xzf /tmp/frr.tar.gz -C /tmp && mv /tmp/frr-frr-${FRR_VERSION} /tmp/frr
 
 WORKDIR /tmp/frr
