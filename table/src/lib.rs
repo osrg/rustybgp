@@ -207,6 +207,10 @@ impl Destination {
     fn new() -> Self {
         Destination { entry: Vec::new() }
     }
+
+    fn unfiltered_best(&self) -> Option<&Path> {
+        self.entry.iter().find(|p| !p.is_filtered())
+    }
 }
 
 #[derive(Default, Clone, Debug)]
@@ -352,13 +356,14 @@ impl RoutingTable {
             Some(t) => {
                 let mut v = Vec::with_capacity(t.len());
                 for (n, dst) in t {
-                    let r = &dst.entry[0];
-                    v.push(Change {
-                        source: r.source.clone(),
-                        family: *family,
-                        net: *n,
-                        attr: r.pa.attr.clone(),
-                    });
+                    if let Some(r) = dst.unfiltered_best() {
+                        v.push(Change {
+                            source: r.source.clone(),
+                            family: *family,
+                            net: *n,
+                            attr: r.pa.attr.clone(),
+                        });
+                    }
                 }
                 v
             }
@@ -527,9 +532,7 @@ impl RoutingTable {
 
         // Remember the old unfiltered best before any modification
         let old_best = dst
-            .entry
-            .iter()
-            .find(|p| !p.is_filtered())
+            .unfiltered_best()
             .map(|p| (p.source.clone(), p.pa.attr.clone()));
 
         for i in 0..dst.entry.len() {
@@ -562,11 +565,11 @@ impl RoutingTable {
         dst.entry.insert(idx, path);
 
         // Check if the unfiltered best path changed
-        let Some(best) = dst.entry.iter().find(|p| !p.is_filtered()) else {
+        let Some(best) = dst.unfiltered_best() else {
             // All paths are filtered; withdraw if there was a previous unfiltered best
-            if old_best.is_some() {
+            if let Some((old_source, _)) = old_best {
                 return Some(Change {
-                    source,
+                    source: old_source,
                     family,
                     net,
                     attr: Arc::new(Vec::new()),
@@ -601,44 +604,66 @@ impl RoutingTable {
     ) -> Option<Change> {
         let rt = self.global.get_mut(&family)?;
         let dst = rt.get_mut(&net)?;
-        let mut was_best = true;
-        for i in 0..dst.entry.len() {
-            if Arc::ptr_eq(&dst.entry[i].source, &source) && dst.entry[i].id == remote_id {
-                let (received, accepted) = self
-                    .route_stats
-                    .get_mut(&source.remote_addr)
-                    .unwrap()
-                    .get_mut(&family)
-                    .unwrap();
-                *received -= 1;
-                if !dst.entry.remove(i).is_filtered() {
-                    *accepted -= 1;
-                }
 
-                if dst.entry.is_empty() {
-                    rt.remove(&net);
-                    // withdraw
-                    return Some(Change {
-                        source: source.clone(),
-                        family,
-                        net,
-                        attr: Arc::new(Vec::new()),
-                    });
-                }
-                if was_best {
-                    let best = &dst.entry[0];
-                    return Some(Change {
-                        source: best.source.clone(),
-                        family,
-                        net,
-                        attr: best.pa.attr.clone(),
-                    });
-                }
-                break;
+        let i = dst
+            .entry
+            .iter()
+            .position(|e| Arc::ptr_eq(&e.source, &source) && e.id == remote_id)?;
+
+        let old_best = dst
+            .unfiltered_best()
+            .map(|p| (p.source.clone(), p.pa.attr.clone()));
+
+        let (received, accepted) = self
+            .route_stats
+            .get_mut(&source.remote_addr)
+            .unwrap()
+            .get_mut(&family)
+            .unwrap();
+        *received -= 1;
+        if !dst.entry.remove(i).is_filtered() {
+            *accepted -= 1;
+        }
+
+        if dst.entry.is_empty() {
+            rt.remove(&net);
+            if let Some((old_source, _)) = old_best {
+                return Some(Change {
+                    source: old_source,
+                    family,
+                    net,
+                    attr: Arc::new(Vec::new()),
+                });
             }
-            if was_best && !dst.entry[i].is_filtered() {
-                was_best = false;
+            return None;
+        }
+
+        let Some(best) = dst.unfiltered_best() else {
+            // All remaining paths are filtered
+            if let Some((old_source, _)) = old_best {
+                return Some(Change {
+                    source: old_source,
+                    family,
+                    net,
+                    attr: Arc::new(Vec::new()),
+                });
             }
+            return None;
+        };
+
+        let changed = match &old_best {
+            Some((old_source, old_attr)) => {
+                !Arc::ptr_eq(old_source, &best.source) || !Arc::ptr_eq(old_attr, &best.pa.attr)
+            }
+            None => true,
+        };
+        if changed {
+            return Some(Change {
+                source: best.source.clone(),
+                family,
+                net,
+                attr: best.pa.attr.clone(),
+            });
         }
         None
     }
@@ -648,12 +673,39 @@ impl RoutingTable {
         self.route_stats.remove(&source.remote_addr);
         for (family, rt) in self.global.iter_mut() {
             rt.retain(|net, dst| {
-                for i in 0..dst.entry.len() {
-                    let e = &dst.entry[i];
-                    if Arc::ptr_eq(&e.source, &source) {
-                        dst.entry.remove(i);
-                        if i == 0 && !dst.entry.is_empty() {
-                            let best = &dst.entry[0];
+                let old_best = dst
+                    .unfiltered_best()
+                    .map(|p| (p.source.clone(), p.pa.attr.clone()));
+
+                dst.entry.retain(|e| !Arc::ptr_eq(&e.source, &source));
+
+                if dst.entry.is_empty() {
+                    if old_best.is_some() {
+                        advertise.push(Change {
+                            source: source.clone(),
+                            family: *family,
+                            net: *net,
+                            attr: Arc::new(Vec::new()),
+                        });
+                    }
+                    return false;
+                }
+
+                let new_best = dst.unfiltered_best();
+                match (&old_best, new_best) {
+                    (Some((old_source, _)), None) => {
+                        // Had unfiltered best, now all filtered → withdraw
+                        advertise.push(Change {
+                            source: old_source.clone(),
+                            family: *family,
+                            net: *net,
+                            attr: Arc::new(Vec::new()),
+                        });
+                    }
+                    (Some((old_source, old_attr)), Some(best)) => {
+                        if !Arc::ptr_eq(old_source, &best.source)
+                            || !Arc::ptr_eq(old_attr, &best.pa.attr)
+                        {
                             advertise.push(Change {
                                 source: best.source.clone(),
                                 family: *family,
@@ -661,18 +713,10 @@ impl RoutingTable {
                                 attr: best.pa.attr.clone(),
                             });
                         }
-                        break;
                     }
+                    _ => {}
                 }
-                if dst.entry.is_empty() {
-                    advertise.push(Change {
-                        source: source.clone(),
-                        family: *family,
-                        net: *net,
-                        attr: Arc::new(Vec::new()),
-                    });
-                }
-                !dst.entry.is_empty()
+                true
             });
         }
         advertise
@@ -2467,5 +2511,162 @@ mod tests {
         let change = rt.insert(s1, Family::IPV4, net, 0, empty_attrs(), true);
         let change = change.expect("should return withdrawal Change");
         assert!(change.attr.is_empty());
+    }
+
+    #[test]
+    fn withdraw_source_is_old_best() {
+        // When all paths become filtered, the withdrawal source must be the
+        // old unfiltered best's source, not the inserting peer's source.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        // s1 is unfiltered best
+        rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        // s2 inserts a filtered path
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), true);
+        // s1 gets replaced as filtered → all filtered → withdrawal
+        let change = rt
+            .insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), true)
+            .expect("should return withdrawal");
+        assert!(change.attr.is_empty());
+        // withdrawal source must be s1 (old best), not the inserting peer
+        assert!(Arc::ptr_eq(&change.source, &s1));
+    }
+
+    // --- best() with filtered head ---
+
+    #[test]
+    fn best_skips_filtered_paths() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // filtered path (better router_id)
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            true,
+        );
+        // unfiltered path
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        let bests = rt.best(&Family::IPV4);
+        assert_eq!(bests.len(), 1);
+        assert!(Arc::ptr_eq(&bests[0].source, &s2));
+    }
+
+    #[test]
+    fn best_skips_all_filtered_destination() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            true,
+        );
+        let bests = rt.best(&Family::IPV4);
+        assert!(bests.is_empty());
+    }
+
+    // --- remove() with filtered head ---
+
+    #[test]
+    fn remove_best_with_filtered_head() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let attrs = attrs_with_local_pref(100);
+        // filtered at head
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            attrs.clone(),
+            true,
+        );
+        // unfiltered best (router_id=2)
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, attrs.clone(), false);
+        // unfiltered non-best (router_id=3)
+        let s3 = source(3, 65003, 65000, 3);
+        rt.insert(s3.clone(), Family::IPV4, net, 0, attrs.clone(), false);
+        // remove s2 (best) → s3 becomes new best
+        let change = rt
+            .remove(s2, Family::IPV4, net, 0)
+            .expect("should return new best");
+        assert!(Arc::ptr_eq(&change.source, &s3));
+        assert!(!change.attr.is_empty());
+    }
+
+    #[test]
+    fn remove_last_unfiltered_withdraws() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // filtered path
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            true,
+        );
+        // only unfiltered path
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        // remove s2 → all filtered → withdrawal
+        let change = rt
+            .remove(s2, Family::IPV4, net, 0)
+            .expect("should return withdrawal");
+        assert!(change.attr.is_empty());
+    }
+
+    // --- drop() with filtered head ---
+
+    #[test]
+    fn drop_best_with_filtered_head() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let attrs = attrs_with_local_pref(100);
+        // filtered at head
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            attrs.clone(),
+            true,
+        );
+        // unfiltered best
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, attrs.clone(), false);
+        // unfiltered non-best
+        let s3 = source(3, 65003, 65000, 3);
+        rt.insert(s3.clone(), Family::IPV4, net, 0, attrs.clone(), false);
+        // drop s2 → s3 becomes new best
+        let changes = rt.drop(s2);
+        assert_eq!(changes.len(), 1);
+        assert!(Arc::ptr_eq(&changes[0].source, &s3));
+        assert!(!changes[0].attr.is_empty());
+    }
+
+    #[test]
+    fn drop_filtered_no_change() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // filtered path from s1
+        let s1 = source(1, 65001, 65000, 1);
+        rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), true);
+        // unfiltered best from s2
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s2, Family::IPV4, net, 0, empty_attrs(), false);
+        // drop s1 (filtered) → no best change
+        let changes = rt.drop(s1);
+        assert!(changes.is_empty());
     }
 }
