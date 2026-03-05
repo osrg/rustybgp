@@ -252,7 +252,7 @@ struct PeerBuilder {
     ctrl_channel: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
     multihop_ttl: Option<u8>,
     password: Option<String>,
-    families: FnvHashMap<Family, bool>,
+    families: FnvHashMap<Family, u8>,
 }
 
 impl PeerBuilder {
@@ -289,7 +289,7 @@ impl PeerBuilder {
 
     fn families(&mut self, families: Vec<Family>) -> &mut Self {
         for f in families {
-            self.families.insert(f, false);
+            self.families.insert(f, 0);
         }
         self
     }
@@ -372,9 +372,9 @@ impl PeerBuilder {
         self
     }
 
-    fn addpath(&mut self, families: Vec<packet::Family>) -> &mut Self {
-        for f in families {
-            self.families.insert(f, true);
+    fn addpath(&mut self, families: Vec<(packet::Family, u8)>) -> &mut Self {
+        for (f, mode) in families {
+            self.families.insert(f, mode);
         }
         self
     }
@@ -387,9 +387,9 @@ impl PeerBuilder {
             });
         } else {
             let mut addpath = Vec::new();
-            for (f, v) in &self.families {
-                if *v {
-                    addpath.push((*f, 1));
+            for (f, mode) in &self.families {
+                if *mode > 0 {
+                    addpath.push((*f, *mode));
                 }
                 self.local_cap.push(packet::Capability::MultiProtocol(*f));
             }
@@ -609,7 +609,7 @@ impl From<&config::Neighbor> for Peer {
     fn from(n: &config::Neighbor) -> Peer {
         let c = n.config.as_ref().unwrap();
         let mut families = Vec::new();
-        let addpath_families: Vec<packet::Family> = n
+        let addpath_families: Vec<(packet::Family, u8)> = n
             .afi_safis
             .as_ref()
             .map_or(Vec::new().iter(), |x| x.iter())
@@ -629,19 +629,23 @@ impl From<&config::Neighbor> for Peer {
                 })
             })
             .filter_map(|x| {
-                x.add_paths.as_ref().and_then(|c| {
-                    c.config.as_ref().and_then(|c| {
-                        c.receive.as_ref().and_then(|r| {
-                            if *r {
-                                Some(x.config.as_ref().unwrap().afi_safi_name.as_ref().unwrap())
-                            } else {
-                                None
-                            }
-                        })
+                x.add_paths.as_ref().and_then(|ap| {
+                    ap.config.as_ref().and_then(|c| {
+                        let rx = c.receive.unwrap_or(false);
+                        let tx = c.send_max.unwrap_or(0) > 0;
+                        let mode = u8::from(rx) | (u8::from(tx) << 1);
+                        if mode > 0 {
+                            let family = convert::family_from_config(
+                                x.config.as_ref()?.afi_safi_name.as_ref()?,
+                            )
+                            .ok()?;
+                            Some((family, mode))
+                        } else {
+                            None
+                        }
                     })
                 })
             })
-            .map(|x| convert::family_from_config(x).unwrap())
             .collect();
         let mut builder = PeerBuilder::new(c.neighbor_address.as_ref().unwrap().parse().unwrap());
         builder
