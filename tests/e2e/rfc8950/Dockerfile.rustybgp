@@ -28,10 +28,13 @@ RUN chmod +x /usr/local/bin/rustybgpd
 # Install gobgp CLI for route injection via gRPC
 ARG GOBGP_VERSION=4.3.0
 RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then GOARCH=amd64; \
-    elif [ "$ARCH" = "aarch64" ]; then GOARCH=arm64; \
+    if [ "$ARCH" = "x86_64" ]; then GOARCH=amd64; HASH="06f8fa5cc15aa306ff9b3e266beb4da4eb51ea92c9c7d6586846fdbd3ce40f18"; \
+    elif [ "$ARCH" = "aarch64" ]; then GOARCH=arm64; HASH="5d31b27d488f4f2230c2807fd540693316d192354702522afd562b2b9c54d9e7"; \
     else echo "unsupported arch: $ARCH" && exit 1; fi && \
     curl -sL "https://github.com/osrg/gobgp/releases/download/v${GOBGP_VERSION}/gobgp_${GOBGP_VERSION}_linux_${GOARCH}.tar.gz" \
-    | tar xz -C /usr/local/bin gobgp
+    -o /tmp/gobgp.tar.gz && \
+    echo "${HASH}  /tmp/gobgp.tar.gz" | sha256sum -c - && \
+    tar xz -C /usr/local/bin gobgp < /tmp/gobgp.tar.gz && \
+    rm /tmp/gobgp.tar.gz
 
 ENTRYPOINT ["/entrypoint.sh"]
