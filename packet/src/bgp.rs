@@ -1516,10 +1516,8 @@ impl PeerCodec {
                 // Locally-originated routes may lack AS_PATH; create one
                 // with the local ASN prepended. Skip for End-of-RIB markers
                 // (empty UPDATEs with no NLRI).
-                let has_nlri = reach
-                    .as_ref()
-                    .is_some_and(|r| !r.entries.is_empty())
-                    || mp_reach.is_some();
+                let has_nlri =
+                    reach.as_ref().is_some_and(|r| !r.entries.is_empty()) || mp_reach.is_some();
                 if !has_as_path && has_nlri {
                     let empty = Attribute::empty_as_path();
                     let (n, _) = empty.export(Attribute::AS_PATH, Some(dst), attr_family, self);
