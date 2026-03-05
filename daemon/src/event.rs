@@ -3761,7 +3761,8 @@ impl Handler {
                         }
 
                         for (family, p) in &mut pending_update {
-                            let unreach: Vec<packet::PathNlri> = p.unreach.drain().map(packet::PathNlri::new).collect();
+                            let addpath_tx = framer.inner().channel.get(family).is_some_and(|c| c.addpath_tx());
+                            let unreach: Vec<packet::PathNlri> = p.unreach.drain().map(|nlri| packet::PathNlri { path_id: if addpath_tx { 1 } else { 0 }, nlri }).collect();
                             if !unreach.is_empty() {
                                 txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                                 let msg = bgp::Message::Update(bgp::Update {
@@ -3783,8 +3784,9 @@ impl Handler {
                         let max_tx_count = 2048;
                         let mut sent = FnvHashMap::default();
                         for (family, p) in &mut pending_update {
+                            let addpath_tx = framer.inner().channel.get(family).is_some_and(|c| c.addpath_tx());
                             for (attr, reach) in p.bucket.iter() {
-                                let nlri_set = packet::NlriSet { family: *family, entries: reach.iter().copied().map(packet::PathNlri::new).collect() };
+                                let nlri_set = packet::NlriSet { family: *family, entries: reach.iter().copied().map(|nlri| packet::PathNlri { path_id: if addpath_tx { 1 } else { 0 }, nlri }).collect() };
                                 // RFC 8950: use MP_REACH_NLRI for IPv4 when extended nexthop is negotiated
                                 let use_mp = framer.inner().channel.get(family).is_some_and(|c| c.extended_nexthop());
                                 let msg = if use_mp {
