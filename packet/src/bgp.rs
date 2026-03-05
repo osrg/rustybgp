@@ -1271,7 +1271,10 @@ impl PeerCodec {
     ) -> Result<u16, ()> {
         let family = &reach.family;
         let nets = &reach.entries;
-        let is_extended = self.channel.get(family).is_some_and(|c| c.extended_nexthop());
+        let is_extended = self
+            .channel
+            .get(family)
+            .is_some_and(|c| c.extended_nexthop());
         // RFC 8950: extended nexthop requires IPv6 local address
         assert!(
             !is_extended || matches!(self.local_addr, IpAddr::V6(_)) || self.keep_nexthop,

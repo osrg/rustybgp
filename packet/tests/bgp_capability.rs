@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustybgp_packet::bgp::{create_channel, Capability, Message, Open, PeerCodecBuilder};
+use rustybgp_packet::bgp::{Capability, Message, Open, PeerCodecBuilder, create_channel};
 use rustybgp_packet::{BgpError, BgpFramer, Family, HoldTime};
 use std::net::Ipv4Addr;
 
