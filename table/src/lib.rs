@@ -443,11 +443,15 @@ impl RoutingTable {
                     .entry
                     .iter()
                     .enumerate()
-                    .filter(|(i, p)| {
+                    .filter(|(_, p)| {
                         if table_type == TableType::AdjIn {
                             return p.source.remote_addr == peer_addr.unwrap();
                         } else if table_type == TableType::AdjOut {
-                            return *i == 0 && p.source.remote_addr != peer_addr.unwrap();
+                            if let Some(best) = dst.unfiltered_best() {
+                                return std::ptr::eq(p as &Path, best)
+                                    && p.source.remote_addr != peer_addr.unwrap();
+                            }
+                            return false;
                         }
                         true
                     })
@@ -2668,5 +2672,58 @@ mod tests {
         // drop s1 (filtered) → no best change
         let changes = rt.drop(s1);
         assert!(changes.is_empty());
+    }
+
+    // --- iter_destinations AdjOut with filtered head ---
+
+    #[test]
+    fn adj_out_skips_filtered_head() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let attrs = attrs_with_local_pref(100);
+        // filtered path with better router_id → sorts at index 0
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            attrs.clone(),
+            true,
+        );
+        // unfiltered path → should be the AdjOut best
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, attrs.clone(), false);
+
+        // peer_addr=10.0.0.99 (different from both sources)
+        let peer_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)));
+        let dsts: Vec<_> = rt
+            .iter_destinations(TableType::AdjOut, Family::IPV4, peer_addr, vec![], None)
+            .collect();
+        assert_eq!(dsts.len(), 1);
+        assert_eq!(dsts[0].paths.len(), 1);
+        // attr should be non-empty (not a withdrawal / not filtered path)
+        assert!(!dsts[0].paths[0].attr.is_empty());
+    }
+
+    #[test]
+    fn adj_out_skips_all_filtered_destination() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // only filtered paths
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            attrs_with_local_pref(100),
+            true,
+        );
+
+        let peer_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)));
+        let dsts: Vec<_> = rt
+            .iter_destinations(TableType::AdjOut, Family::IPV4, peer_addr, vec![], None)
+            .collect();
+        // no unfiltered best → destination should be filtered out
+        assert!(dsts.is_empty());
     }
 }
