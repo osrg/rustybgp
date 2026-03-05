@@ -306,8 +306,6 @@ fn capability_llgr_round_trip() {
 
 // ─── create_channel negotiation ──────────────────────────────────────────────
 
-use rustybgp_packet::bgp::create_channel;
-
 #[test]
 fn create_channel_addpath_rx_only() {
     // Local wants RX (1), remote can TX (2) → local channel gets RX

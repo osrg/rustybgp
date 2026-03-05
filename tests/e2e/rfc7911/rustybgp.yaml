@@ -1,0 +1,25 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.5.1"
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.5.2"
+      peer-as: 65002
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+        add-paths:
+          config:
+            receive: true
+
+  - config:
+      neighbor-address: "172.30.6.2"
+      peer-as: 65003
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+        add-paths:
+          config:
+            send-max: 1

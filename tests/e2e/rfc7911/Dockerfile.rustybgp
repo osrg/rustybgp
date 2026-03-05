@@ -1,0 +1,36 @@
+# Stage 1: Build rustybgpd statically linked binary
+ARG RUST_TARGET=aarch64-unknown-linux-musl
+FROM ghcr.io/rust-cross/rust-musl-cross:${RUST_TARGET} AS builder
+
+ARG RUST_TARGET=aarch64-unknown-linux-musl
+
+# Install protobuf compiler (required by tonic-build)
+RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /home/rust/src
+COPY . .
+
+RUN cargo build --release --target ${RUST_TARGET}
+
+# Stage 2: Minimal runtime
+FROM alpine:latest
+
+ARG RUST_TARGET=aarch64-unknown-linux-musl
+
+RUN apk add --no-cache iproute2 bash curl
+
+COPY --from=builder \
+    /home/rust/src/target/${RUST_TARGET}/release/rustybgpd \
+    /usr/local/bin/rustybgpd
+RUN chmod +x /usr/local/bin/rustybgpd
+
+# Install gobgp CLI for route injection via gRPC
+ARG GOBGP_VERSION=4.3.0
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then GOARCH=amd64; \
+    elif [ "$ARCH" = "aarch64" ]; then GOARCH=arm64; \
+    else echo "unsupported arch: $ARCH" && exit 1; fi && \
+    curl -sL "https://github.com/osrg/gobgp/releases/download/v${GOBGP_VERSION}/gobgp_${GOBGP_VERSION}_linux_${GOARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin gobgp
+
+ENTRYPOINT ["/entrypoint.sh"]
