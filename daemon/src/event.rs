@@ -396,6 +396,20 @@ impl PeerBuilder {
             if !addpath.is_empty() {
                 self.local_cap.push(packet::Capability::AddPath(addpath));
             }
+            // RFC 8950: advertise ExtendedNexthop when peering over IPv6
+            // with IPv4 address family configured
+            if matches!(self.remote_addr, IpAddr::V6(_)) {
+                let enh_families: Vec<(Family, u16)> = self
+                    .families
+                    .keys()
+                    .filter(|f| f.afi() == Family::AFI_IP)
+                    .map(|f| (*f, Family::AFI_IP6))
+                    .collect();
+                if !enh_families.is_empty() {
+                    self.local_cap
+                        .push(packet::Capability::ExtendedNexthop(enh_families));
+                }
+            }
         }
         Peer {
             remote_addr: self.remote_addr,
