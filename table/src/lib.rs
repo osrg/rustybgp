@@ -374,11 +374,19 @@ impl RoutingTable {
     pub fn state(&self, family: Family) -> RoutingTableState {
         match self.global.get(&family) {
             Some(t) => {
-                let num_path = t.values().flat_map(|x| x.entry.iter()).count();
+                let entries = t.values().flat_map(|x| x.entry.iter());
+                let mut num_path = 0;
+                let mut num_accepted = 0;
+                for p in entries {
+                    num_path += 1;
+                    if !p.is_filtered() {
+                        num_accepted += 1;
+                    }
+                }
                 RoutingTableState {
                     num_destination: t.len(),
                     num_path,
-                    num_accepted: num_path,
+                    num_accepted,
                 }
             }
 
@@ -439,74 +447,73 @@ impl RoutingTable {
             })
             .map(move |(net, dst)| DestinationEntry {
                 net: *net,
-                paths: dst
-                    .entry
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| {
-                        if table_type == TableType::AdjIn {
-                            return p.source.remote_addr == peer_addr.unwrap();
-                        } else if table_type == TableType::AdjOut {
-                            if let Some(best) = dst.unfiltered_best() {
-                                return std::ptr::eq(p as &Path, best)
+                paths: {
+                    let best = dst.unfiltered_best().map(|p| p as *const Path);
+                    dst.entry
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            if table_type == TableType::AdjIn {
+                                return p.source.remote_addr == peer_addr.unwrap();
+                            } else if table_type == TableType::AdjOut {
+                                return best == Some(*p as *const Path)
                                     && p.source.remote_addr != peer_addr.unwrap();
                             }
-                            return false;
-                        }
-                        true
-                    })
-                    .filter_map(|(_, p)| {
-                        if table_type == TableType::AdjOut {
-                            let codec = bgp::PeerCodecBuilder::new()
-                                .local_asn(p.source.local_asn)
-                                .local_addr(p.source.local_addr)
-                                .keep_aspath(p.source.rs_client)
-                                .keep_nexthop(p.source.rs_client)
-                                .build();
-                            let attr = Arc::new(
-                                p.pa.attr
-                                    .iter()
-                                    .cloned()
-                                    .map(|a| {
-                                        let (_, m) = a.export(
-                                            a.code(),
-                                            None::<&mut BytesMut>,
-                                            family,
-                                            &codec,
-                                        );
-                                        if let Some(m) = m { m } else { a }
-                                    })
-                                    .collect::<Vec<packet::Attribute>>(),
-                            );
-                            if let Some(pa) = &export_policy {
-                                if self.apply_policy(pa, &p.source, net, &attr)
-                                    == Disposition::Reject
-                                {
-                                    None
+                            true
+                        })
+                        .filter_map(|(_, p)| {
+                            if table_type == TableType::AdjOut {
+                                let codec = bgp::PeerCodecBuilder::new()
+                                    .local_asn(p.source.local_asn)
+                                    .local_addr(p.source.local_addr)
+                                    .keep_aspath(p.source.rs_client)
+                                    .keep_nexthop(p.source.rs_client)
+                                    .build();
+                                let attr = Arc::new(
+                                    p.pa.attr
+                                        .iter()
+                                        .cloned()
+                                        .map(|a| {
+                                            let (_, m) = a.export(
+                                                a.code(),
+                                                None::<&mut BytesMut>,
+                                                family,
+                                                &codec,
+                                            );
+                                            if let Some(m) = m { m } else { a }
+                                        })
+                                        .collect::<Vec<packet::Attribute>>(),
+                                );
+                                if let Some(pa) = &export_policy {
+                                    if self.apply_policy(pa, &p.source, net, &attr)
+                                        == Disposition::Reject
+                                    {
+                                        None
+                                    } else {
+                                        Some((p, attr))
+                                    }
                                 } else {
                                     Some((p, attr))
                                 }
                             } else {
-                                Some((p, attr))
+                                Some((p, p.pa.attr.clone()))
                             }
-                        } else {
-                            Some((p, p.pa.attr.clone()))
-                        }
-                    })
-                    .map(|(p, attr)| {
-                        let validation = self.rpki.validate(family, &p.source, net, &attr);
-                        PathEntry {
-                            id: if table_type == TableType::AdjOut {
-                                0
-                            } else {
-                                p.id
-                            },
-                            timestamp: p.timestamp,
-                            attr,
-                            validation,
-                        }
-                    })
-                    .collect(),
+                        })
+                        .map(|(p, attr)| {
+                            let validation = self.rpki.validate(family, &p.source, net, &attr);
+                            PathEntry {
+                                id: if table_type == TableType::AdjOut {
+                                    0
+                                } else {
+                                    p.id
+                                },
+                                timestamp: p.timestamp,
+                                attr,
+                                validation,
+                            }
+                        })
+                        .collect()
+                },
             })
             .filter(|d| !d.paths.is_empty())
     }
@@ -2725,5 +2732,35 @@ mod tests {
             .collect();
         // no unfiltered best → destination should be filtered out
         assert!(dsts.is_empty());
+    }
+
+    // --- state() counts ---
+
+    #[test]
+    fn state_counts_filtered_as_not_accepted() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // 1 filtered path
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            true,
+        );
+        // 1 unfiltered path
+        rt.insert(
+            source(2, 65002, 65000, 2),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            false,
+        );
+        let s = rt.state(Family::IPV4);
+        assert_eq!(s.num_destination, 1);
+        assert_eq!(s.num_path, 2);
+        assert_eq!(s.num_accepted, 1);
     }
 }
