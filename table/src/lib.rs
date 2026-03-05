@@ -155,7 +155,49 @@ impl Path {
     fn is_filtered(&self) -> bool {
         self.flags & Path::FLAG_FILTERED != 0
     }
+
+    fn originator_id(&self) -> u32 {
+        self.pa
+            .attr_originator_id()
+            .unwrap_or(self.source.router_id)
+    }
 }
+
+impl Ord for Path {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Higher LOCAL_PREF is better (reverse order)
+        self.pa
+            .attr_local_preference()
+            .cmp(&other.pa.attr_local_preference())
+            .reverse()
+            // Shorter AS path is better
+            .then_with(|| {
+                self.pa
+                    .attr_as_path_length()
+                    .cmp(&other.pa.attr_as_path_length())
+            })
+            // Lower origin is better (IGP=0 < EGP=1 < Incomplete=2)
+            .then_with(|| self.pa.attr_origin().cmp(&other.pa.attr_origin()))
+            // eBGP preferred over iBGP
+            .then_with(|| self.source.peer_type().cmp(&other.source.peer_type()))
+            // Lower originator ID / router ID is better
+            .then_with(|| self.originator_id().cmp(&other.originator_id()))
+    }
+}
+
+impl PartialOrd for Path {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Path {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Path {}
 
 struct Destination {
     entry: Vec<Path>,
@@ -231,10 +273,10 @@ impl From<Change> for bgp::Message {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum PeerType {
-    Ibgp,
     Ebgp,
+    Ibgp,
 }
 
 pub struct Source {
@@ -470,10 +512,8 @@ impl RoutingTable {
         attr: Arc<Vec<packet::Attribute>>,
         filtered: bool,
     ) -> Option<Change> {
-        let mut replaced = false;
-        let mut best_changed = false;
+        let mut replaced = None;
         let flags = if filtered { Path::FLAG_FILTERED } else { 0 };
-        let mut old_filtered = false;
 
         let path = Path {
             source: source.clone(),
@@ -485,11 +525,17 @@ impl RoutingTable {
 
         let rt = self.global.entry(family).or_default();
         let dst = rt.entry(net).or_insert_with(Destination::new);
+
+        // Remember the old unfiltered best before any modification
+        let old_best = dst
+            .entry
+            .iter()
+            .find(|p| !p.is_filtered())
+            .map(|p| (p.source.clone(), p.pa.attr.clone()));
+
         for i in 0..dst.entry.len() {
             if Arc::ptr_eq(&dst.entry[i].source, &source) && dst.entry[i].id == remote_id {
-                replaced = true;
-                old_filtered = dst.entry.remove(i).is_filtered();
-                best_changed = i == 0;
+                replaced = Some(dst.entry.remove(i));
                 break;
             }
         }
@@ -499,12 +545,12 @@ impl RoutingTable {
             .or_default()
             .entry(family)
             .or_insert((0, 0));
-        if replaced {
-            if old_filtered && !filtered {
-                *accepted += 1;
-            }
-            if !old_filtered && filtered {
-                *accepted -= 1;
+
+        if let Some(ref old) = replaced {
+            match (old.is_filtered(), filtered) {
+                (true, false) => *accepted += 1,
+                (false, true) => *accepted -= 1,
+                _ => {}
             }
         } else {
             *received += 1;
@@ -513,51 +559,30 @@ impl RoutingTable {
             }
         }
 
-        let mut idx = 0;
-        for _ in 0..dst.entry.len() {
-            let a = &dst.entry[idx];
-
-            // local prefecence
-            if path.pa.attr_local_preference() > a.pa.attr_local_preference() {
-                break;
-            }
-
-            if path.pa.attr_as_path_length() < a.pa.attr_as_path_length() {
-                break;
-            }
-
-            if path.pa.attr_origin() < a.pa.attr_origin() {
-                break;
-            }
-
-            // external prefer
-            if path.source.peer_type() == PeerType::Ebgp && a.source.peer_type() == PeerType::Ibgp {
-                break;
-            }
-
-            let f = |p: &Path| match p.pa.attr_originator_id() {
-                Some(v) => v,
-                None => p.source.router_id,
-            };
-            if f(&path) < f(a) {
-                break;
-            }
-
-            idx += 1;
-        }
-
+        let idx = dst.entry.partition_point(|a| path.cmp(a).is_ge());
         dst.entry.insert(idx, path);
-        for i in 0..dst.entry.len() {
-            if !dst.entry[i].is_filtered() {
-                if idx == i {
-                    best_changed = true;
-                }
-                break;
-            }
-        }
 
-        if best_changed {
-            let best = &dst.entry[0];
+        // Check if the unfiltered best path changed
+        let Some(best) = dst.entry.iter().find(|p| !p.is_filtered()) else {
+            // All paths are filtered; withdraw if there was a previous unfiltered best
+            if old_best.is_some() {
+                return Some(Change {
+                    source,
+                    family,
+                    net,
+                    attr: Arc::new(Vec::new()),
+                });
+            }
+            return None;
+        };
+
+        let changed = match &old_best {
+            Some((old_source, old_attr)) => {
+                !Arc::ptr_eq(old_source, &best.source) || !Arc::ptr_eq(old_attr, &best.pa.attr)
+            }
+            None => true, // no previous unfiltered best
+        };
+        if changed {
             return Some(Change {
                 source: best.source.clone(),
                 family,
@@ -756,54 +781,6 @@ impl RoutingTable {
     }
 }
 
-#[test]
-fn drop() {
-    let s1 = Arc::new(Source::new(
-        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
-        1,
-        2,
-        Ipv4Addr::new(1, 1, 1, 1),
-        0,
-        false,
-    ));
-    let s2 = Arc::new(Source::new(
-        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
-        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
-        1,
-        2,
-        Ipv4Addr::new(1, 1, 1, 2),
-        0,
-        false,
-    ));
-
-    let n1 = packet::Nlri::V4(packet::bgp::Ipv4Net {
-        addr: Ipv4Addr::new(1, 0, 0, 0),
-        mask: 24,
-    });
-    let n2 = packet::Nlri::V4(packet::bgp::Ipv4Net {
-        addr: Ipv4Addr::new(2, 0, 0, 0),
-        mask: 24,
-    });
-    let n3 = packet::Nlri::V4(packet::bgp::Ipv4Net {
-        addr: Ipv4Addr::new(3, 0, 0, 0),
-        mask: 24,
-    });
-
-    let mut rt = RoutingTable::new();
-    let family = Family::IPV4;
-    let attrs = Arc::new(Vec::new());
-
-    rt.insert(s1.clone(), family, n1, 0, attrs.clone(), false);
-    rt.insert(s2, family, n1, 0, attrs.clone(), false);
-    rt.insert(s1.clone(), family, n2, 0, attrs.clone(), false);
-    rt.insert(s1.clone(), family, n3, 0, attrs.clone(), false);
-
-    assert_eq!(rt.global.get(&family).unwrap().len(), 3);
-    rt.drop(s1);
-    assert_eq!(rt.global.get(&family).unwrap().len(), 1);
-}
-
 #[derive(Clone)]
 pub struct Prefix {
     pub net: packet::IpNet,
@@ -966,26 +943,6 @@ impl fmt::Display for SingleAsPathMatch {
             SingleAsPathMatch::RangeOnly(min, max) => write!(f, "^{}-{}$", min, max),
         }
     }
-}
-
-#[test]
-fn single_aspath_match() {
-    assert_eq!(
-        SingleAsPathMatch::LeftMost(65100),
-        SingleAsPathMatch::new("^65100_").unwrap()
-    );
-    assert_eq!(
-        SingleAsPathMatch::Origin(65100),
-        SingleAsPathMatch::new("_65100$").unwrap()
-    );
-    assert_eq!(
-        SingleAsPathMatch::Include(65100),
-        SingleAsPathMatch::new("_65100_").unwrap()
-    );
-    assert_eq!(
-        SingleAsPathMatch::Only(65100),
-        SingleAsPathMatch::new("^65100$").unwrap(),
-    );
 }
 
 enum WellKnownCommunity {
@@ -1856,5 +1813,660 @@ impl RpkiTable {
                 Some(result)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(addr: u8, remote_asn: u32, local_asn: u32, router_id: u8) -> Arc<Source> {
+        Arc::new(Source::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, addr)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
+            remote_asn,
+            local_asn,
+            Ipv4Addr::new(0, 0, 0, router_id),
+            0,
+            false,
+        ))
+    }
+
+    fn nlri(a: u8, b: u8, c: u8, d: u8, mask: u8) -> packet::Nlri {
+        packet::Nlri::V4(packet::bgp::Ipv4Net {
+            addr: Ipv4Addr::new(a, b, c, d),
+            mask,
+        })
+    }
+
+    fn empty_attrs() -> Arc<Vec<packet::Attribute>> {
+        Arc::new(Vec::new())
+    }
+
+    fn attrs_with_local_pref(val: u32) -> Arc<Vec<packet::Attribute>> {
+        Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, val).unwrap(),
+        ])
+    }
+
+    fn attrs_with_origin(val: u32) -> Arc<Vec<packet::Attribute>> {
+        Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, val).unwrap(),
+        ])
+    }
+
+    fn attrs_with_as_path_len(len: u8) -> Arc<Vec<packet::Attribute>> {
+        // Build AS_PATH binary: type=SEQ, count=len, then len * 4 bytes (dummy ASNs)
+        let mut bin = Vec::new();
+        bin.push(packet::Attribute::AS_PATH_TYPE_SEQ);
+        bin.push(len);
+        for i in 0..len as u32 {
+            bin.extend_from_slice(&(65000 + i).to_be_bytes());
+        }
+        Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, bin).unwrap(),
+        ])
+    }
+
+    // --- drop ---
+
+    #[test]
+    fn drop_source() {
+        let s1 = Arc::new(Source::new(
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
+            1,
+            2,
+            Ipv4Addr::new(1, 1, 1, 1),
+            0,
+            false,
+        ));
+        let s2 = Arc::new(Source::new(
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
+            1,
+            2,
+            Ipv4Addr::new(1, 1, 1, 2),
+            0,
+            false,
+        ));
+
+        let n1 = nlri(1, 0, 0, 0, 24);
+        let n2 = nlri(2, 0, 0, 0, 24);
+        let n3 = nlri(3, 0, 0, 0, 24);
+
+        let mut rt = RoutingTable::new();
+        let family = Family::IPV4;
+        let attrs = Arc::new(Vec::new());
+
+        rt.insert(s1.clone(), family, n1, 0, attrs.clone(), false);
+        rt.insert(s2, family, n1, 0, attrs.clone(), false);
+        rt.insert(s1.clone(), family, n2, 0, attrs.clone(), false);
+        rt.insert(s1.clone(), family, n3, 0, attrs.clone(), false);
+
+        assert_eq!(rt.global.get(&family).unwrap().len(), 3);
+        rt.drop(s1);
+        assert_eq!(rt.global.get(&family).unwrap().len(), 1);
+    }
+
+    // --- single_aspath_match ---
+
+    #[test]
+    fn single_aspath_match() {
+        assert_eq!(
+            SingleAsPathMatch::LeftMost(65100),
+            SingleAsPathMatch::new("^65100_").unwrap()
+        );
+        assert_eq!(
+            SingleAsPathMatch::Origin(65100),
+            SingleAsPathMatch::new("_65100$").unwrap()
+        );
+        assert_eq!(
+            SingleAsPathMatch::Include(65100),
+            SingleAsPathMatch::new("_65100_").unwrap()
+        );
+        assert_eq!(
+            SingleAsPathMatch::Only(65100),
+            SingleAsPathMatch::new("^65100$").unwrap(),
+        );
+    }
+
+    // --- insert basic ---
+
+    #[test]
+    fn insert_single() {
+        let mut rt = RoutingTable::new();
+        let change = rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            nlri(10, 0, 0, 0, 24),
+            0,
+            empty_attrs(),
+            false,
+        );
+        assert!(change.is_some());
+    }
+
+    #[test]
+    fn insert_same_nlri_no_best_change() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // Insert with router_id=1 (lower, so this is best)
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            false,
+        );
+        // Insert with router_id=2 (higher, won't become best)
+        let change = rt.insert(
+            source(2, 65002, 65000, 2),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            false,
+        );
+        assert!(change.is_none());
+    }
+
+    // --- best path selection ---
+
+    #[test]
+    fn best_path_local_pref() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            attrs_with_local_pref(100),
+            false,
+        );
+        let change = rt.insert(
+            source(2, 65002, 65000, 2),
+            Family::IPV4,
+            net,
+            0,
+            attrs_with_local_pref(200),
+            false,
+        );
+        // Higher local_pref wins → best path changes
+        let change = change.unwrap();
+        assert_eq!(
+            change.source.remote_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    #[test]
+    fn best_path_as_path_length() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            attrs_with_as_path_len(3),
+            false,
+        );
+        let change = rt.insert(
+            source(2, 65002, 65000, 2),
+            Family::IPV4,
+            net,
+            0,
+            attrs_with_as_path_len(1),
+            false,
+        );
+        // Shorter AS path wins
+        let change = change.unwrap();
+        assert_eq!(
+            change.source.remote_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    #[test]
+    fn best_path_origin() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // Insert with ORIGIN=Incomplete(2), router_id=1
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            attrs_with_origin(2),
+            false,
+        );
+        // Insert with ORIGIN=IGP(0), router_id=2
+        let change = rt.insert(
+            source(2, 65002, 65000, 2),
+            Family::IPV4,
+            net,
+            0,
+            attrs_with_origin(0),
+            false,
+        );
+        // IGP (lower origin value) wins
+        let change = change.unwrap();
+        assert_eq!(
+            change.source.remote_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    #[test]
+    fn best_path_ebgp_over_ibgp() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // iBGP peer (remote_asn == local_asn), router_id=1 (lower)
+        rt.insert(
+            source(1, 65000, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            false,
+        );
+        // eBGP peer (remote_asn != local_asn), router_id=2 (higher)
+        let change = rt.insert(
+            source(2, 65001, 65000, 2),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            false,
+        );
+        // eBGP wins even though router_id is higher
+        let change = change.unwrap();
+        assert_eq!(
+            change.source.remote_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    #[test]
+    fn best_path_router_id() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // router_id=10
+        rt.insert(
+            source(1, 65001, 65000, 10),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            false,
+        );
+        // router_id=5 (lower wins)
+        let change = rt.insert(
+            source(2, 65002, 65000, 5),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            false,
+        );
+        let change = change.unwrap();
+        assert_eq!(
+            change.source.remote_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    // --- remove ---
+
+    #[test]
+    fn remove_best_path() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        // Remove best (router_id=1)
+        let change = rt.remove(s1, Family::IPV4, net, 0);
+        let change = change.unwrap();
+        // New best is s2
+        assert_eq!(
+            change.source.remote_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    #[test]
+    fn remove_non_best_path() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        // Remove non-best (router_id=2)
+        let change = rt.remove(s2, Family::IPV4, net, 0);
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn remove_last_path() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        let change = rt.remove(s1, Family::IPV4, net, 0);
+        let change = change.unwrap();
+        // Withdrawal: empty attrs
+        assert!(change.attr.is_empty());
+    }
+
+    // --- filtered ---
+
+    #[test]
+    fn filtered_path_no_change() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // Only filtered path → no Change (no unfiltered best)
+        let change = rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            true,
+        );
+        assert!(change.is_none());
+
+        // Unfiltered path added → Change points to the unfiltered path
+        let s2 = source(2, 65002, 65000, 2);
+        let change = rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        let change = change.unwrap();
+        assert!(Arc::ptr_eq(&change.source, &s2));
+    }
+
+    // A2: filtered at head, insert unfiltered behind existing unfiltered best
+    #[test]
+    fn filtered_head_insert_unfiltered_non_best() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // filtered path at head (router_id=1)
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            true,
+        );
+        // unfiltered best (router_id=2)
+        let s2 = source(2, 65002, 65000, 2);
+        let change = rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        let change = change.unwrap();
+        assert!(Arc::ptr_eq(&change.source, &s2));
+        // another unfiltered but worse (router_id=3) → no best change
+        let change = rt.insert(
+            source(3, 65003, 65000, 3),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            false,
+        );
+        assert!(change.is_none());
+    }
+
+    // B1: replace filtered path at index 0 → unfiltered best unchanged
+    #[test]
+    fn replace_filtered_head_no_best_change() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        // filtered at head
+        rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), true);
+        // unfiltered best
+        rt.insert(
+            source(2, 65002, 65000, 2),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            false,
+        );
+        // replace the filtered head with updated attrs (still filtered) → no best change
+        let change = rt.insert(s1, Family::IPV4, net, 0, attrs_with_local_pref(200), true);
+        assert!(change.is_none());
+    }
+
+    // B2: replace unfiltered best with filtered → best changes to another unfiltered
+    #[test]
+    fn replace_unfiltered_best_changes() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        // filtered at head (router_id=3, won't be best)
+        rt.insert(
+            source(3, 65003, 65000, 3),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            true,
+        );
+        // unfiltered best (router_id=1)
+        rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        // another unfiltered (router_id=2)
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        // replace s1 as filtered → s2 becomes unfiltered best
+        let change = rt.insert(s1, Family::IPV4, net, 0, empty_attrs(), true);
+        let change = change.unwrap();
+        assert!(Arc::ptr_eq(&change.source, &s2));
+    }
+
+    // B3: replace unfiltered non-best → no best change
+    #[test]
+    fn replace_unfiltered_non_best_no_change() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // filtered at head
+        rt.insert(
+            source(3, 65003, 65000, 3),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            true,
+        );
+        // unfiltered best (router_id=1)
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            empty_attrs(),
+            false,
+        );
+        // unfiltered non-best (router_id=2)
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        // replace s2 with different attrs → still non-best, no change
+        let change = rt.insert(s2, Family::IPV4, net, 0, attrs_with_local_pref(50), false);
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn filtered_path_peer_stats() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), true);
+        // peer_stats tracks (received, accepted) — filtered path: received=1, accepted=0
+        let stats: Vec<_> = rt.peer_stats(&s1.remote_addr).unwrap().collect();
+        assert_eq!(stats.len(), 1);
+        let (_, (received, accepted)) = stats[0];
+        assert_eq!(received, 1);
+        assert_eq!(accepted, 0);
+    }
+
+    // --- best() ---
+
+    #[test]
+    fn best_returns_all_prefixes() {
+        let mut rt = RoutingTable::new();
+        let s1 = source(1, 65001, 65000, 1);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            nlri(10, 0, 0, 0, 24),
+            0,
+            empty_attrs(),
+            false,
+        );
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            nlri(10, 0, 1, 0, 24),
+            0,
+            empty_attrs(),
+            false,
+        );
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            nlri(10, 0, 2, 0, 24),
+            0,
+            empty_attrs(),
+            false,
+        );
+        let best = rt.best(&Family::IPV4);
+        assert_eq!(best.len(), 3);
+    }
+
+    // --- policy ---
+
+    #[test]
+    fn policy_prefix_reject() {
+        let rt = RoutingTable::new();
+        let mut ptable = PolicyTable::new();
+
+        ptable
+            .add_defined_set(DefinedSetConfig::Prefix {
+                name: "ps1".to_string(),
+                prefixes: vec![PrefixConfig {
+                    ip_prefix: "10.0.0.0/24".to_string(),
+                    mask_length_min: 24,
+                    mask_length_max: 24,
+                }],
+            })
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::PrefixSet(
+                    "ps1".to_string(),
+                    MatchOption::Any,
+                )],
+                Some(Disposition::Reject),
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Import,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+
+        let s = source(1, 65001, 65000, 1);
+        let net = nlri(10, 0, 0, 0, 24);
+        let result = rt.apply_policy(&assignment, &s, &net, &empty_attrs());
+        assert_eq!(result, Disposition::Reject);
+    }
+
+    #[test]
+    fn policy_default_accept() {
+        let rt = RoutingTable::new();
+        let mut ptable = PolicyTable::new();
+
+        ptable
+            .add_defined_set(DefinedSetConfig::Prefix {
+                name: "ps1".to_string(),
+                prefixes: vec![PrefixConfig {
+                    ip_prefix: "10.0.0.0/24".to_string(),
+                    mask_length_min: 24,
+                    mask_length_max: 24,
+                }],
+            })
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::PrefixSet(
+                    "ps1".to_string(),
+                    MatchOption::Any,
+                )],
+                Some(Disposition::Reject),
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Import,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+
+        let s = source(1, 65001, 65000, 1);
+        // Different prefix → no match → default disposition (Accept)
+        let net = nlri(192, 168, 0, 0, 24);
+        let result = rt.apply_policy(&assignment, &s, &net, &empty_attrs());
+        assert_eq!(result, Disposition::Accept);
+    }
+
+    // --- Ord regression: higher-priority attribute must win ---
+
+    #[test]
+    fn best_path_local_pref_over_router_id() {
+        // Regression: previously, a path losing on LOCAL_PREF could still
+        // win on router_id due to missing "lose" checks in the comparison loop.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // s1: local_pref=200, router_id=2
+        let s1 = source(1, 65001, 65000, 2);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            attrs_with_local_pref(200),
+            false,
+        );
+        // s2: local_pref=50, router_id=1 (better router_id, worse local_pref)
+        let s2 = source(2, 65002, 65000, 1);
+        let change = rt.insert(s2, Family::IPV4, net, 0, attrs_with_local_pref(50), false);
+        // s1 must remain best (higher local_pref wins over lower router_id)
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn replace_unfiltered_to_filtered_withdraws() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        // Insert unfiltered path
+        let change = rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        assert!(change.is_some());
+        // Replace with filtered → no unfiltered best remains → withdraw
+        let change = rt.insert(s1, Family::IPV4, net, 0, empty_attrs(), true);
+        let change = change.expect("should return withdrawal Change");
+        assert!(change.attr.is_empty());
     }
 }
