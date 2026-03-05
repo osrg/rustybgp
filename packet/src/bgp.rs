@@ -690,6 +690,14 @@ impl Attribute {
         })
     }
 
+    pub fn empty_as_path() -> Self {
+        Attribute {
+            flags: Self::FLAG_TRANSITIVE,
+            code: Self::AS_PATH,
+            data: AttributeData::Bin(Vec::new()),
+        }
+    }
+
     pub fn new_with_bin(code: u8, bin: Vec<u8>) -> Option<Self> {
         Some(Attribute {
             flags: Self::canonical_flags(code)?,
@@ -818,12 +826,18 @@ impl Attribute {
             new_buf.put_u32(as_number);
             new_buf.put(&buf[2..]);
             AttributeData::Bin(new_buf)
+        } else if len == 0 {
+            let mut new_buf = Vec::with_capacity(6);
+            new_buf.put_u8(Attribute::AS_PATH_TYPE_SEQ);
+            new_buf.put_u8(1);
+            new_buf.put_u32(as_number);
+            AttributeData::Bin(new_buf)
         } else {
             let mut new_buf = Vec::with_capacity(len as usize + 6);
             new_buf.put_u8(Attribute::AS_PATH_TYPE_SEQ);
             new_buf.put_u8(1);
             new_buf.put_u32(as_number);
-            new_buf.put(&buf[4..]);
+            new_buf.put(&buf[..]);
             AttributeData::Bin(new_buf)
         };
         Attribute {
@@ -1483,9 +1497,13 @@ impl PeerCodec {
                     .as_ref()
                     .or(mp_unreach.as_ref())
                     .map_or(family, |s| s.family);
+                let mut has_as_path = false;
                 for a in &*attrs {
                     if a.flags & Attribute::FLAG_TRANSITIVE > 0 {
                         let code = a.code();
+                        if code == Attribute::AS_PATH {
+                            has_as_path = true;
+                        }
                         // RFC 8950: nexthop is carried inside MP_REACH_NLRI
                         if code == Attribute::NEXTHOP && mp_reach.is_some() {
                             continue;
@@ -1493,6 +1511,14 @@ impl PeerCodec {
                         let (n, _) = a.export(code, Some(dst), attr_family, self);
                         attr_len += n;
                     }
+                }
+                // Ensure AS_PATH is present (mandatory for eBGP UPDATEs).
+                // Locally-originated routes may lack AS_PATH; create one
+                // with the local ASN prepended.
+                if !has_as_path {
+                    let empty = Attribute::empty_as_path();
+                    let (n, _) = empty.export(Attribute::AS_PATH, Some(dst), attr_family, self);
+                    attr_len += n;
                 }
                 // MP_REACH_NLRI attribute
                 if let Some(mp_reach) = mp_reach {

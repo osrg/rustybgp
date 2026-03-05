@@ -85,13 +85,13 @@ else
     fail "Extended Next Hop capability negotiated"
 fi
 
-# Test 3: FRR has IPv4 route 172.30.4.0/24 in BGP table
-ROUTE_FRR=$(docker exec router-frr vtysh -c "show bgp ipv4 unicast 172.30.4.0/24 json" 2>/dev/null \
-    | grep -c "172.30.4.0" || true)
-if [ "$ROUTE_FRR" -gt 0 ]; then
-    pass "FRR has IPv4 route 172.30.4.0/24 in BGP table"
+# Test 3: FRR received 172.30.1.0/24 from rustybgpd via BGP
+ROUTE_RUSTY=$(docker exec router-frr vtysh -c "show bgp ipv4 unicast 172.30.1.0/24 json" 2>/dev/null \
+    | grep -c "172.30.1.0" || true)
+if [ "$ROUTE_RUSTY" -gt 0 ]; then
+    pass "FRR received 172.30.1.0/24 from rustybgpd via BGP"
 else
-    fail "FRR has IPv4 route 172.30.4.0/24 in BGP table"
+    fail "FRR received 172.30.1.0/24 from rustybgpd via BGP"
 fi
 
 # Test 4: End-to-end ping from client1 to client4

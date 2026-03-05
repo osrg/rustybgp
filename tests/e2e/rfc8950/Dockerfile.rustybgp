@@ -23,7 +23,15 @@ RUN apk add --no-cache iproute2 bash curl
 COPY --from=builder \
     /home/rust/src/target/${RUST_TARGET}/release/rustybgpd \
     /usr/local/bin/rustybgpd
-
 RUN chmod +x /usr/local/bin/rustybgpd
+
+# Install gobgp CLI for route injection via gRPC
+ARG GOBGP_VERSION=4.3.0
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then GOARCH=amd64; \
+    elif [ "$ARCH" = "aarch64" ]; then GOARCH=arm64; \
+    else echo "unsupported arch: $ARCH" && exit 1; fi && \
+    curl -sL "https://github.com/osrg/gobgp/releases/download/v${GOBGP_VERSION}/gobgp_${GOBGP_VERSION}_linux_${GOARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin gobgp
 
 ENTRYPOINT ["/entrypoint.sh"]
