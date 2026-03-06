@@ -1592,6 +1592,9 @@ impl PeerCodec {
     ) -> Result<PathNlri, Error> {
         let malformed: Error = BgpError::UpdateMalformedAttributeList.into();
         let id = if chan.addpath_rx() {
+            if len < 4 {
+                return Err(malformed);
+            }
             if let Ok(id) = c.read_u32::<NetworkEndian>() {
                 len -= 4;
                 id

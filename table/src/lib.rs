@@ -199,6 +199,10 @@ impl PartialEq for Path {
 
 impl Eq for Path {}
 
+/// Maximum number of paths stored per prefix per destination.
+/// Limits memory usage when Add-Path peers advertise many path IDs.
+const MAX_PATHS_PER_DESTINATION: usize = 32;
+
 struct Destination {
     entry: Vec<Path>,
 }
@@ -559,6 +563,12 @@ impl RoutingTable {
                 break;
             }
         }
+
+        // Reject new paths (not replacements) when the per-prefix limit is reached.
+        if replaced.is_none() && dst.entry.len() >= MAX_PATHS_PER_DESTINATION {
+            return None;
+        }
+
         let (received, accepted) = self
             .route_stats
             .entry(source.remote_addr)
