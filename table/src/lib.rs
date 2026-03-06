@@ -355,6 +355,8 @@ impl Source {
 pub struct RoutingTable {
     global: FnvHashMap<Family, FnvHashMap<packet::Nlri, Destination>>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, (u64, u64)>>,
+    /// Per-peer per-family maximum prefix limits.
+    prefix_limits: FnvHashMap<IpAddr, FnvHashMap<Family, u32>>,
     rpki: RpkiTable,
 }
 
@@ -371,8 +373,20 @@ impl RoutingTable {
                 .into_iter()
                 .collect(),
             route_stats: FnvHashMap::default(),
+            prefix_limits: FnvHashMap::default(),
             rpki: RpkiTable::new(),
         }
+    }
+
+    pub fn set_prefix_limit(&mut self, peer: IpAddr, family: Family, max: u32) {
+        self.prefix_limits
+            .entry(peer)
+            .or_default()
+            .insert(family, max);
+    }
+
+    pub fn remove_prefix_limits(&mut self, peer: &IpAddr) {
+        self.prefix_limits.remove(peer);
     }
 
     pub fn best(&self, family: &Family) -> Vec<Change> {
@@ -571,6 +585,34 @@ impl RoutingTable {
         filtered: bool,
         send_max: usize,
     ) -> Vec<Change> {
+        // Enforce per-peer per-family prefix limit
+        if let Some(limit) = self
+            .prefix_limits
+            .get(&source.remote_addr)
+            .and_then(|m| m.get(&family))
+        {
+            let received = self
+                .route_stats
+                .get(&source.remote_addr)
+                .and_then(|m| m.get(&family))
+                .map_or(0, |(r, _)| *r);
+            if received >= *limit as u64 {
+                // Still count as received so the stat reflects wire traffic
+                let (rx, _) = self
+                    .route_stats
+                    .entry(source.remote_addr)
+                    .or_default()
+                    .entry(family)
+                    .or_insert((0, 0));
+                *rx += 1;
+                eprintln!(
+                    "prefix limit ({}) reached for peer {} family {:?}, dropping route",
+                    limit, source.remote_addr, family
+                );
+                return Vec::new();
+            }
+        }
+
         let mut replaced = None;
         let flags = if filtered { Path::FLAG_FILTERED } else { 0 };
         let n = send_max.max(1);
@@ -780,6 +822,7 @@ impl RoutingTable {
         let n = send_max.max(1);
         let mut advertise = Vec::new();
         self.route_stats.remove(&source.remote_addr);
+        self.prefix_limits.remove(&source.remote_addr);
         for (family, rt) in self.global.iter_mut() {
             rt.retain(|net, dst| {
                 let old_top: Vec<(Arc<Source>, Arc<Vec<packet::Attribute>>)> = dst

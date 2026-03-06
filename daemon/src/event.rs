@@ -200,6 +200,8 @@ struct Peer {
     mgmt_tx: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
     /// Per-family send_max for Add-Path TX (RFC 7911).
     send_max: FnvHashMap<Family, usize>,
+    /// Per-family prefix limits from config.
+    prefix_limits: FnvHashMap<Family, u32>,
 }
 
 impl Peer {
@@ -256,6 +258,7 @@ struct PeerBuilder {
     password: Option<String>,
     families: FnvHashMap<Family, u8>,
     send_max: FnvHashMap<Family, usize>,
+    prefix_limits: FnvHashMap<Family, u32>,
 }
 
 impl PeerBuilder {
@@ -283,6 +286,7 @@ impl PeerBuilder {
             password: None,
             families: Default::default(),
             send_max: Default::default(),
+            prefix_limits: Default::default(),
         }
     }
 
@@ -456,6 +460,7 @@ impl PeerBuilder {
             multihop_ttl: self.multihop_ttl.take(),
             password: self.password.take(),
             send_max: std::mem::take(&mut self.send_max),
+            prefix_limits: std::mem::take(&mut self.prefix_limits),
         }
     }
 }
@@ -711,6 +716,30 @@ impl TryFrom<&config::Neighbor> for Peer {
 
         builder.families(families);
         builder.addpath(addpath_families);
+
+        // Extract per-family prefix limits
+        if let Some(afi_safis) = n.afi_safis.as_ref() {
+            for afi_safi in afi_safis {
+                if let Some(v4) = afi_safi.ipv4_unicast.as_ref()
+                    && let Some(max) = v4
+                        .prefix_limit
+                        .as_ref()
+                        .and_then(|pl| pl.config.as_ref())
+                        .and_then(|c| c.max_prefixes)
+                {
+                    builder.prefix_limits.insert(packet::Family::IPV4, max);
+                }
+                if let Some(v6) = afi_safi.ipv6_unicast.as_ref()
+                    && let Some(max) = v6
+                        .prefix_limit
+                        .as_ref()
+                        .and_then(|pl| pl.config.as_ref())
+                        .and_then(|c| c.max_prefixes)
+                {
+                    builder.prefix_limits.insert(packet::Family::IPV6, max);
+                }
+            }
+        }
 
         Ok(builder.build())
     }
@@ -2726,6 +2755,7 @@ impl Global {
             peer.counter_tx.clone(),
             peer.counter_rx.clone(),
             peer.send_max.clone(),
+            peer.prefix_limits.clone(),
         )
         .map(|h| (h, mgmt_rx))
     }
@@ -3385,6 +3415,8 @@ struct Handler {
     shutdown: Option<bmp::PeerDownReason>,
     /// Per-family send_max for Add-Path TX (RFC 7911).
     send_max: FnvHashMap<Family, usize>,
+    /// Per-family prefix limits from config.
+    prefix_limits: FnvHashMap<Family, u32>,
 }
 
 impl Handler {
@@ -3400,6 +3432,7 @@ impl Handler {
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
         send_max: FnvHashMap<Family, usize>,
+        prefix_limits: FnvHashMap<Family, u32>,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         Some(Handler {
@@ -3425,6 +3458,7 @@ impl Handler {
             holdtimer_renewed: Instant::now(),
             shutdown: None,
             send_max,
+            prefix_limits,
         })
     }
 
@@ -3641,6 +3675,10 @@ impl Handler {
                                     *current = *sm;
                                 }
                             }
+                        }
+                        // Register per-peer prefix limits
+                        for (f, max) in &self.prefix_limits {
+                            t.rtable.set_prefix_limit(self.remote_addr, *f, *max);
                         }
                         t.peer_event_tx
                             .insert(self.remote_addr, self.peer_event_tx.remove(0));
