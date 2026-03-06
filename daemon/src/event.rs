@@ -613,10 +613,11 @@ impl TryFrom<&api::Peer> for Peer {
     }
 }
 
-// assumes that config::Neighbor is validated so use From instead of TryFrom
-impl From<&config::Neighbor> for Peer {
-    fn from(n: &config::Neighbor) -> Peer {
-        let c = n.config.as_ref().unwrap();
+impl TryFrom<&config::Neighbor> for Peer {
+    type Error = String;
+
+    fn try_from(n: &config::Neighbor) -> Result<Peer, Self::Error> {
+        let c = n.config.as_ref().ok_or("missing neighbor config")?;
         let mut families = Vec::new();
         let addpath_families: Vec<(packet::Family, u8, usize)> = n
             .afi_safis
@@ -657,10 +658,13 @@ impl From<&config::Neighbor> for Peer {
                 })
             })
             .collect();
-        let mut builder = PeerBuilder::new(c.neighbor_address.as_ref().unwrap().parse().unwrap());
+        let addr_str = c.neighbor_address.as_ref().ok_or("missing neighbor address")?;
+        let addr = addr_str.parse().map_err(|e| format!("invalid neighbor address: {}", e))?;
+        let peer_as = c.peer_as.ok_or("missing peer-as")?;
+        let mut builder = PeerBuilder::new(addr);
         builder
             .local_asn(c.local_as.map_or(0, |x| x))
-            .remote_asn(c.peer_as.unwrap())
+            .remote_asn(peer_as)
             .remote_port(n.transport.as_ref().map_or(Global::BGP_PORT, |t| {
                 t.config.as_ref().map_or(Global::BGP_PORT, |t| {
                     t.remote_port.map_or(Global::BGP_PORT, |n| n)
@@ -703,7 +707,7 @@ impl From<&config::Neighbor> for Peer {
         builder.families(families);
         builder.addpath(addpath_families);
 
-        builder.build()
+        Ok(builder.build())
     }
 }
 
@@ -2930,7 +2934,10 @@ impl Global {
             let mut server = GLOBAL.write().await;
             for p in peers {
                 server
-                    .add_peer(Peer::from(p), Some(active_tx.clone()))
+                    .add_peer(
+                        Peer::try_from(p).expect("validated config should produce valid Peer"),
+                        Some(active_tx.clone()),
+                    )
                     .unwrap();
             }
         }
