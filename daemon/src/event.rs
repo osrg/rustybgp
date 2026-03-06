@@ -3547,9 +3547,8 @@ impl Handler {
                 }
 
                 // Drop send_max for families where Add-Path TX was not negotiated
-                self.send_max.retain(|f, _| {
-                    codec.channel.get(f).is_some_and(|c| c.addpath_tx())
-                });
+                self.send_max
+                    .retain(|f, _| codec.channel.get(f).is_some_and(|c| c.addpath_tx()));
 
                 // Warn when locally-configured Add-Path was not negotiated
                 for (family, mode) in &local_addpath {
@@ -3650,6 +3649,7 @@ impl Handler {
                             *family,
                             PendingTx {
                                 sync: true,
+                                addpath_tx: c.addpath_tx(),
                                 ..Default::default()
                             },
                         );
@@ -4057,6 +4057,7 @@ struct PendingTx {
     unreach: FnvHashSet<PendingKey>,
     bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<PendingKey>>,
     sync: bool,
+    addpath_tx: bool,
 }
 
 impl PendingTx {
@@ -4065,7 +4066,8 @@ impl PendingTx {
     }
 
     fn insert_change(&mut self, change: table::Change) {
-        let key: PendingKey = (change.net, change.path_id);
+        let pid = if self.addpath_tx { change.path_id } else { 0 };
+        let key: PendingKey = (change.net, pid);
         if change.attr.is_empty() {
             if let Some(attr) = self.reach.remove(&key) {
                 let set = self.bucket.get_mut(&attr).unwrap();
@@ -4122,7 +4124,10 @@ fn bucket() {
 
     let attr1 = vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap()];
 
-    let mut pending = PendingTx::default();
+    let mut pending = PendingTx {
+        addpath_tx: true,
+        ..Default::default()
+    };
 
     pending.insert_change(table::Change {
         source: src.clone(),
