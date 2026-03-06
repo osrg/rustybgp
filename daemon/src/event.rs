@@ -3505,22 +3505,22 @@ impl Handler {
                     match codec.channel.get(family) {
                         Some(ch) => {
                             if mode & 0x1 > 0 && !ch.addpath_rx() {
-                                println!(
-                                    "add-path receive configured for {:?} but not negotiated with peer",
-                                    family
+                                eprintln!(
+                                    "add-path receive configured for {:?} but not negotiated with peer {}",
+                                    family, self.remote_addr
                                 );
                             }
                             if mode & 0x2 > 0 && !ch.addpath_tx() {
-                                println!(
-                                    "add-path send configured for {:?} but not negotiated with peer",
-                                    family
+                                eprintln!(
+                                    "add-path send configured for {:?} but not negotiated with peer {}",
+                                    family, self.remote_addr
                                 );
                             }
                         }
                         None => {
-                            println!(
-                                "add-path configured for {:?} but family not negotiated with peer",
-                                family
+                            eprintln!(
+                                "add-path configured for {:?} but family not negotiated with peer {}",
+                                family, self.remote_addr
                             );
                         }
                     }
