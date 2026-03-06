@@ -18,7 +18,7 @@ services:
   frr-sender:
     build:
       context: ../../..
-      dockerfile: tests/e2e/rfc7911/Dockerfile.frr
+      dockerfile: tests/e2e/shared/Dockerfile.frr
       args:
         FRR_CONF_DIR: tests/e2e/rfc7911/frr-sender
     container_name: frr-sender
@@ -31,7 +31,7 @@ services:
   router-rusty:
     build:
       context: ../../..
-      dockerfile: tests/e2e/rfc7911/Dockerfile.rustybgp
+      dockerfile: tests/e2e/shared/Dockerfile.rustybgp
       args:
         RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
     container_name: router-rusty
@@ -49,7 +49,7 @@ services:
   frr-receiver:
     build:
       context: ../../..
-      dockerfile: tests/e2e/rfc7911/Dockerfile.frr
+      dockerfile: tests/e2e/shared/Dockerfile.frr
       args:
         FRR_CONF_DIR: tests/e2e/rfc7911/frr-receiver
     container_name: frr-receiver

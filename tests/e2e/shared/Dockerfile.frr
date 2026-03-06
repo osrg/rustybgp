@@ -25,7 +25,9 @@ RUN addgroup -S frr && adduser -S -G frr frr && \
     addgroup -S frrvty && adduser frr frrvty
 
 ARG FRR_VERSION=10.2.1
+ARG FRR_SHA256=6cbf142d0b12fb8679f5dc95f7638ba6faf848a44f38fd45bf9caeee8c12097c
 ADD https://github.com/FRRouting/frr/archive/refs/tags/frr-${FRR_VERSION}.tar.gz /tmp/frr.tar.gz
+RUN echo "${FRR_SHA256}  /tmp/frr.tar.gz" | sha256sum -c -
 RUN tar xzf /tmp/frr.tar.gz -C /tmp && mv /tmp/frr-frr-${FRR_VERSION} /tmp/frr
 
 WORKDIR /tmp/frr
@@ -80,15 +82,16 @@ COPY --from=builder /build/ /
 RUN mkdir -p /etc/frr /var/run/frr /var/log/frr && \
     chown -R frr:frr /etc/frr /var/run/frr /var/log/frr
 
+# FRR_CONF_DIR must be passed as a build arg pointing to the test's FRR config
 ARG FRR_CONF_DIR
-COPY ${FRR_CONF_DIR}/daemons /etc/frr/daemons
 COPY ${FRR_CONF_DIR}/frr.conf /etc/frr/frr.conf
+COPY tests/e2e/shared/daemons /etc/frr/daemons
 RUN chown -R frr:frr /etc/frr
 
 RUN echo 'service integrated-vtysh-config' > /etc/frr/vtysh.conf && \
     chown frr:frrvty /etc/frr/vtysh.conf
 
-COPY tests/e2e/rfc7911/entrypoint-frr.sh /entrypoint.sh
+COPY tests/e2e/shared/entrypoint-frr.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
