@@ -4,6 +4,7 @@ global:
     router-id: "172.30.5.1"
 
 neighbors:
+  # Sender 1 (AS 65002): receives add-path from this peer
   - config:
       neighbor-address: "172.30.5.2"
       peer-as: 65002
@@ -14,6 +15,18 @@ neighbors:
           config:
             receive: true
 
+  # Sender 2 (AS 65004): receives add-path from this peer
+  - config:
+      neighbor-address: "172.30.5.3"
+      peer-as: 65004
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+        add-paths:
+          config:
+            receive: true
+
+  # Receiver (AS 65003): sends up to 2 paths via add-path
   - config:
       neighbor-address: "172.30.6.2"
       peer-as: 65003
@@ -22,4 +35,4 @@ neighbors:
           afi-safi-name: ipv4-unicast
         add-paths:
           config:
-            send-max: 1
+            send-max: 2

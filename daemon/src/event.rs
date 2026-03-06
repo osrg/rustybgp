@@ -198,6 +198,8 @@ struct Peer {
     password: Option<String>,
 
     mgmt_tx: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
+    /// Per-family send_max for Add-Path TX (RFC 7911).
+    send_max: FnvHashMap<Family, usize>,
 }
 
 impl Peer {
@@ -253,6 +255,7 @@ struct PeerBuilder {
     multihop_ttl: Option<u8>,
     password: Option<String>,
     families: FnvHashMap<Family, u8>,
+    send_max: FnvHashMap<Family, usize>,
 }
 
 impl PeerBuilder {
@@ -279,6 +282,7 @@ impl PeerBuilder {
             multihop_ttl: None,
             password: None,
             families: Default::default(),
+            send_max: Default::default(),
         }
     }
 
@@ -372,10 +376,13 @@ impl PeerBuilder {
         self
     }
 
-    fn addpath(&mut self, families: Vec<(packet::Family, u8)>) -> &mut Self {
-        for (f, mode) in families {
+    fn addpath(&mut self, families: Vec<(packet::Family, u8, usize)>) -> &mut Self {
+        for (f, mode, sm) in families {
             // RFC 7911 mode is 2 bits: bit 0 = receive, bit 1 = send
             self.families.insert(f, mode & 0x3);
+            if sm > 0 {
+                self.send_max.insert(f, sm);
+            }
         }
         self
     }
@@ -448,6 +455,7 @@ impl PeerBuilder {
             counter_rx: Default::default(),
             multihop_ttl: self.multihop_ttl.take(),
             password: self.password.take(),
+            send_max: std::mem::take(&mut self.send_max),
         }
     }
 }
@@ -610,7 +618,7 @@ impl From<&config::Neighbor> for Peer {
     fn from(n: &config::Neighbor) -> Peer {
         let c = n.config.as_ref().unwrap();
         let mut families = Vec::new();
-        let addpath_families: Vec<(packet::Family, u8)> = n
+        let addpath_families: Vec<(packet::Family, u8, usize)> = n
             .afi_safis
             .as_ref()
             .map_or(Vec::new().iter(), |x| x.iter())
@@ -633,14 +641,7 @@ impl From<&config::Neighbor> for Peer {
                 x.add_paths.as_ref().and_then(|ap| {
                     ap.config.as_ref().and_then(|c| {
                         let rx = c.receive.unwrap_or(false);
-                        let send_max = c.send_max.unwrap_or(0);
-                        if send_max > 1 {
-                            println!(
-                                "send-max {} configured but only 1 path will be advertised \
-                                 (multi-path send not yet implemented)",
-                                send_max
-                            );
-                        }
+                        let send_max = c.send_max.unwrap_or(0) as usize;
                         let tx = send_max > 0;
                         let mode = u8::from(rx) | (u8::from(tx) << 1);
                         if mode > 0 {
@@ -648,7 +649,7 @@ impl From<&config::Neighbor> for Peer {
                                 x.config.as_ref()?.afi_safi_name.as_ref()?,
                             )
                             .ok()?;
-                            Some((family, mode))
+                            Some((family, mode, send_max))
                         } else {
                             None
                         }
@@ -2532,6 +2533,8 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
             bmp_event_tx: FnvHashMap::default(),
             mrt_event_tx: None,
             addpath: FnvHashMap::default(),
+            max_send: FnvHashMap::default(),
+            peer_send_max: FnvHashMap::default(),
             global_import_policy: None,
             global_export_policy: None,
         }));
@@ -2713,6 +2716,7 @@ impl Global {
             peer.state.clone(),
             peer.counter_tx.clone(),
             peer.counter_rx.clone(),
+            peer.send_max.clone(),
         )
         .map(|h| (h, mgmt_rx))
     }
@@ -3041,6 +3045,11 @@ struct Table {
     bmp_event_tx: FnvHashMap<SocketAddr, mpsc::UnboundedSender<bmp::Message>>,
     mrt_event_tx: Option<mpsc::UnboundedSender<mrt::Message>>,
     addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
+    /// Maximum send_max across all connected peers, per family.
+    /// Used to compute the right number of top-N changes.
+    max_send: FnvHashMap<Family, usize>,
+    /// Per-peer per-family send_max for recomputing max_send on disconnect.
+    peer_send_max: FnvHashMap<IpAddr, FnvHashMap<Family, usize>>,
 
     // global->ptable copies
     global_import_policy: Option<Arc<table::PolicyAssignment>>,
@@ -3127,14 +3136,17 @@ impl Table {
                                 {
                                     filtered = true;
                                 }
-                                if let Some(ri) = t.rtable.insert(
+                                let send_max = t.max_send.get(&family).copied().unwrap_or(1);
+                                let changes = t.rtable.insert_n(
                                     source.clone(),
                                     family,
                                     net.nlri,
                                     net.path_id,
                                     attrs.clone(),
                                     filtered,
-                                ) {
+                                    send_max,
+                                );
+                                for ri in changes {
                                     if let Some(a) = t.global_export_policy.as_ref()
                                         && t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
                                             == table::Disposition::Reject
@@ -3206,10 +3218,15 @@ impl Table {
                                 let _ = mrt_tx.send(msg);
                             }
                             for net in nets {
-                                if let Some(ri) =
-                                    t.rtable
-                                        .remove(source.clone(), family, net.nlri, net.path_id)
-                                {
+                                let send_max = t.max_send.get(&family).copied().unwrap_or(1);
+                                let changes = t.rtable.remove_n(
+                                    source.clone(),
+                                    family,
+                                    net.nlri,
+                                    net.path_id,
+                                    send_max,
+                                );
+                                for ri in changes {
                                     for c in t.peer_event_tx.values() {
                                         if let Some(a) = t.global_export_policy.as_ref()
                                             && t.rtable.apply_policy(
@@ -3229,11 +3246,23 @@ impl Table {
                     },
                     TableEvent::Disconnected(source) => {
                         let mut t = TABLE[idx].lock().await;
-                        for change in t.rtable.drop(source) {
+                        let global_max = t.max_send.values().copied().max().unwrap_or(1);
+                        let changes = t.rtable.drop_n(source.clone(), global_max);
+                        for change in changes {
                             for c in t.peer_event_tx.values() {
                                 let _ = c.send(ToPeerEvent::Advertise(change.clone()));
                             }
                         }
+                        // Clean up peer tracking and recompute max_send
+                        t.peer_send_max.remove(&source.remote_addr);
+                        let mut new_max = FnvHashMap::default();
+                        for peer_families in t.peer_send_max.values() {
+                            for (f, n) in peer_families {
+                                let entry = new_max.entry(*f).or_insert(1usize);
+                                *entry = (*entry).max(*n);
+                            }
+                        }
+                        t.max_send = new_max;
                     }
                     TableEvent::InsertRoa(v) => {
                         let mut t = TABLE[idx].lock().await;
@@ -3342,6 +3371,8 @@ struct Handler {
     peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
     holdtimer_renewed: Instant,
     shutdown: Option<bmp::PeerDownReason>,
+    /// Per-family send_max for Add-Path TX (RFC 7911).
+    send_max: FnvHashMap<Family, usize>,
 }
 
 impl Handler {
@@ -3356,6 +3387,7 @@ impl Handler {
         state: Arc<PeerState>,
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
+        send_max: FnvHashMap<Family, usize>,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         Some(Handler {
@@ -3380,6 +3412,7 @@ impl Handler {
             peer_event_tx: Vec::new(),
             holdtimer_renewed: Instant::now(),
             shutdown: None,
+            send_max,
         })
     }
 
@@ -3575,7 +3608,8 @@ impl Handler {
                     for i in 0..*NUM_TABLES {
                         let mut t = TABLE[i].lock().await;
                         for f in codec.channel.keys() {
-                            for c in t.rtable.best(f).into_iter() {
+                            let sm = self.send_max.get(f).copied().unwrap_or(1);
+                            for c in t.rtable.best_n(f, sm).into_iter() {
                                 if let Some(a) = t.global_export_policy.as_ref()
                                     && t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
                                         == table::Disposition::Reject
@@ -3583,6 +3617,17 @@ impl Handler {
                                     continue;
                                 }
                                 pending.get_mut(f).unwrap().insert_change(c);
+                            }
+                        }
+                        // Register peer's send_max and update global max
+                        if !self.send_max.is_empty() {
+                            t.peer_send_max
+                                .insert(self.remote_addr, self.send_max.clone());
+                            for (f, sm) in &self.send_max {
+                                let current = t.max_send.entry(*f).or_insert(1);
+                                if *sm > *current {
+                                    *current = *sm;
+                                }
                             }
                         }
                         t.peer_event_tx
@@ -3742,6 +3787,11 @@ impl Handler {
                                 if !framer.inner().channel.contains_key(&ri.family) {
                                     continue;
                                 }
+                                // Filter by peer's send_max: skip changes beyond this peer's limit
+                                let sm = self.send_max.get(&ri.family).copied().unwrap_or(1) as u32;
+                                if ri.path_id > sm {
+                                    continue;
+                                }
                                 pending_update.get_mut(&ri.family).unwrap().insert_change(ri);
                             }
                         }
@@ -3811,7 +3861,7 @@ impl Handler {
 
                         for (family, p) in &mut pending_update {
                             let addpath_tx = framer.inner().channel.get(family).is_some_and(|c| c.addpath_tx());
-                            let unreach: Vec<packet::PathNlri> = p.unreach.drain().map(|nlri| packet::PathNlri { path_id: if addpath_tx { 1 } else { 0 }, nlri }).collect();
+                            let unreach: Vec<packet::PathNlri> = p.unreach.drain().map(|(nlri, pid)| packet::PathNlri { path_id: if addpath_tx { pid } else { 0 }, nlri }).collect();
                             if !unreach.is_empty() {
                                 txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                                 let msg = bgp::Message::Update(bgp::Update {
@@ -3835,7 +3885,7 @@ impl Handler {
                         for (family, p) in &mut pending_update {
                             let addpath_tx = framer.inner().channel.get(family).is_some_and(|c| c.addpath_tx());
                             for (attr, reach) in p.bucket.iter() {
-                                let nlri_set = packet::NlriSet { family: *family, entries: reach.iter().copied().map(|nlri| packet::PathNlri { path_id: if addpath_tx { 1 } else { 0 }, nlri }).collect() };
+                                let nlri_set = packet::NlriSet { family: *family, entries: reach.iter().copied().map(|(nlri, pid)| packet::PathNlri { path_id: if addpath_tx { pid } else { 0 }, nlri }).collect() };
                                 // RFC 8950: use MP_REACH_NLRI for IPv4 when extended nexthop is negotiated
                                 let use_mp = framer.inner().channel.get(family).is_some_and(|c| c.extended_nexthop());
                                 let msg = if use_mp {
@@ -3947,11 +3997,15 @@ impl Handler {
     }
 }
 
+/// Key for PendingTx maps: (NLRI, path_id). path_id distinguishes
+/// multiple paths for the same prefix under RFC 7911 Add-Path.
+type PendingKey = (packet::Nlri, u32);
+
 #[derive(Default)]
 struct PendingTx {
-    reach: FnvHashMap<packet::Nlri, Arc<Vec<packet::Attribute>>>,
-    unreach: FnvHashSet<packet::Nlri>,
-    bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<packet::Nlri>>,
+    reach: FnvHashMap<PendingKey, Arc<Vec<packet::Attribute>>>,
+    unreach: FnvHashSet<PendingKey>,
+    bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<PendingKey>>,
     sync: bool,
 }
 
@@ -3961,60 +4015,40 @@ impl PendingTx {
     }
 
     fn insert_change(&mut self, change: table::Change) {
+        let key: PendingKey = (change.net, change.path_id);
         if change.attr.is_empty() {
-            if let Some(attr) = self.reach.remove(&change.net) {
+            if let Some(attr) = self.reach.remove(&key) {
                 let set = self.bucket.get_mut(&attr).unwrap();
-                let b = set.remove(&change.net);
+                let b = set.remove(&key);
                 assert!(b);
                 if set.is_empty() {
                     self.bucket.remove(&attr);
                 }
             }
-            self.unreach.insert(change.net);
+            self.unreach.insert(key);
         } else {
-            self.unreach.remove(&change.net);
+            self.unreach.remove(&key);
 
-            // a) net doesn't exists in reach
-            // a-1) the attr exists in bucket (with other nets)
-            //  -> add the net to reach with the attr
-            //  -> add the net to the attr bucket
-            // a-2) the attr doesn't exist either in bucket
-            //  -> add the net to reach with the attr
-            //  -> create attr bucket and the net to add it
-            //
-            // b) net already exists in reach
-            // b-1) the old attr in reach same to the attr
-            //  -> nothing to do
-            // b-2) the old attr in reach not same to the attr
-            // b-2-1) the attr exists in bucket
-            //  -> update the net's attr in reach
-            //  -> remove the net from the old attr bucket
-            //  -> add the net to the attr bucket
-            // b-2-2) the attr doesn't exist in bucket
-            //  -> update the net's attr in reach
-            //  -> remove the net from the old attr bucket
-            //  -> create attr bucket add he net to it
-
-            if let Some(old_attr) = self.reach.insert(change.net, change.attr.clone()) {
-                // b-1)
+            if let Some(old_attr) = self.reach.insert(key, change.attr.clone()) {
+                // b-1) same attr → no-op
                 if old_attr == change.attr {
                     return;
                 }
 
-                // b-2-1) and b-2-2)
+                // b-2) different attr → move between buckets
                 let old_bucket = self.bucket.get_mut(&old_attr).unwrap();
-                let b = old_bucket.remove(&change.net);
+                let b = old_bucket.remove(&key);
                 assert!(b);
                 if old_bucket.is_empty() {
                     self.bucket.remove(&old_attr);
                 }
 
                 let bucket = self.bucket.entry(change.attr).or_default();
-                bucket.insert(change.net);
+                bucket.insert(key);
             } else {
-                // a-1) and a-2)
+                // a) new key
                 let bucket = self.bucket.entry(change.attr).or_default();
-                bucket.insert(change.net);
+                bucket.insert(key);
             }
         }
     }
@@ -4045,6 +4079,7 @@ fn bucket() {
         family,
         net: net1,
         attr: Arc::new(attr1.clone()),
+        path_id: 1,
     });
 
     pending.insert_change(table::Change {
@@ -4054,6 +4089,7 @@ fn bucket() {
         attr: Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]),
+        path_id: 1,
     });
 
     // a-1) and a-2) properly marged?
@@ -4071,6 +4107,7 @@ fn bucket() {
         attr: Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]),
+        path_id: 1,
     });
     assert_eq!(1, pending.bucket.len());
     assert_eq!(
@@ -4087,9 +4124,10 @@ fn bucket() {
         attr: Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap(),
         ]),
+        path_id: 1,
     });
     assert_eq!(2, pending.bucket.len());
-    assert_eq!(&Arc::new(attr2), pending.reach.get(&net2).unwrap());
+    assert_eq!(&Arc::new(attr2), pending.reach.get(&(net2, 1)).unwrap());
     assert_eq!(
         1,
         pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()
