@@ -29,7 +29,7 @@ type RrClusterIdType = String;
 // are removed from advertisements.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum RemovePrivateAsOption {
+pub enum RemovePrivateAsOption {
     All,
     Replace,
 }
@@ -53,7 +53,7 @@ type BgpCommunityRegexpType = StdRegexp;
 // BOTH: both standard and extended community.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum CommunityType {
+pub enum CommunityType {
     Standard,
     Extended,
     Both,
@@ -81,7 +81,7 @@ type BgpStdCommunityType = String;
 // external.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum PeerType {
+pub enum PeerType {
     Internal,
     External,
 }
@@ -100,7 +100,7 @@ impl TryFrom<String> for PeerType {
 // Type to describe the direction of NLRI transmission.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum BgpSessionDirection {
+pub enum BgpSessionDirection {
     Inbound,
     Outbound,
 }
@@ -119,7 +119,7 @@ impl TryFrom<String> for BgpSessionDirection {
 // Type definition for standard BGP origin attribute.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum BgpOriginAttrType {
+pub enum BgpOriginAttrType {
     Igp,
     Egp,
     Incomplete,
@@ -140,7 +140,7 @@ impl TryFrom<String> for BgpOriginAttrType {
 // Base identity type for AFI,SAFI tuples for BGP-4.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum AfiSafiType {
+pub enum AfiSafiType {
     Ipv4Unicast,
     Ipv6Unicast,
     Ipv4LabelledUnicast,
@@ -203,7 +203,7 @@ impl TryFrom<String> for AfiSafiType {
 // Base identity for a BGP capability.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum BgpCapability {
+pub enum BgpCapability {
     Mpbgp,
     RouteRefresh,
     Asn32,
@@ -230,7 +230,7 @@ impl TryFrom<String> for BgpCapability {
 // range 0x00000000 to 0xFFFFFFFF.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum BgpWellKnownStdCommunity {
+pub enum BgpWellKnownStdCommunity {
     NoExport,
     NoAdvertise,
     NoExportSubconfed,
@@ -259,7 +259,7 @@ impl TryFrom<String> for BgpWellKnownStdCommunity {
 // restricted version of the match-set-options-type.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum MatchSetOptionsRestrictedType {
+pub enum MatchSetOptionsRestrictedType {
     Any,
     Invert,
 }
@@ -283,7 +283,7 @@ impl TryFrom<String> for MatchSetOptionsRestrictedType {
 // of the members of the defined set.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum MatchSetOptionsType {
+pub enum MatchSetOptionsType {
     Any,
     All,
     Invert,
@@ -307,7 +307,7 @@ type TagType = String;
 // RIB.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum InstallProtocolType {
+pub enum InstallProtocolType {
     Bgp,
     Isis,
     Ospf,
@@ -337,7 +337,7 @@ impl TryFrom<String> for InstallProtocolType {
 // attributes.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum AttributeComparison {
+pub enum AttributeComparison {
     AttributeEq,
     AttributeGe,
     AttributeLe,
@@ -365,7 +365,7 @@ impl TryFrom<String> for AttributeComparison {
 // accept or reject.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum RouteDisposition {
+pub enum RouteDisposition {
     None,
     AcceptRoute,
     RejectRoute,
@@ -386,7 +386,7 @@ impl TryFrom<String> for RouteDisposition {
 // Condition to check the route type in the route update.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum RouteType {
+pub enum RouteType {
     None,
     Internal,
     External,
@@ -410,7 +410,7 @@ impl TryFrom<String> for RouteType {
 // a policy chain.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum DefaultPolicyType {
+pub enum DefaultPolicyType {
     AcceptRoute,
     RejectRoute,
 }
@@ -429,7 +429,7 @@ impl TryFrom<String> for DefaultPolicyType {
 // Operational state of the BGP peer.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum SessionState {
+pub enum SessionState {
     Idle,
     Connect,
     Active,
@@ -455,7 +455,7 @@ impl TryFrom<String> for SessionState {
 // typedef for identity bgp:admin-state.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum AdminState {
+pub enum AdminState {
     Up,
     Down,
     PfxCt,
@@ -477,7 +477,7 @@ impl TryFrom<String> for AdminState {
 // restart with the peer.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum Mode {
+pub enum Mode {
     HelperOnly,
     Bilateral,
     RemoteHelper,
@@ -505,7 +505,7 @@ type BgpSetMedType = String;
 // attribute in a policy action.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum BgpSetCommunityOptionType {
+pub enum BgpSetCommunityOptionType {
     Add,
     Remove,
     Replace,
@@ -528,7 +528,7 @@ impl TryFrom<String> for BgpSetCommunityOptionType {
 // typedef for identity gobgp:bmp-route-monitoring-policy-type.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum BmpRouteMonitoringPolicyType {
+pub enum BmpRouteMonitoringPolicyType {
     PrePolicy,
     PostPolicy,
     Both,
@@ -555,7 +555,7 @@ impl TryFrom<String> for BmpRouteMonitoringPolicyType {
 // typedef for identity gobgp:mrt-type.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum MrtType {
+pub enum MrtType {
     Updates,
     Table,
 }
@@ -574,7 +574,7 @@ impl TryFrom<String> for MrtType {
 // indicate the validation result of RPKI based on ROA.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub(crate) enum RpkiValidationResultType {
+pub enum RpkiValidationResultType {
     None,
     NotFound,
     Valid,
@@ -599,486 +599,486 @@ impl TryFrom<String> for RpkiValidationResultType {
 // struct for container gobgp:state.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DynamicNeighborState {
+pub struct DynamicNeighborState {
     // original -> gobgp:prefix
-    pub(crate) prefix: Option<String>,
+    pub prefix: Option<String>,
     // original -> gobgp:peer-group
     #[serde(rename = "peer-group")]
-    pub(crate) peer_group: Option<String>,
+    pub peer_group: Option<String>,
 }
 // struct for container gobgp:config.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DynamicNeighborConfig {
+pub struct DynamicNeighborConfig {
     // original -> gobgp:prefix
-    pub(crate) prefix: Option<String>,
+    pub prefix: Option<String>,
     // original -> gobgp:peer-group
     #[serde(rename = "peer-group")]
-    pub(crate) peer_group: Option<String>,
+    pub peer_group: Option<String>,
 }
 // struct for container gobgp:dynamic-neighbor.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DynamicNeighbor {
+pub struct DynamicNeighbor {
     // original -> gobgp:prefix
     // original -> gobgp:dynamic-neighbor-config
-    pub(crate) config: Option<DynamicNeighborConfig>,
+    pub config: Option<DynamicNeighborConfig>,
     // original -> gobgp:dynamic-neighbor-state
-    pub(crate) state: Option<DynamicNeighborState>,
+    pub state: Option<DynamicNeighborState>,
 }
 // struct for container gobgp:state.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CollectorState {
+pub struct CollectorState {
     // original -> gobgp:url
-    pub(crate) url: Option<String>,
+    pub url: Option<String>,
     // original -> gobgp:db-name
     #[serde(rename = "db-name")]
-    pub(crate) db_name: Option<String>,
+    pub db_name: Option<String>,
     // original -> gobgp:table-dump-interval
     #[serde(rename = "table-dump-interval")]
-    pub(crate) table_dump_interval: Option<u64>,
+    pub table_dump_interval: Option<u64>,
 }
 // struct for container gobgp:config.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CollectorConfig {
+pub struct CollectorConfig {
     // original -> gobgp:url
-    pub(crate) url: Option<String>,
+    pub url: Option<String>,
     // original -> gobgp:db-name
     #[serde(rename = "db-name")]
-    pub(crate) db_name: Option<String>,
+    pub db_name: Option<String>,
     // original -> gobgp:table-dump-interval
     #[serde(rename = "table-dump-interval")]
-    pub(crate) table_dump_interval: Option<u64>,
+    pub table_dump_interval: Option<u64>,
 }
 // struct for container gobgp:collector.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Collector {
+pub struct Collector {
     // original -> gobgp:collector-config
-    pub(crate) config: Option<CollectorConfig>,
+    pub config: Option<CollectorConfig>,
     // original -> gobgp:collector-state
-    pub(crate) state: Option<CollectorState>,
+    pub state: Option<CollectorState>,
 }
 // struct for container gobgp:state.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ZebraState {
+pub struct ZebraState {
     // original -> gobgp:enabled
     // gobgp:enabled's original type is boolean.
     // Configure enabling to connect to zebra.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> gobgp:url
     // Configure url for zebra.
-    pub(crate) url: Option<String>,
+    pub url: Option<String>,
     // original -> gobgp:redistribute-route-type
     #[serde(rename = "redistribute-route-type-list")]
-    pub(crate) redistribute_route_type_list: Option<Vec<String>>,
+    pub redistribute_route_type_list: Option<Vec<String>>,
     // original -> gobgp:version
     // Configure version of zebra protocol.  Default is 2.
     // Supported version are 2 or 3 for Quagga and 4, 5 or 6 for FRRouting.
-    pub(crate) version: Option<u8>,
+    pub version: Option<u8>,
     // original -> gobgp:nexthop-trigger-enable
     // gobgp:nexthop-trigger-enable's original type is boolean.
     #[serde(rename = "nexthop-trigger-enable")]
-    pub(crate) nexthop_trigger_enable: Option<bool>,
+    pub nexthop_trigger_enable: Option<bool>,
     // original -> gobgp:nexthop-trigger-delay
     #[serde(rename = "nexthop-trigger-delay")]
-    pub(crate) nexthop_trigger_delay: Option<u8>,
+    pub nexthop_trigger_delay: Option<u8>,
     // original -> gobgp:mpls-label-range-size
     // Configure MPLS label range size which will be requested to
     // FRR/Zebra.
     #[serde(rename = "mpls-label-range-size")]
-    pub(crate) mpls_label_range_size: Option<u32>,
+    pub mpls_label_range_size: Option<u32>,
     // original -> gobgp:software-name
     // Configure zebra software name.
     // frr4, cumulus, frr6, frr7, frr7.2 and frr7.3 can be used.
     #[serde(rename = "software-name")]
-    pub(crate) software_name: Option<String>,
+    pub software_name: Option<String>,
 }
 // struct for container gobgp:config.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ZebraConfig {
+pub struct ZebraConfig {
     // original -> gobgp:enabled
     // gobgp:enabled's original type is boolean.
     // Configure enabling to connect to zebra.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> gobgp:url
     // Configure url for zebra.
-    pub(crate) url: Option<String>,
+    pub url: Option<String>,
     // original -> gobgp:redistribute-route-type
     #[serde(rename = "redistribute-route-type-list")]
-    pub(crate) redistribute_route_type_list: Option<Vec<String>>,
+    pub redistribute_route_type_list: Option<Vec<String>>,
     // original -> gobgp:version
     // Configure version of zebra protocol.  Default is 2.
     // Supported version are 2 or 3 for Quagga and 4, 5 or 6 for FRRouting.
-    pub(crate) version: Option<u8>,
+    pub version: Option<u8>,
     // original -> gobgp:nexthop-trigger-enable
     // gobgp:nexthop-trigger-enable's original type is boolean.
     #[serde(rename = "nexthop-trigger-enable")]
-    pub(crate) nexthop_trigger_enable: Option<bool>,
+    pub nexthop_trigger_enable: Option<bool>,
     // original -> gobgp:nexthop-trigger-delay
     #[serde(rename = "nexthop-trigger-delay")]
-    pub(crate) nexthop_trigger_delay: Option<u8>,
+    pub nexthop_trigger_delay: Option<u8>,
     // original -> gobgp:mpls-label-range-size
     // Configure MPLS label range size which will be requested to
     // FRR/Zebra.
     #[serde(rename = "mpls-label-range-size")]
-    pub(crate) mpls_label_range_size: Option<u32>,
+    pub mpls_label_range_size: Option<u32>,
     // original -> gobgp:software-name
     // Configure zebra software name.
     // frr4, cumulus, frr6, frr7, frr7.2 and frr7.3 can be used.
     #[serde(rename = "software-name")]
-    pub(crate) software_name: Option<String>,
+    pub software_name: Option<String>,
 }
 // struct for container gobgp:zebra.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Zebra {
+pub struct Zebra {
     // original -> gobgp:zebra-config
-    pub(crate) config: Option<ZebraConfig>,
+    pub config: Option<ZebraConfig>,
     // original -> gobgp:zebra-state
-    pub(crate) state: Option<ZebraState>,
+    pub state: Option<ZebraState>,
 }
 // struct for container gobgp:config.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MrtConfig {
+pub struct MrtConfig {
     // original -> gobgp:dump-type
     #[serde(rename = "dump-type")]
-    pub(crate) dump_type: Option<MrtType>,
+    pub dump_type: Option<MrtType>,
     // original -> gobgp:file-name
     // Configures a file name to be written.
     #[serde(rename = "file-name")]
-    pub(crate) file_name: Option<String>,
+    pub file_name: Option<String>,
     // original -> gobgp:table-name
     // specify the table name with route server setup.
     #[serde(rename = "table-name")]
-    pub(crate) table_name: Option<String>,
+    pub table_name: Option<String>,
     // original -> gobgp:dump-interval
     #[serde(rename = "dump-interval")]
-    pub(crate) dump_interval: Option<u64>,
+    pub dump_interval: Option<u64>,
     // original -> gobgp:rotation-interval
     #[serde(rename = "rotation-interval")]
-    pub(crate) rotation_interval: Option<u64>,
+    pub rotation_interval: Option<u64>,
 }
 // struct for container gobgp:mrt.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Mrt {
+pub struct Mrt {
     // original -> gobgp:file-name
     // original -> gobgp:mrt-config
-    pub(crate) config: Option<MrtConfig>,
+    pub config: Option<MrtConfig>,
 }
 // struct for container gobgp:state.
 // Configured states of VRF.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct VrfState {
+pub struct VrfState {
     // original -> gobgp:name
     // Unique name among all VRF instances.
-    pub(crate) name: Option<String>,
+    pub name: Option<String>,
     // original -> gobgp:id
     // Unique identifier among all VRF instances.
-    pub(crate) id: Option<u32>,
+    pub id: Option<u32>,
     // original -> gobgp:rd
     // Route Distinguisher for this VRF.
-    pub(crate) rd: Option<String>,
+    pub rd: Option<String>,
     // original -> gobgp:import-rt
     // List of import Route Targets for this VRF.
     #[serde(rename = "import-rt-list")]
-    pub(crate) import_rt_list: Option<Vec<String>>,
+    pub import_rt_list: Option<Vec<String>>,
     // original -> gobgp:export-rt
     // List of export Route Targets for this VRF.
     #[serde(rename = "export-rt-list")]
-    pub(crate) export_rt_list: Option<Vec<String>>,
+    pub export_rt_list: Option<Vec<String>>,
 }
 // struct for container gobgp:config.
 // Configuration parameters for VRF.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct VrfConfig {
+pub struct VrfConfig {
     // original -> gobgp:name
     // Unique name among all VRF instances.
-    pub(crate) name: Option<String>,
+    pub name: Option<String>,
     // original -> gobgp:id
     // Unique identifier among all VRF instances.
-    pub(crate) id: Option<u32>,
+    pub id: Option<u32>,
     // original -> gobgp:rd
     // Route Distinguisher for this VRF.
-    pub(crate) rd: Option<String>,
+    pub rd: Option<String>,
     // original -> gobgp:import-rt
     // List of import Route Targets for this VRF.
     #[serde(rename = "import-rt-list")]
-    pub(crate) import_rt_list: Option<Vec<String>>,
+    pub import_rt_list: Option<Vec<String>>,
     // original -> gobgp:export-rt
     // List of export Route Targets for this VRF.
     #[serde(rename = "export-rt-list")]
-    pub(crate) export_rt_list: Option<Vec<String>>,
+    pub export_rt_list: Option<Vec<String>>,
     // original -> gobgp:both-rt
     // List of both import and export Route Targets for this VRF. Each
     // configuration for import and export Route Targets will be preferred.
     #[serde(rename = "both-rt-list")]
-    pub(crate) both_rt_list: Option<Vec<String>>,
+    pub both_rt_list: Option<Vec<String>>,
 }
 // struct for container gobgp:vrf.
 // VRF instance configurations on the local system.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Vrf {
+pub struct Vrf {
     // original -> gobgp:name
     // original -> gobgp:vrf-config
     // Configuration parameters for VRF.
-    pub(crate) config: Option<VrfConfig>,
+    pub config: Option<VrfConfig>,
     // original -> gobgp:vrf-state
     // Configured states of VRF.
-    pub(crate) state: Option<VrfState>,
+    pub state: Option<VrfState>,
 }
 // struct for container gobgp:state.
 // Configuration parameters relating to BMP server.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BmpServerState {
+pub struct BmpServerState {
     // original -> gobgp:address
     // gobgp:address's original type is inet:ip-address.
     // Reference to the address of the BMP server used as
     // a key in the BMP server list.
-    pub(crate) address: Option<String>,
+    pub address: Option<String>,
     // original -> gobgp:port
     // Reference to the port of the BMP server.
-    pub(crate) port: Option<u32>,
+    pub port: Option<u32>,
     // original -> gobgp:route-monitoring-policy
     #[serde(rename = "route-monitoring-policy")]
-    pub(crate) route_monitoring_policy: Option<BmpRouteMonitoringPolicyType>,
+    pub route_monitoring_policy: Option<BmpRouteMonitoringPolicyType>,
     // original -> gobgp:statistics-timeout
     // Interval seconds of statistics messages sent to BMP server.
     #[serde(rename = "statistics-timeout")]
-    pub(crate) statistics_timeout: Option<u16>,
+    pub statistics_timeout: Option<u16>,
     // original -> gobgp:route-mirroring-enabled
     // gobgp:route-mirroring-enabled's original type is boolean.
     // Enable feature for mirroring of received BGP messages
     // mainly for debugging purpose.
     #[serde(rename = "route-mirroring-enabled")]
-    pub(crate) route_mirroring_enabled: Option<bool>,
+    pub route_mirroring_enabled: Option<bool>,
     // original -> gobgp:sys-name
     // Reference to the SysName of the BMP server.
     #[serde(rename = "sys-name")]
-    pub(crate) sys_name: Option<String>,
+    pub sys_name: Option<String>,
     // original -> gobgp:sys-descr
     // Reference to the SysDescr of the BMP server.
     #[serde(rename = "sys-descr")]
-    pub(crate) sys_descr: Option<String>,
+    pub sys_descr: Option<String>,
 }
 // struct for container gobgp:config.
 // Configuration parameters relating to BMP server.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BmpServerConfig {
+pub struct BmpServerConfig {
     // original -> gobgp:address
     // gobgp:address's original type is inet:ip-address.
     // Reference to the address of the BMP server used as
     // a key in the BMP server list.
-    pub(crate) address: Option<String>,
+    pub address: Option<String>,
     // original -> gobgp:port
     // Reference to the port of the BMP server.
-    pub(crate) port: Option<u32>,
+    pub port: Option<u32>,
     // original -> gobgp:route-monitoring-policy
     #[serde(rename = "route-monitoring-policy")]
-    pub(crate) route_monitoring_policy: Option<BmpRouteMonitoringPolicyType>,
+    pub route_monitoring_policy: Option<BmpRouteMonitoringPolicyType>,
     // original -> gobgp:statistics-timeout
     // Interval seconds of statistics messages sent to BMP server.
     #[serde(rename = "statistics-timeout")]
-    pub(crate) statistics_timeout: Option<u16>,
+    pub statistics_timeout: Option<u16>,
     // original -> gobgp:route-mirroring-enabled
     // gobgp:route-mirroring-enabled's original type is boolean.
     // Enable feature for mirroring of received BGP messages
     // mainly for debugging purpose.
     #[serde(rename = "route-mirroring-enabled")]
-    pub(crate) route_mirroring_enabled: Option<bool>,
+    pub route_mirroring_enabled: Option<bool>,
     // original -> gobgp:sys-name
     // Reference to the SysName of the BMP server.
     #[serde(rename = "sys-name")]
-    pub(crate) sys_name: Option<String>,
+    pub sys_name: Option<String>,
     // original -> gobgp:sys-descr
     // Reference to the SysDescr of the BMP server.
     #[serde(rename = "sys-descr")]
-    pub(crate) sys_descr: Option<String>,
+    pub sys_descr: Option<String>,
 }
 // struct for container gobgp:bmp-server.
 // List of BMP servers configured on the local system.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BmpServer {
+pub struct BmpServer {
     // original -> gobgp:address
     // original -> gobgp:bmp-server-config
     // Configuration parameters relating to BMP server.
-    pub(crate) config: Option<BmpServerConfig>,
+    pub config: Option<BmpServerConfig>,
     // original -> gobgp:bmp-server-state
     // Configuration parameters relating to BMP server.
-    pub(crate) state: Option<BmpServerState>,
+    pub state: Option<BmpServerState>,
 }
 // struct for container gobgp:rpki-received.
 // Counters for reception RPKI Message types.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RpkiReceived {
+pub struct RpkiReceived {
     // original -> gobgp:serial-notify
     // Number of serial notify message received from RPKI server.
     #[serde(rename = "serial-notify")]
-    pub(crate) serial_notify: Option<i64>,
+    pub serial_notify: Option<i64>,
     // original -> gobgp:cache-reset
     // Number of cache reset message received from RPKI server.
     #[serde(rename = "cache-reset")]
-    pub(crate) cache_reset: Option<i64>,
+    pub cache_reset: Option<i64>,
     // original -> gobgp:cache-response
     // Number of cache response message received from RPKI server.
     #[serde(rename = "cache-response")]
-    pub(crate) cache_response: Option<i64>,
+    pub cache_response: Option<i64>,
     // original -> gobgp:ipv4-prefix
     // Number of ipv4 prefix message received from RPKI server.
     #[serde(rename = "ipv4-prefix")]
-    pub(crate) ipv4_prefix: Option<i64>,
+    pub ipv4_prefix: Option<i64>,
     // original -> gobgp:ipv6-prefix
     // Number of ipv6 prefix message received from RPKI server.
     #[serde(rename = "ipv6-prefix")]
-    pub(crate) ipv6_prefix: Option<i64>,
+    pub ipv6_prefix: Option<i64>,
     // original -> gobgp:end-of-data
     // Number of end of data message received from RPKI server.
     #[serde(rename = "end-of-data")]
-    pub(crate) end_of_data: Option<i64>,
+    pub end_of_data: Option<i64>,
     // original -> gobgp:error
     // Number of error message received from RPKI server.
-    pub(crate) error: Option<i64>,
+    pub error: Option<i64>,
 }
 // struct for container gobgp:rpki-sent.
 // Counters for transmission RPKI Message types.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RpkiSent {
+pub struct RpkiSent {
     // original -> gobgp:serial-query
     // Number of serial query message sent to RPKI server.
     #[serde(rename = "serial-query")]
-    pub(crate) serial_query: Option<i64>,
+    pub serial_query: Option<i64>,
     // original -> gobgp:reset-query
     // Number of reset query message sent to RPKI server.
     #[serde(rename = "reset-query")]
-    pub(crate) reset_query: Option<i64>,
+    pub reset_query: Option<i64>,
     // original -> gobgp:error
     // Number of error message sent to RPKI server.
-    pub(crate) error: Option<i64>,
+    pub error: Option<i64>,
 }
 // struct for container gobgp:rpki-messages.
 // Counters for transmission and reception RPKI Message types.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RpkiMessages {
+pub struct RpkiMessages {
     // original -> gobgp:rpki-sent
     // Counters for transmission RPKI Message types.
     #[serde(rename = "rpki-sent")]
-    pub(crate) rpki_sent: Option<RpkiSent>,
+    pub rpki_sent: Option<RpkiSent>,
     // original -> gobgp:rpki-received
     // Counters for reception RPKI Message types.
     #[serde(rename = "rpki-received")]
-    pub(crate) rpki_received: Option<RpkiReceived>,
+    pub rpki_received: Option<RpkiReceived>,
 }
 // struct for container gobgp:state.
 // State information relating to RPKI server.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RpkiServerState {
+pub struct RpkiServerState {
     // original -> gobgp:up
     // gobgp:up's original type is boolean.
-    pub(crate) up: Option<bool>,
+    pub up: Option<bool>,
     // original -> gobgp:serial-number
     #[serde(rename = "serial-number")]
-    pub(crate) serial_number: Option<u32>,
+    pub serial_number: Option<u32>,
     // original -> gobgp:records-v4
     #[serde(rename = "records-v4")]
-    pub(crate) records_v4: Option<u32>,
+    pub records_v4: Option<u32>,
     // original -> gobgp:records-v6
     #[serde(rename = "records-v6")]
-    pub(crate) records_v6: Option<u32>,
+    pub records_v6: Option<u32>,
     // original -> gobgp:prefixes-v4
     #[serde(rename = "prefixes-v4")]
-    pub(crate) prefixes_v4: Option<u32>,
+    pub prefixes_v4: Option<u32>,
     // original -> gobgp:prefixes-v6
     #[serde(rename = "prefixes-v6")]
-    pub(crate) prefixes_v6: Option<u32>,
+    pub prefixes_v6: Option<u32>,
     // original -> gobgp:uptime
     // This timer determines the amount of time since the
     // RPKI last transitioned in of the Established state.
-    pub(crate) uptime: Option<i64>,
+    pub uptime: Option<i64>,
     // original -> gobgp:downtime
     // This timer determines the amount of time since the
     // RPKI last transitioned out of the Established state.
-    pub(crate) downtime: Option<i64>,
+    pub downtime: Option<i64>,
     // original -> gobgp:last-pdu-recv-time
     // last time the received an pdu message from RPKI server.
     #[serde(rename = "last-pdu-recv-time")]
-    pub(crate) last_pdu_recv_time: Option<i64>,
+    pub last_pdu_recv_time: Option<i64>,
     // original -> gobgp:rpki-messages
     // Counters for transmission and reception RPKI Message types.
     #[serde(rename = "rpki-messages")]
-    pub(crate) rpki_messages: Option<RpkiMessages>,
+    pub rpki_messages: Option<RpkiMessages>,
 }
 // struct for container gobgp:config.
 // Configuration parameters relating to RPKI server.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RpkiServerConfig {
+pub struct RpkiServerConfig {
     // original -> gobgp:address
     // gobgp:address's original type is inet:ip-address.
     // Reference to the address of the RPKI server used as
     // a key in the RPKI server list.
-    pub(crate) address: Option<String>,
+    pub address: Option<String>,
     // original -> gobgp:port
     // Reference to the port of the RPKI server.
-    pub(crate) port: Option<u32>,
+    pub port: Option<u32>,
     // original -> gobgp:refresh-time
     // Check interval for a configured RPKI server.
     #[serde(rename = "refresh-time")]
-    pub(crate) refresh_time: Option<i64>,
+    pub refresh_time: Option<i64>,
     // original -> gobgp:hold-time
     // Specify the length of time in seconds that the session between
     // the router and RPKI server is to be considered operational
     // without any activity.
     #[serde(rename = "hold-time")]
-    pub(crate) hold_time: Option<i64>,
+    pub hold_time: Option<i64>,
     // original -> gobgp:record-lifetime
     // Indicate the expiration date of the route validation recode
     // received from RPKI server.
     #[serde(rename = "record-lifetime")]
-    pub(crate) record_lifetime: Option<i64>,
+    pub record_lifetime: Option<i64>,
     // original -> gobgp:preference
     // RPKI server has a static preference.
     // Higher the preference values indicates a higher priority RPKI server.
-    pub(crate) preference: Option<u8>,
+    pub preference: Option<u8>,
 }
 // struct for container gobgp:rpki-server.
 // List of RPKI servers configured on the local system.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RpkiServer {
+pub struct RpkiServer {
     // original -> gobgp:address
     // original -> gobgp:rpki-server-config
     // Configuration parameters relating to RPKI server.
-    pub(crate) config: Option<RpkiServerConfig>,
+    pub config: Option<RpkiServerConfig>,
     // original -> gobgp:rpki-server-state
     // State information relating to RPKI server.
-    pub(crate) state: Option<RpkiServerState>,
+    pub state: Option<RpkiServerState>,
 }
 // struct for container bgp:state.
 // State information relating to the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PeerGroupState {
+pub struct PeerGroupState {
     // original -> bgp:peer-as
     // bgp:peer-as's original type is inet:as-number.
     // AS number of the peer.
     #[serde(rename = "peer-as")]
-    pub(crate) peer_as: Option<u32>,
+    pub peer_as: Option<u32>,
     // original -> bgp:local-as
     // bgp:local-as's original type is inet:as-number.
     // The local autonomous system number that is to be used
@@ -1086,60 +1086,60 @@ pub(crate) struct PeerGroupState {
     // group, if this differs from the global BGP router
     // autonomous system number.
     #[serde(rename = "local-as")]
-    pub(crate) local_as: Option<u32>,
+    pub local_as: Option<u32>,
     // original -> bgp:peer-type
     // Explicitly designate the peer or peer group as internal
     // (iBGP) or external (eBGP).
     #[serde(rename = "peer-type")]
-    pub(crate) peer_type: Option<PeerType>,
+    pub peer_type: Option<PeerType>,
     // original -> bgp:auth-password
     // Configures an MD5 authentication password for use with
     // neighboring devices.
     #[serde(rename = "auth-password")]
-    pub(crate) auth_password: Option<String>,
+    pub auth_password: Option<String>,
     // original -> bgp:remove-private-as
     // Remove private AS numbers from updates sent to peers.
     #[serde(rename = "remove-private-as")]
-    pub(crate) remove_private_as: Option<RemovePrivateAsOption>,
+    pub remove_private_as: Option<RemovePrivateAsOption>,
     // original -> bgp:route-flap-damping
     // bgp:route-flap-damping's original type is boolean.
     // Enable route flap damping.
     #[serde(rename = "route-flap-damping")]
-    pub(crate) route_flap_damping: Option<bool>,
+    pub route_flap_damping: Option<bool>,
     // original -> bgp:send-community
     // Specify which types of community should be sent to the
     // neighbor or group. The default is to not send the
     // community attribute.
     #[serde(rename = "send-community")]
-    pub(crate) send_community: Option<CommunityType>,
+    pub send_community: Option<CommunityType>,
     // original -> bgp:description
     // An optional textual description (intended primarily for use
     // with a peer or group.
-    pub(crate) description: Option<String>,
+    pub description: Option<String>,
     // original -> bgp:peer-group-name
     // Name of the BGP peer-group.
     #[serde(rename = "peer-group-name")]
-    pub(crate) peer_group_name: Option<String>,
+    pub peer_group_name: Option<String>,
     // original -> bgp-op:total-paths
     // Total number of BGP paths within the context.
     #[serde(rename = "total-paths")]
-    pub(crate) total_paths: Option<u32>,
+    pub total_paths: Option<u32>,
     // original -> bgp-op:total-prefixes
     // .
     #[serde(rename = "total-prefixes")]
-    pub(crate) total_prefixes: Option<u32>,
+    pub total_prefixes: Option<u32>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to the BGP neighbor or
 // group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PeerGroupConfig {
+pub struct PeerGroupConfig {
     // original -> bgp:peer-as
     // bgp:peer-as's original type is inet:as-number.
     // AS number of the peer.
     #[serde(rename = "peer-as")]
-    pub(crate) peer_as: Option<u32>,
+    pub peer_as: Option<u32>,
     // original -> bgp:local-as
     // bgp:local-as's original type is inet:as-number.
     // The local autonomous system number that is to be used
@@ -1147,485 +1147,485 @@ pub(crate) struct PeerGroupConfig {
     // group, if this differs from the global BGP router
     // autonomous system number.
     #[serde(rename = "local-as")]
-    pub(crate) local_as: Option<u32>,
+    pub local_as: Option<u32>,
     // original -> bgp:peer-type
     // Explicitly designate the peer or peer group as internal
     // (iBGP) or external (eBGP).
     #[serde(rename = "peer-type")]
-    pub(crate) peer_type: Option<PeerType>,
+    pub peer_type: Option<PeerType>,
     // original -> bgp:auth-password
     // Configures an MD5 authentication password for use with
     // neighboring devices.
     #[serde(rename = "auth-password")]
-    pub(crate) auth_password: Option<String>,
+    pub auth_password: Option<String>,
     // original -> bgp:remove-private-as
     // Remove private AS numbers from updates sent to peers.
     #[serde(rename = "remove-private-as")]
-    pub(crate) remove_private_as: Option<RemovePrivateAsOption>,
+    pub remove_private_as: Option<RemovePrivateAsOption>,
     // original -> bgp:route-flap-damping
     // bgp:route-flap-damping's original type is boolean.
     // Enable route flap damping.
     #[serde(rename = "route-flap-damping")]
-    pub(crate) route_flap_damping: Option<bool>,
+    pub route_flap_damping: Option<bool>,
     // original -> bgp:send-community
     // Specify which types of community should be sent to the
     // neighbor or group. The default is to not send the
     // community attribute.
     #[serde(rename = "send-community")]
-    pub(crate) send_community: Option<CommunityType>,
+    pub send_community: Option<CommunityType>,
     // original -> bgp:description
     // An optional textual description (intended primarily for use
     // with a peer or group.
-    pub(crate) description: Option<String>,
+    pub description: Option<String>,
     // original -> bgp:peer-group-name
     // Name of the BGP peer-group.
     #[serde(rename = "peer-group-name")]
-    pub(crate) peer_group_name: Option<String>,
+    pub peer_group_name: Option<String>,
 }
 // struct for container bgp:peer-group.
 // List of BGP peer-groups configured on the local system -
 // uniquely identified by peer-group name.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PeerGroup {
+pub struct PeerGroup {
     // original -> bgp:peer-group-name
     // original -> bgp:peer-group-config
     // Configuration parameters relating to the BGP neighbor or
     // group.
-    pub(crate) config: Option<PeerGroupConfig>,
+    pub config: Option<PeerGroupConfig>,
     // original -> bgp:peer-group-state
     // State information relating to the BGP neighbor or group.
-    pub(crate) state: Option<PeerGroupState>,
+    pub state: Option<PeerGroupState>,
     // original -> bgp:timers
     // Timers related to a BGP neighbor or group.
-    pub(crate) timers: Option<Timers>,
+    pub timers: Option<Timers>,
     // original -> bgp:transport
     // Transport session parameters for the BGP neighbor or group.
-    pub(crate) transport: Option<Transport>,
+    pub transport: Option<Transport>,
     // original -> bgp:error-handling
     // Error handling parameters used for the BGP neighbor or
     // group.
     #[serde(rename = "error-handling")]
-    pub(crate) error_handling: Option<ErrorHandling>,
+    pub error_handling: Option<ErrorHandling>,
     // original -> bgp:logging-options
     // Logging options for events related to the BGP neighbor or
     // group.
     #[serde(rename = "logging-options")]
-    pub(crate) logging_options: Option<LoggingOptions>,
+    pub logging_options: Option<LoggingOptions>,
     // original -> bgp:ebgp-multihop
     // eBGP multi-hop parameters for the BGP neighbor or group.
     #[serde(rename = "ebgp-multihop")]
-    pub(crate) ebgp_multihop: Option<EbgpMultihop>,
+    pub ebgp_multihop: Option<EbgpMultihop>,
     // original -> bgp:route-reflector
     // Route reflector parameters for the BGP neighbor or group.
     #[serde(rename = "route-reflector")]
-    pub(crate) route_reflector: Option<RouteReflector>,
+    pub route_reflector: Option<RouteReflector>,
     // original -> bgp:as-path-options
     // AS_PATH manipulation parameters for the BGP neighbor or
     // group.
     #[serde(rename = "as-path-options")]
-    pub(crate) as_path_options: Option<AsPathOptions>,
+    pub as_path_options: Option<AsPathOptions>,
     // original -> bgp:add-paths
     // Parameters relating to the advertisement and receipt of
     // multiple paths for a single NLRI (add-paths).
     #[serde(rename = "add-paths")]
-    pub(crate) add_paths: Option<AddPaths>,
+    pub add_paths: Option<AddPaths>,
     // original -> bgp:afi-safis
     // Per-address-family configuration parameters associated with
     // the neighbor or group.
     #[serde(rename = "afi-safis")]
-    pub(crate) afi_safis: Option<Vec<AfiSafi>>,
+    pub afi_safis: Option<Vec<AfiSafi>>,
     // original -> bgp:graceful-restart
     // Parameters relating the graceful restart mechanism for BGP.
     #[serde(rename = "graceful-restart")]
-    pub(crate) graceful_restart: Option<GracefulRestart>,
+    pub graceful_restart: Option<GracefulRestart>,
     // original -> rpol:apply-policy
     // Anchor point for routing policies in the model.
     // Import and export policies are with respect to the local
     // routing table, i.e., export (send) and import (receive),
     // depending on the context.
     #[serde(rename = "apply-policy")]
-    pub(crate) apply_policy: Option<ApplyPolicy>,
+    pub apply_policy: Option<ApplyPolicy>,
     // original -> bgp-mp:use-multiple-paths
     // Parameters related to the use of multiple paths for the
     // same NLRI.
     #[serde(rename = "use-multiple-paths")]
-    pub(crate) use_multiple_paths: Option<UseMultiplePaths>,
+    pub use_multiple_paths: Option<UseMultiplePaths>,
     // original -> gobgp:route-server
     // Configure the local router as a route server.
     #[serde(rename = "route-server")]
-    pub(crate) route_server: Option<RouteServer>,
+    pub route_server: Option<RouteServer>,
     // original -> gobgp:ttl-security
     // Configure TTL Security feature.
     #[serde(rename = "ttl-security")]
-    pub(crate) ttl_security: Option<TtlSecurity>,
+    pub ttl_security: Option<TtlSecurity>,
 }
 // struct for container gobgp:state.
 // State information for TTL Security.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TtlSecurityState {
+pub struct TtlSecurityState {
     // original -> gobgp:enabled
     // gobgp:enabled's original type is boolean.
     // Enable features for TTL Security.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> gobgp:ttl-min
     // Reference to the port of the BMP server.
     #[serde(rename = "ttl-min")]
-    pub(crate) ttl_min: Option<u8>,
+    pub ttl_min: Option<u8>,
 }
 // struct for container gobgp:config.
 // Configuration parameters for TTL Security.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TtlSecurityConfig {
+pub struct TtlSecurityConfig {
     // original -> gobgp:enabled
     // gobgp:enabled's original type is boolean.
     // Enable features for TTL Security.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> gobgp:ttl-min
     // Reference to the port of the BMP server.
     #[serde(rename = "ttl-min")]
-    pub(crate) ttl_min: Option<u8>,
+    pub ttl_min: Option<u8>,
 }
 // struct for container gobgp:ttl-security.
 // Configure TTL Security feature.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TtlSecurity {
+pub struct TtlSecurity {
     // original -> gobgp:ttl-security-config
     // Configuration parameters for TTL Security.
-    pub(crate) config: Option<TtlSecurityConfig>,
+    pub config: Option<TtlSecurityConfig>,
     // original -> gobgp:ttl-security-state
     // State information for TTL Security.
-    pub(crate) state: Option<TtlSecurityState>,
+    pub state: Option<TtlSecurityState>,
 }
 // struct for container gobgp:state.
 // State information relating to route server
 // client(s) used for the BGP neighbor.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteServerState {
+pub struct RouteServerState {
     // original -> gobgp:route-server-client
     // gobgp:route-server-client's original type is boolean.
     // Configure the neighbor as a route server client.
     #[serde(rename = "route-server-client")]
-    pub(crate) route_server_client: Option<bool>,
+    pub route_server_client: Option<bool>,
     // original -> gobgp:secondary-route
     // gobgp:secondary-route's original type is boolean.
     // if an export policy rejects a selected route, try the next route in
     // order until one that is accepted is found or all routes for the peer
     // are rejected.
     #[serde(rename = "secondary-route")]
-    pub(crate) secondary_route: Option<bool>,
+    pub secondary_route: Option<bool>,
 }
 // struct for container gobgp:config.
 // Configuration parameters relating to route server
 // client(s) used for the BGP neighbor.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteServerConfig {
+pub struct RouteServerConfig {
     // original -> gobgp:route-server-client
     // gobgp:route-server-client's original type is boolean.
     // Configure the neighbor as a route server client.
     #[serde(rename = "route-server-client")]
-    pub(crate) route_server_client: Option<bool>,
+    pub route_server_client: Option<bool>,
     // original -> gobgp:secondary-route
     // gobgp:secondary-route's original type is boolean.
     // if an export policy rejects a selected route, try the next route in
     // order until one that is accepted is found or all routes for the peer
     // are rejected.
     #[serde(rename = "secondary-route")]
-    pub(crate) secondary_route: Option<bool>,
+    pub secondary_route: Option<bool>,
 }
 // struct for container gobgp:route-server.
 // Configure the local router as a route server.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteServer {
+pub struct RouteServer {
     // original -> gobgp:route-server-config
     // Configuration parameters relating to route server
     // client(s) used for the BGP neighbor.
-    pub(crate) config: Option<RouteServerConfig>,
+    pub config: Option<RouteServerConfig>,
     // original -> gobgp:route-server-state
     // State information relating to route server
     // client(s) used for the BGP neighbor.
-    pub(crate) state: Option<RouteServerState>,
+    pub state: Option<RouteServerState>,
 }
 // struct for container bgp-op:prefixes.
 // Prefix counters for the BGP session.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Prefixes {
+pub struct Prefixes {
     // original -> bgp-op:received
     // The number of prefixes received from the neighbor.
-    pub(crate) received: Option<u32>,
+    pub received: Option<u32>,
     // original -> bgp-op:sent
     // The number of prefixes advertised to the neighbor.
-    pub(crate) sent: Option<u32>,
+    pub sent: Option<u32>,
     // original -> bgp-op:installed
     // The number of advertised prefixes installed in the
     // Loc-RIB.
-    pub(crate) installed: Option<u32>,
+    pub installed: Option<u32>,
 }
 // struct for container bgp:state.
 // State information associated with ADD_PATHS.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AddPathsState {
+pub struct AddPathsState {
     // original -> bgp:receive
     // bgp:receive's original type is boolean.
     // Enable ability to receive multiple path advertisements
     // for an NLRI from the neighbor or group.
-    pub(crate) receive: Option<bool>,
+    pub receive: Option<bool>,
     // original -> bgp:send-max
     // The maximum number of paths to advertise to neighbors
     // for a single NLRI.
     #[serde(rename = "send-max")]
-    pub(crate) send_max: Option<u8>,
+    pub send_max: Option<u8>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to ADD_PATHS.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AddPathsConfig {
+pub struct AddPathsConfig {
     // original -> bgp:receive
     // bgp:receive's original type is boolean.
     // Enable ability to receive multiple path advertisements
     // for an NLRI from the neighbor or group.
-    pub(crate) receive: Option<bool>,
+    pub receive: Option<bool>,
     // original -> bgp:send-max
     // The maximum number of paths to advertise to neighbors
     // for a single NLRI.
     #[serde(rename = "send-max")]
-    pub(crate) send_max: Option<u8>,
+    pub send_max: Option<u8>,
 }
 // struct for container bgp:add-paths.
 // Parameters relating to the advertisement and receipt of
 // multiple paths for a single NLRI (add-paths).
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AddPaths {
+pub struct AddPaths {
     // original -> bgp:add-paths-config
     // Configuration parameters relating to ADD_PATHS.
-    pub(crate) config: Option<AddPathsConfig>,
+    pub config: Option<AddPathsConfig>,
     // original -> bgp:add-paths-state
     // State information associated with ADD_PATHS.
-    pub(crate) state: Option<AddPathsState>,
+    pub state: Option<AddPathsState>,
 }
 // struct for container bgp:state.
 // State information relating to the AS_PATH manipulation
 // mechanisms for the BGP peer or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AsPathOptionsState {
+pub struct AsPathOptionsState {
     // original -> bgp:allow-own-as
     // Specify the number of occurrences of the local BGP speaker's
     // AS that can occur within the AS_PATH before it is rejected.
     #[serde(rename = "allow-own-as")]
-    pub(crate) allow_own_as: Option<u8>,
+    pub allow_own_as: Option<u8>,
     // original -> bgp:replace-peer-as
     // bgp:replace-peer-as's original type is boolean.
     // Replace occurrences of the peer's AS in the AS_PATH
     // with the local autonomous system number.
     #[serde(rename = "replace-peer-as")]
-    pub(crate) replace_peer_as: Option<bool>,
+    pub replace_peer_as: Option<bool>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to AS_PATH manipulation
 // for the BGP peer or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AsPathOptionsConfig {
+pub struct AsPathOptionsConfig {
     // original -> bgp:allow-own-as
     // Specify the number of occurrences of the local BGP speaker's
     // AS that can occur within the AS_PATH before it is rejected.
     #[serde(rename = "allow-own-as")]
-    pub(crate) allow_own_as: Option<u8>,
+    pub allow_own_as: Option<u8>,
     // original -> bgp:replace-peer-as
     // bgp:replace-peer-as's original type is boolean.
     // Replace occurrences of the peer's AS in the AS_PATH
     // with the local autonomous system number.
     #[serde(rename = "replace-peer-as")]
-    pub(crate) replace_peer_as: Option<bool>,
+    pub replace_peer_as: Option<bool>,
 }
 // struct for container bgp:as-path-options.
 // AS_PATH manipulation parameters for the BGP neighbor or
 // group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AsPathOptions {
+pub struct AsPathOptions {
     // original -> bgp:as-path-options-config
     // Configuration parameters relating to AS_PATH manipulation
     // for the BGP peer or group.
-    pub(crate) config: Option<AsPathOptionsConfig>,
+    pub config: Option<AsPathOptionsConfig>,
     // original -> bgp:as-path-options-state
     // State information relating to the AS_PATH manipulation
     // mechanisms for the BGP peer or group.
-    pub(crate) state: Option<AsPathOptionsState>,
+    pub state: Option<AsPathOptionsState>,
 }
 // struct for container bgp:state.
 // State information relating to route reflection for the
 // BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteReflectorState {
+pub struct RouteReflectorState {
     // original -> bgp:route-reflector-cluster-id
     // route-reflector cluster id to use when local router is
     // configured as a route reflector.  Commonly set at the group
     // level, but allows a different cluster
     // id to be set for each neighbor.
     #[serde(rename = "route-reflector-cluster-id")]
-    pub(crate) route_reflector_cluster_id: Option<RrClusterIdType>,
+    pub route_reflector_cluster_id: Option<RrClusterIdType>,
     // original -> bgp:route-reflector-client
     // bgp:route-reflector-client's original type is boolean.
     // Configure the neighbor as a route reflector client.
     #[serde(rename = "route-reflector-client")]
-    pub(crate) route_reflector_client: Option<bool>,
+    pub route_reflector_client: Option<bool>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to route reflection
 // for the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteReflectorConfig {
+pub struct RouteReflectorConfig {
     // original -> bgp:route-reflector-cluster-id
     // route-reflector cluster id to use when local router is
     // configured as a route reflector.  Commonly set at the group
     // level, but allows a different cluster
     // id to be set for each neighbor.
     #[serde(rename = "route-reflector-cluster-id")]
-    pub(crate) route_reflector_cluster_id: Option<RrClusterIdType>,
+    pub route_reflector_cluster_id: Option<RrClusterIdType>,
     // original -> bgp:route-reflector-client
     // bgp:route-reflector-client's original type is boolean.
     // Configure the neighbor as a route reflector client.
     #[serde(rename = "route-reflector-client")]
-    pub(crate) route_reflector_client: Option<bool>,
+    pub route_reflector_client: Option<bool>,
 }
 // struct for container bgp:route-reflector.
 // Route reflector parameters for the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteReflector {
+pub struct RouteReflector {
     // original -> bgp:route-reflector-config
     // Configuration parameters relating to route reflection
     // for the BGP neighbor or group.
-    pub(crate) config: Option<RouteReflectorConfig>,
+    pub config: Option<RouteReflectorConfig>,
     // original -> bgp:route-reflector-state
     // State information relating to route reflection for the
     // BGP neighbor or group.
-    pub(crate) state: Option<RouteReflectorState>,
+    pub state: Option<RouteReflectorState>,
 }
 // struct for container bgp:state.
 // State information for eBGP multihop, for the BGP neighbor
 // or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct EbgpMultihopState {
+pub struct EbgpMultihopState {
     // original -> bgp:enabled
     // bgp:enabled's original type is boolean.
     // When enabled the referenced group or neighbors are permitted
     // to be indirectly connected - including cases where the TTL
     // can be decremented between the BGP peers.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> bgp:multihop-ttl
     // Time-to-live value to use when packets are sent to the
     // referenced group or neighbors and ebgp-multihop is enabled.
     #[serde(rename = "multihop-ttl")]
-    pub(crate) multihop_ttl: Option<u8>,
+    pub multihop_ttl: Option<u8>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to eBGP multihop for the
 // BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct EbgpMultihopConfig {
+pub struct EbgpMultihopConfig {
     // original -> bgp:enabled
     // bgp:enabled's original type is boolean.
     // When enabled the referenced group or neighbors are permitted
     // to be indirectly connected - including cases where the TTL
     // can be decremented between the BGP peers.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> bgp:multihop-ttl
     // Time-to-live value to use when packets are sent to the
     // referenced group or neighbors and ebgp-multihop is enabled.
     #[serde(rename = "multihop-ttl")]
-    pub(crate) multihop_ttl: Option<u8>,
+    pub multihop_ttl: Option<u8>,
 }
 // struct for container bgp:ebgp-multihop.
 // eBGP multi-hop parameters for the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct EbgpMultihop {
+pub struct EbgpMultihop {
     // original -> bgp:ebgp-multihop-config
     // Configuration parameters relating to eBGP multihop for the
     // BGP neighbor or group.
-    pub(crate) config: Option<EbgpMultihopConfig>,
+    pub config: Option<EbgpMultihopConfig>,
     // original -> bgp:ebgp-multihop-state
     // State information for eBGP multihop, for the BGP neighbor
     // or group.
-    pub(crate) state: Option<EbgpMultihopState>,
+    pub state: Option<EbgpMultihopState>,
 }
 // struct for container bgp:state.
 // State information relating to logging for the BGP neighbor
 // or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LoggingOptionsState {
+pub struct LoggingOptionsState {
     // original -> bgp:log-neighbor-state-changes
     // bgp:log-neighbor-state-changes's original type is boolean.
     // Configure logging of peer state changes.  Default is
     // to enable logging of peer state changes.
     #[serde(rename = "log-neighbor-state-changes")]
-    pub(crate) log_neighbor_state_changes: Option<bool>,
+    pub log_neighbor_state_changes: Option<bool>,
 }
 // struct for container bgp:config.
 // Configuration parameters enabling or modifying logging
 // for events relating to the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LoggingOptionsConfig {
+pub struct LoggingOptionsConfig {
     // original -> bgp:log-neighbor-state-changes
     // bgp:log-neighbor-state-changes's original type is boolean.
     // Configure logging of peer state changes.  Default is
     // to enable logging of peer state changes.
     #[serde(rename = "log-neighbor-state-changes")]
-    pub(crate) log_neighbor_state_changes: Option<bool>,
+    pub log_neighbor_state_changes: Option<bool>,
 }
 // struct for container bgp:logging-options.
 // Logging options for events related to the BGP neighbor or
 // group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LoggingOptions {
+pub struct LoggingOptions {
     // original -> bgp:logging-options-config
     // Configuration parameters enabling or modifying logging
     // for events relating to the BGP neighbor or group.
-    pub(crate) config: Option<LoggingOptionsConfig>,
+    pub config: Option<LoggingOptionsConfig>,
     // original -> bgp:logging-options-state
     // State information relating to logging for the BGP neighbor
     // or group.
-    pub(crate) state: Option<LoggingOptionsState>,
+    pub state: Option<LoggingOptionsState>,
 }
 // struct for container bgp:state.
 // State information relating to enhanced error handling
 // mechanisms for the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ErrorHandlingState {
+pub struct ErrorHandlingState {
     // original -> bgp:treat-as-withdraw
     // bgp:treat-as-withdraw's original type is boolean.
     // Specify whether erroneous UPDATE messages for which the
     // NLRI can be extracted are reated as though the NLRI is
     // withdrawn - avoiding session reset.
     #[serde(rename = "treat-as-withdraw")]
-    pub(crate) treat_as_withdraw: Option<bool>,
+    pub treat_as_withdraw: Option<bool>,
     // original -> bgp-op:erroneous-update-messages
     // The number of BGP UPDATE messages for which the
     // treat-as-withdraw mechanism has been applied based
     // on erroneous message contents.
     #[serde(rename = "erroneous-update-messages")]
-    pub(crate) erroneous_update_messages: Option<u32>,
+    pub erroneous_update_messages: Option<u32>,
 }
 // struct for container bgp:config.
 // Configuration parameters enabling or modifying the
@@ -1633,53 +1633,53 @@ pub(crate) struct ErrorHandlingState {
 // neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ErrorHandlingConfig {
+pub struct ErrorHandlingConfig {
     // original -> bgp:treat-as-withdraw
     // bgp:treat-as-withdraw's original type is boolean.
     // Specify whether erroneous UPDATE messages for which the
     // NLRI can be extracted are reated as though the NLRI is
     // withdrawn - avoiding session reset.
     #[serde(rename = "treat-as-withdraw")]
-    pub(crate) treat_as_withdraw: Option<bool>,
+    pub treat_as_withdraw: Option<bool>,
 }
 // struct for container bgp:error-handling.
 // Error handling parameters used for the BGP neighbor or
 // group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ErrorHandling {
+pub struct ErrorHandling {
     // original -> bgp:error-handling-config
     // Configuration parameters enabling or modifying the
     // behavior or enhanced error handling mechanisms for the BGP
     // neighbor or group.
-    pub(crate) config: Option<ErrorHandlingConfig>,
+    pub config: Option<ErrorHandlingConfig>,
     // original -> bgp:error-handling-state
     // State information relating to enhanced error handling
     // mechanisms for the BGP neighbor or group.
-    pub(crate) state: Option<ErrorHandlingState>,
+    pub state: Option<ErrorHandlingState>,
 }
 // struct for container bgp:state.
 // State information relating to the transport session(s)
 // used for the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TransportState {
+pub struct TransportState {
     // original -> bgp:tcp-mss
     // Sets the max segment size for BGP TCP sessions.
     #[serde(rename = "tcp-mss")]
-    pub(crate) tcp_mss: Option<u16>,
+    pub tcp_mss: Option<u16>,
     // original -> bgp:mtu-discovery
     // bgp:mtu-discovery's original type is boolean.
     // Turns path mtu discovery for BGP TCP sessions on (true)
     // or off (false).
     #[serde(rename = "mtu-discovery")]
-    pub(crate) mtu_discovery: Option<bool>,
+    pub mtu_discovery: Option<bool>,
     // original -> bgp:passive-mode
     // bgp:passive-mode's original type is boolean.
     // Wait for peers to issue requests to open a BGP session,
     // rather than initiating sessions from the local router.
     #[serde(rename = "passive-mode")]
-    pub(crate) passive_mode: Option<bool>,
+    pub passive_mode: Option<bool>,
     // original -> bgp:local-address
     // bgp:local-address's original type is union.
     // Set the local IP (either IPv4 or IPv6) address to use
@@ -1687,48 +1687,48 @@ pub(crate) struct TransportState {
     // may be expressed as either an IP address or reference
     // to the name of an interface.
     #[serde(rename = "local-address")]
-    pub(crate) local_address: Option<String>,
+    pub local_address: Option<String>,
     // original -> bgp-op:local-port
     // bgp-op:local-port's original type is inet:port-number.
     // Local TCP port being used for the TCP session supporting
     // the BGP session.
     #[serde(rename = "local-port")]
-    pub(crate) local_port: Option<u16>,
+    pub local_port: Option<u16>,
     // original -> bgp-op:remote-address
     // bgp-op:remote-address's original type is inet:ip-address.
     // Remote address to which the BGP session has been
     // established.
     #[serde(rename = "remote-address")]
-    pub(crate) remote_address: Option<String>,
+    pub remote_address: Option<String>,
     // original -> bgp-op:remote-port
     // bgp-op:remote-port's original type is inet:port-number.
     // Remote port being used by the peer for the TCP session
     // supporting the BGP session.
     #[serde(rename = "remote-port")]
-    pub(crate) remote_port: Option<u16>,
+    pub remote_port: Option<u16>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to the transport
 // session(s) used for the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TransportConfig {
+pub struct TransportConfig {
     // original -> bgp:tcp-mss
     // Sets the max segment size for BGP TCP sessions.
     #[serde(rename = "tcp-mss")]
-    pub(crate) tcp_mss: Option<u16>,
+    pub tcp_mss: Option<u16>,
     // original -> bgp:mtu-discovery
     // bgp:mtu-discovery's original type is boolean.
     // Turns path mtu discovery for BGP TCP sessions on (true)
     // or off (false).
     #[serde(rename = "mtu-discovery")]
-    pub(crate) mtu_discovery: Option<bool>,
+    pub mtu_discovery: Option<bool>,
     // original -> bgp:passive-mode
     // bgp:passive-mode's original type is boolean.
     // Wait for peers to issue requests to open a BGP session,
     // rather than initiating sessions from the local router.
     #[serde(rename = "passive-mode")]
-    pub(crate) passive_mode: Option<bool>,
+    pub passive_mode: Option<bool>,
     // original -> bgp:local-address
     // bgp:local-address's original type is union.
     // Set the local IP (either IPv4 or IPv6) address to use
@@ -1736,45 +1736,45 @@ pub(crate) struct TransportConfig {
     // may be expressed as either an IP address or reference
     // to the name of an interface.
     #[serde(rename = "local-address")]
-    pub(crate) local_address: Option<String>,
+    pub local_address: Option<String>,
     // original -> gobgp:remote-port
     // gobgp:remote-port's original type is inet:port-number.
     #[serde(rename = "remote-port")]
-    pub(crate) remote_port: Option<u16>,
+    pub remote_port: Option<u16>,
     // original -> gobgp:ttl
     // TTL value for BGP packets.
-    pub(crate) ttl: Option<u8>,
+    pub ttl: Option<u8>,
     // original -> gobgp:bind-interface
     // Interface name for binding.
     #[serde(rename = "bind-interface")]
-    pub(crate) bind_interface: Option<String>,
+    pub bind_interface: Option<String>,
 }
 // struct for container bgp:transport.
 // Transport session parameters for the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Transport {
+pub struct Transport {
     // original -> bgp:transport-config
     // Configuration parameters relating to the transport
     // session(s) used for the BGP neighbor or group.
-    pub(crate) config: Option<TransportConfig>,
+    pub config: Option<TransportConfig>,
     // original -> bgp:transport-state
     // State information relating to the transport session(s)
     // used for the BGP neighbor or group.
-    pub(crate) state: Option<TransportState>,
+    pub state: Option<TransportState>,
 }
 // struct for container bgp:state.
 // State information relating to the timers used for the BGP
 // neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TimersState {
+pub struct TimersState {
     // original -> bgp:connect-retry
     // bgp:connect-retry's original type is decimal64.
     // Time interval in seconds between attempts to establish a
     // session with the peer.
     #[serde(rename = "connect-retry")]
-    pub(crate) connect_retry: Option<f64>,
+    pub connect_retry: Option<f64>,
     // original -> bgp:hold-time
     // bgp:hold-time's original type is decimal64.
     // Time interval in seconds that a BGP session will be
@@ -1782,14 +1782,14 @@ pub(crate) struct TimersState {
     // messages from the peer.  The hold-time is typically
     // set to 3x the keepalive-interval.
     #[serde(rename = "hold-time")]
-    pub(crate) hold_time: Option<f64>,
+    pub hold_time: Option<f64>,
     // original -> bgp:keepalive-interval
     // bgp:keepalive-interval's original type is decimal64.
     // Time interval in seconds between transmission of keepalive
     // messages to the neighbor.  Typically set to 1/3 the
     // hold-time.
     #[serde(rename = "keepalive-interval")]
-    pub(crate) keepalive_interval: Option<f64>,
+    pub keepalive_interval: Option<f64>,
     // original -> bgp:minimum-advertisement-interval
     // bgp:minimum-advertisement-interval's original type is decimal64.
     // Minimum time which must elapse between subsequent UPDATE
@@ -1799,47 +1799,47 @@ pub(crate) struct TimersState {
     // reduce the number of UPDATE messages transmitted when a
     // particular set of NLRI exhibit instability.
     #[serde(rename = "minimum-advertisement-interval")]
-    pub(crate) minimum_advertisement_interval: Option<f64>,
+    pub minimum_advertisement_interval: Option<f64>,
     // original -> bgp-op:uptime
     // bgp-op:uptime's original type is yang:timeticks.
     // This timer determines the amount of time since the
     // BGP last transitioned in or out of the Established
     // state.
-    pub(crate) uptime: Option<i64>,
+    pub uptime: Option<i64>,
     // original -> bgp-op:negotiated-hold-time
     // bgp-op:negotiated-hold-time's original type is decimal64.
     // The negotiated hold-time for the BGP session.
     #[serde(rename = "negotiated-hold-time")]
-    pub(crate) negotiated_hold_time: Option<f64>,
+    pub negotiated_hold_time: Option<f64>,
     // original -> gobgp:idle-hold-time-after-reset
     // gobgp:idle-hold-time-after-reset's original type is decimal64.
     // Time interval in seconds that a BGP session will be
     // in idle state after neighbor reset operation.
     #[serde(rename = "idle-hold-time-after-reset")]
-    pub(crate) idle_hold_time_after_reset: Option<f64>,
+    pub idle_hold_time_after_reset: Option<f64>,
     // original -> gobgp:downtime
     // gobgp:downtime's original type is yang:timeticks.
     // This timer determines the amount of time since the
     // BGP last transitioned out of the Established state.
-    pub(crate) downtime: Option<i64>,
+    pub downtime: Option<i64>,
     // original -> gobgp:update-recv-time
     // The number of seconds elapsed since January 1, 1970 UTC
     // last time the BGP session received an UPDATE message.
     #[serde(rename = "update-recv-time")]
-    pub(crate) update_recv_time: Option<i64>,
+    pub update_recv_time: Option<i64>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to timers used for the
 // BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TimersConfig {
+pub struct TimersConfig {
     // original -> bgp:connect-retry
     // bgp:connect-retry's original type is decimal64.
     // Time interval in seconds between attempts to establish a
     // session with the peer.
     #[serde(rename = "connect-retry")]
-    pub(crate) connect_retry: Option<f64>,
+    pub connect_retry: Option<f64>,
     // original -> bgp:hold-time
     // bgp:hold-time's original type is decimal64.
     // Time interval in seconds that a BGP session will be
@@ -1847,14 +1847,14 @@ pub(crate) struct TimersConfig {
     // messages from the peer.  The hold-time is typically
     // set to 3x the keepalive-interval.
     #[serde(rename = "hold-time")]
-    pub(crate) hold_time: Option<f64>,
+    pub hold_time: Option<f64>,
     // original -> bgp:keepalive-interval
     // bgp:keepalive-interval's original type is decimal64.
     // Time interval in seconds between transmission of keepalive
     // messages to the neighbor.  Typically set to 1/3 the
     // hold-time.
     #[serde(rename = "keepalive-interval")]
-    pub(crate) keepalive_interval: Option<f64>,
+    pub keepalive_interval: Option<f64>,
     // original -> bgp:minimum-advertisement-interval
     // bgp:minimum-advertisement-interval's original type is decimal64.
     // Minimum time which must elapse between subsequent UPDATE
@@ -1864,172 +1864,172 @@ pub(crate) struct TimersConfig {
     // reduce the number of UPDATE messages transmitted when a
     // particular set of NLRI exhibit instability.
     #[serde(rename = "minimum-advertisement-interval")]
-    pub(crate) minimum_advertisement_interval: Option<f64>,
+    pub minimum_advertisement_interval: Option<f64>,
     // original -> gobgp:idle-hold-time-after-reset
     // gobgp:idle-hold-time-after-reset's original type is decimal64.
     // Time interval in seconds that a BGP session will be
     // in idle state after neighbor reset operation.
     #[serde(rename = "idle-hold-time-after-reset")]
-    pub(crate) idle_hold_time_after_reset: Option<f64>,
+    pub idle_hold_time_after_reset: Option<f64>,
 }
 // struct for container bgp:timers.
 // Timers related to a BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Timers {
+pub struct Timers {
     // original -> bgp:timers-config
     // Configuration parameters relating to timers used for the
     // BGP neighbor or group.
-    pub(crate) config: Option<TimersConfig>,
+    pub config: Option<TimersConfig>,
     // original -> bgp:timers-state
     // State information relating to the timers used for the BGP
     // neighbor or group.
-    pub(crate) state: Option<TimersState>,
+    pub state: Option<TimersState>,
 }
 // struct for container gobgp:adj-table.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AdjTable {
+pub struct AdjTable {
     // original -> gobgp:ADVERTISED
-    pub(crate) advertised: Option<u32>,
+    pub advertised: Option<u32>,
     // original -> gobgp:FILTERED
-    pub(crate) filtered: Option<u32>,
+    pub filtered: Option<u32>,
     // original -> gobgp:RECEIVED
-    pub(crate) received: Option<u32>,
+    pub received: Option<u32>,
     // original -> gobgp:ACCEPTED
-    pub(crate) accepted: Option<u32>,
+    pub accepted: Option<u32>,
 }
 // struct for container bgp:queues.
 // Counters related to queued messages associated with the
 // BGP neighbor.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Queues {
+pub struct Queues {
     // original -> bgp-op:input
     // The number of messages received from the peer currently
     // queued.
-    pub(crate) input: Option<u32>,
+    pub input: Option<u32>,
     // original -> bgp-op:output
     // The number of messages queued to be sent to the peer.
-    pub(crate) output: Option<u32>,
+    pub output: Option<u32>,
 }
 // struct for container bgp:received.
 // Counters for BGP messages received from the neighbor.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Received {
+pub struct Received {
     // original -> bgp-op:UPDATE
     // Number of BGP UPDATE messages announcing, withdrawing
     // or modifying paths exchanged.
-    pub(crate) update: Option<u64>,
+    pub update: Option<u64>,
     // original -> bgp-op:NOTIFICATION
     // Number of BGP NOTIFICATION messages indicating an
     // error condition has occurred exchanged.
-    pub(crate) notification: Option<u64>,
+    pub notification: Option<u64>,
     // original -> gobgp:OPEN
     // Number of BGP open messages announcing, withdrawing
     // or modifying paths exchanged.
-    pub(crate) open: Option<u64>,
+    pub open: Option<u64>,
     // original -> gobgp:REFRESH
     // Number of BGP Route-Refresh messages indicating an
     // error condition has occurred exchanged.
-    pub(crate) refresh: Option<u64>,
+    pub refresh: Option<u64>,
     // original -> gobgp:KEEPALIVE
     // Number of BGP Keepalive messages indicating an
     // error condition has occurred exchanged.
-    pub(crate) keepalive: Option<u64>,
+    pub keepalive: Option<u64>,
     // original -> gobgp:DYNAMIC-CAP
     // Number of BGP dynamic-cap messages indicating an
     // error condition has occurred exchanged.
     #[serde(rename = "dynamic-cap")]
-    pub(crate) dynamic_cap: Option<u64>,
+    pub dynamic_cap: Option<u64>,
     // original -> gobgp:WITHDRAW-UPDATE
     // Number of updates subjected to treat-as-withdraw treatment.
     #[serde(rename = "withdraw-update")]
-    pub(crate) withdraw_update: Option<u32>,
+    pub withdraw_update: Option<u32>,
     // original -> gobgp:WITHDRAW-PREFIX
     // Number of prefixes subjected to treat-as-withdraw treatment.
     #[serde(rename = "withdraw-prefix")]
-    pub(crate) withdraw_prefix: Option<u32>,
+    pub withdraw_prefix: Option<u32>,
     // original -> gobgp:DISCARDED
     // Number of discarded messages indicating an
     // error condition has occurred exchanged.
-    pub(crate) discarded: Option<u64>,
+    pub discarded: Option<u64>,
     // original -> gobgp:TOTAL
     // Number of total messages indicating an
     // error condition has occurred exchanged.
-    pub(crate) total: Option<u64>,
+    pub total: Option<u64>,
 }
 // struct for container bgp:sent.
 // Counters relating to BGP messages sent to the neighbor.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Sent {
+pub struct Sent {
     // original -> bgp-op:UPDATE
     // Number of BGP UPDATE messages announcing, withdrawing
     // or modifying paths exchanged.
-    pub(crate) update: Option<u64>,
+    pub update: Option<u64>,
     // original -> bgp-op:NOTIFICATION
     // Number of BGP NOTIFICATION messages indicating an
     // error condition has occurred exchanged.
-    pub(crate) notification: Option<u64>,
+    pub notification: Option<u64>,
     // original -> gobgp:OPEN
     // Number of BGP open messages announcing, withdrawing
     // or modifying paths exchanged.
-    pub(crate) open: Option<u64>,
+    pub open: Option<u64>,
     // original -> gobgp:REFRESH
     // Number of BGP Route-Refresh messages indicating an
     // error condition has occurred exchanged.
-    pub(crate) refresh: Option<u64>,
+    pub refresh: Option<u64>,
     // original -> gobgp:KEEPALIVE
     // Number of BGP Keepalive messages indicating an
     // error condition has occurred exchanged.
-    pub(crate) keepalive: Option<u64>,
+    pub keepalive: Option<u64>,
     // original -> gobgp:DYNAMIC-CAP
     // Number of BGP dynamic-cap messages indicating an
     // error condition has occurred exchanged.
     #[serde(rename = "dynamic-cap")]
-    pub(crate) dynamic_cap: Option<u64>,
+    pub dynamic_cap: Option<u64>,
     // original -> gobgp:WITHDRAW-UPDATE
     // Number of updates subjected to treat-as-withdraw treatment.
     #[serde(rename = "withdraw-update")]
-    pub(crate) withdraw_update: Option<u32>,
+    pub withdraw_update: Option<u32>,
     // original -> gobgp:WITHDRAW-PREFIX
     // Number of prefixes subjected to treat-as-withdraw treatment.
     #[serde(rename = "withdraw-prefix")]
-    pub(crate) withdraw_prefix: Option<u32>,
+    pub withdraw_prefix: Option<u32>,
     // original -> gobgp:DISCARDED
     // Number of discarded messages indicating an
     // error condition has occurred exchanged.
-    pub(crate) discarded: Option<u64>,
+    pub discarded: Option<u64>,
     // original -> gobgp:TOTAL
     // Number of total messages indicating an
     // error condition has occurred exchanged.
-    pub(crate) total: Option<u64>,
+    pub total: Option<u64>,
 }
 // struct for container bgp:messages.
 // Counters for BGP messages sent and received from the
 // neighbor.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Messages {
+pub struct Messages {
     // original -> bgp:sent
     // Counters relating to BGP messages sent to the neighbor.
-    pub(crate) sent: Option<Sent>,
+    pub sent: Option<Sent>,
     // original -> bgp:received
     // Counters for BGP messages received from the neighbor.
-    pub(crate) received: Option<Received>,
+    pub received: Option<Received>,
 }
 // struct for container bgp:state.
 // State information relating to the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct NeighborState {
+pub struct NeighborState {
     // original -> bgp:peer-as
     // bgp:peer-as's original type is inet:as-number.
     // AS number of the peer.
     #[serde(rename = "peer-as")]
-    pub(crate) peer_as: Option<u32>,
+    pub peer_as: Option<u32>,
     // original -> bgp:local-as
     // bgp:local-as's original type is inet:as-number.
     // The local autonomous system number that is to be used
@@ -2037,111 +2037,111 @@ pub(crate) struct NeighborState {
     // group, if this differs from the global BGP router
     // autonomous system number.
     #[serde(rename = "local-as")]
-    pub(crate) local_as: Option<u32>,
+    pub local_as: Option<u32>,
     // original -> bgp:peer-type
     // Explicitly designate the peer or peer group as internal
     // (iBGP) or external (eBGP).
     #[serde(rename = "peer-type")]
-    pub(crate) peer_type: Option<PeerType>,
+    pub peer_type: Option<PeerType>,
     // original -> bgp:auth-password
     // Configures an MD5 authentication password for use with
     // neighboring devices.
     #[serde(rename = "auth-password")]
-    pub(crate) auth_password: Option<String>,
+    pub auth_password: Option<String>,
     // original -> bgp:remove-private-as
     // Remove private AS numbers from updates sent to peers.
     #[serde(rename = "remove-private-as")]
-    pub(crate) remove_private_as: Option<RemovePrivateAsOption>,
+    pub remove_private_as: Option<RemovePrivateAsOption>,
     // original -> bgp:route-flap-damping
     // bgp:route-flap-damping's original type is boolean.
     // Enable route flap damping.
     #[serde(rename = "route-flap-damping")]
-    pub(crate) route_flap_damping: Option<bool>,
+    pub route_flap_damping: Option<bool>,
     // original -> bgp:send-community
     // Specify which types of community should be sent to the
     // neighbor or group. The default is to not send the
     // community attribute.
     #[serde(rename = "send-community")]
-    pub(crate) send_community: Option<CommunityType>,
+    pub send_community: Option<CommunityType>,
     // original -> bgp:description
     // An optional textual description (intended primarily for use
     // with a peer or group.
-    pub(crate) description: Option<String>,
+    pub description: Option<String>,
     // original -> bgp:peer-group
     // The peer-group with which this neighbor is associated.
     #[serde(rename = "peer-group")]
-    pub(crate) peer_group: Option<String>,
+    pub peer_group: Option<String>,
     // original -> bgp:neighbor-address
     // bgp:neighbor-address's original type is inet:ip-address.
     // Address of the BGP peer, either in IPv4 or IPv6.
     #[serde(rename = "neighbor-address")]
-    pub(crate) neighbor_address: Option<String>,
+    pub neighbor_address: Option<String>,
     // original -> bgp-op:session-state
     // Operational state of the BGP peer.
     #[serde(rename = "session-state")]
-    pub(crate) session_state: Option<SessionState>,
+    pub session_state: Option<SessionState>,
     // original -> bgp-op:supported-capabilities
     // BGP capabilities negotiated as supported with the peer.
     #[serde(rename = "supported-capabilities-list")]
-    pub(crate) supported_capabilities_list: Option<Vec<BgpCapability>>,
+    pub supported_capabilities_list: Option<Vec<BgpCapability>>,
     // original -> bgp:messages
     // Counters for BGP messages sent and received from the
     // neighbor.
-    pub(crate) messages: Option<Messages>,
+    pub messages: Option<Messages>,
     // original -> bgp:queues
     // Counters related to queued messages associated with the
     // BGP neighbor.
-    pub(crate) queues: Option<Queues>,
+    pub queues: Option<Queues>,
     // original -> gobgp:adj-table
     #[serde(rename = "adj-table")]
-    pub(crate) adj_table: Option<AdjTable>,
+    pub adj_table: Option<AdjTable>,
     // original -> gobgp:remote-capability
     // original type is list of bgp-capability
     #[serde(rename = "remote-capability-list")]
-    pub(crate) remote_capability_list: Option<Vec<Vec<u8>>>,
+    pub remote_capability_list: Option<Vec<Vec<u8>>>,
     // original -> gobgp:local-capability
     // original type is list of bgp-capability
     #[serde(rename = "local-capability-list")]
-    pub(crate) local_capability_list: Option<Vec<Vec<u8>>>,
+    pub local_capability_list: Option<Vec<Vec<u8>>>,
     // original -> gobgp:received-open-message
     // gobgp:received-open-message's original type is bgp-open-message.
     #[serde(rename = "received-open-message")]
-    pub(crate) received_open_message: Option<Vec<u8>>,
+    pub received_open_message: Option<Vec<u8>>,
     // original -> gobgp:admin-down
     // gobgp:admin-down's original type is boolean.
     // The state of administrative operation. If the state is true, it indicates the neighbor is disabled by the administrator.
     #[serde(rename = "admin-down")]
-    pub(crate) admin_down: Option<bool>,
+    pub admin_down: Option<bool>,
     // original -> gobgp:admin-state
     #[serde(rename = "admin-state")]
-    pub(crate) admin_state: Option<AdminState>,
+    pub admin_state: Option<AdminState>,
     // original -> gobgp:established-count
     // The number of how many the peer became established state.
     #[serde(rename = "established-count")]
-    pub(crate) established_count: Option<u32>,
+    pub established_count: Option<u32>,
     // original -> gobgp:flops
     // The number of flip-flops.
-    pub(crate) flops: Option<u32>,
+    pub flops: Option<u32>,
     // original -> gobgp:neighbor-interface
     #[serde(rename = "neighbor-interface")]
-    pub(crate) neighbor_interface: Option<String>,
+    pub neighbor_interface: Option<String>,
     // original -> gobgp:vrf
-    pub(crate) vrf: Option<String>,
+    pub vrf: Option<String>,
     // original -> gobgp:remote-router-id
     #[serde(rename = "remote-router-id")]
-    pub(crate) remote_router_id: Option<String>,
+    pub remote_router_id: Option<String>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to the BGP neighbor or
 // group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct NeighborConfig {
+pub struct NeighborConfig {
     // original -> bgp:peer-as
     // bgp:peer-as's original type is inet:as-number.
     // AS number of the peer.
     #[serde(rename = "peer-as")]
-    pub(crate) peer_as: Option<u32>,
+    pub peer_as: Option<u32>,
     // original -> bgp:local-as
     // bgp:local-as's original type is inet:as-number.
     // The local autonomous system number that is to be used
@@ -2149,522 +2149,522 @@ pub(crate) struct NeighborConfig {
     // group, if this differs from the global BGP router
     // autonomous system number.
     #[serde(rename = "local-as")]
-    pub(crate) local_as: Option<u32>,
+    pub local_as: Option<u32>,
     // original -> bgp:peer-type
     // Explicitly designate the peer or peer group as internal
     // (iBGP) or external (eBGP).
     #[serde(rename = "peer-type")]
-    pub(crate) peer_type: Option<PeerType>,
+    pub peer_type: Option<PeerType>,
     // original -> bgp:auth-password
     // Configures an MD5 authentication password for use with
     // neighboring devices.
     #[serde(rename = "auth-password")]
-    pub(crate) auth_password: Option<String>,
+    pub auth_password: Option<String>,
     // original -> bgp:remove-private-as
     // Remove private AS numbers from updates sent to peers.
     #[serde(rename = "remove-private-as")]
-    pub(crate) remove_private_as: Option<RemovePrivateAsOption>,
+    pub remove_private_as: Option<RemovePrivateAsOption>,
     // original -> bgp:route-flap-damping
     // bgp:route-flap-damping's original type is boolean.
     // Enable route flap damping.
     #[serde(rename = "route-flap-damping")]
-    pub(crate) route_flap_damping: Option<bool>,
+    pub route_flap_damping: Option<bool>,
     // original -> bgp:send-community
     // Specify which types of community should be sent to the
     // neighbor or group. The default is to not send the
     // community attribute.
     #[serde(rename = "send-community")]
-    pub(crate) send_community: Option<CommunityType>,
+    pub send_community: Option<CommunityType>,
     // original -> bgp:description
     // An optional textual description (intended primarily for use
     // with a peer or group.
-    pub(crate) description: Option<String>,
+    pub description: Option<String>,
     // original -> bgp:peer-group
     // The peer-group with which this neighbor is associated.
     #[serde(rename = "peer-group")]
-    pub(crate) peer_group: Option<String>,
+    pub peer_group: Option<String>,
     // original -> bgp:neighbor-address
     // bgp:neighbor-address's original type is inet:ip-address.
     // Address of the BGP peer, either in IPv4 or IPv6.
     #[serde(rename = "neighbor-address")]
-    pub(crate) neighbor_address: Option<String>,
+    pub neighbor_address: Option<String>,
     // original -> gobgp:admin-down
     // gobgp:admin-down's original type is boolean.
     // The config of administrative operation. If state, indicates the neighbor is disabled by the administrator.
     #[serde(rename = "admin-down")]
-    pub(crate) admin_down: Option<bool>,
+    pub admin_down: Option<bool>,
     // original -> gobgp:neighbor-interface
     #[serde(rename = "neighbor-interface")]
-    pub(crate) neighbor_interface: Option<String>,
+    pub neighbor_interface: Option<String>,
     // original -> gobgp:vrf
-    pub(crate) vrf: Option<String>,
+    pub vrf: Option<String>,
 }
 // struct for container bgp:neighbor.
 // List of BGP neighbors configured on the local system,
 // uniquely identified by peer IPv[46] address.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Neighbor {
+pub struct Neighbor {
     // original -> bgp:neighbor-address
     // original -> bgp:neighbor-config
     // Configuration parameters relating to the BGP neighbor or
     // group.
-    pub(crate) config: Option<NeighborConfig>,
+    pub config: Option<NeighborConfig>,
     // original -> bgp:neighbor-state
     // State information relating to the BGP neighbor or group.
-    pub(crate) state: Option<NeighborState>,
+    pub state: Option<NeighborState>,
     // original -> bgp:timers
     // Timers related to a BGP neighbor or group.
-    pub(crate) timers: Option<Timers>,
+    pub timers: Option<Timers>,
     // original -> bgp:transport
     // Transport session parameters for the BGP neighbor or group.
-    pub(crate) transport: Option<Transport>,
+    pub transport: Option<Transport>,
     // original -> bgp:error-handling
     // Error handling parameters used for the BGP neighbor or
     // group.
     #[serde(rename = "error-handling")]
-    pub(crate) error_handling: Option<ErrorHandling>,
+    pub error_handling: Option<ErrorHandling>,
     // original -> bgp:logging-options
     // Logging options for events related to the BGP neighbor or
     // group.
     #[serde(rename = "logging-options")]
-    pub(crate) logging_options: Option<LoggingOptions>,
+    pub logging_options: Option<LoggingOptions>,
     // original -> bgp:ebgp-multihop
     // eBGP multi-hop parameters for the BGP neighbor or group.
     #[serde(rename = "ebgp-multihop")]
-    pub(crate) ebgp_multihop: Option<EbgpMultihop>,
+    pub ebgp_multihop: Option<EbgpMultihop>,
     // original -> bgp:route-reflector
     // Route reflector parameters for the BGP neighbor or group.
     #[serde(rename = "route-reflector")]
-    pub(crate) route_reflector: Option<RouteReflector>,
+    pub route_reflector: Option<RouteReflector>,
     // original -> bgp:as-path-options
     // AS_PATH manipulation parameters for the BGP neighbor or
     // group.
     #[serde(rename = "as-path-options")]
-    pub(crate) as_path_options: Option<AsPathOptions>,
+    pub as_path_options: Option<AsPathOptions>,
     // original -> bgp:add-paths
     // Parameters relating to the advertisement and receipt of
     // multiple paths for a single NLRI (add-paths).
     #[serde(rename = "add-paths")]
-    pub(crate) add_paths: Option<AddPaths>,
+    pub add_paths: Option<AddPaths>,
     // original -> bgp:afi-safis
     // Per-address-family configuration parameters associated with
     // the neighbor or group.
     #[serde(rename = "afi-safis")]
-    pub(crate) afi_safis: Option<Vec<AfiSafi>>,
+    pub afi_safis: Option<Vec<AfiSafi>>,
     // original -> bgp:graceful-restart
     // Parameters relating the graceful restart mechanism for BGP.
     #[serde(rename = "graceful-restart")]
-    pub(crate) graceful_restart: Option<GracefulRestart>,
+    pub graceful_restart: Option<GracefulRestart>,
     // original -> rpol:apply-policy
     // Anchor point for routing policies in the model.
     // Import and export policies are with respect to the local
     // routing table, i.e., export (send) and import (receive),
     // depending on the context.
     #[serde(rename = "apply-policy")]
-    pub(crate) apply_policy: Option<ApplyPolicy>,
+    pub apply_policy: Option<ApplyPolicy>,
     // original -> bgp-mp:use-multiple-paths
     // Parameters related to the use of multiple-paths for the same
     // NLRI when they are received only from this neighbor.
     #[serde(rename = "use-multiple-paths")]
-    pub(crate) use_multiple_paths: Option<UseMultiplePaths>,
+    pub use_multiple_paths: Option<UseMultiplePaths>,
     // original -> gobgp:route-server
     // Configure the local router as a route server.
     #[serde(rename = "route-server")]
-    pub(crate) route_server: Option<RouteServer>,
+    pub route_server: Option<RouteServer>,
     // original -> gobgp:ttl-security
     // Configure TTL Security feature.
     #[serde(rename = "ttl-security")]
-    pub(crate) ttl_security: Option<TtlSecurity>,
+    pub ttl_security: Option<TtlSecurity>,
 }
 // struct for container gobgp:state.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LongLivedGracefulRestartState {
+pub struct LongLivedGracefulRestartState {
     // original -> gobgp:enabled
     // gobgp:enabled's original type is boolean.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> gobgp:received
     // gobgp:received's original type is boolean.
-    pub(crate) received: Option<bool>,
+    pub received: Option<bool>,
     // original -> gobgp:advertised
     // gobgp:advertised's original type is boolean.
-    pub(crate) advertised: Option<bool>,
+    pub advertised: Option<bool>,
     // original -> gobgp:peer-restart-time
     #[serde(rename = "peer-restart-time")]
-    pub(crate) peer_restart_time: Option<u32>,
+    pub peer_restart_time: Option<u32>,
     // original -> gobgp:peer-restart-timer-expired
     // gobgp:peer-restart-timer-expired's original type is boolean.
     #[serde(rename = "peer-restart-timer-expired")]
-    pub(crate) peer_restart_timer_expired: Option<bool>,
+    pub peer_restart_timer_expired: Option<bool>,
 }
 // struct for container gobgp:config.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LongLivedGracefulRestartConfig {
+pub struct LongLivedGracefulRestartConfig {
     // original -> gobgp:enabled
     // gobgp:enabled's original type is boolean.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> gobgp:restart-time
     #[serde(rename = "restart-time")]
-    pub(crate) restart_time: Option<u32>,
+    pub restart_time: Option<u32>,
 }
 // struct for container gobgp:long-lived-graceful-restart.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LongLivedGracefulRestart {
+pub struct LongLivedGracefulRestart {
     // original -> gobgp:long-lived-graceful-restart-config
-    pub(crate) config: Option<LongLivedGracefulRestartConfig>,
+    pub config: Option<LongLivedGracefulRestartConfig>,
     // original -> gobgp:long-lived-graceful-restart-state
-    pub(crate) state: Option<LongLivedGracefulRestartState>,
+    pub state: Option<LongLivedGracefulRestartState>,
 }
 // struct for container gobgp:state.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteTargetMembershipState {
+pub struct RouteTargetMembershipState {
     // original -> gobgp:deferral-time
     #[serde(rename = "deferral-time")]
-    pub(crate) deferral_time: Option<u16>,
+    pub deferral_time: Option<u16>,
 }
 // struct for container gobgp:config.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteTargetMembershipConfig {
+pub struct RouteTargetMembershipConfig {
     // original -> gobgp:deferral-time
     #[serde(rename = "deferral-time")]
-    pub(crate) deferral_time: Option<u16>,
+    pub deferral_time: Option<u16>,
 }
 // struct for container gobgp:route-target-membership.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteTargetMembership {
+pub struct RouteTargetMembership {
     // original -> gobgp:route-target-membership-config
-    pub(crate) config: Option<RouteTargetMembershipConfig>,
+    pub config: Option<RouteTargetMembershipConfig>,
     // original -> gobgp:route-target-membership-state
-    pub(crate) state: Option<RouteTargetMembershipState>,
+    pub state: Option<RouteTargetMembershipState>,
 }
 // struct for container bgp-mp:l2vpn-evpn.
 // BGP EVPN configuration options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct L2vpnEvpn {
+pub struct L2vpnEvpn {
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
 }
 // struct for container bgp-mp:l2vpn-vpls.
 // BGP-signalled VPLS configuration options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct L2vpnVpls {
+pub struct L2vpnVpls {
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
 }
 // struct for container bgp-mp:l3vpn-ipv6-multicast.
 // Multicast IPv6 L3VPN configuration options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct L3vpnIpv6Multicast {
+pub struct L3vpnIpv6Multicast {
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
 }
 // struct for container bgp-mp:l3vpn-ipv4-multicast.
 // Multicast IPv4 L3VPN configuration options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct L3vpnIpv4Multicast {
+pub struct L3vpnIpv4Multicast {
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
 }
 // struct for container bgp-mp:l3vpn-ipv6-unicast.
 // Unicast IPv6 L3VPN configuration options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct L3vpnIpv6Unicast {
+pub struct L3vpnIpv6Unicast {
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
 }
 // struct for container bgp-mp:l3vpn-ipv4-unicast.
 // Unicast IPv4 L3VPN configuration options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct L3vpnIpv4Unicast {
+pub struct L3vpnIpv4Unicast {
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
 }
 // struct for container bgp-mp:ipv6-labelled-unicast.
 // IPv6 Labelled Unicast configuration options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ipv6LabelledUnicast {
+pub struct Ipv6LabelledUnicast {
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
 }
 // struct for container bgp-mp:ipv4-labelled-unicast.
 // IPv4 Labelled Unicast configuration options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ipv4LabelledUnicast {
+pub struct Ipv4LabelledUnicast {
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
 }
 // struct for container bgp-mp:state.
 // State information for common IPv4 and IPv6 unicast
 // parameters.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ipv6UnicastState {
+pub struct Ipv6UnicastState {
     // original -> bgp-mp:send-default-route
     // bgp-mp:send-default-route's original type is boolean.
     // If set to true, send the default-route to the neighbour(s).
     #[serde(rename = "send-default-route")]
-    pub(crate) send_default_route: Option<bool>,
+    pub send_default_route: Option<bool>,
 }
 // struct for container bgp-mp:config.
 // Configuration parameters for common IPv4 and IPv6 unicast
 // AFI-SAFI options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ipv6UnicastConfig {
+pub struct Ipv6UnicastConfig {
     // original -> bgp-mp:send-default-route
     // bgp-mp:send-default-route's original type is boolean.
     // If set to true, send the default-route to the neighbour(s).
     #[serde(rename = "send-default-route")]
-    pub(crate) send_default_route: Option<bool>,
+    pub send_default_route: Option<bool>,
 }
 // struct for container bgp-mp:ipv6-unicast.
 // IPv6 unicast configuration options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ipv6Unicast {
+pub struct Ipv6Unicast {
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
     // original -> bgp-mp:ipv6-unicast-config
     // Configuration parameters for common IPv4 and IPv6 unicast
     // AFI-SAFI options.
-    pub(crate) config: Option<Ipv6UnicastConfig>,
+    pub config: Option<Ipv6UnicastConfig>,
     // original -> bgp-mp:ipv6-unicast-state
     // State information for common IPv4 and IPv6 unicast
     // parameters.
-    pub(crate) state: Option<Ipv6UnicastState>,
+    pub state: Option<Ipv6UnicastState>,
 }
 // struct for container bgp-mp:state.
 // State information for common IPv4 and IPv6 unicast
 // parameters.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ipv4UnicastState {
+pub struct Ipv4UnicastState {
     // original -> bgp-mp:send-default-route
     // bgp-mp:send-default-route's original type is boolean.
     // If set to true, send the default-route to the neighbour(s).
     #[serde(rename = "send-default-route")]
-    pub(crate) send_default_route: Option<bool>,
+    pub send_default_route: Option<bool>,
 }
 // struct for container bgp-mp:config.
 // Configuration parameters for common IPv4 and IPv6 unicast
 // AFI-SAFI options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ipv4UnicastConfig {
+pub struct Ipv4UnicastConfig {
     // original -> bgp-mp:send-default-route
     // bgp-mp:send-default-route's original type is boolean.
     // If set to true, send the default-route to the neighbour(s).
     #[serde(rename = "send-default-route")]
-    pub(crate) send_default_route: Option<bool>,
+    pub send_default_route: Option<bool>,
 }
 // struct for container bgp-mp:state.
 // State information relating to the prefix-limit for the
 // AFI-SAFI.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PrefixLimitState {
+pub struct PrefixLimitState {
     // original -> bgp-mp:max-prefixes
     // Maximum number of prefixes that will be accepted
     // from the neighbour.
     #[serde(rename = "max-prefixes")]
-    pub(crate) max_prefixes: Option<u32>,
+    pub max_prefixes: Option<u32>,
     // original -> bgp-mp:shutdown-threshold-pct
     // Threshold on number of prefixes that can be received
     // from a neighbour before generation of warning messages
     // or log entries. Expressed as a percentage of
     // max-prefixes.
     #[serde(rename = "shutdown-threshold-pct")]
-    pub(crate) shutdown_threshold_pct: Option<Percentage>,
+    pub shutdown_threshold_pct: Option<Percentage>,
     // original -> bgp-mp:restart-timer
     // bgp-mp:restart-timer's original type is decimal64.
     // Time interval in seconds after which the BGP session
     // is re-established after being torn down due to exceeding
     // the max-prefix limit.
     #[serde(rename = "restart-timer")]
-    pub(crate) restart_timer: Option<f64>,
+    pub restart_timer: Option<f64>,
 }
 // struct for container bgp-mp:config.
 // Configuration parameters relating to the prefix
 // limit for the AFI-SAFI.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PrefixLimitConfig {
+pub struct PrefixLimitConfig {
     // original -> bgp-mp:max-prefixes
     // Maximum number of prefixes that will be accepted
     // from the neighbour.
     #[serde(rename = "max-prefixes")]
-    pub(crate) max_prefixes: Option<u32>,
+    pub max_prefixes: Option<u32>,
     // original -> bgp-mp:shutdown-threshold-pct
     // Threshold on number of prefixes that can be received
     // from a neighbour before generation of warning messages
     // or log entries. Expressed as a percentage of
     // max-prefixes.
     #[serde(rename = "shutdown-threshold-pct")]
-    pub(crate) shutdown_threshold_pct: Option<Percentage>,
+    pub shutdown_threshold_pct: Option<Percentage>,
     // original -> bgp-mp:restart-timer
     // bgp-mp:restart-timer's original type is decimal64.
     // Time interval in seconds after which the BGP session
     // is re-established after being torn down due to exceeding
     // the max-prefix limit.
     #[serde(rename = "restart-timer")]
-    pub(crate) restart_timer: Option<f64>,
+    pub restart_timer: Option<f64>,
 }
 // struct for container bgp-mp:prefix-limit.
 // Configure the maximum number of prefixes that will be
 // accepted from a peer.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PrefixLimit {
+pub struct PrefixLimit {
     // original -> bgp-mp:prefix-limit-config
     // Configuration parameters relating to the prefix
     // limit for the AFI-SAFI.
-    pub(crate) config: Option<PrefixLimitConfig>,
+    pub config: Option<PrefixLimitConfig>,
     // original -> bgp-mp:prefix-limit-state
     // State information relating to the prefix-limit for the
     // AFI-SAFI.
-    pub(crate) state: Option<PrefixLimitState>,
+    pub state: Option<PrefixLimitState>,
 }
 // struct for container bgp-mp:ipv4-unicast.
 // IPv4 unicast configuration options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ipv4Unicast {
+pub struct Ipv4Unicast {
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
     // original -> bgp-mp:ipv4-unicast-config
     // Configuration parameters for common IPv4 and IPv6 unicast
     // AFI-SAFI options.
-    pub(crate) config: Option<Ipv4UnicastConfig>,
+    pub config: Option<Ipv4UnicastConfig>,
     // original -> bgp-mp:ipv4-unicast-state
     // State information for common IPv4 and IPv6 unicast
     // parameters.
-    pub(crate) state: Option<Ipv4UnicastState>,
+    pub state: Option<Ipv4UnicastState>,
 }
 // struct for container rpol:state.
 // Operational state for routing policy.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ApplyPolicyState {
+pub struct ApplyPolicyState {
     // original -> rpol:import-policy
     // list of policy names in sequence to be applied on
     // receiving a routing update in the current context, e.g.,
     // for the current peer group, neighbor, address family,
     // etc.
     #[serde(rename = "import-policy-list")]
-    pub(crate) import_policy_list: Option<Vec<String>>,
+    pub import_policy_list: Option<Vec<String>>,
     // original -> rpol:default-import-policy
     // explicitly set a default policy if no policy definition
     // in the import policy chain is satisfied.
     #[serde(rename = "default-import-policy")]
-    pub(crate) default_import_policy: Option<DefaultPolicyType>,
+    pub default_import_policy: Option<DefaultPolicyType>,
     // original -> rpol:export-policy
     // list of policy names in sequence to be applied on
     // sending a routing update in the current context, e.g.,
     // for the current peer group, neighbor, address family,
     // etc.
     #[serde(rename = "export-policy-list")]
-    pub(crate) export_policy_list: Option<Vec<String>>,
+    pub export_policy_list: Option<Vec<String>>,
     // original -> rpol:default-export-policy
     // explicitly set a default policy if no policy definition
     // in the export policy chain is satisfied.
     #[serde(rename = "default-export-policy")]
-    pub(crate) default_export_policy: Option<DefaultPolicyType>,
+    pub default_export_policy: Option<DefaultPolicyType>,
     // original -> gobgp:in-policy
     // list of policy names in sequence to be applied on
     // sending a routing update in the current context, e.g.,
     // for the current other route server clients.
     #[serde(rename = "in-policy-list")]
-    pub(crate) in_policy_list: Option<Vec<String>>,
+    pub in_policy_list: Option<Vec<String>>,
     // original -> gobgp:default-in-policy
     // explicitly set a default policy if no policy definition
     // in the in-policy chain is satisfied.
     #[serde(rename = "default-in-policy")]
-    pub(crate) default_in_policy: Option<DefaultPolicyType>,
+    pub default_in_policy: Option<DefaultPolicyType>,
 }
 // struct for container rpol:config.
 // Policy configuration data.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ApplyPolicyConfig {
+pub struct ApplyPolicyConfig {
     // original -> rpol:import-policy
     // list of policy names in sequence to be applied on
     // receiving a routing update in the current context, e.g.,
     // for the current peer group, neighbor, address family,
     // etc.
     #[serde(rename = "import-policy-list")]
-    pub(crate) import_policy_list: Option<Vec<String>>,
+    pub import_policy_list: Option<Vec<String>>,
     // original -> rpol:default-import-policy
     // explicitly set a default policy if no policy definition
     // in the import policy chain is satisfied.
     #[serde(rename = "default-import-policy")]
-    pub(crate) default_import_policy: Option<DefaultPolicyType>,
+    pub default_import_policy: Option<DefaultPolicyType>,
     // original -> rpol:export-policy
     // list of policy names in sequence to be applied on
     // sending a routing update in the current context, e.g.,
     // for the current peer group, neighbor, address family,
     // etc.
     #[serde(rename = "export-policy-list")]
-    pub(crate) export_policy_list: Option<Vec<String>>,
+    pub export_policy_list: Option<Vec<String>>,
     // original -> rpol:default-export-policy
     // explicitly set a default policy if no policy definition
     // in the export policy chain is satisfied.
     #[serde(rename = "default-export-policy")]
-    pub(crate) default_export_policy: Option<DefaultPolicyType>,
+    pub default_export_policy: Option<DefaultPolicyType>,
     // original -> gobgp:in-policy
     // list of policy names in sequence to be applied on
     // sending a routing update in the current context, e.g.,
     // for the current other route server clients.
     #[serde(rename = "in-policy-list")]
-    pub(crate) in_policy_list: Option<Vec<String>>,
+    pub in_policy_list: Option<Vec<String>>,
     // original -> gobgp:default-in-policy
     // explicitly set a default policy if no policy definition
     // in the in-policy chain is satisfied.
     #[serde(rename = "default-in-policy")]
-    pub(crate) default_in_policy: Option<DefaultPolicyType>,
+    pub default_in_policy: Option<DefaultPolicyType>,
 }
 // struct for container rpol:apply-policy.
 // Anchor point for routing policies in the model.
@@ -2673,206 +2673,206 @@ pub(crate) struct ApplyPolicyConfig {
 // depending on the context.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ApplyPolicy {
+pub struct ApplyPolicy {
     // original -> rpol:apply-policy-config
     // Policy configuration data.
-    pub(crate) config: Option<ApplyPolicyConfig>,
+    pub config: Option<ApplyPolicyConfig>,
     // original -> rpol:apply-policy-state
     // Operational state for routing policy.
-    pub(crate) state: Option<ApplyPolicyState>,
+    pub state: Option<ApplyPolicyState>,
 }
 // struct for container bgp-mp:state.
 // State information relating to the AFI-SAFI.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AfiSafiState {
+pub struct AfiSafiState {
     // original -> bgp-mp:afi-safi-name
     // AFI,SAFI.
     #[serde(rename = "afi-safi-name")]
-    pub(crate) afi_safi_name: Option<AfiSafiType>,
+    pub afi_safi_name: Option<AfiSafiType>,
     // original -> bgp-mp:enabled
     // bgp-mp:enabled's original type is boolean.
     // This leaf indicates whether the IPv4 Unicast AFI,SAFI is
     // enabled for the neighbour or group.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> bgp-op:total-paths
     // Total number of BGP paths within the context.
     #[serde(rename = "total-paths")]
-    pub(crate) total_paths: Option<u32>,
+    pub total_paths: Option<u32>,
     // original -> bgp-op:total-prefixes
     // .
     #[serde(rename = "total-prefixes")]
-    pub(crate) total_prefixes: Option<u32>,
+    pub total_prefixes: Option<u32>,
     // original -> gobgp:family
     // gobgp:family's original type is route-family.
     // Address family value of AFI-SAFI pair translated from afi-safi-name.
-    pub(crate) family: Option<u32>,
+    pub family: Option<u32>,
 }
 // struct for container bgp-mp:config.
 // Configuration parameters for the AFI-SAFI.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AfiSafiConfig {
+pub struct AfiSafiConfig {
     // original -> bgp-mp:afi-safi-name
     // AFI,SAFI.
     #[serde(rename = "afi-safi-name")]
-    pub(crate) afi_safi_name: Option<AfiSafiType>,
+    pub afi_safi_name: Option<AfiSafiType>,
     // original -> bgp-mp:enabled
     // bgp-mp:enabled's original type is boolean.
     // This leaf indicates whether the IPv4 Unicast AFI,SAFI is
     // enabled for the neighbour or group.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
 }
 // struct for container bgp-mp:state.
 // State information for BGP graceful-restart.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MpGracefulRestartState {
+pub struct MpGracefulRestartState {
     // original -> bgp-mp:enabled
     // bgp-mp:enabled's original type is boolean.
     // This leaf indicates whether graceful-restart is enabled for
     // this AFI-SAFI.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> bgp-op:received
     // bgp-op:received's original type is boolean.
     // This leaf indicates whether the neighbor advertised the
     // ability to support graceful-restart for this AFI-SAFI.
-    pub(crate) received: Option<bool>,
+    pub received: Option<bool>,
     // original -> bgp-op:advertised
     // bgp-op:advertised's original type is boolean.
     // This leaf indicates whether the ability to support
     // graceful-restart has been advertised to the peer.
-    pub(crate) advertised: Option<bool>,
+    pub advertised: Option<bool>,
     // original -> gobgp:end-of-rib-received
     // gobgp:end-of-rib-received's original type is boolean.
     #[serde(rename = "end-of-rib-received")]
-    pub(crate) end_of_rib_received: Option<bool>,
+    pub end_of_rib_received: Option<bool>,
     // original -> gobgp:end-of-rib-sent
     // gobgp:end-of-rib-sent's original type is boolean.
     #[serde(rename = "end-of-rib-sent")]
-    pub(crate) end_of_rib_sent: Option<bool>,
+    pub end_of_rib_sent: Option<bool>,
 }
 // struct for container bgp-mp:config.
 // Configuration options for BGP graceful-restart.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MpGracefulRestartConfig {
+pub struct MpGracefulRestartConfig {
     // original -> bgp-mp:enabled
     // bgp-mp:enabled's original type is boolean.
     // This leaf indicates whether graceful-restart is enabled for
     // this AFI-SAFI.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
 }
 // struct for container bgp-mp:graceful-restart.
 // Parameters relating to BGP graceful-restart.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MpGracefulRestart {
+pub struct MpGracefulRestart {
     // original -> bgp-mp:mp-graceful-restart-config
     // Configuration options for BGP graceful-restart.
-    pub(crate) config: Option<MpGracefulRestartConfig>,
+    pub config: Option<MpGracefulRestartConfig>,
     // original -> bgp-mp:mp-graceful-restart-state
     // State information for BGP graceful-restart.
-    pub(crate) state: Option<MpGracefulRestartState>,
+    pub state: Option<MpGracefulRestartState>,
 }
 // struct for container bgp-mp:afi-safi.
 // AFI,SAFI configuration available for the
 // neighbour or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AfiSafi {
+pub struct AfiSafi {
     // original -> bgp-mp:afi-safi-name
     // original -> bgp-mp:mp-graceful-restart
     // Parameters relating to BGP graceful-restart.
     #[serde(rename = "mp-graceful-restart")]
-    pub(crate) mp_graceful_restart: Option<MpGracefulRestart>,
+    pub mp_graceful_restart: Option<MpGracefulRestart>,
     // original -> bgp-mp:afi-safi-config
     // Configuration parameters for the AFI-SAFI.
-    pub(crate) config: Option<AfiSafiConfig>,
+    pub config: Option<AfiSafiConfig>,
     // original -> bgp-mp:afi-safi-state
     // State information relating to the AFI-SAFI.
-    pub(crate) state: Option<AfiSafiState>,
+    pub state: Option<AfiSafiState>,
     // original -> rpol:apply-policy
     // Anchor point for routing policies in the model.
     // Import and export policies are with respect to the local
     // routing table, i.e., export (send) and import (receive),
     // depending on the context.
     #[serde(rename = "apply-policy")]
-    pub(crate) apply_policy: Option<ApplyPolicy>,
+    pub apply_policy: Option<ApplyPolicy>,
     // original -> bgp-mp:ipv4-unicast
     // IPv4 unicast configuration options.
     #[serde(rename = "ipv4-unicast")]
-    pub(crate) ipv4_unicast: Option<Ipv4Unicast>,
+    pub ipv4_unicast: Option<Ipv4Unicast>,
     // original -> bgp-mp:ipv6-unicast
     // IPv6 unicast configuration options.
     #[serde(rename = "ipv6-unicast")]
-    pub(crate) ipv6_unicast: Option<Ipv6Unicast>,
+    pub ipv6_unicast: Option<Ipv6Unicast>,
     // original -> bgp-mp:ipv4-labelled-unicast
     // IPv4 Labelled Unicast configuration options.
     #[serde(rename = "ipv4-labelled-unicast")]
-    pub(crate) ipv4_labelled_unicast: Option<Ipv4LabelledUnicast>,
+    pub ipv4_labelled_unicast: Option<Ipv4LabelledUnicast>,
     // original -> bgp-mp:ipv6-labelled-unicast
     // IPv6 Labelled Unicast configuration options.
     #[serde(rename = "ipv6-labelled-unicast")]
-    pub(crate) ipv6_labelled_unicast: Option<Ipv6LabelledUnicast>,
+    pub ipv6_labelled_unicast: Option<Ipv6LabelledUnicast>,
     // original -> bgp-mp:l3vpn-ipv4-unicast
     // Unicast IPv4 L3VPN configuration options.
     #[serde(rename = "l3vpn-ipv4-unicast")]
-    pub(crate) l3vpn_ipv4_unicast: Option<L3vpnIpv4Unicast>,
+    pub l3vpn_ipv4_unicast: Option<L3vpnIpv4Unicast>,
     // original -> bgp-mp:l3vpn-ipv6-unicast
     // Unicast IPv6 L3VPN configuration options.
     #[serde(rename = "l3vpn-ipv6-unicast")]
-    pub(crate) l3vpn_ipv6_unicast: Option<L3vpnIpv6Unicast>,
+    pub l3vpn_ipv6_unicast: Option<L3vpnIpv6Unicast>,
     // original -> bgp-mp:l3vpn-ipv4-multicast
     // Multicast IPv4 L3VPN configuration options.
     #[serde(rename = "l3vpn-ipv4-multicast")]
-    pub(crate) l3vpn_ipv4_multicast: Option<L3vpnIpv4Multicast>,
+    pub l3vpn_ipv4_multicast: Option<L3vpnIpv4Multicast>,
     // original -> bgp-mp:l3vpn-ipv6-multicast
     // Multicast IPv6 L3VPN configuration options.
     #[serde(rename = "l3vpn-ipv6-multicast")]
-    pub(crate) l3vpn_ipv6_multicast: Option<L3vpnIpv6Multicast>,
+    pub l3vpn_ipv6_multicast: Option<L3vpnIpv6Multicast>,
     // original -> bgp-mp:l2vpn-vpls
     // BGP-signalled VPLS configuration options.
     #[serde(rename = "l2vpn-vpls")]
-    pub(crate) l2vpn_vpls: Option<L2vpnVpls>,
+    pub l2vpn_vpls: Option<L2vpnVpls>,
     // original -> bgp-mp:l2vpn-evpn
     // BGP EVPN configuration options.
     #[serde(rename = "l2vpn-evpn")]
-    pub(crate) l2vpn_evpn: Option<L2vpnEvpn>,
+    pub l2vpn_evpn: Option<L2vpnEvpn>,
     // original -> bgp-mp:route-selection-options
     // Parameters relating to options for route selection.
     #[serde(rename = "route-selection-options")]
-    pub(crate) route_selection_options: Option<RouteSelectionOptions>,
+    pub route_selection_options: Option<RouteSelectionOptions>,
     // original -> bgp-mp:use-multiple-paths
     // Parameters related to the use of multiple paths for the
     // same NLRI.
     #[serde(rename = "use-multiple-paths")]
-    pub(crate) use_multiple_paths: Option<UseMultiplePaths>,
+    pub use_multiple_paths: Option<UseMultiplePaths>,
     // original -> bgp-mp:prefix-limit
     // Configure the maximum number of prefixes that will be
     // accepted from a peer.
     #[serde(rename = "prefix-limit")]
-    pub(crate) prefix_limit: Option<PrefixLimit>,
+    pub prefix_limit: Option<PrefixLimit>,
     // original -> gobgp:route-target-membership
     #[serde(rename = "route-target-membership")]
-    pub(crate) route_target_membership: Option<RouteTargetMembership>,
+    pub route_target_membership: Option<RouteTargetMembership>,
     // original -> gobgp:long-lived-graceful-restart
     #[serde(rename = "long-lived-graceful-restart")]
-    pub(crate) long_lived_graceful_restart: Option<LongLivedGracefulRestart>,
+    pub long_lived_graceful_restart: Option<LongLivedGracefulRestart>,
     // original -> gobgp:add-paths
     // add-paths configuration options related to a particular AFI-SAFI.
     #[serde(rename = "add-paths")]
-    pub(crate) add_paths: Option<AddPaths>,
+    pub add_paths: Option<AddPaths>,
 }
 // struct for container bgp:state.
 // State information associated with graceful-restart.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GracefulRestartState {
+pub struct GracefulRestartState {
     // original -> bgp:enabled
     // bgp:enabled's original type is boolean.
     // Enable or disable the graceful-restart capability.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> bgp:restart-time
     // Estimated time (in seconds) for the local BGP speaker to
     // restart a session. This value is advertise in the graceful
@@ -2880,7 +2880,7 @@ pub(crate) struct GracefulRestartState {
     // as Restart Time in RFC4724.  Per RFC4724, the suggested
     // default value is <= the hold-time value.
     #[serde(rename = "restart-time")]
-    pub(crate) restart_time: Option<u16>,
+    pub restart_time: Option<u16>,
     // original -> bgp:stale-routes-time
     // bgp:stale-routes-time's original type is decimal64.
     // An upper-bound on the time thate stale routes will be
@@ -2891,7 +2891,7 @@ pub(crate) struct GracefulRestartState {
     // will be purged. This timer is referred to as the
     // Selection_Deferral_Timer in RFC4724.
     #[serde(rename = "stale-routes-time")]
-    pub(crate) stale_routes_time: Option<f64>,
+    pub stale_routes_time: Option<f64>,
     // original -> bgp:helper-only
     // bgp:helper-only's original type is boolean.
     // Enable graceful-restart in helper mode only. When this
@@ -2899,20 +2899,20 @@ pub(crate) struct GracefulRestartState {
     // its own state during a restart, but supports procedures
     // for the receiving speaker, as defined in RFC4724.
     #[serde(rename = "helper-only")]
-    pub(crate) helper_only: Option<bool>,
+    pub helper_only: Option<bool>,
     // original -> bgp-op:peer-restart-time
     // The period of time (advertised by the peer) that
     // the peer expects a restart of a BGP session to
     // take.
     #[serde(rename = "peer-restart-time")]
-    pub(crate) peer_restart_time: Option<u16>,
+    pub peer_restart_time: Option<u16>,
     // original -> bgp-op:peer-restarting
     // bgp-op:peer-restarting's original type is boolean.
     // This flag indicates whether the remote neighbor is currently
     // in the process of restarting, and hence received routes are
     // currently stale.
     #[serde(rename = "peer-restarting")]
-    pub(crate) peer_restarting: Option<bool>,
+    pub peer_restarting: Option<bool>,
     // original -> bgp-op:local-restarting
     // bgp-op:local-restarting's original type is boolean.
     // This flag indicates whether the local neighbor is currently
@@ -2920,32 +2920,32 @@ pub(crate) struct GracefulRestartState {
     // advertised to the peer, and the End-of-RIB (EOR) marker has
     // been unset.
     #[serde(rename = "local-restarting")]
-    pub(crate) local_restarting: Option<bool>,
+    pub local_restarting: Option<bool>,
     // original -> bgp-op:mode
     // This leaf indicates the mode of operation of BGP graceful
     // restart with the peer.
-    pub(crate) mode: Option<Mode>,
+    pub mode: Option<Mode>,
     // original -> gobgp:deferral-time
     #[serde(rename = "deferral-time")]
-    pub(crate) deferral_time: Option<u16>,
+    pub deferral_time: Option<u16>,
     // original -> gobgp:notification-enabled
     // gobgp:notification-enabled's original type is boolean.
     #[serde(rename = "notification-enabled")]
-    pub(crate) notification_enabled: Option<bool>,
+    pub notification_enabled: Option<bool>,
     // original -> gobgp:long-lived-enabled
     // gobgp:long-lived-enabled's original type is boolean.
     #[serde(rename = "long-lived-enabled")]
-    pub(crate) long_lived_enabled: Option<bool>,
+    pub long_lived_enabled: Option<bool>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to graceful-restart.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GracefulRestartConfig {
+pub struct GracefulRestartConfig {
     // original -> bgp:enabled
     // bgp:enabled's original type is boolean.
     // Enable or disable the graceful-restart capability.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> bgp:restart-time
     // Estimated time (in seconds) for the local BGP speaker to
     // restart a session. This value is advertise in the graceful
@@ -2953,7 +2953,7 @@ pub(crate) struct GracefulRestartConfig {
     // as Restart Time in RFC4724.  Per RFC4724, the suggested
     // default value is <= the hold-time value.
     #[serde(rename = "restart-time")]
-    pub(crate) restart_time: Option<u16>,
+    pub restart_time: Option<u16>,
     // original -> bgp:stale-routes-time
     // bgp:stale-routes-time's original type is decimal64.
     // An upper-bound on the time thate stale routes will be
@@ -2964,7 +2964,7 @@ pub(crate) struct GracefulRestartConfig {
     // will be purged. This timer is referred to as the
     // Selection_Deferral_Timer in RFC4724.
     #[serde(rename = "stale-routes-time")]
-    pub(crate) stale_routes_time: Option<f64>,
+    pub stale_routes_time: Option<f64>,
     // original -> bgp:helper-only
     // bgp:helper-only's original type is boolean.
     // Enable graceful-restart in helper mode only. When this
@@ -2972,243 +2972,243 @@ pub(crate) struct GracefulRestartConfig {
     // its own state during a restart, but supports procedures
     // for the receiving speaker, as defined in RFC4724.
     #[serde(rename = "helper-only")]
-    pub(crate) helper_only: Option<bool>,
+    pub helper_only: Option<bool>,
     // original -> gobgp:deferral-time
     #[serde(rename = "deferral-time")]
-    pub(crate) deferral_time: Option<u16>,
+    pub deferral_time: Option<u16>,
     // original -> gobgp:notification-enabled
     // gobgp:notification-enabled's original type is boolean.
     #[serde(rename = "notification-enabled")]
-    pub(crate) notification_enabled: Option<bool>,
+    pub notification_enabled: Option<bool>,
     // original -> gobgp:long-lived-enabled
     // gobgp:long-lived-enabled's original type is boolean.
     #[serde(rename = "long-lived-enabled")]
-    pub(crate) long_lived_enabled: Option<bool>,
+    pub long_lived_enabled: Option<bool>,
 }
 // struct for container bgp:graceful-restart.
 // Parameters relating the graceful restart mechanism for BGP.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GracefulRestart {
+pub struct GracefulRestart {
     // original -> bgp:graceful-restart-config
     // Configuration parameters relating to graceful-restart.
-    pub(crate) config: Option<GracefulRestartConfig>,
+    pub config: Option<GracefulRestartConfig>,
     // original -> bgp:graceful-restart-state
     // State information associated with graceful-restart.
-    pub(crate) state: Option<GracefulRestartState>,
+    pub state: Option<GracefulRestartState>,
 }
 // struct for container bgp-mp:state.
 // State information relating to iBGP multipath.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct IbgpState {
+pub struct IbgpState {
     // original -> bgp-mp:maximum-paths
     // Maximum number of parallel paths to consider when using
     // iBGP multipath. The default is to use a single path.
     #[serde(rename = "maximum-paths")]
-    pub(crate) maximum_paths: Option<u32>,
+    pub maximum_paths: Option<u32>,
 }
 // struct for container bgp-mp:config.
 // Configuration parameters relating to iBGP multipath.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct IbgpConfig {
+pub struct IbgpConfig {
     // original -> bgp-mp:maximum-paths
     // Maximum number of parallel paths to consider when using
     // iBGP multipath. The default is to use a single path.
     #[serde(rename = "maximum-paths")]
-    pub(crate) maximum_paths: Option<u32>,
+    pub maximum_paths: Option<u32>,
 }
 // struct for container bgp-mp:ibgp.
 // Multipath parameters for iBGP.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ibgp {
+pub struct Ibgp {
     // original -> bgp-mp:ibgp-config
     // Configuration parameters relating to iBGP multipath.
-    pub(crate) config: Option<IbgpConfig>,
+    pub config: Option<IbgpConfig>,
     // original -> bgp-mp:ibgp-state
     // State information relating to iBGP multipath.
-    pub(crate) state: Option<IbgpState>,
+    pub state: Option<IbgpState>,
 }
 // struct for container bgp-mp:state.
 // State information relating to eBGP multipath.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct EbgpState {
+pub struct EbgpState {
     // original -> bgp-mp:allow-multiple-as
     // bgp-mp:allow-multiple-as's original type is boolean.
     // Allow multipath to use paths from different neighbouring
     // ASes.  The default is to only consider multiple paths from
     // the same neighbouring AS.
     #[serde(rename = "allow-multiple-as")]
-    pub(crate) allow_multiple_as: Option<bool>,
+    pub allow_multiple_as: Option<bool>,
     // original -> bgp-mp:maximum-paths
     // Maximum number of parallel paths to consider when using
     // BGP multipath. The default is use a single path.
     #[serde(rename = "maximum-paths")]
-    pub(crate) maximum_paths: Option<u32>,
+    pub maximum_paths: Option<u32>,
 }
 // struct for container bgp-mp:config.
 // Configuration parameters relating to eBGP multipath.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct EbgpConfig {
+pub struct EbgpConfig {
     // original -> bgp-mp:allow-multiple-as
     // bgp-mp:allow-multiple-as's original type is boolean.
     // Allow multipath to use paths from different neighbouring
     // ASes.  The default is to only consider multiple paths from
     // the same neighbouring AS.
     #[serde(rename = "allow-multiple-as")]
-    pub(crate) allow_multiple_as: Option<bool>,
+    pub allow_multiple_as: Option<bool>,
     // original -> bgp-mp:maximum-paths
     // Maximum number of parallel paths to consider when using
     // BGP multipath. The default is use a single path.
     #[serde(rename = "maximum-paths")]
-    pub(crate) maximum_paths: Option<u32>,
+    pub maximum_paths: Option<u32>,
 }
 // struct for container bgp-mp:ebgp.
 // Multipath parameters for eBGP.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ebgp {
+pub struct Ebgp {
     // original -> bgp-mp:ebgp-config
     // Configuration parameters relating to eBGP multipath.
-    pub(crate) config: Option<EbgpConfig>,
+    pub config: Option<EbgpConfig>,
     // original -> bgp-mp:ebgp-state
     // State information relating to eBGP multipath.
-    pub(crate) state: Option<EbgpState>,
+    pub state: Option<EbgpState>,
 }
 // struct for container bgp-mp:state.
 // State parameters relating to multipath.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct UseMultiplePathsState {
+pub struct UseMultiplePathsState {
     // original -> bgp-mp:enabled
     // bgp-mp:enabled's original type is boolean.
     // Whether the use of multiple paths for the same NLRI is
     // enabled for the neighbor. This value is overridden by
     // any more specific configuration value.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
 }
 // struct for container bgp-mp:config.
 // Configuration parameters relating to multipath.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct UseMultiplePathsConfig {
+pub struct UseMultiplePathsConfig {
     // original -> bgp-mp:enabled
     // bgp-mp:enabled's original type is boolean.
     // Whether the use of multiple paths for the same NLRI is
     // enabled for the neighbor. This value is overridden by
     // any more specific configuration value.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
 }
 // struct for container bgp-mp:use-multiple-paths.
 // Parameters related to the use of multiple paths for the
 // same NLRI.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct UseMultiplePaths {
+pub struct UseMultiplePaths {
     // original -> bgp-mp:use-multiple-paths-config
     // Configuration parameters relating to multipath.
-    pub(crate) config: Option<UseMultiplePathsConfig>,
+    pub config: Option<UseMultiplePathsConfig>,
     // original -> bgp-mp:use-multiple-paths-state
     // State parameters relating to multipath.
-    pub(crate) state: Option<UseMultiplePathsState>,
+    pub state: Option<UseMultiplePathsState>,
     // original -> bgp-mp:ebgp
     // Multipath parameters for eBGP.
-    pub(crate) ebgp: Option<Ebgp>,
+    pub ebgp: Option<Ebgp>,
     // original -> bgp-mp:ibgp
     // Multipath parameters for iBGP.
-    pub(crate) ibgp: Option<Ibgp>,
+    pub ibgp: Option<Ibgp>,
 }
 // struct for container bgp:state.
 // State information relating to the BGP confederations.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ConfederationState {
+pub struct ConfederationState {
     // original -> bgp:enabled
     // bgp:enabled's original type is boolean.
     // When this leaf is set to true it indicates that
     // the local-AS is part of a BGP confederation.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> bgp:identifier
     // bgp:identifier's original type is inet:as-number.
     // Confederation identifier for the autonomous system.
-    pub(crate) identifier: Option<u32>,
+    pub identifier: Option<u32>,
     // original -> bgp:member-as
     // original type is list of inet:as-number
     // Remote autonomous systems that are to be treated
     // as part of the local confederation.
     #[serde(rename = "member-as-list")]
-    pub(crate) member_as_list: Option<Vec<u32>>,
+    pub member_as_list: Option<Vec<u32>>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to BGP confederations.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ConfederationConfig {
+pub struct ConfederationConfig {
     // original -> bgp:enabled
     // bgp:enabled's original type is boolean.
     // When this leaf is set to true it indicates that
     // the local-AS is part of a BGP confederation.
-    pub(crate) enabled: Option<bool>,
+    pub enabled: Option<bool>,
     // original -> bgp:identifier
     // bgp:identifier's original type is inet:as-number.
     // Confederation identifier for the autonomous system.
-    pub(crate) identifier: Option<u32>,
+    pub identifier: Option<u32>,
     // original -> bgp:member-as
     // original type is list of inet:as-number
     // Remote autonomous systems that are to be treated
     // as part of the local confederation.
     #[serde(rename = "member-as-list")]
-    pub(crate) member_as_list: Option<Vec<u32>>,
+    pub member_as_list: Option<Vec<u32>>,
 }
 // struct for container bgp:confederation.
 // Parameters indicating whether the local system acts as part
 // of a BGP confederation.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Confederation {
+pub struct Confederation {
     // original -> bgp:confederation-config
     // Configuration parameters relating to BGP confederations.
-    pub(crate) config: Option<ConfederationConfig>,
+    pub config: Option<ConfederationConfig>,
     // original -> bgp:confederation-state
     // State information relating to the BGP confederations.
-    pub(crate) state: Option<ConfederationState>,
+    pub state: Option<ConfederationState>,
 }
 // struct for container bgp:state.
 // State information relating to the default route distance.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DefaultRouteDistanceState {
+pub struct DefaultRouteDistanceState {
     // original -> bgp:external-route-distance
     // Administrative distance for routes learned from external
     // BGP (eBGP).
     #[serde(rename = "external-route-distance")]
-    pub(crate) external_route_distance: Option<u8>,
+    pub external_route_distance: Option<u8>,
     // original -> bgp:internal-route-distance
     // Administrative distance for routes learned from internal
     // BGP (iBGP).
     #[serde(rename = "internal-route-distance")]
-    pub(crate) internal_route_distance: Option<u8>,
+    pub internal_route_distance: Option<u8>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to the default route
 // distance.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DefaultRouteDistanceConfig {
+pub struct DefaultRouteDistanceConfig {
     // original -> bgp:external-route-distance
     // Administrative distance for routes learned from external
     // BGP (eBGP).
     #[serde(rename = "external-route-distance")]
-    pub(crate) external_route_distance: Option<u8>,
+    pub external_route_distance: Option<u8>,
     // original -> bgp:internal-route-distance
     // Administrative distance for routes learned from internal
     // BGP (iBGP).
     #[serde(rename = "internal-route-distance")]
-    pub(crate) internal_route_distance: Option<u8>,
+    pub internal_route_distance: Option<u8>,
 }
 // struct for container bgp:default-route-distance.
 // Administrative distance (or preference) assigned to
@@ -3216,20 +3216,20 @@ pub(crate) struct DefaultRouteDistanceConfig {
 // (external, internal, and local).
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DefaultRouteDistance {
+pub struct DefaultRouteDistance {
     // original -> bgp:default-route-distance-config
     // Configuration parameters relating to the default route
     // distance.
-    pub(crate) config: Option<DefaultRouteDistanceConfig>,
+    pub config: Option<DefaultRouteDistanceConfig>,
     // original -> bgp:default-route-distance-state
     // State information relating to the default route distance.
-    pub(crate) state: Option<DefaultRouteDistanceState>,
+    pub state: Option<DefaultRouteDistanceState>,
 }
 // struct for container bgp-mp:state.
 // State information for the route selection options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteSelectionOptionsState {
+pub struct RouteSelectionOptionsState {
     // original -> bgp-mp:always-compare-med
     // bgp-mp:always-compare-med's original type is boolean.
     // Compare multi-exit discriminator (MED) value from
@@ -3237,52 +3237,52 @@ pub(crate) struct RouteSelectionOptionsState {
     // default behavior is to only compare MEDs for paths
     // received from the same AS.
     #[serde(rename = "always-compare-med")]
-    pub(crate) always_compare_med: Option<bool>,
+    pub always_compare_med: Option<bool>,
     // original -> bgp-mp:ignore-as-path-length
     // bgp-mp:ignore-as-path-length's original type is boolean.
     // Ignore the AS path length when selecting the best path.
     // The default is to use the AS path length and prefer paths
     // with shorter length.
     #[serde(rename = "ignore-as-path-length")]
-    pub(crate) ignore_as_path_length: Option<bool>,
+    pub ignore_as_path_length: Option<bool>,
     // original -> bgp-mp:external-compare-router-id
     // bgp-mp:external-compare-router-id's original type is boolean.
     // When comparing similar routes received from external
     // BGP peers, use the router-id as a criterion to select
     // the active path.
     #[serde(rename = "external-compare-router-id")]
-    pub(crate) external_compare_router_id: Option<bool>,
+    pub external_compare_router_id: Option<bool>,
     // original -> bgp-mp:advertise-inactive-routes
     // bgp-mp:advertise-inactive-routes's original type is boolean.
     // Advertise inactive routes to external peers.  The
     // default is to only advertise active routes.
     #[serde(rename = "advertise-inactive-routes")]
-    pub(crate) advertise_inactive_routes: Option<bool>,
+    pub advertise_inactive_routes: Option<bool>,
     // original -> bgp-mp:enable-aigp
     // bgp-mp:enable-aigp's original type is boolean.
     // Flag to enable sending / receiving accumulated IGP
     // attribute in routing updates.
     #[serde(rename = "enable-aigp")]
-    pub(crate) enable_aigp: Option<bool>,
+    pub enable_aigp: Option<bool>,
     // original -> bgp-mp:ignore-next-hop-igp-metric
     // bgp-mp:ignore-next-hop-igp-metric's original type is boolean.
     // Ignore the IGP metric to the next-hop when calculating
     // BGP best-path. The default is to select the route for
     // which the metric to the next-hop is lowest.
     #[serde(rename = "ignore-next-hop-igp-metric")]
-    pub(crate) ignore_next_hop_igp_metric: Option<bool>,
+    pub ignore_next_hop_igp_metric: Option<bool>,
     // original -> gobgp:disable-best-path-selection
     // gobgp:disable-best-path-selection's original type is boolean.
     // Disables best path selection process.
     #[serde(rename = "disable-best-path-selection")]
-    pub(crate) disable_best_path_selection: Option<bool>,
+    pub disable_best_path_selection: Option<bool>,
 }
 // struct for container bgp-mp:config.
 // Configuration parameters relating to route selection
 // options.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteSelectionOptionsConfig {
+pub struct RouteSelectionOptionsConfig {
     // original -> bgp-mp:always-compare-med
     // bgp-mp:always-compare-med's original type is boolean.
     // Compare multi-exit discriminator (MED) value from
@@ -3290,226 +3290,226 @@ pub(crate) struct RouteSelectionOptionsConfig {
     // default behavior is to only compare MEDs for paths
     // received from the same AS.
     #[serde(rename = "always-compare-med")]
-    pub(crate) always_compare_med: Option<bool>,
+    pub always_compare_med: Option<bool>,
     // original -> bgp-mp:ignore-as-path-length
     // bgp-mp:ignore-as-path-length's original type is boolean.
     // Ignore the AS path length when selecting the best path.
     // The default is to use the AS path length and prefer paths
     // with shorter length.
     #[serde(rename = "ignore-as-path-length")]
-    pub(crate) ignore_as_path_length: Option<bool>,
+    pub ignore_as_path_length: Option<bool>,
     // original -> bgp-mp:external-compare-router-id
     // bgp-mp:external-compare-router-id's original type is boolean.
     // When comparing similar routes received from external
     // BGP peers, use the router-id as a criterion to select
     // the active path.
     #[serde(rename = "external-compare-router-id")]
-    pub(crate) external_compare_router_id: Option<bool>,
+    pub external_compare_router_id: Option<bool>,
     // original -> bgp-mp:advertise-inactive-routes
     // bgp-mp:advertise-inactive-routes's original type is boolean.
     // Advertise inactive routes to external peers.  The
     // default is to only advertise active routes.
     #[serde(rename = "advertise-inactive-routes")]
-    pub(crate) advertise_inactive_routes: Option<bool>,
+    pub advertise_inactive_routes: Option<bool>,
     // original -> bgp-mp:enable-aigp
     // bgp-mp:enable-aigp's original type is boolean.
     // Flag to enable sending / receiving accumulated IGP
     // attribute in routing updates.
     #[serde(rename = "enable-aigp")]
-    pub(crate) enable_aigp: Option<bool>,
+    pub enable_aigp: Option<bool>,
     // original -> bgp-mp:ignore-next-hop-igp-metric
     // bgp-mp:ignore-next-hop-igp-metric's original type is boolean.
     // Ignore the IGP metric to the next-hop when calculating
     // BGP best-path. The default is to select the route for
     // which the metric to the next-hop is lowest.
     #[serde(rename = "ignore-next-hop-igp-metric")]
-    pub(crate) ignore_next_hop_igp_metric: Option<bool>,
+    pub ignore_next_hop_igp_metric: Option<bool>,
     // original -> gobgp:disable-best-path-selection
     // gobgp:disable-best-path-selection's original type is boolean.
     // Disables best path selection process.
     #[serde(rename = "disable-best-path-selection")]
-    pub(crate) disable_best_path_selection: Option<bool>,
+    pub disable_best_path_selection: Option<bool>,
 }
 // struct for container bgp-mp:route-selection-options.
 // Parameters relating to options for route selection.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteSelectionOptions {
+pub struct RouteSelectionOptions {
     // original -> bgp-mp:route-selection-options-config
     // Configuration parameters relating to route selection
     // options.
-    pub(crate) config: Option<RouteSelectionOptionsConfig>,
+    pub config: Option<RouteSelectionOptionsConfig>,
     // original -> bgp-mp:route-selection-options-state
     // State information for the route selection options.
-    pub(crate) state: Option<RouteSelectionOptionsState>,
+    pub state: Option<RouteSelectionOptionsState>,
 }
 // struct for container bgp:state.
 // State information relating to the global BGP router.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GlobalState {
+pub struct GlobalState {
     // original -> bgp:as
     // bgp:as's original type is inet:as-number.
     // Local autonomous system number of the router.  Uses
     // the 32-bit as-number type from the model in RFC 6991.
-    pub(crate) r#as: Option<u32>,
+    pub r#as: Option<u32>,
     // original -> bgp:router-id
     // bgp:router-id's original type is inet:ipv4-address.
     // Router id of the router, expressed as an
     // 32-bit value, IPv4 address.
     #[serde(rename = "router-id")]
-    pub(crate) router_id: Option<String>,
+    pub router_id: Option<String>,
     // original -> bgp-op:total-paths
     // Total number of BGP paths within the context.
     #[serde(rename = "total-paths")]
-    pub(crate) total_paths: Option<u32>,
+    pub total_paths: Option<u32>,
     // original -> bgp-op:total-prefixes
     // .
     #[serde(rename = "total-prefixes")]
-    pub(crate) total_prefixes: Option<u32>,
+    pub total_prefixes: Option<u32>,
     // original -> gobgp:port
-    pub(crate) port: Option<i32>,
+    pub port: Option<i32>,
     // original -> gobgp:local-address
     #[serde(rename = "local-address-list")]
-    pub(crate) local_address_list: Option<Vec<String>>,
+    pub local_address_list: Option<Vec<String>>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to the global BGP router.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GlobalConfig {
+pub struct GlobalConfig {
     // original -> bgp:as
     // bgp:as's original type is inet:as-number.
     // Local autonomous system number of the router.  Uses
     // the 32-bit as-number type from the model in RFC 6991.
-    pub(crate) r#as: Option<u32>,
+    pub r#as: Option<u32>,
     // original -> bgp:router-id
     // bgp:router-id's original type is inet:ipv4-address.
     // Router id of the router, expressed as an
     // 32-bit value, IPv4 address.
     #[serde(rename = "router-id")]
-    pub(crate) router_id: Option<String>,
+    pub router_id: Option<String>,
     // original -> gobgp:port
-    pub(crate) port: Option<i32>,
+    pub port: Option<i32>,
     // original -> gobgp:local-address
     #[serde(rename = "local-address-list")]
-    pub(crate) local_address_list: Option<Vec<String>>,
+    pub local_address_list: Option<Vec<String>>,
 }
 // struct for container bgp:global.
 // Global configuration for the BGP router.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Global {
+pub struct Global {
     // original -> bgp:global-config
     // Configuration parameters relating to the global BGP router.
-    pub(crate) config: Option<GlobalConfig>,
+    pub config: Option<GlobalConfig>,
     // original -> bgp:global-state
     // State information relating to the global BGP router.
-    pub(crate) state: Option<GlobalState>,
+    pub state: Option<GlobalState>,
     // original -> bgp-mp:route-selection-options
     // Parameters relating to options for route selection.
     #[serde(rename = "route-selection-options")]
-    pub(crate) route_selection_options: Option<RouteSelectionOptions>,
+    pub route_selection_options: Option<RouteSelectionOptions>,
     // original -> bgp:default-route-distance
     // Administrative distance (or preference) assigned to
     // routes received from different sources
     // (external, internal, and local).
     #[serde(rename = "default-route-distance")]
-    pub(crate) default_route_distance: Option<DefaultRouteDistance>,
+    pub default_route_distance: Option<DefaultRouteDistance>,
     // original -> bgp:confederation
     // Parameters indicating whether the local system acts as part
     // of a BGP confederation.
-    pub(crate) confederation: Option<Confederation>,
+    pub confederation: Option<Confederation>,
     // original -> bgp-mp:use-multiple-paths
     // Parameters related to the use of multiple paths for the
     // same NLRI.
     #[serde(rename = "use-multiple-paths")]
-    pub(crate) use_multiple_paths: Option<UseMultiplePaths>,
+    pub use_multiple_paths: Option<UseMultiplePaths>,
     // original -> bgp:graceful-restart
     // Parameters relating the graceful restart mechanism for BGP.
     #[serde(rename = "graceful-restart")]
-    pub(crate) graceful_restart: Option<GracefulRestart>,
+    pub graceful_restart: Option<GracefulRestart>,
     // original -> bgp:afi-safis
     // Address family specific configuration.
     #[serde(rename = "afi-safis")]
-    pub(crate) afi_safis: Option<Vec<AfiSafi>>,
+    pub afi_safis: Option<Vec<AfiSafi>>,
     // original -> rpol:apply-policy
     // Anchor point for routing policies in the model.
     // Import and export policies are with respect to the local
     // routing table, i.e., export (send) and import (receive),
     // depending on the context.
     #[serde(rename = "apply-policy")]
-    pub(crate) apply_policy: Option<ApplyPolicy>,
+    pub apply_policy: Option<ApplyPolicy>,
 }
 // struct for container bgp:bgp.
 // Top-level configuration and state for the BGP router.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Bgp {
+pub struct Bgp {
     // original -> bgp:global
     // Global configuration for the BGP router.
-    pub(crate) global: Option<Global>,
+    pub global: Option<Global>,
     // original -> bgp:neighbors
     // Configuration for BGP neighbors.
-    pub(crate) neighbors: Option<Vec<Neighbor>>,
+    pub neighbors: Option<Vec<Neighbor>>,
     // original -> bgp:peer-groups
     // Configuration for BGP peer-groups.
     #[serde(rename = "peer-groups")]
-    pub(crate) peer_groups: Option<Vec<PeerGroup>>,
+    pub peer_groups: Option<Vec<PeerGroup>>,
     // original -> gobgp:rpki-servers
     #[serde(rename = "rpki-servers")]
-    pub(crate) rpki_servers: Option<Vec<RpkiServer>>,
+    pub rpki_servers: Option<Vec<RpkiServer>>,
     // original -> gobgp:bmp-servers
     #[serde(rename = "bmp-servers")]
-    pub(crate) bmp_servers: Option<Vec<BmpServer>>,
+    pub bmp_servers: Option<Vec<BmpServer>>,
     // original -> gobgp:vrfs
-    pub(crate) vrfs: Option<Vec<Vrf>>,
+    pub vrfs: Option<Vec<Vrf>>,
     // original -> gobgp:mrt-dump
     #[serde(rename = "mrt-dump")]
-    pub(crate) mrt_dump: Option<Vec<Mrt>>,
+    pub mrt_dump: Option<Vec<Mrt>>,
     // original -> gobgp:zebra
-    pub(crate) zebra: Option<Zebra>,
+    pub zebra: Option<Zebra>,
     // original -> gobgp:collector
-    pub(crate) collector: Option<Collector>,
+    pub collector: Option<Collector>,
     // original -> gobgp:dynamic-neighbors
     #[serde(rename = "dynamic-neighbors")]
-    pub(crate) dynamic_neighbors: Option<Vec<DynamicNeighbor>>,
+    pub dynamic_neighbors: Option<Vec<DynamicNeighbor>>,
 }
 // struct for container gobgp:set-large-community-method.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SetLargeCommunityMethod {
+pub struct SetLargeCommunityMethod {
     // original -> gobgp:communities
     #[serde(rename = "communities-list")]
-    pub(crate) communities_list: Option<Vec<String>>,
+    pub communities_list: Option<Vec<String>>,
 }
 // struct for container gobgp:set-large-community.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SetLargeCommunity {
+pub struct SetLargeCommunity {
     // original -> gobgp:set-large-community-method
     #[serde(rename = "set-large-community-method")]
-    pub(crate) set_large_community_method: Option<SetLargeCommunityMethod>,
+    pub set_large_community_method: Option<SetLargeCommunityMethod>,
     // original -> gobgp:options
-    pub(crate) options: Option<BgpSetCommunityOptionType>,
+    pub options: Option<BgpSetCommunityOptionType>,
 }
 // struct for container bgp-pol:set-ext-community-method.
 // Option to set communities using an inline list or
 // reference to an existing defined set.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SetExtCommunityMethod {
+pub struct SetExtCommunityMethod {
     // original -> bgp-pol:communities
     // original type is list of union
     // Set the community values for the update inline with
     // a list.
     #[serde(rename = "communities-list")]
-    pub(crate) communities_list: Option<Vec<String>>,
+    pub communities_list: Option<Vec<String>>,
     // original -> bgp-pol:ext-community-set-ref
     // References a defined extended community set by
     // name.
     #[serde(rename = "ext-community-set-ref")]
-    pub(crate) ext_community_set_ref: Option<String>,
+    pub ext_community_set_ref: Option<String>,
 }
 // struct for container bgp-pol:set-ext-community.
 // Action to set the extended community attributes of the
@@ -3517,236 +3517,236 @@ pub(crate) struct SetExtCommunityMethod {
 // modified.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SetExtCommunity {
+pub struct SetExtCommunity {
     // original -> bgp-pol:set-ext-community-method
     // Option to set communities using an inline list or
     // reference to an existing defined set.
     #[serde(rename = "set-ext-community-method")]
-    pub(crate) set_ext_community_method: Option<SetExtCommunityMethod>,
+    pub set_ext_community_method: Option<SetExtCommunityMethod>,
     // original -> bgp-pol:options
     // bgp-pol:options's original type is bgp-set-community-option-type.
     // options for modifying the extended community
     // attribute with the specified values. These options
     // apply to both methods of setting the community
     // attribute.
-    pub(crate) options: Option<String>,
+    pub options: Option<String>,
 }
 // struct for container bgp-pol:set-community-method.
 // Option to set communities using an inline list or
 // reference to an existing defined set.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SetCommunityMethod {
+pub struct SetCommunityMethod {
     // original -> bgp-pol:communities
     // original type is list of union
     // Set the community values for the update inline with
     // a list.
     #[serde(rename = "communities-list")]
-    pub(crate) communities_list: Option<Vec<String>>,
+    pub communities_list: Option<Vec<String>>,
     // original -> bgp-pol:community-set-ref
     // References a defined community set by name.
     #[serde(rename = "community-set-ref")]
-    pub(crate) community_set_ref: Option<String>,
+    pub community_set_ref: Option<String>,
 }
 // struct for container bgp-pol:set-community.
 // action to set the community attributes of the route, along
 // with options to modify how the community is modified.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SetCommunity {
+pub struct SetCommunity {
     // original -> bgp-pol:set-community-method
     // Option to set communities using an inline list or
     // reference to an existing defined set.
     #[serde(rename = "set-community-method")]
-    pub(crate) set_community_method: Option<SetCommunityMethod>,
+    pub set_community_method: Option<SetCommunityMethod>,
     // original -> bgp-pol:options
     // bgp-pol:options's original type is bgp-set-community-option-type.
     // Options for modifying the community attribute with
     // the specified values.  These options apply to both
     // methods of setting the community attribute.
-    pub(crate) options: Option<String>,
+    pub options: Option<String>,
 }
 // struct for container bgp-pol:set-as-path-prepend.
 // action to prepend local AS number to the AS-path a
 // specified number of times.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SetAsPathPrepend {
+pub struct SetAsPathPrepend {
     // original -> bgp-pol:repeat-n
     // number of times to prepend the local AS
     // number.
     #[serde(rename = "repeat-n")]
-    pub(crate) repeat_n: Option<u8>,
+    pub repeat_n: Option<u8>,
     // original -> gobgp:as
     // gobgp:as's original type is union.
     // autonomous system number or 'last-as' which means
     // the leftmost as number in the AS-path to be prepended.
-    pub(crate) r#as: Option<String>,
+    pub r#as: Option<String>,
 }
 // struct for container bgp-pol:bgp-actions.
 // Definitions for policy action statements that
 // change BGP-specific attributes of the route.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BgpActions {
+pub struct BgpActions {
     // original -> bgp-pol:set-as-path-prepend
     // action to prepend local AS number to the AS-path a
     // specified number of times.
     #[serde(rename = "set-as-path-prepend")]
-    pub(crate) set_as_path_prepend: Option<SetAsPathPrepend>,
+    pub set_as_path_prepend: Option<SetAsPathPrepend>,
     // original -> bgp-pol:set-community
     // action to set the community attributes of the route, along
     // with options to modify how the community is modified.
     #[serde(rename = "set-community")]
-    pub(crate) set_community: Option<SetCommunity>,
+    pub set_community: Option<SetCommunity>,
     // original -> bgp-pol:set-ext-community
     // Action to set the extended community attributes of the
     // route, along with options to modify how the community is
     // modified.
     #[serde(rename = "set-ext-community")]
-    pub(crate) set_ext_community: Option<SetExtCommunity>,
+    pub set_ext_community: Option<SetExtCommunity>,
     // original -> bgp-pol:set-route-origin
     // set the origin attribute to the specified
     // value.
     #[serde(rename = "set-route-origin")]
-    pub(crate) set_route_origin: Option<BgpOriginAttrType>,
+    pub set_route_origin: Option<BgpOriginAttrType>,
     // original -> bgp-pol:set-local-pref
     // set the local pref attribute on the route
     // update.
     #[serde(rename = "set-local-pref")]
-    pub(crate) set_local_pref: Option<u32>,
+    pub set_local_pref: Option<u32>,
     // original -> bgp-pol:set-next-hop
     // set the next-hop attribute in the route update.
     #[serde(rename = "set-next-hop")]
-    pub(crate) set_next_hop: Option<BgpNextHopType>,
+    pub set_next_hop: Option<BgpNextHopType>,
     // original -> bgp-pol:set-med
     // set the med metric attribute in the route
     // update.
     #[serde(rename = "set-med")]
-    pub(crate) set_med: Option<BgpSetMedType>,
+    pub set_med: Option<BgpSetMedType>,
     // original -> gobgp:set-large-community
     #[serde(rename = "set-large-community")]
-    pub(crate) set_large_community: Option<SetLargeCommunity>,
+    pub set_large_community: Option<SetLargeCommunity>,
 }
 // struct for container rpol:igp-actions.
 // Actions to set IGP route attributes; these actions
 // apply to multiple IGPs.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct IgpActions {
+pub struct IgpActions {
     // original -> rpol:set-tag
     // Set the tag value for OSPF or IS-IS routes.
     #[serde(rename = "set-tag")]
-    pub(crate) set_tag: Option<TagType>,
+    pub set_tag: Option<TagType>,
 }
 // struct for container rpol:actions.
 // Action statements for this policy
 // statement.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Actions {
+pub struct Actions {
     // original -> rpol:route-disposition
     // Select the final disposition for the route, either
     // accept or reject.
     #[serde(rename = "route-disposition")]
-    pub(crate) route_disposition: Option<RouteDisposition>,
+    pub route_disposition: Option<RouteDisposition>,
     // original -> rpol:igp-actions
     // Actions to set IGP route attributes; these actions
     // apply to multiple IGPs.
     #[serde(rename = "igp-actions")]
-    pub(crate) igp_actions: Option<IgpActions>,
+    pub igp_actions: Option<IgpActions>,
     // original -> bgp-pol:bgp-actions
     // Definitions for policy action statements that
     // change BGP-specific attributes of the route.
     #[serde(rename = "bgp-actions")]
-    pub(crate) bgp_actions: Option<BgpActions>,
+    pub bgp_actions: Option<BgpActions>,
 }
 // struct for container gobgp:match-large-community-set.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MatchLargeCommunitySet {
+pub struct MatchLargeCommunitySet {
     // original -> gobgp:large-community-set
     #[serde(rename = "large-community-set")]
-    pub(crate) large_community_set: Option<String>,
+    pub large_community_set: Option<String>,
     // original -> rpol:match-set-options
     // Optional parameter that governs the behaviour of the
     // match operation.
     #[serde(rename = "match-set-options")]
-    pub(crate) match_set_options: Option<MatchSetOptionsType>,
+    pub match_set_options: Option<MatchSetOptionsType>,
 }
 // struct for container bgp-pol:as-path-length.
 // Value and comparison operations for conditions based on the
 // length of the AS path in the route update.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AsPathLength {
+pub struct AsPathLength {
     // original -> ptypes:operator
     // type of comparison to be performed.
-    pub(crate) operator: Option<AttributeComparison>,
+    pub operator: Option<AttributeComparison>,
     // original -> ptypes:value
     // value to compare with the community count.
-    pub(crate) value: Option<u32>,
+    pub value: Option<u32>,
 }
 // struct for container bgp-pol:community-count.
 // Value and comparison operations for conditions based on the
 // number of communities in the route update.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CommunityCount {
+pub struct CommunityCount {
     // original -> ptypes:operator
     // type of comparison to be performed.
-    pub(crate) operator: Option<AttributeComparison>,
+    pub operator: Option<AttributeComparison>,
     // original -> ptypes:value
     // value to compare with the community count.
-    pub(crate) value: Option<u32>,
+    pub value: Option<u32>,
 }
 // struct for container bgp-pol:match-as-path-set.
 // Match a referenced as-path set according to the logic
 // defined in the match-set-options leaf.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MatchAsPathSet {
+pub struct MatchAsPathSet {
     // original -> bgp-pol:as-path-set
     // References a defined AS path set.
     #[serde(rename = "as-path-set")]
-    pub(crate) as_path_set: Option<String>,
+    pub as_path_set: Option<String>,
     // original -> rpol:match-set-options
     // Optional parameter that governs the behaviour of the
     // match operation.
     #[serde(rename = "match-set-options")]
-    pub(crate) match_set_options: Option<MatchSetOptionsType>,
+    pub match_set_options: Option<MatchSetOptionsType>,
 }
 // struct for container bgp-pol:match-ext-community-set.
 // Match a referenced extended community-set according to the
 // logic defined in the match-set-options leaf.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MatchExtCommunitySet {
+pub struct MatchExtCommunitySet {
     // original -> bgp-pol:ext-community-set
     // References a defined extended community set.
     #[serde(rename = "ext-community-set")]
-    pub(crate) ext_community_set: Option<String>,
+    pub ext_community_set: Option<String>,
     // original -> rpol:match-set-options
     // Optional parameter that governs the behaviour of the
     // match operation.
     #[serde(rename = "match-set-options")]
-    pub(crate) match_set_options: Option<MatchSetOptionsType>,
+    pub match_set_options: Option<MatchSetOptionsType>,
 }
 // struct for container bgp-pol:match-community-set.
 // Match a referenced community-set according to the logic
 // defined in the match-set-options leaf.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MatchCommunitySet {
+pub struct MatchCommunitySet {
     // original -> bgp-pol:community-set
     // References a defined community set.
     #[serde(rename = "community-set")]
-    pub(crate) community_set: Option<String>,
+    pub community_set: Option<String>,
     // original -> rpol:match-set-options
     // Optional parameter that governs the behaviour of the
     // match operation.
     #[serde(rename = "match-set-options")]
-    pub(crate) match_set_options: Option<MatchSetOptionsType>,
+    pub match_set_options: Option<MatchSetOptionsType>,
 }
 // struct for container bgp-pol:bgp-conditions.
 // Policy conditions for matching
@@ -3754,135 +3754,135 @@ pub(crate) struct MatchCommunitySet {
 // attributes.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BgpConditions {
+pub struct BgpConditions {
     // original -> bgp-pol:match-community-set
     // Match a referenced community-set according to the logic
     // defined in the match-set-options leaf.
     #[serde(rename = "match-community-set")]
-    pub(crate) match_community_set: Option<MatchCommunitySet>,
+    pub match_community_set: Option<MatchCommunitySet>,
     // original -> bgp-pol:match-ext-community-set
     // Match a referenced extended community-set according to the
     // logic defined in the match-set-options leaf.
     #[serde(rename = "match-ext-community-set")]
-    pub(crate) match_ext_community_set: Option<MatchExtCommunitySet>,
+    pub match_ext_community_set: Option<MatchExtCommunitySet>,
     // original -> bgp-pol:match-as-path-set
     // Match a referenced as-path set according to the logic
     // defined in the match-set-options leaf.
     #[serde(rename = "match-as-path-set")]
-    pub(crate) match_as_path_set: Option<MatchAsPathSet>,
+    pub match_as_path_set: Option<MatchAsPathSet>,
     // original -> bgp-pol:med-eq
     // Condition to check if the received MED value is equal to
     // the specified value.
     #[serde(rename = "med-eq")]
-    pub(crate) med_eq: Option<u32>,
+    pub med_eq: Option<u32>,
     // original -> bgp-pol:origin-eq
     // Condition to check if the route origin is equal to the
     // specified value.
     #[serde(rename = "origin-eq")]
-    pub(crate) origin_eq: Option<BgpOriginAttrType>,
+    pub origin_eq: Option<BgpOriginAttrType>,
     // original -> bgp-pol:next-hop-in
     // original type is list of inet:ip-address
     // List of next hop addresses to check for in the route
     // update.
     #[serde(rename = "next-hop-in-list")]
-    pub(crate) next_hop_in_list: Option<Vec<String>>,
+    pub next_hop_in_list: Option<Vec<String>>,
     // original -> bgp-pol:afi-safi-in
     // List of address families which the NLRI may be
     // within.
     #[serde(rename = "afi-safi-in-list")]
-    pub(crate) afi_safi_in_list: Option<Vec<AfiSafiType>>,
+    pub afi_safi_in_list: Option<Vec<AfiSafiType>>,
     // original -> bgp-pol:local-pref-eq
     // Condition to check if the local pref attribute is equal to
     // the specified value.
     #[serde(rename = "local-pref-eq")]
-    pub(crate) local_pref_eq: Option<u32>,
+    pub local_pref_eq: Option<u32>,
     // original -> bgp-pol:community-count
     // Value and comparison operations for conditions based on the
     // number of communities in the route update.
     #[serde(rename = "community-count")]
-    pub(crate) community_count: Option<CommunityCount>,
+    pub community_count: Option<CommunityCount>,
     // original -> bgp-pol:as-path-length
     // Value and comparison operations for conditions based on the
     // length of the AS path in the route update.
     #[serde(rename = "as-path-length")]
-    pub(crate) as_path_length: Option<AsPathLength>,
+    pub as_path_length: Option<AsPathLength>,
     // original -> bgp-pol:route-type
     // Condition to check the route type in the route update.
     #[serde(rename = "route-type")]
-    pub(crate) route_type: Option<RouteType>,
+    pub route_type: Option<RouteType>,
     // original -> gobgp:rpki-validation-result
     // specify the validation result of RPKI based on ROA as conditions.
     #[serde(rename = "rpki-validation-result")]
-    pub(crate) rpki_validation_result: Option<RpkiValidationResultType>,
+    pub rpki_validation_result: Option<RpkiValidationResultType>,
     // original -> gobgp:match-large-community-set
     #[serde(rename = "match-large-community-set")]
-    pub(crate) match_large_community_set: Option<MatchLargeCommunitySet>,
+    pub match_large_community_set: Option<MatchLargeCommunitySet>,
 }
 // struct for container rpol:igp-conditions.
 // Policy conditions for IGP attributes.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct IgpConditions {}
+pub struct IgpConditions {}
 // struct for container rpol:match-tag-set.
 // Match a referenced tag set according to the logic defined
 // in the match-options-set leaf.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MatchTagSet {
+pub struct MatchTagSet {
     // original -> rpol:tag-set
     // References a defined tag set.
     #[serde(rename = "tag-set")]
-    pub(crate) tag_set: Option<String>,
+    pub tag_set: Option<String>,
     // original -> rpol:match-set-options
     // Optional parameter that governs the behaviour of the
     // match operation.  This leaf only supports matching on ANY
     // member of the set or inverting the match.  Matching on ALL is
     // not supported).
     #[serde(rename = "match-set-options")]
-    pub(crate) match_set_options: Option<MatchSetOptionsRestrictedType>,
+    pub match_set_options: Option<MatchSetOptionsRestrictedType>,
 }
 // struct for container rpol:match-neighbor-set.
 // Match a referenced neighbor set according to the logic
 // defined in the match-set-options-leaf.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MatchNeighborSet {
+pub struct MatchNeighborSet {
     // original -> rpol:neighbor-set
     // References a defined neighbor set.
     #[serde(rename = "neighbor-set")]
-    pub(crate) neighbor_set: Option<String>,
+    pub neighbor_set: Option<String>,
     // original -> rpol:match-set-options
     // Optional parameter that governs the behaviour of the
     // match operation.  This leaf only supports matching on ANY
     // member of the set or inverting the match.  Matching on ALL is
     // not supported).
     #[serde(rename = "match-set-options")]
-    pub(crate) match_set_options: Option<MatchSetOptionsRestrictedType>,
+    pub match_set_options: Option<MatchSetOptionsRestrictedType>,
 }
 // struct for container rpol:match-prefix-set.
 // Match a referenced prefix-set according to the logic
 // defined in the match-set-options leaf.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MatchPrefixSet {
+pub struct MatchPrefixSet {
     // original -> rpol:prefix-set
     // References a defined prefix set.
     #[serde(rename = "prefix-set")]
-    pub(crate) prefix_set: Option<String>,
+    pub prefix_set: Option<String>,
     // original -> rpol:match-set-options
     // Optional parameter that governs the behaviour of the
     // match operation.  This leaf only supports matching on ANY
     // member of the set or inverting the match.  Matching on ALL is
     // not supported).
     #[serde(rename = "match-set-options")]
-    pub(crate) match_set_options: Option<MatchSetOptionsRestrictedType>,
+    pub match_set_options: Option<MatchSetOptionsRestrictedType>,
 }
 // struct for container rpol:conditions.
 // Condition statements for this
 // policy statement.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Conditions {
+pub struct Conditions {
     // original -> rpol:call-policy
     // Applies the statements from the specified policy
     // definition and then returns control the current
@@ -3896,37 +3896,37 @@ pub(crate) struct Conditions {
     // (reject-route), otherwise the behavior may be
     // ambiguous and implementation dependent.
     #[serde(rename = "call-policy")]
-    pub(crate) call_policy: Option<String>,
+    pub call_policy: Option<String>,
     // original -> rpol:match-prefix-set
     // Match a referenced prefix-set according to the logic
     // defined in the match-set-options leaf.
     #[serde(rename = "match-prefix-set")]
-    pub(crate) match_prefix_set: Option<MatchPrefixSet>,
+    pub match_prefix_set: Option<MatchPrefixSet>,
     // original -> rpol:match-neighbor-set
     // Match a referenced neighbor set according to the logic
     // defined in the match-set-options-leaf.
     #[serde(rename = "match-neighbor-set")]
-    pub(crate) match_neighbor_set: Option<MatchNeighborSet>,
+    pub match_neighbor_set: Option<MatchNeighborSet>,
     // original -> rpol:match-tag-set
     // Match a referenced tag set according to the logic defined
     // in the match-options-set leaf.
     #[serde(rename = "match-tag-set")]
-    pub(crate) match_tag_set: Option<MatchTagSet>,
+    pub match_tag_set: Option<MatchTagSet>,
     // original -> rpol:install-protocol-eq
     // Condition to check the protocol / method used to install
     // which installed the route into the local routing table.
     #[serde(rename = "install-protocol-eq")]
-    pub(crate) install_protocol_eq: Option<InstallProtocolType>,
+    pub install_protocol_eq: Option<InstallProtocolType>,
     // original -> rpol:igp-conditions
     // Policy conditions for IGP attributes.
     #[serde(rename = "igp-conditions")]
-    pub(crate) igp_conditions: Option<IgpConditions>,
+    pub igp_conditions: Option<IgpConditions>,
     // original -> bgp-pol:bgp-conditions
     // Policy conditions for matching
     // BGP-specific defined sets or comparing BGP-specific
     // attributes.
     #[serde(rename = "bgp-conditions")]
-    pub(crate) bgp_conditions: Option<BgpConditions>,
+    pub bgp_conditions: Option<BgpConditions>,
 }
 // struct for container rpol:statement.
 // Policy statements group conditions and actions
@@ -3935,18 +3935,18 @@ pub(crate) struct Conditions {
 // evaluation at the top of this module.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Statement {
+pub struct Statement {
     // original -> rpol:name
     // name of the policy statement.
-    pub(crate) name: Option<String>,
+    pub name: Option<String>,
     // original -> rpol:conditions
     // Condition statements for this
     // policy statement.
-    pub(crate) conditions: Option<Conditions>,
+    pub conditions: Option<Conditions>,
     // original -> rpol:actions
     // Action statements for this policy
     // statement.
-    pub(crate) actions: Option<Actions>,
+    pub actions: Option<Actions>,
 }
 // struct for container rpol:policy-definition.
 // List of top-level policy definitions, keyed by unique
@@ -3955,138 +3955,138 @@ pub(crate) struct Statement {
 // or export configuration statements.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PolicyDefinition {
+pub struct PolicyDefinition {
     // original -> rpol:name
     // Name of the top-level policy definition -- this name
     //  is used in references to the current policy.
-    pub(crate) name: Option<String>,
+    pub name: Option<String>,
     // original -> rpol:statements
     // Enclosing container for policy statements.
-    pub(crate) statements: Option<Vec<Statement>>,
+    pub statements: Option<Vec<Statement>>,
 }
 // struct for container gobgp:large-community-set.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LargeCommunitySet {
+pub struct LargeCommunitySet {
     // original -> gobgp:large-community-set-name
     #[serde(rename = "large-community-set-name")]
-    pub(crate) large_community_set_name: Option<String>,
+    pub large_community_set_name: Option<String>,
     // original -> gobgp:large-community
     // extended community set member.
     #[serde(rename = "large-community-list")]
-    pub(crate) large_community_list: Option<Vec<String>>,
+    pub large_community_list: Option<Vec<String>>,
 }
 // struct for container bgp-pol:as-path-set.
 // Definitions for AS path sets.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AsPathSet {
+pub struct AsPathSet {
     // original -> bgp-pol:as-path-set-name
     // name of the AS path set -- this is used to reference
     // the set in match conditions.
     #[serde(rename = "as-path-set-name")]
-    pub(crate) as_path_set_name: Option<String>,
+    pub as_path_set_name: Option<String>,
     // original -> gobgp:as-path
     // AS path expression.
     #[serde(rename = "as-path-list")]
-    pub(crate) as_path_list: Option<Vec<String>>,
+    pub as_path_list: Option<Vec<String>>,
 }
 // struct for container bgp-pol:ext-community-set.
 // Definitions for extended community sets.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ExtCommunitySet {
+pub struct ExtCommunitySet {
     // original -> bgp-pol:ext-community-set-name
     // name / label of the extended community set -- this is
     // used to reference the set in match conditions.
     #[serde(rename = "ext-community-set-name")]
-    pub(crate) ext_community_set_name: Option<String>,
+    pub ext_community_set_name: Option<String>,
     // original -> gobgp:ext-community
     // extended community set member.
     #[serde(rename = "ext-community-list")]
-    pub(crate) ext_community_list: Option<Vec<String>>,
+    pub ext_community_list: Option<Vec<String>>,
 }
 // struct for container bgp-pol:community-set.
 // Definitions for community sets.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CommunitySet {
+pub struct CommunitySet {
     // original -> bgp-pol:community-set-name
     // name / label of the community set -- this is used to
     // reference the set in match conditions.
     #[serde(rename = "community-set-name")]
-    pub(crate) community_set_name: Option<String>,
+    pub community_set_name: Option<String>,
     // original -> gobgp:community
     // community set member.
     #[serde(rename = "community-list")]
-    pub(crate) community_list: Option<Vec<String>>,
+    pub community_list: Option<Vec<String>>,
 }
 // struct for container bgp-pol:bgp-defined-sets.
 // BGP-related set definitions for policy match conditions.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BgpDefinedSets {
+pub struct BgpDefinedSets {
     // original -> bgp-pol:community-sets
     // Enclosing container for community sets.
     #[serde(rename = "community-sets")]
-    pub(crate) community_sets: Option<Vec<CommunitySet>>,
+    pub community_sets: Option<Vec<CommunitySet>>,
     // original -> bgp-pol:ext-community-sets
     // Enclosing container for extended community sets.
     #[serde(rename = "ext-community-sets")]
-    pub(crate) ext_community_sets: Option<Vec<ExtCommunitySet>>,
+    pub ext_community_sets: Option<Vec<ExtCommunitySet>>,
     // original -> bgp-pol:as-path-sets
     // Enclosing container for AS path sets.
     #[serde(rename = "as-path-sets")]
-    pub(crate) as_path_sets: Option<Vec<AsPathSet>>,
+    pub as_path_sets: Option<Vec<AsPathSet>>,
     // original -> gobgp:large-community-sets
     #[serde(rename = "large-community-sets")]
-    pub(crate) large_community_sets: Option<Vec<LargeCommunitySet>>,
+    pub large_community_sets: Option<Vec<LargeCommunitySet>>,
 }
 // struct for container rpol:tag.
 // list of tags that are part of the tag set.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Tag {
+pub struct Tag {
     // original -> rpol:value
     // Value of the tag set member.
-    pub(crate) value: Option<TagType>,
+    pub value: Option<TagType>,
 }
 // struct for container rpol:tag-set.
 // Definitions for tag sets.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TagSet {
+pub struct TagSet {
     // original -> rpol:tag-set-name
     // name / label of the tag set -- this is used to reference
     // the set in match conditions.
     #[serde(rename = "tag-set-name")]
-    pub(crate) tag_set_name: Option<String>,
+    pub tag_set_name: Option<String>,
     // original -> rpol:tag
     // list of tags that are part of the tag set.
     #[serde(rename = "tag-list")]
-    pub(crate) tag_list: Option<Vec<Tag>>,
+    pub tag_list: Option<Vec<Tag>>,
 }
 // struct for container rpol:neighbor-set.
 // Definitions for neighbor sets.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct NeighborSet {
+pub struct NeighborSet {
     // original -> rpol:neighbor-set-name
     // name / label of the neighbor set -- this is used to
     // reference the set in match conditions.
     #[serde(rename = "neighbor-set-name")]
-    pub(crate) neighbor_set_name: Option<String>,
+    pub neighbor_set_name: Option<String>,
     // original -> gobgp:neighbor-info
     // original type is list of inet:ip-address
     // neighbor ip address or prefix.
     #[serde(rename = "neighbor-info-list")]
-    pub(crate) neighbor_info_list: Option<Vec<String>>,
+    pub neighbor_info_list: Option<Vec<String>>,
 }
 // struct for container rpol:prefix.
 // List of prefix expressions that are part of the set.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Prefix {
+pub struct Prefix {
     // original -> rpol:ip-prefix
     // rpol:ip-prefix's original type is inet:ip-prefix.
     // The prefix member in CIDR notation -- while the
@@ -4095,7 +4095,7 @@ pub(crate) struct Prefix {
     // to be the same address family.  Mixing address types in
     // the same prefix set is likely to cause an error.
     #[serde(rename = "ip-prefix")]
-    pub(crate) ip_prefix: Option<String>,
+    pub ip_prefix: Option<String>,
     // original -> rpol:masklength-range
     // Defines a range for the masklength, or 'exact' if
     // the prefix has an exact length.
@@ -4108,59 +4108,59 @@ pub(crate) struct Prefix {
     // prefix: 10.3.192.0/21,
     // masklength-range: exact.
     #[serde(rename = "masklength-range")]
-    pub(crate) masklength_range: Option<String>,
+    pub masklength_range: Option<String>,
 }
 // struct for container rpol:prefix-set.
 // List of the defined prefix sets.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PrefixSet {
+pub struct PrefixSet {
     // original -> rpol:prefix-set-name
     // name / label of the prefix set -- this is used to
     // reference the set in match conditions.
     #[serde(rename = "prefix-set-name")]
-    pub(crate) prefix_set_name: Option<String>,
+    pub prefix_set_name: Option<String>,
     // original -> rpol:prefix
     // List of prefix expressions that are part of the set.
     #[serde(rename = "prefix-list")]
-    pub(crate) prefix_list: Option<Vec<Prefix>>,
+    pub prefix_list: Option<Vec<Prefix>>,
 }
 // struct for container rpol:defined-sets.
 // Predefined sets of attributes used in policy match
 // statements.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DefinedSets {
+pub struct DefinedSets {
     // original -> rpol:prefix-sets
     // Enclosing container for defined prefix sets for matching.
     #[serde(rename = "prefix-sets")]
-    pub(crate) prefix_sets: Option<Vec<PrefixSet>>,
+    pub prefix_sets: Option<Vec<PrefixSet>>,
     // original -> rpol:neighbor-sets
     // Enclosing container for defined neighbor sets for matching.
     #[serde(rename = "neighbor-sets")]
-    pub(crate) neighbor_sets: Option<Vec<NeighborSet>>,
+    pub neighbor_sets: Option<Vec<NeighborSet>>,
     // original -> rpol:tag-sets
     // Enclosing container for defined tag sets for matching.
     #[serde(rename = "tag-sets")]
-    pub(crate) tag_sets: Option<Vec<TagSet>>,
+    pub tag_sets: Option<Vec<TagSet>>,
     // original -> bgp-pol:bgp-defined-sets
     // BGP-related set definitions for policy match conditions.
     #[serde(rename = "bgp-defined-sets")]
-    pub(crate) bgp_defined_sets: Option<BgpDefinedSets>,
+    pub bgp_defined_sets: Option<BgpDefinedSets>,
 }
 // struct for container rpol:routing-policy.
 // top-level container for all routing policy configuration.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RoutingPolicy {
+pub struct RoutingPolicy {
     // original -> rpol:defined-sets
     // Predefined sets of attributes used in policy match
     // statements.
     #[serde(rename = "defined-sets")]
-    pub(crate) defined_sets: Option<DefinedSets>,
+    pub defined_sets: Option<DefinedSets>,
     // original -> rpol:policy-definitions
     // Enclosing container for the list of top-level policy
     // definitions.
     #[serde(rename = "policy-definitions")]
-    pub(crate) policy_definitions: Option<Vec<PolicyDefinition>>,
+    pub policy_definitions: Option<Vec<PolicyDefinition>>,
 }

@@ -8,6 +8,7 @@ edition = "2024"
 
 [dependencies]
 rustybgp-api = { path = "../api" }
+rustybgp-config = { path = "../config" }
 rustybgp-packet = { path = "../packet" }
 rustybgp-table = { path = "../table" }
 ascii = "1"
@@ -33,8 +34,5 @@ byteorder = "1"
 once_cell = "1"
 thiserror = "2"
 libc = "0.2"
-serde = { version = "1", features = ["derive"] }
-toml = "1.0"
 nix = { version = "0.31", features = ["socket"] }
 uuid = { version = "1", features = ["v4"] }
-serde_yaml_bw = "2.5.1"

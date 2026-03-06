@@ -1,0 +1,12 @@
+[package]
+name = "rustybgp-config"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml_bw = "2.5.1"
+thiserror = "2"
+toml = "1.0"
+uuid = { version = "1", features = ["v4"] }

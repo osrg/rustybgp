@@ -2819,7 +2819,7 @@ impl Global {
             }
         }
         if let Some(defined_sets) = bgp.as_ref().and_then(|x| x.defined_sets.as_ref()) {
-            match Vec::<api::DefinedSet>::try_from(defined_sets) {
+            match convert::defined_sets_to_api(defined_sets) {
                 Ok(sets) => {
                     let mut server = GLOBAL.write().await;
                     for set in sets {
@@ -2846,7 +2846,7 @@ impl Global {
                                 s_names.push(n.clone());
                                 continue;
                             }
-                            match api::Statement::try_from(s) {
+                            match convert::statement_from_config(s) {
                                 Ok(s) => {
                                     let conditions =
                                         convert::conditions_from_api(s.conditions).unwrap();
@@ -2885,7 +2885,7 @@ impl Global {
                             })
                             .collect()
                     }),
-                    default_action: action.map_or(1, |x| x.into()),
+                    default_action: action.map_or(1, convert::default_policy_type_to_i32),
                 }
             };
             if let Some(Some(config)) = g.apply_policy.as_ref().map(|x| x.config.as_ref()) {

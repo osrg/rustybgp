@@ -20,6 +20,9 @@ use std::str::FromStr;
 
 use rustybgp_packet::{Family, IpNet, Nlri, bgp::Attribute, bgp::Capability};
 
+use regex::Regex;
+use uuid::Uuid;
+
 use crate::api;
 use crate::config;
 use crate::error::Error;
@@ -791,4 +794,223 @@ pub(crate) fn rpki_validation_to_api(v: rustybgp_table::RpkiValidation) -> api::
         .map(|(net, roa)| roa_to_api(net, roa))
         .collect();
     result
+}
+
+fn prefix_set_to_api(p: &config::PrefixSet) -> Result<api::DefinedSet, Error> {
+    let name = p
+        .prefix_set_name
+        .as_ref()
+        .ok_or_else(|| Error::InvalidConfiguration("empty name".to_string()))?
+        .to_string();
+
+    let mut prefixes = Vec::new();
+    let caps_re = Regex::new(r"^([0-9]+)\.\.([0-9]+)$").unwrap();
+    for s in p
+        .prefix_list
+        .as_ref()
+        .ok_or_else(|| Error::InvalidConfiguration("empty prefix list".to_string()))?
+    {
+        let ip_prefix = s
+            .ip_prefix
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfiguration("empty prefix".to_string()))?
+            .to_string();
+        let range = s
+            .masklength_range
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfiguration("empty mask".to_string()))?;
+
+        let caps = caps_re
+            .captures(range)
+            .ok_or_else(|| Error::InvalidConfiguration("invalid mask format".to_string()))?;
+
+        if caps.len() != 3 {
+            return Err(Error::InvalidConfiguration(
+                "invalid prefix mask format".to_string(),
+            ));
+        }
+        let mask_length_min = caps[1]
+            .parse()
+            .map_err(|_| Error::InvalidConfiguration("invalid mask format".to_string()))?;
+        let mask_length_max = caps[2]
+            .parse()
+            .map_err(|_| Error::InvalidConfiguration("invalid mask format".to_string()))?;
+        prefixes.push(api::Prefix {
+            ip_prefix,
+            mask_length_min,
+            mask_length_max,
+        });
+    }
+
+    Ok(api::DefinedSet {
+        defined_type: api::DefinedType::Prefix as i32,
+        name,
+        list: Vec::new(),
+        prefixes,
+    })
+}
+
+fn bgp_defined_sets_to_api(sets: &config::BgpDefinedSets) -> Result<Vec<api::DefinedSet>, Error> {
+    let mut v = Vec::new();
+    if let Some(sets) = sets.as_path_sets.as_ref() {
+        for set in sets {
+            let name = set
+                .as_path_set_name
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration("empty name".to_string()))?
+                .to_string();
+            let list = set
+                .as_path_list
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration("empty as path list".to_string()))?
+                .to_vec();
+            v.push(api::DefinedSet {
+                defined_type: api::DefinedType::AsPath as i32,
+                name,
+                list,
+                prefixes: Vec::new(),
+            })
+        }
+    }
+    Ok(v)
+}
+
+pub(crate) fn defined_sets_to_api(
+    sets: &config::DefinedSets,
+) -> Result<Vec<api::DefinedSet>, Error> {
+    let mut v = Vec::new();
+    if let Some(sets) = &sets.prefix_sets {
+        for s in sets {
+            v.push(prefix_set_to_api(s)?);
+        }
+    }
+    if let Some(sets) = &sets.bgp_defined_sets {
+        v.append(&mut bgp_defined_sets_to_api(sets)?);
+    }
+    Ok(v)
+}
+
+fn match_set_options_to_i32(o: &config::MatchSetOptionsType) -> i32 {
+    match o {
+        config::MatchSetOptionsType::Any => 0,
+        config::MatchSetOptionsType::All => 1,
+        config::MatchSetOptionsType::Invert => 2,
+    }
+}
+
+fn match_set_options_restricted_to_i32(o: &config::MatchSetOptionsRestrictedType) -> i32 {
+    match o {
+        config::MatchSetOptionsRestrictedType::Any => 0,
+        config::MatchSetOptionsRestrictedType::Invert => 2,
+    }
+}
+
+fn attribute_comparison_to_i32(c: &config::AttributeComparison) -> i32 {
+    match c {
+        config::AttributeComparison::AttributeEq => 0,
+        config::AttributeComparison::AttributeGe => 1,
+        config::AttributeComparison::AttributeLe => 2,
+        config::AttributeComparison::Eq => 0,
+        config::AttributeComparison::Ge => 1,
+        config::AttributeComparison::Le => 2,
+    }
+}
+
+fn conditions_to_api(c: &config::Conditions) -> Result<api::Conditions, Error> {
+    let mut conditions = api::Conditions {
+        ..Default::default()
+    };
+    if let Some(set) = c.match_prefix_set.as_ref() {
+        let name = set
+            .prefix_set
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfiguration("empty name".to_string()))?
+            .to_string();
+        let set_option = set
+            .match_set_options
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfiguration("empty match option".to_string()))?;
+        conditions.prefix_set = Some(api::MatchSet {
+            r#type: match_set_options_restricted_to_i32(set_option),
+            name,
+        });
+    }
+
+    if let Some(set) = c.bgp_conditions.as_ref() {
+        if let Some(set) = set.match_as_path_set.as_ref() {
+            let match_type = match &set.match_set_options {
+                Some(v) => match_set_options_to_i32(v),
+                None => 0,
+            };
+            if let Some(name) = &set.as_path_set {
+                conditions.as_path_set = Some(api::MatchSet {
+                    r#type: match_type,
+                    name: name.to_string(),
+                });
+            }
+        }
+        if let Some(l) = set.as_path_length.as_ref() {
+            let op = l.operator.as_ref().ok_or_else(|| {
+                Error::InvalidConfiguration("empty as path length operator".to_string())
+            })?;
+            let length = l
+                .value
+                .ok_or_else(|| Error::InvalidConfiguration("empty as path length".to_string()))?;
+            conditions.as_path_length = Some(api::AsPathLength {
+                r#type: attribute_comparison_to_i32(op),
+                length,
+            });
+        }
+    }
+    Ok(conditions)
+}
+
+fn route_disposition_to_i32(r: &config::RouteDisposition) -> i32 {
+    match r {
+        config::RouteDisposition::None => 0,
+        config::RouteDisposition::AcceptRoute => 1,
+        config::RouteDisposition::RejectRoute => 2,
+    }
+}
+
+pub(crate) fn statement_from_config(s: &config::Statement) -> Result<api::Statement, Error> {
+    let u = Uuid::new_v4().to_string();
+    let name = match s.name.as_ref() {
+        Some(n) => n.to_string(),
+        None => u,
+    };
+
+    let conditions = if let Some(c) = &s.conditions {
+        Some(conditions_to_api(c)?)
+    } else {
+        None
+    };
+
+    let actions = s.actions.as_ref().map(|a| api::Actions {
+        route_action: match a.route_disposition.as_ref() {
+            Some(a) => route_disposition_to_i32(a),
+            None => 0,
+        },
+        community: None,
+        med: None,
+        as_prepend: None,
+        ext_community: None,
+        nexthop: None,
+        local_pref: None,
+        large_community: None,
+        origin_action: None,
+    });
+
+    Ok(api::Statement {
+        name,
+        conditions,
+        actions,
+    })
+}
+
+pub(crate) fn default_policy_type_to_i32(t: &config::DefaultPolicyType) -> i32 {
+    match t {
+        config::DefaultPolicyType::AcceptRoute => 1,
+        config::DefaultPolicyType::RejectRoute => 2,
+    }
 }

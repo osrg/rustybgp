@@ -27,6 +27,8 @@ pub(crate) enum Error {
     AlreadyExists(String),
     #[error("invalid configuration")]
     InvalidConfiguration(String),
+    #[error("config error")]
+    Config(#[from] rustybgp_config::ConfigError),
     #[error("std::io::Error")]
     StdIoErr(#[from] std::io::Error),
     #[error("packet error")]
