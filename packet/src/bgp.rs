@@ -252,7 +252,7 @@ impl Ipv4Net {
         }
         let mut addr = [0_u8; 4];
         for i in 0..bit_len.div_ceil(8) {
-            addr[i as usize] = c.read_u8().unwrap();
+            addr[i as usize] = c.read_u8()?;
         }
         Ok(Ipv4Net {
             addr: Ipv4Addr::from(addr),
@@ -750,18 +750,18 @@ impl Attribute {
                 if len != 1 {
                     return Err(());
                 }
-                AttributeData::Val(c.read_u8().unwrap() as u32)
+                AttributeData::Val(c.read_u8().map_err(|_| ())? as u32)
             }
             Self::MULTI_EXIT_DESC | Self::LOCAL_PREF | Self::ORIGINATOR_ID => {
                 if len != 4 {
                     return Err(());
                 }
-                AttributeData::Val(c.read_u32::<NetworkEndian>().unwrap())
+                AttributeData::Val(c.read_u32::<NetworkEndian>().map_err(|_| ())?)
             }
             _ => {
                 let mut b = Vec::with_capacity(len.into());
                 for _ in 0..len {
-                    b.push(c.read_u8().unwrap());
+                    b.push(c.read_u8().map_err(|_| ())?);
                 }
                 AttributeData::Bin(b)
             }
