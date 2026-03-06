@@ -213,10 +213,7 @@ impl Destination {
     }
 }
 
-fn same_path(
-    a: &(Arc<Source>, Arc<Vec<packet::Attribute>>),
-    b: &Path,
-) -> bool {
+fn same_path(a: &(Arc<Source>, Arc<Vec<packet::Attribute>>), b: &Path) -> bool {
     let (a_source, a_attr) = a;
     (Arc::ptr_eq(a_source, &b.source) && Arc::ptr_eq(a_attr, &b.pa.attr))
         || (Arc::ptr_eq(a_source, &b.source) && a_attr.as_ref() == b.pa.attr.as_ref())
