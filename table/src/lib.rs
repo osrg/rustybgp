@@ -213,6 +213,15 @@ impl Destination {
     }
 }
 
+fn same_path(
+    a: &(Arc<Source>, Arc<Vec<packet::Attribute>>),
+    b: &Path,
+) -> bool {
+    let (a_source, a_attr) = a;
+    (Arc::ptr_eq(a_source, &b.source) && Arc::ptr_eq(a_attr, &b.pa.attr))
+        || (Arc::ptr_eq(a_source, &b.source) && a_attr.as_ref() == b.pa.attr.as_ref())
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct RoutingTableState {
     pub num_destination: usize,
@@ -591,9 +600,7 @@ impl RoutingTable {
         };
 
         let changed = match &old_best {
-            Some((old_source, old_attr)) => {
-                !Arc::ptr_eq(old_source, &best.source) || !Arc::ptr_eq(old_attr, &best.pa.attr)
-            }
+            Some(old) => !same_path(old, best),
             None => true, // no previous unfiltered best
         };
         if changed {
@@ -664,9 +671,7 @@ impl RoutingTable {
         };
 
         let changed = match &old_best {
-            Some((old_source, old_attr)) => {
-                !Arc::ptr_eq(old_source, &best.source) || !Arc::ptr_eq(old_attr, &best.pa.attr)
-            }
+            Some(old) => !same_path(old, best),
             None => true,
         };
         if changed {
@@ -714,10 +719,8 @@ impl RoutingTable {
                             attr: Arc::new(Vec::new()),
                         });
                     }
-                    (Some((old_source, old_attr)), Some(best)) => {
-                        if !Arc::ptr_eq(old_source, &best.source)
-                            || !Arc::ptr_eq(old_attr, &best.pa.attr)
-                        {
+                    (Some(old), Some(best)) => {
+                        if !same_path(old, best) {
                             advertise.push(Change {
                                 source: best.source.clone(),
                                 family: *family,
