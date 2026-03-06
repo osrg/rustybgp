@@ -13,7 +13,7 @@ COPY . .
 RUN cargo build --release --target ${RUST_TARGET}
 
 # Stage 2: Minimal runtime
-FROM alpine:latest
+FROM alpine:3.21
 
 ARG RUST_TARGET=aarch64-unknown-linux-musl
 

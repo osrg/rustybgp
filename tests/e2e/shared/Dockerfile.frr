@@ -1,5 +1,5 @@
 # Build FRR from source for arm64 support
-FROM alpine:latest AS builder
+FROM alpine:3.21 AS builder
 
 RUN apk add --no-cache \
     alpine-sdk \
@@ -61,7 +61,7 @@ RUN ./bootstrap.sh && \
     make install DESTDIR=/build
 
 # Runtime
-FROM alpine:latest
+FROM alpine:3.21
 
 RUN apk add --no-cache \
     c-ares \
