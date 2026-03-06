@@ -157,15 +157,14 @@ impl Neighbor {
             for afi_safi in afi_safis {
                 if let Some(ap) = afi_safi.add_paths.as_ref()
                     && let Some(c) = ap.config.as_ref()
-                        && let Some(sm) = c.send_max
-                            && sm > 32 {
-                                return Err(ConfigError::InvalidConfiguration(
-                                    format!(
-                                        "send-max {} exceeds maximum of 32",
-                                        sm
-                                    ),
-                                ));
-                            }
+                    && let Some(sm) = c.send_max
+                    && sm > 32
+                {
+                    return Err(ConfigError::InvalidConfiguration(format!(
+                        "send-max {} exceeds maximum of 32",
+                        sm
+                    )));
+                }
             }
         }
 

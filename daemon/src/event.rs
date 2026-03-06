@@ -658,8 +658,13 @@ impl TryFrom<&config::Neighbor> for Peer {
                 })
             })
             .collect();
-        let addr_str = c.neighbor_address.as_ref().ok_or("missing neighbor address")?;
-        let addr = addr_str.parse().map_err(|e| format!("invalid neighbor address: {}", e))?;
+        let addr_str = c
+            .neighbor_address
+            .as_ref()
+            .ok_or("missing neighbor address")?;
+        let addr = addr_str
+            .parse()
+            .map_err(|e| format!("invalid neighbor address: {}", e))?;
         let peer_as = c.peer_as.ok_or("missing peer-as")?;
         let mut builder = PeerBuilder::new(addr);
         builder
