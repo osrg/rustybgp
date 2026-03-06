@@ -573,7 +573,7 @@ impl Capability {
                 }
                 let hostlen = c.read_u8().map_err(|_| ())?;
                 // Validate total length: 1 (hostlen) + hostlen + 1 (domainlen) + domainlen
-                if (hostlen as u8) as u64 + 2 > len as u64 {
+                if hostlen as u64 + 2 > len as u64 {
                     return Err(());
                 }
                 let mut h = Vec::new();
