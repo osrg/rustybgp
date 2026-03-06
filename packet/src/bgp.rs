@@ -1151,10 +1151,11 @@ pub fn create_channel(
         for c in v {
             if let Capability::ExtendedNexthop(v) = c {
                 for (f, nexthop_afi) in v {
-                    assert!(
-                        f.afi() == Family::AFI_IP,
-                        "RFC 8950: extended nexthop only valid for IPv4 families"
-                    );
+                    // RFC 8950: extended nexthop is only valid for IPv4 families;
+                    // skip (don't panic) if a peer advertises it for other AFIs.
+                    if f.afi() != Family::AFI_IP {
+                        continue;
+                    }
                     if *nexthop_afi == Family::AFI_IP6
                         && let Some(fc) = h.get_mut(f)
                     {
