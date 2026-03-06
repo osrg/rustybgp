@@ -3842,11 +3842,6 @@ impl Handler {
                                 if !framer.inner().channel.contains_key(&ri.family) {
                                     continue;
                                 }
-                                // Filter by peer's send_max: skip changes beyond this peer's limit
-                                let sm = self.send_max.get(&ri.family).copied().unwrap_or(1) as u32;
-                                if ri.path_id > sm {
-                                    continue;
-                                }
                                 pending_update.get_mut(&ri.family).unwrap().insert_change(ri);
                             }
                         }
