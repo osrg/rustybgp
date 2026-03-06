@@ -3546,6 +3546,11 @@ impl Handler {
                     codec.channel.insert(f, c);
                 }
 
+                // Drop send_max for families where Add-Path TX was not negotiated
+                self.send_max.retain(|f, _| {
+                    codec.channel.get(f).is_some_and(|c| c.addpath_tx())
+                });
+
                 // Warn when locally-configured Add-Path was not negotiated
                 for (family, mode) in &local_addpath {
                     match codec.channel.get(family) {
