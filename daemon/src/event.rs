@@ -374,7 +374,8 @@ impl PeerBuilder {
 
     fn addpath(&mut self, families: Vec<(packet::Family, u8)>) -> &mut Self {
         for (f, mode) in families {
-            self.families.insert(f, mode);
+            // RFC 7911 mode is 2 bits: bit 0 = receive, bit 1 = send
+            self.families.insert(f, mode & 0x3);
         }
         self
     }
