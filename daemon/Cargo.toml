@@ -11,6 +11,7 @@ rustybgp-api = { path = "../api" }
 rustybgp-config = { path = "../config" }
 rustybgp-packet = { path = "../packet" }
 rustybgp-table = { path = "../table" }
+rustybgp-kernel = { path = "../kernel" }
 arc-swap = "1"
 ascii = "1"
 tonic = "0.14"

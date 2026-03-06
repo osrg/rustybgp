@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::{From, TryFrom};
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Deref;
 use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -52,6 +52,7 @@ use crate::auth;
 use crate::config;
 use crate::convert;
 use crate::error::Error;
+use rustybgp_kernel as kernel;
 use rustybgp_table as table;
 
 #[derive(Default)]
@@ -814,13 +815,33 @@ impl GrpcService {
                 tonic::Status::new(tonic::Code::InvalidArgument, "invalid attribute")
             })?;
             if a.code() == bgp::Attribute::MP_REACH {
-                attr.push(
-                    bgp::Attribute::new_with_bin(
-                        bgp::Attribute::NEXTHOP,
-                        a.binary().unwrap().to_owned(),
-                    )
-                    .unwrap(),
-                );
+                // MP_REACH binary: [AFI:2][SAFI:1][NH_LEN:1][nexthop:NH_LEN][reserved:1][NLRI...]
+                // Extract just the nexthop bytes for the NEXTHOP attribute.
+                let nh_attr = a
+                    .binary()
+                    .and_then(|b| {
+                        let len = *b.get(3)? as usize;
+                        // Minimum: AFI(2) + SAFI(1) + NH_LEN(1) + nexthop(len) + reserved(1)
+                        if b.len() < 5 + len {
+                            return None;
+                        }
+                        let nh = &b[4..4 + len];
+                        // Normalize: 4 bytes (IPv4), 16 bytes (IPv6), or
+                        // 32 bytes (IPv6 global + link-local, store only the global).
+                        let nh = match nh.len() {
+                            4 | 16 => nh.to_vec(),
+                            32 => nh[..16].to_vec(),
+                            _ => return None,
+                        };
+                        bgp::Attribute::new_with_bin(bgp::Attribute::NEXTHOP, nh)
+                    })
+                    .ok_or_else(|| {
+                        tonic::Status::new(
+                            tonic::Code::InvalidArgument,
+                            "malformed MP_REACH nexthop",
+                        )
+                    })?;
+                attr.push(nh_attr);
             } else {
                 attr.push(a);
             }
@@ -1303,8 +1324,7 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddPathRequest>,
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
         let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        let mut t = TABLE[u.0].lock().await;
-        t.event(u.1);
+        TABLE[u.0].lock().await.event(u.1);
 
         // FIXME: support uuid
         Ok(tonic::Response::new(api::AddPathResponse {
@@ -1316,8 +1336,7 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::DeletePathRequest>,
     ) -> Result<tonic::Response<api::DeletePathResponse>, tonic::Status> {
         let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        let mut t = TABLE[u.0].lock().await;
-        t.event(u.1);
+        TABLE[u.0].lock().await.event(u.1);
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
     type ListPathStream = Pin<
@@ -2588,6 +2607,8 @@ static NUM_TABLES: LazyLock<usize> = LazyLock::new(num_cpus::get);
 static GLOBAL: LazyLock<RwLock<Global>> = LazyLock::new(|| RwLock::new(Global::new()));
 static GLOBAL_IMPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
 static GLOBAL_EXPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
+static KERNEL_TX: ArcSwapOption<mpsc::UnboundedSender<KernelRouteEvent>> =
+    ArcSwapOption::const_empty();
 static TABLE: LazyLock<Vec<Mutex<Table>>> = LazyLock::new(|| {
     let mut table = Vec::with_capacity(*NUM_TABLES);
     for _ in 0..*NUM_TABLES {
@@ -2850,6 +2871,46 @@ impl Global {
                 }
             }
         }
+        if bgp
+            .as_ref()
+            .and_then(|x| x.zebra.as_ref())
+            .and_then(|x| x.config.as_ref())
+            .is_some_and(|x| x.enabled == Some(true))
+        {
+            match kernel::Handle::new() {
+                Ok((handle, connection)) => {
+                    tokio::spawn(connection);
+                    let (tx, mut rx) = mpsc::unbounded_channel();
+                    tokio::spawn(async move {
+                        while let Some(event) = rx.recv().await {
+                            match event {
+                                KernelRouteEvent::Install {
+                                    dst,
+                                    prefix_len,
+                                    nexthop,
+                                } => {
+                                    if let Err(e) =
+                                        handle.install(dst, prefix_len, nexthop, 0).await
+                                    {
+                                        eprintln!("kernel route install failed: {}", e);
+                                    }
+                                }
+                                KernelRouteEvent::Withdraw { dst, prefix_len } => {
+                                    if let Err(e) = handle.withdraw(dst, prefix_len).await {
+                                        eprintln!("kernel route withdraw failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    KERNEL_TX.store(Some(Arc::new(tx)));
+                    println!("kernel route integration enabled");
+                }
+                Err(e) => {
+                    eprintln!("failed to enable kernel route integration: {:?}", e);
+                }
+            }
+        }
         if let Some(groups) = bgp.as_ref().and_then(|x| x.peer_groups.as_ref()) {
             let mut server = GLOBAL.write().await;
             for pg in groups {
@@ -3107,6 +3168,18 @@ impl Global {
     }
 }
 
+enum KernelRouteEvent {
+    Install {
+        dst: IpAddr,
+        prefix_len: u8,
+        nexthop: IpAddr,
+    },
+    Withdraw {
+        dst: IpAddr,
+        prefix_len: u8,
+    },
+}
+
 enum TableEvent {
     // BGP events
     PassUpdate(
@@ -3262,6 +3335,9 @@ impl Table {
                                 filtered,
                             );
                             for ri in changes {
+                                if ri.rank == 1 {
+                                    send_kernel_route(&ri);
+                                }
                                 if !ri.attr.is_empty()
                                     && export_policy.as_ref().is_some_and(|a| {
                                         self.rtable.apply_policy(a, &ri.source, &ri.net, &ri.attr)
@@ -3283,6 +3359,9 @@ impl Table {
                                 self.rtable
                                     .remove(source.clone(), family, net.nlri, net.path_id);
                             for ri in changes {
+                                if ri.rank == 1 {
+                                    send_kernel_route(&ri);
+                                }
                                 // don't apply export policy for withdrawn routes.
                                 if !ri.attr.is_empty()
                                     && export_policy.as_ref().is_some_and(|a| {
@@ -3303,6 +3382,9 @@ impl Table {
             TableEvent::Disconnected(source) => {
                 let changes = self.rtable.drop(source.clone());
                 for change in changes {
+                    if change.rank == 1 {
+                        send_kernel_route(&change);
+                    }
                     for c in self.peer_event_tx.values() {
                         let _ = c.send(ToPeerEvent::Advertise(change.clone()));
                     }
@@ -3315,6 +3397,55 @@ impl Table {
             }
             TableEvent::Drop(addr) => {
                 self.rtable.rpki_drop(addr);
+            }
+        }
+    }
+}
+
+fn send_kernel_route(change: &table::Change) {
+    let guard = KERNEL_TX.load();
+    let Some(tx) = guard.as_ref() else {
+        return;
+    };
+    let (dst, prefix_len) = match change.net {
+        packet::Nlri::V4(net) => (IpAddr::from(net.addr), net.mask),
+        packet::Nlri::V6(net) => (IpAddr::from(net.addr), net.mask),
+    };
+    if change.attr.is_empty() {
+        let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
+    } else {
+        let nexthop = change.attr.iter().find_map(|a| {
+            if a.code() == packet::Attribute::NEXTHOP {
+                a.binary().and_then(|b| match b.len() {
+                    4 => Some(IpAddr::from(Ipv4Addr::new(b[0], b[1], b[2], b[3]))),
+                    16 | 32 => {
+                        // 32 bytes: IPv6 global (16B) + link-local (16B); use the global address.
+                        let arr: [u8; 16] = b[..16].try_into().ok()?;
+                        Some(IpAddr::from(Ipv6Addr::from(arr)))
+                    }
+                    _ => None,
+                })
+            } else {
+                None
+            }
+        });
+        match nexthop {
+            Some(nexthop)
+                if matches!(
+                    (dst, nexthop),
+                    (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+                ) =>
+            {
+                let _ = tx.send(KernelRouteEvent::Install {
+                    dst,
+                    prefix_len,
+                    nexthop,
+                });
+            }
+            _ => {
+                // No usable nexthop or family mismatch (e.g., RFC 8950);
+                // withdraw to avoid a stale kernel route.
+                let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
             }
         }
     }

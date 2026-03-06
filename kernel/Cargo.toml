@@ -1,0 +1,13 @@
+[package]
+name = "rustybgp-kernel"
+version = "0.1.0"
+authors = ["FUJITA Tomonori <fujita.tomonori@gmail.com>"]
+edition = "2024"
+
+[dependencies]
+rtnetlink = "0.20"
+futures = "0.3"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

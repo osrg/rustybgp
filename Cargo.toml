@@ -1,7 +1,7 @@
 [workspace]
 
 resolver = "2"
-members = ["api", "config", "packet", "table", "daemon"]
+members = ["api", "config", "kernel", "packet", "table", "daemon"]
 
 [profile.release]
 lto = true

@@ -17,7 +17,10 @@ jobs:
           rustup component add clippy
       - name: build
         run: |
-          cd /home/runner/work/rustybgp/rustybgp
           cargo clippy -- -D warnings
           cargo test --verbose --all
           cargo fmt -- --check
+      - name: kernel integration tests
+        run: |
+          TEST_BIN=$(cargo test --no-run --message-format=json -p rustybgp-kernel | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -n1)
+          sudo unshare -n sh -c "ip link set lo up && \"$TEST_BIN\" --ignored --test-threads=1"
