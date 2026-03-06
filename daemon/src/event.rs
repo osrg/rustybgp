@@ -633,7 +633,15 @@ impl From<&config::Neighbor> for Peer {
                 x.add_paths.as_ref().and_then(|ap| {
                     ap.config.as_ref().and_then(|c| {
                         let rx = c.receive.unwrap_or(false);
-                        let tx = c.send_max.unwrap_or(0) > 0;
+                        let send_max = c.send_max.unwrap_or(0);
+                        if send_max > 1 {
+                            println!(
+                                "send-max {} configured but only 1 path will be advertised \
+                                 (multi-path send not yet implemented)",
+                                send_max
+                            );
+                        }
+                        let tx = send_max > 0;
                         let mode = u8::from(rx) | (u8::from(tx) << 1);
                         if mode > 0 {
                             let family = convert::family_from_config(
@@ -3441,8 +3449,48 @@ impl Handler {
                     return Ok(());
                 }
                 self.state.remote_asn.store(as_number, Ordering::Relaxed);
+                // Collect locally-configured Add-Path families before negotiation
+                let local_addpath: Vec<(packet::Family, u8)> = self
+                    .local_cap
+                    .iter()
+                    .filter_map(|c| {
+                        if let packet::Capability::AddPath(v) = c {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .flatten()
+                    .collect();
+
                 for (f, c) in bgp::create_channel(&self.local_cap, &capability) {
                     codec.channel.insert(f, c);
+                }
+
+                // Warn when locally-configured Add-Path was not negotiated
+                for (family, mode) in &local_addpath {
+                    match codec.channel.get(family) {
+                        Some(ch) => {
+                            if mode & 0x1 > 0 && !ch.addpath_rx() {
+                                println!(
+                                    "add-path receive configured for {:?} but not negotiated with peer",
+                                    family
+                                );
+                            }
+                            if mode & 0x2 > 0 && !ch.addpath_tx() {
+                                println!(
+                                    "add-path send configured for {:?} but not negotiated with peer",
+                                    family
+                                );
+                            }
+                        }
+                        None => {
+                            println!(
+                                "add-path configured for {:?} but family not negotiated with peer",
+                                family
+                            );
+                        }
+                    }
                 }
 
                 self.state.remote_cap.write().await.append(&mut capability);
