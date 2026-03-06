@@ -2,3 +2,6 @@
 
 resolver = "2"
 members = ["api", "packet", "table", "daemon"]
+
+[profile.release]
+lto = true
