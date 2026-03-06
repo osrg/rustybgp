@@ -568,16 +568,23 @@ impl Capability {
                 Ok(Capability::LongLivedGracefulRestart(v))
             }
             Self::FQDN => {
-                if len < 1 {
+                if len < 2 {
                     return Err(());
                 }
                 let hostlen = c.read_u8().map_err(|_| ())?;
+                // Validate total length: 1 (hostlen) + hostlen + 1 (domainlen) + domainlen
+                if (hostlen as u8) as u64 + 2 > len as u64 {
+                    return Err(());
+                }
                 let mut h = Vec::new();
                 for _ in 0..hostlen {
                     h.push(c.read_u8().map_err(|_| ())?);
                 }
                 let host = String::from_utf8(h).unwrap_or_default();
                 let domainlen = c.read_u8().map_err(|_| ())?;
+                if 2u64 + hostlen as u64 + domainlen as u64 > len as u64 {
+                    return Err(());
+                }
                 let mut d = Vec::new();
                 for _ in 0..domainlen {
                     d.push(c.read_u8().map_err(|_| ())?);
