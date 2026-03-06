@@ -220,8 +220,14 @@ impl Destination {
     }
 
     fn alloc_path_id(&mut self) -> u32 {
+        if self.entry.is_empty() {
+            self.next_path_id = 1;
+        }
         let id = self.next_path_id;
-        self.next_path_id += 1;
+        self.next_path_id = self.next_path_id.wrapping_add(1);
+        if self.next_path_id == 0 {
+            self.next_path_id = 1;
+        }
         id
     }
 
