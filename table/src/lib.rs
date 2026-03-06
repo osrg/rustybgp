@@ -602,6 +602,18 @@ impl RoutingTable {
 
         // Reject new paths (not replacements) when the per-prefix limit is reached.
         if replaced.is_none() && dst.entry.len() >= MAX_PATHS_PER_DESTINATION {
+            // Still count the route as received so stats reflect actual wire traffic.
+            let (received, _accepted) = self
+                .route_stats
+                .entry(source.remote_addr)
+                .or_default()
+                .entry(family)
+                .or_insert((0, 0));
+            *received += 1;
+            eprintln!(
+                "add-path: per-prefix path limit ({}) reached for {:?}, dropping path from {}",
+                MAX_PATHS_PER_DESTINATION, net, source.remote_addr
+            );
             return Vec::new();
         }
 
