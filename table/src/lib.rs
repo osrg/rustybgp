@@ -858,8 +858,15 @@ impl RoutingTable {
                     });
                 }
                 Some(old) => {
-                    if !same_top_entry(old, p) {
-                        // Same path ID but attributes changed — re-advertise
+                    let old_rank = old_top
+                        .iter()
+                        .position(|o| o.local_path_id == p.local_path_id)
+                        .unwrap()
+                        + 1;
+                    if !same_top_entry(old, p) || rank != old_rank {
+                        // Attributes changed or rank shifted — re-advertise so
+                        // peers whose send_max window now includes (or excludes)
+                        // this path can update accordingly.
                         changes.push(Change {
                             source: p.source.clone(),
                             family,
@@ -2985,12 +2992,17 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path_id, 1);
 
-        // Insert s2 → new best (lower router_id); s1 stays in top-2
+        // Insert s2 → new best (lower router_id); s1 stays in top-2 but rank shifts 1→2
         let changes = rt.insert_n(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false, 2);
-        // Only the new path should be advertised; s1 is unchanged in top-2
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].path_id, 2); // s2 gets a new stable ID
-        assert!(Arc::ptr_eq(&changes[0].source, &s2));
+        assert_eq!(changes.len(), 2);
+        // s2 is the new best at rank 1
+        let s2_change = changes.iter().find(|c| c.path_id == 2).unwrap();
+        assert_eq!(s2_change.rank, 1);
+        assert!(Arc::ptr_eq(&s2_change.source, &s2));
+        // s1 is re-advertised at rank 2 so peers can update their view
+        let s1_change = changes.iter().find(|c| c.path_id == 1).unwrap();
+        assert_eq!(s1_change.rank, 2);
+        assert!(Arc::ptr_eq(&s1_change.source, &s1));
     }
 
     #[test]
