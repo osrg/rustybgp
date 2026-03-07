@@ -3290,8 +3290,8 @@ impl Table {
                     },
                     TableEvent::Disconnected(source) => {
                         let mut t = TABLE[idx].lock().await;
-                        let global_max = t.max_send.values().copied().max().unwrap_or(1);
-                        let changes = t.rtable.drop_n(source.clone(), global_max);
+                        let max_send = t.max_send.clone();
+                        let changes = t.rtable.drop_n(source.clone(), &max_send);
                         for change in changes {
                             for c in t.peer_event_tx.values() {
                                 let _ = c.send(ToPeerEvent::Advertise(change.clone()));

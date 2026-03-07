@@ -858,15 +858,19 @@ impl RoutingTable {
     }
 
     pub fn drop(&mut self, source: Arc<Source>) -> Vec<Change> {
-        self.drop_n(source, 1)
+        self.drop_n(source, &FnvHashMap::default())
     }
 
-    pub fn drop_n(&mut self, source: Arc<Source>, send_max: usize) -> Vec<Change> {
-        let n = send_max.max(1);
+    pub fn drop_n(
+        &mut self,
+        source: Arc<Source>,
+        max_send: &FnvHashMap<Family, usize>,
+    ) -> Vec<Change> {
         let mut advertise = Vec::new();
         self.route_stats.remove(&source.remote_addr);
         self.prefix_limits.remove(&source.remote_addr);
         for (family, rt) in self.global.iter_mut() {
+            let n = max_send.get(family).copied().unwrap_or(1).max(1);
             rt.retain(|net, dst| {
                 let old_top: Vec<TopNEntry> = dst
                     .unfiltered_top_n(n)
