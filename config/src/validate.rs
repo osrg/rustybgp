@@ -151,6 +151,23 @@ impl Neighbor {
                 "use per-family addpath config".to_string(),
             ));
         }
+
+        // Validate per-family add-paths send_max
+        if let Some(afi_safis) = self.afi_safis.as_ref() {
+            for afi_safi in afi_safis {
+                if let Some(ap) = afi_safi.add_paths.as_ref()
+                    && let Some(c) = ap.config.as_ref()
+                    && let Some(sm) = c.send_max
+                    && sm > 32
+                {
+                    return Err(ConfigError::InvalidConfiguration(format!(
+                        "send-max {} exceeds maximum of 32",
+                        sm
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 }

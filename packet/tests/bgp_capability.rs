@@ -304,6 +304,101 @@ fn capability_llgr_round_trip() {
     }
 }
 
+// ─── create_channel negotiation ──────────────────────────────────────────────
+
+#[test]
+fn create_channel_addpath_rx_only() {
+    // Local wants RX (1), remote can TX (2) → local channel gets RX
+    let local = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::AddPath(vec![(Family::IPV4, 1)]),
+    ];
+    let remote = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::AddPath(vec![(Family::IPV4, 2)]),
+    ];
+    let channels: Vec<_> = create_channel(&local, &remote).collect();
+    assert_eq!(channels.len(), 1);
+    let (_, ch) = &channels[0];
+    assert!(ch.addpath_rx());
+    assert!(!ch.addpath_tx());
+}
+
+#[test]
+fn create_channel_addpath_tx_only() {
+    // Local can TX (2), remote wants RX (1) → local channel gets TX
+    let local = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::AddPath(vec![(Family::IPV4, 2)]),
+    ];
+    let remote = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::AddPath(vec![(Family::IPV4, 1)]),
+    ];
+    let channels: Vec<_> = create_channel(&local, &remote).collect();
+    assert_eq!(channels.len(), 1);
+    let (_, ch) = &channels[0];
+    assert!(!ch.addpath_rx());
+    assert!(ch.addpath_tx());
+}
+
+#[test]
+fn create_channel_addpath_both() {
+    // Both sides advertise BOTH (3) → channel gets RX+TX
+    let local = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::AddPath(vec![(Family::IPV4, 3)]),
+    ];
+    let remote = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::AddPath(vec![(Family::IPV4, 3)]),
+    ];
+    let channels: Vec<_> = create_channel(&local, &remote).collect();
+    assert_eq!(channels.len(), 1);
+    let (_, ch) = &channels[0];
+    assert!(ch.addpath_rx());
+    assert!(ch.addpath_tx());
+}
+
+#[test]
+fn create_channel_addpath_no_match() {
+    // Both sides only want RX (1) → neither can TX → no addpath
+    let local = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::AddPath(vec![(Family::IPV4, 1)]),
+    ];
+    let remote = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::AddPath(vec![(Family::IPV4, 1)]),
+    ];
+    let channels: Vec<_> = create_channel(&local, &remote).collect();
+    assert_eq!(channels.len(), 1);
+    let (_, ch) = &channels[0];
+    assert!(!ch.addpath_rx());
+    assert!(!ch.addpath_tx());
+}
+
+#[test]
+fn create_channel_addpath_mismatched_family() {
+    // Local has AddPath for IPv4, remote for IPv6 → no addpath on either
+    let local = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::MultiProtocol(Family::IPV6),
+        Capability::AddPath(vec![(Family::IPV4, 3)]),
+    ];
+    let remote = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::MultiProtocol(Family::IPV6),
+        Capability::AddPath(vec![(Family::IPV6, 3)]),
+    ];
+    let channels: Vec<_> = create_channel(&local, &remote).collect();
+    assert_eq!(channels.len(), 2);
+    for (_, ch) in &channels {
+        assert!(!ch.addpath_rx());
+        assert!(!ch.addpath_tx());
+    }
+}
+
 // ─── Unknown capability ───────────────────────────────────────────────────────
 
 #[test]

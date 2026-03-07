@@ -143,7 +143,10 @@ impl PathAttribute {
 
 struct Path {
     source: Arc<Source>,
+    /// Remote peer's inbound path ID (from the sending peer's Add-Path).
     id: u32,
+    /// Stable outbound path ID assigned locally for Add-Path TX.
+    local_path_id: u32,
     pa: PathAttribute,
     timestamp: SystemTime,
     flags: u8,
@@ -199,24 +202,63 @@ impl PartialEq for Path {
 
 impl Eq for Path {}
 
+/// Maximum number of paths stored per prefix per destination.
+/// Limits memory usage when Add-Path peers advertise many path IDs.
+const MAX_PATHS_PER_DESTINATION: usize = 32;
+
 struct Destination {
     entry: Vec<Path>,
+    next_path_id: u32,
 }
 
 impl Destination {
     fn new() -> Self {
-        Destination { entry: Vec::new() }
+        Destination {
+            entry: Vec::new(),
+            next_path_id: 1,
+        }
+    }
+
+    fn alloc_path_id(&mut self) -> u32 {
+        if self.entry.is_empty() {
+            // Fast path: when there are no active paths, just reset to 1.
+            self.next_path_id = 1;
+        }
+
+        loop {
+            let id = self.next_path_id;
+            // Advance and maintain the original wrap/skip-0 behavior.
+            self.next_path_id = self.next_path_id.wrapping_add(1);
+            if self.next_path_id == 0 {
+                self.next_path_id = 1;
+            }
+
+            // Ensure we do not reuse an ID that is still in use by an active path.
+            if !self.entry.iter().any(|p| p.local_path_id == id) {
+                return id;
+            }
+        }
     }
 
     fn unfiltered_best(&self) -> Option<&Path> {
         self.entry.iter().find(|p| !p.is_filtered())
     }
+
+    fn unfiltered_all(&self) -> Vec<&Path> {
+        self.entry.iter().filter(|p| !p.is_filtered()).collect()
+    }
 }
 
-fn same_path(a: &(Arc<Source>, Arc<Vec<packet::Attribute>>), b: &Path) -> bool {
-    let (a_source, a_attr) = a;
-    (Arc::ptr_eq(a_source, &b.source) && Arc::ptr_eq(a_attr, &b.pa.attr))
-        || (Arc::ptr_eq(a_source, &b.source) && a_attr.as_ref() == b.pa.attr.as_ref())
+/// Snapshot of a path in the top-N used for diffing before/after mutations.
+struct TopNEntry {
+    source: Arc<Source>,
+    attr: Arc<Vec<packet::Attribute>>,
+    local_path_id: u32,
+}
+
+fn same_top_entry(a: &TopNEntry, b: &Path) -> bool {
+    (Arc::ptr_eq(&a.source, &b.source) && Arc::ptr_eq(&a.attr, &b.pa.attr))
+        || (Arc::ptr_eq(&a.source, &b.source) && a.attr.as_ref() == b.pa.attr.as_ref())
 }
 
 #[derive(Default, Clone, Debug)]
@@ -264,6 +306,11 @@ pub struct Change {
     pub family: Family,
     pub net: packet::Nlri,
     pub attr: Arc<Vec<packet::Attribute>>,
+    /// Stable per-path identifier for Add-Path TX. 0 when Add-Path is not used.
+    pub path_id: u32,
+    /// 1-based rank within the top-N (1 = best). Peers use this to filter
+    /// changes that exceed their effective send_max.
+    pub rank: usize,
 }
 
 impl From<Change> for bgp::Message {
@@ -273,7 +320,10 @@ impl From<Change> for bgp::Message {
         bgp::Message::Update(bgp::Update {
             reach: Some(packet::bgp::NlriSet {
                 family: c.family,
-                entries: vec![packet::bgp::PathNlri::new(c.net)],
+                entries: vec![packet::bgp::PathNlri {
+                    nlri: c.net,
+                    path_id: c.path_id,
+                }],
             }),
             mp_reach: None,
             attr: c.attr,
@@ -338,6 +388,8 @@ impl Source {
 pub struct RoutingTable {
     global: FnvHashMap<Family, FnvHashMap<packet::Nlri, Destination>>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, (u64, u64)>>,
+    /// Per-peer per-family maximum prefix limits.
+    prefix_limits: FnvHashMap<IpAddr, FnvHashMap<Family, u32>>,
     rpki: RpkiTable,
 }
 
@@ -354,21 +406,35 @@ impl RoutingTable {
                 .into_iter()
                 .collect(),
             route_stats: FnvHashMap::default(),
+            prefix_limits: FnvHashMap::default(),
             rpki: RpkiTable::new(),
         }
+    }
+
+    pub fn set_prefix_limit(&mut self, peer: IpAddr, family: Family, max: u32) {
+        self.prefix_limits
+            .entry(peer)
+            .or_default()
+            .insert(family, max);
+    }
+
+    pub fn remove_prefix_limits(&mut self, peer: &IpAddr) {
+        self.prefix_limits.remove(peer);
     }
 
     pub fn best(&self, family: &Family) -> Vec<Change> {
         match self.global.get(family) {
             Some(t) => {
                 let mut v = Vec::with_capacity(t.len());
-                for (n, dst) in t {
-                    if let Some(r) = dst.unfiltered_best() {
+                for (net, dst) in t {
+                    for (i, p) in dst.unfiltered_all().iter().enumerate() {
                         v.push(Change {
-                            source: r.source.clone(),
+                            source: p.source.clone(),
                             family: *family,
-                            net: *n,
-                            attr: r.pa.attr.clone(),
+                            net: *net,
+                            attr: p.pa.attr.clone(),
+                            path_id: p.local_path_id,
+                            rank: i + 1,
                         });
                     }
                 }
@@ -525,6 +591,7 @@ impl RoutingTable {
             .filter(|d| !d.paths.is_empty())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &mut self,
         source: Arc<Source>,
@@ -533,25 +600,51 @@ impl RoutingTable {
         remote_id: u32,
         attr: Arc<Vec<packet::Attribute>>,
         filtered: bool,
-    ) -> Option<Change> {
+    ) -> Vec<Change> {
+        // Enforce per-peer per-family prefix limit
+        if let Some(limit) = self
+            .prefix_limits
+            .get(&source.remote_addr)
+            .and_then(|m| m.get(&family))
+        {
+            let received = self
+                .route_stats
+                .get(&source.remote_addr)
+                .and_then(|m| m.get(&family))
+                .map_or(0, |(r, _)| *r);
+            if received >= *limit as u64 {
+                // Still count as received so the stat reflects wire traffic
+                let (rx, _) = self
+                    .route_stats
+                    .entry(source.remote_addr)
+                    .or_default()
+                    .entry(family)
+                    .or_insert((0, 0));
+                *rx += 1;
+                eprintln!(
+                    "prefix limit ({}) reached for peer {} family {:?}, dropping route",
+                    limit, source.remote_addr, family
+                );
+                return Vec::new();
+            }
+        }
+
         let mut replaced = None;
         let flags = if filtered { Path::FLAG_FILTERED } else { 0 };
-
-        let path = Path {
-            source: source.clone(),
-            id: remote_id,
-            pa: PathAttribute::new(attr),
-            timestamp: SystemTime::now(),
-            flags,
-        };
 
         let rt = self.global.entry(family).or_default();
         let dst = rt.entry(net).or_insert_with(Destination::new);
 
-        // Remember the old unfiltered best before any modification
-        let old_best = dst
-            .unfiltered_best()
-            .map(|p| (p.source.clone(), p.pa.attr.clone()));
+        // Snapshot all unfiltered paths before modification
+        let old_top: Vec<TopNEntry> = dst
+            .unfiltered_all()
+            .iter()
+            .map(|p| TopNEntry {
+                source: p.source.clone(),
+                attr: p.pa.attr.clone(),
+                local_path_id: p.local_path_id,
+            })
+            .collect();
 
         for i in 0..dst.entry.len() {
             if Arc::ptr_eq(&dst.entry[i].source, &source) && dst.entry[i].id == remote_id {
@@ -559,6 +652,41 @@ impl RoutingTable {
                 break;
             }
         }
+
+        // Reject new paths (not replacements) when the per-prefix limit is reached.
+        // Check before allocating a path ID to avoid wasting IDs on dropped paths.
+        if replaced.is_none() && dst.entry.len() >= MAX_PATHS_PER_DESTINATION {
+            // Still count the route as received so stats reflect actual wire traffic.
+            let (received, _accepted) = self
+                .route_stats
+                .entry(source.remote_addr)
+                .or_default()
+                .entry(family)
+                .or_insert((0, 0));
+            *received += 1;
+            eprintln!(
+                "add-path: per-prefix path limit ({}) reached for {:?}, dropping path from {}",
+                MAX_PATHS_PER_DESTINATION, net, source.remote_addr
+            );
+            return Vec::new();
+        }
+
+        // Reuse the old stable path ID on replacement; allocate a new one otherwise.
+        let local_path_id = if let Some(ref old) = replaced {
+            old.local_path_id
+        } else {
+            dst.alloc_path_id()
+        };
+
+        let path = Path {
+            source: source.clone(),
+            id: remote_id,
+            local_path_id,
+            pa: PathAttribute::new(attr),
+            timestamp: SystemTime::now(),
+            flags,
+        };
+
         let (received, accepted) = self
             .route_stats
             .entry(source.remote_addr)
@@ -582,33 +710,8 @@ impl RoutingTable {
         let idx = dst.entry.partition_point(|a| path.cmp(a).is_ge());
         dst.entry.insert(idx, path);
 
-        // Check if the unfiltered best path changed
-        let Some(best) = dst.unfiltered_best() else {
-            // All paths are filtered; withdraw if there was a previous unfiltered best
-            if let Some((old_source, _)) = old_best {
-                return Some(Change {
-                    source: old_source,
-                    family,
-                    net,
-                    attr: Arc::new(Vec::new()),
-                });
-            }
-            return None;
-        };
-
-        let changed = match &old_best {
-            Some(old) => !same_path(old, best),
-            None => true, // no previous unfiltered best
-        };
-        if changed {
-            return Some(Change {
-                source: best.source.clone(),
-                family,
-                net,
-                attr: best.pa.attr.clone(),
-            });
-        }
-        None
+        // Compare old vs new unfiltered paths and emit changes for each affected rank
+        Self::diff_top_n(dst, &old_top, family, net)
     }
 
     pub fn remove(
@@ -617,18 +720,32 @@ impl RoutingTable {
         family: Family,
         net: packet::Nlri,
         remote_id: u32,
-    ) -> Option<Change> {
-        let rt = self.global.get_mut(&family)?;
-        let dst = rt.get_mut(&net)?;
+    ) -> Vec<Change> {
+        let Some(rt) = self.global.get_mut(&family) else {
+            return Vec::new();
+        };
+        let Some(dst) = rt.get_mut(&net) else {
+            return Vec::new();
+        };
 
-        let i = dst
+        let Some(i) = dst
             .entry
             .iter()
-            .position(|e| Arc::ptr_eq(&e.source, &source) && e.id == remote_id)?;
+            .position(|e| Arc::ptr_eq(&e.source, &source) && e.id == remote_id)
+        else {
+            return Vec::new();
+        };
 
-        let old_best = dst
-            .unfiltered_best()
-            .map(|p| (p.source.clone(), p.pa.attr.clone()));
+        // Snapshot all unfiltered paths before removal
+        let old_top: Vec<TopNEntry> = dst
+            .unfiltered_all()
+            .iter()
+            .map(|p| TopNEntry {
+                source: p.source.clone(),
+                attr: p.pa.attr.clone(),
+                local_path_id: p.local_path_id,
+            })
+            .collect();
 
         let (received, accepted) = self
             .route_stats
@@ -643,91 +760,127 @@ impl RoutingTable {
 
         if dst.entry.is_empty() {
             rt.remove(&net);
-            if let Some((old_source, _)) = old_best {
-                return Some(Change {
-                    source: old_source,
+            // Withdraw all previously-advertised paths using their stable IDs
+            return old_top
+                .iter()
+                .enumerate()
+                .map(|(i, e)| Change {
+                    source: e.source.clone(),
                     family,
                     net,
                     attr: Arc::new(Vec::new()),
-                });
-            }
-            return None;
+                    path_id: e.local_path_id,
+                    rank: i + 1,
+                })
+                .collect();
         }
 
-        let Some(best) = dst.unfiltered_best() else {
-            // All remaining paths are filtered
-            if let Some((old_source, _)) = old_best {
-                return Some(Change {
-                    source: old_source,
+        Self::diff_top_n(dst, &old_top, family, net)
+    }
+
+    /// Compare old path snapshot against the current destination state and
+    /// produce `Change` entries for paths that were added, removed, or modified.
+    /// Uses stable `local_path_id` rather than positional rank.
+    fn diff_top_n(
+        dst: &Destination,
+        old_top: &[TopNEntry],
+        family: Family,
+        net: packet::Nlri,
+    ) -> Vec<Change> {
+        let new_top = dst.unfiltered_all();
+        let mut changes = Vec::new();
+
+        // Withdraw: paths in old_top whose local_path_id is absent from new_top
+        for (i, old) in old_top.iter().enumerate() {
+            let still_present = new_top.iter().any(|p| p.local_path_id == old.local_path_id);
+            if !still_present {
+                changes.push(Change {
+                    source: old.source.clone(),
                     family,
                     net,
                     attr: Arc::new(Vec::new()),
+                    path_id: old.local_path_id,
+                    rank: i + 1,
                 });
             }
-            return None;
-        };
-
-        let changed = match &old_best {
-            Some(old) => !same_path(old, best),
-            None => true,
-        };
-        if changed {
-            return Some(Change {
-                source: best.source.clone(),
-                family,
-                net,
-                attr: best.pa.attr.clone(),
-            });
         }
-        None
+
+        // Advertise: paths in new_top that are new or have changed attributes
+        for (i, p) in new_top.iter().enumerate() {
+            let rank = i + 1;
+            let old_entry = old_top.iter().find(|o| o.local_path_id == p.local_path_id);
+            match old_entry {
+                None => {
+                    // Newly entered top-N — advertise
+                    changes.push(Change {
+                        source: p.source.clone(),
+                        family,
+                        net,
+                        attr: p.pa.attr.clone(),
+                        path_id: p.local_path_id,
+                        rank,
+                    });
+                }
+                Some(old) => {
+                    let old_rank = old_top
+                        .iter()
+                        .position(|o| o.local_path_id == p.local_path_id)
+                        .unwrap()
+                        + 1;
+                    if !same_top_entry(old, p) || rank != old_rank {
+                        // Attributes changed or rank shifted — re-advertise so
+                        // peers whose send_max window now includes (or excludes)
+                        // this path can update accordingly.
+                        changes.push(Change {
+                            source: p.source.clone(),
+                            family,
+                            net,
+                            attr: p.pa.attr.clone(),
+                            path_id: p.local_path_id,
+                            rank,
+                        });
+                    }
+                }
+            }
+        }
+
+        changes
     }
 
     pub fn drop(&mut self, source: Arc<Source>) -> Vec<Change> {
         let mut advertise = Vec::new();
         self.route_stats.remove(&source.remote_addr);
+        self.prefix_limits.remove(&source.remote_addr);
         for (family, rt) in self.global.iter_mut() {
             rt.retain(|net, dst| {
-                let old_best = dst
-                    .unfiltered_best()
-                    .map(|p| (p.source.clone(), p.pa.attr.clone()));
+                let old_top: Vec<TopNEntry> = dst
+                    .unfiltered_all()
+                    .iter()
+                    .map(|p| TopNEntry {
+                        source: p.source.clone(),
+                        attr: p.pa.attr.clone(),
+                        local_path_id: p.local_path_id,
+                    })
+                    .collect();
 
                 dst.entry.retain(|e| !Arc::ptr_eq(&e.source, &source));
 
                 if dst.entry.is_empty() {
-                    if old_best.is_some() {
+                    // Withdraw all previously-advertised paths using their stable IDs
+                    for (i, e) in old_top.iter().enumerate() {
                         advertise.push(Change {
-                            source: source.clone(),
+                            source: e.source.clone(),
                             family: *family,
                             net: *net,
                             attr: Arc::new(Vec::new()),
+                            path_id: e.local_path_id,
+                            rank: i + 1,
                         });
                     }
                     return false;
                 }
 
-                let new_best = dst.unfiltered_best();
-                match (&old_best, new_best) {
-                    (Some((old_source, _)), None) => {
-                        // Had unfiltered best, now all filtered → withdraw
-                        advertise.push(Change {
-                            source: old_source.clone(),
-                            family: *family,
-                            net: *net,
-                            attr: Arc::new(Vec::new()),
-                        });
-                    }
-                    (Some(old), Some(best)) => {
-                        if !same_path(old, best) {
-                            advertise.push(Change {
-                                source: best.source.clone(),
-                                family: *family,
-                                net: *net,
-                                attr: best.pa.attr.clone(),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
+                advertise.extend(Self::diff_top_n(dst, &old_top, *family, *net));
                 true
             });
         }
@@ -1999,7 +2152,7 @@ mod tests {
             empty_attrs(),
             false,
         );
-        assert!(change.is_some());
+        assert!(!change.is_empty());
     }
 
     #[test]
@@ -2015,7 +2168,7 @@ mod tests {
             empty_attrs(),
             false,
         );
-        // Insert with router_id=2 (higher, won't become best)
+        // Insert with router_id=2 (higher, won't become best) → emits rank=2
         let change = rt.insert(
             source(2, 65002, 65000, 2),
             Family::IPV4,
@@ -2024,10 +2177,20 @@ mod tests {
             empty_attrs(),
             false,
         );
-        assert!(change.is_none());
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0].rank, 2);
     }
 
     // --- best path selection ---
+
+    /// Find the Change whose source matches the given address.
+    fn find_change_for(changes: Vec<Change>, addr: Ipv4Addr) -> Change {
+        let target = IpAddr::V4(addr);
+        changes
+            .into_iter()
+            .find(|c| c.source.remote_addr == target)
+            .expect("expected a Change for the given source")
+    }
 
     #[test]
     fn best_path_local_pref() {
@@ -2041,7 +2204,7 @@ mod tests {
             attrs_with_local_pref(100),
             false,
         );
-        let change = rt.insert(
+        let changes = rt.insert(
             source(2, 65002, 65000, 2),
             Family::IPV4,
             net,
@@ -2049,10 +2212,11 @@ mod tests {
             attrs_with_local_pref(200),
             false,
         );
-        // Higher local_pref wins → best path changes
-        let change = change.unwrap();
+        // Higher local_pref wins → best path changes; stable IDs produce
+        // a withdraw for the old best + an advertise for the new best.
+        let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(
-            change.source.remote_addr,
+            adv.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
         );
     }
@@ -2069,7 +2233,7 @@ mod tests {
             attrs_with_as_path_len(3),
             false,
         );
-        let change = rt.insert(
+        let changes = rt.insert(
             source(2, 65002, 65000, 2),
             Family::IPV4,
             net,
@@ -2078,9 +2242,9 @@ mod tests {
             false,
         );
         // Shorter AS path wins
-        let change = change.unwrap();
+        let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(
-            change.source.remote_addr,
+            adv.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
         );
     }
@@ -2099,7 +2263,7 @@ mod tests {
             false,
         );
         // Insert with ORIGIN=IGP(0), router_id=2
-        let change = rt.insert(
+        let changes = rt.insert(
             source(2, 65002, 65000, 2),
             Family::IPV4,
             net,
@@ -2108,9 +2272,9 @@ mod tests {
             false,
         );
         // IGP (lower origin value) wins
-        let change = change.unwrap();
+        let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(
-            change.source.remote_addr,
+            adv.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
         );
     }
@@ -2129,7 +2293,7 @@ mod tests {
             false,
         );
         // eBGP peer (remote_asn != local_asn), router_id=2 (higher)
-        let change = rt.insert(
+        let changes = rt.insert(
             source(2, 65001, 65000, 2),
             Family::IPV4,
             net,
@@ -2138,9 +2302,9 @@ mod tests {
             false,
         );
         // eBGP wins even though router_id is higher
-        let change = change.unwrap();
+        let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(
-            change.source.remote_addr,
+            adv.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
         );
     }
@@ -2159,7 +2323,7 @@ mod tests {
             false,
         );
         // router_id=5 (lower wins)
-        let change = rt.insert(
+        let changes = rt.insert(
             source(2, 65002, 65000, 5),
             Family::IPV4,
             net,
@@ -2167,9 +2331,9 @@ mod tests {
             empty_attrs(),
             false,
         );
-        let change = change.unwrap();
+        let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(
-            change.source.remote_addr,
+            adv.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
         );
     }
@@ -2184,12 +2348,11 @@ mod tests {
         let s2 = source(2, 65002, 65000, 2);
         rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
         rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
-        // Remove best (router_id=1)
-        let change = rt.remove(s1, Family::IPV4, net, 0);
-        let change = change.unwrap();
-        // New best is s2
+        // Remove best (router_id=1) → s2 promoted to best
+        let changes = rt.remove(s1, Family::IPV4, net, 0);
+        let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(
-            change.source.remote_addr,
+            adv.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
         );
     }
@@ -2202,9 +2365,10 @@ mod tests {
         let s2 = source(2, 65002, 65000, 2);
         rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
         rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
-        // Remove non-best (router_id=2)
+        // Remove non-best (router_id=2) → withdrawal for the removed path
         let change = rt.remove(s2, Family::IPV4, net, 0);
-        assert!(change.is_none());
+        assert_eq!(change.len(), 1);
+        assert!(change[0].attr.is_empty()); // withdrawal
     }
 
     #[test]
@@ -2214,7 +2378,7 @@ mod tests {
         let s1 = source(1, 65001, 65000, 1);
         rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
         let change = rt.remove(s1, Family::IPV4, net, 0);
-        let change = change.unwrap();
+        let change = change.into_iter().next().unwrap();
         // Withdrawal: empty attrs
         assert!(change.attr.is_empty());
     }
@@ -2234,12 +2398,12 @@ mod tests {
             empty_attrs(),
             true,
         );
-        assert!(change.is_none());
+        assert!(change.is_empty());
 
         // Unfiltered path added → Change points to the unfiltered path
         let s2 = source(2, 65002, 65000, 2);
         let change = rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
-        let change = change.unwrap();
+        let change = change.into_iter().next().unwrap();
         assert!(Arc::ptr_eq(&change.source, &s2));
     }
 
@@ -2260,9 +2424,9 @@ mod tests {
         // unfiltered best (router_id=2)
         let s2 = source(2, 65002, 65000, 2);
         let change = rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
-        let change = change.unwrap();
+        let change = change.into_iter().next().unwrap();
         assert!(Arc::ptr_eq(&change.source, &s2));
-        // another unfiltered but worse (router_id=3) → no best change
+        // another unfiltered but worse (router_id=3) → emits rank=2 (filtered paths skipped)
         let change = rt.insert(
             source(3, 65003, 65000, 3),
             Family::IPV4,
@@ -2271,7 +2435,8 @@ mod tests {
             empty_attrs(),
             false,
         );
-        assert!(change.is_none());
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0].rank, 2);
     }
 
     // B1: replace filtered path at index 0 → unfiltered best unchanged
@@ -2293,7 +2458,7 @@ mod tests {
         );
         // replace the filtered head with updated attrs (still filtered) → no best change
         let change = rt.insert(s1, Family::IPV4, net, 0, attrs_with_local_pref(200), true);
-        assert!(change.is_none());
+        assert!(change.is_empty());
     }
 
     // B2: replace unfiltered best with filtered → best changes to another unfiltered
@@ -2317,9 +2482,9 @@ mod tests {
         let s2 = source(2, 65002, 65000, 2);
         rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
         // replace s1 as filtered → s2 becomes unfiltered best
-        let change = rt.insert(s1, Family::IPV4, net, 0, empty_attrs(), true);
-        let change = change.unwrap();
-        assert!(Arc::ptr_eq(&change.source, &s2));
+        let changes = rt.insert(s1, Family::IPV4, net, 0, empty_attrs(), true);
+        let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
+        assert!(Arc::ptr_eq(&adv.source, &s2));
     }
 
     // B3: replace unfiltered non-best → no best change
@@ -2348,9 +2513,10 @@ mod tests {
         // unfiltered non-best (router_id=2)
         let s2 = source(2, 65002, 65000, 2);
         rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
-        // replace s2 with different attrs → still non-best, no change
+        // replace s2 with different attrs → still non-best, but attrs changed so re-advertised
         let change = rt.insert(s2, Family::IPV4, net, 0, attrs_with_local_pref(50), false);
-        assert!(change.is_none());
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0].rank, 2);
     }
 
     #[test]
@@ -2508,7 +2674,9 @@ mod tests {
         let s2 = source(2, 65002, 65000, 1);
         let change = rt.insert(s2, Family::IPV4, net, 0, attrs_with_local_pref(50), false);
         // s1 must remain best (higher local_pref wins over lower router_id)
-        assert!(change.is_none());
+        // s2 enters as rank=2
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0].rank, 2);
     }
 
     #[test]
@@ -2518,10 +2686,13 @@ mod tests {
         let s1 = source(1, 65001, 65000, 1);
         // Insert unfiltered path
         let change = rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
-        assert!(change.is_some());
+        assert!(!change.is_empty());
         // Replace with filtered → no unfiltered best remains → withdraw
         let change = rt.insert(s1, Family::IPV4, net, 0, empty_attrs(), true);
-        let change = change.expect("should return withdrawal Change");
+        let change = change
+            .into_iter()
+            .next()
+            .expect("should return withdrawal Change");
         assert!(change.attr.is_empty());
     }
 
@@ -2540,6 +2711,8 @@ mod tests {
         // s1 gets replaced as filtered → all filtered → withdrawal
         let change = rt
             .insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), true)
+            .into_iter()
+            .next()
             .expect("should return withdrawal");
         assert!(change.attr.is_empty());
         // withdrawal source must be s1 (old best), not the inserting peer
@@ -2608,11 +2781,9 @@ mod tests {
         let s3 = source(3, 65003, 65000, 3);
         rt.insert(s3.clone(), Family::IPV4, net, 0, attrs.clone(), false);
         // remove s2 (best) → s3 becomes new best
-        let change = rt
-            .remove(s2, Family::IPV4, net, 0)
-            .expect("should return new best");
-        assert!(Arc::ptr_eq(&change.source, &s3));
-        assert!(!change.attr.is_empty());
+        let changes = rt.remove(s2, Family::IPV4, net, 0);
+        let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 3));
+        assert!(Arc::ptr_eq(&adv.source, &s3));
     }
 
     #[test]
@@ -2634,6 +2805,8 @@ mod tests {
         // remove s2 → all filtered → withdrawal
         let change = rt
             .remove(s2, Family::IPV4, net, 0)
+            .into_iter()
+            .next()
             .expect("should return withdrawal");
         assert!(change.attr.is_empty());
     }
@@ -2660,11 +2833,10 @@ mod tests {
         // unfiltered non-best
         let s3 = source(3, 65003, 65000, 3);
         rt.insert(s3.clone(), Family::IPV4, net, 0, attrs.clone(), false);
-        // drop s2 → s3 becomes new best
+        // drop s2 → s3 becomes new best (withdraw old + advertise new)
         let changes = rt.drop(s2);
-        assert_eq!(changes.len(), 1);
-        assert!(Arc::ptr_eq(&changes[0].source, &s3));
-        assert!(!changes[0].attr.is_empty());
+        let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 3));
+        assert!(Arc::ptr_eq(&adv.source, &s3));
     }
 
     #[test]
@@ -2763,5 +2935,92 @@ mod tests {
         assert_eq!(s.num_destination, 1);
         assert_eq!(s.num_path, 2);
         assert_eq!(s.num_accepted, 1);
+    }
+
+    // --- stable path IDs ---
+
+    #[test]
+    fn stable_id_new_best_no_churn() {
+        // Inserting a new best should re-advertise the old path at its new rank.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 10); // router_id=10
+        let s2 = source(2, 65002, 65000, 5); // router_id=5, better
+
+        // Insert s1 → best, path_id=1
+        let changes = rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path_id, 1);
+
+        // Insert s2 → new best (lower router_id); s1 rank shifts 1→2
+        let changes = rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        assert_eq!(changes.len(), 2);
+        // s2 is the new best at rank 1
+        let s2_change = changes.iter().find(|c| c.path_id == 2).unwrap();
+        assert_eq!(s2_change.rank, 1);
+        assert!(Arc::ptr_eq(&s2_change.source, &s2));
+        // s1 is re-advertised at rank 2 so peers can update their view
+        let s1_change = changes.iter().find(|c| c.path_id == 1).unwrap();
+        assert_eq!(s1_change.rank, 2);
+        assert!(Arc::ptr_eq(&s1_change.source, &s1));
+    }
+
+    #[test]
+    fn stable_id_preserved_on_replacement() {
+        // Replacing a path's attributes preserves its stable local_path_id.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+
+        let changes = rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        let original_id = changes[0].path_id;
+
+        // Replace with new attributes
+        let changes = rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            attrs_with_local_pref(200),
+            false,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path_id, original_id); // same stable ID
+    }
+
+    #[test]
+    fn stable_id_withdraw_uses_original_id() {
+        // When a path is removed, the withdrawal uses its original ID.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+
+        let s1 = source(1, 65001, 65000, 1); // best (router_id=1)
+        let s2 = source(2, 65002, 65000, 2);
+        rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+
+        // Remove s1 → withdraw should carry s1's path_id (1)
+        let changes = rt.remove(s1, Family::IPV4, net, 0);
+        let withdrawal = changes.iter().find(|c| c.attr.is_empty());
+        assert!(withdrawal.is_some());
+        assert_eq!(withdrawal.unwrap().path_id, 1);
+    }
+
+    #[test]
+    fn stable_id_best_uses_stored_ids() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+
+        rt.insert(s1.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+        rt.insert(s2.clone(), Family::IPV4, net, 0, empty_attrs(), false);
+
+        let best = rt.best(&Family::IPV4);
+        assert_eq!(best.len(), 2);
+        // IDs should be stable (1 and 2), not re-computed from rank
+        let ids: Vec<u32> = best.iter().map(|c| c.path_id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
     }
 }

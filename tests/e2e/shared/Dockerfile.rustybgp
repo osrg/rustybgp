@@ -1,5 +1,4 @@
 # Stage 1: Build rustybgpd statically linked binary
-# Use ARG to support both amd64 and arm64 hosts
 ARG RUST_TARGET=aarch64-unknown-linux-musl
 FROM ghcr.io/rust-cross/rust-musl-cross:${RUST_TARGET} AS builder
 
@@ -14,7 +13,7 @@ COPY . .
 RUN cargo build --release --target ${RUST_TARGET}
 
 # Stage 2: Minimal runtime
-FROM alpine:latest
+FROM alpine:3.21
 
 ARG RUST_TARGET=aarch64-unknown-linux-musl
 

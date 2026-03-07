@@ -1,5 +1,5 @@
 # Build FRR from source for arm64 support
-FROM alpine:latest AS builder
+FROM alpine:3.21 AS builder
 
 RUN apk add --no-cache \
     alpine-sdk \
@@ -61,7 +61,7 @@ RUN ./bootstrap.sh && \
     make install DESTDIR=/build
 
 # Runtime
-FROM alpine:latest
+FROM alpine:3.21
 
 RUN apk add --no-cache \
     c-ares \
@@ -82,15 +82,16 @@ COPY --from=builder /build/ /
 RUN mkdir -p /etc/frr /var/run/frr /var/log/frr && \
     chown -R frr:frr /etc/frr /var/run/frr /var/log/frr
 
-COPY tests/e2e/rfc8950/frr/daemons /etc/frr/daemons
-COPY tests/e2e/rfc8950/frr/frr.conf /etc/frr/frr.conf
+# FRR_CONF_DIR must be passed as a build arg pointing to the test's FRR config
+ARG FRR_CONF_DIR
+COPY ${FRR_CONF_DIR}/frr.conf /etc/frr/frr.conf
+COPY tests/e2e/shared/daemons /etc/frr/daemons
 RUN chown -R frr:frr /etc/frr
 
-# vtysh config
 RUN echo 'service integrated-vtysh-config' > /etc/frr/vtysh.conf && \
     chown frr:frrvty /etc/frr/vtysh.conf
 
-COPY tests/e2e/rfc8950/entrypoint-frr.sh /entrypoint.sh
+COPY tests/e2e/shared/entrypoint-frr.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

@@ -252,7 +252,7 @@ impl Ipv4Net {
         }
         let mut addr = [0_u8; 4];
         for i in 0..bit_len.div_ceil(8) {
-            addr[i as usize] = c.read_u8().unwrap();
+            addr[i as usize] = c.read_u8()?;
         }
         Ok(Ipv4Net {
             addr: Ipv4Addr::from(addr),
@@ -477,7 +477,7 @@ impl Capability {
                     return Err(());
                 }
                 Ok(Capability::MultiProtocol(Family(
-                    c.read_u32::<NetworkEndian>().unwrap(),
+                    c.read_u32::<NetworkEndian>().map_err(|_| ())?,
                 )))
             }
             Self::ROUTE_REFRESH => {
@@ -492,8 +492,8 @@ impl Capability {
                 }
                 let mut v = Vec::new();
                 for _ in 0..len / 6 {
-                    let family = Family(c.read_u32::<NetworkEndian>().unwrap());
-                    let afi = c.read_u16::<NetworkEndian>().unwrap();
+                    let family = Family(c.read_u32::<NetworkEndian>().map_err(|_| ())?);
+                    let afi = c.read_u16::<NetworkEndian>().map_err(|_| ())?;
                     if family.afi() != Family::AFI_IP || afi != Family::AFI_IP6 {
                         continue;
                     }
@@ -505,14 +505,14 @@ impl Capability {
                 if len % 4 != 2 {
                     return Err(());
                 }
-                let restart = c.read_u16::<NetworkEndian>().unwrap();
+                let restart = c.read_u16::<NetworkEndian>().map_err(|_| ())?;
                 let flags = (restart >> 12) as u8;
                 let time = restart & 0xfff;
                 let mut v = Vec::new();
                 for _ in 0..(len - 2) / 4 {
-                    let afi = c.read_u16::<NetworkEndian>().unwrap() as u32;
-                    let safi = c.read_u8().unwrap() as u32;
-                    let af_flag = c.read_u8().unwrap();
+                    let afi = c.read_u16::<NetworkEndian>().map_err(|_| ())? as u32;
+                    let safi = c.read_u8().map_err(|_| ())? as u32;
+                    let af_flag = c.read_u8().map_err(|_| ())?;
                     v.push((Family(afi << 16 | safi), af_flag));
                 }
                 Ok(Capability::GracefulRestart {
@@ -526,7 +526,7 @@ impl Capability {
                     return Err(());
                 }
                 Ok(Capability::FourOctetAsNumber(
-                    c.read_u32::<NetworkEndian>().unwrap(),
+                    c.read_u32::<NetworkEndian>().map_err(|_| ())?,
                 ))
             }
             Self::ADD_PATH => {
@@ -535,10 +535,10 @@ impl Capability {
                 }
                 let mut v = Vec::new();
                 for _ in 0..len / 4 {
-                    let afi = c.read_u16::<NetworkEndian>().unwrap() as u32;
-                    let safi = c.read_u8().unwrap() as u32;
-                    let val = c.read_u8().unwrap();
-                    if val > 3 {
+                    let afi = c.read_u16::<NetworkEndian>().map_err(|_| ())? as u32;
+                    let safi = c.read_u8().map_err(|_| ())? as u32;
+                    let val = c.read_u8().map_err(|_| ())?;
+                    if val == 0 || val > 3 {
                         continue;
                     }
                     v.push((Family(afi << 16 | safi), val));
@@ -557,30 +557,37 @@ impl Capability {
                 }
                 let mut v = Vec::new();
                 for _ in 0..len / 7 {
-                    let afi = c.read_u16::<NetworkEndian>().unwrap() as u32;
-                    let safi = c.read_u8().unwrap() as u32;
-                    let flags = c.read_u8().unwrap();
-                    let time = (c.read_u8().unwrap() as u32) << 16
-                        | (c.read_u8().unwrap() as u32) << 8
-                        | c.read_u8().unwrap() as u32;
+                    let afi = c.read_u16::<NetworkEndian>().map_err(|_| ())? as u32;
+                    let safi = c.read_u8().map_err(|_| ())? as u32;
+                    let flags = c.read_u8().map_err(|_| ())?;
+                    let time = (c.read_u8().map_err(|_| ())? as u32) << 16
+                        | (c.read_u8().map_err(|_| ())? as u32) << 8
+                        | c.read_u8().map_err(|_| ())? as u32;
                     v.push((Family(afi << 16 | safi), flags, time));
                 }
                 Ok(Capability::LongLivedGracefulRestart(v))
             }
             Self::FQDN => {
-                if len < 1 {
+                if len < 2 {
                     return Err(());
                 }
-                let hostlen = c.read_u8().unwrap();
+                let hostlen = c.read_u8().map_err(|_| ())?;
+                // Validate total length: 1 (hostlen) + hostlen + 1 (domainlen) + domainlen
+                if hostlen as u64 + 2 > len as u64 {
+                    return Err(());
+                }
                 let mut h = Vec::new();
                 for _ in 0..hostlen {
-                    h.push(c.read_u8().unwrap());
+                    h.push(c.read_u8().map_err(|_| ())?);
                 }
                 let host = String::from_utf8(h).unwrap_or_default();
-                let domainlen = c.read_u8().unwrap();
+                let domainlen = c.read_u8().map_err(|_| ())?;
+                if 2u64 + hostlen as u64 + domainlen as u64 > len as u64 {
+                    return Err(());
+                }
                 let mut d = Vec::new();
                 for _ in 0..domainlen {
-                    d.push(c.read_u8().unwrap());
+                    d.push(c.read_u8().map_err(|_| ())?);
                 }
                 let domain = String::from_utf8(d).unwrap_or_default();
                 Ok(Capability::Fqdn {
@@ -591,7 +598,7 @@ impl Capability {
             _ => {
                 let mut bin = Vec::with_capacity(len as usize);
                 for _ in 0..len {
-                    bin.push(c.read_u8().unwrap());
+                    bin.push(c.read_u8().map_err(|_| ())?);
                 }
                 Ok(Capability::Unknown { code, bin })
             }
@@ -750,18 +757,18 @@ impl Attribute {
                 if len != 1 {
                     return Err(());
                 }
-                AttributeData::Val(c.read_u8().unwrap() as u32)
+                AttributeData::Val(c.read_u8().map_err(|_| ())? as u32)
             }
             Self::MULTI_EXIT_DESC | Self::LOCAL_PREF | Self::ORIGINATOR_ID => {
                 if len != 4 {
                     return Err(());
                 }
-                AttributeData::Val(c.read_u32::<NetworkEndian>().unwrap())
+                AttributeData::Val(c.read_u32::<NetworkEndian>().map_err(|_| ())?)
             }
             _ => {
                 let mut b = Vec::with_capacity(len.into());
                 for _ in 0..len {
-                    b.push(c.read_u8().unwrap());
+                    b.push(c.read_u8().map_err(|_| ())?);
                 }
                 AttributeData::Bin(b)
             }
@@ -1151,10 +1158,11 @@ pub fn create_channel(
         for c in v {
             if let Capability::ExtendedNexthop(v) = c {
                 for (f, nexthop_afi) in v {
-                    assert!(
-                        f.afi() == Family::AFI_IP,
-                        "RFC 8950: extended nexthop only valid for IPv4 families"
-                    );
+                    // RFC 8950: extended nexthop is only valid for IPv4 families;
+                    // skip (don't panic) if a peer advertises it for other AFIs.
+                    if f.afi() != Family::AFI_IP {
+                        continue;
+                    }
                     if *nexthop_afi == Family::AFI_IP6
                         && let Some(fc) = h.get_mut(f)
                     {
@@ -1172,7 +1180,11 @@ pub fn create_channel(
                 f,
                 Channel {
                     family: f,
-                    addpath: u8::from(lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0),
+                    addpath: {
+                        let rx = u8::from(lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0);
+                        let tx = u8::from(lc.addpath & 0x2 > 0 && rc.addpath & 0x1 > 0);
+                        rx | (tx << 1)
+                    },
                     extended_nexthop: lc.extended_nexthop & rc.extended_nexthop,
                 },
             )
@@ -1588,6 +1600,9 @@ impl PeerCodec {
     ) -> Result<PathNlri, Error> {
         let malformed: Error = BgpError::UpdateMalformedAttributeList.into();
         let id = if chan.addpath_rx() {
+            if len < 4 {
+                return Err(malformed);
+            }
             if let Ok(id) = c.read_u32::<NetworkEndian>() {
                 len -= 4;
                 id

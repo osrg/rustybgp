@@ -90,17 +90,18 @@ impl MessageCounter {
                 let _ = self.open.fetch_add(1, Ordering::Relaxed);
             }
             bgp::Message::Update(bgp::Update {
-                reach: _,
                 unreach,
-                attr: _,
+                mp_unreach,
                 ..
             }) => {
                 self.update.fetch_add(1, Ordering::Relaxed);
 
-                if let Some(s) = unreach {
+                let unreach_count = unreach.as_ref().map_or(0, |s| s.entries.len())
+                    + mp_unreach.as_ref().map_or(0, |s| s.entries.len());
+                if unreach_count > 0 {
                     self.withdraw_update.fetch_add(1, Ordering::Relaxed);
                     self.withdraw_prefix
-                        .fetch_add(s.entries.len() as u64, Ordering::Relaxed);
+                        .fetch_add(unreach_count as u64, Ordering::Relaxed);
                 }
             }
             bgp::Message::Notification(_) => {
@@ -198,6 +199,10 @@ struct Peer {
     password: Option<String>,
 
     mgmt_tx: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
+    /// Per-family send_max for Add-Path TX (RFC 7911).
+    send_max: FnvHashMap<Family, usize>,
+    /// Per-family prefix limits from config.
+    prefix_limits: FnvHashMap<Family, u32>,
 }
 
 impl Peer {
@@ -252,7 +257,9 @@ struct PeerBuilder {
     ctrl_channel: Option<mpsc::UnboundedSender<PeerMgmtMsg>>,
     multihop_ttl: Option<u8>,
     password: Option<String>,
-    families: FnvHashMap<Family, bool>,
+    families: FnvHashMap<Family, u8>,
+    send_max: FnvHashMap<Family, usize>,
+    prefix_limits: FnvHashMap<Family, u32>,
 }
 
 impl PeerBuilder {
@@ -279,6 +286,8 @@ impl PeerBuilder {
             multihop_ttl: None,
             password: None,
             families: Default::default(),
+            send_max: Default::default(),
+            prefix_limits: Default::default(),
         }
     }
 
@@ -289,7 +298,7 @@ impl PeerBuilder {
 
     fn families(&mut self, families: Vec<Family>) -> &mut Self {
         for f in families {
-            self.families.insert(f, false);
+            self.families.insert(f, 0);
         }
         self
     }
@@ -372,9 +381,13 @@ impl PeerBuilder {
         self
     }
 
-    fn addpath(&mut self, families: Vec<packet::Family>) -> &mut Self {
-        for f in families {
-            self.families.insert(f, true);
+    fn addpath(&mut self, families: Vec<(packet::Family, u8, usize)>) -> &mut Self {
+        for (f, mode, sm) in families {
+            // RFC 7911 mode is 2 bits: bit 0 = receive, bit 1 = send
+            self.families.insert(f, mode & 0x3);
+            if sm > 0 {
+                self.send_max.insert(f, sm);
+            }
         }
         self
     }
@@ -387,9 +400,9 @@ impl PeerBuilder {
             });
         } else {
             let mut addpath = Vec::new();
-            for (f, v) in &self.families {
-                if *v {
-                    addpath.push((*f, 1));
+            for (f, mode) in &self.families {
+                if *mode > 0 {
+                    addpath.push((*f, *mode));
                 }
                 self.local_cap.push(packet::Capability::MultiProtocol(*f));
             }
@@ -447,6 +460,8 @@ impl PeerBuilder {
             counter_rx: Default::default(),
             multihop_ttl: self.multihop_ttl.take(),
             password: self.password.take(),
+            send_max: std::mem::take(&mut self.send_max),
+            prefix_limits: std::mem::take(&mut self.prefix_limits),
         }
     }
 }
@@ -604,84 +619,96 @@ impl TryFrom<&api::Peer> for Peer {
     }
 }
 
-// assumes that config::Neighbor is validated so use From instead of TryFrom
-impl From<&config::Neighbor> for Peer {
-    fn from(n: &config::Neighbor) -> Peer {
-        let c = n.config.as_ref().unwrap();
+impl TryFrom<&config::Neighbor> for Peer {
+    type Error = String;
+
+    fn try_from(n: &config::Neighbor) -> Result<Peer, Self::Error> {
+        let c = n.config.as_ref().ok_or("missing neighbor config")?;
+        let afi_safis = n.afi_safis.as_deref().unwrap_or_default();
+
+        // Collect address families and add-path configuration.
         let mut families = Vec::new();
-        let addpath_families: Vec<packet::Family> = n
-            .afi_safis
-            .as_ref()
-            .map_or(Vec::new().iter(), |x| x.iter())
+        let addpath_families: Vec<(packet::Family, u8, usize)> = afi_safis
+            .iter()
             .filter(|x| {
-                x.config.as_ref().is_some_and(|x| {
-                    if let Some(f) = x.afi_safi_name.as_ref() {
-                        if (f == &config::generate::AfiSafiType::Ipv4Unicast
-                            || f == &config::generate::AfiSafiType::Ipv6Unicast)
-                            && let Ok(family) = convert::family_from_config(f)
-                        {
-                            families.push(family);
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                })
+                let name = x.config.as_ref().and_then(|c| c.afi_safi_name.as_ref());
+                let Some(f) = name else { return false };
+                if (f == &config::generate::AfiSafiType::Ipv4Unicast
+                    || f == &config::generate::AfiSafiType::Ipv6Unicast)
+                    && let Ok(family) = convert::family_from_config(f)
+                {
+                    families.push(family);
+                }
+                true
             })
             .filter_map(|x| {
-                x.add_paths.as_ref().and_then(|c| {
-                    c.config.as_ref().and_then(|c| {
-                        c.receive.as_ref().and_then(|r| {
-                            if *r {
-                                Some(x.config.as_ref().unwrap().afi_safi_name.as_ref().unwrap())
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                })
+                let ap_config = x.add_paths.as_ref()?.config.as_ref()?;
+                let rx = ap_config.receive.unwrap_or(false);
+                let send_max = ap_config.send_max.unwrap_or(0) as usize;
+                let tx = send_max > 0;
+                let mode = u8::from(rx) | (u8::from(tx) << 1);
+                if mode == 0 {
+                    return None;
+                }
+                let family =
+                    convert::family_from_config(x.config.as_ref()?.afi_safi_name.as_ref()?).ok()?;
+                Some((family, mode, send_max))
             })
-            .map(|x| convert::family_from_config(x).unwrap())
             .collect();
-        let mut builder = PeerBuilder::new(c.neighbor_address.as_ref().unwrap().parse().unwrap());
+
+        let addr_str = c
+            .neighbor_address
+            .as_ref()
+            .ok_or("missing neighbor address")?;
+        let addr = addr_str
+            .parse()
+            .map_err(|e| format!("invalid neighbor address: {}", e))?;
+        let peer_as = c.peer_as.ok_or("missing peer-as")?;
+
+        let transport_config = n.transport.as_ref().and_then(|t| t.config.as_ref());
+        let timer_config = n.timers.as_ref().and_then(|t| t.config.as_ref());
+
+        let mut builder = PeerBuilder::new(addr);
         builder
-            .local_asn(c.local_as.map_or(0, |x| x))
-            .remote_asn(c.peer_as.unwrap())
-            .remote_port(n.transport.as_ref().map_or(Global::BGP_PORT, |t| {
-                t.config.as_ref().map_or(Global::BGP_PORT, |t| {
-                    t.remote_port.map_or(Global::BGP_PORT, |n| n)
-                })
-            }))
-            .passive(n.transport.as_ref().is_some_and(|t| {
-                t.config
+            .local_asn(c.local_as.unwrap_or(0))
+            .remote_asn(peer_as)
+            .remote_port(
+                transport_config
+                    .and_then(|t| t.remote_port)
+                    .unwrap_or(Global::BGP_PORT),
+            )
+            .passive(
+                transport_config
+                    .and_then(|t| t.passive_mode)
+                    .unwrap_or(false),
+            )
+            .rs_client(
+                n.route_server
                     .as_ref()
-                    .is_some_and(|t| t.passive_mode.unwrap_or(false))
-            }))
-            .rs_client(n.route_server.as_ref().is_some_and(|r| {
-                r.config
+                    .and_then(|r| r.config.as_ref())
+                    .and_then(|r| r.route_server_client)
+                    .unwrap_or(false),
+            )
+            .holdtime(
+                timer_config
+                    .and_then(|c| c.hold_time)
+                    .map(|v| v as u64)
+                    .unwrap_or(0),
+            )
+            .connect_retry_time(
+                timer_config
+                    .and_then(|c| c.connect_retry)
+                    .map(|v| v as u64)
+                    .unwrap_or(0),
+            )
+            .admin_down(c.admin_down.unwrap_or(false))
+            .multihop_ttl(
+                n.ebgp_multihop
                     .as_ref()
-                    .is_some_and(|r| r.route_server_client.unwrap_or(false))
-            }))
-            .holdtime(n.timers.as_ref().map_or(0, |c| {
-                c.config
-                    .as_ref()
-                    .map_or(0, |c| c.hold_time.map_or(0, |c| c as u64))
-            }))
-            .connect_retry_time(n.timers.as_ref().map_or(0, |c| {
-                c.config
-                    .as_ref()
-                    .map_or(0, |c| c.connect_retry.map_or(0, |c| c as u64))
-            }))
-            .admin_down(c.admin_down.is_some_and(|c| c))
-            .multihop_ttl(n.ebgp_multihop.as_ref().map_or(0, |c| {
-                c.config.as_ref().map_or(0, |c| {
-                    if let Some(ttl) = c.multihop_ttl {
-                        c.enabled.map_or(0, |_c| ttl)
-                    } else {
-                        0
-                    }
-                })
-            }));
+                    .and_then(|m| m.config.as_ref())
+                    .and_then(|c| c.enabled.and(c.multihop_ttl))
+                    .unwrap_or(0),
+            );
         if let Some(password) = c.auth_password.as_ref() {
             builder.password(password);
         }
@@ -689,7 +716,24 @@ impl From<&config::Neighbor> for Peer {
         builder.families(families);
         builder.addpath(addpath_families);
 
-        builder.build()
+        // Extract per-family prefix limits.
+        for afi_safi in afi_safis {
+            let prefix_max = |pl: &Option<config::generate::PrefixLimit>| -> Option<u32> {
+                pl.as_ref()?.config.as_ref()?.max_prefixes
+            };
+            if let Some(v4) = &afi_safi.ipv4_unicast
+                && let Some(max) = prefix_max(&v4.prefix_limit)
+            {
+                builder.prefix_limits.insert(packet::Family::IPV4, max);
+            }
+            if let Some(v6) = &afi_safi.ipv6_unicast
+                && let Some(max) = prefix_max(&v6.prefix_limit)
+            {
+                builder.prefix_limits.insert(packet::Family::IPV6, max);
+            }
+        }
+
+        Ok(builder.build())
     }
 }
 
@@ -2700,6 +2744,8 @@ impl Global {
             peer.state.clone(),
             peer.counter_tx.clone(),
             peer.counter_rx.clone(),
+            peer.send_max.clone(),
+            peer.prefix_limits.clone(),
         )
         .map(|h| (h, mgmt_rx))
     }
@@ -2912,9 +2958,14 @@ impl Global {
         if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
             let mut server = GLOBAL.write().await;
             for p in peers {
-                server
-                    .add_peer(Peer::from(p), Some(active_tx.clone()))
-                    .unwrap();
+                match Peer::try_from(p) {
+                    Ok(peer) => {
+                        let _ = server.add_peer(peer, Some(active_tx.clone()));
+                    }
+                    Err(e) => {
+                        eprintln!("skipping invalid peer config: {}", e);
+                    }
+                }
             }
         }
         if any_peer {
@@ -3041,182 +3092,177 @@ impl Table {
         hasher.finish() as usize % *NUM_TABLES
     }
 
+    fn has_addpath(&self, addr: &IpAddr, family: &Family) -> bool {
+        self.addpath.get(addr).is_some_and(|e| e.contains(family))
+    }
+
+    fn send_bmp_update(
+        &self,
+        source: &table::Source,
+        family: Family,
+        nets: &[packet::PathNlri],
+        attrs: Option<&Arc<Vec<packet::Attribute>>>,
+    ) {
+        let addpath = self.has_addpath(&source.remote_addr, &family);
+        let header = bmp::PerPeerHeader::new(
+            source.remote_asn,
+            Ipv4Addr::from(source.router_id),
+            0,
+            source.remote_addr,
+            source.uptime as u32,
+        );
+        let update = if let Some(attrs) = attrs {
+            bgp::Message::Update(bgp::Update {
+                reach: Some(packet::bgp::NlriSet {
+                    family,
+                    entries: nets.to_owned(),
+                }),
+                mp_reach: None,
+                attr: attrs.clone(),
+                unreach: None,
+                mp_unreach: None,
+            })
+        } else {
+            bgp::Message::Update(bgp::Update {
+                reach: None,
+                mp_reach: None,
+                attr: Arc::new(Vec::new()),
+                unreach: None,
+                mp_unreach: Some(packet::bgp::NlriSet {
+                    family,
+                    entries: nets.to_owned(),
+                }),
+            })
+        };
+        for bmp_tx in self.bmp_event_tx.values() {
+            let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
+                header: header.clone(),
+                update: update.clone(),
+                addpath,
+            });
+        }
+    }
+
+    fn send_mrt_update(
+        &self,
+        source: &table::Source,
+        family: Family,
+        nets: &[packet::PathNlri],
+        attrs: Option<&Arc<Vec<packet::Attribute>>>,
+    ) {
+        let Some(mrt_tx) = self.mrt_event_tx.as_ref() else {
+            return;
+        };
+        let addpath = self.has_addpath(&source.remote_addr, &family);
+        let header = mrt::MpHeader::new(
+            source.remote_asn,
+            source.local_asn,
+            0,
+            source.remote_addr,
+            source.local_addr,
+            true,
+        );
+        let body = if let Some(attrs) = attrs {
+            bgp::Message::Update(bgp::Update {
+                reach: Some(packet::bgp::NlriSet {
+                    family,
+                    entries: nets.to_owned(),
+                }),
+                mp_reach: None,
+                attr: attrs.clone(),
+                unreach: None,
+                mp_unreach: None,
+            })
+        } else {
+            bgp::Message::Update(bgp::Update {
+                reach: None,
+                mp_reach: None,
+                attr: Arc::new(Vec::new()),
+                unreach: None,
+                mp_unreach: Some(packet::bgp::NlriSet {
+                    family,
+                    entries: nets.to_owned(),
+                }),
+            })
+        };
+        let _ = mrt_tx.send(mrt::Message::Mp {
+            header,
+            body,
+            addpath,
+        });
+    }
+
     async fn serve(idx: usize, mut v: Vec<UnboundedReceiverStream<TableEvent>>) {
         loop {
             let mut futures: FuturesUnordered<_> = v.iter_mut().map(|rx| rx.next()).collect();
             if let Some(Some(msg)) = futures.next().await {
                 match msg {
-                    TableEvent::PassUpdate(source, family, nets, attrs) => match attrs {
-                        Some(attrs) => {
-                            let mut t = TABLE[idx].lock().await;
-                            for bmp_tx in t.bmp_event_tx.values() {
-                                let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
-                                    e.contains(&family)
-                                } else {
-                                    false
-                                };
-                                let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
-                                    header: bmp::PerPeerHeader::new(
-                                        source.remote_asn,
-                                        Ipv4Addr::from(source.router_id),
-                                        0,
-                                        source.remote_addr,
-                                        source.uptime as u32,
-                                    ),
-                                    update: bgp::Message::Update(bgp::Update {
-                                        reach: Some(packet::bgp::NlriSet {
-                                            family,
-                                            entries: nets.to_owned(),
-                                        }),
-                                        mp_reach: None,
-                                        attr: attrs.clone(),
-                                        unreach: None,
-                                        mp_unreach: None,
-                                    }),
-                                    addpath,
-                                });
-                            }
-                            if let Some(mrt_tx) = t.mrt_event_tx.as_ref() {
-                                let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
-                                    e.contains(&family)
-                                } else {
-                                    false
-                                };
-                                let msg = mrt::Message::Mp {
-                                    header: mrt::MpHeader::new(
-                                        source.remote_asn,
-                                        source.local_asn,
-                                        0,
-                                        source.remote_addr,
-                                        source.local_addr,
-                                        true,
-                                    ),
-                                    body: bgp::Message::Update(bgp::Update {
-                                        reach: Some(packet::bgp::NlriSet {
-                                            family,
-                                            entries: nets.to_owned(),
-                                        }),
-                                        mp_reach: None,
-                                        attr: attrs.clone(),
-                                        unreach: None,
-                                        mp_unreach: None,
-                                    }),
-                                    addpath,
-                                };
-                                let _ = mrt_tx.send(msg);
-                            }
+                    TableEvent::PassUpdate(source, family, nets, attrs) => {
+                        let mut t = TABLE[idx].lock().await;
+                        t.send_bmp_update(&source, family, &nets, attrs.as_ref());
+                        t.send_mrt_update(&source, family, &nets, attrs.as_ref());
 
-                            for net in nets {
-                                let mut filtered = false;
-                                if let Some(a) = t.global_import_policy.as_ref()
-                                    && t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
-                                        == table::Disposition::Reject
-                                {
-                                    filtered = true;
-                                }
-                                if let Some(ri) = t.rtable.insert(
-                                    source.clone(),
-                                    family,
-                                    net.nlri,
-                                    net.path_id,
-                                    attrs.clone(),
-                                    filtered,
-                                ) {
-                                    if let Some(a) = t.global_export_policy.as_ref()
-                                        && t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
-                                            == table::Disposition::Reject
-                                    {
-                                        continue;
+                        match attrs {
+                            Some(attrs) => {
+                                for net in nets {
+                                    let filtered =
+                                        t.global_import_policy.as_ref().is_some_and(|a| {
+                                            t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
+                                                == table::Disposition::Reject
+                                        });
+                                    let changes = t.rtable.insert(
+                                        source.clone(),
+                                        family,
+                                        net.nlri,
+                                        net.path_id,
+                                        attrs.clone(),
+                                        filtered,
+                                    );
+                                    for ri in changes {
+                                        if t.global_export_policy.as_ref().is_some_and(|a| {
+                                            t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
+                                                == table::Disposition::Reject
+                                        }) {
+                                            continue;
+                                        }
+                                        for c in t.peer_event_tx.values() {
+                                            let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
+                                        }
                                     }
-                                    for c in t.peer_event_tx.values() {
-                                        let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
-                                    }
                                 }
                             }
-                        }
-                        None => {
-                            let mut t = TABLE[idx].lock().await;
-                            for bmp_tx in t.bmp_event_tx.values() {
-                                let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
-                                    e.contains(&family)
-                                } else {
-                                    false
-                                };
-                                let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
-                                    header: bmp::PerPeerHeader::new(
-                                        source.remote_asn,
-                                        Ipv4Addr::from(source.router_id),
-                                        0,
-                                        source.remote_addr,
-                                        source.uptime as u32,
-                                    ),
-                                    update: packet::bgp::Message::Update(packet::bgp::Update {
-                                        reach: None,
-                                        mp_reach: None,
-                                        attr: Arc::new(Vec::new()),
-                                        unreach: None,
-                                        mp_unreach: Some(packet::bgp::NlriSet {
-                                            family,
-                                            entries: nets.to_owned(),
-                                        }),
-                                    }),
-                                    addpath,
-                                });
-                            }
-                            if let Some(mrt_tx) = t.mrt_event_tx.as_ref() {
-                                let addpath = if let Some(e) = t.addpath.get(&source.remote_addr) {
-                                    e.contains(&family)
-                                } else {
-                                    false
-                                };
-                                let msg = mrt::Message::Mp {
-                                    header: mrt::MpHeader::new(
-                                        source.remote_asn,
-                                        source.local_asn,
-                                        0,
-                                        source.remote_addr,
-                                        source.local_addr,
-                                        true,
-                                    ),
-                                    body: bgp::Message::Update(bgp::Update {
-                                        reach: None,
-                                        mp_reach: None,
-                                        attr: Arc::new(Vec::new()),
-                                        unreach: None,
-                                        mp_unreach: Some(packet::bgp::NlriSet {
-                                            family,
-                                            entries: nets.to_owned(),
-                                        }),
-                                    }),
-                                    addpath,
-                                };
-                                let _ = mrt_tx.send(msg);
-                            }
-                            for net in nets {
-                                if let Some(ri) =
-                                    t.rtable
-                                        .remove(source.clone(), family, net.nlri, net.path_id)
-                                {
-                                    for c in t.peer_event_tx.values() {
-                                        if let Some(a) = t.global_export_policy.as_ref()
-                                            && t.rtable.apply_policy(
+                            None => {
+                                let empty_attrs = Arc::new(Vec::new());
+                                for net in nets {
+                                    let changes = t.rtable.remove(
+                                        source.clone(),
+                                        family,
+                                        net.nlri,
+                                        net.path_id,
+                                    );
+                                    for ri in changes {
+                                        if t.global_export_policy.as_ref().is_some_and(|a| {
+                                            t.rtable.apply_policy(
                                                 a,
                                                 &source,
                                                 &net.nlri,
-                                                &Arc::new(Vec::new()),
+                                                &empty_attrs,
                                             ) == table::Disposition::Reject
-                                        {
+                                        }) {
                                             continue;
                                         }
-                                        let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
+                                        for c in t.peer_event_tx.values() {
+                                            let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
+                                        }
                                     }
                                 }
                             }
                         }
-                    },
+                    }
                     TableEvent::Disconnected(source) => {
                         let mut t = TABLE[idx].lock().await;
-                        for change in t.rtable.drop(source) {
+                        let changes = t.rtable.drop(source.clone());
+                        for change in changes {
                             for c in t.peer_event_tx.values() {
                                 let _ = c.send(ToPeerEvent::Advertise(change.clone()));
                             }
@@ -3329,6 +3375,10 @@ struct Handler {
     peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
     holdtimer_renewed: Instant,
     shutdown: Option<bmp::PeerDownReason>,
+    /// Per-family send_max for Add-Path TX (RFC 7911).
+    send_max: FnvHashMap<Family, usize>,
+    /// Per-family prefix limits from config.
+    prefix_limits: FnvHashMap<Family, u32>,
 }
 
 impl Handler {
@@ -3343,6 +3393,8 @@ impl Handler {
         state: Arc<PeerState>,
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
+        send_max: FnvHashMap<Family, usize>,
+        prefix_limits: FnvHashMap<Family, u32>,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         Some(Handler {
@@ -3367,7 +3419,287 @@ impl Handler {
             peer_event_tx: Vec::new(),
             holdtimer_renewed: Instant::now(),
             shutdown: None,
+            send_max,
+            prefix_limits,
         })
+    }
+
+    async fn on_established(
+        &mut self,
+        codec: &bgp::PeerCodec,
+        local_sockaddr: SocketAddr,
+        remote_sockaddr: SocketAddr,
+        pending: &mut FnvHashMap<Family, PendingTx>,
+    ) {
+        let uptime = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.state.uptime.store(uptime, Ordering::Relaxed);
+        let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
+        self.state
+            .fsm
+            .store(SessionState::Established as u8, Ordering::Release);
+        self.source = Some(Arc::new(table::Source::new(
+            self.remote_addr,
+            self.local_addr,
+            remote_asn,
+            self.local_asn,
+            Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed)),
+            uptime,
+            self.rs_client,
+        )));
+
+        let mut addpath = FnvHashSet::default();
+        for (family, c) in &codec.channel {
+            if c.addpath_rx() {
+                addpath.insert(*family);
+            }
+            pending.insert(
+                *family,
+                PendingTx {
+                    sync: true,
+                    addpath_tx: c.addpath_tx(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let d = Table::dealer(self.remote_addr);
+        for i in 0..*NUM_TABLES {
+            let mut t = TABLE[i].lock().await;
+
+            // Populate initial routes for each negotiated family.
+            for f in codec.channel.keys() {
+                for c in t.rtable.best(f).into_iter() {
+                    if t.global_export_policy.as_ref().is_some_and(|a| {
+                        t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
+                            == table::Disposition::Reject
+                    }) {
+                        continue;
+                    }
+                    pending.get_mut(f).unwrap().insert_change(c);
+                }
+            }
+
+            // Register per-peer prefix limits.
+            for (f, max) in &self.prefix_limits {
+                t.rtable.set_prefix_limit(self.remote_addr, *f, *max);
+            }
+
+            t.peer_event_tx
+                .insert(self.remote_addr, self.peer_event_tx.remove(0));
+            if !addpath.is_empty() {
+                t.addpath.insert(self.remote_addr, addpath.clone());
+            }
+
+            let tx = t.table_event_tx[d].clone();
+            self.table_tx.push(tx);
+
+            // Send BMP PeerUp from the first table partition only.
+            if i == 0 {
+                self.send_bmp_peer_up(&t, remote_asn, uptime, local_sockaddr, remote_sockaddr)
+                    .await;
+            }
+        }
+    }
+
+    async fn send_bmp_peer_up(
+        &self,
+        t: &Table,
+        remote_asn: u32,
+        uptime: u64,
+        local_sockaddr: SocketAddr,
+        remote_sockaddr: SocketAddr,
+    ) {
+        let remote_id = self.state.remote_id.load(Ordering::Relaxed);
+        let remote_holdtime = HoldTime::new(self.state.remote_holdtime.load(Ordering::Relaxed))
+            .unwrap_or(HoldTime::DISABLED);
+        for bmp_tx in t.bmp_event_tx.values() {
+            let bmp_msg = bmp::Message::PeerUp {
+                header: bmp::PerPeerHeader::new(
+                    remote_asn,
+                    Ipv4Addr::from(remote_id),
+                    0,
+                    remote_sockaddr.ip(),
+                    uptime as u32,
+                ),
+                local_addr: self.local_addr,
+                local_port: local_sockaddr.port(),
+                remote_port: remote_sockaddr.port(),
+                remote_open: bgp::Message::Open(bgp::Open {
+                    as_number: remote_asn,
+                    holdtime: remote_holdtime,
+                    router_id: remote_id,
+                    capability: self.state.remote_cap.read().await.to_owned(),
+                }),
+                local_open: bgp::Message::Open(bgp::Open {
+                    as_number: remote_asn,
+                    holdtime: remote_holdtime,
+                    router_id: remote_id,
+                    capability: self.local_cap.to_owned(),
+                }),
+            };
+            let _ = bmp_tx.send(bmp_msg);
+        }
+    }
+
+    async fn flush_tx(
+        &mut self,
+        stream: &mut TcpStream,
+        framer: &mut BgpFramer,
+        txbuf_size: usize,
+        urgent: &mut Vec<bgp::Message>,
+        pending: &mut FnvHashMap<Family, PendingTx>,
+    ) {
+        // 1. Flush urgent (open, keepalive, notification) messages.
+        let mut txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+        for _ in 0..urgent.len() {
+            let msg = urgent.remove(0);
+            let _ = framer.encode_to(&msg, &mut txbuf);
+            (*self.counter_tx).sync(&msg);
+
+            if txbuf.len() > txbuf_size {
+                let buf = txbuf.freeze();
+                txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                if stream.write_all(&buf).await.is_err() {
+                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                    return;
+                }
+            }
+        }
+        if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
+            self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+            return;
+        }
+
+        // 2. Flush pending withdrawals.
+        for (family, p) in pending.iter_mut() {
+            let addpath_tx = framer
+                .inner()
+                .channel
+                .get(family)
+                .is_some_and(|c| c.addpath_tx());
+            let unreach: Vec<packet::PathNlri> = p
+                .unreach
+                .drain()
+                .map(|(nlri, pid)| packet::PathNlri {
+                    path_id: if addpath_tx { pid } else { 0 },
+                    nlri,
+                })
+                .collect();
+            if !unreach.is_empty() {
+                txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                let msg = bgp::Message::Update(bgp::Update {
+                    reach: None,
+                    mp_reach: None,
+                    attr: Arc::new(Vec::new()),
+                    unreach: None,
+                    mp_unreach: Some(packet::NlriSet {
+                        family: *family,
+                        entries: unreach,
+                    }),
+                });
+                let _ = framer.encode_to(&msg, &mut txbuf);
+                self.counter_tx.sync(&msg);
+                if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
+                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                    return;
+                }
+            }
+        }
+
+        // 3. Flush pending reach updates (batched by attribute).
+        txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+        let max_tx_count = 2048;
+        let mut sent: FnvHashMap<Family, Vec<Arc<Vec<packet::Attribute>>>> = FnvHashMap::default();
+        for (family, p) in pending.iter_mut() {
+            let addpath_tx = framer
+                .inner()
+                .channel
+                .get(family)
+                .is_some_and(|c| c.addpath_tx());
+            let use_mp = framer
+                .inner()
+                .channel
+                .get(family)
+                .is_some_and(|c| c.extended_nexthop());
+            for (attr, reach) in p.bucket.iter() {
+                let nlri_set = packet::NlriSet {
+                    family: *family,
+                    entries: reach
+                        .iter()
+                        .copied()
+                        .map(|(nlri, pid)| packet::PathNlri {
+                            path_id: if addpath_tx { pid } else { 0 },
+                            nlri,
+                        })
+                        .collect(),
+                };
+                // RFC 8950: use MP_REACH_NLRI for IPv4 when extended nexthop is negotiated
+                let (reach, mp_reach) = if use_mp {
+                    (None, Some(nlri_set))
+                } else {
+                    (Some(nlri_set), None)
+                };
+                let msg = bgp::Message::Update(bgp::Update {
+                    reach,
+                    mp_reach,
+                    attr: attr.clone(),
+                    unreach: None,
+                    mp_unreach: None,
+                });
+                let _ = framer.encode_to(&msg, &mut txbuf);
+                self.counter_tx.sync(&msg);
+                sent.entry(*family)
+                    .or_insert_with(|| Vec::with_capacity(max_tx_count))
+                    .push(attr.clone());
+
+                if txbuf.len() > txbuf_size {
+                    let buf = txbuf.freeze();
+                    txbuf = bytes::BytesMut::with_capacity(txbuf_size);
+                    if stream.write_all(&buf).await.is_err() {
+                        self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                        return;
+                    }
+                }
+
+                if sent.len() > max_tx_count {
+                    break;
+                }
+            }
+        }
+        if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
+            self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+            return;
+        }
+
+        // 4. Remove sent entries from pending maps.
+        for (family, mut s) in sent {
+            for attr in s.drain(..) {
+                let p = pending.get_mut(&family).unwrap();
+                let mut bucket = p.bucket.remove(&attr).unwrap();
+                for net in bucket.drain() {
+                    let _ = p.reach.remove(&net).unwrap();
+                }
+            }
+        }
+
+        // 5. Send EOR markers for families that have completed initial sync.
+        if self.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
+            for (family, p) in pending.iter_mut() {
+                if p.sync && p.is_empty() {
+                    p.sync = false;
+                    let mut b = bytes::BytesMut::with_capacity(txbuf_size);
+                    let eor = bgp::Message::eor(*family);
+                    let _ = framer.encode_to(&eor, &mut b);
+                    if stream.write_all(&b.freeze()).await.is_err() {
+                        self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     async fn rx_update(
@@ -3436,8 +3768,52 @@ impl Handler {
                     return Ok(());
                 }
                 self.state.remote_asn.store(as_number, Ordering::Relaxed);
+                // Collect locally-configured Add-Path families before negotiation
+                let local_addpath: Vec<(packet::Family, u8)> = self
+                    .local_cap
+                    .iter()
+                    .filter_map(|c| {
+                        if let packet::Capability::AddPath(v) = c {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .flatten()
+                    .collect();
+
                 for (f, c) in bgp::create_channel(&self.local_cap, &capability) {
                     codec.channel.insert(f, c);
+                }
+
+                // Drop send_max for families where Add-Path TX was not negotiated
+                self.send_max
+                    .retain(|f, _| codec.channel.get(f).is_some_and(|c| c.addpath_tx()));
+
+                // Warn when locally-configured Add-Path was not negotiated
+                for (family, mode) in &local_addpath {
+                    match codec.channel.get(family) {
+                        Some(ch) => {
+                            if mode & 0x1 > 0 && !ch.addpath_rx() {
+                                eprintln!(
+                                    "add-path receive configured for {:?} but not negotiated with peer {}",
+                                    family, self.remote_addr
+                                );
+                            }
+                            if mode & 0x2 > 0 && !ch.addpath_tx() {
+                                eprintln!(
+                                    "add-path send configured for {:?} but not negotiated with peer {}",
+                                    family, self.remote_addr
+                                );
+                            }
+                        }
+                        None => {
+                            eprintln!(
+                                "add-path configured for {:?} but family not negotiated with peer {}",
+                                family, self.remote_addr
+                            );
+                        }
+                    }
                 }
 
                 self.state.remote_cap.write().await.append(&mut capability);
@@ -3454,9 +3830,10 @@ impl Handler {
             }
             bgp::Message::Update(bgp::Update {
                 reach,
+                mp_reach,
                 attr,
                 unreach,
-                ..
+                mp_unreach,
             }) => {
                 let session_state = self.state.fsm.load(Ordering::Relaxed);
                 if session_state != SessionState::Established as u8 {
@@ -3468,7 +3845,8 @@ impl Handler {
                     ));
                 }
                 self.holdtimer_renewed = Instant::now();
-                self.rx_update(reach, unreach, attr).await;
+                self.rx_update(reach, unreach, attr.clone()).await;
+                self.rx_update(mp_reach, mp_unreach, attr).await;
                 Ok(())
             }
             bgp::Message::Notification(err) => {
@@ -3486,99 +3864,8 @@ impl Handler {
             bgp::Message::Keepalive => {
                 self.holdtimer_renewed = Instant::now();
                 if self.state.fsm.load(Ordering::Relaxed) == SessionState::OpenConfirm as u8 {
-                    let uptime = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    self.state.uptime.store(uptime, Ordering::Relaxed);
-                    let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
-                    self.state
-                        .fsm
-                        .store(SessionState::Established as u8, Ordering::Release);
-                    self.source = Some(Arc::new(table::Source::new(
-                        self.remote_addr,
-                        self.local_addr,
-                        remote_asn,
-                        self.local_asn,
-                        Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed)),
-                        uptime,
-                        self.rs_client,
-                    )));
-                    let mut addpath = FnvHashSet::default();
-                    for (family, c) in &codec.channel {
-                        if c.addpath_rx() {
-                            addpath.insert(*family);
-                        }
-                        pending.insert(
-                            *family,
-                            PendingTx {
-                                sync: true,
-                                ..Default::default()
-                            },
-                        );
-                    }
-
-                    let d = Table::dealer(self.remote_addr);
-                    for i in 0..*NUM_TABLES {
-                        let mut t = TABLE[i].lock().await;
-                        for f in codec.channel.keys() {
-                            for c in t.rtable.best(f).into_iter() {
-                                if let Some(a) = t.global_export_policy.as_ref()
-                                    && t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
-                                        == table::Disposition::Reject
-                                {
-                                    continue;
-                                }
-                                pending.get_mut(f).unwrap().insert_change(c);
-                            }
-                        }
-                        t.peer_event_tx
-                            .insert(self.remote_addr, self.peer_event_tx.remove(0));
-                        if !addpath.is_empty() {
-                            t.addpath.insert(self.remote_addr, addpath.clone());
-                        }
-
-                        let tx = t.table_event_tx[d].clone();
-                        self.table_tx.push(tx);
-
-                        if i == 0 {
-                            for bmp_tx in t.bmp_event_tx.values() {
-                                let bmp_msg = bmp::Message::PeerUp {
-                                    header: bmp::PerPeerHeader::new(
-                                        remote_asn,
-                                        Ipv4Addr::from(
-                                            self.state.remote_id.load(Ordering::Relaxed),
-                                        ),
-                                        0,
-                                        remote_sockaddr.ip(),
-                                        uptime as u32,
-                                    ),
-                                    local_addr: self.local_addr,
-                                    local_port: local_sockaddr.port(),
-                                    remote_port: remote_sockaddr.port(),
-                                    remote_open: bgp::Message::Open(bgp::Open {
-                                        as_number: remote_asn,
-                                        holdtime: HoldTime::new(
-                                            self.state.remote_holdtime.load(Ordering::Relaxed),
-                                        )
-                                        .unwrap_or(HoldTime::DISABLED),
-                                        router_id: self.state.remote_id.load(Ordering::Relaxed),
-                                        capability: self.state.remote_cap.read().await.to_owned(),
-                                    }),
-                                    local_open: bgp::Message::Open(bgp::Open {
-                                        as_number: remote_asn,
-                                        holdtime: HoldTime::new(
-                                            self.state.remote_holdtime.load(Ordering::Relaxed),
-                                        )
-                                        .unwrap_or(HoldTime::DISABLED),
-                                        router_id: self.state.remote_id.load(Ordering::Relaxed),
-                                        capability: self.local_cap.to_owned(),
-                                    }),
-                                };
-                                let _ = bmp_tx.send(bmp_msg);
-                            }
-                        }
-                    }
+                    self.on_established(codec, local_sockaddr, remote_sockaddr, pending)
+                        .await;
                 }
                 Ok(())
             }
@@ -3689,6 +3976,24 @@ impl Handler {
                                 if !framer.inner().channel.contains_key(&ri.family) {
                                     continue;
                                 }
+                                // Filter changes that exceed this peer's effective send_max.
+                                // Note: ranks are 1-based for all changes (including withdrawals); there is no special rank=0.
+                                let effective_max = self.send_max.get(&ri.family).copied().unwrap_or(1);
+                                if ri.rank > effective_max {
+                                    // For Add-Path peers, a previously-advertised path that
+                                    // dropped out of this peer's window needs an explicit
+                                    // withdrawal (path_ids are independent; unlike non-Add-Path
+                                    // where path_id=0 means the new best implicitly replaces).
+                                    if self.send_max.contains_key(&ri.family) && !ri.attr.is_empty() {
+                                        pending_update.get_mut(&ri.family).unwrap().insert_change(
+                                            table::Change {
+                                                attr: Arc::new(Vec::new()),
+                                                ..ri
+                                            },
+                                        );
+                                    }
+                                    continue;
+                                }
                                 pending_update.get_mut(&ri.family).unwrap().insert_change(ri);
                             }
                         }
@@ -3737,115 +4042,7 @@ impl Handler {
                     }
 
                     if ready.is_writable() {
-                        let mut txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                        for _ in 0..urgent.len() {
-                            let msg = urgent.remove(0);
-                            let _ = framer.encode_to(&msg, &mut txbuf);
-                            (*self.counter_tx).sync(&msg);
-
-                            if txbuf.len() > txbuf_size {
-                                let buf = txbuf.freeze();
-                                txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                                if stream.write_all(&buf).await.is_err() {
-                                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                                    break;
-                                }
-                            }
-                        }
-                        if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
-                            self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                        }
-
-                        for (family, p) in &mut pending_update {
-                            let unreach: Vec<packet::PathNlri> = p.unreach.drain().map(packet::PathNlri::new).collect();
-                            if !unreach.is_empty() {
-                                txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                                let msg = bgp::Message::Update(bgp::Update {
-                                    reach: None,
-                                    mp_reach: None,
-                                    attr: Arc::new(Vec::new()),
-                                    unreach: None,
-                                    mp_unreach: Some(packet::NlriSet { family: *family, entries: unreach }),
-                                });
-                                let _ = framer.encode_to(&msg, &mut txbuf);
-                                self.counter_tx.sync(&msg);
-                                if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
-                                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                                }
-                            }
-                        }
-
-                        txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                        let max_tx_count = 2048;
-                        let mut sent = FnvHashMap::default();
-                        for (family, p) in &mut pending_update {
-                            for (attr, reach) in p.bucket.iter() {
-                                let nlri_set = packet::NlriSet { family: *family, entries: reach.iter().copied().map(packet::PathNlri::new).collect() };
-                                // RFC 8950: use MP_REACH_NLRI for IPv4 when extended nexthop is negotiated
-                                let use_mp = framer.inner().channel.get(family).is_some_and(|c| c.extended_nexthop());
-                                let msg = if use_mp {
-                                    bgp::Message::Update(bgp::Update {
-                                        reach: None,
-                                        mp_reach: Some(nlri_set),
-                                        attr: attr.clone(),
-                                        unreach: None,
-                                        mp_unreach: None,
-                                    })
-                                } else {
-                                    bgp::Message::Update(bgp::Update {
-                                        reach: Some(nlri_set),
-                                        mp_reach: None,
-                                        attr: attr.clone(),
-                                        unreach: None,
-                                        mp_unreach: None,
-                                    })
-                                };
-                                let _ = framer.encode_to(&msg, &mut txbuf);
-                                self.counter_tx.sync(&msg);
-                                sent.entry(*family).or_insert_with(|| Vec::with_capacity(max_tx_count)).push(attr.clone());
-
-                                if txbuf.len() > txbuf_size {
-                                    let buf = txbuf.freeze();
-                                    txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                                    if stream.write_all(&buf).await.is_err() {
-                                        self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                                        break;
-                                    }
-                                }
-
-                                if sent.len() > max_tx_count {
-                                    break;
-                                }
-                            }
-                        }
-                        if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
-                            self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                        }
-
-                        for (family, mut s) in sent {
-                            for attr in s.drain(..) {
-                                let p = pending_update.get_mut(&family).unwrap();
-                                let mut bucket = p.bucket.remove(&attr).unwrap();
-                                for net in bucket.drain() {
-                                    let _ = p.reach.remove(&net).unwrap();
-                                }
-                            }
-                        }
-
-                        if self.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
-                            for (family, p) in &mut pending_update {
-                                if p.sync && p.is_empty() {
-                                    p.sync = false;
-                                    let mut b = bytes::BytesMut::with_capacity(txbuf_size);
-                                    let eor = bgp::Message::eor(*family);
-                                    let _ = framer.encode_to(&eor, &mut b);
-                                    if stream.write_all(&b.freeze()).await.is_err() {
-                                        self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        self.flush_tx(&mut stream, &mut framer, txbuf_size, &mut urgent, &mut pending_update).await;
                     }
                 }
             }
@@ -3892,12 +4089,17 @@ impl Handler {
     }
 }
 
+/// Key for PendingTx maps: (NLRI, path_id). path_id distinguishes
+/// multiple paths for the same prefix under RFC 7911 Add-Path.
+type PendingKey = (packet::Nlri, u32);
+
 #[derive(Default)]
 struct PendingTx {
-    reach: FnvHashMap<packet::Nlri, Arc<Vec<packet::Attribute>>>,
-    unreach: FnvHashSet<packet::Nlri>,
-    bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<packet::Nlri>>,
+    reach: FnvHashMap<PendingKey, Arc<Vec<packet::Attribute>>>,
+    unreach: FnvHashSet<PendingKey>,
+    bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<PendingKey>>,
     sync: bool,
+    addpath_tx: bool,
 }
 
 impl PendingTx {
@@ -3906,60 +4108,41 @@ impl PendingTx {
     }
 
     fn insert_change(&mut self, change: table::Change) {
+        let pid = if self.addpath_tx { change.path_id } else { 0 };
+        let key: PendingKey = (change.net, pid);
         if change.attr.is_empty() {
-            if let Some(attr) = self.reach.remove(&change.net) {
+            if let Some(attr) = self.reach.remove(&key) {
                 let set = self.bucket.get_mut(&attr).unwrap();
-                let b = set.remove(&change.net);
+                let b = set.remove(&key);
                 assert!(b);
                 if set.is_empty() {
                     self.bucket.remove(&attr);
                 }
             }
-            self.unreach.insert(change.net);
+            self.unreach.insert(key);
         } else {
-            self.unreach.remove(&change.net);
+            self.unreach.remove(&key);
 
-            // a) net doesn't exists in reach
-            // a-1) the attr exists in bucket (with other nets)
-            //  -> add the net to reach with the attr
-            //  -> add the net to the attr bucket
-            // a-2) the attr doesn't exist either in bucket
-            //  -> add the net to reach with the attr
-            //  -> create attr bucket and the net to add it
-            //
-            // b) net already exists in reach
-            // b-1) the old attr in reach same to the attr
-            //  -> nothing to do
-            // b-2) the old attr in reach not same to the attr
-            // b-2-1) the attr exists in bucket
-            //  -> update the net's attr in reach
-            //  -> remove the net from the old attr bucket
-            //  -> add the net to the attr bucket
-            // b-2-2) the attr doesn't exist in bucket
-            //  -> update the net's attr in reach
-            //  -> remove the net from the old attr bucket
-            //  -> create attr bucket add he net to it
-
-            if let Some(old_attr) = self.reach.insert(change.net, change.attr.clone()) {
-                // b-1)
+            if let Some(old_attr) = self.reach.insert(key, change.attr.clone()) {
+                // b-1) same attr → no-op
                 if old_attr == change.attr {
                     return;
                 }
 
-                // b-2-1) and b-2-2)
+                // b-2) different attr → move between buckets
                 let old_bucket = self.bucket.get_mut(&old_attr).unwrap();
-                let b = old_bucket.remove(&change.net);
+                let b = old_bucket.remove(&key);
                 assert!(b);
                 if old_bucket.is_empty() {
                     self.bucket.remove(&old_attr);
                 }
 
                 let bucket = self.bucket.entry(change.attr).or_default();
-                bucket.insert(change.net);
+                bucket.insert(key);
             } else {
-                // a-1) and a-2)
+                // a) new key
                 let bucket = self.bucket.entry(change.attr).or_default();
-                bucket.insert(change.net);
+                bucket.insert(key);
             }
         }
     }
@@ -3983,13 +4166,18 @@ fn bucket() {
 
     let attr1 = vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap()];
 
-    let mut pending = PendingTx::default();
+    let mut pending = PendingTx {
+        addpath_tx: true,
+        ..Default::default()
+    };
 
     pending.insert_change(table::Change {
         source: src.clone(),
         family,
         net: net1,
         attr: Arc::new(attr1.clone()),
+        path_id: 1,
+        rank: 1,
     });
 
     pending.insert_change(table::Change {
@@ -3999,6 +4187,8 @@ fn bucket() {
         attr: Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]),
+        path_id: 1,
+        rank: 1,
     });
 
     // a-1) and a-2) properly marged?
@@ -4016,6 +4206,8 @@ fn bucket() {
         attr: Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]),
+        path_id: 1,
+        rank: 1,
     });
     assert_eq!(1, pending.bucket.len());
     assert_eq!(
@@ -4032,9 +4224,11 @@ fn bucket() {
         attr: Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap(),
         ]),
+        path_id: 1,
+        rank: 1,
     });
     assert_eq!(2, pending.bucket.len());
-    assert_eq!(&Arc::new(attr2), pending.reach.get(&net2).unwrap());
+    assert_eq!(&Arc::new(attr2), pending.reach.get(&(net2, 1)).unwrap());
     assert_eq!(
         1,
         pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()

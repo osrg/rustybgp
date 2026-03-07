@@ -1,0 +1,72 @@
+networks:
+  left-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.5.0/24
+          gateway: 172.30.5.254
+
+  right-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.6.0/24
+          gateway: 172.30.6.254
+
+services:
+  # FRR sender 1 (AS 65002): advertises 192.168.100.0/24
+  frr-sender:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.frr
+      args:
+        FRR_CONF_DIR: tests/e2e/rfc7911/frr-sender
+    container_name: frr-sender
+    privileged: true
+    networks:
+      left-net:
+        ipv4_address: 172.30.5.2
+
+  # FRR sender 2 (AS 65004): also advertises 192.168.100.0/24 (different AS path)
+  frr-sender2:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.frr
+      args:
+        FRR_CONF_DIR: tests/e2e/rfc7911/frr-sender2
+    container_name: frr-sender2
+    privileged: true
+    networks:
+      left-net:
+        ipv4_address: 172.30.5.3
+
+  # rustybgp: receives paths from both senders, sends add-path to receiver
+  router-rusty:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.rustybgp
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: router-rusty
+    privileged: true
+    networks:
+      left-net:
+        ipv4_address: 172.30.5.1
+      right-net:
+        ipv4_address: 172.30.6.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+
+  # FRR receiver: receives add-path from rustybgp
+  frr-receiver:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.frr
+      args:
+        FRR_CONF_DIR: tests/e2e/rfc7911/frr-receiver
+    container_name: frr-receiver
+    privileged: true
+    networks:
+      right-net:
+        ipv4_address: 172.30.6.2
