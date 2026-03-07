@@ -221,14 +221,23 @@ impl Destination {
 
     fn alloc_path_id(&mut self) -> u32 {
         if self.entry.is_empty() {
+            // Fast path: when there are no active paths, just reset to 1.
             self.next_path_id = 1;
         }
-        let id = self.next_path_id;
-        self.next_path_id = self.next_path_id.wrapping_add(1);
-        if self.next_path_id == 0 {
-            self.next_path_id = 1;
+
+        loop {
+            let id = self.next_path_id;
+            // Advance and maintain the original wrap/skip-0 behavior.
+            self.next_path_id = self.next_path_id.wrapping_add(1);
+            if self.next_path_id == 0 {
+                self.next_path_id = 1;
+            }
+
+            // Ensure we do not reuse an ID that is still in use by an active path.
+            if !self.entry.iter().any(|p| p.path_id == id) {
+                return id;
+            }
         }
-        id
     }
 
     fn unfiltered_best(&self) -> Option<&Path> {
