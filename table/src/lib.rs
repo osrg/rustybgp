@@ -234,7 +234,7 @@ impl Destination {
             }
 
             // Ensure we do not reuse an ID that is still in use by an active path.
-            if !self.entry.iter().any(|p| p.path_id == id) {
+            if !self.entry.iter().any(|p| p.local_path_id == id) {
                 return id;
             }
         }
