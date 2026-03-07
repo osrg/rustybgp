@@ -3471,7 +3471,11 @@ impl Handler {
 
             // Populate initial routes for each negotiated family.
             for f in codec.channel.keys() {
+                let effective_max = self.send_max.get(f).copied().unwrap_or(1);
                 for c in t.rtable.best(f).into_iter() {
+                    if c.rank > effective_max {
+                        continue;
+                    }
                     if t.global_export_policy.as_ref().is_some_and(|a| {
                         t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
                             == table::Disposition::Reject
