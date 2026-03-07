@@ -2968,12 +2968,14 @@ impl Global {
         if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
             let mut server = GLOBAL.write().await;
             for p in peers {
-                server
-                    .add_peer(
-                        Peer::try_from(p).expect("validated config should produce valid Peer"),
-                        Some(active_tx.clone()),
-                    )
-                    .unwrap();
+                match Peer::try_from(p) {
+                    Ok(peer) => {
+                        let _ = server.add_peer(peer, Some(active_tx.clone()));
+                    }
+                    Err(e) => {
+                        eprintln!("skipping invalid peer config: {}", e);
+                    }
+                }
             }
         }
         if any_peer {
