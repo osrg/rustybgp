@@ -3616,8 +3616,9 @@ impl Handler {
         // 3. Flush pending reach updates (batched by attribute).
         txbuf = bytes::BytesMut::with_capacity(txbuf_size);
         let max_tx_count = 2048;
+        let mut updates_sent = 0usize;
         let mut sent: FnvHashMap<Family, Vec<Arc<Vec<packet::Attribute>>>> = FnvHashMap::default();
-        for (family, p) in pending.iter_mut() {
+        'flush: for (family, p) in pending.iter_mut() {
             let addpath_tx = framer
                 .inner()
                 .channel
@@ -3655,9 +3656,9 @@ impl Handler {
                 });
                 let _ = framer.encode_to(&msg, &mut txbuf);
                 self.counter_tx.sync(&msg);
-                sent.entry(*family)
-                    .or_insert_with(|| Vec::with_capacity(max_tx_count))
-                    .push(attr.clone());
+                sent.entry(*family).or_default().push(attr.clone());
+
+                updates_sent += 1;
 
                 if txbuf.len() > txbuf_size {
                     let buf = txbuf.freeze();
@@ -3668,8 +3669,8 @@ impl Handler {
                     }
                 }
 
-                if sent.len() > max_tx_count {
-                    break;
+                if updates_sent >= max_tx_count {
+                    break 'flush;
                 }
             }
         }
