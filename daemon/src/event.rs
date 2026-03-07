@@ -3848,7 +3848,7 @@ impl Handler {
                                     continue;
                                 }
                                 // Filter changes that exceed this peer's effective send_max.
-                                // rank=0 means withdrawal (always relevant).
+                                // Note: ranks are 1-based for all changes (including withdrawals); there is no special rank=0.
                                 let effective_max = self.send_max.get(&ri.family).copied().unwrap_or(1);
                                 if ri.rank > effective_max {
                                     continue;
