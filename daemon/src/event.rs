@@ -90,17 +90,18 @@ impl MessageCounter {
                 let _ = self.open.fetch_add(1, Ordering::Relaxed);
             }
             bgp::Message::Update(bgp::Update {
-                reach: _,
                 unreach,
-                attr: _,
+                mp_unreach,
                 ..
             }) => {
                 self.update.fetch_add(1, Ordering::Relaxed);
 
-                if let Some(s) = unreach {
+                let unreach_count = unreach.as_ref().map_or(0, |s| s.entries.len())
+                    + mp_unreach.as_ref().map_or(0, |s| s.entries.len());
+                if unreach_count > 0 {
                     self.withdraw_update.fetch_add(1, Ordering::Relaxed);
                     self.withdraw_prefix
-                        .fetch_add(s.entries.len() as u64, Ordering::Relaxed);
+                        .fetch_add(unreach_count as u64, Ordering::Relaxed);
                 }
             }
             bgp::Message::Notification(_) => {
@@ -3592,9 +3593,10 @@ impl Handler {
             }
             bgp::Message::Update(bgp::Update {
                 reach,
+                mp_reach,
                 attr,
                 unreach,
-                ..
+                mp_unreach,
             }) => {
                 let session_state = self.state.fsm.load(Ordering::Relaxed);
                 if session_state != SessionState::Established as u8 {
@@ -3606,7 +3608,8 @@ impl Handler {
                     ));
                 }
                 self.holdtimer_renewed = Instant::now();
-                self.rx_update(reach, unreach, attr).await;
+                self.rx_update(reach, unreach, attr.clone()).await;
+                self.rx_update(mp_reach, mp_unreach, attr).await;
                 Ok(())
             }
             bgp::Message::Notification(err) => {
@@ -3842,6 +3845,12 @@ impl Handler {
                                     continue;
                                 }
                                 if !framer.inner().channel.contains_key(&ri.family) {
+                                    continue;
+                                }
+                                // Filter changes that exceed this peer's effective send_max.
+                                // rank=0 means withdrawal (always relevant).
+                                let effective_max = self.send_max.get(&ri.family).copied().unwrap_or(1);
+                                if ri.rank > effective_max {
                                     continue;
                                 }
                                 pending_update.get_mut(&ri.family).unwrap().insert_change(ri);
@@ -4137,6 +4146,7 @@ fn bucket() {
         net: net1,
         attr: Arc::new(attr1.clone()),
         path_id: 1,
+        rank: 1,
     });
 
     pending.insert_change(table::Change {
@@ -4147,6 +4157,7 @@ fn bucket() {
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]),
         path_id: 1,
+        rank: 1,
     });
 
     // a-1) and a-2) properly marged?
@@ -4165,6 +4176,7 @@ fn bucket() {
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]),
         path_id: 1,
+        rank: 1,
     });
     assert_eq!(1, pending.bucket.len());
     assert_eq!(
@@ -4182,6 +4194,7 @@ fn bucket() {
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap(),
         ]),
         path_id: 1,
+        rank: 1,
     });
     assert_eq!(2, pending.bucket.len());
     assert_eq!(&Arc::new(attr2), pending.reach.get(&(net2, 1)).unwrap());

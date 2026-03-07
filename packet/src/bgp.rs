@@ -538,7 +538,7 @@ impl Capability {
                     let afi = c.read_u16::<NetworkEndian>().map_err(|_| ())? as u32;
                     let safi = c.read_u8().map_err(|_| ())? as u32;
                     let val = c.read_u8().map_err(|_| ())?;
-                    if val > 3 {
+                    if val == 0 || val > 3 {
                         continue;
                     }
                     v.push((Family(afi << 16 | safi), val));

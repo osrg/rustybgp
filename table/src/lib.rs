@@ -303,6 +303,9 @@ pub struct Change {
     pub attr: Arc<Vec<packet::Attribute>>,
     /// Stable per-path identifier for Add-Path TX. 0 when Add-Path is not used.
     pub path_id: u32,
+    /// 1-based rank within the top-N (1 = best). Peers use this to filter
+    /// changes that exceed their effective send_max.
+    pub rank: usize,
 }
 
 impl From<Change> for bgp::Message {
@@ -424,13 +427,14 @@ impl RoutingTable {
             Some(t) => {
                 let mut v = Vec::with_capacity(t.len());
                 for (net, dst) in t {
-                    for p in dst.unfiltered_top_n(n) {
+                    for (i, p) in dst.unfiltered_top_n(n).iter().enumerate() {
                         v.push(Change {
                             source: p.source.clone(),
                             family: *family,
                             net: *net,
                             attr: p.pa.attr.clone(),
                             path_id: p.local_path_id,
+                            rank: i + 1,
                         });
                     }
                 }
@@ -785,12 +789,14 @@ impl RoutingTable {
             // Withdraw all previously-advertised paths using their stable IDs
             return old_top
                 .iter()
-                .map(|e| Change {
+                .enumerate()
+                .map(|(i, e)| Change {
                     source: e.source.clone(),
                     family,
                     net,
                     attr: Arc::new(Vec::new()),
                     path_id: e.local_path_id,
+                    rank: i + 1,
                 })
                 .collect();
         }
@@ -812,7 +818,7 @@ impl RoutingTable {
         let mut changes = Vec::new();
 
         // Withdraw: paths in old_top whose local_path_id is absent from new_top
-        for old in old_top {
+        for (i, old) in old_top.iter().enumerate() {
             let still_present = new_top.iter().any(|p| p.local_path_id == old.local_path_id);
             if !still_present {
                 changes.push(Change {
@@ -821,12 +827,14 @@ impl RoutingTable {
                     net,
                     attr: Arc::new(Vec::new()),
                     path_id: old.local_path_id,
+                    rank: i + 1,
                 });
             }
         }
 
         // Advertise: paths in new_top that are new or have changed attributes
-        for p in &new_top {
+        for (i, p) in new_top.iter().enumerate() {
+            let rank = i + 1;
             let old_entry = old_top.iter().find(|o| o.local_path_id == p.local_path_id);
             match old_entry {
                 None => {
@@ -837,6 +845,7 @@ impl RoutingTable {
                         net,
                         attr: p.pa.attr.clone(),
                         path_id: p.local_path_id,
+                        rank,
                     });
                 }
                 Some(old) => {
@@ -848,6 +857,7 @@ impl RoutingTable {
                             net,
                             attr: p.pa.attr.clone(),
                             path_id: p.local_path_id,
+                            rank,
                         });
                     }
                 }
@@ -886,13 +896,14 @@ impl RoutingTable {
 
                 if dst.entry.is_empty() {
                     // Withdraw all previously-advertised paths using their stable IDs
-                    for e in &old_top {
+                    for (i, e) in old_top.iter().enumerate() {
                         advertise.push(Change {
                             source: e.source.clone(),
                             family: *family,
                             net: *net,
                             attr: Arc::new(Vec::new()),
                             path_id: e.local_path_id,
+                            rank: i + 1,
                         });
                     }
                     return false;
