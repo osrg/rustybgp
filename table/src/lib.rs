@@ -663,23 +663,8 @@ impl RoutingTable {
             }
         }
 
-        // Reuse the old stable path ID on replacement; allocate a new one otherwise.
-        let local_path_id = if let Some(ref old) = replaced {
-            old.local_path_id
-        } else {
-            dst.alloc_path_id()
-        };
-
-        let path = Path {
-            source: source.clone(),
-            id: remote_id,
-            local_path_id,
-            pa: PathAttribute::new(attr),
-            timestamp: SystemTime::now(),
-            flags,
-        };
-
         // Reject new paths (not replacements) when the per-prefix limit is reached.
+        // Check before allocating a path ID to avoid wasting IDs on dropped paths.
         if replaced.is_none() && dst.entry.len() >= MAX_PATHS_PER_DESTINATION {
             // Still count the route as received so stats reflect actual wire traffic.
             let (received, _accepted) = self
@@ -695,6 +680,22 @@ impl RoutingTable {
             );
             return Vec::new();
         }
+
+        // Reuse the old stable path ID on replacement; allocate a new one otherwise.
+        let local_path_id = if let Some(ref old) = replaced {
+            old.local_path_id
+        } else {
+            dst.alloc_path_id()
+        };
+
+        let path = Path {
+            source: source.clone(),
+            id: remote_id,
+            local_path_id,
+            pa: PathAttribute::new(attr),
+            timestamp: SystemTime::now(),
+            flags,
+        };
 
         let (received, accepted) = self
             .route_stats
