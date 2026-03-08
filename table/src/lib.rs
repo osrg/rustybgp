@@ -311,6 +311,8 @@ pub struct Change {
     /// 1-based rank within the top-N (1 = best). Peers use this to filter
     /// changes that exceed their effective send_max.
     pub rank: usize,
+    /// Previous 1-based rank before this change (0 = path was not previously present).
+    pub old_rank: usize,
 }
 
 impl From<Change> for bgp::Message {
@@ -435,6 +437,7 @@ impl RoutingTable {
                             attr: p.pa.attr.clone(),
                             path_id: p.local_path_id,
                             rank: i + 1,
+                            old_rank: 0,
                         });
                     }
                 }
@@ -771,6 +774,7 @@ impl RoutingTable {
                     attr: Arc::new(Vec::new()),
                     path_id: e.local_path_id,
                     rank: i + 1,
+                    old_rank: i + 1,
                 })
                 .collect();
         }
@@ -801,6 +805,7 @@ impl RoutingTable {
                     attr: Arc::new(Vec::new()),
                     path_id: old.local_path_id,
                     rank: i + 1,
+                    old_rank: i + 1,
                 });
             }
         }
@@ -819,15 +824,16 @@ impl RoutingTable {
                         attr: p.pa.attr.clone(),
                         path_id: p.local_path_id,
                         rank,
+                        old_rank: 0,
                     });
                 }
-                Some(old) => {
+                Some(_) => {
                     let old_rank = old_top
                         .iter()
                         .position(|o| o.local_path_id == p.local_path_id)
                         .unwrap()
                         + 1;
-                    if !same_top_entry(old, p) || rank != old_rank {
+                    if !same_top_entry(&old_top[old_rank - 1], p) || rank != old_rank {
                         // Attributes changed or rank shifted — re-advertise so
                         // peers whose send_max window now includes (or excludes)
                         // this path can update accordingly.
@@ -838,6 +844,7 @@ impl RoutingTable {
                             attr: p.pa.attr.clone(),
                             path_id: p.local_path_id,
                             rank,
+                            old_rank,
                         });
                     }
                 }
@@ -875,6 +882,7 @@ impl RoutingTable {
                             attr: Arc::new(Vec::new()),
                             path_id: e.local_path_id,
                             rank: i + 1,
+                            old_rank: i + 1,
                         });
                     }
                     return false;

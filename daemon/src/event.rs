@@ -3985,11 +3985,12 @@ impl Handler {
                                 // Note: ranks are 1-based for all changes (including withdrawals); there is no special rank=0.
                                 let effective_max = self.send_max.get(&ri.family).copied().unwrap_or(1);
                                 if ri.rank > effective_max {
-                                    // For Add-Path peers, a previously-advertised path that
-                                    // dropped out of this peer's window needs an explicit
-                                    // withdrawal (path_ids are independent; unlike non-Add-Path
-                                    // where path_id=0 means the new best implicitly replaces).
-                                    if self.send_max.contains_key(&ri.family) && !ri.attr.is_empty() {
+                                    // Only withdraw if the path was previously within
+                                    // this peer's window (old_rank <= effective_max).
+                                    if self.send_max.contains_key(&ri.family)
+                                        && ri.old_rank > 0
+                                        && ri.old_rank <= effective_max
+                                    {
                                         pending_update.get_mut(&ri.family).unwrap().insert_change(
                                             table::Change {
                                                 attr: Arc::new(Vec::new()),
@@ -4183,6 +4184,7 @@ fn bucket() {
         attr: Arc::new(attr1.clone()),
         path_id: 1,
         rank: 1,
+        old_rank: 0,
     });
 
     pending.insert_change(table::Change {
@@ -4194,6 +4196,7 @@ fn bucket() {
         ]),
         path_id: 1,
         rank: 1,
+        old_rank: 0,
     });
 
     // a-1) and a-2) properly marged?
@@ -4213,6 +4216,7 @@ fn bucket() {
         ]),
         path_id: 1,
         rank: 1,
+        old_rank: 0,
     });
     assert_eq!(1, pending.bucket.len());
     assert_eq!(
@@ -4231,6 +4235,7 @@ fn bucket() {
         ]),
         path_id: 1,
         rank: 1,
+        old_rank: 0,
     });
     assert_eq!(2, pending.bucket.len());
     assert_eq!(&Arc::new(attr2), pending.reach.get(&(net2, 1)).unwrap());
