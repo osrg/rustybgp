@@ -161,8 +161,8 @@ impl Neighbor {
                     && sm > 32
                 {
                     return Err(ConfigError::InvalidConfiguration(format!(
-                        "send-max {} exceeds maximum of 32",
-                        sm
+                        "neighbor {} afi-safi {:?}: send-max {} exceeds maximum of 32",
+                        addr, afi_safi, sm
                     )));
                 }
             }
