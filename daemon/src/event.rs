@@ -2960,7 +2960,9 @@ impl Global {
             for p in peers {
                 match Peer::try_from(p) {
                     Ok(peer) => {
-                        let _ = server.add_peer(peer, Some(active_tx.clone()));
+                        if let Err(e) = server.add_peer(peer, Some(active_tx.clone())) {
+                            eprintln!("failed to add peer from config: {}", e);
+                        }
                     }
                     Err(e) => {
                         eprintln!("skipping invalid peer config: {}", e);
