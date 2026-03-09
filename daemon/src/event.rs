@@ -19,6 +19,7 @@ use arc_swap::ArcSwapOption;
 use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
+use tracing::Instrument;
 use once_cell::sync::Lazy;
 use std::boxed::Box;
 use std::collections::HashSet;
@@ -2667,6 +2668,7 @@ impl Global {
         }
     }
 
+    #[tracing::instrument(skip(self, peer, tx), fields(peer = %peer.remote_addr))]
     fn add_peer(
         &mut self,
         mut peer: Peer,
@@ -2701,6 +2703,7 @@ impl Global {
         Ok(())
     }
 
+    #[tracing::instrument(skip(stream), level = "debug")]
     async fn accept_connection(
         stream: TcpStream,
     ) -> Option<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)> {
@@ -3096,6 +3099,8 @@ impl Global {
         assert_ne!(incomings.len(), 0);
         let mut next_peer_taker = 0;
         let nr_takers = conn_tx.len();
+        let mut stats_timer = tokio::time::interval(Duration::from_secs(60));
+        stats_timer.tick().await; // consume the immediate first tick
         loop {
             let mut bgp_listen_futures = FuturesUnordered::new();
             for incoming in &mut incomings {
@@ -3119,6 +3124,28 @@ impl Global {
                             }
                             next_peer_taker = (next_peer_taker + 1) % nr_takers;
                         }
+                }
+                _ = stats_timer.tick().fuse() => {
+                    let global = GLOBAL.read().await;
+                    let total = global.peers.len();
+                    let established = global.peers.values()
+                        .filter(|p| p.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8)
+                        .count();
+                    let mut routes_v4 = 0u64;
+                    let mut routes_v6 = 0u64;
+                    drop(global);
+                    for i in 0..*NUM_TABLES {
+                        let t = TABLE[i].lock().await;
+                        routes_v4 += t.rtable.state(Family::IPV4).num_destination as u64;
+                        routes_v6 += t.rtable.state(Family::IPV6).num_destination as u64;
+                    }
+                    tracing::info!(
+                        peers_total = total,
+                        peers_established = established,
+                        routes_v4 = routes_v4,
+                        routes_v6 = routes_v6,
+                        "periodic stats"
+                    );
                 }
             }
         }
@@ -3404,9 +3431,12 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
                         if let Some((mut h, mgmt_rx)) = rx.recv().await {
                             let active_conn_tx = active_conn_tx.clone();
 
+                            let peer_addr = h.remote_addr;
+                            let span = tracing::info_span!("peer", addr = %peer_addr);
                             tokio::spawn(async move {
-                                let peer_addr = h.remote_addr;
-                                let _ = h.run(mgmt_rx).await;
+                                if let Err(e) = h.run(mgmt_rx).await {
+                                    tracing::warn!(error = %e, "BGP session ended with error");
+                                }
                                 let mut server = GLOBAL.write().await;
                                 if let Some(peer) = server.peers.get_mut(&peer_addr) {
                                     if peer.delete_on_disconnected {
@@ -3416,7 +3446,7 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
                                         enable_active_connect(peer, active_conn_tx.clone());
                                     }
                                 }
-                            });
+                            }.instrument(span));
                         }
                     }
                 })
@@ -3506,6 +3536,7 @@ impl Handler {
         })
     }
 
+    #[tracing::instrument(skip(self, codec, pending), level = "debug")]
     async fn on_established(
         &mut self,
         codec: &bgp::PeerCodec,
@@ -3520,7 +3551,7 @@ impl Handler {
         self.state.uptime.store(uptime, Ordering::Relaxed);
         let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
         tracing::info!(
-            peer = %self.remote_addr, remote_asn = remote_asn,
+            remote_asn = remote_asn,
             holdtime = self.negotiated_holdtime,
             "BGP session established"
         );
@@ -3568,7 +3599,7 @@ impl Handler {
                         t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
                             == table::Disposition::Reject
                     }) {
-                        tracing::trace!(peer = %self.remote_addr, nlri = ?c.net, "export policy rejected initial route");
+                        tracing::trace!(nlri = ?c.net, "export policy rejected initial route");
                         continue;
                     }
                     pending.get_mut(f).unwrap().insert_change(c);
@@ -3634,7 +3665,7 @@ impl Handler {
                 }),
             };
             if bmp_tx.send(bmp_msg).is_err() {
-                tracing::debug!(peer = %self.remote_addr, "BMP PeerUp channel closed");
+                tracing::debug!("BMP PeerUp channel closed");
             }
         }
     }
@@ -3652,7 +3683,7 @@ impl Handler {
         for _ in 0..urgent.len() {
             let msg = urgent.remove(0);
             if let Err(e) = framer.encode_to(&msg, &mut txbuf) {
-                tracing::error!(peer = %self.remote_addr, error = %e, "failed to encode urgent BGP message");
+                tracing::error!(error = %e, "failed to encode urgent BGP message");
             }
             (*self.counter_tx).sync(&msg);
 
@@ -3660,7 +3691,7 @@ impl Handler {
                 let buf = txbuf.freeze();
                 txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                 if let Err(e) = stream.write_all(&buf).await {
-                    tracing::error!(peer = %self.remote_addr, error = %e, "TCP write failed for urgent message");
+                    tracing::error!(error = %e, "TCP write failed for urgent message");
                     self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                     return;
                 }
@@ -3668,7 +3699,7 @@ impl Handler {
         }
         if !txbuf.is_empty() {
             if let Err(e) = stream.write_all(&txbuf.freeze()).await {
-                tracing::error!(peer = %self.remote_addr, error = %e, "TCP write failed flushing urgent messages");
+                tracing::error!(error = %e, "TCP write failed flushing urgent messages");
                 self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                 return;
             }
@@ -3702,12 +3733,12 @@ impl Handler {
                     }),
                 });
                 if let Err(e) = framer.encode_to(&msg, &mut txbuf) {
-                    tracing::error!(peer = %self.remote_addr, error = %e, "failed to encode withdrawal UPDATE");
+                    tracing::error!(error = %e, "failed to encode withdrawal UPDATE");
                 }
                 self.counter_tx.sync(&msg);
                 if !txbuf.is_empty() {
                     if let Err(e) = stream.write_all(&txbuf.freeze()).await {
-                        tracing::error!(peer = %self.remote_addr, error = %e, "TCP write failed for withdrawal");
+                        tracing::error!(error = %e, "TCP write failed for withdrawal");
                         self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         return;
                     }
@@ -3757,7 +3788,7 @@ impl Handler {
                     mp_unreach: None,
                 });
                 if let Err(e) = framer.encode_to(&msg, &mut txbuf) {
-                    tracing::error!(peer = %self.remote_addr, error = %e, "failed to encode reach UPDATE");
+                    tracing::error!(error = %e, "failed to encode reach UPDATE");
                 }
                 self.counter_tx.sync(&msg);
                 sent.entry(*family).or_default().push(attr.clone());
@@ -3768,7 +3799,7 @@ impl Handler {
                     let buf = txbuf.freeze();
                     txbuf = bytes::BytesMut::with_capacity(txbuf_size);
                     if let Err(e) = stream.write_all(&buf).await {
-                        tracing::error!(peer = %self.remote_addr, error = %e, "TCP write failed for reach update");
+                        tracing::error!(error = %e, "TCP write failed for reach update");
                         self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         return;
                     }
@@ -3781,7 +3812,7 @@ impl Handler {
         }
         if !txbuf.is_empty() {
             if let Err(e) = stream.write_all(&txbuf.freeze()).await {
-                tracing::error!(peer = %self.remote_addr, error = %e, "TCP write failed flushing reach updates");
+                tracing::error!(error = %e, "TCP write failed flushing reach updates");
                 self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                 return;
             }
@@ -3806,11 +3837,11 @@ impl Handler {
                     let mut b = bytes::BytesMut::with_capacity(txbuf_size);
                     let eor = bgp::Message::eor(*family);
                     if let Err(e) = framer.encode_to(&eor, &mut b) {
-                        tracing::error!(peer = %self.remote_addr, family = ?family, error = %e, "failed to encode EOR");
+                        tracing::error!(family = ?family, error = %e, "failed to encode EOR");
                     }
-                    tracing::debug!(peer = %self.remote_addr, family = ?family, "sending EOR");
+                    tracing::debug!(family = ?family, "sending EOR");
                     if let Err(e) = stream.write_all(&b.freeze()).await {
-                        tracing::error!(peer = %self.remote_addr, error = %e, "TCP write failed for EOR");
+                        tracing::error!(error = %e, "TCP write failed for EOR");
                         self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         return;
                     }
@@ -3835,7 +3866,7 @@ impl Handler {
                     vec![net],
                     Some(attr.clone()),
                 )).is_err() {
-                    tracing::warn!(peer = %self.remote_addr, "table channel closed, cannot forward reach update");
+                    tracing::warn!("table channel closed, cannot forward reach update");
                 }
             }
         }
@@ -3849,7 +3880,7 @@ impl Handler {
                     vec![net],
                     None,
                 )).is_err() {
-                    tracing::warn!(peer = %self.remote_addr, "table channel closed, cannot forward withdrawal");
+                    tracing::warn!("table channel closed, cannot forward withdrawal");
                 }
             }
         }
@@ -3872,7 +3903,7 @@ impl Handler {
                 mut capability,
             }) => {
                 tracing::debug!(
-                    peer = %self.remote_addr, remote_asn = as_number,
+                    remote_asn = as_number,
                     remote_router_id = %Ipv4Addr::from(router_id),
                     holdtime = holdtime.seconds(),
                     "received BGP OPEN"
@@ -3923,20 +3954,20 @@ impl Handler {
                         Some(ch) => {
                             if mode & 0x1 > 0 && !ch.addpath_rx() {
                                 tracing::warn!(
-                                    peer = %self.remote_addr, family = ?family,
+                                    family = ?family,
                                     "add-path receive configured but not negotiated"
                                 );
                             }
                             if mode & 0x2 > 0 && !ch.addpath_tx() {
                                 tracing::warn!(
-                                    peer = %self.remote_addr, family = ?family,
+                                    family = ?family,
                                     "add-path send configured but not negotiated"
                                 );
                             }
                         }
                         None => {
                             tracing::warn!(
-                                peer = %self.remote_addr, family = ?family,
+                                family = ?family,
                                 "add-path configured but address family not negotiated"
                             );
                         }
@@ -3971,7 +4002,7 @@ impl Handler {
                         .into(),
                     ));
                 }
-                tracing::trace!(peer = %self.remote_addr, "received UPDATE");
+                tracing::trace!("received UPDATE");
                 self.holdtimer_renewed = Instant::now();
                 self.rx_update(reach, unreach, attr.clone()).await;
                 self.rx_update(mp_reach, mp_unreach, attr).await;
@@ -3979,7 +4010,6 @@ impl Handler {
             }
             bgp::Message::Notification(err) => {
                 tracing::warn!(
-                    peer = %self.remote_addr,
                     code = err.notification_code(),
                     subcode = err.notification_subcode(),
                     "received BGP NOTIFICATION"
@@ -3990,7 +4020,7 @@ impl Handler {
                 Ok(())
             }
             bgp::Message::Keepalive => {
-                tracing::trace!(peer = %self.remote_addr, "received KEEPALIVE");
+                tracing::trace!("received KEEPALIVE");
                 self.holdtimer_renewed = Instant::now();
                 if self.state.fsm.load(Ordering::Relaxed) == SessionState::OpenConfirm as u8 {
                     self.on_established(codec, local_sockaddr, remote_sockaddr, pending)
@@ -4006,7 +4036,7 @@ impl Handler {
         &mut self,
         mut mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>,
     ) -> Result<(), Error> {
-        tracing::debug!(peer = %self.remote_addr, "BGP session handler starting");
+        tracing::debug!("BGP session handler starting");
         let mut stream = self.stream.take().unwrap();
         let remote_sockaddr = stream.peer_addr()?;
         let local_sockaddr = stream.local_addr()?;
@@ -4088,7 +4118,7 @@ impl Handler {
                 _ = holdtime_futures.next() => {
                     let elapsed = self.holdtimer_renewed.elapsed().as_secs();
                     if elapsed > self.negotiated_holdtime + 20 {
-                        tracing::warn!(peer = %self.remote_addr, elapsed_secs = self.holdtimer_renewed.elapsed().as_secs(), "hold timer expired");
+                        tracing::warn!(elapsed_secs = self.holdtimer_renewed.elapsed().as_secs(), "hold timer expired");
                         break;
                     }
                     holdtime_futures.push(tokio::time::sleep(Duration::from_secs(self.negotiated_holdtime - elapsed + 10)));
@@ -4190,7 +4220,7 @@ impl Handler {
             }
         }
         if let Some(source) = self.source.take() {
-            tracing::info!(peer = %self.remote_addr, "BGP session disconnected");
+            tracing::info!("BGP session disconnected");
             for i in 0..*NUM_TABLES {
                 let mut t = TABLE[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
