@@ -3221,10 +3221,13 @@ impl Table {
                                         filtered,
                                     );
                                     for ri in changes {
-                                        if t.global_export_policy.as_ref().is_some_and(|a| {
-                                            t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
-                                                == table::Disposition::Reject
-                                        }) {
+                                        if !ri.attr.is_empty()
+                                            && t.global_export_policy.as_ref().is_some_and(|a| {
+                                                t.rtable
+                                                    .apply_policy(a, &ri.source, &ri.net, &ri.attr)
+                                                    == table::Disposition::Reject
+                                            })
+                                        {
                                             continue;
                                         }
                                         for c in t.peer_event_tx.values() {
