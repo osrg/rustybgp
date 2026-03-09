@@ -1856,35 +1856,10 @@ impl GoBgpService for GrpcService {
             ));
         }
         let interval = request.rotation_interval;
-        if GLOBAL_MRT_EVENT_TX.load().is_some() {
-            return Err(tonic::Status::new(
-                tonic::Code::AlreadyExists,
-                "mrt dumper already enabled",
-            ));
-        }
-        let mut d = MrtDumper::new(&request.filename, interval);
-        let file = tokio::fs::File::create(std::path::Path::new(&d.pathname()))
-            .await
-            .map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Internal,
-                    format!("failed to create mrt dump file: {e}"),
-                )
-            })?;
-        {
-            let _global = GLOBAL.write().await;
-            if GLOBAL_MRT_EVENT_TX.load().is_some() {
-                return Err(tonic::Status::new(
-                    tonic::Code::AlreadyExists,
-                    "mrt dumper already enabled",
-                ));
-            }
-            let (tx, rx) = mpsc::unbounded_channel();
-            GLOBAL_MRT_EVENT_TX.store(Some(Arc::new(tx)));
-            tokio::spawn(async move {
-                d.serve_with_rx(file, rx).await;
-            });
-        }
+        tokio::spawn(async move {
+            let mut d = MrtDumper::new(&request.filename, interval);
+            d.serve().await;
+        });
         Ok(tonic::Response::new(api::EnableMrtResponse {}))
     }
     async fn disable_mrt(
@@ -2068,11 +2043,17 @@ impl MrtDumper {
         }
     }
 
-    async fn serve_with_rx(
-        &mut self,
-        mut file: tokio::fs::File,
-        rx: mpsc::UnboundedReceiver<mrt::Message>,
-    ) {
+    async fn serve(&mut self) {
+        let mut file = tokio::fs::File::create(std::path::Path::new(&self.pathname()))
+            .await
+            .unwrap();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        for i in 0..*NUM_TABLES {
+            let mut t = TABLE[i].lock().await;
+            t.mrt_event_tx = Some(tx.clone());
+        }
+
         let mut codec = mrt::MrtCodec::new();
         let mut rx = UnboundedReceiverStream::new(rx);
         let interval = if self.interval == 0 {
@@ -2085,13 +2066,10 @@ impl MrtDumper {
         loop {
             tokio::select! {
                 msg = rx.next() => {
-                    match msg {
-                        Some(msg) => {
-                            let mut buf = bytes::BytesMut::with_capacity(8192);
-                            codec.encode(&msg, &mut buf).unwrap();
-                            let _ = file.write_all(&buf).await;
-                        }
-                        None => break,
+                    if let Some(msg) = msg {
+                        let mut buf = bytes::BytesMut::with_capacity(8192);
+                        codec.encode(&msg, &mut buf).unwrap();
+                        let _ = file.write_all(&buf).await;
                     }
                 }
                 _ = timer.tick().fuse() => {
@@ -2103,7 +2081,6 @@ impl MrtDumper {
                 }
             }
         }
-        GLOBAL_MRT_EVENT_TX.store(None);
     }
 }
 
@@ -2579,8 +2556,6 @@ static NUM_TABLES: Lazy<usize> = Lazy::new(|| num_cpus::get() / 2);
 static GLOBAL: Lazy<RwLock<Global>> = Lazy::new(|| RwLock::new(Global::new()));
 static GLOBAL_IMPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
 static GLOBAL_EXPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
-static GLOBAL_MRT_EVENT_TX: ArcSwapOption<mpsc::UnboundedSender<mrt::Message>> =
-    ArcSwapOption::const_empty();
 static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
     let mut table = Vec::with_capacity(*NUM_TABLES);
     for _ in 0..*NUM_TABLES {
@@ -2589,6 +2564,7 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
             peer_event_tx: FnvHashMap::default(),
             table_event_tx: Vec::new(),
             bmp_event_tx: FnvHashMap::default(),
+            mrt_event_tx: None,
             addpath: FnvHashMap::default(),
         }));
     }
@@ -2813,25 +2789,12 @@ impl Global {
                         continue;
                     }
                     if let Some(filename) = config.file_name.as_ref() {
-                        if GLOBAL_MRT_EVENT_TX.load().is_some() {
-                            println!("mrt dumper already enabled, skipping");
-                            continue;
-                        }
                         let interval = config.rotation_interval.as_ref().map_or(0, |x| *x);
                         let filename = filename.clone();
-                        let mut d = MrtDumper::new(&filename, interval);
-                        match tokio::fs::File::create(std::path::Path::new(&d.pathname())).await {
-                            Ok(file) => {
-                                let (tx, rx) = mpsc::unbounded_channel();
-                                GLOBAL_MRT_EVENT_TX.store(Some(Arc::new(tx)));
-                                tokio::spawn(async move {
-                                    d.serve_with_rx(file, rx).await;
-                                });
-                            }
-                            Err(e) => {
-                                println!("failed to create mrt dump file: {e}");
-                            }
-                        }
+                        tokio::spawn(async move {
+                            let mut d = MrtDumper::new(&filename, interval);
+                            d.serve().await;
+                        });
                     } else {
                         println!("mrt dump filename needs to be specified");
                     }
@@ -3117,6 +3080,7 @@ struct Table {
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
     table_event_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
     bmp_event_tx: FnvHashMap<SocketAddr, mpsc::UnboundedSender<bmp::Message>>,
+    mrt_event_tx: Option<mpsc::UnboundedSender<mrt::Message>>,
     addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
 }
 
@@ -3185,8 +3149,7 @@ impl Table {
         nets: &[packet::PathNlri],
         attrs: Option<&Arc<Vec<packet::Attribute>>>,
     ) {
-        let mrt_event_tx = GLOBAL_MRT_EVENT_TX.load();
-        let Some(mrt_tx) = mrt_event_tx.as_ref() else {
+        let Some(mrt_tx) = self.mrt_event_tx.as_ref() else {
             return;
         };
         let addpath = self.has_addpath(&source.remote_addr, &family);
