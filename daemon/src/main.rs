@@ -23,10 +23,17 @@ mod event;
 mod proto;
 
 use clap::{Arg, Command};
+use once_cell::sync::OnceCell;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use tracing::info;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::reload;
 use tracing_subscriber::EnvFilter;
+
+pub(crate) static LOG_RELOAD_HANDLE: OnceCell<
+    reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+> = OnceCell::new();
 
 fn main() -> Result<(), std::io::Error> {
     if num_cpus::get() < 4 {
@@ -132,11 +139,12 @@ fn main() -> Result<(), std::io::Error> {
     // RUST_LOG env var takes precedence if set.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(true)
-        .with_thread_ids(true)
+    let (filter_layer, reload_handle) = reload::Layer::new(env_filter);
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true))
         .init();
+    LOG_RELOAD_HANDLE.set(reload_handle).expect("reload handle already set");
 
     info!(cpus = num_cpus::get(), version = version, "starting RustyBGPd");
     if let Some(path) = &config_path {

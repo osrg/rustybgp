@@ -1958,9 +1958,34 @@ impl GoBgpService for GrpcService {
     }
     async fn set_log_level(
         &self,
-        _request: tonic::Request<api::SetLogLevelRequest>,
+        request: tonic::Request<api::SetLogLevelRequest>,
     ) -> Result<tonic::Response<api::SetLogLevelResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        use tracing_subscriber::EnvFilter;
+
+        let req = request.into_inner();
+        let level_enum = api::set_log_level_request::Level::try_from(req.level)
+            .unwrap_or(api::set_log_level_request::Level::Unspecified);
+        let filter_str = match level_enum {
+            api::set_log_level_request::Level::Panic
+            | api::set_log_level_request::Level::Fatal
+            | api::set_log_level_request::Level::Error => "error",
+            api::set_log_level_request::Level::Warn => "warn",
+            api::set_log_level_request::Level::Info => "info",
+            api::set_log_level_request::Level::Debug => "debug",
+            api::set_log_level_request::Level::Trace => "trace",
+            api::set_log_level_request::Level::Unspecified => {
+                return Err(tonic::Status::invalid_argument("log level not specified"));
+            }
+        };
+        let new_filter = EnvFilter::new(filter_str);
+        let handle = crate::LOG_RELOAD_HANDLE
+            .get()
+            .ok_or_else(|| tonic::Status::internal("log reload handle not initialized"))?;
+        handle
+            .reload(new_filter)
+            .map_err(|e| tonic::Status::internal(format!("failed to reload log filter: {}", e)))?;
+        tracing::info!(level = filter_str, "log level changed via gRPC");
+        Ok(tonic::Response::new(api::SetLogLevelResponse {}))
     }
 }
 
