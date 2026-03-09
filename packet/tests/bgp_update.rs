@@ -275,7 +275,7 @@ fn update_eor_ipv6() {
             // IPv6 EOR: mp_unreach is present but empty after parsing
             assert!(unreach.is_none());
             assert!(
-                mp_unreach.is_none() || mp_unreach.as_ref().map_or(true, |s| s.entries.is_empty())
+                mp_unreach.is_none() || mp_unreach.as_ref().is_none_or(|s| s.entries.is_empty())
             );
             assert!(attr.is_empty());
         }
@@ -337,9 +337,9 @@ fn update_attr_med_dropped_on_encode() {
             assert!(!reach.unwrap().entries.is_empty());
             // MED is dropped because it's optional non-transitive
             assert!(
-                attr.iter()
-                    .find(|a| a.code() == Attribute::MULTI_EXIT_DESC)
-                    .is_none(),
+                !attr
+                    .iter()
+                    .any(|a| a.code() == Attribute::MULTI_EXIT_DESC),
                 "MED must be dropped on encode (non-transitive optional attribute)"
             );
         }

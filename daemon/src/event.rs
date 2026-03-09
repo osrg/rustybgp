@@ -19,7 +19,6 @@ use arc_swap::ArcSwapOption;
 use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
-use tracing::Instrument;
 use once_cell::sync::Lazy;
 use std::boxed::Box;
 use std::collections::HashSet;
@@ -43,6 +42,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::{Encoder, Framed};
+use tracing::Instrument;
 
 use crate::api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
@@ -924,16 +924,18 @@ impl GoBgpService for GrpcService {
             tracing::info!(peer = %peer_addr, "gRPC: deleting peer");
             let mut global = GLOBAL.write().await;
             if let Some(p) = global.peers.remove(&peer_addr) {
-                if let Some(mgmt_tx) = &p.mgmt_tx {
-                    if mgmt_tx.send(PeerMgmtMsg::Notification(bgp::Message::Notification(
-                        rustybgp_packet::BgpError::Other {
-                            code: 6,
-                            subcode: 3,
-                            data: vec![],
-                        },
-                    ))).is_err() {
-                        tracing::warn!(peer = %peer_addr, "failed to send cease notification to peer handler");
-                    }
+                if let Some(mgmt_tx) = &p.mgmt_tx
+                    && mgmt_tx
+                        .send(PeerMgmtMsg::Notification(bgp::Message::Notification(
+                            rustybgp_packet::BgpError::Other {
+                                code: 6,
+                                subcode: 3,
+                                data: vec![],
+                            },
+                        )))
+                        .is_err()
+                {
+                    tracing::warn!(peer = %peer_addr, "failed to send cease notification to peer handler");
                 }
                 if p.password.is_some() {
                     for fd in &global.listen_sockets {
@@ -1065,13 +1067,16 @@ impl GoBgpService for GrpcService {
                         tracing::info!(peer = %peer_addr, "gRPC: disabling peer");
                         p.admin_down = true;
                         if let Some(mgmt_tx) = &p.mgmt_tx {
-                            if mgmt_tx.send(PeerMgmtMsg::Notification(
-                                bgp::Message::Notification(rustybgp_packet::BgpError::Other {
-                                    code: 6,
-                                    subcode: 2,
-                                    data: vec![],
-                                }),
-                            )).is_err() {
+                            if mgmt_tx
+                                .send(PeerMgmtMsg::Notification(bgp::Message::Notification(
+                                    rustybgp_packet::BgpError::Other {
+                                        code: 6,
+                                        subcode: 2,
+                                        data: vec![],
+                                    },
+                                )))
+                                .is_err()
+                            {
                                 tracing::warn!(peer = %peer_addr, "failed to send admin-down notification to peer handler");
                             }
                             return Ok(tonic::Response::new(api::DisablePeerResponse {}));
@@ -2797,10 +2802,10 @@ impl Global {
             }
         };
         if let Some(ttl) = peer.multihop_ttl {
-            if peer.state.remote_asn.load(Ordering::Relaxed) != peer.local_asn {
-                if let Err(e) = stream.set_ttl(ttl.into()) {
-                    tracing::warn!(peer = %remote_addr, ttl = ttl, error = %e, "failed to set multihop TTL");
-                }
+            if peer.state.remote_asn.load(Ordering::Relaxed) != peer.local_asn
+                && let Err(e) = stream.set_ttl(ttl.into())
+            {
+                tracing::warn!(peer = %remote_addr, ttl = ttl, error = %e, "failed to set multihop TTL");
             }
         } else if let Err(e) = stream.set_ttl(1) {
             tracing::warn!(peer = %remote_addr, error = %e, "failed to set TTL to 1");
@@ -2975,10 +2980,11 @@ impl Global {
                                         convert::conditions_from_api(s.conditions).unwrap();
                                     let disposition =
                                         convert::disposition_from_api(s.actions).unwrap();
-                                    if let Err(e) = server
-                                        .ptable
-                                        .add_statement(&s.name, conditions, disposition)
-                                    {
+                                    if let Err(e) = server.ptable.add_statement(
+                                        &s.name,
+                                        conditions,
+                                        disposition,
+                                    ) {
                                         tracing::error!(statement = %s.name, error = ?e, "failed to add policy statement");
                                         panic!("{:?}", e);
                                     }
@@ -3250,11 +3256,14 @@ impl Table {
             })
         };
         for bmp_tx in self.bmp_event_tx.values() {
-            if bmp_tx.send(bmp::Message::RouteMonitoring {
-                header: header.clone(),
-                update: update.clone(),
-                addpath,
-            }).is_err() {
+            if bmp_tx
+                .send(bmp::Message::RouteMonitoring {
+                    header: header.clone(),
+                    update: update.clone(),
+                    addpath,
+                })
+                .is_err()
+            {
                 tracing::debug!("BMP route monitoring channel closed");
             }
         }
@@ -3302,11 +3311,14 @@ impl Table {
                 }),
             })
         };
-        if mrt_tx.send(mrt::Message::Mp {
-            header,
-            body,
-            addpath,
-        }).is_err() {
+        if mrt_tx
+            .send(mrt::Message::Mp {
+                header,
+                body,
+                addpath,
+            })
+            .is_err()
+        {
             tracing::debug!("MRT event channel closed");
         }
     }
@@ -3354,7 +3366,9 @@ impl Table {
                                         }
                                         for c in t.peer_event_tx.values() {
                                             if c.send(ToPeerEvent::Advertise(ri.clone())).is_err() {
-                                                tracing::debug!("peer event channel closed during reach advertisement");
+                                                tracing::debug!(
+                                                    "peer event channel closed during reach advertisement"
+                                                );
                                             }
                                         }
                                     }
@@ -3383,7 +3397,9 @@ impl Table {
                                         }
                                         for c in t.peer_event_tx.values() {
                                             if c.send(ToPeerEvent::Advertise(ri.clone())).is_err() {
-                                                tracing::debug!("peer event channel closed during withdrawal");
+                                                tracing::debug!(
+                                                    "peer event channel closed during withdrawal"
+                                                );
                                             }
                                         }
                                     }
@@ -3397,7 +3413,9 @@ impl Table {
                         for change in changes {
                             for c in t.peer_event_tx.values() {
                                 if c.send(ToPeerEvent::Advertise(change.clone())).is_err() {
-                                    tracing::debug!("peer event channel closed during disconnect cleanup");
+                                    tracing::debug!(
+                                        "peer event channel closed during disconnect cleanup"
+                                    );
                                 }
                             }
                         }
@@ -3446,19 +3464,20 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
             mpsc::unbounded_channel::<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)>();
         conn_tx.push(tx);
         let active_conn_tx = active_tx.clone();
-        let h = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    loop {
-                        if let Some((mut h, mgmt_rx)) = rx.recv().await {
-                            let active_conn_tx = active_conn_tx.clone();
+        let h =
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        loop {
+                            if let Some((mut h, mgmt_rx)) = rx.recv().await {
+                                let active_conn_tx = active_conn_tx.clone();
 
-                            let peer_addr = h.remote_addr;
-                            let span = tracing::info_span!("peer", addr = %peer_addr);
-                            tokio::spawn(async move {
+                                let peer_addr = h.remote_addr;
+                                let span = tracing::info_span!("peer", addr = %peer_addr);
+                                tokio::spawn(async move {
                                 if let Err(e) = h.run(mgmt_rx).await {
                                     tracing::warn!(error = %e, "BGP session ended with error");
                                 }
@@ -3472,10 +3491,10 @@ pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
                                     }
                                 }
                             }.instrument(span));
+                            }
                         }
-                    }
-                })
-        });
+                    })
+            });
         handlers.push(h);
     }
 
@@ -3722,12 +3741,12 @@ impl Handler {
                 }
             }
         }
-        if !txbuf.is_empty() {
-            if let Err(e) = stream.write_all(&txbuf.freeze()).await {
-                tracing::error!(error = %e, "TCP write failed flushing urgent messages");
-                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                return;
-            }
+        if !txbuf.is_empty()
+            && let Err(e) = stream.write_all(&txbuf.freeze()).await
+        {
+            tracing::error!(error = %e, "TCP write failed flushing urgent messages");
+            self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+            return;
         }
 
         // 2. Flush pending withdrawals.
@@ -3761,12 +3780,12 @@ impl Handler {
                     tracing::error!(error = %e, "failed to encode withdrawal UPDATE");
                 }
                 self.counter_tx.sync(&msg);
-                if !txbuf.is_empty() {
-                    if let Err(e) = stream.write_all(&txbuf.freeze()).await {
-                        tracing::error!(error = %e, "TCP write failed for withdrawal");
-                        self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                        return;
-                    }
+                if !txbuf.is_empty()
+                    && let Err(e) = stream.write_all(&txbuf.freeze()).await
+                {
+                    tracing::error!(error = %e, "TCP write failed for withdrawal");
+                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                    return;
                 }
             }
         }
@@ -3835,12 +3854,12 @@ impl Handler {
                 }
             }
         }
-        if !txbuf.is_empty() {
-            if let Err(e) = stream.write_all(&txbuf.freeze()).await {
-                tracing::error!(error = %e, "TCP write failed flushing reach updates");
-                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                return;
-            }
+        if !txbuf.is_empty()
+            && let Err(e) = stream.write_all(&txbuf.freeze()).await
+        {
+            tracing::error!(error = %e, "TCP write failed flushing reach updates");
+            self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+            return;
         }
 
         // 4. Remove sent entries from pending maps.
@@ -3885,12 +3904,15 @@ impl Handler {
             let family = s.family;
             for net in s.entries {
                 let idx = Table::dealer(net.nlri);
-                if self.table_tx[idx].send(TableEvent::PassUpdate(
-                    self.source.as_ref().unwrap().clone(),
-                    family,
-                    vec![net],
-                    Some(attr.clone()),
-                )).is_err() {
+                if self.table_tx[idx]
+                    .send(TableEvent::PassUpdate(
+                        self.source.as_ref().unwrap().clone(),
+                        family,
+                        vec![net],
+                        Some(attr.clone()),
+                    ))
+                    .is_err()
+                {
                     tracing::warn!("table channel closed, cannot forward reach update");
                 }
             }
@@ -3899,12 +3921,15 @@ impl Handler {
             let family = s.family;
             for net in s.entries {
                 let idx = Table::dealer(net.nlri);
-                if self.table_tx[idx].send(TableEvent::PassUpdate(
-                    self.source.as_ref().unwrap().clone(),
-                    family,
-                    vec![net],
-                    None,
-                )).is_err() {
+                if self.table_tx[idx]
+                    .send(TableEvent::PassUpdate(
+                        self.source.as_ref().unwrap().clone(),
+                        family,
+                        vec![net],
+                        None,
+                    ))
+                    .is_err()
+                {
                     tracing::warn!("table channel closed, cannot forward withdrawal");
                 }
             }
