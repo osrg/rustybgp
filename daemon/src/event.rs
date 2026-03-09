@@ -15,6 +15,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use arc_swap::ArcSwapOption;
 use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
@@ -1372,17 +1373,20 @@ impl GoBgpService for GrpcService {
             .collect();
 
         let mut v = Vec::new();
+        let pa = if table_type == table::TableType::AdjOut {
+            GLOBAL_EXPORT_POLICY.load_full()
+        } else {
+            None
+        };
         for i in 0..*NUM_TABLES {
             let t = TABLE[i].lock().await;
-            let pa = if table_type == table::TableType::AdjOut {
-                t.global_export_policy.as_ref().cloned()
-            } else {
-                None
-            };
-            for d in t
-                .rtable
-                .iter_destinations(table_type, family, peer_addr, prefixes.clone(), pa)
-            {
+            for d in t.rtable.iter_destinations(
+                table_type,
+                family,
+                peer_addr,
+                prefixes.clone(),
+                pa.clone(),
+            ) {
                 v.push(api::ListPathResponse {
                     destination: Some(convert::destination_to_api(d, family)),
                 });
@@ -1959,13 +1963,10 @@ async fn add_policy_assignment(req: api::PolicyAssignment) -> Result<(), Error> 
         default_action,
         policy_names,
     )?;
-    for i in 0..*NUM_TABLES {
-        let mut t = TABLE[i].lock().await;
-        if dir == table::PolicyDirection::Import {
-            t.global_import_policy = Some(assignment.clone());
-        } else {
-            t.global_export_policy = Some(assignment.clone());
-        }
+    if dir == table::PolicyDirection::Import {
+        GLOBAL_IMPORT_POLICY.store(Some(Arc::clone(&assignment)));
+    } else {
+        GLOBAL_EXPORT_POLICY.store(Some(Arc::clone(&assignment)));
     }
     Ok(())
 }
@@ -2553,6 +2554,8 @@ fn create_listen_socket(addr: String, port: u16) -> std::io::Result<std::net::Tc
 
 static NUM_TABLES: Lazy<usize> = Lazy::new(|| num_cpus::get() / 2);
 static GLOBAL: Lazy<RwLock<Global>> = Lazy::new(|| RwLock::new(Global::new()));
+static GLOBAL_IMPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
+static GLOBAL_EXPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
 static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
     let mut table = Vec::with_capacity(*NUM_TABLES);
     for _ in 0..*NUM_TABLES {
@@ -2563,8 +2566,6 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
             bmp_event_tx: FnvHashMap::default(),
             mrt_event_tx: None,
             addpath: FnvHashMap::default(),
-            global_import_policy: None,
-            global_export_policy: None,
         }));
     }
     table
@@ -3081,10 +3082,6 @@ struct Table {
     bmp_event_tx: FnvHashMap<SocketAddr, mpsc::UnboundedSender<bmp::Message>>,
     mrt_event_tx: Option<mpsc::UnboundedSender<mrt::Message>>,
     addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
-
-    // global->ptable copies
-    global_import_policy: Option<Arc<table::PolicyAssignment>>,
-    global_export_policy: Option<Arc<table::PolicyAssignment>>,
 }
 
 impl Table {
@@ -3206,12 +3203,13 @@ impl Table {
 
                         match attrs {
                             Some(attrs) => {
+                                let import_policy = GLOBAL_IMPORT_POLICY.load();
+                                let export_policy = GLOBAL_EXPORT_POLICY.load();
                                 for net in nets {
-                                    let filtered =
-                                        t.global_import_policy.as_ref().is_some_and(|a| {
-                                            t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
-                                                == table::Disposition::Reject
-                                        });
+                                    let filtered = import_policy.as_ref().is_some_and(|a| {
+                                        t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
+                                            == table::Disposition::Reject
+                                    });
                                     let changes = t.rtable.insert(
                                         source.clone(),
                                         family,
@@ -3222,7 +3220,7 @@ impl Table {
                                     );
                                     for ri in changes {
                                         if !ri.attr.is_empty()
-                                            && t.global_export_policy.as_ref().is_some_and(|a| {
+                                            && export_policy.as_ref().is_some_and(|a| {
                                                 t.rtable
                                                     .apply_policy(a, &ri.source, &ri.net, &ri.attr)
                                                     == table::Disposition::Reject
@@ -3237,6 +3235,7 @@ impl Table {
                                 }
                             }
                             None => {
+                                let export_policy = GLOBAL_EXPORT_POLICY.load();
                                 for net in nets {
                                     let changes = t.rtable.remove(
                                         source.clone(),
@@ -3247,7 +3246,7 @@ impl Table {
                                     for ri in changes {
                                         // don't apply export policy for withdrawn routes.
                                         if !ri.attr.is_empty()
-                                            && t.global_export_policy.as_ref().is_some_and(|a| {
+                                            && export_policy.as_ref().is_some_and(|a| {
                                                 t.rtable
                                                     .apply_policy(a, &ri.source, &ri.net, &ri.attr)
                                                     == table::Disposition::Reject
@@ -3474,13 +3473,14 @@ impl Handler {
             let mut t = TABLE[i].lock().await;
 
             // Populate initial routes for each negotiated family.
+            let export_policy = GLOBAL_EXPORT_POLICY.load();
             for f in codec.channel.keys() {
                 let effective_max = self.send_max.get(f).copied().unwrap_or(1);
                 for c in t.rtable.best(f).into_iter() {
                     if c.rank > effective_max {
                         continue;
                     }
-                    if t.global_export_policy.as_ref().is_some_and(|a| {
+                    if export_policy.as_ref().is_some_and(|a| {
                         t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
                             == table::Disposition::Reject
                     }) {
