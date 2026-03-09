@@ -624,9 +624,9 @@ impl RoutingTable {
                     .entry(family)
                     .or_insert((0, 0));
                 *rx += 1;
-                eprintln!(
-                    "prefix limit ({}) reached for peer {} family {:?}, dropping route",
-                    limit, source.remote_addr, family
+                tracing::warn!(
+                    peer = %source.remote_addr, family = ?family, limit = limit,
+                    "prefix limit reached, dropping route"
                 );
                 return Vec::new();
             }
@@ -667,9 +667,9 @@ impl RoutingTable {
                 .entry(family)
                 .or_insert((0, 0));
             *received += 1;
-            eprintln!(
-                "add-path: per-prefix path limit ({}) reached for {:?}, dropping path from {}",
-                MAX_PATHS_PER_DESTINATION, net, source.remote_addr
+            tracing::warn!(
+                peer = %source.remote_addr, prefix = ?net, limit = MAX_PATHS_PER_DESTINATION,
+                "add-path per-prefix path limit reached, dropping path"
             );
             return Vec::new();
         }
