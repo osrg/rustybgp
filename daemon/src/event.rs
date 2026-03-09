@@ -3237,7 +3237,6 @@ impl Table {
                                 }
                             }
                             None => {
-                                let empty_attrs = Arc::new(Vec::new());
                                 for net in nets {
                                     let changes = t.rtable.remove(
                                         source.clone(),
@@ -3246,14 +3245,14 @@ impl Table {
                                         net.path_id,
                                     );
                                     for ri in changes {
-                                        if t.global_export_policy.as_ref().is_some_and(|a| {
-                                            t.rtable.apply_policy(
-                                                a,
-                                                &source,
-                                                &net.nlri,
-                                                &empty_attrs,
-                                            ) == table::Disposition::Reject
-                                        }) {
+                                        // don't apply export policy for withdrawn routes.
+                                        if !ri.attr.is_empty()
+                                            && t.global_export_policy.as_ref().is_some_and(|a| {
+                                                t.rtable
+                                                    .apply_policy(a, &ri.source, &ri.net, &ri.attr)
+                                                    == table::Disposition::Reject
+                                            })
+                                        {
                                             continue;
                                         }
                                         for c in t.peer_event_tx.values() {
