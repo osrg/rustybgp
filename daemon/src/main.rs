@@ -71,8 +71,10 @@ fn main() -> Result<(), std::io::Error> {
         )
         .get_matches();
 
-    let conf = if let Some(conf) = args.get_one::<String>("config") {
-        let conf: config::BgpConfig = config::read_from_file(conf).expect("invalid configuration");
+    let config_path = args.get_one::<String>("config").cloned();
+    let conf = if let Some(ref config_path) = config_path {
+        let conf: config::BgpConfig =
+            config::read_from_file(config_path).expect("invalid configuration");
         Some(conf)
     } else {
         let as_number = if let Some(asn) = args.get_one::<String>("asn") {
@@ -137,6 +139,9 @@ fn main() -> Result<(), std::io::Error> {
         .init();
 
     info!(cpus = num_cpus::get(), version = version, "starting RustyBGPd");
+    if let Some(path) = &config_path {
+        info!(path = %path, "loaded configuration file");
+    }
 
     event::main(conf, args.get_flag("any"));
     Ok(())
