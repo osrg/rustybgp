@@ -337,9 +337,7 @@ fn update_attr_med_dropped_on_encode() {
             assert!(!reach.unwrap().entries.is_empty());
             // MED is dropped because it's optional non-transitive
             assert!(
-                !attr
-                    .iter()
-                    .any(|a| a.code() == Attribute::MULTI_EXIT_DESC),
+                !attr.iter().any(|a| a.code() == Attribute::MULTI_EXIT_DESC),
                 "MED must be dropped on encode (non-transitive optional attribute)"
             );
         }
