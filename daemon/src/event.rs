@@ -2127,15 +2127,18 @@ impl MrtDumper {
         loop {
             tokio::select! {
                 msg = rx.next() => {
-                    if let Some(msg) = msg {
-                        let mut buf = bytes::BytesMut::with_capacity(8192);
-                        if let Err(e) = codec.encode(&msg, &mut buf) {
-                            tracing::error!(error = %e, "MRT message encode failed");
-                            continue;
+                    match msg {
+                        Some(msg) => {
+                            let mut buf = bytes::BytesMut::with_capacity(8192);
+                            if let Err(e) = codec.encode(&msg, &mut buf) {
+                                tracing::error!(error = %e, "MRT message encode failed");
+                                continue;
+                            }
+                            if let Err(e) = file.write_all(&buf).await {
+                                tracing::error!(error = %e, "MRT file write failed");
+                            }
                         }
-                        if let Err(e) = file.write_all(&buf).await {
-                            tracing::error!(error = %e, "MRT file write failed");
-                        }
+                        None => break,
                     }
                 }
                 _ = timer.tick().fuse() => {
