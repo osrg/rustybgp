@@ -61,13 +61,19 @@ pub(crate) fn set_md5sig(rawfd: RawFd, addr: &IpAddr, key: &str) {
     unsafe {
         let ptr: *const TcpMd5sig = &s;
         let len = std::mem::size_of::<TcpMd5sig>() as u32;
-        let _ = libc::setsockopt(
+        let rc = libc::setsockopt(
             rawfd,
             libc::IPPROTO_TCP,
             libc::TCP_MD5SIG,
             ptr as *const _,
             len,
         );
+        if rc != 0 {
+            tracing::error!(
+                peer = %addr, errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1),
+                "failed to set TCP_MD5SIG socket option"
+            );
+        }
     }
 }
 

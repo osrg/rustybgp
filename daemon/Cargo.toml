@@ -37,3 +37,5 @@ thiserror = "2"
 libc = "0.2"
 nix = { version = "0.31", features = ["socket"] }
 uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
