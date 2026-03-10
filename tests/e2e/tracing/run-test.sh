@@ -46,8 +46,9 @@ trap cleanup EXIT
 start_bgpd() {
     LOGFILE=$1; shift
     # Use sh -c "cmd &" instead of docker exec -d for reliable background execution.
+    # Use $* (not $@) so all args stay in the single sh -c string.
     # shellcheck disable=SC2145
-    docker exec tracing-rusty sh -c "rustybgpd $@ >/tmp/${LOGFILE} 2>&1 &"
+    docker exec tracing-rusty sh -c "rustybgpd $* >/tmp/${LOGFILE} 2>&1 &"
 }
 
 # Start with a custom env var prepended.
@@ -56,7 +57,7 @@ start_bgpd_env() {
     local env=$1; shift
     LOGFILE=$1; shift
     # shellcheck disable=SC2145
-    docker exec tracing-rusty sh -c "${env} rustybgpd $@ >/tmp/${LOGFILE} 2>&1 &"
+    docker exec tracing-rusty sh -c "${env} rustybgpd $* >/tmp/${LOGFILE} 2>&1 &"
 }
 
 stop_bgpd() {
