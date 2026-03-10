@@ -23,23 +23,20 @@ mod event;
 mod proto;
 
 use clap::{Arg, Command};
-use once_cell::sync::OnceCell;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::sync::OnceLock;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::reload;
 
-pub(crate) static LOG_RELOAD_HANDLE: OnceCell<
+pub(crate) static LOG_RELOAD_HANDLE: OnceLock<
     reload::Handle<EnvFilter, tracing_subscriber::Registry>,
-> = OnceCell::new();
+> = OnceLock::new();
 
-fn main() -> Result<(), std::io::Error> {
-    if num_cpus::get() < 4 {
-        panic!("four local CPUs are necessary at least");
-    }
-
+#[tokio::main]
+async fn main() -> Result<(), std::io::Error> {
     let version: &'static str = concat!("v", env!("CARGO_PKG_VERSION"), "-", env!("GIT_HASH"));
     let args = Command::new("rustybgpd")
         .version(version)
@@ -161,6 +158,6 @@ fn main() -> Result<(), std::io::Error> {
         info!(path = %path, "loaded configuration file");
     }
 
-    event::main(conf, args.get_flag("any"));
+    event::main(conf, args.get_flag("any")).await;
     Ok(())
 }

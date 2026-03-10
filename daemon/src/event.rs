@@ -19,7 +19,6 @@ use arc_swap::ArcSwapOption;
 use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
-use once_cell::sync::Lazy;
 use std::boxed::Box;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
@@ -32,6 +31,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
@@ -1317,8 +1317,9 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddPathRequest>,
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
         let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        let chan = TABLE[u.0].lock().await.table_event_tx[0].clone();
-        let _ = chan.send(u.1);
+        let mut t = TABLE[u.0].lock().await;
+        t.event(u.1);
+
         // FIXME: support uuid
         Ok(tonic::Response::new(api::AddPathResponse {
             uuid: Vec::new(),
@@ -1329,8 +1330,8 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::DeletePathRequest>,
     ) -> Result<tonic::Response<api::DeletePathResponse>, tonic::Status> {
         let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        let chan = TABLE[u.0].lock().await.table_event_tx[0].clone();
-        let _ = chan.send(u.1);
+        let mut t = TABLE[u.0].lock().await;
+        t.event(u.1);
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
     type ListPathStream = Pin<
@@ -1427,8 +1428,8 @@ impl GoBgpService for GrpcService {
         while let Some(Ok(request)) = stream.next().await {
             for path in request.paths {
                 if let Ok(u) = self.local_path(path) {
-                    let chan = TABLE[u.0].lock().await.table_event_tx[0].clone();
-                    let _ = chan.send(u.1);
+                    let mut t = TABLE[u.0].lock().await;
+                    t.event(u.1);
                 }
             }
         }
@@ -1870,35 +1871,32 @@ impl GoBgpService for GrpcService {
             ));
         }
         let interval = request.rotation_interval;
-        if GLOBAL_MRT_EVENT_TX.load().is_some() {
-            return Err(tonic::Status::new(
-                tonic::Code::AlreadyExists,
-                "mrt dumper already enabled",
-            ));
-        }
-        let mut d = MrtDumper::new(&request.filename, interval);
-        let file = tokio::fs::File::create(std::path::Path::new(&d.pathname()))
-            .await
-            .map_err(|e| {
-                tonic::Status::new(
-                    tonic::Code::Internal,
-                    format!("failed to create mrt dump file: {e}"),
-                )
-            })?;
+        let filename = request.filename;
+        let mut d = MrtDumper::new(&filename, interval);
         {
-            let _global = GLOBAL.write().await;
-            if GLOBAL_MRT_EVENT_TX.load().is_some() {
+            let mut g = GLOBAL.write().await;
+            if !g.mrt_filenames.insert(filename.clone()) {
                 return Err(tonic::Status::new(
                     tonic::Code::AlreadyExists,
-                    "mrt dumper already enabled",
+                    "mrt dumper already enabled for this file",
                 ));
             }
-            let (tx, rx) = mpsc::unbounded_channel();
-            GLOBAL_MRT_EVENT_TX.store(Some(Arc::new(tx)));
-            tokio::spawn(async move {
-                d.serve_with_rx(file, rx).await;
-            });
         }
+        let file = match tokio::fs::File::create(std::path::Path::new(&d.pathname())).await {
+            Ok(file) => file,
+            Err(e) => {
+                GLOBAL.write().await.mrt_filenames.remove(&filename);
+                return Err(tonic::Status::new(
+                    tonic::Code::Internal,
+                    format!("failed to create mrt dump file: {e}"),
+                ));
+            }
+        };
+        tokio::spawn(async move {
+            if let Err(e) = d.serve(file).await {
+                println!("mrt dumper failed: {:?}", e);
+            }
+        });
         Ok(tonic::Response::new(api::EnableMrtResponse {}))
     }
     async fn disable_mrt(
@@ -2110,11 +2108,28 @@ impl MrtDumper {
         }
     }
 
-    async fn serve_with_rx(
-        &mut self,
-        mut file: tokio::fs::File,
+    async fn serve(&mut self, mut file: tokio::fs::File) -> Result<(), Error> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for i in 0..*NUM_TABLES {
+            let mut t = TABLE[i].lock().await;
+            t.mrt_event_tx.insert(self.filename.clone(), tx.clone());
+        }
+
+        let result = self.run_loop(&mut file, rx).await;
+
+        for i in 0..*NUM_TABLES {
+            let mut t = TABLE[i].lock().await;
+            t.mrt_event_tx.remove(&self.filename);
+        }
+        GLOBAL.write().await.mrt_filenames.remove(&self.filename);
+        result
+    }
+
+    async fn run_loop(
+        &self,
+        file: &mut tokio::fs::File,
         rx: mpsc::UnboundedReceiver<mrt::Message>,
-    ) {
+    ) -> Result<(), Error> {
         let mut codec = mrt::MrtCodec::new();
         let mut rx = UnboundedReceiverStream::new(rx);
         let interval = if self.interval == 0 {
@@ -2138,19 +2153,17 @@ impl MrtDumper {
                                 tracing::error!(error = %e, "MRT file write failed");
                             }
                         }
-                        None => break,
+                        None => return Ok(()),
                     }
                 }
                 _ = timer.tick().fuse() => {
                     if self.interval != 0 {
-                        file = tokio::fs::File::create(std::path::Path::new(&self.pathname()))
-                        .await
-                        .unwrap();
+                        *file = tokio::fs::File::create(std::path::Path::new(&self.pathname()))
+                            .await?;
                     }
                 }
             }
         }
-        GLOBAL_MRT_EVENT_TX.store(None);
     }
 }
 
@@ -2493,7 +2506,6 @@ impl RpkiClient {
     async fn serve(
         stream: TcpStream,
         rx: mpsc::UnboundedReceiver<RpkiMgmtMsg>,
-        txv: Vec<mpsc::UnboundedSender<TableEvent>>,
         state: Arc<RpkiState>,
     ) -> Result<(), Error> {
         let remote_addr = stream.peer_addr()?.ip();
@@ -2539,8 +2551,9 @@ impl RpkiClient {
                             if prefix.flags & 1 > 0 {
                                 let roa = Arc::new(table::Roa::new(prefix.max_length, prefix.as_number, remote_addr.clone()));
                                 if end_of_data {
-                                    for tx in &txv {
-                                        let _ = tx.send(TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())]));
+                                    for i in 0..*NUM_TABLES {
+                                        let mut t = TABLE[i].lock().await;
+                                        t.event(TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())]));
                                     }
                                 } else {
                                     v.push((
@@ -2554,9 +2567,10 @@ impl RpkiClient {
                             tracing::info!(rpki_server = %remote_addr, serial = serial_number, roas = v.len(), "RPKI EndOfData received");
                             end_of_data = true;
                             state.serial.store(serial_number, Ordering::Relaxed);
-                            for tx in &txv {
-                                let _ = tx.send(TableEvent::Drop(remote_addr.clone()));
-                                let _ = tx.send(TableEvent::InsertRoa(v.to_owned()));
+                            for i in 0..*NUM_TABLES {
+                                let mut t = TABLE[i].lock().await;
+                                t.event(TableEvent::Drop(remote_addr.clone()));
+                                t.event(TableEvent::InsertRoa(v.to_owned()));
                             }
                         }
                         _ => {}
@@ -2572,20 +2586,15 @@ impl RpkiClient {
                 .as_secs(),
             Ordering::Relaxed,
         );
-        for tx in &txv {
-            let _ = tx.send(TableEvent::Drop(remote_addr.clone()));
+        for i in 0..*NUM_TABLES {
+            let mut t = TABLE[i].lock().await;
+            t.event(TableEvent::Drop(remote_addr.clone()));
         }
         Ok(())
     }
 
     fn try_connect(sockaddr: SocketAddr, configured_time: u64) {
         tokio::spawn(async move {
-            let mut table_tx = Vec::with_capacity(*NUM_TABLES);
-            let d = Table::dealer(sockaddr);
-            for i in 0..*NUM_TABLES {
-                let t = TABLE[i].lock().await;
-                table_tx.push(t.table_event_tx[d].clone());
-            }
             loop {
                 tracing::debug!(%sockaddr, "RPKI connecting");
                 if let Ok(Ok(stream)) = tokio::time::timeout(
@@ -2603,7 +2612,7 @@ impl RpkiClient {
                     } else {
                         break;
                     };
-                    if let Err(e) = RpkiClient::serve(stream, rx, table_tx.to_vec(), state).await {
+                    if let Err(e) = RpkiClient::serve(stream, rx, state).await {
                         tracing::warn!(%sockaddr, error = %e, "RPKI session ended with error");
                     }
                 } else {
@@ -2650,20 +2659,18 @@ fn create_listen_socket(addr: String, port: u16) -> std::io::Result<std::net::Tc
     Ok(sock.into())
 }
 
-static NUM_TABLES: Lazy<usize> = Lazy::new(|| num_cpus::get() / 2);
-static GLOBAL: Lazy<RwLock<Global>> = Lazy::new(|| RwLock::new(Global::new()));
+static NUM_TABLES: LazyLock<usize> = LazyLock::new(num_cpus::get);
+static GLOBAL: LazyLock<RwLock<Global>> = LazyLock::new(|| RwLock::new(Global::new()));
 static GLOBAL_IMPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
 static GLOBAL_EXPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
-static GLOBAL_MRT_EVENT_TX: ArcSwapOption<mpsc::UnboundedSender<mrt::Message>> =
-    ArcSwapOption::const_empty();
-static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
+static TABLE: LazyLock<Vec<Mutex<Table>>> = LazyLock::new(|| {
     let mut table = Vec::with_capacity(*NUM_TABLES);
     for _ in 0..*NUM_TABLES {
         table.push(Mutex::new(Table {
             rtable: table::RoutingTable::new(),
             peer_event_tx: FnvHashMap::default(),
-            table_event_tx: Vec::new(),
             bmp_event_tx: FnvHashMap::default(),
+            mrt_event_tx: FnvHashMap::default(),
             addpath: FnvHashMap::default(),
         }));
     }
@@ -2682,6 +2689,7 @@ struct Global {
 
     rpki_clients: FnvHashMap<SocketAddr, RpkiClient>,
     bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
+    mrt_filenames: FnvHashSet<String>,
 }
 
 impl From<&Global> for api::Global {
@@ -2719,6 +2727,7 @@ impl Global {
 
             rpki_clients: FnvHashMap::default(),
             bmp_clients: FnvHashMap::default(),
+            mrt_filenames: FnvHashSet::default(),
         }
     }
 
@@ -2854,7 +2863,6 @@ impl Global {
     async fn serve(
         bgp: Option<config::BgpConfig>,
         any_peer: bool,
-        conn_tx: Vec<mpsc::UnboundedSender<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)>>,
         active_tx: mpsc::UnboundedSender<TcpStream>,
         mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
     ) {
@@ -2889,23 +2897,27 @@ impl Global {
                         continue;
                     }
                     if let Some(filename) = config.file_name.as_ref() {
-                        if GLOBAL_MRT_EVENT_TX.load().is_some() {
-                            println!("mrt dumper already enabled, skipping");
-                            continue;
+                        {
+                            let mut g = GLOBAL.write().await;
+                            if !g.mrt_filenames.insert(filename.clone()) {
+                                println!("mrt dumper already enabled for {filename}, skipping");
+                                continue;
+                            }
                         }
                         let interval = config.rotation_interval.as_ref().map_or(0, |x| *x);
                         let filename = filename.clone();
                         let mut d = MrtDumper::new(&filename, interval);
                         match tokio::fs::File::create(std::path::Path::new(&d.pathname())).await {
                             Ok(file) => {
-                                let (tx, rx) = mpsc::unbounded_channel();
-                                GLOBAL_MRT_EVENT_TX.store(Some(Arc::new(tx)));
                                 tokio::spawn(async move {
-                                    d.serve_with_rx(file, rx).await;
+                                    if let Err(e) = d.serve(file).await {
+                                        println!("mrt dumper failed: {:?}", e);
+                                    }
                                 });
                             }
                             Err(e) => {
-                                println!("failed to create mrt dump file: {e}");
+                                GLOBAL.write().await.mrt_filenames.remove(&filename);
+                                println!("failed to create mrt dump file: {:?}", e);
                             }
                         }
                     } else {
@@ -3122,10 +3134,11 @@ impl Global {
         let addr = "0.0.0.0:50051".parse().unwrap();
         tracing::info!(%addr, "starting gRPC server");
         let notify2 = notify.clone();
+        let active_tx2 = active_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(GoBgpServiceServer::new(GrpcService::new(
-                    notify2, active_tx,
+                    notify2, active_tx2,
                 )))
                 .serve(addr)
                 .await
@@ -3165,8 +3178,6 @@ impl Global {
             })
             .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
         assert_ne!(incomings.len(), 0);
-        let mut next_peer_taker = 0;
-        let nr_takers = conn_tx.len();
         let mut stats_timer = tokio::time::interval(Duration::from_secs(60));
         stats_timer.tick().await; // consume the immediate first tick
         loop {
@@ -3178,19 +3189,13 @@ impl Global {
                 stream = bgp_listen_futures.next() => {
                     if let Some(Some(Ok(stream))) = stream
                         && let Some(r) = Global::accept_connection(stream).await {
-                            if conn_tx[next_peer_taker].send(r).is_err() {
-                                tracing::warn!("failed to hand off passive connection to handler thread");
-                            }
-                            next_peer_taker = (next_peer_taker + 1) % nr_takers;
+                            peer_loop(r.0, r.1, active_tx.clone());
                         }
                 }
                 stream = active_rx.recv().fuse() => {
                     if let Some(stream) = stream
                         && let Some(r) = Global::accept_connection(stream).await {
-                            if conn_tx[next_peer_taker].send(r).is_err() {
-                                tracing::warn!("failed to hand off active connection to handler thread");
-                            }
-                            next_peer_taker = (next_peer_taker + 1) % nr_takers;
+                            peer_loop(r.0, r.1, active_tx.clone());
                         }
                 }
                 _ = stats_timer.tick().fuse() => {
@@ -3237,8 +3242,8 @@ enum TableEvent {
 struct Table {
     rtable: table::RoutingTable,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
-    table_event_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
     bmp_event_tx: FnvHashMap<SocketAddr, mpsc::UnboundedSender<bmp::Message>>,
+    mrt_event_tx: FnvHashMap<String, mpsc::UnboundedSender<mrt::Message>>,
     addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
 }
 
@@ -3312,10 +3317,9 @@ impl Table {
         nets: &[packet::PathNlri],
         attrs: Option<&Arc<Vec<packet::Attribute>>>,
     ) {
-        let mrt_event_tx = GLOBAL_MRT_EVENT_TX.load();
-        let Some(mrt_tx) = mrt_event_tx.as_ref() else {
+        if self.mrt_event_tx.is_empty() {
             return;
-        };
+        }
         let addpath = self.has_addpath(&source.remote_addr, &family);
         let header = mrt::MpHeader::new(
             source.remote_asn,
@@ -3348,198 +3352,141 @@ impl Table {
                 }),
             })
         };
-        if mrt_tx
-            .send(mrt::Message::Mp {
-                header,
-                body,
-                addpath,
-            })
-            .is_err()
-        {
-            tracing::debug!("MRT event channel closed");
+        for mrt_tx in self.mrt_event_tx.values() {
+            if mrt_tx
+                .send(mrt::Message::Mp {
+                    header: header.clone(),
+                    body: body.clone(),
+                    addpath,
+                })
+                .is_err()
+            {
+                tracing::debug!("MRT event channel closed");
+            }
         }
     }
 
-    async fn serve(idx: usize, mut v: Vec<UnboundedReceiverStream<TableEvent>>) {
-        loop {
-            let mut futures: FuturesUnordered<_> = v.iter_mut().map(|rx| rx.next()).collect();
-            if let Some(Some(msg)) = futures.next().await {
-                match msg {
-                    TableEvent::PassUpdate(source, family, nets, attrs) => {
-                        let mut t = TABLE[idx].lock().await;
-                        t.send_bmp_update(&source, family, &nets, attrs.as_ref());
-                        t.send_mrt_update(&source, family, &nets, attrs.as_ref());
+    fn event(&mut self, msg: TableEvent) {
+        match msg {
+            TableEvent::PassUpdate(source, family, nets, attrs) => {
+                self.send_bmp_update(&source, family, &nets, attrs.as_ref());
+                self.send_mrt_update(&source, family, &nets, attrs.as_ref());
 
-                        match attrs {
-                            Some(attrs) => {
-                                let import_policy = GLOBAL_IMPORT_POLICY.load();
-                                let export_policy = GLOBAL_EXPORT_POLICY.load();
-                                for net in nets {
-                                    let filtered = import_policy.as_ref().is_some_and(|a| {
-                                        t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
+                match attrs {
+                    Some(attrs) => {
+                        let import_policy = GLOBAL_IMPORT_POLICY.load();
+                        let export_policy = GLOBAL_EXPORT_POLICY.load();
+                        for net in nets {
+                            let filtered = import_policy.as_ref().is_some_and(|a| {
+                                self.rtable.apply_policy(a, &source, &net.nlri, &attrs)
+                                    == table::Disposition::Reject
+                            });
+                            let changes = self.rtable.insert(
+                                source.clone(),
+                                family,
+                                net.nlri,
+                                net.path_id,
+                                attrs.clone(),
+                                filtered,
+                            );
+                            for ri in changes {
+                                if !ri.attr.is_empty()
+                                    && export_policy.as_ref().is_some_and(|a| {
+                                        self.rtable.apply_policy(a, &ri.source, &ri.net, &ri.attr)
                                             == table::Disposition::Reject
-                                    });
-                                    if filtered {
-                                        tracing::trace!(peer = %source.remote_addr, nlri = ?net.nlri, "import policy rejected route");
-                                    }
-                                    let changes = t.rtable.insert(
-                                        source.clone(),
-                                        family,
-                                        net.nlri,
-                                        net.path_id,
-                                        attrs.clone(),
-                                        filtered,
-                                    );
-                                    for ri in changes {
-                                        if !ri.attr.is_empty()
-                                            && export_policy.as_ref().is_some_and(|a| {
-                                                t.rtable
-                                                    .apply_policy(a, &ri.source, &ri.net, &ri.attr)
-                                                    == table::Disposition::Reject
-                                            })
-                                        {
-                                            tracing::trace!(nlri = ?ri.net, "export policy rejected route advertisement");
-                                            continue;
-                                        }
-                                        for c in t.peer_event_tx.values() {
-                                            if c.send(ToPeerEvent::Advertise(ri.clone())).is_err() {
-                                                tracing::debug!(
-                                                    "peer event channel closed during reach advertisement"
-                                                );
-                                            }
-                                        }
-                                    }
+                                    })
+                                {
+                                    tracing::trace!(nlri = ?ri.net, "export policy rejected route advertisement");
+                                    continue;
                                 }
-                            }
-                            None => {
-                                let export_policy = GLOBAL_EXPORT_POLICY.load();
-                                for net in nets {
-                                    let changes = t.rtable.remove(
-                                        source.clone(),
-                                        family,
-                                        net.nlri,
-                                        net.path_id,
-                                    );
-                                    for ri in changes {
-                                        // don't apply export policy for withdrawn routes.
-                                        if !ri.attr.is_empty()
-                                            && export_policy.as_ref().is_some_and(|a| {
-                                                t.rtable
-                                                    .apply_policy(a, &ri.source, &ri.net, &ri.attr)
-                                                    == table::Disposition::Reject
-                                            })
-                                        {
-                                            tracing::trace!(nlri = ?ri.net, "export policy rejected withdrawal propagation");
-                                            continue;
-                                        }
-                                        for c in t.peer_event_tx.values() {
-                                            if c.send(ToPeerEvent::Advertise(ri.clone())).is_err() {
-                                                tracing::debug!(
-                                                    "peer event channel closed during withdrawal"
-                                                );
-                                            }
-                                        }
+                                for c in self.peer_event_tx.values() {
+                                    if c.send(ToPeerEvent::Advertise(ri.clone())).is_err() {
+                                        tracing::debug!(
+                                            "peer event channel closed during reach advertisement"
+                                        );
                                     }
                                 }
                             }
                         }
                     }
-                    TableEvent::Disconnected(source) => {
-                        let mut t = TABLE[idx].lock().await;
-                        let changes = t.rtable.drop(source.clone());
-                        for change in changes {
-                            for c in t.peer_event_tx.values() {
-                                if c.send(ToPeerEvent::Advertise(change.clone())).is_err() {
-                                    tracing::debug!(
-                                        "peer event channel closed during disconnect cleanup"
-                                    );
+                    None => {
+                        let export_policy = GLOBAL_EXPORT_POLICY.load();
+                        for net in nets {
+                            let changes =
+                                self.rtable
+                                    .remove(source.clone(), family, net.nlri, net.path_id);
+                            for ri in changes {
+                                // don't apply export policy for withdrawn routes.
+                                if !ri.attr.is_empty()
+                                    && export_policy.as_ref().is_some_and(|a| {
+                                        self.rtable.apply_policy(a, &ri.source, &ri.net, &ri.attr)
+                                            == table::Disposition::Reject
+                                    })
+                                {
+                                    tracing::trace!(nlri = ?ri.net, "export policy rejected withdrawal propagation");
+                                    continue;
+                                }
+                                for c in self.peer_event_tx.values() {
+                                    if c.send(ToPeerEvent::Advertise(ri.clone())).is_err() {
+                                        tracing::debug!(
+                                            "peer event channel closed during withdrawal"
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
-                    TableEvent::InsertRoa(v) => {
-                        let mut t = TABLE[idx].lock().await;
-                        for (net, roa) in v {
-                            t.rtable.roa_insert(net, roa);
-                        }
-                    }
-                    TableEvent::Drop(addr) => {
-                        TABLE[idx].lock().await.rtable.rpki_drop(addr);
                     }
                 }
+            }
+            TableEvent::Disconnected(source) => {
+                let changes = self.rtable.drop(source.clone());
+                for change in changes {
+                    for c in self.peer_event_tx.values() {
+                        let _ = c.send(ToPeerEvent::Advertise(change.clone()));
+                    }
+                }
+            }
+            TableEvent::InsertRoa(v) => {
+                for (net, roa) in v {
+                    self.rtable.roa_insert(net, roa);
+                }
+            }
+            TableEvent::Drop(addr) => {
+                self.rtable.rpki_drop(addr);
             }
         }
     }
 }
 
-pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
-    let mut handlers = Vec::new();
-    for i in 0..*NUM_TABLES {
-        let h = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let mut v = Vec::new();
-                    for _ in 0..*NUM_TABLES {
-                        let mut t = TABLE[i].lock().await;
-                        let (tx, rx) = mpsc::unbounded_channel();
-                        t.table_event_tx.push(tx);
-                        v.push(UnboundedReceiverStream::new(rx));
-                    }
-                    Table::serve(i, v).await;
-                })
-        });
-        handlers.push(h);
-    }
-
+pub(crate) async fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
     let (active_tx, active_rx) = mpsc::unbounded_channel();
-    let mut conn_tx = Vec::new();
-    for _ in 0..*NUM_TABLES - 1 {
-        let (tx, mut rx) =
-            mpsc::unbounded_channel::<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)>();
-        conn_tx.push(tx);
-        let active_conn_tx = active_tx.clone();
-        let h =
-            std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(async move {
-                        loop {
-                            if let Some((mut h, mgmt_rx)) = rx.recv().await {
-                                let active_conn_tx = active_conn_tx.clone();
+    Global::serve(bgp, any_peer, active_tx, active_rx).await;
+}
 
-                                let peer_addr = h.remote_addr;
-                                let span = tracing::info_span!("peer", addr = %peer_addr);
-                                tokio::spawn(async move {
-                                if let Err(e) = h.run(mgmt_rx).await {
-                                    tracing::warn!(error = %e, "BGP session ended with error");
-                                }
-                                let mut server = GLOBAL.write().await;
-                                if let Some(peer) = server.peers.get_mut(&peer_addr) {
-                                    if peer.delete_on_disconnected {
-                                        server.peers.remove(&peer_addr);
-                                    } else {
-                                        peer.reset();
-                                        enable_active_connect(peer, active_conn_tx.clone());
-                                    }
-                                }
-                            }.instrument(span));
-                            }
-                        }
-                    })
-            });
-        handlers.push(h);
-    }
-
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(Global::serve(bgp, any_peer, conn_tx, active_tx, active_rx));
+fn peer_loop(
+    mut h: Handler,
+    mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>,
+    active_conn_tx: mpsc::UnboundedSender<TcpStream>,
+) {
+    let peer_addr = h.remote_addr;
+    let span = tracing::info_span!("peer", addr = %peer_addr);
+    tokio::spawn(
+        async move {
+            if let Err(e) = h.run(mgmt_rx).await {
+                tracing::warn!(error = %e, "BGP session ended with error");
+            }
+            let mut server = GLOBAL.write().await;
+            if let Some(peer) = server.peers.get_mut(&peer_addr) {
+                if peer.delete_on_disconnected {
+                    server.peers.remove(&peer_addr);
+                } else {
+                    peer.reset();
+                    enable_active_connect(peer, active_conn_tx);
+                }
+            }
+        }
+        .instrument(span),
+    );
 }
 
 struct Handler {
@@ -3564,7 +3511,6 @@ struct Handler {
     stream: Option<TcpStream>,
     keepalive_timer: tokio::time::Interval,
     source: Option<Arc<table::Source>>,
-    table_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
     peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
     holdtimer_renewed: Instant,
     shutdown: Option<bmp::PeerDownReason>,
@@ -3608,7 +3554,6 @@ impl Handler {
             ),
             stream: Some(stream),
             source: None,
-            table_tx: Vec::with_capacity(*NUM_TABLES),
             peer_event_tx: Vec::new(),
             holdtimer_renewed: Instant::now(),
             shutdown: None,
@@ -3664,12 +3609,11 @@ impl Handler {
             );
         }
 
-        let d = Table::dealer(self.remote_addr);
+        let export_policy = GLOBAL_EXPORT_POLICY.load_full();
         for i in 0..*NUM_TABLES {
             let mut t = TABLE[i].lock().await;
 
             // Populate initial routes for each negotiated family.
-            let export_policy = GLOBAL_EXPORT_POLICY.load();
             for f in codec.channel.keys() {
                 let effective_max = self.send_max.get(f).copied().unwrap_or(1);
                 for c in t.rtable.best(f).into_iter() {
@@ -3697,9 +3641,6 @@ impl Handler {
             if !addpath.is_empty() {
                 t.addpath.insert(self.remote_addr, addpath.clone());
             }
-
-            let tx = t.table_event_tx[d].clone();
-            self.table_tx.push(tx);
 
             // Send BMP PeerUp from the first table partition only.
             if i == 0 {
@@ -3941,34 +3882,26 @@ impl Handler {
             let family = s.family;
             for net in s.entries {
                 let idx = Table::dealer(net.nlri);
-                if self.table_tx[idx]
-                    .send(TableEvent::PassUpdate(
-                        self.source.as_ref().unwrap().clone(),
-                        family,
-                        vec![net],
-                        Some(attr.clone()),
-                    ))
-                    .is_err()
-                {
-                    tracing::warn!("table channel closed, cannot forward reach update");
-                }
+                let mut t = TABLE[idx].lock().await;
+                t.event(TableEvent::PassUpdate(
+                    self.source.as_ref().unwrap().clone(),
+                    family,
+                    vec![net],
+                    Some(attr.clone()),
+                ));
             }
         }
         if let Some(s) = unreach {
             let family = s.family;
             for net in s.entries {
                 let idx = Table::dealer(net.nlri);
-                if self.table_tx[idx]
-                    .send(TableEvent::PassUpdate(
-                        self.source.as_ref().unwrap().clone(),
-                        family,
-                        vec![net],
-                        None,
-                    ))
-                    .is_err()
-                {
-                    tracing::warn!("table channel closed, cannot forward withdrawal");
-                }
+                let mut t = TABLE[idx].lock().await;
+                t.event(TableEvent::PassUpdate(
+                    self.source.as_ref().unwrap().clone(),
+                    family,
+                    vec![net],
+                    None,
+                ));
             }
         }
     }
@@ -4312,7 +4245,7 @@ impl Handler {
                 let mut t = TABLE[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
                 t.addpath.remove(&self.remote_addr);
-                let _ = self.table_tx[i].send(TableEvent::Disconnected(source.clone()));
+                t.event(TableEvent::Disconnected(source.clone()));
                 let reason = self
                     .shutdown
                     .take()
