@@ -1303,8 +1303,9 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddPathRequest>,
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
         let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        let chan = TABLE[u.0].lock().await.table_event_tx[0].clone();
-        let _ = chan.send(u.1);
+        let mut t = TABLE[u.0].lock().await;
+        t.event(u.1);
+
         // FIXME: support uuid
         Ok(tonic::Response::new(api::AddPathResponse {
             uuid: Vec::new(),
@@ -1315,8 +1316,8 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::DeletePathRequest>,
     ) -> Result<tonic::Response<api::DeletePathResponse>, tonic::Status> {
         let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        let chan = TABLE[u.0].lock().await.table_event_tx[0].clone();
-        let _ = chan.send(u.1);
+        let mut t = TABLE[u.0].lock().await;
+        t.event(u.1);
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
     type ListPathStream = Pin<
@@ -1413,8 +1414,8 @@ impl GoBgpService for GrpcService {
         while let Some(Ok(request)) = stream.next().await {
             for path in request.paths {
                 if let Ok(u) = self.local_path(path) {
-                    let chan = TABLE[u.0].lock().await.table_event_tx[0].clone();
-                    let _ = chan.send(u.1);
+                    let mut t = TABLE[u.0].lock().await;
+                    t.event(u.1);
                 }
             }
         }
@@ -2444,7 +2445,6 @@ impl RpkiClient {
     async fn serve(
         stream: TcpStream,
         rx: mpsc::UnboundedReceiver<RpkiMgmtMsg>,
-        txv: Vec<mpsc::UnboundedSender<TableEvent>>,
         state: Arc<RpkiState>,
     ) -> Result<(), Error> {
         let remote_addr = stream.peer_addr()?.ip();
@@ -2483,8 +2483,9 @@ impl RpkiClient {
                             if prefix.flags & 1 > 0 {
                                 let roa = Arc::new(table::Roa::new(prefix.max_length, prefix.as_number, remote_addr.clone()));
                                 if end_of_data {
-                                    for tx in &txv {
-                                        let _ = tx.send(TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())]));
+                                    for i in 0..*NUM_TABLES {
+                                        let mut t = TABLE[i].lock().await;
+                                        t.event(TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())]));
                                     }
                                 } else {
                                     v.push((
@@ -2497,9 +2498,10 @@ impl RpkiClient {
                         rpki::Message::EndOfData { serial_number } => {
                             end_of_data = true;
                             state.serial.store(serial_number, Ordering::Relaxed);
-                            for tx in &txv {
-                                let _ = tx.send(TableEvent::Drop(remote_addr.clone()));
-                                let _ = tx.send(TableEvent::InsertRoa(v.to_owned()));
+                            for i in 0..*NUM_TABLES {
+                                let mut t = TABLE[i].lock().await;
+                                t.event(TableEvent::Drop(remote_addr.clone()));
+                                t.event(TableEvent::InsertRoa(v.to_owned()));
                             }
                         }
                         _ => {}
@@ -2514,20 +2516,15 @@ impl RpkiClient {
                 .as_secs(),
             Ordering::Relaxed,
         );
-        for tx in &txv {
-            let _ = tx.send(TableEvent::Drop(remote_addr.clone()));
+        for i in 0..*NUM_TABLES {
+            let mut t = TABLE[i].lock().await;
+            t.event(TableEvent::Drop(remote_addr.clone()));
         }
         Ok(())
     }
 
     fn try_connect(sockaddr: SocketAddr, configured_time: u64) {
         tokio::spawn(async move {
-            let mut table_tx = Vec::with_capacity(*NUM_TABLES);
-            let d = Table::dealer(sockaddr);
-            for i in 0..*NUM_TABLES {
-                let t = TABLE[i].lock().await;
-                table_tx.push(t.table_event_tx[d].clone());
-            }
             loop {
                 if let Ok(Ok(stream)) = tokio::time::timeout(
                     tokio::time::Duration::from_secs(5),
@@ -2544,7 +2541,7 @@ impl RpkiClient {
                     } else {
                         break;
                     };
-                    let _ = RpkiClient::serve(stream, rx, table_tx.to_vec(), state).await;
+                    let _ = RpkiClient::serve(stream, rx, state).await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 }
@@ -2587,7 +2584,7 @@ fn create_listen_socket(addr: String, port: u16) -> std::io::Result<std::net::Tc
     Ok(sock.into())
 }
 
-static NUM_TABLES: Lazy<usize> = Lazy::new(|| num_cpus::get() / 2);
+static NUM_TABLES: Lazy<usize> = Lazy::new(num_cpus::get);
 static GLOBAL: Lazy<RwLock<Global>> = Lazy::new(|| RwLock::new(Global::new()));
 static GLOBAL_IMPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
 static GLOBAL_EXPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
@@ -2597,7 +2594,6 @@ static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
         table.push(Mutex::new(Table {
             rtable: table::RoutingTable::new(),
             peer_event_tx: FnvHashMap::default(),
-            table_event_tx: Vec::new(),
             bmp_event_tx: FnvHashMap::default(),
             mrt_event_tx: FnvHashMap::default(),
             addpath: FnvHashMap::default(),
@@ -2791,7 +2787,6 @@ impl Global {
     async fn serve(
         bgp: Option<config::BgpConfig>,
         any_peer: bool,
-        conn_tx: Vec<mpsc::UnboundedSender<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)>>,
         active_tx: mpsc::UnboundedSender<TcpStream>,
         mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
     ) {
@@ -3047,10 +3042,11 @@ impl Global {
         }
         let addr = "0.0.0.0:50051".parse().unwrap();
         let notify2 = notify.clone();
+        let active_tx2 = active_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(GoBgpServiceServer::new(GrpcService::new(
-                    notify2, active_tx,
+                    notify2, active_tx2,
                 )))
                 .serve(addr)
                 .await
@@ -3088,8 +3084,6 @@ impl Global {
             })
             .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
         assert_ne!(incomings.len(), 0);
-        let mut next_peer_taker = 0;
-        let nr_takers = conn_tx.len();
         loop {
             let mut bgp_listen_futures = FuturesUnordered::new();
             for incoming in &mut incomings {
@@ -3099,15 +3093,13 @@ impl Global {
                 stream = bgp_listen_futures.next() => {
                     if let Some(Some(Ok(stream))) = stream
                         && let Some(r) = Global::accept_connection(stream).await {
-                            let _ = conn_tx[next_peer_taker].send(r);
-                            next_peer_taker = (next_peer_taker + 1) % nr_takers;
+                            peer_loop(r.0, r.1, active_tx.clone());
                         }
                 }
                 stream = active_rx.recv().fuse() => {
                     if let Some(stream) = stream
                         && let Some(r) = Global::accept_connection(stream).await {
-                            let _ = conn_tx[next_peer_taker].send(r);
-                            next_peer_taker = (next_peer_taker + 1) % nr_takers;
+                            peer_loop(r.0, r.1, active_tx.clone());
                         }
                 }
             }
@@ -3132,7 +3124,6 @@ enum TableEvent {
 struct Table {
     rtable: table::RoutingTable,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
-    table_event_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
     bmp_event_tx: FnvHashMap<SocketAddr, mpsc::UnboundedSender<bmp::Message>>,
     mrt_event_tx: FnvHashMap<String, mpsc::UnboundedSender<mrt::Message>>,
     addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
@@ -3247,165 +3238,111 @@ impl Table {
         }
     }
 
-    async fn serve(idx: usize, mut v: Vec<UnboundedReceiverStream<TableEvent>>) {
-        loop {
-            let mut futures: FuturesUnordered<_> = v.iter_mut().map(|rx| rx.next()).collect();
-            if let Some(Some(msg)) = futures.next().await {
-                match msg {
-                    TableEvent::PassUpdate(source, family, nets, attrs) => {
-                        let mut t = TABLE[idx].lock().await;
-                        t.send_bmp_update(&source, family, &nets, attrs.as_ref());
-                        t.send_mrt_update(&source, family, &nets, attrs.as_ref());
+    fn event(&mut self, msg: TableEvent) {
+        match msg {
+            TableEvent::PassUpdate(source, family, nets, attrs) => {
+                self.send_bmp_update(&source, family, &nets, attrs.as_ref());
+                self.send_mrt_update(&source, family, &nets, attrs.as_ref());
 
-                        match attrs {
-                            Some(attrs) => {
-                                let import_policy = GLOBAL_IMPORT_POLICY.load();
-                                let export_policy = GLOBAL_EXPORT_POLICY.load();
-                                for net in nets {
-                                    let filtered = import_policy.as_ref().is_some_and(|a| {
-                                        t.rtable.apply_policy(a, &source, &net.nlri, &attrs)
+                match attrs {
+                    Some(attrs) => {
+                        let import_policy = GLOBAL_IMPORT_POLICY.load();
+                        let export_policy = GLOBAL_EXPORT_POLICY.load();
+                        for net in nets {
+                            let filtered = import_policy.as_ref().is_some_and(|a| {
+                                self.rtable.apply_policy(a, &source, &net.nlri, &attrs)
+                                    == table::Disposition::Reject
+                            });
+                            let changes = self.rtable.insert(
+                                source.clone(),
+                                family,
+                                net.nlri,
+                                net.path_id,
+                                attrs.clone(),
+                                filtered,
+                            );
+                            for ri in changes {
+                                if !ri.attr.is_empty()
+                                    && export_policy.as_ref().is_some_and(|a| {
+                                        self.rtable.apply_policy(a, &ri.source, &ri.net, &ri.attr)
                                             == table::Disposition::Reject
-                                    });
-                                    let changes = t.rtable.insert(
-                                        source.clone(),
-                                        family,
-                                        net.nlri,
-                                        net.path_id,
-                                        attrs.clone(),
-                                        filtered,
-                                    );
-                                    for ri in changes {
-                                        if !ri.attr.is_empty()
-                                            && export_policy.as_ref().is_some_and(|a| {
-                                                t.rtable
-                                                    .apply_policy(a, &ri.source, &ri.net, &ri.attr)
-                                                    == table::Disposition::Reject
-                                            })
-                                        {
-                                            continue;
-                                        }
-                                        for c in t.peer_event_tx.values() {
-                                            let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
-                                        }
-                                    }
+                                    })
+                                {
+                                    continue;
                                 }
-                            }
-                            None => {
-                                let export_policy = GLOBAL_EXPORT_POLICY.load();
-                                for net in nets {
-                                    let changes = t.rtable.remove(
-                                        source.clone(),
-                                        family,
-                                        net.nlri,
-                                        net.path_id,
-                                    );
-                                    for ri in changes {
-                                        // don't apply export policy for withdrawn routes.
-                                        if !ri.attr.is_empty()
-                                            && export_policy.as_ref().is_some_and(|a| {
-                                                t.rtable
-                                                    .apply_policy(a, &ri.source, &ri.net, &ri.attr)
-                                                    == table::Disposition::Reject
-                                            })
-                                        {
-                                            continue;
-                                        }
-                                        for c in t.peer_event_tx.values() {
-                                            let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
-                                        }
-                                    }
+                                for c in self.peer_event_tx.values() {
+                                    let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
                                 }
                             }
                         }
                     }
-                    TableEvent::Disconnected(source) => {
-                        let mut t = TABLE[idx].lock().await;
-                        let changes = t.rtable.drop(source.clone());
-                        for change in changes {
-                            for c in t.peer_event_tx.values() {
-                                let _ = c.send(ToPeerEvent::Advertise(change.clone()));
+                    None => {
+                        let export_policy = GLOBAL_EXPORT_POLICY.load();
+                        for net in nets {
+                            let changes =
+                                self.rtable
+                                    .remove(source.clone(), family, net.nlri, net.path_id);
+                            for ri in changes {
+                                // don't apply export policy for withdrawn routes.
+                                if !ri.attr.is_empty()
+                                    && export_policy.as_ref().is_some_and(|a| {
+                                        self.rtable.apply_policy(a, &ri.source, &ri.net, &ri.attr)
+                                            == table::Disposition::Reject
+                                    })
+                                {
+                                    continue;
+                                }
+                                for c in self.peer_event_tx.values() {
+                                    let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
+                                }
                             }
                         }
-                    }
-                    TableEvent::InsertRoa(v) => {
-                        let mut t = TABLE[idx].lock().await;
-                        for (net, roa) in v {
-                            t.rtable.roa_insert(net, roa);
-                        }
-                    }
-                    TableEvent::Drop(addr) => {
-                        TABLE[idx].lock().await.rtable.rpki_drop(addr);
                     }
                 }
+            }
+            TableEvent::Disconnected(source) => {
+                let changes = self.rtable.drop(source.clone());
+                for change in changes {
+                    for c in self.peer_event_tx.values() {
+                        let _ = c.send(ToPeerEvent::Advertise(change.clone()));
+                    }
+                }
+            }
+            TableEvent::InsertRoa(v) => {
+                for (net, roa) in v {
+                    self.rtable.roa_insert(net, roa);
+                }
+            }
+            TableEvent::Drop(addr) => {
+                self.rtable.rpki_drop(addr);
             }
         }
     }
 }
 
-pub(crate) fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
-    let mut handlers = Vec::new();
-    for i in 0..*NUM_TABLES {
-        let h = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let mut v = Vec::new();
-                    for _ in 0..*NUM_TABLES {
-                        let mut t = TABLE[i].lock().await;
-                        let (tx, rx) = mpsc::unbounded_channel();
-                        t.table_event_tx.push(tx);
-                        v.push(UnboundedReceiverStream::new(rx));
-                    }
-                    Table::serve(i, v).await;
-                })
-        });
-        handlers.push(h);
-    }
-
+pub(crate) async fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
     let (active_tx, active_rx) = mpsc::unbounded_channel();
-    let mut conn_tx = Vec::new();
-    for _ in 0..*NUM_TABLES - 1 {
-        let (tx, mut rx) =
-            mpsc::unbounded_channel::<(Handler, mpsc::UnboundedReceiver<PeerMgmtMsg>)>();
-        conn_tx.push(tx);
-        let active_conn_tx = active_tx.clone();
-        let h = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    loop {
-                        if let Some((mut h, mgmt_rx)) = rx.recv().await {
-                            let active_conn_tx = active_conn_tx.clone();
+    Global::serve(bgp, any_peer, active_tx, active_rx).await;
+}
 
-                            tokio::spawn(async move {
-                                let peer_addr = h.remote_addr;
-                                let _ = h.run(mgmt_rx).await;
-                                let mut server = GLOBAL.write().await;
-                                if let Some(peer) = server.peers.get_mut(&peer_addr) {
-                                    if peer.delete_on_disconnected {
-                                        server.peers.remove(&peer_addr);
-                                    } else {
-                                        peer.reset();
-                                        enable_active_connect(peer, active_conn_tx.clone());
-                                    }
-                                }
-                            });
-                        }
-                    }
-                })
-        });
-        handlers.push(h);
-    }
-
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(Global::serve(bgp, any_peer, conn_tx, active_tx, active_rx));
+fn peer_loop(
+    mut h: Handler,
+    mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>,
+    active_conn_tx: mpsc::UnboundedSender<TcpStream>,
+) {
+    tokio::spawn(async move {
+        let peer_addr = h.remote_addr;
+        let _ = h.run(mgmt_rx).await;
+        let mut server = GLOBAL.write().await;
+        if let Some(peer) = server.peers.get_mut(&peer_addr) {
+            if peer.delete_on_disconnected {
+                server.peers.remove(&peer_addr);
+            } else {
+                peer.reset();
+                enable_active_connect(peer, active_conn_tx);
+            }
+        }
+    });
 }
 
 struct Handler {
@@ -3430,7 +3367,6 @@ struct Handler {
     stream: Option<TcpStream>,
     keepalive_timer: tokio::time::Interval,
     source: Option<Arc<table::Source>>,
-    table_tx: Vec<mpsc::UnboundedSender<TableEvent>>,
     peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
     holdtimer_renewed: Instant,
     shutdown: Option<bmp::PeerDownReason>,
@@ -3474,7 +3410,6 @@ impl Handler {
             ),
             stream: Some(stream),
             source: None,
-            table_tx: Vec::with_capacity(*NUM_TABLES),
             peer_event_tx: Vec::new(),
             holdtimer_renewed: Instant::now(),
             shutdown: None,
@@ -3524,12 +3459,11 @@ impl Handler {
             );
         }
 
-        let d = Table::dealer(self.remote_addr);
+        let export_policy = GLOBAL_EXPORT_POLICY.load_full();
         for i in 0..*NUM_TABLES {
             let mut t = TABLE[i].lock().await;
 
             // Populate initial routes for each negotiated family.
-            let export_policy = GLOBAL_EXPORT_POLICY.load();
             for f in codec.channel.keys() {
                 let effective_max = self.send_max.get(f).copied().unwrap_or(1);
                 for c in t.rtable.best(f).into_iter() {
@@ -3556,9 +3490,6 @@ impl Handler {
             if !addpath.is_empty() {
                 t.addpath.insert(self.remote_addr, addpath.clone());
             }
-
-            let tx = t.table_event_tx[d].clone();
-            self.table_tx.push(tx);
 
             // Send BMP PeerUp from the first table partition only.
             if i == 0 {
@@ -3777,7 +3708,8 @@ impl Handler {
             let family = s.family;
             for net in s.entries {
                 let idx = Table::dealer(net.nlri);
-                let _ = self.table_tx[idx].send(TableEvent::PassUpdate(
+                let mut t = TABLE[idx].lock().await;
+                t.event(TableEvent::PassUpdate(
                     self.source.as_ref().unwrap().clone(),
                     family,
                     vec![net],
@@ -3789,7 +3721,8 @@ impl Handler {
             let family = s.family;
             for net in s.entries {
                 let idx = Table::dealer(net.nlri);
-                let _ = self.table_tx[idx].send(TableEvent::PassUpdate(
+                let mut t = TABLE[idx].lock().await;
+                t.event(TableEvent::PassUpdate(
                     self.source.as_ref().unwrap().clone(),
                     family,
                     vec![net],
@@ -4129,7 +4062,7 @@ impl Handler {
                 let mut t = TABLE[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
                 t.addpath.remove(&self.remote_addr);
-                let _ = self.table_tx[i].send(TableEvent::Disconnected(source.clone()));
+                t.event(TableEvent::Disconnected(source.clone()));
                 let reason = self
                     .shutdown
                     .take()

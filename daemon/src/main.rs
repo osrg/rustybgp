@@ -26,11 +26,8 @@ use clap::{Arg, Command};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
-fn main() -> Result<(), std::io::Error> {
-    if num_cpus::get() < 4 {
-        panic!("four local CPUs are necessary at least");
-    }
-
+#[tokio::main]
+async fn main() -> Result<(), std::io::Error> {
     let version: &'static str = concat!("v", env!("CARGO_PKG_VERSION"), "-", env!("GIT_HASH"));
     let args = Command::new("rustybgpd")
         .version(version)
@@ -99,6 +96,6 @@ fn main() -> Result<(), std::io::Error> {
 
     println!("Hello, RustyBGPd ({} cpus)!", num_cpus::get());
 
-    event::main(conf, args.get_flag("any"));
+    event::main(conf, args.get_flag("any")).await;
     Ok(())
 }
