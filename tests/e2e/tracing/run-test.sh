@@ -18,6 +18,7 @@ cd "$SCRIPT_DIR"
 
 PASS=0
 FAIL=0
+LOGFILE=""
 
 pass() {
     echo "  PASS: $1"
@@ -43,18 +44,18 @@ trap cleanup EXIT
 # Start rustybgpd inside the container. Logs go to /tmp/<logfile>.
 # Usage: start_bgpd <logfile> [extra rustybgpd args...]
 start_bgpd() {
-    local logfile=$1; shift
+    LOGFILE=$1; shift
     # shellcheck disable=SC2068
-    docker exec -d tracing-rusty sh -c "rustybgpd $@ >/tmp/${logfile} 2>&1"
+    docker exec -d tracing-rusty sh -c "rustybgpd $@ >/tmp/${LOGFILE} 2>&1"
 }
 
 # Start with a custom env var prepended.
 # Usage: start_bgpd_env <env> <logfile> [extra rustybgpd args...]
 start_bgpd_env() {
     local env=$1; shift
-    local logfile=$1; shift
+    LOGFILE=$1; shift
     # shellcheck disable=SC2068
-    docker exec -d tracing-rusty sh -c "${env} rustybgpd $@ >/tmp/${logfile} 2>&1"
+    docker exec -d tracing-rusty sh -c "${env} rustybgpd $@ >/tmp/${LOGFILE} 2>&1"
 }
 
 stop_bgpd() {
@@ -63,6 +64,7 @@ stop_bgpd() {
 }
 
 wait_grpc() {
+    local logfile=${1:-}
     for _ in $(seq 1 30); do
         if docker exec tracing-rusty gobgp global >/dev/null 2>&1; then
             sleep 1  # allow log buffers to flush
@@ -71,6 +73,12 @@ wait_grpc() {
         sleep 1
     done
     echo "    WARNING: gRPC not ready after 30s"
+    echo "    --- daemon process check ---"
+    docker exec tracing-rusty ps aux 2>/dev/null | grep -E "rustybgp|PID" || true
+    if [ -n "$logfile" ]; then
+        echo "    --- $logfile contents ---"
+        docker exec tracing-rusty cat "/tmp/$logfile" 2>/dev/null | tail -20 || true
+    fi
     return 1
 }
 
@@ -143,7 +151,7 @@ echo ""
 echo "--- Test 1: --log-level error suppresses info messages ---"
 
 start_bgpd test1.log -f /etc/rustybgp.yaml --log-level error
-wait_grpc
+wait_grpc $LOGFILE
 
 if read_log test1.log | grep -q "starting RustyBGPd"; then
     fail "--log-level error should suppress info-level 'starting RustyBGPd'"
@@ -159,7 +167,7 @@ echo ""
 echo "--- Test 2: --log-level debug shows debug-level output ---"
 
 start_bgpd test2.log -f /etc/rustybgp.yaml --log-level debug
-wait_grpc
+wait_grpc $LOGFILE
 
 if read_log test2.log | grep -q "starting RustyBGPd"; then
     pass "--log-level debug shows info messages"
@@ -182,7 +190,7 @@ echo ""
 echo "--- Test 3: RUST_LOG overrides --log-level ---"
 
 start_bgpd_env "RUST_LOG=info" test3.log -f /etc/rustybgp.yaml --log-level error
-wait_grpc
+wait_grpc $LOGFILE
 
 if read_log test3.log | grep -q "starting RustyBGPd"; then
     pass "RUST_LOG=info overrides --log-level error"
@@ -198,7 +206,7 @@ echo ""
 echo "--- Test 4: Runtime log level change via gRPC ---"
 
 start_bgpd test4.log -f /etc/rustybgp.yaml --log-level error
-wait_grpc
+wait_grpc $LOGFILE
 
 # Confirm no info-level output yet
 if read_log test4.log | grep -q "starting RustyBGPd"; then
@@ -230,7 +238,7 @@ echo ""
 echo "--- Test 5: Peer session logs include addr= span context ---"
 
 start_bgpd test5.log -f /etc/rustybgp.yaml --log-level debug
-wait_grpc
+wait_grpc $LOGFILE
 wait_session
 
 # The peer span attaches addr=<ip> to all handler logs.
