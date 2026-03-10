@@ -42,6 +42,7 @@ impl Header {
     }
 }
 
+#[derive(Clone)]
 pub struct MpHeader {
     remote_asn: u32,
     local_asn: u32,
