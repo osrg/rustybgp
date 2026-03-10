@@ -19,7 +19,6 @@ use arc_swap::ArcSwapOption;
 use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, Stream, StreamExt};
-use once_cell::sync::Lazy;
 use std::boxed::Box;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
@@ -32,6 +31,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
@@ -2584,11 +2584,11 @@ fn create_listen_socket(addr: String, port: u16) -> std::io::Result<std::net::Tc
     Ok(sock.into())
 }
 
-static NUM_TABLES: Lazy<usize> = Lazy::new(num_cpus::get);
-static GLOBAL: Lazy<RwLock<Global>> = Lazy::new(|| RwLock::new(Global::new()));
+static NUM_TABLES: LazyLock<usize> = LazyLock::new(num_cpus::get);
+static GLOBAL: LazyLock<RwLock<Global>> = LazyLock::new(|| RwLock::new(Global::new()));
 static GLOBAL_IMPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
 static GLOBAL_EXPORT_POLICY: ArcSwapOption<table::PolicyAssignment> = ArcSwapOption::const_empty();
-static TABLE: Lazy<Vec<Mutex<Table>>> = Lazy::new(|| {
+static TABLE: LazyLock<Vec<Mutex<Table>>> = LazyLock::new(|| {
     let mut table = Vec::with_capacity(*NUM_TABLES);
     for _ in 0..*NUM_TABLES {
         table.push(Mutex::new(Table {

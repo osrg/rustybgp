@@ -15,7 +15,6 @@
 
 use fnv::FnvHashMap;
 use ip_network_table_deps_treebitmap::IpLookupTable;
-use once_cell::sync::Lazy;
 use patricia_tree::PatriciaMap;
 use regex::Regex;
 use std::collections::{hash_map::Entry::Occupied, hash_map::Entry::Vacant};
@@ -26,6 +25,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
 use bytes::BytesMut;
@@ -1006,7 +1006,7 @@ pub struct Prefix {
 
 type SingleMatchRegex = (Regex, fn(s: &regex::Captures) -> Option<SingleAsPathMatch>);
 
-static SINGLE_MATCH_REGEX: Lazy<Vec<SingleMatchRegex>> = Lazy::new(|| {
+static SINGLE_MATCH_REGEX: LazyLock<Vec<SingleMatchRegex>> = LazyLock::new(|| {
     vec![
         (
             Regex::new(r"^_([0-9]+)_$").unwrap(),
