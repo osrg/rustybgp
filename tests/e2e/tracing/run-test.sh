@@ -87,7 +87,7 @@ wait_grpc() {
 wait_session() {
     for _ in $(seq 1 60); do
         if docker exec tracing-rusty gobgp neighbor 172.30.10.2 2>/dev/null \
-            | grep -qi "established"; then
+            | grep -i "established" >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
@@ -155,7 +155,7 @@ echo "--- Test 1: --log-level error suppresses info messages ---"
 start_bgpd test1.log -f /etc/rustybgp.yaml --log-level error
 wait_grpc $LOGFILE
 
-if read_log test1.log | grep -q "starting RustyBGPd"; then
+if read_log test1.log | grep "starting RustyBGPd" >/dev/null 2>&1; then
     fail "--log-level error should suppress info-level 'starting RustyBGPd'"
 else
     pass "--log-level error suppresses info messages"
@@ -171,14 +171,14 @@ echo "--- Test 2: --log-level debug shows debug-level output ---"
 start_bgpd test2.log -f /etc/rustybgp.yaml --log-level debug
 wait_grpc $LOGFILE
 
-if read_log test2.log | grep -q "starting RustyBGPd"; then
+if read_log test2.log | grep "starting RustyBGPd" >/dev/null 2>&1; then
     pass "--log-level debug shows info messages"
 else
     fail "--log-level debug should show info messages"
 fi
 
 # At debug level, accept_connection or session handler should produce DEBUG lines
-if read_log test2.log | grep -qi "DEBUG"; then
+if read_log test2.log | grep -i "DEBUG" >/dev/null 2>&1; then
     pass "--log-level debug shows DEBUG-level output"
 else
     fail "--log-level debug should show DEBUG-level output"
@@ -194,7 +194,7 @@ echo "--- Test 3: RUST_LOG overrides --log-level ---"
 start_bgpd_env "RUST_LOG=info" test3.log -f /etc/rustybgp.yaml --log-level error
 wait_grpc $LOGFILE
 
-if read_log test3.log | grep -q "starting RustyBGPd"; then
+if read_log test3.log | grep "starting RustyBGPd" >/dev/null 2>&1; then
     pass "RUST_LOG=info overrides --log-level error"
 else
     fail "RUST_LOG=info should override --log-level error"
@@ -211,7 +211,7 @@ start_bgpd test4.log -f /etc/rustybgp.yaml --log-level error
 wait_grpc $LOGFILE
 
 # Confirm no info-level output yet
-if read_log test4.log | grep -q "starting RustyBGPd"; then
+if read_log test4.log | grep "starting RustyBGPd" >/dev/null 2>&1; then
     fail "should have no info output at error level (before change)"
 else
     pass "no info output at error level (before gRPC change)"
@@ -224,7 +224,7 @@ grpc_set_log_level 5
 # Give it a moment to flush.
 sleep 2
 
-if read_log test4.log | grep -q "log level changed"; then
+if read_log test4.log | grep "log level changed" >/dev/null 2>&1; then
     pass "runtime gRPC SetLogLevel changes log level"
 else
     fail "expected 'log level changed' message after gRPC SetLogLevel"
@@ -245,11 +245,11 @@ wait_session
 
 # The peer span attaches addr=<ip> to all handler logs.
 # Look for the span format: peer{addr=172.30.10.2}
-if read_log test5.log | grep -Fq "peer{addr=172.30.10.2}"; then
+if read_log test5.log | grep -F "peer{addr=172.30.10.2}" >/dev/null 2>&1; then
     pass "peer session logs include addr= span context"
 else
     # Tracing may format the span differently; try a looser match
-    if read_log test5.log | grep -Fq "addr=172.30.10.2"; then
+    if read_log test5.log | grep -F "addr=172.30.10.2" >/dev/null 2>&1; then
         pass "peer session logs include addr= context (alternate format)"
     else
         fail "peer session logs should include addr=172.30.10.2 context"
@@ -260,7 +260,7 @@ fi
 
 # Also verify that a session-level message (e.g. "BGP session established") appears
 # within the peer span context.
-if read_log test5.log | grep "BGP session established" | grep -q "172.30.10.2"; then
+if read_log test5.log | grep "BGP session established" | grep "172.30.10.2" >/dev/null 2>&1; then
     pass "BGP session established message carries peer addr context"
 else
     fail "BGP session established message should carry peer addr context"
