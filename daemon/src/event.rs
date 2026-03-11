@@ -3178,8 +3178,6 @@ impl Global {
             })
             .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
         assert_ne!(incomings.len(), 0);
-        let mut stats_timer = tokio::time::interval(Duration::from_secs(60));
-        stats_timer.tick().await; // consume the immediate first tick
         loop {
             let mut bgp_listen_futures = FuturesUnordered::new();
             for incoming in &mut incomings {
@@ -3197,28 +3195,6 @@ impl Global {
                         && let Some(r) = Global::accept_connection(stream).await {
                             peer_loop(r.0, r.1, active_tx.clone());
                         }
-                }
-                _ = stats_timer.tick().fuse() => {
-                    let global = GLOBAL.read().await;
-                    let total = global.peers.len();
-                    let established = global.peers.values()
-                        .filter(|p| p.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8)
-                        .count();
-                    let mut routes_v4 = 0u64;
-                    let mut routes_v6 = 0u64;
-                    drop(global);
-                    for i in 0..*NUM_TABLES {
-                        let t = TABLE[i].lock().await;
-                        routes_v4 += t.rtable.state(Family::IPV4).num_destination as u64;
-                        routes_v6 += t.rtable.state(Family::IPV6).num_destination as u64;
-                    }
-                    tracing::info!(
-                        peers_total = total,
-                        peers_established = established,
-                        routes_v4 = routes_v4,
-                        routes_v6 = routes_v6,
-                        "periodic stats"
-                    );
                 }
             }
         }
