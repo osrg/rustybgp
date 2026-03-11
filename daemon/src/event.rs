@@ -2151,7 +2151,7 @@ impl MrtDumper {
                             }
                             if let Err(e) = file.write_all(&buf).await {
                                 tracing::error!(error = %e, "MRT file write failed");
-                                return Err(e::into());
+                                return Err(e.into());
                             }
                         }
                         None => return Ok(()),
