@@ -1,0 +1,38 @@
+networks:
+  test-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.10.0/24
+          gateway: 172.30.10.254
+
+services:
+  # rustybgp router (AS 65001)
+  # Entrypoint sleeps; the test script starts/stops rustybgpd via docker exec.
+  router-rusty:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.rustybgp
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: tracing-rusty
+    privileged: true
+    networks:
+      test-net:
+        ipv4_address: 172.30.10.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+
+  # FRR peer (AS 65002): establishes a BGP session with rustybgp
+  frr-peer:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.frr
+      args:
+        FRR_CONF_DIR: tests/e2e/tracing/frr-peer
+    container_name: tracing-frr
+    privileged: true
+    networks:
+      test-net:
+        ipv4_address: 172.30.10.2

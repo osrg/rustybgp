@@ -1,0 +1,9 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.10.1"
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.10.2"
+      peer-as: 65002
