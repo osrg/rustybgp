@@ -238,6 +238,72 @@ impl NlriSet {
     }
 }
 
+/// BGP nexthop address, parsed from NEXT_HOP attribute (type 3)
+/// or MP_REACH_NLRI nexthop field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Nexthop {
+    V4(Ipv4Addr),
+    V6(Ipv6Addr),
+    /// IPv6 global + link-local (RFC 2545, 32-byte MP_REACH nexthop).
+    V6LinkLocal(Ipv6Addr, Ipv6Addr),
+}
+
+impl Nexthop {
+    /// Parse nexthop from raw bytes (4, 16, or 32 bytes).
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        match b.len() {
+            4 => Some(Nexthop::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))),
+            16 => {
+                let arr: [u8; 16] = b.try_into().ok()?;
+                Some(Nexthop::V6(Ipv6Addr::from(arr)))
+            }
+            32 => {
+                let global: [u8; 16] = b[..16].try_into().ok()?;
+                let ll: [u8; 16] = b[16..32].try_into().ok()?;
+                let ll_addr = Ipv6Addr::from(ll);
+                if ll_addr.is_unspecified() {
+                    Some(Nexthop::V6(Ipv6Addr::from(global)))
+                } else {
+                    Some(Nexthop::V6LinkLocal(Ipv6Addr::from(global), ll_addr))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Serialize to bytes for wire encoding.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Nexthop::V4(addr) => addr.octets().to_vec(),
+            Nexthop::V6(addr) => addr.octets().to_vec(),
+            Nexthop::V6LinkLocal(global, ll) => {
+                let mut v = Vec::with_capacity(32);
+                v.extend_from_slice(&global.octets());
+                v.extend_from_slice(&ll.octets());
+                v
+            }
+        }
+    }
+
+    /// Return the primary (global) IP address for forwarding decisions.
+    pub fn addr(&self) -> IpAddr {
+        match self {
+            Nexthop::V4(a) => IpAddr::V4(*a),
+            Nexthop::V6(a) | Nexthop::V6LinkLocal(a, _) => IpAddr::V6(*a),
+        }
+    }
+}
+
+impl fmt::Display for Nexthop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Nexthop::V4(a) => write!(f, "{}", a),
+            Nexthop::V6(a) => write!(f, "{}", a),
+            Nexthop::V6LinkLocal(g, ll) => write!(f, "{} (link-local {})", g, ll),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
 pub struct Ipv4Net {
     pub addr: Ipv4Addr,
