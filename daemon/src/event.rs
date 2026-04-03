@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::{From, TryFrom};
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -810,38 +810,29 @@ impl GrpcService {
         let net = convert::net_from_api(path.nlri.ok_or(Error::EmptyArgument)?)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
         let mut attr = Vec::new();
+        let mut nexthop = None;
         for a in path.pattrs {
             let a = convert::attr_from_api(a).map_err(|_| {
                 tonic::Status::new(tonic::Code::InvalidArgument, "invalid attribute")
             })?;
             if a.code() == bgp::Attribute::MP_REACH {
                 // MP_REACH binary: [AFI:2][SAFI:1][NH_LEN:1][nexthop:NH_LEN][reserved:1][NLRI...]
-                // Extract just the nexthop bytes for the NEXTHOP attribute.
-                let nh_attr = a
-                    .binary()
-                    .and_then(|b| {
-                        let len = *b.get(3)? as usize;
-                        // Minimum: AFI(2) + SAFI(1) + NH_LEN(1) + nexthop(len) + reserved(1)
-                        if b.len() < 5 + len {
-                            return None;
-                        }
-                        let nh = &b[4..4 + len];
-                        // Normalize: 4 bytes (IPv4), 16 bytes (IPv6), or
-                        // 32 bytes (IPv6 global + link-local, store only the global).
-                        let nh = match nh.len() {
-                            4 | 16 => nh.to_vec(),
-                            32 => nh[..16].to_vec(),
-                            _ => return None,
-                        };
-                        bgp::Attribute::new_with_bin(bgp::Attribute::NEXTHOP, nh)
-                    })
-                    .ok_or_else(|| {
-                        tonic::Status::new(
-                            tonic::Code::InvalidArgument,
-                            "malformed MP_REACH nexthop",
-                        )
-                    })?;
-                attr.push(nh_attr);
+                // Extract just the nexthop.
+                nexthop = a.binary().and_then(|b| {
+                    let len = *b.get(3)? as usize;
+                    if b.len() < 5 + len {
+                        return None;
+                    }
+                    bgp::Nexthop::from_bytes(&b[4..4 + len])
+                });
+                if nexthop.is_none() {
+                    return Err(tonic::Status::new(
+                        tonic::Code::InvalidArgument,
+                        "malformed MP_REACH nexthop",
+                    ));
+                }
+            } else if a.code() == bgp::Attribute::NEXTHOP {
+                nexthop = a.binary().and_then(|b| bgp::Nexthop::from_bytes(b));
             } else {
                 attr.push(a);
             }
@@ -862,6 +853,7 @@ impl GrpcService {
                         Some(Arc::new(attr))
                     }
                 },
+                nexthop,
             ),
         ))
     }
@@ -3187,6 +3179,7 @@ enum TableEvent {
         Family,
         Vec<packet::PathNlri>,
         Option<Arc<Vec<packet::Attribute>>>,
+        Option<bgp::Nexthop>,
     ),
     Disconnected(Arc<table::Source>),
     // RPKI events
@@ -3219,6 +3212,7 @@ impl Table {
         family: Family,
         nets: &[packet::PathNlri],
         attrs: Option<&Arc<Vec<packet::Attribute>>>,
+        nexthop: Option<bgp::Nexthop>,
     ) {
         let addpath = self.has_addpath(&source.remote_addr, &family);
         let header = bmp::PerPeerHeader::new(
@@ -3238,6 +3232,7 @@ impl Table {
                 attr: attrs.clone(),
                 unreach: None,
                 mp_unreach: None,
+                nexthop,
             })
         } else {
             bgp::Message::Update(bgp::Update {
@@ -3249,6 +3244,7 @@ impl Table {
                     family,
                     entries: nets.to_owned(),
                 }),
+                nexthop: None,
             })
         };
         for bmp_tx in self.bmp_event_tx.values() {
@@ -3266,6 +3262,7 @@ impl Table {
         family: Family,
         nets: &[packet::PathNlri],
         attrs: Option<&Arc<Vec<packet::Attribute>>>,
+        nexthop: Option<bgp::Nexthop>,
     ) {
         if self.mrt_event_tx.is_empty() {
             return;
@@ -3289,6 +3286,7 @@ impl Table {
                 attr: attrs.clone(),
                 unreach: None,
                 mp_unreach: None,
+                nexthop,
             })
         } else {
             bgp::Message::Update(bgp::Update {
@@ -3300,6 +3298,7 @@ impl Table {
                     family,
                     entries: nets.to_owned(),
                 }),
+                nexthop: None,
             })
         };
         for mrt_tx in self.mrt_event_tx.values() {
@@ -3313,9 +3312,9 @@ impl Table {
 
     fn event(&mut self, msg: TableEvent) {
         match msg {
-            TableEvent::PassUpdate(source, family, nets, attrs) => {
-                self.send_bmp_update(&source, family, &nets, attrs.as_ref());
-                self.send_mrt_update(&source, family, &nets, attrs.as_ref());
+            TableEvent::PassUpdate(source, family, nets, attrs, nexthop) => {
+                self.send_bmp_update(&source, family, &nets, attrs.as_ref(), nexthop);
+                self.send_mrt_update(&source, family, &nets, attrs.as_ref(), nexthop);
 
                 match attrs {
                     Some(attrs) => {
@@ -3331,6 +3330,7 @@ impl Table {
                                 family,
                                 net.nlri,
                                 net.path_id,
+                                nexthop.unwrap(),
                                 attrs.clone(),
                                 filtered,
                             );
@@ -3414,39 +3414,19 @@ fn send_kernel_route(change: &table::Change) {
     if change.attr.is_empty() {
         let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
     } else {
-        let nexthop = change.attr.iter().find_map(|a| {
-            if a.code() == packet::Attribute::NEXTHOP {
-                a.binary().and_then(|b| match b.len() {
-                    4 => Some(IpAddr::from(Ipv4Addr::new(b[0], b[1], b[2], b[3]))),
-                    16 | 32 => {
-                        // 32 bytes: IPv6 global (16B) + link-local (16B); use the global address.
-                        let arr: [u8; 16] = b[..16].try_into().ok()?;
-                        Some(IpAddr::from(Ipv6Addr::from(arr)))
-                    }
-                    _ => None,
-                })
-            } else {
-                None
-            }
-        });
-        match nexthop {
-            Some(nexthop)
-                if matches!(
-                    (dst, nexthop),
-                    (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
-                ) =>
-            {
-                let _ = tx.send(KernelRouteEvent::Install {
-                    dst,
-                    prefix_len,
-                    nexthop,
-                });
-            }
-            _ => {
-                // No usable nexthop or family mismatch (e.g., RFC 8950);
-                // withdraw to avoid a stale kernel route.
-                let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
-            }
+        let nexthop = change.nexthop.addr();
+        if matches!(
+            (dst, nexthop),
+            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+        ) {
+            let _ = tx.send(KernelRouteEvent::Install {
+                dst,
+                prefix_len,
+                nexthop,
+            });
+        } else {
+            // Family mismatch (e.g., RFC 8950); withdraw to avoid stale kernel route.
+            let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
         }
     }
 }
@@ -3725,6 +3705,7 @@ impl Handler {
                         family: *family,
                         entries: unreach,
                     }),
+                    nexthop: None,
                 });
                 let _ = framer.encode_to(&msg, &mut txbuf);
                 self.counter_tx.sync(&msg);
@@ -3775,6 +3756,7 @@ impl Handler {
                     attr: attr.clone(),
                     unreach: None,
                     mp_unreach: None,
+                    nexthop: None,
                 });
                 let _ = framer.encode_to(&msg, &mut txbuf);
                 self.counter_tx.sync(&msg);
@@ -3834,6 +3816,7 @@ impl Handler {
         reach: Option<packet::NlriSet>,
         unreach: Option<packet::NlriSet>,
         attr: Arc<Vec<packet::Attribute>>,
+        nexthop: Option<bgp::Nexthop>,
     ) {
         if let Some(s) = reach {
             let family = s.family;
@@ -3845,6 +3828,7 @@ impl Handler {
                     family,
                     vec![net],
                     Some(attr.clone()),
+                    nexthop,
                 ));
             }
         }
@@ -3857,6 +3841,7 @@ impl Handler {
                     self.source.as_ref().unwrap().clone(),
                     family,
                     vec![net],
+                    None,
                     None,
                 ));
             }
@@ -3963,6 +3948,7 @@ impl Handler {
                 attr,
                 unreach,
                 mp_unreach,
+                nexthop,
             }) => {
                 let session_state = self.state.fsm.load(Ordering::Relaxed);
                 if session_state != SessionState::Established as u8 {
@@ -3974,8 +3960,8 @@ impl Handler {
                     ));
                 }
                 self.holdtimer_renewed = Instant::now();
-                self.rx_update(reach, unreach, attr.clone()).await;
-                self.rx_update(mp_reach, mp_unreach, attr).await;
+                self.rx_update(reach, unreach, attr.clone(), nexthop).await;
+                self.rx_update(mp_reach, mp_unreach, attr, nexthop).await;
                 Ok(())
             }
             bgp::Message::Notification(err) => {
@@ -4303,6 +4289,7 @@ fn bucket() {
 
     pending.insert_change(table::Change {
         source: src.clone(),
+        nexthop: bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)),
         family,
         net: net1,
         attr: Arc::new(attr1.clone()),
@@ -4313,6 +4300,7 @@ fn bucket() {
 
     pending.insert_change(table::Change {
         source: src.clone(),
+        nexthop: bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)),
         family: Family::IPV4,
         net: net2,
         attr: Arc::new(vec![
@@ -4333,6 +4321,7 @@ fn bucket() {
     // b-1)
     pending.insert_change(table::Change {
         source: src.clone(),
+        nexthop: bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)),
         family,
         net: net2,
         attr: Arc::new(vec![
@@ -4352,6 +4341,7 @@ fn bucket() {
     let attr2 = vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap()];
     pending.insert_change(table::Change {
         source: src.clone(),
+        nexthop: bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)),
         family,
         net: net2,
         attr: Arc::new(vec![

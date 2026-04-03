@@ -108,6 +108,7 @@ fn build_many_v4_route() {
         ]),
         unreach: None,
         mp_unreach: None,
+        nexthop: None,
     });
 
     let codec = PeerCodecBuilder::new()
@@ -141,6 +142,7 @@ fn build_many_v4_route() {
             entries: net.iter().cloned().map(PathNlri::new).collect(),
         }),
         mp_unreach: None,
+        nexthop: None,
     });
     for n in &net {
         set.insert(PathNlri::new(*n));
@@ -190,6 +192,7 @@ fn many_mp_reach() {
         ]),
         unreach: None,
         mp_unreach: None,
+        nexthop: None,
     });
 
     let codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
@@ -236,6 +239,7 @@ fn many_mp_unreach() {
             family: Family::IPV6,
             entries: net.iter().cloned().map(PathNlri::new).collect(),
         }),
+        nexthop: None,
     });
 
     let codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();

@@ -1103,6 +1103,9 @@ pub struct Update {
     /// MP_UNREACH_NLRI attribute (non-IPv4, or IPv4 via RFC 8950 Extended Nexthop).
     pub mp_unreach: Option<NlriSet>,
     pub attr: Arc<Vec<Attribute>>,
+    /// Parsed nexthop from NEXT_HOP attribute (type 3) or MP_REACH_NLRI.
+    /// `None` for withdrawal-only UPDATE messages.
+    pub nexthop: Option<Nexthop>,
 }
 
 #[derive(Clone)]
@@ -1138,6 +1141,7 @@ impl Message {
                 attr: Arc::new(Vec::new()),
                 unreach: None,
                 mp_unreach: None,
+                nexthop: None,
             })
         } else {
             Message::Update(Update {
@@ -1146,6 +1150,7 @@ impl Message {
                 attr: Arc::new(Vec::new()),
                 unreach: None,
                 mp_unreach: Some(NlriSet::new(family)),
+                nexthop: None,
             })
         }
     }
@@ -1356,10 +1361,10 @@ impl PeerCodec {
     fn mp_reach_encode<B: BufMut + AsMut<[u8]>>(
         &self,
         buf_head: usize,
-        attrs: Arc<Vec<Attribute>>,
         dst: &mut B,
         reach: &NlriSet,
         reach_idx: &mut usize,
+        nexthop: Option<&Nexthop>,
     ) -> Result<u16, ()> {
         let family = &reach.family;
         let nets = &reach.entries;
@@ -1383,17 +1388,17 @@ impl PeerCodec {
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
         if self.keep_nexthop {
-            let mut addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).octets();
-            for a in &*attrs {
-                if a.code() == Attribute::NEXTHOP {
-                    if let Some(b) = a.binary() {
-                        addr[0..b.len()].clone_from_slice(&b[..]);
-                    }
-                    break;
-                }
-            }
-            dst.put_u8(addr.len() as u8);
-            dst.put_slice(&addr);
+            let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
+            // Pad to at least 16 bytes for MP_REACH nexthop
+            let padded = if nh_bytes.len() < 16 {
+                let mut v = vec![0u8; 16];
+                v[..nh_bytes.len()].copy_from_slice(&nh_bytes);
+                v
+            } else {
+                nh_bytes
+            };
+            dst.put_u8(padded.len() as u8);
+            dst.put_slice(&padded);
         } else {
             match self.local_addr {
                 IpAddr::V6(addr) => {
@@ -1533,6 +1538,7 @@ impl PeerCodec {
                 attr,
                 unreach,
                 mp_unreach,
+                nexthop: _nexthop,
             }) => {
                 let attrs = attr.clone();
                 // Use family from whichever NlriSet is present for addpath lookup
@@ -1582,11 +1588,23 @@ impl PeerCodec {
                         if code == Attribute::AS_PATH {
                             has_as_path = true;
                         }
-                        // RFC 8950: nexthop is carried inside MP_REACH_NLRI
-                        if code == Attribute::NEXTHOP && mp_reach.is_some() {
-                            continue;
-                        }
                         let (n, _) = a.export(code, Some(dst), attr_family, self);
+                        attr_len += n;
+                    }
+                }
+                // Encode NEXTHOP attribute for traditional IPv4 reach (not MP_REACH)
+                if reach.as_ref().is_some_and(|r| !r.entries.is_empty()) && mp_reach.is_none() {
+                    let nh_addr = if self.keep_nexthop {
+                        _nexthop.map(|nh| nh.addr()).unwrap_or(self.local_addr)
+                    } else {
+                        self.local_addr
+                    };
+                    if let IpAddr::V4(v4) = nh_addr {
+                        let nh_attr =
+                            Attribute::new_with_bin(Attribute::NEXTHOP, v4.octets().to_vec())
+                                .unwrap();
+                        let (n, _) =
+                            nh_attr.export(Attribute::NEXTHOP, Some(dst), attr_family, self);
                         attr_len += n;
                     }
                 }
@@ -1604,7 +1622,7 @@ impl PeerCodec {
                 // MP_REACH_NLRI attribute
                 if let Some(mp_reach) = mp_reach {
                     attr_len += self
-                        .mp_reach_encode(pos_head, attr.clone(), dst, mp_reach, reach_idx)
+                        .mp_reach_encode(pos_head, dst, mp_reach, reach_idx, _nexthop.as_ref())
                         .unwrap();
                 }
                 // MP_UNREACH_NLRI attribute
@@ -1802,6 +1820,7 @@ impl PeerCodec {
                 let mut mp_unreach_entries: Vec<PathNlri> = Vec::new();
                 let mut mp_reach_attr = None;
                 let mut mp_unreach_attr = None;
+                let mut mp_nexthop: Option<Nexthop> = None;
                 if buf.len() < MINIMUM_UPDATE_LENGTH {
                     return Err(header_len_error);
                 }
@@ -1878,6 +1897,9 @@ impl PeerCodec {
                                             mp_reach_attr = Some(a);
                                         } else if code == Attribute::MP_UNREACH {
                                             mp_unreach_attr = Some(a);
+                                        } else if code == Attribute::NEXTHOP {
+                                            mp_nexthop =
+                                                a.binary().and_then(|b| Nexthop::from_bytes(b));
                                         } else {
                                             attr.push(a);
                                             attr_idx += 1;
@@ -1908,6 +1930,7 @@ impl PeerCodec {
                         attr: Arc::new(Vec::new()),
                         unreach: None,
                         mp_unreach: None,
+                        nexthop: None,
                     }));
                 }
 
@@ -1918,8 +1941,7 @@ impl PeerCodec {
                         error_withdraw = true;
                     }
 
-                    if !error_withdraw && !seen.contains_key(&Attribute::NEXTHOP) && reach_len != 0
-                    {
+                    if !error_withdraw && mp_nexthop.is_none() && reach_len != 0 {
                         error_withdraw = true;
                     }
 
@@ -2011,12 +2033,7 @@ impl PeerCodec {
                             for _ in 0..nexthop_len {
                                 data.push(c.read_u8().unwrap());
                             }
-                            let na = Attribute {
-                                code: Attribute::NEXTHOP,
-                                flags: Attribute::canonical_flags(Attribute::NEXTHOP).unwrap(),
-                                data: AttributeData::Bin(data),
-                            };
-                            attr.insert(0, na);
+                            mp_nexthop = Nexthop::from_bytes(&data);
                         }
                         _ => return Err(err),
                     }
@@ -2088,6 +2105,7 @@ impl PeerCodec {
                             entries: mp_unreach_entries,
                         })
                     },
+                    nexthop: mp_nexthop,
                 }))
             }
             Message::NOTIFICATION => {

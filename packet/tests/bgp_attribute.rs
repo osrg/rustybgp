@@ -67,6 +67,7 @@ fn update_with_attrs(attrs: Vec<Attribute>) -> Message {
         attr: Arc::new(attrs),
         unreach: None,
         mp_unreach: None,
+        nexthop: None,
     })
 }
 

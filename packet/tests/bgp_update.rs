@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use rustybgp_packet::bgp::{
-    Attribute, Ipv4Net, Ipv6Net, Message, NlriSet, PeerCodec, PeerCodecBuilder, Update,
+    Attribute, Ipv4Net, Ipv6Net, Message, Nexthop, NlriSet, PeerCodec, PeerCodecBuilder, Update,
 };
 use rustybgp_packet::{BgpFramer, Family, Nlri, PathNlri};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -93,6 +93,7 @@ fn update_ipv4_announce() {
         attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
         unreach: None,
         mp_unreach: None,
+        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -125,6 +126,7 @@ fn update_ipv4_announce_multiple() {
         attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
         unreach: None,
         mp_unreach: None,
+        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -153,6 +155,7 @@ fn update_ipv4_withdraw() {
             entries: vec![prefix],
         }),
         mp_unreach: None,
+        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -190,6 +193,7 @@ fn update_ipv6_announce() {
         ]),
         unreach: None,
         mp_unreach: None,
+        nexthop: None,
     });
 
     match round_trip(&msg, ipv6_codec()) {
@@ -219,6 +223,7 @@ fn update_ipv6_withdraw() {
             family: Family::IPV6,
             entries: vec![prefix],
         }),
+        nexthop: None,
     });
 
     match round_trip(&msg, ipv6_codec()) {
@@ -296,6 +301,7 @@ fn update_attr_origin_igp() {
         attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
         unreach: None,
         mp_unreach: None,
+        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -329,6 +335,7 @@ fn update_attr_med_dropped_on_encode() {
         attr: Arc::new(attrs),
         unreach: None,
         mp_unreach: None,
+        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -368,7 +375,6 @@ fn ipv4_extended_nexthop_codec() -> PeerCodec {
 fn update_ipv4_with_ipv6_nexthop() {
     let prefix = ipv4_prefix("10.0.0.0", 8);
     let nexthop_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
-    let nexthop_bytes = nexthop_v6.octets().to_vec();
 
     let msg = Message::Update(Update {
         reach: None,
@@ -383,17 +389,17 @@ fn update_ipv4_with_ipv6_nexthop() {
                 vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
             )
             .unwrap(),
-            Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes.clone()).unwrap(),
         ]),
         unreach: None,
         mp_unreach: None,
+        nexthop: Some(Nexthop::V6(nexthop_v6)),
     });
 
     match round_trip(&msg, ipv4_extended_nexthop_codec()) {
         Message::Update(Update {
             reach,
             mp_reach,
-            attr,
+            nexthop,
             ..
         }) => {
             // IPv4 NLRI must come back via mp_reach (not traditional reach)
@@ -401,14 +407,8 @@ fn update_ipv4_with_ipv6_nexthop() {
             let s = mp_reach.expect("mp_reach must be present");
             assert_eq!(s.family, Family::IPV4);
             assert_eq!(s.entries, vec![prefix]);
-            // Nexthop must be the IPv6 address (16 bytes)
-            let nh = attr
-                .iter()
-                .find(|a| a.code() == Attribute::NEXTHOP)
-                .expect("NEXTHOP attribute must be present");
-            let nh_bytes = nh.binary().unwrap();
-            assert_eq!(nh_bytes.len(), 16, "nexthop must be 16 bytes (IPv6)");
-            assert_eq!(&nh_bytes[..], &nexthop_v6.octets());
+            // Nexthop must be the IPv6 address
+            assert_eq!(nexthop, Some(Nexthop::V6(nexthop_v6)));
         }
         _ => panic!("expected Update"),
     }
@@ -426,6 +426,7 @@ fn update_ipv4_extended_nexthop_withdraw() {
             family: Family::IPV4,
             entries: vec![prefix],
         }),
+        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_extended_nexthop_codec()) {
@@ -461,6 +462,7 @@ fn update_attr_community() {
         attr: Arc::new(attrs),
         unreach: None,
         mp_unreach: None,
+        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
