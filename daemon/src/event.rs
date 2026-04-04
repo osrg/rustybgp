@@ -3536,8 +3536,6 @@ struct Handler {
     peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
     holdtimer_renewed: Instant,
     shutdown: Option<bmp::PeerDownReason>,
-    /// Per-family send_max for Add-Path TX (RFC 7911).
-    send_max: FnvHashMap<Family, usize>,
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
 }
@@ -3568,7 +3566,7 @@ impl Handler {
             local_holdtime,
             expected_remote_asn,
             false, // TODO: set based on active/passive in collision detection PR
-            send_max.clone(),
+            send_max,
         );
         Some(Handler {
             remote_addr,
@@ -3590,7 +3588,6 @@ impl Handler {
             peer_event_tx: Vec::new(),
             holdtimer_renewed: Instant::now(),
             shutdown: None,
-            send_max: send_max.clone(),
             prefix_limits,
         })
     }
@@ -3642,7 +3639,7 @@ impl Handler {
 
             // Populate initial routes for each negotiated family.
             for f in codec.channel.keys() {
-                let effective_max = self.send_max.get(f).copied().unwrap_or(1);
+                let effective_max = self.session.send_max().get(f).copied().unwrap_or(1);
                 for mut c in t.rtable.best(f).into_iter() {
                     if c.rank > effective_max {
                         continue;
