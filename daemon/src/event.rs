@@ -3331,27 +3331,40 @@ impl Table {
                         let import_policy = GLOBAL_IMPORT_POLICY.load();
                         let export_policy = GLOBAL_EXPORT_POLICY.load();
                         for net in nets {
+                            let mut nh = nexthop.unwrap();
                             let filtered = import_policy.as_ref().is_some_and(|a| {
-                                self.rtable.apply_policy(a, &source, &net.nlri, &attrs)
-                                    == table::Disposition::Reject
+                                self.rtable.apply_policy(
+                                    a,
+                                    &source,
+                                    &net.nlri,
+                                    &attrs,
+                                    &mut nh,
+                                    source.local_addr,
+                                ) == table::Disposition::Reject
                             });
                             let changes = self.rtable.insert(
                                 source.clone(),
                                 family,
                                 net.nlri,
                                 net.path_id,
-                                nexthop.unwrap(),
+                                nh,
                                 attrs.clone(),
                                 filtered,
                             );
-                            for ri in changes {
+                            for mut ri in changes {
                                 if ri.rank == 1 {
                                     send_kernel_route(&ri);
                                 }
                                 if !ri.attr.is_empty()
                                     && export_policy.as_ref().is_some_and(|a| {
-                                        self.rtable.apply_policy(a, &ri.source, &ri.net, &ri.attr)
-                                            == table::Disposition::Reject
+                                        self.rtable.apply_policy(
+                                            a,
+                                            &ri.source,
+                                            &ri.net,
+                                            &ri.attr,
+                                            &mut ri.nexthop,
+                                            ri.source.local_addr,
+                                        ) == table::Disposition::Reject
                                     })
                                 {
                                     continue;
@@ -3368,15 +3381,21 @@ impl Table {
                             let changes =
                                 self.rtable
                                     .remove(source.clone(), family, net.nlri, net.path_id);
-                            for ri in changes {
+                            for mut ri in changes {
                                 if ri.rank == 1 {
                                     send_kernel_route(&ri);
                                 }
                                 // don't apply export policy for withdrawn routes.
                                 if !ri.attr.is_empty()
                                     && export_policy.as_ref().is_some_and(|a| {
-                                        self.rtable.apply_policy(a, &ri.source, &ri.net, &ri.attr)
-                                            == table::Disposition::Reject
+                                        self.rtable.apply_policy(
+                                            a,
+                                            &ri.source,
+                                            &ri.net,
+                                            &ri.attr,
+                                            &mut ri.nexthop,
+                                            ri.source.local_addr,
+                                        ) == table::Disposition::Reject
                                     })
                                 {
                                     continue;
@@ -3626,13 +3645,19 @@ impl Handler {
             // Populate initial routes for each negotiated family.
             for f in codec.channel.keys() {
                 let effective_max = self.send_max.get(f).copied().unwrap_or(1);
-                for c in t.rtable.best(f).into_iter() {
+                for mut c in t.rtable.best(f).into_iter() {
                     if c.rank > effective_max {
                         continue;
                     }
                     if export_policy.as_ref().is_some_and(|a| {
-                        t.rtable.apply_policy(a, &c.source, &c.net, &c.attr)
-                            == table::Disposition::Reject
+                        t.rtable.apply_policy(
+                            a,
+                            &c.source,
+                            &c.net,
+                            &c.attr,
+                            &mut c.nexthop,
+                            c.source.local_addr,
+                        ) == table::Disposition::Reject
                     }) {
                         continue;
                     }

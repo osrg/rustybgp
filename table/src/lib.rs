@@ -567,8 +567,15 @@ impl RoutingTable {
                                         .collect::<Vec<packet::Attribute>>(),
                                 );
                                 if let Some(pa) = &export_policy {
-                                    if self.apply_policy(pa, &p.source, net, &attr)
-                                        == Disposition::Reject
+                                    let mut nh = p.nexthop;
+                                    if self.apply_policy(
+                                        pa,
+                                        &p.source,
+                                        net,
+                                        &attr,
+                                        &mut nh,
+                                        p.source.local_addr,
+                                    ) == Disposition::Reject
                                     {
                                         None
                                     } else {
@@ -1008,8 +1015,10 @@ impl RoutingTable {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
+        nexthop: &mut bgp::Nexthop,
+        local_addr: IpAddr,
     ) -> Disposition {
-        assignment.apply(&self.rpki, source, net, attr)
+        assignment.apply(&self.rpki, source, net, attr, nexthop, local_addr)
     }
 }
 
@@ -1445,20 +1454,29 @@ impl Statement {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
+        nexthop: &mut bgp::Nexthop,
+        local_addr: IpAddr,
     ) -> Disposition {
-        let mut result = true;
-        // if any in the conditions returns false, this statement becomes false.
-        for condition in &self.conditions {
-            if !condition.evalute(source, net, attr) {
-                result = false;
-                break;
-            }
+        let matched = self.conditions.iter().all(|c| c.evalute(source, net, attr));
+        if !matched {
+            return Disposition::Pass;
         }
 
-        if result && let Some(disposition) = &self.disposition {
-            return *disposition;
+        if let Some(action) = &self.actions.nexthop {
+            *nexthop = match action {
+                NexthopAction::Address(addr) => match addr {
+                    IpAddr::V4(v4) => bgp::Nexthop::V4(*v4),
+                    IpAddr::V6(v6) => bgp::Nexthop::V6(*v6),
+                },
+                NexthopAction::PeerSelf => match local_addr {
+                    IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
+                    IpAddr::V6(v6) => bgp::Nexthop::V6(v6),
+                },
+                NexthopAction::Unchanged => *nexthop,
+            };
         }
-        Disposition::Pass
+
+        self.disposition.unwrap_or(Disposition::Pass)
     }
 }
 
@@ -1534,11 +1552,13 @@ impl Policy {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
+        nexthop: &mut bgp::Nexthop,
+        local_addr: IpAddr,
     ) -> Disposition {
         for statement in &self.statements {
-            let r = statement.apply(source, net, attr);
-            if r != Disposition::Pass {
-                return r;
+            let d = statement.apply(source, net, attr, nexthop, local_addr);
+            if d != Disposition::Pass {
+                return d;
             }
         }
         Disposition::Pass
@@ -1558,11 +1578,13 @@ impl PolicyAssignment {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
+        nexthop: &mut bgp::Nexthop,
+        local_addr: IpAddr,
     ) -> Disposition {
         for policy in &self.policies {
-            let r = policy.apply(source, net, attr);
-            if r != Disposition::Pass {
-                return r;
+            let d = policy.apply(source, net, attr, nexthop, local_addr);
+            if d != Disposition::Pass {
+                return d;
             }
         }
         self.disposition
@@ -2693,7 +2715,14 @@ mod tests {
 
         let s = source(1, 65001, 65000, 1);
         let net = nlri(10, 0, 0, 0, 24);
-        let result = rt.apply_policy(&assignment, &s, &net, &empty_attrs());
+        let result = rt.apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &empty_attrs(),
+            &mut nh(),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        );
         assert_eq!(result, Disposition::Reject);
     }
 
@@ -2736,8 +2765,180 @@ mod tests {
         let s = source(1, 65001, 65000, 1);
         // Different prefix → no match → default disposition (Accept)
         let net = nlri(192, 168, 0, 0, 24);
-        let result = rt.apply_policy(&assignment, &s, &net, &empty_attrs());
+        let result = rt.apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &empty_attrs(),
+            &mut nh(),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        );
         assert_eq!(result, Disposition::Accept);
+    }
+
+    #[test]
+    fn policy_nexthop_action_address() {
+        let rt = RoutingTable::new();
+        let mut ptable = PolicyTable::new();
+
+        ptable
+            .add_defined_set(DefinedSetConfig::Prefix {
+                name: "ps1".to_string(),
+                prefixes: vec![PrefixConfig {
+                    ip_prefix: "10.0.0.0/24".to_string(),
+                    mask_length_min: 24,
+                    mask_length_max: 24,
+                }],
+            })
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::PrefixSet(
+                    "ps1".to_string(),
+                    MatchOption::Any,
+                )],
+                Some(Disposition::Accept),
+                Actions {
+                    nexthop: Some(NexthopAction::Address(IpAddr::V4(Ipv4Addr::new(
+                        192, 168, 1, 1,
+                    )))),
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+
+        let s = source(1, 65001, 65000, 1);
+        let net = nlri(10, 0, 0, 0, 24);
+        let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let result = rt.apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &empty_attrs(),
+            &mut nexthop,
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        );
+        assert_eq!(result, Disposition::Accept);
+        assert_eq!(nexthop, bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn policy_nexthop_action_self() {
+        let rt = RoutingTable::new();
+        let mut ptable = PolicyTable::new();
+
+        ptable
+            .add_defined_set(DefinedSetConfig::Prefix {
+                name: "ps1".to_string(),
+                prefixes: vec![PrefixConfig {
+                    ip_prefix: "10.0.0.0/24".to_string(),
+                    mask_length_min: 24,
+                    mask_length_max: 24,
+                }],
+            })
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::PrefixSet(
+                    "ps1".to_string(),
+                    MatchOption::Any,
+                )],
+                Some(Disposition::Accept),
+                Actions {
+                    nexthop: Some(NexthopAction::PeerSelf),
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+
+        let s = source(1, 65001, 65000, 1);
+        let net = nlri(10, 0, 0, 0, 24);
+        let local_addr = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
+        let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let result = rt.apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &empty_attrs(),
+            &mut nexthop,
+            local_addr,
+        );
+        assert_eq!(result, Disposition::Accept);
+        assert_eq!(nexthop, bgp::Nexthop::V4(Ipv4Addr::new(172, 16, 0, 1)));
+    }
+
+    #[test]
+    fn policy_nexthop_no_match_unchanged() {
+        let rt = RoutingTable::new();
+        let mut ptable = PolicyTable::new();
+
+        ptable
+            .add_defined_set(DefinedSetConfig::Prefix {
+                name: "ps1".to_string(),
+                prefixes: vec![PrefixConfig {
+                    ip_prefix: "10.0.0.0/24".to_string(),
+                    mask_length_min: 24,
+                    mask_length_max: 24,
+                }],
+            })
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::PrefixSet(
+                    "ps1".to_string(),
+                    MatchOption::Any,
+                )],
+                Some(Disposition::Accept),
+                Actions {
+                    nexthop: Some(NexthopAction::Address(IpAddr::V4(Ipv4Addr::new(
+                        192, 168, 1, 1,
+                    )))),
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+
+        let s = source(1, 65001, 65000, 1);
+        // Different prefix → no match → nexthop should not change
+        let net = nlri(192, 168, 0, 0, 24);
+        let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut nexthop = original;
+        let _result = rt.apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &empty_attrs(),
+            &mut nexthop,
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        );
+        assert_eq!(nexthop, original);
     }
 
     // --- Ord regression: higher-priority attribute must win ---
