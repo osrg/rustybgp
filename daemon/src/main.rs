@@ -20,6 +20,7 @@ mod auth;
 mod convert;
 mod error;
 mod event;
+mod fsm;
 mod proto;
 
 use clap::{Arg, Command};
