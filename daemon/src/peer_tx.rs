@@ -25,14 +25,11 @@ use std::sync::Arc;
 
 /// Key for PendingTx maps: (NLRI, path_id). path_id distinguishes
 /// multiple paths for the same prefix under RFC 7911 Add-Path.
-#[allow(dead_code)]
 type PendingKey = (packet::Nlri, u32);
 
 /// Maximum number of UPDATE messages produced per drain_messages() call.
-#[allow(dead_code)]
 const MAX_TX_COUNT: usize = 2048;
 
-#[allow(dead_code)]
 pub(crate) struct PendingTx {
     reach: FnvHashMap<PendingKey, (Arc<Vec<packet::Attribute>>, Nexthop)>,
     unreach: FnvHashSet<PendingKey>,
@@ -41,7 +38,6 @@ pub(crate) struct PendingTx {
     addpath_tx: bool,
 }
 
-#[allow(dead_code)]
 impl PendingTx {
     pub(crate) fn new(addpath_tx: bool) -> Self {
         PendingTx {
@@ -298,15 +294,76 @@ mod tests {
     }
 
     #[test]
-    fn attr_update_moves_between_buckets() {
+    fn same_attr_reinsert_is_noop() {
         let mut p = PendingTx::new(true);
         p.insert_change(change("10.0.0.0/24", 1, 0, false));
         p.insert_change(change("20.0.0.0/24", 1, 0, false));
         assert_eq!(p.bucket.len(), 1);
+        assert_eq!(p.bucket.values().next().unwrap().len(), 2);
 
-        // Change 20.0.0.0/24 to different origin → moves to new bucket
+        // Re-insert 20.0.0.0/24 with same attr → no change
+        p.insert_change(change("20.0.0.0/24", 1, 0, false));
+        assert_eq!(p.bucket.len(), 1);
+        assert_eq!(p.bucket.values().next().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn attr_update_moves_between_buckets() {
+        let mut p = PendingTx::new(true);
+        p.insert_change(change("10.0.0.0/24", 1, 0, false)); // origin=IGP
+        p.insert_change(change("20.0.0.0/24", 1, 0, false)); // origin=IGP
+        // Same attrs → 1 bucket with 2 entries
+        assert_eq!(p.bucket.len(), 1);
+        assert_eq!(p.bucket.values().next().unwrap().len(), 2);
+
+        // Change 20.0.0.0/24 to origin=EGP → moves to new bucket
         p.insert_change(change("20.0.0.0/24", 1, 1, false));
         assert_eq!(p.bucket.len(), 2);
+        // Old bucket has only 10.0.0.0/24
+        let old_attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+        ]);
+        assert_eq!(p.bucket.get(&old_attr).unwrap().len(), 1);
+
+        // Drain and verify: 2 UPDATEs with correct NLRIs
+        let msgs = p.drain_messages(Family::IPV4, false);
+        let mut origins: Vec<u32> = Vec::new();
+        for msg in &msgs {
+            if let bgp::Message::Update(u) = msg {
+                if let Some(reach) = &u.reach {
+                    if !reach.entries.is_empty() {
+                        let origin = u
+                            .attr
+                            .iter()
+                            .find(|a| a.code() == packet::Attribute::ORIGIN)
+                            .and_then(|a| a.value())
+                            .unwrap();
+                        origins.push(origin);
+                    }
+                }
+            }
+        }
+        origins.sort();
+        assert_eq!(origins, vec![0, 1]); // both IGP and EGP present
+    }
+
+    #[test]
+    fn withdraw_then_readvertise() {
+        let mut p = PendingTx::new(false);
+        p.insert_change(change("10.0.0.0/24", 0, 0, false));
+        p.insert_change(change("10.0.0.0/24", 0, 0, true));
+        p.insert_change(change("10.0.0.0/24", 0, 0, false));
+
+        // The final state is a reach (withdrawal was cancelled by re-advertisement)
+        let msgs = p.drain_messages(Family::IPV4, false);
+        assert!(msgs.iter().any(|m| {
+            matches!(m, bgp::Message::Update(u) if u.reach.as_ref().is_some_and(|r| !r.entries.is_empty()))
+        }));
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| { matches!(m, bgp::Message::Update(u) if u.mp_unreach.is_some()) })
+        );
     }
 
     #[test]

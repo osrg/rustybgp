@@ -3575,7 +3575,7 @@ impl Handler {
         codec: &bgp::PeerCodec,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
-        pending: &mut FnvHashMap<Family, PendingTx>,
+        pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
     ) {
         let uptime = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -3601,14 +3601,7 @@ impl Handler {
             if c.addpath_rx() {
                 addpath.insert(*family);
             }
-            pending.insert(
-                *family,
-                PendingTx {
-                    sync: true,
-                    addpath_tx: c.addpath_tx(),
-                    ..Default::default()
-                },
-            );
+            pending.insert(*family, crate::peer_tx::PendingTx::new(c.addpath_tx()));
         }
 
         let export_policy = GLOBAL_EXPORT_POLICY.load_full();
@@ -3703,7 +3696,7 @@ impl Handler {
         urgent: &mut Vec<bgp::Message>,
         framer: &mut BgpFramer,
         holdtime_futures: &mut FuturesUnordered<tokio::time::Sleep>,
-        pending: &mut FnvHashMap<Family, PendingTx>,
+        pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
     ) {
@@ -3812,7 +3805,7 @@ impl Handler {
         framer: &mut BgpFramer,
         txbuf_size: usize,
         urgent: &mut Vec<bgp::Message>,
-        pending: &mut FnvHashMap<Family, PendingTx>,
+        pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
     ) {
         // 1. Flush urgent (open, keepalive, notification) messages.
         let mut txbuf = bytes::BytesMut::with_capacity(txbuf_size);
@@ -3835,90 +3828,17 @@ impl Handler {
             return;
         }
 
-        // 2. Flush pending withdrawals.
-        for (family, p) in pending.iter_mut() {
-            let addpath_tx = framer
-                .inner()
-                .channel
-                .get(family)
-                .is_some_and(|c| c.addpath_tx());
-            let unreach: Vec<packet::PathNlri> = p
-                .unreach
-                .drain()
-                .map(|(nlri, pid)| packet::PathNlri {
-                    path_id: if addpath_tx { pid } else { 0 },
-                    nlri,
-                })
-                .collect();
-            if !unreach.is_empty() {
-                txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-                let msg = bgp::Message::Update(bgp::Update {
-                    reach: None,
-                    mp_reach: None,
-                    attr: Arc::new(Vec::new()),
-                    unreach: None,
-                    mp_unreach: Some(packet::NlriSet {
-                        family: *family,
-                        entries: unreach,
-                    }),
-                    nexthop: None,
-                });
-                let _ = framer.encode_to(&msg, &mut txbuf);
-                self.counter_tx.sync(&msg);
-                if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
-                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                    return;
-                }
-            }
-        }
-
-        // 3. Flush pending reach updates (batched by attribute).
+        // 2. Drain pending updates (withdrawals, reach, EOR) via peer_tx.
         txbuf = bytes::BytesMut::with_capacity(txbuf_size);
-        let max_tx_count = 2048;
-        let mut updates_sent = 0usize;
-        let mut sent: FnvHashMap<Family, Vec<Arc<Vec<packet::Attribute>>>> = FnvHashMap::default();
-        'flush: for (family, p) in pending.iter_mut() {
-            let addpath_tx = framer
-                .inner()
-                .channel
-                .get(family)
-                .is_some_and(|c| c.addpath_tx());
+        for (family, p) in pending.iter_mut() {
             let use_mp = framer
                 .inner()
                 .channel
                 .get(family)
                 .is_some_and(|c| c.extended_nexthop());
-            for (attr, reach) in p.bucket.iter() {
-                let nlri_set = packet::NlriSet {
-                    family: *family,
-                    entries: reach
-                        .iter()
-                        .copied()
-                        .map(|(nlri, pid)| packet::PathNlri {
-                            path_id: if addpath_tx { pid } else { 0 },
-                            nlri,
-                        })
-                        .collect(),
-                };
-                // RFC 8950: use MP_REACH_NLRI for IPv4 when extended nexthop is negotiated
-                let (reach, mp_reach) = if use_mp {
-                    (None, Some(nlri_set))
-                } else {
-                    (Some(nlri_set), None)
-                };
-                let msg = bgp::Message::Update(bgp::Update {
-                    reach,
-                    mp_reach,
-                    attr: attr.clone(),
-                    unreach: None,
-                    mp_unreach: None,
-                    nexthop: None,
-                });
+            for msg in p.drain_messages(*family, use_mp) {
                 let _ = framer.encode_to(&msg, &mut txbuf);
                 self.counter_tx.sync(&msg);
-                sent.entry(*family).or_default().push(attr.clone());
-
-                updates_sent += 1;
 
                 if txbuf.len() > txbuf_size {
                     let buf = txbuf.freeze();
@@ -3928,42 +3848,10 @@ impl Handler {
                         return;
                     }
                 }
-
-                if updates_sent >= max_tx_count {
-                    break 'flush;
-                }
             }
         }
         if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
             self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-            return;
-        }
-
-        // 4. Remove sent entries from pending maps.
-        for (family, mut s) in sent {
-            for attr in s.drain(..) {
-                let p = pending.get_mut(&family).unwrap();
-                let mut bucket = p.bucket.remove(&attr).unwrap();
-                for net in bucket.drain() {
-                    let _ = p.reach.remove(&net).unwrap();
-                }
-            }
-        }
-
-        // 5. Send EOR markers for families that have completed initial sync.
-        if self.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
-            for (family, p) in pending.iter_mut() {
-                if p.sync && p.is_empty() {
-                    p.sync = false;
-                    let mut b = bytes::BytesMut::with_capacity(txbuf_size);
-                    let eor = bgp::Message::eor(*family);
-                    let _ = framer.encode_to(&eor, &mut b);
-                    if stream.write_all(&b.freeze()).await.is_err() {
-                        self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
-                        return;
-                    }
-                }
-            }
         }
     }
 
@@ -4012,7 +3900,7 @@ impl Handler {
         msg: bgp::Message,
         urgent: &mut Vec<bgp::Message>,
         holdtime_futures: &mut FuturesUnordered<tokio::time::Sleep>,
-        pending: &mut FnvHashMap<Family, PendingTx>,
+        pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
     ) -> std::result::Result<(), Error> {
         // Extract UPDATE fields before passing to FSM (FSM doesn't process routes).
         let update_fields = if let bgp::Message::Update(ref u) = msg {
@@ -4096,7 +3984,8 @@ impl Handler {
             peer_event_rx.push(UnboundedReceiverStream::new(rx));
         }
 
-        let mut pending_update: FnvHashMap<Family, PendingTx> = FnvHashMap::default();
+        let mut pending_update: FnvHashMap<Family, crate::peer_tx::PendingTx> =
+            FnvHashMap::default();
         let mut urgent = Vec::new();
         let mut holdtime_futures: FuturesUnordered<_> =
             vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
@@ -4271,158 +4160,4 @@ impl Handler {
         }
         Ok(())
     }
-}
-
-/// Key for PendingTx maps: (NLRI, path_id). path_id distinguishes
-/// multiple paths for the same prefix under RFC 7911 Add-Path.
-type PendingKey = (packet::Nlri, u32);
-
-#[derive(Default)]
-struct PendingTx {
-    reach: FnvHashMap<PendingKey, Arc<Vec<packet::Attribute>>>,
-    unreach: FnvHashSet<PendingKey>,
-    bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<PendingKey>>,
-    sync: bool,
-    addpath_tx: bool,
-}
-
-impl PendingTx {
-    fn is_empty(&self) -> bool {
-        self.reach.is_empty() && self.unreach.is_empty()
-    }
-
-    fn insert_change(&mut self, change: table::Change) {
-        let pid = if self.addpath_tx { change.path_id } else { 0 };
-        let key: PendingKey = (change.net, pid);
-        if change.attr.is_empty() {
-            if let Some(attr) = self.reach.remove(&key) {
-                let set = self.bucket.get_mut(&attr).unwrap();
-                let b = set.remove(&key);
-                assert!(b);
-                if set.is_empty() {
-                    self.bucket.remove(&attr);
-                }
-            }
-            self.unreach.insert(key);
-        } else {
-            self.unreach.remove(&key);
-
-            if let Some(old_attr) = self.reach.insert(key, change.attr.clone()) {
-                // b-1) same attr → no-op
-                if old_attr == change.attr {
-                    return;
-                }
-
-                // b-2) different attr → move between buckets
-                let old_bucket = self.bucket.get_mut(&old_attr).unwrap();
-                let b = old_bucket.remove(&key);
-                assert!(b);
-                if old_bucket.is_empty() {
-                    self.bucket.remove(&old_attr);
-                }
-
-                let bucket = self.bucket.entry(change.attr).or_default();
-                bucket.insert(key);
-            } else {
-                // a) new key
-                let bucket = self.bucket.entry(change.attr).or_default();
-                bucket.insert(key);
-            }
-        }
-    }
-}
-
-#[test]
-fn bucket() {
-    let src = Arc::new(table::Source::new(
-        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)),
-        IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
-        1,
-        2,
-        Ipv4Addr::new(127, 0, 0, 1),
-        0,
-        false,
-    ));
-    let family = Family::IPV4;
-
-    let net1 = packet::Nlri::from_str("10.0.0.0/24").unwrap();
-    let net2 = packet::Nlri::from_str("20.0.0.0/24").unwrap();
-
-    let attr1 = vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap()];
-
-    let mut pending = PendingTx {
-        addpath_tx: true,
-        ..Default::default()
-    };
-
-    pending.insert_change(table::Change {
-        source: src.clone(),
-        nexthop: bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)),
-        family,
-        net: net1,
-        attr: Arc::new(attr1.clone()),
-        path_id: 1,
-        rank: 1,
-        old_rank: 0,
-    });
-
-    pending.insert_change(table::Change {
-        source: src.clone(),
-        nexthop: bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)),
-        family: Family::IPV4,
-        net: net2,
-        attr: Arc::new(vec![
-            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-        ]),
-        path_id: 1,
-        rank: 1,
-        old_rank: 0,
-    });
-
-    // a-1) and a-2) properly marged?
-    assert_eq!(1, pending.bucket.len());
-    assert_eq!(
-        2,
-        pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()
-    );
-
-    // b-1)
-    pending.insert_change(table::Change {
-        source: src.clone(),
-        nexthop: bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)),
-        family,
-        net: net2,
-        attr: Arc::new(vec![
-            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-        ]),
-        path_id: 1,
-        rank: 1,
-        old_rank: 0,
-    });
-    assert_eq!(1, pending.bucket.len());
-    assert_eq!(
-        2,
-        pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()
-    );
-
-    // b-2-2)
-    let attr2 = vec![packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap()];
-    pending.insert_change(table::Change {
-        source: src.clone(),
-        nexthop: bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)),
-        family,
-        net: net2,
-        attr: Arc::new(vec![
-            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap(),
-        ]),
-        path_id: 1,
-        rank: 1,
-        old_rank: 0,
-    });
-    assert_eq!(2, pending.bucket.len());
-    assert_eq!(&Arc::new(attr2), pending.reach.get(&(net2, 1)).unwrap());
-    assert_eq!(
-        1,
-        pending.bucket.get(&Arc::new(attr1.clone())).unwrap().len()
-    );
 }
