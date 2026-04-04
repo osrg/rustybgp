@@ -1,27 +1,10 @@
-# Full build: used for local development (docker compose up --build)
-ARG RUST_TARGET=aarch64-unknown-linux-musl
-FROM ghcr.io/rust-cross/rust-musl-cross:${RUST_TARGET} AS builder
-
-ARG RUST_TARGET=aarch64-unknown-linux-musl
-
-# Install protobuf compiler (required by tonic-build)
-RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /home/rust/src
-COPY . .
-
-RUN cargo build --release --target ${RUST_TARGET}
-
-# Minimal runtime
+# Runtime-only: used in CI with a prebuilt rustybgpd binary
 FROM alpine:3.21
-
-ARG RUST_TARGET=aarch64-unknown-linux-musl
 
 RUN apk add --no-cache iproute2 bash curl
 
-COPY --from=builder \
-    /home/rust/src/target/${RUST_TARGET}/release/rustybgpd \
-    /usr/local/bin/rustybgpd
+# The prebuilt binary is passed via build context
+COPY rustybgpd /usr/local/bin/rustybgpd
 RUN chmod +x /usr/local/bin/rustybgpd
 
 # Install gobgp CLI for route injection via gRPC

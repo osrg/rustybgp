@@ -9,9 +9,24 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: checking out
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@v6
+      - name: setup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - name: cache
+        uses: Swatinem/rust-cache@v2
+      - name: build rustybgpd
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: prepare prebuilt context
+        run: |
+          mkdir -p /tmp/rustybgp-prebuilt
+          cp target/x86_64-unknown-linux-musl/release/rustybgpd /tmp/rustybgp-prebuilt/
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
       - name: Run RFC 7911 e2e test
         working-directory: tests/e2e/rfc7911
         env:
-          RUST_TARGET: x86_64-unknown-linux-musl
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
         run: ./run-test.sh

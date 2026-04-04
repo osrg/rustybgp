@@ -41,8 +41,8 @@ services:
   # rustybgp: receives paths from both senders, sends add-path to receiver
   router-rusty:
     build:
-      context: ../../..
-      dockerfile: tests/e2e/shared/Dockerfile.rustybgp
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
       args:
         RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
     container_name: router-rusty
