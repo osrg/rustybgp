@@ -1267,6 +1267,7 @@ pub struct PeerCodecBuilder {
     local_asn: u32,
     remote_asn: u32,
     local_addr: IpAddr,
+    link_addr: Option<Ipv6Addr>,
     extended_length: bool,
     keep_aspath: bool,
     keep_nexthop: bool,
@@ -1285,6 +1286,7 @@ impl PeerCodecBuilder {
             local_asn: 0,
             remote_asn: 0,
             local_addr: IpAddr::V4(Ipv4Addr::from(0)),
+            link_addr: None,
             extended_length: false,
             keep_aspath: false,
             keep_nexthop: false,
@@ -1302,6 +1304,7 @@ impl PeerCodecBuilder {
             local_asn: self.local_asn,
             remote_asn: self.remote_asn,
             local_addr: self.local_addr,
+            link_addr: self.link_addr,
             extended_length: self.extended_length,
             keep_aspath: self.keep_aspath,
             keep_nexthop: self.keep_nexthop,
@@ -1316,6 +1319,11 @@ impl PeerCodecBuilder {
 
     pub fn local_addr(&mut self, local_addr: IpAddr) -> &mut Self {
         self.local_addr = local_addr;
+        self
+    }
+
+    pub fn link_addr(&mut self, addr: Ipv6Addr) -> &mut Self {
+        self.link_addr = Some(addr);
         self
     }
 
@@ -1340,6 +1348,7 @@ pub struct PeerCodec {
     local_asn: u32,
     remote_asn: u32,
     local_addr: IpAddr,
+    link_addr: Option<Ipv6Addr>,
     keep_aspath: bool,
     keep_nexthop: bool,
     pub channel: FnvHashMap<Family, Channel>,
@@ -1401,15 +1410,20 @@ impl PeerCodec {
             dst.put_slice(&padded);
         } else {
             match self.local_addr {
-                IpAddr::V6(addr) => {
-                    let addr = addr.octets();
-                    dst.put_u8(addr.len() as u8);
-                    dst.put_slice(&addr);
+                IpAddr::V6(global) => {
+                    if let Some(ll) = self.link_addr {
+                        // 32-byte nexthop: global + link-local (RFC 2545)
+                        dst.put_u8(32);
+                        dst.put_slice(&global.octets());
+                        dst.put_slice(&ll.octets());
+                    } else {
+                        dst.put_u8(16);
+                        dst.put_slice(&global.octets());
+                    }
                 }
                 IpAddr::V4(addr) => {
-                    let addr = addr.octets();
-                    dst.put_u8(addr.len() as u8);
-                    dst.put_slice(&addr);
+                    dst.put_u8(4);
+                    dst.put_slice(&addr.octets());
                 }
             };
         }

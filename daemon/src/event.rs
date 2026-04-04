@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::{From, TryFrom};
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Deref;
 use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -3436,6 +3436,40 @@ pub(crate) async fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
     Global::serve(bgp, any_peer, active_tx, active_rx).await;
 }
 
+/// For an IPv6 socket, find the link-local address of the same interface.
+/// Returns `None` for IPv4 sockets or if no link-local address is found.
+/// For a directly-connected IPv6 peer, find the link-local address of the
+/// local interface. Only looks up link-local when scope_id is non-zero
+/// (indicating a directly-connected peer). Multihop peers have no
+/// reachable link-local, so they get `None`.
+fn find_link_local(local: &SocketAddr) -> Option<Ipv6Addr> {
+    let scope_id = match local {
+        SocketAddr::V6(v6) if v6.scope_id() != 0 => v6.scope_id(),
+        _ => return None,
+    };
+    // If local address is itself link-local, use it directly.
+    if let IpAddr::V6(v6) = local.ip()
+        && v6.is_unicast_link_local()
+    {
+        return Some(v6);
+    }
+    // Look up the interface's link-local address.
+    let name = nix::net::if_::if_indextoname(scope_id)
+        .ok()
+        .and_then(|c| c.into_string().ok())?;
+    nix::ifaddrs::getifaddrs().ok()?.find_map(|ifa| {
+        if ifa.interface_name != name {
+            return None;
+        }
+        let addr = ifa.address?.as_sockaddr_in6()?.ip();
+        if (addr.segments()[0] & 0xffc0) == 0xfe80 {
+            Some(addr)
+        } else {
+            None
+        }
+    })
+}
+
 fn peer_loop(
     mut h: Handler,
     mgmt_rx: mpsc::UnboundedReceiver<PeerMgmtMsg>,
@@ -3459,6 +3493,8 @@ fn peer_loop(
 struct Handler {
     remote_addr: IpAddr,
     local_addr: IpAddr,
+    /// IPv6 link-local address of the local interface (for 32-byte MP_REACH nexthop).
+    link_addr: Option<Ipv6Addr>,
 
     local_asn: u32,
 
@@ -3503,9 +3539,12 @@ impl Handler {
         prefix_limits: FnvHashMap<Family, u32>,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
+        let local_addr = local_sockaddr.ip();
+        let link_addr = find_link_local(&local_sockaddr);
         Some(Handler {
             remote_addr,
-            local_addr: local_sockaddr.ip(),
+            local_addr,
+            link_addr,
             local_router_id,
             local_asn,
             state,
@@ -4003,19 +4042,17 @@ impl Handler {
             txbuf_size = std::cmp::min(txbuf_size, r / 2);
         }
 
-        let mut framer = BgpFramer::new(if self.rs_client {
-            bgp::PeerCodecBuilder::new()
-                .local_asn(self.local_asn)
-                .local_addr(self.local_addr)
-                .keep_aspath(true)
-                .keep_nexthop(true)
-                .build()
-        } else {
-            bgp::PeerCodecBuilder::new()
-                .local_asn(self.local_asn)
-                .local_addr(self.local_addr)
-                .build()
-        });
+        let mut builder = bgp::PeerCodecBuilder::new();
+        builder
+            .local_asn(self.local_asn)
+            .local_addr(self.local_addr);
+        if let Some(ll) = self.link_addr {
+            builder.link_addr(ll);
+        }
+        if self.rs_client {
+            builder.keep_aspath(true).keep_nexthop(true);
+        }
+        let mut framer = BgpFramer::new(builder.build());
 
         let mut peer_event_rx = Vec::new();
         for _ in 0..*NUM_TABLES {
