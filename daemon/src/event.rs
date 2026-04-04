@@ -3290,6 +3290,23 @@ impl Table {
         }
     }
 
+    fn distribute_changes(
+        &self,
+        changes: Vec<table::Change>,
+        export_policy: Option<&table::PolicyAssignment>,
+    ) {
+        for c in &changes {
+            if c.rank == 1 {
+                send_kernel_route(c);
+            }
+        }
+        for c in crate::export::filter_changes(changes, export_policy, &self.rtable) {
+            for tx in self.peer_event_tx.values() {
+                let _ = tx.send(ToPeerEvent::Advertise(c.clone()));
+            }
+        }
+    }
+
     fn event(&mut self, msg: TableEvent) {
         match msg {
             TableEvent::PassUpdate(source, family, nets, attrs, nexthop) => {
@@ -3321,28 +3338,7 @@ impl Table {
                                 attrs.clone(),
                                 filtered,
                             );
-                            for mut ri in changes {
-                                if ri.rank == 1 {
-                                    send_kernel_route(&ri);
-                                }
-                                if !ri.attr.is_empty()
-                                    && export_policy.as_ref().is_some_and(|a| {
-                                        self.rtable.apply_policy(
-                                            a,
-                                            &ri.source,
-                                            &ri.net,
-                                            &ri.attr,
-                                            &mut ri.nexthop,
-                                            ri.source.local_addr,
-                                        ) == table::Disposition::Reject
-                                    })
-                                {
-                                    continue;
-                                }
-                                for c in self.peer_event_tx.values() {
-                                    let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
-                                }
-                            }
+                            self.distribute_changes(changes, export_policy.as_deref());
                         }
                     }
                     None => {
@@ -3351,43 +3347,14 @@ impl Table {
                             let changes =
                                 self.rtable
                                     .remove(source.clone(), family, net.nlri, net.path_id);
-                            for mut ri in changes {
-                                if ri.rank == 1 {
-                                    send_kernel_route(&ri);
-                                }
-                                // don't apply export policy for withdrawn routes.
-                                if !ri.attr.is_empty()
-                                    && export_policy.as_ref().is_some_and(|a| {
-                                        self.rtable.apply_policy(
-                                            a,
-                                            &ri.source,
-                                            &ri.net,
-                                            &ri.attr,
-                                            &mut ri.nexthop,
-                                            ri.source.local_addr,
-                                        ) == table::Disposition::Reject
-                                    })
-                                {
-                                    continue;
-                                }
-                                for c in self.peer_event_tx.values() {
-                                    let _ = c.send(ToPeerEvent::Advertise(ri.clone()));
-                                }
-                            }
+                            self.distribute_changes(changes, export_policy.as_deref());
                         }
                     }
                 }
             }
             TableEvent::Disconnected(source) => {
                 let changes = self.rtable.drop(source.clone());
-                for change in changes {
-                    if change.rank == 1 {
-                        send_kernel_route(&change);
-                    }
-                    for c in self.peer_event_tx.values() {
-                        let _ = c.send(ToPeerEvent::Advertise(change.clone()));
-                    }
-                }
+                self.distribute_changes(changes, None);
             }
             TableEvent::InsertRoa(v) => {
                 for (net, roa) in v {

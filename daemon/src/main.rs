@@ -20,6 +20,7 @@ mod auth;
 mod convert;
 mod error;
 mod event;
+mod export;
 mod fsm;
 mod peer_tx;
 mod proto;
