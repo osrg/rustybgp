@@ -47,6 +47,21 @@ impl From<State> for u8 {
     }
 }
 
+impl TryFrom<u8> for State {
+    type Error = u8;
+    fn try_from(v: u8) -> Result<Self, u8> {
+        match v {
+            0 => Ok(State::Idle),
+            1 => Ok(State::Connect),
+            2 => Ok(State::Active),
+            3 => Ok(State::OpenSent),
+            4 => Ok(State::OpenConfirm),
+            5 => Ok(State::Established),
+            _ => Err(v),
+        }
+    }
+}
+
 /// Events fed into the session FSM.
 #[allow(dead_code)]
 pub(crate) enum Input {

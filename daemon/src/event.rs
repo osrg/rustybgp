@@ -122,39 +122,16 @@ impl MessageCounter {
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
-#[allow(dead_code)]
-enum SessionState {
-    Idle,
-    Connect,
-    Active,
-    OpenSent,
-    OpenConfirm,
-    Established,
-}
+use crate::fsm::State as SessionState;
 
-fn session_state_to_api(v: u8) -> api::peer_state::SessionState {
+fn session_state_to_api(v: SessionState) -> api::peer_state::SessionState {
     match v {
-        0 => api::peer_state::SessionState::Idle,
-        1 => api::peer_state::SessionState::Connect,
-        2 => api::peer_state::SessionState::Active,
-        3 => api::peer_state::SessionState::Opensent,
-        4 => api::peer_state::SessionState::Openconfirm,
-        5 => api::peer_state::SessionState::Established,
-        _ => panic!("unexpected session state {}", v),
-    }
-}
-
-impl From<SessionState> for u8 {
-    fn from(s: SessionState) -> Self {
-        match s {
-            SessionState::Idle => 0,
-            SessionState::Connect => 1,
-            SessionState::Active => 2,
-            SessionState::OpenSent => 3,
-            SessionState::OpenConfirm => 4,
-            SessionState::Established => 5,
-        }
+        SessionState::Idle => api::peer_state::SessionState::Idle,
+        SessionState::Connect => api::peer_state::SessionState::Connect,
+        SessionState::Active => api::peer_state::SessionState::Active,
+        SessionState::OpenSent => api::peer_state::SessionState::Opensent,
+        SessionState::OpenConfirm => api::peer_state::SessionState::Openconfirm,
+        SessionState::Established => api::peer_state::SessionState::Established,
     }
 }
 
@@ -471,7 +448,8 @@ impl PeerBuilder {
 
 impl From<&Peer> for api::Peer {
     fn from(p: &Peer) -> Self {
-        let session_state = p.state.fsm.load(Ordering::Acquire);
+        let session_state = SessionState::try_from(p.state.fsm.load(Ordering::Acquire))
+            .unwrap_or(SessionState::Idle);
         let remote_cap = {
             let mut v = Vec::new();
             loop {
