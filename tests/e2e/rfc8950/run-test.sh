@@ -14,6 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+source ../shared/helpers.sh
 
 PASS=0
 FAIL=0
@@ -45,10 +46,9 @@ docker compose up -d --build 2>&1
 # Wait for BGP to converge
 echo "Waiting for BGP convergence..."
 MAX_WAIT=60
+STATE=""
 for i in $(seq 1 $MAX_WAIT); do
-    # Check if FRR's BGP session is established
-    STATE=$(docker exec router-frr vtysh -c "show bgp neighbor fd00:1::2 json" 2>/dev/null \
-        | grep -o '"bgpState":"[^"]*"' | head -1 | cut -d'"' -f4) || true
+    STATE=$(frr_bgp_state router-frr fd00:1::2)
     if [ "$STATE" = "Established" ]; then
         echo "BGP session established after ${i}s"
         break
@@ -78,7 +78,7 @@ fi
 
 # Test 2: Extended Next Hop capability negotiated
 ENH=$(docker exec router-frr vtysh -c "show bgp neighbor fd00:1::2 json" 2>/dev/null \
-    | grep -c "extendedNexthop" || true)
+    | jq '[.. | objects | select(has("extendedNexthop"))] | length' 2>/dev/null || echo "0")
 if [ "$ENH" -gt 0 ]; then
     pass "Extended Next Hop capability negotiated"
 else
@@ -87,7 +87,7 @@ fi
 
 # Test 3: FRR received 172.30.1.0/24 from rustybgpd via BGP
 ROUTE_RUSTY=$(docker exec router-frr vtysh -c "show bgp ipv4 unicast 172.30.1.0/24 json" 2>/dev/null \
-    | grep -c "172.30.1.0" || true)
+    | jq '.paths | length' 2>/dev/null || echo "0")
 if [ "$ROUTE_RUSTY" -gt 0 ]; then
     pass "FRR received 172.30.1.0/24 from rustybgpd via BGP"
 else

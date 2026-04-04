@@ -19,6 +19,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+source ../shared/helpers.sh
 
 PASS=0
 FAIL=0
@@ -56,27 +57,21 @@ RECEIVER_OK=false
 
 for i in $(seq 1 $MAX_WAIT); do
     if ! $SENDER1_OK; then
-        STATE=$(docker exec frr-sender vtysh -c "show bgp neighbor 172.30.5.1 json" 2>/dev/null \
-            | grep -o '"bgpState":"[^"]*"' | head -1 | cut -d'"' -f4) || true
-        if [ "$STATE" = "Established" ]; then
+        if [ "$(frr_bgp_state frr-sender 172.30.5.1)" = "Established" ]; then
             SENDER1_OK=true
             echo "Sender1 BGP session established after ${i}s"
         fi
     fi
 
     if ! $SENDER2_OK; then
-        STATE=$(docker exec frr-sender2 vtysh -c "show bgp neighbor 172.30.5.1 json" 2>/dev/null \
-            | grep -o '"bgpState":"[^"]*"' | head -1 | cut -d'"' -f4) || true
-        if [ "$STATE" = "Established" ]; then
+        if [ "$(frr_bgp_state frr-sender2 172.30.5.1)" = "Established" ]; then
             SENDER2_OK=true
             echo "Sender2 BGP session established after ${i}s"
         fi
     fi
 
     if ! $RECEIVER_OK; then
-        STATE=$(docker exec frr-receiver vtysh -c "show bgp neighbor 172.30.6.1 json" 2>/dev/null \
-            | grep -o '"bgpState":"[^"]*"' | head -1 | cut -d'"' -f4) || true
-        if [ "$STATE" = "Established" ]; then
+        if [ "$(frr_bgp_state frr-receiver 172.30.6.1)" = "Established" ]; then
             RECEIVER_OK=true
             echo "Receiver BGP session established after ${i}s"
         fi
@@ -133,24 +128,24 @@ fi
 
 # Test 4: Add-Path capability negotiated with sender1
 ADDPATH_SENDER=$(docker exec frr-sender vtysh -c "show bgp neighbor 172.30.5.1 json" 2>/dev/null \
-    | grep -c "addPath" || true)
+    | jq '[.. | objects | select(has("addPath"))] | length' 2>/dev/null || echo "0")
 if [ "$ADDPATH_SENDER" -gt 0 ]; then
     pass "Add-Path capability negotiated with sender1"
 else
     fail "Add-Path capability negotiated with sender1"
     echo "    Debug: frr-sender neighbor details:"
-    docker exec frr-sender vtysh -c "show bgp neighbor 172.30.5.1" 2>/dev/null | grep -i "add.path" || true
+    docker exec frr-sender vtysh -c "show bgp neighbor 172.30.5.1 json" 2>/dev/null | jq . || true
 fi
 
 # Test 5: Add-Path capability negotiated with receiver
 ADDPATH_RECEIVER=$(docker exec frr-receiver vtysh -c "show bgp neighbor 172.30.6.1 json" 2>/dev/null \
-    | grep -c "addPath" || true)
+    | jq '[.. | objects | select(has("addPath"))] | length' 2>/dev/null || echo "0")
 if [ "$ADDPATH_RECEIVER" -gt 0 ]; then
     pass "Add-Path capability negotiated with receiver"
 else
     fail "Add-Path capability negotiated with receiver"
     echo "    Debug: frr-receiver neighbor details:"
-    docker exec frr-receiver vtysh -c "show bgp neighbor 172.30.6.1" 2>/dev/null | grep -i "add.path" || true
+    docker exec frr-receiver vtysh -c "show bgp neighbor 172.30.6.1 json" 2>/dev/null | jq . || true
 fi
 
 # Test 6: rustybgp RIB has 2 paths for 192.168.100.0/24
@@ -165,15 +160,14 @@ else
 fi
 
 # Test 7: frr-receiver sees 2 paths for 192.168.100.0/24 via Add-Path
-# FRR JSON output includes a "paths" array; count the number of path entries
 RECEIVER_PATHS=$(docker exec frr-receiver vtysh -c "show bgp ipv4 unicast 192.168.100.0/24 json" 2>/dev/null \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('paths',[])))" 2>/dev/null || echo "0")
+    | jq '.paths | length' 2>/dev/null || echo "0")
 if [ "$RECEIVER_PATHS" -ge 2 ]; then
     pass "frr-receiver has $RECEIVER_PATHS paths for 192.168.100.0/24 via Add-Path (expected >= 2)"
 else
     fail "frr-receiver has $RECEIVER_PATHS paths for 192.168.100.0/24 via Add-Path (expected >= 2)"
     echo "    Debug: frr-receiver BGP table for 192.168.100.0/24:"
-    docker exec frr-receiver vtysh -c "show bgp ipv4 unicast 192.168.100.0/24" 2>/dev/null || true
+    docker exec frr-receiver vtysh -c "show bgp ipv4 unicast 192.168.100.0/24 json" 2>/dev/null | jq . || true
     echo ""
     echo "    Debug: frr-receiver full BGP table:"
     docker exec frr-receiver vtysh -c "show bgp ipv4 unicast" 2>/dev/null || true
