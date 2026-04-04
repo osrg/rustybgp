@@ -64,7 +64,6 @@ pub(crate) enum Input {
 }
 
 /// Actions the I/O driver should perform.
-#[allow(dead_code)]
 pub(crate) enum Output {
     /// Send a BGP message on the wire.
     SendMessage(bgp::Message),
@@ -98,6 +97,7 @@ pub(crate) enum Output {
 pub(crate) enum SessionDownReason {
     HoldTimerExpired,
     RemoteNotification(bgp::Message),
+    FsmError(State),
     AdminShutdown,
 }
 
@@ -105,7 +105,6 @@ pub(crate) enum SessionDownReason {
 ///
 /// Holds all negotiation state for a single BGP connection. Has no I/O
 /// dependencies — processes [`Input`] events and returns [`Output`] actions.
-#[allow(dead_code)]
 pub(crate) struct Session {
     state: State,
     local_asn: u32,
@@ -113,6 +112,7 @@ pub(crate) struct Session {
     local_holdtime: u64,
     local_cap: Vec<Capability>,
     expected_remote_asn: u32,
+    #[allow(dead_code)] // Used in collision detection (future PR)
     is_active: bool,
 
     // Populated after OPEN received
@@ -126,7 +126,6 @@ pub(crate) struct Session {
     send_max: FnvHashMap<Family, usize>,
 }
 
-#[allow(dead_code)]
 impl Session {
     pub(crate) fn new(
         local_asn: u32,
@@ -154,6 +153,7 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self) -> State {
         self.state
     }
@@ -168,6 +168,7 @@ impl Session {
 
     /// RFC 4271 §6.8: returns true if THIS connection should be kept
     /// when a collision is detected with the other connection.
+    #[allow(dead_code)] // Used in collision detection (future PR)
     pub(crate) fn wins_collision(&self) -> bool {
         if self.local_router_id > self.remote_id {
             self.is_active
@@ -278,7 +279,14 @@ impl Session {
 
     fn on_update(&mut self) -> Vec<Output> {
         if self.state != State::Established {
-            return vec![Output::SessionDown(SessionDownReason::AdminShutdown)];
+            return vec![
+                Output::SendMessage(bgp::Message::Notification(
+                    rustybgp_packet::BgpError::FsmUnexpectedState {
+                        state: u8::from(self.state),
+                    },
+                )),
+                Output::SessionDown(SessionDownReason::FsmError(self.state)),
+            ];
         }
         vec![Output::RenewHoldTimer]
     }

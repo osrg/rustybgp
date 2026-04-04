@@ -123,6 +123,7 @@ impl MessageCounter {
 }
 
 #[derive(PartialEq, Clone, Copy)]
+#[allow(dead_code)]
 enum SessionState {
     Idle,
     Connect,
@@ -3518,8 +3519,6 @@ struct Handler {
 
     local_asn: u32,
 
-    local_router_id: Ipv4Addr,
-
     state: Arc<PeerState>,
 
     counter_tx: Arc<MessageCounter>,
@@ -3527,11 +3526,8 @@ struct Handler {
 
     local_cap: Vec<packet::Capability>,
 
-    local_holdtime: u64,
-    negotiated_holdtime: u64,
     rs_client: bool,
 
-    #[allow(dead_code)]
     session: crate::fsm::Session,
 
     stream: Option<TcpStream>,
@@ -3578,14 +3574,11 @@ impl Handler {
             remote_addr,
             local_addr,
             link_addr,
-            local_router_id,
             local_asn,
             state,
             counter_tx,
             counter_rx,
             local_cap,
-            local_holdtime,
-            negotiated_holdtime: 0,
             rs_client,
             session,
             keepalive_timer: tokio::time::interval_at(
@@ -3729,7 +3722,6 @@ impl Handler {
         }
     }
 
-    #[allow(dead_code)]
     async fn apply_outputs(
         &mut self,
         outputs: Vec<crate::fsm::Output>,
@@ -3823,6 +3815,9 @@ impl Handler {
                         }
                         crate::fsm::SessionDownReason::RemoteNotification(msg) => {
                             bmp::PeerDownReason::RemoteNotification(msg)
+                        }
+                        crate::fsm::SessionDownReason::FsmError(_) => {
+                            bmp::PeerDownReason::LocalFsm(0)
                         }
                         crate::fsm::SessionDownReason::AdminShutdown => {
                             bmp::PeerDownReason::LocalFsm(0)
@@ -4036,142 +4031,60 @@ impl Handler {
 
     async fn rx_msg(
         &mut self,
-        codec: &mut packet::bgp::PeerCodec,
+        framer: &mut BgpFramer,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
         msg: bgp::Message,
         urgent: &mut Vec<bgp::Message>,
+        holdtime_futures: &mut FuturesUnordered<tokio::time::Sleep>,
         pending: &mut FnvHashMap<Family, PendingTx>,
     ) -> std::result::Result<(), Error> {
-        match msg {
-            bgp::Message::Open(bgp::Open {
-                as_number,
-                holdtime,
-                router_id,
-                mut capability,
-            }) => {
-                urgent.push(bgp::Message::Keepalive);
-                self.state
-                    .remote_holdtime
-                    .store(holdtime.seconds(), Ordering::Relaxed);
-                self.state.remote_id.store(router_id, Ordering::Relaxed);
-                let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
-                if remote_asn != 0 && remote_asn != as_number {
-                    urgent.insert(
-                        0,
-                        bgp::Message::Notification(rustybgp_packet::BgpError::Other {
-                            code: 2,
-                            subcode: 2,
-                            data: vec![],
-                        }),
-                    );
-                    return Ok(());
-                }
-                self.state.remote_asn.store(as_number, Ordering::Relaxed);
-                // Collect locally-configured Add-Path families before negotiation
-                let local_addpath: Vec<(packet::Family, u8)> = self
-                    .local_cap
-                    .iter()
-                    .filter_map(|c| {
-                        if let packet::Capability::AddPath(v) = c {
-                            Some(v.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .flatten()
-                    .collect();
+        // Extract UPDATE fields before passing to FSM (FSM doesn't process routes).
+        let update_fields = if let bgp::Message::Update(ref u) = msg {
+            Some((
+                u.reach.clone(),
+                u.mp_reach.clone(),
+                u.attr.clone(),
+                u.unreach.clone(),
+                u.mp_unreach.clone(),
+                u.nexthop,
+            ))
+        } else {
+            None
+        };
 
-                for (f, c) in bgp::create_channel(&self.local_cap, &capability) {
-                    codec.channel.insert(f, c);
-                }
+        let outputs = self
+            .session
+            .process(crate::fsm::Input::MessageReceived(msg));
+        let has_session_down = outputs
+            .iter()
+            .any(|o| matches!(o, crate::fsm::Output::SessionDown(_)));
+        self.apply_outputs(
+            outputs,
+            urgent,
+            framer,
+            holdtime_futures,
+            pending,
+            local_sockaddr,
+            remote_sockaddr,
+        )
+        .await;
 
-                // Drop send_max for families where Add-Path TX was not negotiated
-                self.send_max
-                    .retain(|f, _| codec.channel.get(f).is_some_and(|c| c.addpath_tx()));
-
-                // Warn when locally-configured Add-Path was not negotiated
-                for (family, mode) in &local_addpath {
-                    match codec.channel.get(family) {
-                        Some(ch) => {
-                            if mode & 0x1 > 0 && !ch.addpath_rx() {
-                                eprintln!(
-                                    "add-path receive configured for {:?} but not negotiated with peer {}",
-                                    family, self.remote_addr
-                                );
-                            }
-                            if mode & 0x2 > 0 && !ch.addpath_tx() {
-                                eprintln!(
-                                    "add-path send configured for {:?} but not negotiated with peer {}",
-                                    family, self.remote_addr
-                                );
-                            }
-                        }
-                        None => {
-                            eprintln!(
-                                "add-path configured for {:?} but family not negotiated with peer {}",
-                                family, self.remote_addr
-                            );
-                        }
-                    }
-                }
-
-                self.state.remote_cap.write().await.append(&mut capability);
-                self.negotiated_holdtime =
-                    std::cmp::min(self.local_holdtime, holdtime.seconds() as u64);
-                if self.negotiated_holdtime != 0 {
-                    self.keepalive_timer =
-                        tokio::time::interval(Duration::from_secs(self.negotiated_holdtime / 3));
-                }
-                self.state
-                    .fsm
-                    .store(SessionState::OpenConfirm as u8, Ordering::Release);
-                Ok(())
-            }
-            bgp::Message::Update(bgp::Update {
-                reach,
-                mp_reach,
-                attr,
-                unreach,
-                mp_unreach,
-                nexthop,
-            }) => {
+        // For UPDATE messages: if FSM didn't reject (no SessionDown), process routes.
+        if let Some((reach, mp_reach, attr, unreach, mp_unreach, nexthop)) = update_fields {
+            if has_session_down {
                 let session_state = self.state.fsm.load(Ordering::Relaxed);
-                if session_state != SessionState::Established as u8 {
-                    return Err(Error::Packet(
-                        rustybgp_packet::BgpError::FsmUnexpectedState {
-                            state: session_state,
-                        }
-                        .into(),
-                    ));
-                }
-                self.holdtimer_renewed = Instant::now();
-                self.rx_update(reach, unreach, attr.clone(), nexthop).await;
-                self.rx_update(mp_reach, mp_unreach, attr, nexthop).await;
-                Ok(())
-            }
-            bgp::Message::Notification(err) => {
-                println!(
-                    "{}: notification {} {}",
-                    self.remote_addr,
-                    err.notification_code(),
-                    err.notification_subcode()
-                );
-                self.shutdown = Some(bmp::PeerDownReason::RemoteNotification(
-                    bgp::Message::Notification(err),
+                return Err(Error::Packet(
+                    rustybgp_packet::BgpError::FsmUnexpectedState {
+                        state: session_state,
+                    }
+                    .into(),
                 ));
-                Ok(())
             }
-            bgp::Message::Keepalive => {
-                self.holdtimer_renewed = Instant::now();
-                if self.state.fsm.load(Ordering::Relaxed) == SessionState::OpenConfirm as u8 {
-                    self.on_established(codec, local_sockaddr, remote_sockaddr, pending)
-                        .await;
-                }
-                Ok(())
-            }
-            bgp::Message::RouteRefresh { family: _ } => Ok(()),
+            self.rx_update(reach, unreach, attr.clone(), nexthop).await;
+            self.rx_update(mp_reach, mp_unreach, attr, nexthop).await;
         }
+        Ok(())
     }
 
     async fn run(
@@ -4209,20 +4122,24 @@ impl Handler {
         }
 
         let mut pending_update: FnvHashMap<Family, PendingTx> = FnvHashMap::default();
-        let mut urgent = vec![bgp::Message::Open(bgp::Open {
-            as_number: self.local_asn,
-            holdtime: HoldTime::new(self.local_holdtime as u16).unwrap_or(HoldTime::DISABLED),
-            router_id: u32::from(self.local_router_id),
-            capability: self.local_cap.to_owned(),
-        })];
-
-        self.state
-            .fsm
-            .store(SessionState::OpenSent as u8, Ordering::Relaxed);
+        let mut urgent = Vec::new();
         let mut holdtime_futures: FuturesUnordered<_> =
             vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
                 .into_iter()
                 .collect();
+
+        // Kick off the OPEN exchange via the FSM.
+        let outputs = self.session.process(crate::fsm::Input::Connected);
+        self.apply_outputs(
+            outputs,
+            &mut urgent,
+            &mut framer,
+            &mut holdtime_futures,
+            &mut pending_update,
+            local_sockaddr,
+            remote_sockaddr,
+        )
+        .await;
 
         let mut rxbuf = bytes::BytesMut::with_capacity(rxbuf_size);
         while self.shutdown.is_none() {
@@ -4242,12 +4159,10 @@ impl Handler {
                 tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE
             };
 
-            let oldstate = self.state.fsm.load(Ordering::Relaxed);
             futures::select_biased! {
                 _ = self.keepalive_timer.tick().fuse() => {
-                    if self.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
-                        urgent.insert(0, bgp::Message::Keepalive);
-                    }
+                    let outputs = self.session.process(crate::fsm::Input::KeepaliveTick);
+                    self.apply_outputs(outputs, &mut urgent, &mut framer, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
                 }
                 msg = mgmt_rx.recv().fuse() => {
                     if let Some(PeerMgmtMsg::Notification(msg)) = msg {
@@ -4256,11 +4171,14 @@ impl Handler {
                 }
                 _ = holdtime_futures.next() => {
                     let elapsed = self.holdtimer_renewed.elapsed().as_secs();
-                    if elapsed > self.negotiated_holdtime + 20 {
-                        println!("{}: holdtime expired {}", self.remote_addr, self.holdtimer_renewed.elapsed().as_secs());
-                        break;
+                    let outputs = self.session.process(crate::fsm::Input::HoldTimerCheck { elapsed_secs: elapsed });
+                    if !outputs.is_empty() {
+                        println!("{}: holdtime expired {}", self.remote_addr, elapsed);
+                        self.apply_outputs(outputs, &mut urgent, &mut framer, &mut holdtime_futures, &mut pending_update, local_sockaddr, remote_sockaddr).await;
+                    } else {
+                        let negotiated = self.session.negotiated_holdtime();
+                        holdtime_futures.push(tokio::time::sleep(Duration::from_secs(negotiated - elapsed + 10)));
                     }
-                    holdtime_futures.push(tokio::time::sleep(Duration::from_secs(self.negotiated_holdtime - elapsed + 10)));
                 }
                 msg = peer_event_futures.next().fuse() => {
                     if let Some(Some(msg)) = msg {
@@ -4277,11 +4195,11 @@ impl Handler {
                                 }
                                 // Filter changes that exceed this peer's effective send_max.
                                 // Note: ranks are 1-based for all changes (including withdrawals); there is no special rank=0.
-                                let effective_max = self.send_max.get(&ri.family).copied().unwrap_or(1);
+                                let effective_max = self.session.send_max().get(&ri.family).copied().unwrap_or(1);
                                 if ri.rank > effective_max {
                                     // Only withdraw if the path was previously within
                                     // this peer's window (old_rank <= effective_max).
-                                    if self.send_max.contains_key(&ri.family)
+                                    if self.session.send_max().contains_key(&ri.family)
                                         && ri.old_rank > 0
                                         && ri.old_rank <= effective_max
                                     {
@@ -4316,7 +4234,7 @@ impl Handler {
                                     Ok(msg) => match msg {
                                         Some(msg) => {
                                             (*self.counter_rx).sync(&msg);
-                                            let _ = self.rx_msg(framer.inner_mut(), local_sockaddr, remote_sockaddr, msg, &mut urgent, &mut pending_update).await;
+                                            let _ = self.rx_msg(&mut framer, local_sockaddr, remote_sockaddr, msg, &mut urgent, &mut holdtime_futures, &mut pending_update).await;
                                         }
                                         None => {
                                             // partial read
@@ -4347,16 +4265,7 @@ impl Handler {
                 }
             }
 
-            if oldstate == SessionState::OpenSent as u8
-                && self.state.fsm.load(Ordering::Relaxed) == SessionState::OpenConfirm as u8
-                && self.negotiated_holdtime != 0
-            {
-                holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(
-                    self.negotiated_holdtime,
-                ))]
-                .into_iter()
-                .collect();
-            }
+            // Hold timer setup is now handled by apply_outputs (SetHoldTimer).
         }
         if let Some(source) = self.source.take() {
             for i in 0..*NUM_TABLES {
