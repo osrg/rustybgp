@@ -3531,6 +3531,9 @@ struct Handler {
     negotiated_holdtime: u64,
     rs_client: bool,
 
+    #[allow(dead_code)]
+    session: crate::fsm::Session,
+
     stream: Option<TcpStream>,
     keepalive_timer: tokio::time::Interval,
     source: Option<Arc<table::Source>>,
@@ -3561,6 +3564,16 @@ impl Handler {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
         let link_addr = find_link_local(&local_sockaddr);
+        let expected_remote_asn = state.remote_asn.load(Ordering::Relaxed);
+        let session = crate::fsm::Session::new(
+            local_asn,
+            u32::from(local_router_id),
+            local_cap.clone(),
+            local_holdtime,
+            expected_remote_asn,
+            false, // TODO: set based on active/passive in collision detection PR
+            send_max.clone(),
+        );
         Some(Handler {
             remote_addr,
             local_addr,
@@ -3574,6 +3587,7 @@ impl Handler {
             local_holdtime,
             negotiated_holdtime: 0,
             rs_client,
+            session,
             keepalive_timer: tokio::time::interval_at(
                 tokio::time::Instant::now() + Duration::new(u32::MAX.into(), 0),
                 Duration::from_secs(3600),
@@ -3583,7 +3597,7 @@ impl Handler {
             peer_event_tx: Vec::new(),
             holdtimer_renewed: Instant::now(),
             shutdown: None,
-            send_max,
+            send_max: send_max.clone(),
             prefix_limits,
         })
     }
@@ -3712,6 +3726,113 @@ impl Handler {
                 }),
             };
             let _ = bmp_tx.send(bmp_msg);
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn apply_outputs(
+        &mut self,
+        outputs: Vec<crate::fsm::Output>,
+        urgent: &mut Vec<bgp::Message>,
+        framer: &mut BgpFramer,
+        holdtime_futures: &mut FuturesUnordered<tokio::time::Sleep>,
+        pending: &mut FnvHashMap<Family, PendingTx>,
+        local_sockaddr: SocketAddr,
+        remote_sockaddr: SocketAddr,
+    ) {
+        for output in outputs {
+            match output {
+                crate::fsm::Output::SendMessage(m) => {
+                    urgent.push(m);
+                }
+                crate::fsm::Output::SetKeepaliveInterval(secs) => {
+                    self.keepalive_timer = tokio::time::interval(Duration::from_secs(secs));
+                }
+                crate::fsm::Output::SetHoldTimer(secs) => {
+                    *holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
+                        .into_iter()
+                        .collect();
+                }
+                crate::fsm::Output::RenewHoldTimer => {
+                    self.holdtimer_renewed = Instant::now();
+                }
+                crate::fsm::Output::ChannelsNegotiated(channels) => {
+                    // Log Add-Path warnings for locally configured but not negotiated families
+                    let local_addpath: Vec<(Family, u8)> = self
+                        .local_cap
+                        .iter()
+                        .filter_map(|c| {
+                            if let packet::Capability::AddPath(v) = c {
+                                Some(v.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .flatten()
+                        .collect();
+                    for (family, mode) in &local_addpath {
+                        match channels.get(family) {
+                            Some(ch) => {
+                                if mode & 0x1 > 0 && !ch.addpath_rx() {
+                                    eprintln!(
+                                        "add-path receive configured for {:?} but not negotiated with peer {}",
+                                        family, self.remote_addr
+                                    );
+                                }
+                                if mode & 0x2 > 0 && !ch.addpath_tx() {
+                                    eprintln!(
+                                        "add-path send configured for {:?} but not negotiated with peer {}",
+                                        family, self.remote_addr
+                                    );
+                                }
+                            }
+                            None => {
+                                eprintln!(
+                                    "add-path configured for {:?} but family not negotiated with peer {}",
+                                    family, self.remote_addr
+                                );
+                            }
+                        }
+                    }
+                    framer.inner_mut().channel = channels;
+                }
+                crate::fsm::Output::SessionEstablished {
+                    remote_asn,
+                    remote_id,
+                    remote_holdtime,
+                    remote_capabilities,
+                } => {
+                    self.state.remote_asn.store(remote_asn, Ordering::Relaxed);
+                    self.state.remote_id.store(remote_id, Ordering::Relaxed);
+                    self.state
+                        .remote_holdtime
+                        .store(remote_holdtime, Ordering::Relaxed);
+                    loop {
+                        if let Ok(mut a) = self.state.remote_cap.try_write() {
+                            *a = remote_capabilities;
+                            break;
+                        }
+                    }
+                    self.on_established(framer.inner(), local_sockaddr, remote_sockaddr, pending)
+                        .await;
+                }
+                crate::fsm::Output::SessionDown(reason) => {
+                    self.shutdown = Some(match reason {
+                        crate::fsm::SessionDownReason::HoldTimerExpired => {
+                            bmp::PeerDownReason::LocalFsm(0)
+                        }
+                        crate::fsm::SessionDownReason::RemoteNotification(msg) => {
+                            bmp::PeerDownReason::RemoteNotification(msg)
+                        }
+                        crate::fsm::SessionDownReason::AdminShutdown => {
+                            bmp::PeerDownReason::LocalFsm(0)
+                        }
+                    });
+                }
+                crate::fsm::Output::StateChanged(s) => {
+                    self.state.fsm.store(u8::from(s), Ordering::Release);
+                }
+            }
         }
     }
 
