@@ -61,13 +61,12 @@ services:
       - ./entrypoint-rusty.sh:/entrypoint.sh:ro
 
   router-frr:
-    build:
-      context: ../../..
-      dockerfile: tests/e2e/shared/Dockerfile.frr
-      args:
-        FRR_CONF_DIR: tests/e2e/rfc8950/frr
+    image: quay.io/frrouting/frr:10.6.0
     container_name: router-frr
     privileged: true
+    volumes:
+      - ./frr/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv6.conf.all.forwarding=1

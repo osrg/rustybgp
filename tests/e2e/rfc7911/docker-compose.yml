@@ -16,26 +16,24 @@ networks:
 services:
   # FRR sender 1 (AS 65002): advertises 192.168.100.0/24
   frr-sender:
-    build:
-      context: ../../..
-      dockerfile: tests/e2e/shared/Dockerfile.frr
-      args:
-        FRR_CONF_DIR: tests/e2e/rfc7911/frr-sender
+    image: quay.io/frrouting/frr:10.6.0
     container_name: frr-sender
     privileged: true
+    volumes:
+      - ./frr-sender/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
     networks:
       left-net:
         ipv4_address: 172.30.5.2
 
   # FRR sender 2 (AS 65004): also advertises 192.168.100.0/24 (different AS path)
   frr-sender2:
-    build:
-      context: ../../..
-      dockerfile: tests/e2e/shared/Dockerfile.frr
-      args:
-        FRR_CONF_DIR: tests/e2e/rfc7911/frr-sender2
+    image: quay.io/frrouting/frr:10.6.0
     container_name: frr-sender2
     privileged: true
+    volumes:
+      - ./frr-sender2/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
     networks:
       left-net:
         ipv4_address: 172.30.5.3
@@ -60,13 +58,12 @@ services:
 
   # FRR receiver: receives add-path from rustybgp
   frr-receiver:
-    build:
-      context: ../../..
-      dockerfile: tests/e2e/shared/Dockerfile.frr
-      args:
-        FRR_CONF_DIR: tests/e2e/rfc7911/frr-receiver
+    image: quay.io/frrouting/frr:10.6.0
     container_name: frr-receiver
     privileged: true
+    volumes:
+      - ./frr-receiver/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
     networks:
       right-net:
         ipv4_address: 172.30.6.2
