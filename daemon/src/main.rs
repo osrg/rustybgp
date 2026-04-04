@@ -21,6 +21,7 @@ mod convert;
 mod error;
 mod event;
 mod fsm;
+mod peer_tx;
 mod proto;
 
 use clap::{Arg, Command};
