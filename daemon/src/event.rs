@@ -3300,7 +3300,7 @@ impl Table {
                 send_kernel_route(c);
             }
         }
-        for c in crate::export::filter_changes(changes, export_policy, &self.rtable) {
+        for c in crate::policy::filter_export(changes, export_policy, &self.rtable) {
             for tx in self.peer_event_tx.values() {
                 let _ = tx.send(ToPeerEvent::Advertise(c.clone()));
             }
@@ -3319,16 +3319,14 @@ impl Table {
                         let export_policy = GLOBAL_EXPORT_POLICY.load();
                         for net in nets {
                             let mut nh = nexthop.unwrap();
-                            let filtered = import_policy.as_ref().is_some_and(|a| {
-                                self.rtable.apply_policy(
-                                    a,
-                                    &source,
-                                    &net.nlri,
-                                    &attrs,
-                                    &mut nh,
-                                    source.local_addr,
-                                ) == table::Disposition::Reject
-                            });
+                            let filtered = crate::policy::apply_import(
+                                import_policy.as_deref(),
+                                &self.rtable,
+                                &source,
+                                &net.nlri,
+                                &attrs,
+                                &mut nh,
+                            );
                             let changes = self.rtable.insert(
                                 source.clone(),
                                 family,

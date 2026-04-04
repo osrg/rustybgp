@@ -13,12 +13,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Export policy filtering and kernel route selection.
+//! Import and export policy application.
 //!
-//! Pure logic — no async, no I/O. Takes route changes from the routing table
-//! and determines which should be advertised to peers and installed in the kernel.
+//! Pure logic — no async, no I/O.
 
+use rustybgp_packet::bgp::Nexthop;
 use rustybgp_table::{Change, Disposition, PolicyAssignment, RoutingTable};
+use std::sync::Arc;
+
+/// Apply import policy to a route and return whether it should be filtered
+/// (rejected). Also applies any nexthop rewriting action.
+pub(crate) fn apply_import(
+    import_policy: Option<&PolicyAssignment>,
+    rtable: &RoutingTable,
+    source: &Arc<rustybgp_table::Source>,
+    nlri: &rustybgp_packet::Nlri,
+    attrs: &Arc<Vec<rustybgp_packet::Attribute>>,
+    nexthop: &mut Nexthop,
+) -> bool {
+    import_policy.is_some_and(|a| {
+        rtable.apply_policy(a, source, nlri, attrs, nexthop, source.local_addr)
+            == Disposition::Reject
+    })
+}
 
 /// Apply export policy to route changes and return those that should
 /// be advertised to peers.
@@ -26,7 +43,7 @@ use rustybgp_table::{Change, Disposition, PolicyAssignment, RoutingTable};
 /// - Withdrawal changes (empty attrs) always pass (RFC 4271 §9.1.3).
 /// - Reach changes are filtered by `export_policy`; rejected ones are skipped.
 /// - Nexthop may be rewritten by policy actions.
-pub(crate) fn filter_changes(
+pub(crate) fn filter_export(
     changes: Vec<Change>,
     export_policy: Option<&PolicyAssignment>,
     rtable: &RoutingTable,
@@ -190,7 +207,7 @@ mod tests {
     fn reach_passes_without_policy() {
         let rtable = RoutingTable::new();
         let changes = vec![reach_change("10.0.0.0/24", 1)];
-        let result = filter_changes(changes, None, &rtable);
+        let result = filter_export(changes, None, &rtable);
         assert_eq!(result.len(), 1);
     }
 
@@ -199,7 +216,7 @@ mod tests {
         let rtable = RoutingTable::new();
         let policy = reject_policy();
         let changes = vec![reach_change("10.0.0.0/24", 1)];
-        let result = filter_changes(changes, Some(&policy), &rtable);
+        let result = filter_export(changes, Some(&policy), &rtable);
         assert_eq!(result.len(), 0);
     }
 
@@ -208,7 +225,7 @@ mod tests {
         let rtable = RoutingTable::new();
         let policy = reject_policy();
         let changes = vec![withdrawal_change("10.0.0.0/24", 1)];
-        let result = filter_changes(changes, Some(&policy), &rtable);
+        let result = filter_export(changes, Some(&policy), &rtable);
         assert_eq!(result.len(), 1);
         assert!(result[0].attr.is_empty());
     }
@@ -221,7 +238,7 @@ mod tests {
             reach_change("20.0.0.0/24", 2),
             withdrawal_change("30.0.0.0/24", 1),
         ];
-        let result = filter_changes(changes, None, &rtable);
+        let result = filter_export(changes, None, &rtable);
         assert_eq!(result.len(), 3);
     }
 
@@ -230,9 +247,48 @@ mod tests {
         let rtable = RoutingTable::new();
         let policy = nexthop_self_policy();
         let changes = vec![reach_change("10.0.0.0/24", 1)];
-        let result = filter_changes(changes, Some(&policy), &rtable);
+        let result = filter_export(changes, Some(&policy), &rtable);
         assert_eq!(result.len(), 1);
         // local_addr in source is 1.1.1.1 → nexthop should be rewritten to self
         assert_eq!(result[0].nexthop, Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    }
+
+    // --- import policy tests ---
+
+    #[test]
+    fn import_no_policy_accepts() {
+        let rtable = RoutingTable::new();
+        let attrs = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+        ]);
+        let mut nh = Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let filtered = apply_import(
+            None,
+            &rtable,
+            &source(1),
+            &packet::Nlri::from_str("10.0.0.0/24").unwrap(),
+            &attrs,
+            &mut nh,
+        );
+        assert!(!filtered);
+    }
+
+    #[test]
+    fn import_rejected_by_policy() {
+        let rtable = RoutingTable::new();
+        let policy = reject_policy();
+        let attrs = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+        ]);
+        let mut nh = Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let filtered = apply_import(
+            Some(&policy),
+            &rtable,
+            &source(1),
+            &packet::Nlri::from_str("10.0.0.0/24").unwrap(),
+            &attrs,
+            &mut nh,
+        );
+        assert!(filtered);
     }
 }
