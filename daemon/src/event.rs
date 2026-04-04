@@ -1599,17 +1599,13 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::AddStatementResponse>, tonic::Status> {
         let statement = request.into_inner().statement.ok_or(Error::EmptyArgument)?;
         let conditions = convert::conditions_from_api(statement.conditions).map_err(Error::from)?;
-        let disposition = convert::disposition_from_api(statement.actions).map_err(Error::from)?;
+        let (disposition, actions) =
+            convert::disposition_from_api(statement.actions).map_err(Error::from)?;
         GLOBAL
             .write()
             .await
             .ptable
-            .add_statement(
-                &statement.name,
-                conditions,
-                disposition,
-                table::Actions::default(),
-            )
+            .add_statement(&statement.name, conditions, disposition, actions)
             .map_err(Error::from)
             .map(|_| Ok(tonic::Response::new(api::AddStatementResponse {})))?
     }
@@ -3004,16 +3000,11 @@ impl Global {
                                 Ok(s) => {
                                     let conditions =
                                         convert::conditions_from_api(s.conditions).unwrap();
-                                    let disposition =
+                                    let (disposition, actions) =
                                         convert::disposition_from_api(s.actions).unwrap();
                                     server
                                         .ptable
-                                        .add_statement(
-                                            &s.name,
-                                            conditions,
-                                            disposition,
-                                            table::Actions::default(),
-                                        )
+                                        .add_statement(&s.name, conditions, disposition, actions)
                                         .unwrap();
                                     s_names.push(s.name.clone());
                                     h.insert(s.name);

@@ -471,12 +471,34 @@ pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement
         }
     }
     s.conditions = Some(conditions);
-    if let Some(a) = my.disposition {
-        s.actions = Some(api::Actions {
-            route_action: a as i32,
-            ..Default::default()
-        });
-    }
+    let nexthop = my.actions.nexthop.as_ref().map(|nh| {
+        use rustybgp_table::NexthopAction;
+        match nh {
+            NexthopAction::Address(addr) => api::NexthopAction {
+                address: addr.to_string(),
+                self_: false,
+                unchanged: false,
+                peer_address: false,
+            },
+            NexthopAction::PeerSelf => api::NexthopAction {
+                address: String::new(),
+                self_: true,
+                unchanged: false,
+                peer_address: false,
+            },
+            NexthopAction::Unchanged => api::NexthopAction {
+                address: String::new(),
+                self_: false,
+                unchanged: true,
+                peer_address: false,
+            },
+        }
+    });
+    s.actions = Some(api::Actions {
+        route_action: my.disposition.map_or(0, |a| a as i32),
+        nexthop,
+        ..Default::default()
+    });
     s
 }
 
@@ -624,18 +646,41 @@ pub(crate) fn conditions_from_api(
 
 pub(crate) fn disposition_from_api(
     actions: Option<api::Actions>,
-) -> Result<Option<rustybgp_table::Disposition>, rustybgp_table::TableError> {
-    use rustybgp_table::{Disposition, TableError};
+) -> Result<
+    (Option<rustybgp_table::Disposition>, rustybgp_table::Actions),
+    rustybgp_table::TableError,
+> {
+    use rustybgp_table::{Disposition, NexthopAction, TableError};
 
     let Some(actions) = actions else {
-        return Ok(None);
+        return Ok((None, rustybgp_table::Actions::default()));
     };
-    match api::RouteAction::try_from(actions.route_action) {
-        Ok(api::RouteAction::Accept) => Ok(Some(Disposition::Accept)),
-        Ok(api::RouteAction::Reject) => Ok(Some(Disposition::Reject)),
-        Ok(_) => Ok(None),
-        Err(_) => Err(TableError::InvalidArgument("invalid action".to_string())),
-    }
+
+    let disposition = match api::RouteAction::try_from(actions.route_action) {
+        Ok(api::RouteAction::Accept) => Some(Disposition::Accept),
+        Ok(api::RouteAction::Reject) => Some(Disposition::Reject),
+        Ok(_) => None,
+        Err(_) => {
+            return Err(TableError::InvalidArgument("invalid action".to_string()));
+        }
+    };
+
+    let nexthop = actions.nexthop.and_then(|nh| {
+        if nh.self_ {
+            Some(NexthopAction::PeerSelf)
+        } else if nh.unchanged {
+            Some(NexthopAction::Unchanged)
+        } else if !nh.address.is_empty() {
+            nh.address
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(NexthopAction::Address)
+        } else {
+            None
+        }
+    });
+
+    Ok((disposition, rustybgp_table::Actions { nexthop }))
 }
 
 pub(crate) fn defined_set_from_api(
@@ -986,19 +1031,38 @@ pub(crate) fn statement_from_config(s: &config::Statement) -> Result<api::Statem
         None
     };
 
-    let actions = s.actions.as_ref().map(|a| api::Actions {
-        route_action: match a.route_disposition.as_ref() {
-            Some(a) => route_disposition_to_i32(a),
-            None => 0,
-        },
-        community: None,
-        med: None,
-        as_prepend: None,
-        ext_community: None,
-        nexthop: None,
-        local_pref: None,
-        large_community: None,
-        origin_action: None,
+    let actions = s.actions.as_ref().map(|a| {
+        let nexthop = a
+            .bgp_actions
+            .as_ref()
+            .and_then(|ba| ba.set_next_hop.as_ref())
+            .map(|nh| {
+                let s = nh.as_str();
+                api::NexthopAction {
+                    self_: s == "self",
+                    unchanged: s == "unchanged",
+                    address: if s != "self" && s != "unchanged" {
+                        s.to_string()
+                    } else {
+                        String::new()
+                    },
+                    peer_address: false,
+                }
+            });
+        api::Actions {
+            route_action: match a.route_disposition.as_ref() {
+                Some(a) => route_disposition_to_i32(a),
+                None => 0,
+            },
+            community: None,
+            med: None,
+            as_prepend: None,
+            ext_community: None,
+            nexthop,
+            local_pref: None,
+            large_community: None,
+            origin_action: None,
+        }
     });
 
     Ok(api::Statement {
@@ -1012,5 +1076,82 @@ pub(crate) fn default_policy_type_to_i32(t: &config::DefaultPolicyType) -> i32 {
     match t {
         config::DefaultPolicyType::AcceptRoute => 1,
         config::DefaultPolicyType::RejectRoute => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustybgp_table::NexthopAction;
+
+    #[test]
+    fn nexthop_action_self() {
+        let actions = Some(api::Actions {
+            nexthop: Some(api::NexthopAction {
+                self_: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let (_, actions) = disposition_from_api(actions).unwrap();
+        assert_eq!(actions.nexthop, Some(NexthopAction::PeerSelf));
+    }
+
+    #[test]
+    fn nexthop_action_unchanged() {
+        let actions = Some(api::Actions {
+            nexthop: Some(api::NexthopAction {
+                unchanged: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let (_, actions) = disposition_from_api(actions).unwrap();
+        assert_eq!(actions.nexthop, Some(NexthopAction::Unchanged));
+    }
+
+    #[test]
+    fn nexthop_action_address() {
+        let actions = Some(api::Actions {
+            nexthop: Some(api::NexthopAction {
+                address: "10.0.0.1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let (_, actions) = disposition_from_api(actions).unwrap();
+        assert_eq!(
+            actions.nexthop,
+            Some(NexthopAction::Address("10.0.0.1".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn nexthop_action_address_v6() {
+        let actions = Some(api::Actions {
+            nexthop: Some(api::NexthopAction {
+                address: "2001:db8::1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let (_, actions) = disposition_from_api(actions).unwrap();
+        assert_eq!(
+            actions.nexthop,
+            Some(NexthopAction::Address("2001:db8::1".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn nexthop_action_none() {
+        let actions = Some(api::Actions::default());
+        let (_, actions) = disposition_from_api(actions).unwrap();
+        assert_eq!(actions.nexthop, None);
+    }
+
+    #[test]
+    fn nexthop_action_empty_actions() {
+        let (_, actions) = disposition_from_api(None).unwrap();
+        assert_eq!(actions.nexthop, None);
     }
 }
