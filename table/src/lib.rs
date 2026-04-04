@@ -1413,13 +1413,30 @@ impl From<Disposition> for i32 {
     }
 }
 
+/// Policy action to modify the nexthop of a route.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NexthopAction {
+    /// Set nexthop to a specific address.
+    Address(IpAddr),
+    /// Set nexthop to self (the local router's address).
+    PeerSelf,
+    /// Leave nexthop unchanged.
+    Unchanged,
+}
+
+/// Actions applied to a route when a policy statement matches.
+#[derive(Clone, Default)]
+pub struct Actions {
+    pub nexthop: Option<NexthopAction>,
+}
+
 #[derive(Clone)]
 pub struct Statement {
     pub name: Arc<str>,
     // ALL the conditions are matched, the action will be executed.
     pub conditions: Vec<Condition>,
     pub disposition: Option<Disposition>,
-    // pub route_action: Action,
+    pub actions: Actions,
 }
 
 impl Statement {
@@ -1825,6 +1842,7 @@ impl PolicyTable {
         name: &str,
         conditions: Vec<ConditionConfig>,
         disposition: Option<Disposition>,
+        actions: Actions,
     ) -> Result<(), TableError> {
         if self.statements.contains_key(name) {
             return Err(TableError::AlreadyExists(name.to_string()));
@@ -1901,6 +1919,7 @@ impl PolicyTable {
             name: Arc::from(name),
             conditions: v,
             disposition,
+            actions,
         };
         self.statements.insert(s.name.clone(), Arc::new(s));
         Ok(())
@@ -2659,6 +2678,7 @@ mod tests {
                     MatchOption::Any,
                 )],
                 Some(Disposition::Reject),
+                Actions::default(),
             )
             .unwrap();
         ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
@@ -2700,6 +2720,7 @@ mod tests {
                     MatchOption::Any,
                 )],
                 Some(Disposition::Reject),
+                Actions::default(),
             )
             .unwrap();
         ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();

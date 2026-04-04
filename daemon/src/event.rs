@@ -1604,7 +1604,12 @@ impl GoBgpService for GrpcService {
             .write()
             .await
             .ptable
-            .add_statement(&statement.name, conditions, disposition)
+            .add_statement(
+                &statement.name,
+                conditions,
+                disposition,
+                table::Actions::default(),
+            )
             .map_err(Error::from)
             .map(|_| Ok(tonic::Response::new(api::AddStatementResponse {})))?
     }
@@ -3003,7 +3008,12 @@ impl Global {
                                         convert::disposition_from_api(s.actions).unwrap();
                                     server
                                         .ptable
-                                        .add_statement(&s.name, conditions, disposition)
+                                        .add_statement(
+                                            &s.name,
+                                            conditions,
+                                            disposition,
+                                            table::Actions::default(),
+                                        )
                                         .unwrap();
                                     s_names.push(s.name.clone());
                                     h.insert(s.name);
