@@ -142,7 +142,7 @@ struct PeerState {
     remote_asn: AtomicU32,
     remote_id: AtomicU32,
     remote_holdtime: AtomicU16,
-    remote_cap: RwLock<Vec<packet::Capability>>,
+    remote_cap: ArcSwapOption<Vec<packet::Capability>>,
 }
 
 #[derive(Clone)]
@@ -202,12 +202,7 @@ impl Peer {
                 .as_secs(),
             Ordering::Relaxed,
         );
-        loop {
-            if let Ok(mut a) = self.state.remote_cap.try_write() {
-                a.clear();
-                break;
-            }
-        }
+        self.state.remote_cap.store(None);
         self.state.remote_id.store(0, Ordering::Relaxed);
         self.state.remote_holdtime.store(0, Ordering::Relaxed);
 
@@ -430,7 +425,7 @@ impl PeerBuilder {
                 remote_asn: AtomicU32::new(self.remote_asn),
                 remote_id: AtomicU32::new(0),
                 remote_holdtime: AtomicU16::new(0),
-                remote_cap: RwLock::new(Vec::new()),
+                remote_cap: ArcSwapOption::empty(),
             }),
             route_stats: FnvHashMap::default(),
             local_cap: self.local_cap.split_off(0),
@@ -450,16 +445,13 @@ impl From<&Peer> for api::Peer {
     fn from(p: &Peer) -> Self {
         let session_state = SessionState::try_from(p.state.fsm.load(Ordering::Relaxed))
             .unwrap_or(SessionState::Idle);
-        let remote_cap = {
-            let mut v = Vec::new();
-            loop {
-                if let Ok(a) = p.state.remote_cap.try_read() {
-                    v.append(&mut a.iter().map(convert::capability_to_api).collect());
-                    break;
-                }
-            }
-            v
-        };
+        let remote_cap = p
+            .state
+            .remote_cap
+            .load()
+            .as_ref()
+            .map(|caps| caps.iter().map(convert::capability_to_api).collect())
+            .unwrap_or_default();
         let mut ps = api::PeerState {
             neighbor_address: p.remote_addr.to_string(),
             peer_asn: p.state.remote_asn.load(Ordering::Relaxed),
@@ -2198,7 +2190,13 @@ impl BmpClient {
                         holdtime: HoldTime::new(peer.state.remote_holdtime.load(Ordering::Relaxed))
                             .unwrap_or(HoldTime::DISABLED),
                         router_id: u32::from(remote_id),
-                        capability: peer.state.remote_cap.read().await.to_owned(),
+                        capability: peer
+                            .state
+                            .remote_cap
+                            .load()
+                            .as_deref()
+                            .cloned()
+                            .unwrap_or_default(),
                     }),
                     local_open: bgp::Message::Open(bgp::Open {
                         as_number: peer.local_asn,
@@ -3639,7 +3637,9 @@ impl Handler {
                     as_number: remote_asn,
                     holdtime: remote_holdtime,
                     router_id: remote_id,
-                    capability: self.state.remote_cap.read().await.to_owned(),
+                    // Safe to unwrap: called from on_established() where
+                    // remote_cap has just been set by apply_outputs().
+                    capability: self.state.remote_cap.load().as_deref().cloned().unwrap(),
                 }),
                 local_open: bgp::Message::Open(bgp::Open {
                     as_number: remote_asn,
@@ -3729,12 +3729,9 @@ impl Handler {
                     self.state
                         .remote_holdtime
                         .store(remote_holdtime, Ordering::Relaxed);
-                    loop {
-                        if let Ok(mut a) = self.state.remote_cap.try_write() {
-                            *a = remote_capabilities;
-                            break;
-                        }
-                    }
+                    self.state
+                        .remote_cap
+                        .store(Some(Arc::new(remote_capabilities)));
                     self.on_established(framer.inner(), local_sockaddr, remote_sockaddr, pending)
                         .await;
                 }
