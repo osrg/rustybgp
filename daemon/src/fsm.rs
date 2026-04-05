@@ -168,7 +168,6 @@ impl Session {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn state(&self) -> State {
         self.state
     }

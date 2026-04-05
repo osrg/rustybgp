@@ -3548,9 +3548,6 @@ impl Handler {
             .as_secs();
         self.state.uptime.store(uptime, Ordering::Relaxed);
         let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
-        self.state
-            .fsm
-            .store(SessionState::Established as u8, Ordering::Release);
         self.source = Some(Arc::new(table::Source::new(
             self.remote_addr,
             self.local_addr,
@@ -3901,10 +3898,9 @@ impl Handler {
         // For UPDATE messages: if FSM didn't reject (no SessionDown), process routes.
         if let Some((reach, mp_reach, attr, unreach, mp_unreach, nexthop)) = update_fields {
             if has_session_down {
-                let session_state = self.state.fsm.load(Ordering::Relaxed);
                 return Err(Error::Packet(
                     rustybgp_packet::BgpError::FsmUnexpectedState {
-                        state: session_state,
+                        state: u8::from(self.session.state()),
                     }
                     .into(),
                 ));
@@ -4013,7 +4009,7 @@ impl Handler {
                     if let Some(Some(msg)) = msg {
                         match msg {
                             ToPeerEvent::Advertise(ri) => {
-                                if self.state.fsm.load(Ordering::Relaxed) != SessionState::Established as u8 {
+                                if self.session.state() != SessionState::Established {
                                     continue;
                                 }
                                 if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
