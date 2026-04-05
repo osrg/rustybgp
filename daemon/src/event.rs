@@ -117,7 +117,7 @@ impl MessageCounter {
                 let _ = self.refresh.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.total.fetch_add(1, Ordering::SeqCst);
+        self.total.fetch_add(1, Ordering::Relaxed);
         ret
     }
 }
@@ -448,7 +448,7 @@ impl PeerBuilder {
 
 impl From<&Peer> for api::Peer {
     fn from(p: &Peer) -> Self {
-        let session_state = SessionState::try_from(p.state.fsm.load(Ordering::Acquire))
+        let session_state = SessionState::try_from(p.state.fsm.load(Ordering::Relaxed))
             .unwrap_or(SessionState::Idle);
         let remote_cap = {
             let mut v = Vec::new();
@@ -2178,7 +2178,7 @@ impl BmpClient {
         let local_id = GLOBAL.read().await.router_id;
         let mut established_peers = Vec::new();
         for peer in GLOBAL.read().await.peers.values() {
-            if peer.state.fsm.load(Ordering::Acquire) == SessionState::Established as u8 {
+            if peer.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
                 established_peers.push(peer.remote_addr);
                 let remote_asn = peer.state.remote_asn.load(Ordering::Relaxed);
                 let remote_id = Ipv4Addr::from(peer.state.remote_id.load(Ordering::Relaxed));
@@ -3755,7 +3755,7 @@ impl Handler {
                     });
                 }
                 crate::fsm::Output::StateChanged(s) => {
-                    self.state.fsm.store(u8::from(s), Ordering::Release);
+                    self.state.fsm.store(u8::from(s), Ordering::Relaxed);
                 }
             }
         }
