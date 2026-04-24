@@ -606,10 +606,7 @@ impl TryFrom<&config::Neighbor> for Peer {
             .filter(|x| {
                 let name = x.config.as_ref().and_then(|c| c.afi_safi_name.as_ref());
                 let Some(f) = name else { return false };
-                if (f == &config::generate::AfiSafiType::Ipv4Unicast
-                    || f == &config::generate::AfiSafiType::Ipv6Unicast)
-                    && let Ok(family) = convert::family_from_config(f)
-                {
+                if let Ok(family) = convert::family_from_config(f) {
                     families.push(family);
                 }
                 true
