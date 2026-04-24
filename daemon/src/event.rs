@@ -3790,11 +3790,16 @@ impl Handler {
         // 2. Drain pending updates (withdrawals, reach, EOR) via peer_tx.
         txbuf = bytes::BytesMut::with_capacity(txbuf_size);
         for (family, p) in pending.iter_mut() {
-            let use_mp = framer
-                .inner()
-                .channel
-                .get(family)
-                .is_some_and(|c| c.extended_nexthop());
+            // IPv4-unicast can carry reachability either in the UPDATE's
+            // traditional NLRI section or via MP_REACH_NLRI (when RFC 8950
+            // Extended Nexthop is negotiated). Every other family must use
+            // MP_REACH_NLRI.
+            let use_mp = *family != packet::Family::IPV4
+                || framer
+                    .inner()
+                    .channel
+                    .get(family)
+                    .is_some_and(|c| c.extended_nexthop());
             for msg in p.drain_messages(*family, use_mp) {
                 let _ = framer.encode_to(&msg, &mut txbuf);
                 self.counter_tx.sync(&msg);
