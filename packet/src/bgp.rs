@@ -183,6 +183,15 @@ impl Nlri {
             Nlri::V6(net) => net.encode(dst),
         }
     }
+
+    // Add a new match arm here when introducing a new SAFI.
+    fn decode<T: io::Read>(family: Family, c: &mut T, len: usize) -> Result<Nlri, Error> {
+        match family {
+            Family::IPV4 => Ipv4Net::decode(c, len).map(Nlri::V4),
+            Family::IPV6 => Ipv6Net::decode(c, len).map(Nlri::V6),
+            _ => Err(BgpError::UpdateMalformedAttributeList.into()),
+        }
+    }
 }
 
 impl FromStr for Nlri {
@@ -399,6 +408,43 @@ fn parse_bogus_ipv6net() {
     let len = buf.len();
     let mut c = Cursor::new(buf);
     assert!(Ipv6Net::decode(&mut c, len).is_err());
+}
+
+#[test]
+fn nlri_decode_ipv4() {
+    let buf = vec![24, 10, 0, 0];
+    let len = buf.len();
+    let mut c = Cursor::new(buf);
+    assert_eq!(
+        Nlri::decode(Family::IPV4, &mut c, len).unwrap(),
+        Nlri::V4(Ipv4Net {
+            addr: Ipv4Addr::new(10, 0, 0, 0),
+            mask: 24,
+        }),
+    );
+}
+
+#[test]
+fn nlri_decode_ipv6() {
+    let buf = vec![32, 0x20, 0x01, 0x0d, 0xb8];
+    let len = buf.len();
+    let mut c = Cursor::new(buf);
+    assert_eq!(
+        Nlri::decode(Family::IPV6, &mut c, len).unwrap(),
+        Nlri::V6(Ipv6Net {
+            addr: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0),
+            mask: 32,
+        }),
+    );
+}
+
+#[test]
+fn nlri_decode_unsupported_family() {
+    let buf = vec![24, 10, 0, 0];
+    let len = buf.len();
+    let mut c = Cursor::new(buf);
+    let mup_ipv4 = Family::new((Family::AFI_IP as u32) << 16 | 85);
+    assert!(Nlri::decode(mup_ipv4, &mut c, len).is_err());
 }
 
 #[derive(Debug, Clone)]
@@ -1710,23 +1756,7 @@ impl PeerCodec {
         } else {
             0
         };
-        match chan.family {
-            Family::IPV4 => match Ipv4Net::decode(c, len) {
-                Ok(net) => Ok(PathNlri {
-                    nlri: Nlri::V4(net),
-                    path_id: id,
-                }),
-                Err(err) => Err(err),
-            },
-            Family::IPV6 => match Ipv6Net::decode(c, len) {
-                Ok(net) => Ok(PathNlri {
-                    nlri: Nlri::V6(net),
-                    path_id: id,
-                }),
-                Err(err) => Err(err),
-            },
-            _ => Err(malformed),
-        }
+        Nlri::decode(chan.family, c, len).map(|nlri| PathNlri { path_id: id, nlri })
     }
     pub fn parse_message(&mut self, buf: &[u8]) -> Result<Message, Error> {
         if buf.len() < Message::HEADER_LENGTH as usize {
