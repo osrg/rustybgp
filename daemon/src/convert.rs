@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
@@ -402,6 +402,39 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
                 c.write_u32::<NetworkEndian>(v.local_data2).unwrap();
             }
             Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, c.into_inner())
+                .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
+        }
+        api::attribute::Attr::MpReach(m) => {
+            let family = m
+                .family
+                .ok_or_else(|| Error::InvalidArgument("mp_reach missing family".to_string()))?;
+            let nh_str = m.next_hops.first().ok_or_else(|| {
+                Error::InvalidArgument("mp_reach must carry at least one nexthop".to_string())
+            })?;
+            let mut nh_bytes = Vec::with_capacity(16);
+            if let Ok(v4) = nh_str.parse::<Ipv4Addr>() {
+                nh_bytes.extend_from_slice(&v4.octets());
+            } else if let Ok(v6) = nh_str.parse::<Ipv6Addr>() {
+                nh_bytes.extend_from_slice(&v6.octets());
+            } else {
+                return Err(Error::InvalidArgument(format!(
+                    "invalid mp_reach nexthop: {}",
+                    nh_str
+                )));
+            }
+            // Binary layout consumed by event.rs:
+            //   [AFI:2][SAFI:1][NH_LEN:1][nexthop:NH_LEN][reserved:1]
+            // NLRI bytes are intentionally omitted here; the daemon uses
+            // `path.nlri` to carry NLRI and only reads the nexthop from the
+            // MP_REACH attribute.
+            let mut c = Cursor::new(Vec::with_capacity(5 + nh_bytes.len()));
+            c.write_u16::<NetworkEndian>(family.afi as u16).unwrap();
+            c.write_u8(family.safi as u8).unwrap();
+            c.write_u8(nh_bytes.len() as u8).unwrap();
+            c.write_all(&nh_bytes)
+                .map_err(|e| Error::InvalidArgument(format!("mp_reach write: {}", e)))?;
+            c.write_u8(0).unwrap(); // reserved
+            Attribute::new_with_bin(Attribute::MP_REACH, c.into_inner())
                 .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
         }
         _ => Err(Error::InvalidArgument(
@@ -1153,5 +1186,72 @@ mod tests {
     fn nexthop_action_empty_actions() {
         let (_, actions) = disposition_from_api(None).unwrap();
         assert_eq!(actions.nexthop, None);
+    }
+
+    // ─── MpReach round-trip ──────────────────────────────────────────────────
+
+    fn mp_reach_api_v4(nh: &str) -> api::Attribute {
+        api::Attribute {
+            attr: Some(api::attribute::Attr::MpReach(api::MpReachNlriAttribute {
+                family: Some(api::Family { afi: 1, safi: 85 }),
+                next_hops: vec![nh.to_string()],
+                nlris: vec![],
+            })),
+        }
+    }
+
+    #[test]
+    fn mp_reach_ipv4_nexthop_builds_binary() {
+        let attr = attr_from_api(mp_reach_api_v4("10.0.0.1")).unwrap();
+        assert_eq!(attr.code(), Attribute::MP_REACH);
+        let b = attr.binary().unwrap();
+        // AFI=1, SAFI=85, NH_LEN=4, nexthop=10.0.0.1, reserved=0
+        assert_eq!(b, &vec![0x00, 0x01, 0x55, 0x04, 10, 0, 0, 1, 0x00]);
+    }
+
+    #[test]
+    fn mp_reach_ipv6_nexthop_builds_binary() {
+        let api_attr = api::Attribute {
+            attr: Some(api::attribute::Attr::MpReach(api::MpReachNlriAttribute {
+                family: Some(api::Family { afi: 2, safi: 1 }),
+                next_hops: vec!["2001:db8::1".to_string()],
+                nlris: vec![],
+            })),
+        };
+        let attr = attr_from_api(api_attr).unwrap();
+        let b = attr.binary().unwrap();
+        assert_eq!(b[0..3], [0x00, 0x02, 0x01]); // AFI=2, SAFI=1
+        assert_eq!(b[3], 16); // NH_LEN=16
+        assert_eq!(b.last(), Some(&0x00)); // reserved
+    }
+
+    #[test]
+    fn mp_reach_rejects_missing_family() {
+        let bad = api::Attribute {
+            attr: Some(api::attribute::Attr::MpReach(api::MpReachNlriAttribute {
+                family: None,
+                next_hops: vec!["10.0.0.1".to_string()],
+                nlris: vec![],
+            })),
+        };
+        assert!(attr_from_api(bad).is_err());
+    }
+
+    #[test]
+    fn mp_reach_rejects_empty_nexthops() {
+        let bad = api::Attribute {
+            attr: Some(api::attribute::Attr::MpReach(api::MpReachNlriAttribute {
+                family: Some(api::Family { afi: 1, safi: 1 }),
+                next_hops: vec![],
+                nlris: vec![],
+            })),
+        };
+        assert!(attr_from_api(bad).is_err());
+    }
+
+    #[test]
+    fn mp_reach_rejects_invalid_nexthop() {
+        let bad = mp_reach_api_v4("not-an-ip");
+        assert!(attr_from_api(bad).is_err());
     }
 }
