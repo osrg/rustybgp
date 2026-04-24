@@ -24,6 +24,7 @@ pub mod bmp;
 pub mod error;
 pub mod frame;
 pub mod mrt;
+pub mod mup;
 pub mod prefix_sid;
 pub mod rd;
 pub mod rpki;

@@ -33,10 +33,13 @@ impl Family {
     pub const AFI_IP6: u16 = 2;
 
     const SAFI_UNICAST: u8 = 1;
+    const SAFI_MUP: u8 = 85;
 
     pub const EMPTY: Family = Family(0);
     pub const IPV4: Family = Family((Family::AFI_IP as u32) << 16 | Family::SAFI_UNICAST as u32);
     pub const IPV6: Family = Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_UNICAST as u32);
+    pub const IPV4_MUP: Family = Family((Family::AFI_IP as u32) << 16 | Family::SAFI_MUP as u32);
+    pub const IPV6_MUP: Family = Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_MUP as u32);
 
     pub fn new(v: u32) -> Self {
         Family(v)
