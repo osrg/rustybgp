@@ -18,7 +18,7 @@ use std::io::Cursor;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
-use rustybgp_packet::{Family, IpNet, Nlri, bgp::Attribute, bgp::Capability};
+use rustybgp_packet::{Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, prefix_sid};
 
 use regex::Regex;
 use uuid::Uuid;
@@ -286,6 +286,18 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
                 )),
             }
         }
+        Attribute::PREFIX_SID => match prefix_sid::PrefixSid::decode(a.binary().unwrap()) {
+            Ok(sid) => api::Attribute {
+                attr: Some(api::attribute::Attr::PrefixSid(prefix_sid_to_api(&sid))),
+            },
+            Err(_) => api::Attribute {
+                attr: Some(api::attribute::Attr::Unknown(api::UnknownAttribute {
+                    flags: a.flags() as u32,
+                    r#type: a.code() as u32,
+                    value: a.binary().unwrap().to_owned(),
+                })),
+            },
+        },
         _ => api::Attribute {
             attr: Some(api::attribute::Attr::Unknown(api::UnknownAttribute {
                 flags: a.flags() as u32,
@@ -404,10 +416,211 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
             Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, c.into_inner())
                 .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
         }
+        api::attribute::Attr::PrefixSid(p) => {
+            let sid = prefix_sid_from_api(p)?;
+            Attribute::new_with_bin(Attribute::PREFIX_SID, sid.to_vec())
+                .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
+        }
         _ => Err(Error::InvalidArgument(
             "attribute conversion not implemented".to_string(),
         )),
     }
+}
+
+pub(crate) fn prefix_sid_to_api(sid: &prefix_sid::PrefixSid) -> api::PrefixSid {
+    let tlvs = sid
+        .tlvs
+        .iter()
+        .filter_map(|tlv| match tlv {
+            prefix_sid::PrefixSidTlv::Srv6L3Service(t) => Some(api::prefix_sid::Tlv {
+                tlv: Some(api::prefix_sid::tlv::Tlv::L3Service(
+                    api::SRv6L3ServiceTlv {
+                        sub_tlvs: srv6_service_sub_tlvs_to_api(&t.sub_tlvs),
+                    },
+                )),
+            }),
+            prefix_sid::PrefixSidTlv::Srv6L2Service(t) => Some(api::prefix_sid::Tlv {
+                tlv: Some(api::prefix_sid::tlv::Tlv::L2Service(
+                    api::SRv6L2ServiceTlv {
+                        sub_tlvs: srv6_service_sub_tlvs_to_api(&t.sub_tlvs),
+                    },
+                )),
+            }),
+            // Unknown TLVs are not represented in the proto; drop them for
+            // the typed gRPC view. They still round-trip on the wire because
+            // the daemon keeps the original attribute bytes.
+            prefix_sid::PrefixSidTlv::Unknown { .. } => None,
+        })
+        .collect();
+    api::PrefixSid { tlvs }
+}
+
+fn srv6_service_sub_tlvs_to_api(
+    subs: &[prefix_sid::Srv6ServiceSubTlv],
+) -> std::collections::HashMap<u32, api::SRv6SubTlVs> {
+    let mut map = std::collections::HashMap::new();
+    for sub in subs {
+        if let prefix_sid::Srv6ServiceSubTlv::Information(info) = sub {
+            let entry = map
+                .entry(prefix_sid::Srv6ServiceSubTlv::SUBTLV_SRV6_INFORMATION as u32)
+                .or_insert(api::SRv6SubTlVs { tlvs: Vec::new() });
+            entry.tlvs.push(api::SRv6SubTlv {
+                tlv: Some(api::s_rv6_sub_tlv::Tlv::Information(
+                    api::SRv6InformationSubTlv {
+                        sid: info.sid.octets().to_vec(),
+                        flags: Some(api::SRv6SidFlags { flag_1: false }),
+                        endpoint_behavior: info.endpoint_behavior as u32,
+                        sub_sub_tlvs: srv6_service_sub_sub_tlvs_to_api(&info.sub_sub_tlvs),
+                    },
+                )),
+            });
+        }
+    }
+    map
+}
+
+fn srv6_service_sub_sub_tlvs_to_api(
+    subs: &[prefix_sid::Srv6ServiceDataSubSubTlv],
+) -> std::collections::HashMap<u32, api::SRv6SubSubTlVs> {
+    let mut map = std::collections::HashMap::new();
+    for sub in subs {
+        if let prefix_sid::Srv6ServiceDataSubSubTlv::Structure(s) = sub {
+            let entry = map
+                .entry(prefix_sid::Srv6ServiceDataSubSubTlv::SUBSUBTLV_SRV6_SID_STRUCTURE as u32)
+                .or_insert(api::SRv6SubSubTlVs { tlvs: Vec::new() });
+            entry.tlvs.push(api::SRv6SubSubTlv {
+                tlv: Some(api::s_rv6_sub_sub_tlv::Tlv::Structure(
+                    api::SRv6StructureSubSubTlv {
+                        locator_block_length: s.locator_block_length as u32,
+                        locator_node_length: s.locator_node_length as u32,
+                        function_length: s.function_length as u32,
+                        argument_length: s.argument_length as u32,
+                        transposition_length: s.transposition_length as u32,
+                        transposition_offset: s.transposition_offset as u32,
+                    },
+                )),
+            });
+        }
+    }
+    map
+}
+
+pub(crate) fn prefix_sid_from_api(p: api::PrefixSid) -> Result<prefix_sid::PrefixSid, Error> {
+    let mut tlvs = Vec::with_capacity(p.tlvs.len());
+    for tlv in p.tlvs {
+        let inner = tlv
+            .tlv
+            .ok_or_else(|| Error::InvalidArgument("empty prefix_sid tlv oneof".to_string()))?;
+        match inner {
+            api::prefix_sid::tlv::Tlv::L3Service(t) => {
+                tlvs.push(prefix_sid::PrefixSidTlv::Srv6L3Service(
+                    prefix_sid::Srv6ServiceTlv {
+                        reserved: 0,
+                        sub_tlvs: srv6_service_sub_tlvs_from_api(t.sub_tlvs)?,
+                    },
+                ));
+            }
+            api::prefix_sid::tlv::Tlv::L2Service(t) => {
+                tlvs.push(prefix_sid::PrefixSidTlv::Srv6L2Service(
+                    prefix_sid::Srv6ServiceTlv {
+                        reserved: 0,
+                        sub_tlvs: srv6_service_sub_tlvs_from_api(t.sub_tlvs)?,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(prefix_sid::PrefixSid { tlvs })
+}
+
+fn srv6_service_sub_tlvs_from_api(
+    map: std::collections::HashMap<u32, api::SRv6SubTlVs>,
+) -> Result<Vec<prefix_sid::Srv6ServiceSubTlv>, Error> {
+    let mut out = Vec::new();
+    for (_key, sub_tlvs) in map {
+        for sub in sub_tlvs.tlvs {
+            let inner = sub
+                .tlv
+                .ok_or_else(|| Error::InvalidArgument("empty srv6 sub_tlv".to_string()))?;
+            match inner {
+                api::s_rv6_sub_tlv::Tlv::Information(info) => {
+                    if info.sid.len() != 16 {
+                        return Err(Error::InvalidArgument(format!(
+                            "SRv6 SID must be 16 bytes, got {}",
+                            info.sid.len()
+                        )));
+                    }
+                    let mut sid_bytes = [0u8; 16];
+                    sid_bytes.copy_from_slice(&info.sid);
+                    if info.endpoint_behavior > u16::MAX as u32 {
+                        return Err(Error::InvalidArgument(format!(
+                            "endpoint_behavior out of range: {}",
+                            info.endpoint_behavior
+                        )));
+                    }
+                    out.push(prefix_sid::Srv6ServiceSubTlv::Information(
+                        prefix_sid::Srv6InformationSubTlv {
+                            sid: sid_bytes.into(),
+                            flags: 0,
+                            endpoint_behavior: info.endpoint_behavior as u16,
+                            sub_sub_tlvs: srv6_service_sub_sub_tlvs_from_api(info.sub_sub_tlvs)?,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn srv6_service_sub_sub_tlvs_from_api(
+    map: std::collections::HashMap<u32, api::SRv6SubSubTlVs>,
+) -> Result<Vec<prefix_sid::Srv6ServiceDataSubSubTlv>, Error> {
+    let mut out = Vec::new();
+    for (_key, sub_sub_tlvs) in map {
+        for sub in sub_sub_tlvs.tlvs {
+            let inner = sub
+                .tlv
+                .ok_or_else(|| Error::InvalidArgument("empty srv6 sub_sub_tlv".to_string()))?;
+            match inner {
+                api::s_rv6_sub_sub_tlv::Tlv::Structure(s) => {
+                    let ensure_u8 = |name: &str, v: u32| -> Result<u8, Error> {
+                        if v > u8::MAX as u32 {
+                            Err(Error::InvalidArgument(format!(
+                                "{} out of range: {}",
+                                name, v
+                            )))
+                        } else {
+                            Ok(v as u8)
+                        }
+                    };
+                    out.push(prefix_sid::Srv6ServiceDataSubSubTlv::Structure(
+                        prefix_sid::Srv6SidStructureSubSubTlv {
+                            locator_block_length: ensure_u8(
+                                "locator_block_length",
+                                s.locator_block_length,
+                            )?,
+                            locator_node_length: ensure_u8(
+                                "locator_node_length",
+                                s.locator_node_length,
+                            )?,
+                            function_length: ensure_u8("function_length", s.function_length)?,
+                            argument_length: ensure_u8("argument_length", s.argument_length)?,
+                            transposition_length: ensure_u8(
+                                "transposition_length",
+                                s.transposition_length,
+                            )?,
+                            transposition_offset: ensure_u8(
+                                "transposition_offset",
+                                s.transposition_offset,
+                            )?,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement {
