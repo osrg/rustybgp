@@ -16,6 +16,7 @@
 use rustybgp_packet::bgp::{
     Attribute, Ipv4Net, Ipv6Net, Message, Nexthop, NlriSet, PeerCodec, PeerCodecBuilder, Update,
 };
+use rustybgp_packet::prefix_sid;
 use rustybgp_packet::{BgpFramer, Family, Nlri, PathNlri};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -476,6 +477,130 @@ fn update_attr_community() {
             assert_eq!(bytes.len(), 4);
             let parsed = u32::from_be_bytes(bytes[..4].try_into().unwrap());
             assert_eq!(parsed, community);
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+// ─── Prefix SID attribute (RFC 8669) ─────────────────────────────────────────
+
+#[test]
+fn update_ipv4_with_prefix_sid() {
+    let prefix = ipv4_prefix("10.0.0.0", 24);
+    // Build a Prefix SID attribute with SRv6 L3 Service TLV containing one
+    // Information sub-TLV and one SID Structure sub-sub-TLV.
+    let sid = prefix_sid::PrefixSid {
+        tlvs: vec![prefix_sid::PrefixSidTlv::Srv6L3Service(
+            prefix_sid::Srv6ServiceTlv {
+                reserved: 0,
+                sub_tlvs: vec![prefix_sid::Srv6ServiceSubTlv::Information(
+                    prefix_sid::Srv6InformationSubTlv {
+                        sid: "2001:0:5:3::".parse().unwrap(),
+                        flags: 0,
+                        endpoint_behavior: 19, // End.DT4
+                        sub_sub_tlvs: vec![prefix_sid::Srv6ServiceDataSubSubTlv::Structure(
+                            prefix_sid::Srv6SidStructureSubSubTlv {
+                                locator_block_length: 40,
+                                locator_node_length: 24,
+                                function_length: 16,
+                                argument_length: 0,
+                                transposition_length: 16,
+                                transposition_offset: 64,
+                            },
+                        )],
+                    },
+                )],
+            },
+        )],
+    };
+    let sid_bytes = sid.to_vec();
+
+    let msg = Message::Update(Update {
+        reach: Some(NlriSet {
+            family: Family::IPV4,
+            entries: vec![prefix],
+        }),
+        mp_reach: None,
+        attr: Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+            Attribute::new_with_bin(
+                Attribute::NEXTHOP,
+                Ipv4Addr::new(192, 0, 2, 254).octets().to_vec(),
+            )
+            .unwrap(),
+            Attribute::new_with_bin(Attribute::PREFIX_SID, sid_bytes.clone()).unwrap(),
+        ]),
+        unreach: None,
+        mp_unreach: None,
+        nexthop: None,
+    });
+
+    match round_trip(&msg, ipv4_codec()) {
+        Message::Update(Update { reach, attr, .. }) => {
+            assert_eq!(reach.unwrap().entries, vec![prefix]);
+            let a = attr
+                .iter()
+                .find(|a| a.code() == Attribute::PREFIX_SID)
+                .expect("PREFIX_SID must be present");
+            assert_eq!(a.binary().unwrap(), &sid_bytes);
+            // Decoded structure equals the input.
+            let decoded = prefix_sid::PrefixSid::decode(a.binary().unwrap()).unwrap();
+            assert_eq!(decoded, sid);
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+#[test]
+fn update_passes_through_unknown_prefix_sid_tlv() {
+    // Receivers must re-advertise TLV types they do not understand.
+    let prefix = ipv4_prefix("10.0.0.0", 24);
+    let sid = prefix_sid::PrefixSid {
+        tlvs: vec![prefix_sid::PrefixSidTlv::Unknown {
+            type_id: 0x55,
+            value: vec![0xAA, 0xBB, 0xCC],
+        }],
+    };
+    let sid_bytes = sid.to_vec();
+    assert_eq!(sid_bytes, vec![0x55, 0x00, 0x03, 0xAA, 0xBB, 0xCC]);
+
+    let msg = Message::Update(Update {
+        reach: Some(NlriSet {
+            family: Family::IPV4,
+            entries: vec![prefix],
+        }),
+        mp_reach: None,
+        attr: Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+            Attribute::new_with_bin(
+                Attribute::NEXTHOP,
+                Ipv4Addr::new(192, 0, 2, 254).octets().to_vec(),
+            )
+            .unwrap(),
+            Attribute::new_with_bin(Attribute::PREFIX_SID, sid_bytes.clone()).unwrap(),
+        ]),
+        unreach: None,
+        mp_unreach: None,
+        nexthop: None,
+    });
+
+    match round_trip(&msg, ipv4_codec()) {
+        Message::Update(Update { attr, .. }) => {
+            let a = attr
+                .iter()
+                .find(|a| a.code() == Attribute::PREFIX_SID)
+                .expect("PREFIX_SID must be present");
+            assert_eq!(a.binary().unwrap(), &sid_bytes);
         }
         _ => panic!("expected Update"),
     }
