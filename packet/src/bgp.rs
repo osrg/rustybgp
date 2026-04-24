@@ -785,6 +785,7 @@ impl Attribute {
     pub const AS4_AGGREGATOR: u8 = 18;
     pub const AIGP: u8 = 26;
     pub const LARGE_COMMUNITY: u8 = 32;
+    pub const PREFIX_SID: u8 = 40;
 
     pub const AS_PATH_TYPE_SET: u8 = 1;
     pub const AS_PATH_TYPE_SEQ: u8 = 2;
@@ -859,6 +860,7 @@ impl Attribute {
             Self::AS4_AGGREGATOR => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             Self::AIGP => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             Self::LARGE_COMMUNITY => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
+            Self::PREFIX_SID => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             _ => None,
         }
     }
