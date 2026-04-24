@@ -3367,6 +3367,8 @@ fn send_kernel_route(change: &table::Change) {
     let (dst, prefix_len) = match change.net {
         packet::Nlri::V4(net) => (IpAddr::from(net.addr), net.mask),
         packet::Nlri::V6(net) => (IpAddr::from(net.addr), net.mask),
+        // MUP NLRI do not map to kernel routes; skip them here.
+        packet::Nlri::Mup(_) => return,
     };
     if change.attr.is_empty() {
         let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });

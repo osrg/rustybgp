@@ -176,6 +176,7 @@ impl fmt::Display for IpNet {
 pub enum Nlri {
     V4(Ipv4Net),
     V6(Ipv6Net),
+    Mup(crate::mup::MupNlri),
     // add more Family here
 }
 
@@ -184,6 +185,7 @@ impl Nlri {
         match self {
             Nlri::V4(net) => net.encode(dst),
             Nlri::V6(net) => net.encode(dst),
+            Nlri::Mup(m) => Ok(m.encode(dst)),
         }
     }
 
@@ -192,6 +194,9 @@ impl Nlri {
         match family {
             Family::IPV4 => Ipv4Net::decode(c, len).map(Nlri::V4),
             Family::IPV6 => Ipv6Net::decode(c, len).map(Nlri::V6),
+            Family::IPV4_MUP | Family::IPV6_MUP => {
+                crate::mup::MupNlri::decode(family, c, len).map(Nlri::Mup)
+            }
             _ => Err(BgpError::UpdateMalformedAttributeList.into()),
         }
     }
@@ -216,6 +221,7 @@ impl fmt::Display for Nlri {
         match self {
             Nlri::V4(net) => net.fmt(f),
             Nlri::V6(net) => net.fmt(f),
+            Nlri::Mup(m) => m.fmt(f),
         }
     }
 }

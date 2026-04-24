@@ -22,6 +22,7 @@ use crate::rd::RouteDistinguisher;
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::BufMut;
 use std::fmt;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub const ARCH_TYPE_3GPP_5G: u8 = 1;
@@ -102,7 +103,7 @@ fn ip_octets(addr: IpAddr) -> Vec<u8> {
 }
 
 /// A single BGP-MUP NLRI, parameterised by address family (IPv4-MUP or IPv6-MUP).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MupNlri {
     InterworkSegmentDiscovery(MupInterworkSegmentDiscoveryRoute),
     DirectSegmentDiscovery(MupDirectSegmentDiscoveryRoute),
@@ -111,7 +112,7 @@ pub enum MupNlri {
 }
 
 /// Route Type 1: Interwork Segment Discovery Route.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MupInterworkSegmentDiscoveryRoute {
     pub rd: RouteDistinguisher,
     pub prefix_addr: IpAddr,
@@ -126,7 +127,7 @@ pub struct MupDirectSegmentDiscoveryRoute {
 }
 
 /// Route Type 3: Type 1 Session Transformed Route (3GPP-5G).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MupType1SessionTransformedRoute {
     pub rd: RouteDistinguisher,
     pub prefix_addr: IpAddr,
@@ -149,42 +150,46 @@ pub struct MupType2SessionTransformedRoute {
 }
 
 impl MupNlri {
-    /// Decode a single MUP NLRI starting at the current position of `data`.
-    /// Returns the NLRI and the number of bytes consumed.
-    pub fn decode(family: Family, data: &[u8]) -> Result<(Self, usize), Error> {
-        if data.len() < 4 {
+    /// Decode a single MUP NLRI from `c`, consuming `4 + body_length` bytes.
+    /// `len` is the upper bound of bytes remaining in the enclosing buffer.
+    pub fn decode<T: io::Read>(family: Family, c: &mut T, len: usize) -> Result<Self, Error> {
+        if len < 4 {
             return Err(malformed());
         }
-        let arch_type = data[0];
+        let mut header = [0u8; 4];
+        c.read_exact(&mut header).map_err(|_| malformed())?;
+        let arch_type = header[0];
         if arch_type != ARCH_TYPE_3GPP_5G {
             return Err(malformed());
         }
-        let route_type = NetworkEndian::read_u16(&data[1..3]);
-        let length = data[3] as usize;
-        let total = 4 + length;
-        if data.len() < total {
+        let route_type = NetworkEndian::read_u16(&header[1..3]);
+        let body_len = header[3] as usize;
+        if len < 4 + body_len {
             return Err(malformed());
         }
-        let body = &data[4..total];
-        let nlri = match route_type {
-            ROUTE_TYPE_INTERWORK_SEGMENT_DISCOVERY => MupNlri::InterworkSegmentDiscovery(
-                MupInterworkSegmentDiscoveryRoute::decode(family, body)?,
-            ),
-            ROUTE_TYPE_DIRECT_SEGMENT_DISCOVERY => MupNlri::DirectSegmentDiscovery(
-                MupDirectSegmentDiscoveryRoute::decode(family, body)?,
-            ),
-            ROUTE_TYPE_TYPE_1_SESSION_TRANSFORMED => MupNlri::Type1SessionTransformed(
-                MupType1SessionTransformedRoute::decode(family, body)?,
-            ),
-            ROUTE_TYPE_TYPE_2_SESSION_TRANSFORMED => MupNlri::Type2SessionTransformed(
-                MupType2SessionTransformedRoute::decode(family, body)?,
-            ),
-            _ => return Err(malformed()),
-        };
-        Ok((nlri, total))
+        let mut body = vec![0u8; body_len];
+        if body_len > 0 {
+            c.read_exact(&mut body).map_err(|_| malformed())?;
+        }
+        match route_type {
+            ROUTE_TYPE_INTERWORK_SEGMENT_DISCOVERY => Ok(MupNlri::InterworkSegmentDiscovery(
+                MupInterworkSegmentDiscoveryRoute::decode(family, &body)?,
+            )),
+            ROUTE_TYPE_DIRECT_SEGMENT_DISCOVERY => Ok(MupNlri::DirectSegmentDiscovery(
+                MupDirectSegmentDiscoveryRoute::decode(family, &body)?,
+            )),
+            ROUTE_TYPE_TYPE_1_SESSION_TRANSFORMED => Ok(MupNlri::Type1SessionTransformed(
+                MupType1SessionTransformedRoute::decode(family, &body)?,
+            )),
+            ROUTE_TYPE_TYPE_2_SESSION_TRANSFORMED => Ok(MupNlri::Type2SessionTransformed(
+                MupType2SessionTransformedRoute::decode(family, &body)?,
+            )),
+            _ => Err(malformed()),
+        }
     }
 
-    pub fn encode<B: BufMut>(&self, dst: &mut B) {
+    /// Encode the NLRI (header + body) into `dst` and return the number of bytes written.
+    pub fn encode<B: BufMut>(&self, dst: &mut B) -> u16 {
         let (route_type, body) = match self {
             MupNlri::InterworkSegmentDiscovery(r) => {
                 (ROUTE_TYPE_INTERWORK_SEGMENT_DISCOVERY, r.serialize())
@@ -203,6 +208,7 @@ impl MupNlri {
         dst.put_u16(route_type);
         dst.put_u8(body.len() as u8);
         dst.put_slice(&body);
+        (4 + body.len()) as u16
     }
 
     pub fn route_type(&self) -> u16 {
@@ -472,6 +478,7 @@ impl fmt::Display for MupExtended {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn rd() -> RouteDistinguisher {
         RouteDistinguisher::TwoOctetAs {
@@ -483,9 +490,11 @@ mod tests {
     fn roundtrip(family: Family, nlri: MupNlri) {
         let mut buf = Vec::new();
         nlri.encode(&mut buf);
-        let (decoded, consumed) = MupNlri::decode(family, &buf).unwrap();
-        assert_eq!(consumed, buf.len());
+        let len = buf.len();
+        let mut c = Cursor::new(buf);
+        let decoded = MupNlri::decode(family, &mut c, len).unwrap();
         assert_eq!(decoded, nlri);
+        assert_eq!(c.position(), len as u64);
     }
 
     #[test]
@@ -637,23 +646,26 @@ mod tests {
         );
     }
 
+    fn decode_slice(family: Family, data: &[u8]) -> Result<MupNlri, Error> {
+        let len = data.len();
+        let mut c = Cursor::new(data);
+        MupNlri::decode(family, &mut c, len)
+    }
+
     #[test]
     fn decode_rejects_wrong_arch_type() {
-        let data = [0x02u8, 0x00, 0x01, 0x00];
-        assert!(MupNlri::decode(Family::IPV4_MUP, &data).is_err());
+        assert!(decode_slice(Family::IPV4_MUP, &[0x02u8, 0x00, 0x01, 0x00]).is_err());
     }
 
     #[test]
     fn decode_rejects_unknown_route_type() {
-        let data = [0x01u8, 0x00, 0x05, 0x00];
-        assert!(MupNlri::decode(Family::IPV4_MUP, &data).is_err());
+        assert!(decode_slice(Family::IPV4_MUP, &[0x01u8, 0x00, 0x05, 0x00]).is_err());
     }
 
     #[test]
     fn decode_rejects_truncated() {
         // header claims length=10 but body is empty
-        let data = [0x01u8, 0x00, 0x01, 0x0a];
-        assert!(MupNlri::decode(Family::IPV4_MUP, &data).is_err());
+        assert!(decode_slice(Family::IPV4_MUP, &[0x01u8, 0x00, 0x01, 0x0a]).is_err());
     }
 
     #[test]

@@ -1354,6 +1354,7 @@ impl Condition {
                         return !(*opt == MatchOption::Any);
                     }
                     packet::Nlri::V6(_) => {}
+                    packet::Nlri::Mup(_) => {}
                 };
             }
             Condition::AsPath(_name, opt, set) => {
@@ -2053,6 +2054,7 @@ impl RpkiTable {
                 let (mut addr, mask) = match net {
                     packet::Nlri::V4(net) => (net.addr.octets().to_vec(), net.mask),
                     packet::Nlri::V6(net) => (net.addr.octets().to_vec(), net.mask),
+                    packet::Nlri::Mup(_) => return None,
                 };
                 addr.drain((mask.div_ceil(8)) as usize..);
                 for (ipnet, entry) in m.iter_prefix(&addr) {

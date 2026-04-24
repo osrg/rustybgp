@@ -18,7 +18,9 @@ use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
-use rustybgp_packet::{Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, prefix_sid};
+use rustybgp_packet::{
+    Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, mup, prefix_sid, rd::RouteDistinguisher,
+};
 
 use regex::Regex;
 use uuid::Uuid;
@@ -48,6 +50,130 @@ pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
                 prefix_len: n.mask as u32,
             })),
         },
+        Nlri::Mup(m) => api::Nlri {
+            nlri: Some(mup_nlri_to_api(m)),
+        },
+    }
+}
+
+fn mup_nlri_to_api(m: &mup::MupNlri) -> api::nlri::Nlri {
+    match m {
+        mup::MupNlri::InterworkSegmentDiscovery(r) => {
+            api::nlri::Nlri::MupInterworkSegmentDiscovery(api::MupInterworkSegmentDiscoveryRoute {
+                rd: Some(rd_to_api(&r.rd)),
+                prefix: format!("{}/{}", r.prefix_addr, r.prefix_len),
+            })
+        }
+        mup::MupNlri::DirectSegmentDiscovery(r) => {
+            api::nlri::Nlri::MupDirectSegmentDiscovery(api::MupDirectSegmentDiscoveryRoute {
+                rd: Some(rd_to_api(&r.rd)),
+                address: r.address.to_string(),
+            })
+        }
+        mup::MupNlri::Type1SessionTransformed(r) => {
+            let ea_len = match r.endpoint_address {
+                std::net::IpAddr::V4(_) => 32,
+                std::net::IpAddr::V6(_) => 128,
+            };
+            let (sa_len, sa_str) = match r.source_address {
+                None => (0u32, String::new()),
+                Some(std::net::IpAddr::V4(a)) => (32, a.to_string()),
+                Some(std::net::IpAddr::V6(a)) => (128, a.to_string()),
+            };
+            #[allow(deprecated)]
+            api::nlri::Nlri::MupType1SessionTransformed(api::MupType1SessionTransformedRoute {
+                rd: Some(rd_to_api(&r.rd)),
+                prefix_length: 0,
+                prefix: format!("{}/{}", r.prefix_addr, r.prefix_len),
+                teid: r.teid,
+                qfi: r.qfi as u32,
+                endpoint_address_length: ea_len,
+                endpoint_address: r.endpoint_address.to_string(),
+                source_address_length: sa_len,
+                source_address: sa_str,
+            })
+        }
+        mup::MupNlri::Type2SessionTransformed(r) => {
+            api::nlri::Nlri::MupType2SessionTransformed(api::MupType2SessionTransformedRoute {
+                rd: Some(rd_to_api(&r.rd)),
+                endpoint_address_length: r.endpoint_address_length as u32,
+                endpoint_address: r.endpoint_address.to_string(),
+                teid: r.teid,
+            })
+        }
+    }
+}
+
+pub(crate) fn rd_to_api(rd: &RouteDistinguisher) -> api::RouteDistinguisher {
+    let v = match *rd {
+        RouteDistinguisher::TwoOctetAs { admin, assigned } => {
+            api::route_distinguisher::Rd::TwoOctetAsn(api::RouteDistinguisherTwoOctetAsn {
+                admin: admin as u32,
+                assigned,
+            })
+        }
+        RouteDistinguisher::Ipv4 { admin, assigned } => {
+            api::route_distinguisher::Rd::IpAddress(api::RouteDistinguisherIpAddress {
+                admin: admin.to_string(),
+                assigned: assigned as u32,
+            })
+        }
+        RouteDistinguisher::FourOctetAs { admin, assigned } => {
+            api::route_distinguisher::Rd::FourOctetAsn(api::RouteDistinguisherFourOctetAsn {
+                admin,
+                assigned: assigned as u32,
+            })
+        }
+    };
+    api::RouteDistinguisher { rd: Some(v) }
+}
+
+pub(crate) fn rd_from_api(rd: &api::RouteDistinguisher) -> Result<RouteDistinguisher, Error> {
+    let inner = rd
+        .rd
+        .as_ref()
+        .ok_or_else(|| Error::InvalidArgument("missing route distinguisher".to_string()))?;
+    match inner {
+        api::route_distinguisher::Rd::TwoOctetAsn(r) => {
+            if r.admin > u16::MAX as u32 {
+                return Err(Error::InvalidArgument(format!(
+                    "two-octet RD admin out of range: {}",
+                    r.admin
+                )));
+            }
+            Ok(RouteDistinguisher::TwoOctetAs {
+                admin: r.admin as u16,
+                assigned: r.assigned,
+            })
+        }
+        api::route_distinguisher::Rd::IpAddress(r) => {
+            let admin = r
+                .admin
+                .parse::<Ipv4Addr>()
+                .map_err(|e| Error::InvalidArgument(format!("invalid RD IPv4 admin: {}", e)))?;
+            if r.assigned > u16::MAX as u32 {
+                return Err(Error::InvalidArgument(format!(
+                    "ipv4 RD assigned out of range: {}",
+                    r.assigned
+                )));
+            }
+            Ok(RouteDistinguisher::Ipv4 {
+                admin,
+                assigned: r.assigned as u16,
+            })
+        }
+        api::route_distinguisher::Rd::FourOctetAsn(r) => {
+            if r.assigned > u16::MAX as u32 {
+                return Err(Error::InvalidArgument(format!(
+                    "four-octet RD assigned out of range: {}",
+                    r.assigned
+                )));
+            }
+            Ok(RouteDistinguisher::FourOctetAs {
+                admin: r.admin,
+                assigned: r.assigned as u16,
+            })
+        }
     }
 }
 
@@ -469,6 +595,8 @@ pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Fa
     match f {
         config::generate::AfiSafiType::Ipv4Unicast => Ok(Family::IPV4),
         config::generate::AfiSafiType::Ipv6Unicast => Ok(Family::IPV6),
+        config::generate::AfiSafiType::Ipv4Mup => Ok(Family::IPV4_MUP),
+        config::generate::AfiSafiType::Ipv6Mup => Ok(Family::IPV6_MUP),
         _ => Err(()),
     }
 }
@@ -479,8 +607,108 @@ pub(crate) fn net_from_api(n: api::Nlri) -> Result<Nlri, Error> {
             Nlri::from_str(&format!("{}/{}", p.prefix, p.prefix_len))
                 .map_err(|e| Error::InvalidArgument(e.to_string()))
         }
+        Some(api::nlri::Nlri::MupInterworkSegmentDiscovery(r)) => {
+            let rd = rd_from_api(
+                r.rd.as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing rd".to_string()))?,
+            )?;
+            let (addr, bits) = parse_prefix(&r.prefix)?;
+            Ok(Nlri::Mup(mup::MupNlri::InterworkSegmentDiscovery(
+                mup::MupInterworkSegmentDiscoveryRoute {
+                    rd,
+                    prefix_addr: addr,
+                    prefix_len: bits,
+                },
+            )))
+        }
+        Some(api::nlri::Nlri::MupDirectSegmentDiscovery(r)) => {
+            let rd = rd_from_api(
+                r.rd.as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing rd".to_string()))?,
+            )?;
+            let address = r
+                .address
+                .parse::<std::net::IpAddr>()
+                .map_err(|e| Error::InvalidArgument(format!("invalid mup address: {}", e)))?;
+            Ok(Nlri::Mup(mup::MupNlri::DirectSegmentDiscovery(
+                mup::MupDirectSegmentDiscoveryRoute { rd, address },
+            )))
+        }
+        Some(api::nlri::Nlri::MupType1SessionTransformed(r)) => {
+            let rd = rd_from_api(
+                r.rd.as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing rd".to_string()))?,
+            )?;
+            let (prefix_addr, prefix_len) = parse_prefix(&r.prefix)?;
+            let endpoint_address = r
+                .endpoint_address
+                .parse::<std::net::IpAddr>()
+                .map_err(|e| Error::InvalidArgument(format!("invalid mup endpoint: {}", e)))?;
+            let source_address =
+                if r.source_address_length == 0 || r.source_address.is_empty() {
+                    None
+                } else {
+                    Some(r.source_address.parse::<std::net::IpAddr>().map_err(|e| {
+                        Error::InvalidArgument(format!("invalid mup source: {}", e))
+                    })?)
+                };
+            if r.qfi > u8::MAX as u32 {
+                return Err(Error::InvalidArgument(format!(
+                    "qfi out of range: {}",
+                    r.qfi
+                )));
+            }
+            Ok(Nlri::Mup(mup::MupNlri::Type1SessionTransformed(
+                mup::MupType1SessionTransformedRoute {
+                    rd,
+                    prefix_addr,
+                    prefix_len,
+                    teid: r.teid,
+                    qfi: r.qfi as u8,
+                    endpoint_address,
+                    source_address,
+                },
+            )))
+        }
+        Some(api::nlri::Nlri::MupType2SessionTransformed(r)) => {
+            let rd = rd_from_api(
+                r.rd.as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing rd".to_string()))?,
+            )?;
+            let endpoint_address = r
+                .endpoint_address
+                .parse::<std::net::IpAddr>()
+                .map_err(|e| Error::InvalidArgument(format!("invalid mup endpoint: {}", e)))?;
+            if r.endpoint_address_length > u8::MAX as u32 {
+                return Err(Error::InvalidArgument(format!(
+                    "endpoint_address_length out of range: {}",
+                    r.endpoint_address_length
+                )));
+            }
+            Ok(Nlri::Mup(mup::MupNlri::Type2SessionTransformed(
+                mup::MupType2SessionTransformedRoute {
+                    rd,
+                    endpoint_address_length: r.endpoint_address_length as u8,
+                    endpoint_address,
+                    teid: r.teid,
+                },
+            )))
+        }
         _ => Err(Error::InvalidArgument("invalid NLRI".to_string())),
     }
+}
+
+fn parse_prefix(s: &str) -> Result<(std::net::IpAddr, u8), Error> {
+    let (addr_str, len_str) = s
+        .rsplit_once('/')
+        .ok_or_else(|| Error::InvalidArgument(format!("missing prefix length: {}", s)))?;
+    let addr = addr_str
+        .parse::<std::net::IpAddr>()
+        .map_err(|e| Error::InvalidArgument(format!("invalid prefix: {}", e)))?;
+    let len: u8 = len_str
+        .parse()
+        .map_err(|e| Error::InvalidArgument(format!("invalid prefix length: {}", e)))?;
+    Ok((addr, len))
 }
 
 pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
