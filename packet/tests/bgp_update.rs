@@ -16,7 +16,9 @@
 use rustybgp_packet::bgp::{
     Attribute, Ipv4Net, Ipv6Net, Message, Nexthop, NlriSet, PeerCodec, PeerCodecBuilder, Update,
 };
+use rustybgp_packet::mup;
 use rustybgp_packet::prefix_sid;
+use rustybgp_packet::rd::RouteDistinguisher;
 use rustybgp_packet::{BgpFramer, Family, Nlri, PathNlri};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -601,6 +603,211 @@ fn update_passes_through_unknown_prefix_sid_tlv() {
                 .find(|a| a.code() == Attribute::PREFIX_SID)
                 .expect("PREFIX_SID must be present");
             assert_eq!(a.binary().unwrap(), &sid_bytes);
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+// ─── MUP SAFI announce / withdraw ────────────────────────────────────────────
+
+fn ipv4_mup_codec() -> PeerCodec {
+    PeerCodecBuilder::new()
+        .local_asn(65001)
+        .keep_aspath(true)
+        .keep_nexthop(true)
+        .families(vec![Family::IPV4_MUP])
+        .build()
+}
+
+fn ipv6_mup_codec() -> PeerCodec {
+    PeerCodecBuilder::new()
+        .local_asn(65001)
+        .keep_aspath(true)
+        .keep_nexthop(true)
+        .families(vec![Family::IPV6_MUP])
+        .build()
+}
+
+fn mup_rd() -> RouteDistinguisher {
+    RouteDistinguisher::TwoOctetAs {
+        admin: 65000,
+        assigned: 100,
+    }
+}
+
+#[test]
+fn update_ipv4_mup_announce() {
+    let nlri = PathNlri::new(Nlri::Mup(mup::MupNlri::InterworkSegmentDiscovery(
+        mup::MupInterworkSegmentDiscoveryRoute {
+            rd: mup_rd(),
+            prefix_addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+            prefix_len: 24,
+        },
+    )));
+    let nexthop: Ipv4Addr = "10.0.0.1".parse().unwrap();
+    let msg = Message::Update(Update {
+        reach: None,
+        mp_reach: Some(NlriSet {
+            family: Family::IPV4_MUP,
+            entries: vec![nlri],
+        }),
+        attr: Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+            Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
+        ]),
+        unreach: None,
+        mp_unreach: None,
+        nexthop: None,
+    });
+
+    match round_trip(&msg, ipv4_mup_codec()) {
+        Message::Update(Update {
+            mp_reach,
+            mp_unreach,
+            ..
+        }) => {
+            assert!(mp_unreach.is_none());
+            let s = mp_reach.unwrap();
+            assert_eq!(s.family, Family::IPV4_MUP);
+            assert_eq!(s.entries, vec![nlri]);
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+#[test]
+fn update_ipv6_mup_announce() {
+    let nlri = PathNlri::new(Nlri::Mup(mup::MupNlri::DirectSegmentDiscovery(
+        mup::MupDirectSegmentDiscoveryRoute {
+            rd: mup_rd(),
+            address: IpAddr::V6("2001:db8::1".parse().unwrap()),
+        },
+    )));
+    let nexthop_bytes: Vec<u8> = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec();
+    let msg = Message::Update(Update {
+        reach: None,
+        mp_reach: Some(NlriSet {
+            family: Family::IPV6_MUP,
+            entries: vec![nlri],
+        }),
+        attr: Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+            Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes).unwrap(),
+        ]),
+        unreach: None,
+        mp_unreach: None,
+        nexthop: None,
+    });
+
+    match round_trip(&msg, ipv6_mup_codec()) {
+        Message::Update(Update {
+            mp_reach,
+            mp_unreach,
+            ..
+        }) => {
+            assert!(mp_unreach.is_none());
+            let s = mp_reach.unwrap();
+            assert_eq!(s.family, Family::IPV6_MUP);
+            assert_eq!(s.entries, vec![nlri]);
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+#[test]
+fn update_mup_withdraw() {
+    let nlri = PathNlri::new(Nlri::Mup(mup::MupNlri::Type2SessionTransformed(
+        mup::MupType2SessionTransformedRoute {
+            rd: mup_rd(),
+            endpoint_address_length: 64,
+            endpoint_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            teid: 0xdead_beef,
+        },
+    )));
+    let msg = Message::Update(Update {
+        reach: None,
+        mp_reach: None,
+        attr: Arc::new(Vec::new()),
+        unreach: None,
+        mp_unreach: Some(NlriSet {
+            family: Family::IPV4_MUP,
+            entries: vec![nlri],
+        }),
+        nexthop: None,
+    });
+
+    match round_trip(&msg, ipv4_mup_codec()) {
+        Message::Update(Update {
+            mp_reach,
+            mp_unreach,
+            ..
+        }) => {
+            assert!(mp_reach.is_none());
+            let s = mp_unreach.unwrap();
+            assert_eq!(s.family, Family::IPV4_MUP);
+            assert_eq!(s.entries, vec![nlri]);
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+#[test]
+fn update_mup_with_ext_community() {
+    let nlri = PathNlri::new(Nlri::Mup(mup::MupNlri::DirectSegmentDiscovery(
+        mup::MupDirectSegmentDiscoveryRoute {
+            rd: mup_rd(),
+            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+        },
+    )));
+    // Build EXTENDED_COMMUNITY bytes containing a MUP ext community.
+    let mut ec_bytes = Vec::new();
+    mup::MupExtended {
+        sub_type: mup::EC_SUBTYPE_MUP_DIRECT_SEG,
+        segment_id2: 10,
+        segment_id4: 20,
+    }
+    .encode(&mut ec_bytes);
+    let nexthop: Ipv4Addr = "10.0.0.1".parse().unwrap();
+    let msg = Message::Update(Update {
+        reach: None,
+        mp_reach: Some(NlriSet {
+            family: Family::IPV4_MUP,
+            entries: vec![nlri],
+        }),
+        attr: Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+            Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
+            Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, ec_bytes.clone()).unwrap(),
+        ]),
+        unreach: None,
+        mp_unreach: None,
+        nexthop: None,
+    });
+
+    match round_trip(&msg, ipv4_mup_codec()) {
+        Message::Update(Update { mp_reach, attr, .. }) => {
+            let s = mp_reach.unwrap();
+            assert_eq!(s.entries, vec![nlri]);
+            let ec = attr
+                .iter()
+                .find(|a| a.code() == Attribute::EXTENDED_COMMUNITY)
+                .expect("EXTENDED_COMMUNITY missing");
+            assert_eq!(ec.binary().unwrap(), ec_bytes.as_slice());
         }
         _ => panic!("expected Update"),
     }
