@@ -286,6 +286,19 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
                 )),
             }
         }
+        Attribute::EXTENDED_COMMUNITY => {
+            let mut c = Cursor::new(a.binary().unwrap());
+            let count = c.get_ref().len() / 8;
+            let mut communities = Vec::with_capacity(count);
+            for _ in 0..count {
+                communities.push(read_extcom(&mut c));
+            }
+            api::Attribute {
+                attr: Some(api::attribute::Attr::ExtendedCommunities(
+                    api::ExtendedCommunitiesAttribute { communities },
+                )),
+            }
+        }
         Attribute::PREFIX_SID => match prefix_sid::PrefixSid::decode(a.binary().unwrap()) {
             Ok(sid) => api::Attribute {
                 attr: Some(api::attribute::Attr::PrefixSid(prefix_sid_to_api(&sid))),
@@ -305,6 +318,146 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
                 value: a.binary().unwrap().to_owned(),
             })),
         },
+    }
+}
+
+/// Type byte category masks (RFC 4360 §2, RFC 5668 §2).
+const EXTCOM_TYPE_NON_TRANSITIVE: u8 = 0x40;
+const EXTCOM_TYPE_TWO_OCTET_AS: u8 = 0x00;
+const EXTCOM_TYPE_IPV4_ADDRESS: u8 = 0x01;
+const EXTCOM_TYPE_FOUR_OCTET_AS: u8 = 0x02;
+
+fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
+    let start = c.position() as usize;
+    let type_high = c.read_u8().unwrap();
+    let is_transitive = type_high & EXTCOM_TYPE_NON_TRANSITIVE == 0;
+    let category = type_high & !EXTCOM_TYPE_NON_TRANSITIVE;
+    let sub_type = c.read_u8().unwrap();
+    let extcom = match category {
+        EXTCOM_TYPE_TWO_OCTET_AS => {
+            let asn = c.read_u16::<NetworkEndian>().unwrap() as u32;
+            let local_admin = c.read_u32::<NetworkEndian>().unwrap();
+            api::extended_community::Extcom::TwoOctetAsSpecific(api::TwoOctetAsSpecificExtended {
+                is_transitive,
+                sub_type: sub_type as u32,
+                asn,
+                local_admin,
+            })
+        }
+        EXTCOM_TYPE_IPV4_ADDRESS => {
+            let addr = Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap());
+            let local_admin = c.read_u16::<NetworkEndian>().unwrap() as u32;
+            api::extended_community::Extcom::Ipv4AddressSpecific(api::IPv4AddressSpecificExtended {
+                is_transitive,
+                sub_type: sub_type as u32,
+                address: addr.to_string(),
+                local_admin,
+            })
+        }
+        EXTCOM_TYPE_FOUR_OCTET_AS => {
+            let asn = c.read_u32::<NetworkEndian>().unwrap();
+            let local_admin = c.read_u16::<NetworkEndian>().unwrap() as u32;
+            api::extended_community::Extcom::FourOctetAsSpecific(api::FourOctetAsSpecificExtended {
+                is_transitive,
+                sub_type: sub_type as u32,
+                asn,
+                local_admin,
+            })
+        }
+        _ => {
+            // Copy the full 8-byte chunk so the unknown extcom round-trips.
+            let buf = c.get_ref();
+            let value = buf[start..start + 8].to_vec();
+            c.set_position((start + 8) as u64);
+            api::extended_community::Extcom::Unknown(api::UnknownExtended {
+                r#type: type_high as u32,
+                value,
+            })
+        }
+    };
+    api::ExtendedCommunity {
+        extcom: Some(extcom),
+    }
+}
+
+fn write_extcom(c: &mut Cursor<Vec<u8>>, com: api::ExtendedCommunity) -> Result<(), Error> {
+    let inner = com
+        .extcom
+        .ok_or_else(|| Error::InvalidArgument("missing extcom oneof".to_string()))?;
+    let transitive_bit = |is_transitive: bool| {
+        if is_transitive {
+            0
+        } else {
+            EXTCOM_TYPE_NON_TRANSITIVE
+        }
+    };
+    match inner {
+        api::extended_community::Extcom::TwoOctetAsSpecific(t) => {
+            c.write_u8(EXTCOM_TYPE_TWO_OCTET_AS | transitive_bit(t.is_transitive))
+                .unwrap();
+            c.write_u8(ensure_u8("sub_type", t.sub_type)?).unwrap();
+            c.write_u16::<NetworkEndian>(ensure_u16("asn", t.asn)?)
+                .unwrap();
+            c.write_u32::<NetworkEndian>(t.local_admin).unwrap();
+        }
+        api::extended_community::Extcom::Ipv4AddressSpecific(t) => {
+            c.write_u8(EXTCOM_TYPE_IPV4_ADDRESS | transitive_bit(t.is_transitive))
+                .unwrap();
+            c.write_u8(ensure_u8("sub_type", t.sub_type)?).unwrap();
+            let addr: Ipv4Addr = t
+                .address
+                .parse()
+                .map_err(|e| Error::InvalidArgument(format!("invalid extcom address: {}", e)))?;
+            c.write_u32::<NetworkEndian>(addr.into()).unwrap();
+            c.write_u16::<NetworkEndian>(ensure_u16("local_admin", t.local_admin)?)
+                .unwrap();
+        }
+        api::extended_community::Extcom::FourOctetAsSpecific(t) => {
+            c.write_u8(EXTCOM_TYPE_FOUR_OCTET_AS | transitive_bit(t.is_transitive))
+                .unwrap();
+            c.write_u8(ensure_u8("sub_type", t.sub_type)?).unwrap();
+            c.write_u32::<NetworkEndian>(t.asn).unwrap();
+            c.write_u16::<NetworkEndian>(ensure_u16("local_admin", t.local_admin)?)
+                .unwrap();
+        }
+        api::extended_community::Extcom::Unknown(u) => {
+            if u.value.len() != 8 {
+                return Err(Error::InvalidArgument(format!(
+                    "extended community must be 8 bytes, got {}",
+                    u.value.len()
+                )));
+            }
+            c.get_mut().extend_from_slice(&u.value);
+            c.set_position(c.position() + 8);
+        }
+        _ => {
+            return Err(Error::InvalidArgument(
+                "extended community variant not supported".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_u8(name: &str, v: u32) -> Result<u8, Error> {
+    if v > u8::MAX as u32 {
+        Err(Error::InvalidArgument(format!(
+            "{} out of range: {}",
+            name, v
+        )))
+    } else {
+        Ok(v as u8)
+    }
+}
+
+fn ensure_u16(name: &str, v: u32) -> Result<u16, Error> {
+    if v > u16::MAX as u32 {
+        Err(Error::InvalidArgument(format!(
+            "{} out of range: {}",
+            name, v
+        )))
+    } else {
+        Ok(v as u16)
     }
 }
 
@@ -447,6 +600,14 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
                 .map_err(|e| Error::InvalidArgument(format!("mp_reach write: {}", e)))?;
             c.write_u8(0).unwrap(); // reserved
             Attribute::new_with_bin(Attribute::MP_REACH, c.into_inner())
+                .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
+        }
+        api::attribute::Attr::ExtendedCommunities(ec) => {
+            let mut c = Cursor::new(Vec::with_capacity(ec.communities.len() * 8));
+            for com in ec.communities {
+                write_extcom(&mut c, com)?;
+            }
+            Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, c.into_inner())
                 .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
         }
         api::attribute::Attr::PrefixSid(p) => {
@@ -1466,5 +1627,78 @@ mod tests {
     fn mp_reach_rejects_invalid_nexthop() {
         let bad = mp_reach_api_v4("not-an-ip");
         assert!(attr_from_api(bad).is_err());
+    }
+
+    // ─── Extended Community round-trip ───────────────────────────────────────
+
+    fn roundtrip_extcom(chunk: [u8; 8]) {
+        let buf = chunk.to_vec();
+        let mut rc = Cursor::new(&buf);
+        let api_ec = read_extcom(&mut rc);
+        let mut wc = Cursor::new(Vec::new());
+        write_extcom(&mut wc, api_ec).unwrap();
+        assert_eq!(wc.into_inner(), chunk);
+    }
+
+    #[test]
+    fn extcom_two_octet_as_route_target() {
+        // Transitive Two-Octet AS Specific, sub_type=0x02 (Route Target),
+        // AS=10, local=10.
+        roundtrip_extcom([0x00, 0x02, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x0a]);
+    }
+
+    #[test]
+    fn extcom_two_octet_as_route_origin_non_transitive() {
+        // Non-Transitive Two-Octet AS Specific, sub_type=0x03 (Route Origin).
+        roundtrip_extcom([0x40, 0x03, 0x00, 0x65, 0x00, 0x00, 0x04, 0xd2]);
+    }
+
+    #[test]
+    fn extcom_ipv4_address_specific() {
+        // Transitive IPv4 Address Specific, sub_type=0x02, addr=192.0.2.1,
+        // local=100.
+        roundtrip_extcom([0x01, 0x02, 192, 0, 2, 1, 0x00, 0x64]);
+    }
+
+    #[test]
+    fn extcom_four_octet_as_specific() {
+        // Transitive Four-Octet AS Specific, sub_type=0x02, AS=4200000000.
+        roundtrip_extcom([0x02, 0x02, 0xfa, 0x56, 0xea, 0x00, 0x00, 0x07]);
+    }
+
+    #[test]
+    fn extcom_unknown_passthrough() {
+        // Unknown type (0x06 = EVPN) should survive round-trip as raw bytes.
+        roundtrip_extcom([0x06, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    }
+
+    #[test]
+    fn write_extcom_rejects_unknown_wrong_length() {
+        let bad = api::ExtendedCommunity {
+            extcom: Some(api::extended_community::Extcom::Unknown(
+                api::UnknownExtended {
+                    r#type: 0x10,
+                    value: vec![1, 2, 3],
+                },
+            )),
+        };
+        let mut c = Cursor::new(Vec::new());
+        assert!(write_extcom(&mut c, bad).is_err());
+    }
+
+    #[test]
+    fn write_extcom_rejects_out_of_range_sub_type() {
+        let bad = api::ExtendedCommunity {
+            extcom: Some(api::extended_community::Extcom::TwoOctetAsSpecific(
+                api::TwoOctetAsSpecificExtended {
+                    is_transitive: true,
+                    sub_type: 999,
+                    asn: 100,
+                    local_admin: 200,
+                },
+            )),
+        };
+        let mut c = Cursor::new(Vec::new());
+        assert!(write_extcom(&mut c, bad).is_err());
     }
 }
