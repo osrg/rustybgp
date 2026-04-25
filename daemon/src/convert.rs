@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
@@ -327,8 +327,7 @@ const EXTCOM_TYPE_TWO_OCTET_AS: u8 = 0x00;
 const EXTCOM_TYPE_IPV4_ADDRESS: u8 = 0x01;
 const EXTCOM_TYPE_FOUR_OCTET_AS: u8 = 0x02;
 
-fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
-    let start = c.position() as usize;
+fn read_extcom(c: &mut impl Read) -> api::ExtendedCommunity {
     let type_high = c.read_u8().unwrap();
     let is_transitive = type_high & EXTCOM_TYPE_NON_TRANSITIVE == 0;
     let category = type_high & !EXTCOM_TYPE_NON_TRANSITIVE;
@@ -365,10 +364,13 @@ fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
             })
         }
         _ => {
-            // Copy the full 8-byte chunk so the unknown extcom round-trips.
-            let buf = c.get_ref();
-            let value = buf[start..start + 8].to_vec();
-            c.set_position((start + 8) as u64);
+            // Read the remaining 6 bytes to complete the 8-byte chunk.
+            let mut rest = [0u8; 6];
+            c.read_exact(&mut rest).unwrap();
+            let mut value = Vec::with_capacity(8);
+            value.push(type_high);
+            value.push(sub_type);
+            value.extend_from_slice(&rest);
             api::extended_community::Extcom::Unknown(api::UnknownExtended {
                 r#type: type_high as u32,
                 value,
@@ -380,7 +382,7 @@ fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
     }
 }
 
-fn write_extcom(c: &mut Cursor<Vec<u8>>, com: api::ExtendedCommunity) -> Result<(), Error> {
+fn write_extcom(c: &mut impl Write, com: api::ExtendedCommunity) -> Result<(), Error> {
     let inner = com
         .extcom
         .ok_or_else(|| Error::InvalidArgument("missing extcom oneof".to_string()))?;
@@ -427,8 +429,7 @@ fn write_extcom(c: &mut Cursor<Vec<u8>>, com: api::ExtendedCommunity) -> Result<
                     u.value.len()
                 )));
             }
-            c.get_mut().extend_from_slice(&u.value);
-            c.set_position(c.position() + 8);
+            c.write_all(&u.value).unwrap();
         }
         _ => {
             return Err(Error::InvalidArgument(
