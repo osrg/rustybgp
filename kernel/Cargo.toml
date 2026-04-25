@@ -5,7 +5,7 @@ authors = ["FUJITA Tomonori <fujita.tomonori@gmail.com>"]
 edition = "2024"
 
 [dependencies]
-rtnetlink = "0.20"
+rtnetlink = "0.21"
 futures = "0.3"
 thiserror = "2"
 
