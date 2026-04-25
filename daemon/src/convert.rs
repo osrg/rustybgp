@@ -490,6 +490,15 @@ fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
                 local_admin,
             })
         }
+        mup::EC_TYPE_MUP => {
+            let segment_id2 = c.read_u16::<NetworkEndian>().unwrap() as u32;
+            let segment_id4 = c.read_u32::<NetworkEndian>().unwrap();
+            api::extended_community::Extcom::Mup(api::MupExtended {
+                sub_type: sub_type as u32,
+                segment_id2,
+                segment_id4,
+            })
+        }
         _ => {
             // Copy the full 8-byte chunk so the unknown extcom round-trips.
             let buf = c.get_ref();
@@ -545,6 +554,15 @@ fn write_extcom(c: &mut Cursor<Vec<u8>>, com: api::ExtendedCommunity) -> Result<
             c.write_u32::<NetworkEndian>(t.asn).unwrap();
             c.write_u16::<NetworkEndian>(ensure_u16("local_admin", t.local_admin)?)
                 .unwrap();
+        }
+        api::extended_community::Extcom::Mup(m) => {
+            let mup_ec = mup::MupExtended {
+                sub_type: ensure_u8("sub_type", m.sub_type)?,
+                segment_id2: ensure_u16("segment_id2", m.segment_id2)?,
+                segment_id4: m.segment_id4,
+            };
+            mup_ec.encode(c.get_mut());
+            c.set_position(c.position() + 8);
         }
         api::extended_community::Extcom::Unknown(u) => {
             if u.value.len() != 8 {
