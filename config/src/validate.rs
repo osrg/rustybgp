@@ -67,13 +67,10 @@ impl BgpConfig {
             ));
         }
 
-        let router_id = global_config
+        let _router_id = global_config
             .router_id
             .as_ref()
             .ok_or_else(|| ConfigError::InvalidConfiguration("empty router-id".to_string()))?;
-        let _: std::net::Ipv4Addr = router_id
-            .parse()
-            .map_err(|_| ConfigError::InvalidConfiguration("can't parse router-id".to_string()))?;
 
         if let Some(peers) = self.neighbors.as_ref() {
             for n in peers {
@@ -96,13 +93,10 @@ impl BmpServer {
         let config = self.config.as_ref().ok_or_else(|| {
             ConfigError::InvalidConfiguration("empty bmp server configuration".to_string())
         })?;
-        let addr = config
+        let _addr = config
             .address
             .as_ref()
             .ok_or_else(|| ConfigError::InvalidConfiguration("empty bmp address".to_string()))?;
-        let _: std::net::IpAddr = addr.parse().map_err(|_| {
-            ConfigError::InvalidConfiguration("can't parse neighbor address".to_string())
-        })?;
         let port = config
             .port
             .as_ref()
@@ -141,9 +135,6 @@ impl Neighbor {
 
         let addr = config.neighbor_address.as_ref().ok_or_else(|| {
             ConfigError::InvalidConfiguration("empty neighbor address".to_string())
-        })?;
-        let _: std::net::IpAddr = addr.parse().map_err(|_| {
-            ConfigError::InvalidConfiguration("can't parse neighbor address".to_string())
         })?;
 
         if self.add_paths.is_some() {

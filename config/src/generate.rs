@@ -18,237 +18,91 @@
 use serde::Deserialize;
 use std::convert::TryFrom;
 
-// typedef for typedef openconfig-types:std-regexp.
-type StdRegexp = String;
-// typedef for typedef openconfig-types:percentage.
-type Percentage = u8;
-// typedef for typedef bgp-types:rr-cluster-id-type.
-type RrClusterIdType = String;
-// typedef for identity bgp-types:remove-private-as-option.
-// set of options for configuring how private AS path numbers
-// are removed from advertisements.
+// typedef for identity rpol:default-policy-type.
+// type used to specify default route disposition in
+// a policy chain.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub enum RemovePrivateAsOption {
-    All,
-    Replace,
+pub enum DefaultPolicyType {
+    AcceptRoute,
+    RejectRoute,
 }
 
-impl TryFrom<String> for RemovePrivateAsOption {
+impl TryFrom<String> for DefaultPolicyType {
     type Error = String;
     fn try_from(s: String) -> Result<Self, Self::Error> {
         match s.as_str() {
-            "all" => Ok(Self::All),
-            "replace" => Ok(Self::Replace),
-            _ => Err(format!("invalid parameter (RemovePrivateAsOption) {}", s)),
+            "accept-route" => Ok(Self::AcceptRoute),
+            "reject-route" => Ok(Self::RejectRoute),
+            _ => Err(format!("invalid parameter (DefaultPolicyType) {}", s)),
         }
     }
 }
-// typedef for typedef bgp-types:bgp-community-regexp-type.
-type BgpCommunityRegexpType = StdRegexp;
-// typedef for identity bgp-types:community-type.
-// type describing variations of community attributes:
-// STANDARD: standard BGP community [rfc1997]
-// EXTENDED: extended BGP community [rfc4360]
-// BOTH: both standard and extended community.
+// typedef for identity rpol:route-type.
+// Condition to check the route type in the route update.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub enum CommunityType {
-    Standard,
-    Extended,
-    Both,
+pub enum RouteType {
     None,
-}
-
-impl TryFrom<String> for CommunityType {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
-            "standard" => Ok(Self::Standard),
-            "extended" => Ok(Self::Extended),
-            "both" => Ok(Self::Both),
-            "none" => Ok(Self::None),
-            _ => Err(format!("invalid parameter (CommunityType) {}", s)),
-        }
-    }
-}
-// typedef for typedef bgp-types:bgp-ext-community-type.
-type BgpExtCommunityType = String;
-// typedef for typedef bgp-types:bgp-std-community-type.
-type BgpStdCommunityType = String;
-// typedef for identity bgp-types:peer-type.
-// labels a peer or peer group as explicitly internal or
-// external.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub enum PeerType {
     Internal,
     External,
+    Local,
 }
 
-impl TryFrom<String> for PeerType {
+impl TryFrom<String> for RouteType {
     type Error = String;
     fn try_from(s: String) -> Result<Self, Self::Error> {
         match s.as_str() {
+            "none" => Ok(Self::None),
             "internal" => Ok(Self::Internal),
             "external" => Ok(Self::External),
-            _ => Err(format!("invalid parameter (PeerType) {}", s)),
+            "local" => Ok(Self::Local),
+            _ => Err(format!("invalid parameter (RouteType) {}", s)),
         }
     }
 }
-// typedef for identity bgp-types:bgp-session-direction.
-// Type to describe the direction of NLRI transmission.
+// typedef for identity rpol:route-disposition.
+// Select the final disposition for the route, either
+// accept or reject.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub enum BgpSessionDirection {
-    Inbound,
-    Outbound,
+pub enum RouteDisposition {
+    None,
+    AcceptRoute,
+    RejectRoute,
 }
 
-impl TryFrom<String> for BgpSessionDirection {
+impl TryFrom<String> for RouteDisposition {
     type Error = String;
     fn try_from(s: String) -> Result<Self, Self::Error> {
         match s.as_str() {
-            "inbound" => Ok(Self::Inbound),
-            "outbound" => Ok(Self::Outbound),
-            _ => Err(format!("invalid parameter (BgpSessionDirection) {}", s)),
+            "none" => Ok(Self::None),
+            "accept-route" => Ok(Self::AcceptRoute),
+            "reject-route" => Ok(Self::RejectRoute),
+            _ => Err(format!("invalid parameter (RouteDisposition) {}", s)),
         }
     }
 }
-// typedef for identity bgp-types:bgp-origin-attr-type.
-// Type definition for standard BGP origin attribute.
+// typedef for identity ptypes:match-set-options-type.
+// Options that govern the behavior of a match statement.  The
+// default behavior is ANY, i.e., the given value matches any
+// of the members of the defined set.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub enum BgpOriginAttrType {
-    Igp,
-    Egp,
-    Incomplete,
+pub enum MatchSetOptionsType {
+    Any,
+    All,
+    Invert,
 }
 
-impl TryFrom<String> for BgpOriginAttrType {
+impl TryFrom<String> for MatchSetOptionsType {
     type Error = String;
     fn try_from(s: String) -> Result<Self, Self::Error> {
         match s.as_str() {
-            "igp" => Ok(Self::Igp),
-            "egp" => Ok(Self::Egp),
-            "incomplete" => Ok(Self::Incomplete),
-            _ => Err(format!("invalid parameter (BgpOriginAttrType) {}", s)),
-        }
-    }
-}
-// typedef for identity bgp-types:afi-safi-type.
-// Base identity type for AFI,SAFI tuples for BGP-4.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub enum AfiSafiType {
-    Ipv4Unicast,
-    Ipv6Unicast,
-    Ipv4LabelledUnicast,
-    Ipv6LabelledUnicast,
-    L3VpnIpv4Unicast,
-    L3VpnIpv6Unicast,
-    L3VpnIpv4Multicast,
-    L3VpnIpv6Multicast,
-    L2VpnVpls,
-    L2VpnEvpn,
-    Ipv4Multicast,
-    Ipv6Multicast,
-    Rtc,
-    Ipv4Encap,
-    Ipv6Encap,
-    Ipv4Flowspec,
-    L3VpnIpv4Flowspec,
-    Ipv6Flowspec,
-    L3VpnIpv6Flowspec,
-    L2VpnFlowspec,
-    Ipv4Srpolicy,
-    Ipv6Srpolicy,
-    Opaque,
-    Ls,
-}
-
-impl TryFrom<String> for AfiSafiType {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
-            "ipv4-unicast" => Ok(Self::Ipv4Unicast),
-            "ipv6-unicast" => Ok(Self::Ipv6Unicast),
-            "ipv4-labelled-unicast" => Ok(Self::Ipv4LabelledUnicast),
-            "ipv6-labelled-unicast" => Ok(Self::Ipv6LabelledUnicast),
-            "l3vpn-ipv4-unicast" => Ok(Self::L3VpnIpv4Unicast),
-            "l3vpn-ipv6-unicast" => Ok(Self::L3VpnIpv6Unicast),
-            "l3vpn-ipv4-multicast" => Ok(Self::L3VpnIpv4Multicast),
-            "l3vpn-ipv6-multicast" => Ok(Self::L3VpnIpv6Multicast),
-            "l2vpn-vpls" => Ok(Self::L2VpnVpls),
-            "l2vpn-evpn" => Ok(Self::L2VpnEvpn),
-            "ipv4-multicast" => Ok(Self::Ipv4Multicast),
-            "ipv6-multicast" => Ok(Self::Ipv6Multicast),
-            "rtc" => Ok(Self::Rtc),
-            "ipv4-encap" => Ok(Self::Ipv4Encap),
-            "ipv6-encap" => Ok(Self::Ipv6Encap),
-            "ipv4-flowspec" => Ok(Self::Ipv4Flowspec),
-            "l3vpn-ipv4-flowspec" => Ok(Self::L3VpnIpv4Flowspec),
-            "ipv6-flowspec" => Ok(Self::Ipv6Flowspec),
-            "l3vpn-ipv6-flowspec" => Ok(Self::L3VpnIpv6Flowspec),
-            "l2vpn-flowspec" => Ok(Self::L2VpnFlowspec),
-            "ipv4-srpolicy" => Ok(Self::Ipv4Srpolicy),
-            "ipv6-srpolicy" => Ok(Self::Ipv6Srpolicy),
-            "opaque" => Ok(Self::Opaque),
-            "ls" => Ok(Self::Ls),
-            _ => Err(format!("invalid parameter (AfiSafiType) {}", s)),
-        }
-    }
-}
-// typedef for identity bgp-types:bgp-capability.
-// Base identity for a BGP capability.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub enum BgpCapability {
-    Mpbgp,
-    RouteRefresh,
-    Asn32,
-    GracefulRestart,
-    AddPaths,
-}
-
-impl TryFrom<String> for BgpCapability {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
-            "mpbgp" => Ok(Self::Mpbgp),
-            "route-refresh" => Ok(Self::RouteRefresh),
-            "asn32" => Ok(Self::Asn32),
-            "graceful-restart" => Ok(Self::GracefulRestart),
-            "add-paths" => Ok(Self::AddPaths),
-            _ => Err(format!("invalid parameter (BgpCapability) {}", s)),
-        }
-    }
-}
-// typedef for identity bgp-types:bgp-well-known-std-community.
-// Reserved communities within the standard community space
-// defined by RFC1997. These communities must fall within the
-// range 0x00000000 to 0xFFFFFFFF.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub enum BgpWellKnownStdCommunity {
-    NoExport,
-    NoAdvertise,
-    NoExportSubconfed,
-    Nopeer,
-}
-
-impl TryFrom<String> for BgpWellKnownStdCommunity {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
-            "no_export" => Ok(Self::NoExport),
-            "no_advertise" => Ok(Self::NoAdvertise),
-            "no_export_subconfed" => Ok(Self::NoExportSubconfed),
-            "nopeer" => Ok(Self::Nopeer),
-            _ => Err(format!(
-                "invalid parameter (BgpWellKnownStdCommunity) {}",
-                s
-            )),
+            "any" => Ok(Self::Any),
+            "all" => Ok(Self::All),
+            "invert" => Ok(Self::Invert),
+            _ => Err(format!("invalid parameter (MatchSetOptionsType) {}", s)),
         }
     }
 }
@@ -277,61 +131,8 @@ impl TryFrom<String> for MatchSetOptionsRestrictedType {
         }
     }
 }
-// typedef for identity ptypes:match-set-options-type.
-// Options that govern the behavior of a match statement.  The
-// default behavior is ANY, i.e., the given value matches any
-// of the members of the defined set.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub enum MatchSetOptionsType {
-    Any,
-    All,
-    Invert,
-}
-
-impl TryFrom<String> for MatchSetOptionsType {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
-            "any" => Ok(Self::Any),
-            "all" => Ok(Self::All),
-            "invert" => Ok(Self::Invert),
-            _ => Err(format!("invalid parameter (MatchSetOptionsType) {}", s)),
-        }
-    }
-}
 // typedef for typedef ptypes:tag-type.
 type TagType = String;
-// typedef for identity ptypes:install-protocol-type.
-// Base type for protocols which can install prefixes into the
-// RIB.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub enum InstallProtocolType {
-    Bgp,
-    Isis,
-    Ospf,
-    Ospf3,
-    Static,
-    DirectlyConnected,
-    LocalAggregate,
-}
-
-impl TryFrom<String> for InstallProtocolType {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
-            "bgp" => Ok(Self::Bgp),
-            "isis" => Ok(Self::Isis),
-            "ospf" => Ok(Self::Ospf),
-            "ospf3" => Ok(Self::Ospf3),
-            "static" => Ok(Self::Static),
-            "directly-connected" => Ok(Self::DirectlyConnected),
-            "local-aggregate" => Ok(Self::LocalAggregate),
-            _ => Err(format!("invalid parameter (InstallProtocolType) {}", s)),
-        }
-    }
-}
 // typedef for identity ptypes:attribute-comparison.
 // base type for supported comparison operators on route
 // attributes.
@@ -360,68 +161,33 @@ impl TryFrom<String> for AttributeComparison {
         }
     }
 }
-// typedef for identity rpol:route-disposition.
-// Select the final disposition for the route, either
-// accept or reject.
+// typedef for identity ptypes:install-protocol-type.
+// Base type for protocols which can install prefixes into the
+// RIB.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub enum RouteDisposition {
-    None,
-    AcceptRoute,
-    RejectRoute,
+pub enum InstallProtocolType {
+    Bgp,
+    Isis,
+    Ospf,
+    Ospf3,
+    Static,
+    DirectlyConnected,
+    LocalAggregate,
 }
 
-impl TryFrom<String> for RouteDisposition {
+impl TryFrom<String> for InstallProtocolType {
     type Error = String;
     fn try_from(s: String) -> Result<Self, Self::Error> {
         match s.as_str() {
-            "none" => Ok(Self::None),
-            "accept-route" => Ok(Self::AcceptRoute),
-            "reject-route" => Ok(Self::RejectRoute),
-            _ => Err(format!("invalid parameter (RouteDisposition) {}", s)),
-        }
-    }
-}
-// typedef for identity rpol:route-type.
-// Condition to check the route type in the route update.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub enum RouteType {
-    None,
-    Internal,
-    External,
-    Local,
-}
-
-impl TryFrom<String> for RouteType {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
-            "none" => Ok(Self::None),
-            "internal" => Ok(Self::Internal),
-            "external" => Ok(Self::External),
-            "local" => Ok(Self::Local),
-            _ => Err(format!("invalid parameter (RouteType) {}", s)),
-        }
-    }
-}
-// typedef for identity rpol:default-policy-type.
-// type used to specify default route disposition in
-// a policy chain.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub enum DefaultPolicyType {
-    AcceptRoute,
-    RejectRoute,
-}
-
-impl TryFrom<String> for DefaultPolicyType {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
-            "accept-route" => Ok(Self::AcceptRoute),
-            "reject-route" => Ok(Self::RejectRoute),
-            _ => Err(format!("invalid parameter (DefaultPolicyType) {}", s)),
+            "bgp" => Ok(Self::Bgp),
+            "isis" => Ok(Self::Isis),
+            "ospf" => Ok(Self::Ospf),
+            "ospf3" => Ok(Self::Ospf3),
+            "static" => Ok(Self::Static),
+            "directly-connected" => Ok(Self::DirectlyConnected),
+            "local-aggregate" => Ok(Self::LocalAggregate),
+            _ => Err(format!("invalid parameter (InstallProtocolType) {}", s)),
         }
     }
 }
@@ -473,7 +239,7 @@ impl TryFrom<String> for AdminState {
     }
 }
 // typedef for identity bgp:mode.
-// This leaf indicates the mode of operation of BGP graceful
+// Ths leaf indicates the mode of operation of BGP graceful
 // restart with the peer.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
@@ -494,37 +260,244 @@ impl TryFrom<String> for Mode {
         }
     }
 }
-// typedef for typedef bgp-pol:bgp-next-hop-type.
-type BgpNextHopType = String;
-// typedef for typedef bgp-pol:bgp-as-path-prepend-repeat.
-type BgpAsPathPrependRepeat = u8;
-// typedef for typedef bgp-pol:bgp-set-med-type.
-type BgpSetMedType = String;
-// typedef for identity bgp-pol:bgp-set-community-option-type.
-// Type definition for options when setting the community
-// attribute in a policy action.
+// typedef for identity bgp-types:bgp-session-direction.
+// Type to describe the direction of NLRI transmission.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
-pub enum BgpSetCommunityOptionType {
-    Add,
-    Remove,
-    Replace,
+pub enum BgpSessionDirection {
+    Inbound,
+    Outbound,
 }
 
-impl TryFrom<String> for BgpSetCommunityOptionType {
+impl TryFrom<String> for BgpSessionDirection {
     type Error = String;
     fn try_from(s: String) -> Result<Self, Self::Error> {
         match s.as_str() {
-            "add" => Ok(Self::Add),
-            "remove" => Ok(Self::Remove),
+            "inbound" => Ok(Self::Inbound),
+            "outbound" => Ok(Self::Outbound),
+            _ => Err(format!("invalid parameter (BgpSessionDirection) {}", s)),
+        }
+    }
+}
+// typedef for typedef bgp-types:bgp-std-community-type.
+type BgpStdCommunityType = String;
+// typedef for typedef bgp-types:bgp-ext-community-type.
+type BgpExtCommunityType = String;
+// typedef for typedef bgp-types:bgp-community-regexp-type.
+type BgpCommunityRegexpType = StdRegexp;
+// typedef for identity bgp-types:bgp-origin-attr-type.
+// Type definition for standard BGP origin attribute.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum BgpOriginAttrType {
+    Igp,
+    Egp,
+    Incomplete,
+}
+
+impl TryFrom<String> for BgpOriginAttrType {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "igp" => Ok(Self::Igp),
+            "egp" => Ok(Self::Egp),
+            "incomplete" => Ok(Self::Incomplete),
+            _ => Err(format!("invalid parameter (BgpOriginAttrType) {}", s)),
+        }
+    }
+}
+// typedef for identity bgp-types:peer-type.
+// labels a peer or peer group as explicitly internal or
+// external.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum PeerType {
+    Internal,
+    External,
+}
+
+impl TryFrom<String> for PeerType {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "internal" => Ok(Self::Internal),
+            "external" => Ok(Self::External),
+            _ => Err(format!("invalid parameter (PeerType) {}", s)),
+        }
+    }
+}
+// typedef for identity bgp-types:remove-private-as-option.
+// set of options for configuring how private AS path numbers
+// are removed from advertisements.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum RemovePrivateAsOption {
+    All,
+    Replace,
+}
+
+impl TryFrom<String> for RemovePrivateAsOption {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "all" => Ok(Self::All),
             "replace" => Ok(Self::Replace),
+            _ => Err(format!("invalid parameter (RemovePrivateAsOption) {}", s)),
+        }
+    }
+}
+// typedef for typedef bgp-types:percentage.
+type Percentage = u8;
+// typedef for typedef bgp-types:rr-cluster-id-type.
+type RrClusterIdType = String;
+// typedef for identity bgp-types:community-type.
+// type describing variations of community attributes:
+// STANDARD: standard BGP community [rfc1997]
+// EXTENDED: extended BGP community [rfc4360]
+// BOTH: both standard and extended community.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum CommunityType {
+    Standard,
+    Extended,
+    Both,
+    None,
+}
+
+impl TryFrom<String> for CommunityType {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "standard" => Ok(Self::Standard),
+            "extended" => Ok(Self::Extended),
+            "both" => Ok(Self::Both),
+            "none" => Ok(Self::None),
+            _ => Err(format!("invalid parameter (CommunityType) {}", s)),
+        }
+    }
+}
+// typedef for identity bgp-types:bgp-capability.
+// Base identity for a BGP capability.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum BgpCapability {
+    Mpbgp,
+    RouteRefresh,
+    Asn32,
+    GracefulRestart,
+    AddPaths,
+}
+
+impl TryFrom<String> for BgpCapability {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "mpbgp" => Ok(Self::Mpbgp),
+            "route-refresh" => Ok(Self::RouteRefresh),
+            "asn32" => Ok(Self::Asn32),
+            "graceful-restart" => Ok(Self::GracefulRestart),
+            "add-paths" => Ok(Self::AddPaths),
+            _ => Err(format!("invalid parameter (BgpCapability) {}", s)),
+        }
+    }
+}
+// typedef for identity bgp-types:afi-safi-type.
+// Base identity type for AFI,SAFI tuples for BGP-4.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum AfiSafiType {
+    Ipv4Unicast,
+    Ipv6Unicast,
+    Ipv4LabelledUnicast,
+    Ipv6LabelledUnicast,
+    L3VpnIpv4Unicast,
+    L3VpnIpv6Unicast,
+    L3VpnIpv4Multicast,
+    L3VpnIpv6Multicast,
+    L2VpnVpls,
+    L2VpnEvpn,
+    Ipv4Multicast,
+    Ipv6Multicast,
+    Rtc,
+    Ipv4Encap,
+    Ipv6Encap,
+    Ipv4Flowspec,
+    L3VpnIpv4Flowspec,
+    Ipv6Flowspec,
+    L3VpnIpv6Flowspec,
+    L2VpnFlowspec,
+    Ipv4Srpolicy,
+    Ipv6Srpolicy,
+    Opaque,
+    Ls,
+    Ipv4Mup,
+    Ipv6Mup,
+}
+
+impl TryFrom<String> for AfiSafiType {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "ipv4-unicast" => Ok(Self::Ipv4Unicast),
+            "ipv6-unicast" => Ok(Self::Ipv6Unicast),
+            "ipv4-labelled-unicast" => Ok(Self::Ipv4LabelledUnicast),
+            "ipv6-labelled-unicast" => Ok(Self::Ipv6LabelledUnicast),
+            "l3vpn-ipv4-unicast" => Ok(Self::L3VpnIpv4Unicast),
+            "l3vpn-ipv6-unicast" => Ok(Self::L3VpnIpv6Unicast),
+            "l3vpn-ipv4-multicast" => Ok(Self::L3VpnIpv4Multicast),
+            "l3vpn-ipv6-multicast" => Ok(Self::L3VpnIpv6Multicast),
+            "l2vpn-vpls" => Ok(Self::L2VpnVpls),
+            "l2vpn-evpn" => Ok(Self::L2VpnEvpn),
+            "ipv4-multicast" => Ok(Self::Ipv4Multicast),
+            "ipv6-multicast" => Ok(Self::Ipv6Multicast),
+            "rtc" => Ok(Self::Rtc),
+            "ipv4-encap" => Ok(Self::Ipv4Encap),
+            "ipv6-encap" => Ok(Self::Ipv6Encap),
+            "ipv4-flowspec" => Ok(Self::Ipv4Flowspec),
+            "l3vpn-ipv4-flowspec" => Ok(Self::L3VpnIpv4Flowspec),
+            "ipv6-flowspec" => Ok(Self::Ipv6Flowspec),
+            "l3vpn-ipv6-flowspec" => Ok(Self::L3VpnIpv6Flowspec),
+            "l2vpn-flowspec" => Ok(Self::L2VpnFlowspec),
+            "ipv4-srpolicy" => Ok(Self::Ipv4Srpolicy),
+            "ipv6-srpolicy" => Ok(Self::Ipv6Srpolicy),
+            "opaque" => Ok(Self::Opaque),
+            "ls" => Ok(Self::Ls),
+            "ipv4-mup" => Ok(Self::Ipv4Mup),
+            "ipv6-mup" => Ok(Self::Ipv6Mup),
+            _ => Err(format!("invalid parameter (AfiSafiType) {}", s)),
+        }
+    }
+}
+// typedef for identity bgp-types:bgp-well-known-std-community.
+// Reserved communities within the standard community space
+// defined by RFC1997. These communities must fall within the
+// range 0x00000000 to 0xFFFFFFFF.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum BgpWellKnownStdCommunity {
+    NoExport,
+    NoAdvertise,
+    NoExportSubconfed,
+    Nopeer,
+}
+
+impl TryFrom<String> for BgpWellKnownStdCommunity {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "no_export" => Ok(Self::NoExport),
+            "no_advertise" => Ok(Self::NoAdvertise),
+            "no_export_subconfed" => Ok(Self::NoExportSubconfed),
+            "nopeer" => Ok(Self::Nopeer),
             _ => Err(format!(
-                "invalid parameter (BgpSetCommunityOptionType) {}",
+                "invalid parameter (BgpWellKnownStdCommunity) {}",
                 s
             )),
         }
     }
 }
+// typedef for typedef openconfig-types:std-regexp.
+type StdRegexp = String;
 // typedef for identity gobgp:bmp-route-monitoring-policy-type.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
@@ -549,24 +522,6 @@ impl TryFrom<String> for BmpRouteMonitoringPolicyType {
                 "invalid parameter (BmpRouteMonitoringPolicyType) {}",
                 s
             )),
-        }
-    }
-}
-// typedef for identity gobgp:mrt-type.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub enum MrtType {
-    Updates,
-    Table,
-}
-
-impl TryFrom<String> for MrtType {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
-            "updates" => Ok(Self::Updates),
-            "table" => Ok(Self::Table),
-            _ => Err(format!("invalid parameter (MrtType) {}", s)),
         }
     }
 }
@@ -596,11 +551,115 @@ impl TryFrom<String> for RpkiValidationResultType {
         }
     }
 }
+// typedef for identity gobgp:bfd-session-state.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum BfdSessionState {
+    Up,
+    Down,
+    AdminDown,
+    Init,
+}
+
+impl TryFrom<String> for BfdSessionState {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "up" => Ok(Self::Up),
+            "down" => Ok(Self::Down),
+            "admin_down" => Ok(Self::AdminDown),
+            "init" => Ok(Self::Init),
+            _ => Err(format!("invalid parameter (BfdSessionState) {}", s)),
+        }
+    }
+}
+// typedef for identity gobgp:bfd-diagnostic-code.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum BfdDiagnosticCode {
+    NoDiagnostic,
+    DetectionTimeout,
+    EchoFailed,
+    ForwardingReset,
+    PathDown,
+    ConcatenatedPathDown,
+    AdminDown,
+    ReverseConcatenatedPathDown,
+    NeighborDown,
+}
+
+impl TryFrom<String> for BfdDiagnosticCode {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "no_diagnostic" => Ok(Self::NoDiagnostic),
+            "detection_timeout" => Ok(Self::DetectionTimeout),
+            "echo_failed" => Ok(Self::EchoFailed),
+            "forwarding_reset" => Ok(Self::ForwardingReset),
+            "path_down" => Ok(Self::PathDown),
+            "concatenated_path_down" => Ok(Self::ConcatenatedPathDown),
+            "admin_down" => Ok(Self::AdminDown),
+            "reverse_concatenated_path_down" => Ok(Self::ReverseConcatenatedPathDown),
+            "neighbor_down" => Ok(Self::NeighborDown),
+            _ => Err(format!("invalid parameter (BfdDiagnosticCode) {}", s)),
+        }
+    }
+}
+// typedef for identity gobgp:mrt-type.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum MrtType {
+    Updates,
+    Table,
+}
+
+impl TryFrom<String> for MrtType {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "updates" => Ok(Self::Updates),
+            "table" => Ok(Self::Table),
+            _ => Err(format!("invalid parameter (MrtType) {}", s)),
+        }
+    }
+}
+// typedef for typedef bgp-pol:bgp-as-path-prepend-repeat.
+type BgpAsPathPrependRepeat = u8;
+// typedef for identity bgp-pol:bgp-set-community-option-type.
+// Type definition for options when setting the community
+// attribute in a policy action.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum BgpSetCommunityOptionType {
+    Add,
+    Remove,
+    Replace,
+}
+
+impl TryFrom<String> for BgpSetCommunityOptionType {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "add" => Ok(Self::Add),
+            "remove" => Ok(Self::Remove),
+            "replace" => Ok(Self::Replace),
+            _ => Err(format!(
+                "invalid parameter (BgpSetCommunityOptionType) {}",
+                s
+            )),
+        }
+    }
+}
+// typedef for typedef bgp-pol:bgp-next-hop-type.
+type BgpNextHopType = String;
+// typedef for typedef bgp-pol:bgp-set-med-type.
+type BgpSetMedType = String;
 // struct for container gobgp:state.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicNeighborState {
     // original -> gobgp:prefix
+    // gobgp:prefix's original type is inet:ip-prefix.
     pub prefix: Option<String>,
     // original -> gobgp:peer-group
     #[serde(rename = "peer-group")]
@@ -611,6 +670,7 @@ pub struct DynamicNeighborState {
 #[serde(deny_unknown_fields)]
 pub struct DynamicNeighborConfig {
     // original -> gobgp:prefix
+    // gobgp:prefix's original type is inet:ip-prefix.
     pub prefix: Option<String>,
     // original -> gobgp:peer-group
     #[serde(rename = "peer-group")]
@@ -693,7 +753,7 @@ pub struct ZebraState {
     pub mpls_label_range_size: Option<u32>,
     // original -> gobgp:software-name
     // Configure zebra software name.
-    // frr4, cumulus, frr6, frr7, frr7.2 and frr7.3 can be used.
+    // frr4, cumulus, frr6, frr7, frr7.2, frr7.3, frr7.4, frr7.5, frr8, frr8.1 can be used.
     #[serde(rename = "software-name")]
     pub software_name: Option<String>,
 }
@@ -729,7 +789,7 @@ pub struct ZebraConfig {
     pub mpls_label_range_size: Option<u32>,
     // original -> gobgp:software-name
     // Configure zebra software name.
-    // frr4, cumulus, frr6, frr7, frr7.2 and frr7.3 can be used.
+    // frr4, cumulus, frr6, frr7, frr7.2, frr7.3, frr7.4, frr7.5, frr8, frr8.1 can be used.
     #[serde(rename = "software-name")]
     pub software_name: Option<String>,
 }
@@ -754,9 +814,10 @@ pub struct MrtConfig {
     #[serde(rename = "file-name")]
     pub file_name: Option<String>,
     // original -> gobgp:table-name
+    // gobgp:table-name's original type is inet:ip-address.
     // specify the table name with route server setup.
     #[serde(rename = "table-name")]
-    pub table_name: Option<String>,
+    pub table_name: Option<std::net::IpAddr>,
     // original -> gobgp:dump-interval
     #[serde(rename = "dump-interval")]
     pub dump_interval: Option<u64>,
@@ -845,7 +906,7 @@ pub struct BmpServerState {
     // gobgp:address's original type is inet:ip-address.
     // Reference to the address of the BMP server used as
     // a key in the BMP server list.
-    pub address: Option<String>,
+    pub address: Option<std::net::IpAddr>,
     // original -> gobgp:port
     // Reference to the port of the BMP server.
     pub port: Option<u32>,
@@ -880,7 +941,7 @@ pub struct BmpServerConfig {
     // gobgp:address's original type is inet:ip-address.
     // Reference to the address of the BMP server used as
     // a key in the BMP server list.
-    pub address: Option<String>,
+    pub address: Option<std::net::IpAddr>,
     // original -> gobgp:port
     // Reference to the port of the BMP server.
     pub port: Option<u32>,
@@ -1032,7 +1093,7 @@ pub struct RpkiServerConfig {
     // gobgp:address's original type is inet:ip-address.
     // Reference to the address of the RPKI server used as
     // a key in the RPKI server list.
-    pub address: Option<String>,
+    pub address: Option<std::net::IpAddr>,
     // original -> gobgp:port
     // Reference to the port of the RPKI server.
     pub port: Option<u32>,
@@ -1181,6 +1242,10 @@ pub struct PeerGroupConfig {
     // Name of the BGP peer-group.
     #[serde(rename = "peer-group-name")]
     pub peer_group_name: Option<String>,
+    // original -> gobgp:send-software-version
+    // gobgp:send-software-version's original type is boolean.
+    #[serde(rename = "send-software-version")]
+    pub send_software_version: Option<bool>,
 }
 // struct for container bgp:peer-group.
 // List of BGP peer-groups configured on the local system -
@@ -1259,6 +1324,129 @@ pub struct PeerGroup {
     // Configure TTL Security feature.
     #[serde(rename = "ttl-security")]
     pub ttl_security: Option<TtlSecurity>,
+    // original -> gobgp:bfd
+    // Configure BFD liveness detection for this BGP neighbor.
+    pub bfd: Option<Bfd>,
+}
+// struct for container gobgp:bfd-async.
+// Counters for BFD asynchronous-mode control packets.
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BfdAsync {
+    // original -> gobgp:last-packet-transmitted
+    // Nanoseconds since the Unix epoch at which the last BFD packet was transmitted.
+    #[serde(rename = "last-packet-transmitted")]
+    pub last_packet_transmitted: Option<u64>,
+    // original -> gobgp:last-packet-received
+    // Nanoseconds since the Unix epoch at which the last BFD packet was received.
+    #[serde(rename = "last-packet-received")]
+    pub last_packet_received: Option<u64>,
+    // original -> gobgp:transmitted-packets
+    // Total number of BFD control packets transmitted.
+    #[serde(rename = "transmitted-packets")]
+    pub transmitted_packets: Option<u64>,
+    // original -> gobgp:received-packets
+    // Total number of BFD control packets received.
+    #[serde(rename = "received-packets")]
+    pub received_packets: Option<u64>,
+}
+// struct for container gobgp:state.
+// BFD configuration and operational state.
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BfdState {
+    // original -> gobgp:enabled
+    // gobgp:enabled's original type is boolean.
+    // Enable BFD liveness detection for this BGP neighbor.
+    pub enabled: Option<bool>,
+    // original -> gobgp:desired-minimum-tx-interval
+    // Desired minimum transmission interval for BFD control packets.
+    #[serde(rename = "desired-minimum-tx-interval")]
+    pub desired_minimum_tx_interval: Option<u32>,
+    // original -> gobgp:required-minimum-receive
+    // Required minimum receive interval for BFD control packets.
+    #[serde(rename = "required-minimum-receive")]
+    pub required_minimum_receive: Option<u32>,
+    // original -> gobgp:detection-multiplier
+    // Detection time multiplier.  The negotiated transmit interval
+    // multiplied by this value gives the detection time.
+    #[serde(rename = "detection-multiplier")]
+    pub detection_multiplier: Option<u8>,
+    // original -> gobgp:session-state
+    // Local view of the BFD session state.
+    #[serde(rename = "session-state")]
+    pub session_state: Option<BfdSessionState>,
+    // original -> gobgp:remote-session-state
+    // Remote view of the BFD session state.
+    #[serde(rename = "remote-session-state")]
+    pub remote_session_state: Option<BfdSessionState>,
+    // original -> gobgp:last-failure-time
+    // Nanoseconds since the Unix epoch at which the last session failure occurred.
+    #[serde(rename = "last-failure-time")]
+    pub last_failure_time: Option<u64>,
+    // original -> gobgp:failure-transitions
+    // Number of UP-to-DOWN transitions.
+    #[serde(rename = "failure-transitions")]
+    pub failure_transitions: Option<u64>,
+    // original -> gobgp:local-discriminator
+    // Unique local discriminator for this BFD session.
+    #[serde(rename = "local-discriminator")]
+    pub local_discriminator: Option<String>,
+    // original -> gobgp:remote-discriminator
+    // Discriminator received from the remote system.
+    #[serde(rename = "remote-discriminator")]
+    pub remote_discriminator: Option<String>,
+    // original -> gobgp:local-diagnostic-code
+    // Diagnostic code for the last local session failure.
+    #[serde(rename = "local-diagnostic-code")]
+    pub local_diagnostic_code: Option<BfdDiagnosticCode>,
+    // original -> gobgp:remote-diagnostic-code
+    // Diagnostic code received from the remote system.
+    #[serde(rename = "remote-diagnostic-code")]
+    pub remote_diagnostic_code: Option<BfdDiagnosticCode>,
+    // original -> gobgp:remote-minimum-receive-interval
+    // Required minimum receive interval advertised by the remote system.
+    #[serde(rename = "remote-minimum-receive-interval")]
+    pub remote_minimum_receive_interval: Option<u32>,
+    // original -> gobgp:bfd-async
+    // Counters for BFD asynchronous-mode control packets.
+    #[serde(rename = "bfd-async")]
+    pub bfd_async: Option<BfdAsync>,
+}
+// struct for container gobgp:config.
+// BFD configuration parameters.
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BfdConfig {
+    // original -> gobgp:enabled
+    // gobgp:enabled's original type is boolean.
+    // Enable BFD liveness detection for this BGP neighbor.
+    pub enabled: Option<bool>,
+    // original -> gobgp:desired-minimum-tx-interval
+    // Desired minimum transmission interval for BFD control packets.
+    #[serde(rename = "desired-minimum-tx-interval")]
+    pub desired_minimum_tx_interval: Option<u32>,
+    // original -> gobgp:required-minimum-receive
+    // Required minimum receive interval for BFD control packets.
+    #[serde(rename = "required-minimum-receive")]
+    pub required_minimum_receive: Option<u32>,
+    // original -> gobgp:detection-multiplier
+    // Detection time multiplier.  The negotiated transmit interval
+    // multiplied by this value gives the detection time.
+    #[serde(rename = "detection-multiplier")]
+    pub detection_multiplier: Option<u8>,
+}
+// struct for container gobgp:bfd.
+// Configure BFD liveness detection for this BGP neighbor.
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Bfd {
+    // original -> gobgp:bfd-config
+    // BFD configuration parameters.
+    pub config: Option<BfdConfig>,
+    // original -> gobgp:bfd-state
+    // BFD configuration and operational state.
+    pub state: Option<BfdState>,
 }
 // struct for container gobgp:state.
 // State information for TTL Security.
@@ -1430,6 +1618,14 @@ pub struct AsPathOptionsState {
     // with the local autonomous system number.
     #[serde(rename = "replace-peer-as")]
     pub replace_peer_as: Option<bool>,
+    // original -> gobgp:allow-as-path-loop-local
+    // gobgp:allow-as-path-loop-local's original type is boolean.
+    // Bypasses as-path loop detection on locally sourced (static) routes
+    // when exporting towards iBGP neighbors. This is needed in some environments
+    // where gobgp is functioning as a route injector. Non-local routes
+    // are still checked for as-path loops.
+    #[serde(rename = "allow-as-path-loop-local")]
+    pub allow_as_path_loop_local: Option<bool>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to AS_PATH manipulation
@@ -1448,6 +1644,14 @@ pub struct AsPathOptionsConfig {
     // with the local autonomous system number.
     #[serde(rename = "replace-peer-as")]
     pub replace_peer_as: Option<bool>,
+    // original -> gobgp:allow-as-path-loop-local
+    // gobgp:allow-as-path-loop-local's original type is boolean.
+    // Bypasses as-path loop detection on locally sourced (static) routes
+    // when exporting towards iBGP neighbors. This is needed in some environments
+    // where gobgp is functioning as a route injector. Non-local routes
+    // are still checked for as-path loops.
+    #[serde(rename = "allow-as-path-loop-local")]
+    pub allow_as_path_loop_local: Option<bool>,
 }
 // struct for container bgp:as-path-options.
 // AS_PATH manipulation parameters for the BGP neighbor or
@@ -1484,7 +1688,7 @@ pub struct RouteReflectorState {
     pub route_reflector_client: Option<bool>,
 }
 // struct for container bgp:config.
-// Configuration parameters relating to route reflection
+// Configuraton parameters relating to route reflection
 // for the BGP neighbor or group.
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
@@ -1508,7 +1712,7 @@ pub struct RouteReflectorConfig {
 #[serde(deny_unknown_fields)]
 pub struct RouteReflector {
     // original -> bgp:route-reflector-config
-    // Configuration parameters relating to route reflection
+    // Configuraton parameters relating to route reflection
     // for the BGP neighbor or group.
     pub config: Option<RouteReflectorConfig>,
     // original -> bgp:route-reflector-state
@@ -1699,7 +1903,7 @@ pub struct TransportState {
     // Remote address to which the BGP session has been
     // established.
     #[serde(rename = "remote-address")]
-    pub remote_address: Option<String>,
+    pub remote_address: Option<std::net::IpAddr>,
     // original -> bgp-op:remote-port
     // bgp-op:remote-port's original type is inet:port-number.
     // Remote port being used by the peer for the TCP session
@@ -1737,17 +1941,23 @@ pub struct TransportConfig {
     // to the name of an interface.
     #[serde(rename = "local-address")]
     pub local_address: Option<String>,
+    // original -> gobgp:local-port
+    // gobgp:local-port's original type is inet:port-number.
+    // Set the local port (if available) to use for the session.
+    #[serde(rename = "local-port")]
+    pub local_port: Option<u16>,
     // original -> gobgp:remote-port
     // gobgp:remote-port's original type is inet:port-number.
     #[serde(rename = "remote-port")]
     pub remote_port: Option<u16>,
-    // original -> gobgp:ttl
-    // TTL value for BGP packets.
-    pub ttl: Option<u8>,
     // original -> gobgp:bind-interface
     // Interface name for binding.
     #[serde(rename = "bind-interface")]
     pub bind_interface: Option<String>,
+    // original -> gobgp:ip-tos
+    // IPv4 Type of Service/IPv6 Traffic Class value set on BGP TCP socket.
+    #[serde(rename = "ip-tos")]
+    pub ip_tos: Option<u8>,
 }
 // struct for container bgp:transport.
 // Transport session parameters for the BGP neighbor or group.
@@ -2075,7 +2285,7 @@ pub struct NeighborState {
     // bgp:neighbor-address's original type is inet:ip-address.
     // Address of the BGP peer, either in IPv4 or IPv6.
     #[serde(rename = "neighbor-address")]
-    pub neighbor_address: Option<String>,
+    pub neighbor_address: Option<std::net::IpAddr>,
     // original -> bgp-op:session-state
     // Operational state of the BGP peer.
     #[serde(rename = "session-state")]
@@ -2128,8 +2338,9 @@ pub struct NeighborState {
     // original -> gobgp:vrf
     pub vrf: Option<String>,
     // original -> gobgp:remote-router-id
+    // gobgp:remote-router-id's original type is inet:ipv4-address.
     #[serde(rename = "remote-router-id")]
-    pub remote_router_id: Option<String>,
+    pub remote_router_id: Option<std::net::Ipv4Addr>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to the BGP neighbor or
@@ -2187,7 +2398,7 @@ pub struct NeighborConfig {
     // bgp:neighbor-address's original type is inet:ip-address.
     // Address of the BGP peer, either in IPv4 or IPv6.
     #[serde(rename = "neighbor-address")]
-    pub neighbor_address: Option<String>,
+    pub neighbor_address: Option<std::net::IpAddr>,
     // original -> gobgp:admin-down
     // gobgp:admin-down's original type is boolean.
     // The config of administrative operation. If state, indicates the neighbor is disabled by the administrator.
@@ -2198,6 +2409,10 @@ pub struct NeighborConfig {
     pub neighbor_interface: Option<String>,
     // original -> gobgp:vrf
     pub vrf: Option<String>,
+    // original -> gobgp:send-software-version
+    // gobgp:send-software-version's original type is boolean.
+    #[serde(rename = "send-software-version")]
+    pub send_software_version: Option<bool>,
 }
 // struct for container bgp:neighbor.
 // List of BGP neighbors configured on the local system,
@@ -2276,6 +2491,9 @@ pub struct Neighbor {
     // Configure TTL Security feature.
     #[serde(rename = "ttl-security")]
     pub ttl_security: Option<TtlSecurity>,
+    // original -> gobgp:bfd
+    // Configure BFD liveness detection for this BGP neighbor.
+    pub bfd: Option<Bfd>,
 }
 // struct for container gobgp:state.
 #[derive(Deserialize, Debug, Default)]
@@ -2293,6 +2511,9 @@ pub struct LongLivedGracefulRestartState {
     // original -> gobgp:peer-restart-time
     #[serde(rename = "peer-restart-time")]
     pub peer_restart_time: Option<u32>,
+    // original -> gobgp:running
+    // gobgp:running's original type is boolean.
+    pub running: Option<bool>,
     // original -> gobgp:peer-restart-timer-expired
     // gobgp:peer-restart-timer-expired's original type is boolean.
     #[serde(rename = "peer-restart-timer-expired")]
@@ -2613,17 +2834,6 @@ pub struct ApplyPolicyState {
     // in the export policy chain is satisfied.
     #[serde(rename = "default-export-policy")]
     pub default_export_policy: Option<DefaultPolicyType>,
-    // original -> gobgp:in-policy
-    // list of policy names in sequence to be applied on
-    // sending a routing update in the current context, e.g.,
-    // for the current other route server clients.
-    #[serde(rename = "in-policy-list")]
-    pub in_policy_list: Option<Vec<String>>,
-    // original -> gobgp:default-in-policy
-    // explicitly set a default policy if no policy definition
-    // in the in-policy chain is satisfied.
-    #[serde(rename = "default-in-policy")]
-    pub default_in_policy: Option<DefaultPolicyType>,
 }
 // struct for container rpol:config.
 // Policy configuration data.
@@ -2654,17 +2864,6 @@ pub struct ApplyPolicyConfig {
     // in the export policy chain is satisfied.
     #[serde(rename = "default-export-policy")]
     pub default_export_policy: Option<DefaultPolicyType>,
-    // original -> gobgp:in-policy
-    // list of policy names in sequence to be applied on
-    // sending a routing update in the current context, e.g.,
-    // for the current other route server clients.
-    #[serde(rename = "in-policy-list")]
-    pub in_policy_list: Option<Vec<String>>,
-    // original -> gobgp:default-in-policy
-    // explicitly set a default policy if no policy definition
-    // in the in-policy chain is satisfied.
-    #[serde(rename = "default-in-policy")]
-    pub default_in_policy: Option<DefaultPolicyType>,
 }
 // struct for container rpol:apply-policy.
 // Anchor point for routing policies in the model.
@@ -2751,6 +2950,9 @@ pub struct MpGracefulRestartState {
     // gobgp:end-of-rib-sent's original type is boolean.
     #[serde(rename = "end-of-rib-sent")]
     pub end_of_rib_sent: Option<bool>,
+    // original -> gobgp:running
+    // gobgp:running's original type is boolean.
+    pub running: Option<bool>,
 }
 // struct for container bgp-mp:config.
 // Configuration options for BGP graceful-restart.
@@ -2922,7 +3124,7 @@ pub struct GracefulRestartState {
     #[serde(rename = "local-restarting")]
     pub local_restarting: Option<bool>,
     // original -> bgp-op:mode
-    // This leaf indicates the mode of operation of BGP graceful
+    // Ths leaf indicates the mode of operation of BGP graceful
     // restart with the peer.
     pub mode: Option<Mode>,
     // original -> gobgp:deferral-time
@@ -3358,7 +3560,7 @@ pub struct GlobalState {
     // Router id of the router, expressed as an
     // 32-bit value, IPv4 address.
     #[serde(rename = "router-id")]
-    pub router_id: Option<String>,
+    pub router_id: Option<std::net::Ipv4Addr>,
     // original -> bgp-op:total-paths
     // Total number of BGP paths within the context.
     #[serde(rename = "total-paths")]
@@ -3370,8 +3572,9 @@ pub struct GlobalState {
     // original -> gobgp:port
     pub port: Option<i32>,
     // original -> gobgp:local-address
+    // original type is list of inet:ip-address
     #[serde(rename = "local-address-list")]
-    pub local_address_list: Option<Vec<String>>,
+    pub local_address_list: Option<Vec<std::net::IpAddr>>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to the global BGP router.
@@ -3388,12 +3591,13 @@ pub struct GlobalConfig {
     // Router id of the router, expressed as an
     // 32-bit value, IPv4 address.
     #[serde(rename = "router-id")]
-    pub router_id: Option<String>,
+    pub router_id: Option<std::net::Ipv4Addr>,
     // original -> gobgp:port
     pub port: Option<i32>,
     // original -> gobgp:local-address
+    // original type is list of inet:ip-address
     #[serde(rename = "local-address-list")]
-    pub local_address_list: Option<Vec<String>>,
+    pub local_address_list: Option<Vec<std::net::IpAddr>>,
 }
 // struct for container bgp:global.
 // Global configuration for the BGP router.
@@ -3785,7 +3989,7 @@ pub struct BgpConditions {
     // List of next hop addresses to check for in the route
     // update.
     #[serde(rename = "next-hop-in-list")]
-    pub next_hop_in_list: Option<Vec<String>>,
+    pub next_hop_in_list: Option<Vec<std::net::IpAddr>>,
     // original -> bgp-pol:afi-safi-in
     // List of address families which the NLRI may be
     // within.
@@ -4077,7 +4281,6 @@ pub struct NeighborSet {
     #[serde(rename = "neighbor-set-name")]
     pub neighbor_set_name: Option<String>,
     // original -> gobgp:neighbor-info
-    // original type is list of inet:ip-address
     // neighbor ip address or prefix.
     #[serde(rename = "neighbor-info-list")]
     pub neighbor_info_list: Option<Vec<String>>,

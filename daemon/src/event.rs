@@ -629,19 +629,16 @@ impl TryFrom<&config::Neighbor> for Peer {
             })
             .collect();
 
-        let addr_str = c
+        let addr = c
             .neighbor_address
             .as_ref()
             .ok_or("missing neighbor address")?;
-        let addr = addr_str
-            .parse()
-            .map_err(|e| format!("invalid neighbor address: {}", e))?;
         let peer_as = c.peer_as.ok_or("missing peer-as")?;
 
         let transport_config = n.transport.as_ref().and_then(|t| t.config.as_ref());
         let timer_config = n.timers.as_ref().and_then(|t| t.config.as_ref());
 
-        let mut builder = PeerBuilder::new(addr);
+        let mut builder = PeerBuilder::new(*addr);
         builder
             .local_asn(c.local_as.unwrap_or(0))
             .remote_asn(peer_as)
@@ -2468,20 +2465,20 @@ impl RpkiClient {
                     };
                     state.update(&msg);
                     match msg {
-                        rpki::Message::IpPrefix(prefix) => {
-                            if prefix.flags & 1 > 0 {
-                                let roa = Arc::new(table::Roa::new(prefix.max_length, prefix.as_number, remote_addr.clone()));
-                                if end_of_data {
-                                    for i in 0..*NUM_TABLES {
-                                        let mut t = TABLE[i].lock().await;
-                                        t.event(TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())]));
-                                    }
-                                } else {
-                                    v.push((
-                                        prefix.net,
-                                        roa,
-                                    ));
+                        rpki::Message::IpPrefix(prefix)
+                            if prefix.flags & 1 > 0 =>
+                        {
+                            let roa = Arc::new(table::Roa::new(prefix.max_length, prefix.as_number, remote_addr.clone()));
+                            if end_of_data {
+                                for i in 0..*NUM_TABLES {
+                                    let mut t = TABLE[i].lock().await;
+                                    t.event(TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())]));
                                 }
+                            } else {
+                                v.push((
+                                    prefix.net,
+                                    roa,
+                                ));
                             }
                         }
                         rpki::Message::EndOfData { serial_number } => {
@@ -2791,7 +2788,7 @@ impl Global {
             .unwrap_or_default();
         let router_id =
             if let Some(router_id) = global_config.as_ref().and_then(|x| x.router_id.as_ref()) {
-                router_id.parse().unwrap()
+                *router_id
             } else {
                 Ipv4Addr::new(0, 0, 0, 0)
             };
@@ -2928,10 +2925,8 @@ impl Global {
             let mut server = GLOBAL.write().await;
             for s in bmp_servers {
                 let config = s.config.as_ref().unwrap();
-                let sockaddr = SocketAddr::new(
-                    config.address.as_ref().unwrap().parse().unwrap(),
-                    config.port.unwrap() as u16,
-                );
+                let sockaddr =
+                    SocketAddr::new(config.address.unwrap(), config.port.unwrap() as u16);
                 match server.bmp_clients.entry(sockaddr) {
                     Occupied(_) => {
                         panic!("duplicated bmp server {}", sockaddr);

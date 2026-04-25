@@ -142,7 +142,7 @@ def emit_class_def(ctx, stmt, struct_name, prefix, fd):
     emit_description(stmt, fd)
     print('#[derive(Deserialize, Debug, Default)]')
     print('#[serde(deny_unknown_fields)]')
-    print('pub(crate) struct %s {' % convert_to_golang(struct_name), file=fd)
+    print('pub struct %s {' % convert_to_golang(struct_name), file=fd)
 
     equal_elems = []
 
@@ -282,7 +282,7 @@ def emit_class_def(ctx, stmt, struct_name, prefix, fd):
 
         if tag_name == 'as':
             tag_name = 'r#as'
-        print('pub(crate) {0}:Option<{1}>,'.format(tag_name.replace('-', '_'), emit_type_name), file=fd)
+        print('pub {0}:Option<{1}>,'.format(tag_name.replace('-', '_'), emit_type_name), file=fd)
 
         equal_elems.append((val_name_go, emit_type_name, equal_type, equal_data))
 
@@ -477,7 +477,7 @@ def emit_enum(prefix, name, stmt, substmts, fd):
     const_prefix = convert_const_prefix(type_name_org)
     print('#[derive(Deserialize, Debug, PartialEq)]')
     print('#[serde(try_from = "String")]')
-    print('pub(crate) enum %s {' % type_name, file=fd)
+    print('pub enum %s {' % type_name, file=fd)
     m = {}
 
     if is_choice(stmt) and is_enum_choice(stmt):
@@ -661,9 +661,9 @@ _type_translation_map = {
     'decimal64': 'f64',
     'boolean': 'bool',
     'empty': 'bool',
-    'inet:ip-address': 'String',
+    'inet:ip-address': 'std::net::IpAddr',
     'inet:ip-prefix': 'String',
-    'inet:ipv4-address': 'String',
+    'inet:ipv4-address': 'std::net::Ipv4Addr',
     'inet:as-number': 'u32',
     'bgp-set-community-option-type': 'String',
     'inet:port-number': 'u16',

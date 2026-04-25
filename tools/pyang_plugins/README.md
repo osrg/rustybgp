@@ -5,7 +5,7 @@ This is a pyang plugin to generate config/gen.rs from
 
 ## How to use
 
-You must use Python 2.7 versions. Set the environment variables for this tool:
+You must use Python 3 versions. Set the environment variables for this tool:
 
 ```bash
 $ SOURCE=$HOME/git
@@ -38,8 +38,8 @@ $ PYTHONPATH=. ./bin/pyang \
 -p $SOURCE/public/release/models/bgp \
 -p $SOURCE/public/release/models/policy \
 -f rust \
-$SOURCE/public/release/models/bgp/openconfig-bgp.yang \
 $SOURCE/public/release/models/policy/openconfig-routing-policy.yang \
+$SOURCE/public/release/models/bgp/openconfig-bgp.yang \
 $RUSTYBGP/tools/pyang_plugins/gobgp.yang > \
-$RUSTYBGP/daemon/src/config/gen.rs
+$RUSTYBGP/config/src/generate.rs
 ```

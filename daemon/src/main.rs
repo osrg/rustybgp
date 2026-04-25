@@ -27,7 +27,6 @@ mod proto;
 
 use clap::{Arg, Command};
 use std::net::Ipv4Addr;
-use std::str::FromStr;
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
@@ -70,9 +69,8 @@ async fn main() -> Result<(), std::io::Error> {
         } else {
             0
         };
-        let router_id = if let Some(id) = args.get_one::<String>("id") {
-            Ipv4Addr::from_str(id).unwrap();
-            Some(id.to_string())
+        let router_id = if let Some(id) = args.get_one::<Ipv4Addr>("id") {
+            Some(*id)
         } else {
             if as_number != 0 {
                 panic!("both as number and router-id must be specified");

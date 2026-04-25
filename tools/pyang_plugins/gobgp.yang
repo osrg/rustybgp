@@ -169,6 +169,20 @@ module gobgp {
     reference "RFC7752";
   }
 
+  identity IPV4-MUP {
+    base bgp-types:afi-safi-type;
+    description
+      "MUP IPv4 (AFI,SAFI = 1,85)";
+    reference "https://www.ietf.org/archive/id/draft-mpmz-bess-mup-safi-01.html";
+  }
+
+  identity IPV6-MUP {
+    base bgp-types:afi-safi-type;
+    description
+      "MUP IPv6 (AFI,SAFI = 2,85)";
+    reference "https://www.ietf.org/archive/id/draft-mpmz-bess-mup-safi-01.html";
+  }
+
   grouping gobgp-message-counter {
     description
       "Counters for all BGPMessage types";
@@ -282,31 +296,6 @@ module gobgp {
     }
   }
 
-
-  grouping gobgp-in-policy {
-    description
-      "additional policy";
-
-    leaf-list in-policy {
-      type leafref {
-        path "/rpol:routing-policy/rpol:policy-definitions/" +
-            "rpol:policy-definition/rpol:name";
-        //require-instance true;
-      }
-      description
-        "list of policy names in sequence to be applied on
-        sending a routing update in the current context, e.g.,
-        for the current other route server clients.";
-    }
-
-    leaf default-in-policy {
-      type rpol:default-policy-type;
-      default REJECT-ROUTE;
-      description
-        "explicitly set a default policy if no policy definition
-        in the in-policy chain is satisfied.";
-    }
-  }
 
   grouping gobgp-route-server-config {
     description
@@ -768,11 +757,210 @@ module gobgp {
 	      leaf peer-restart-time {
 		  type uint32;
 	      }
+        leaf running {
+          type boolean;
+        }
 	      leaf peer-restart-timer-expired {
-		  type boolean;
+		      type boolean;
 	      }
 	  }
       }
+  }
+
+  typedef bfd-session-state {
+    type enumeration {
+      enum UP {
+        description "BFD session is up.";
+      }
+      enum DOWN {
+        description "BFD session is down.";
+      }
+      enum ADMIN_DOWN {
+        description "BFD session is administratively down.";
+      }
+      enum INIT {
+        description "BFD session is in the INIT state.";
+      }
+    }
+  }
+
+  typedef bfd-diagnostic-code {
+    type enumeration {
+      enum NO_DIAGNOSTIC {
+        description "No diagnostic.";
+      }
+      enum DETECTION_TIMEOUT {
+        description "Control detection time expired.";
+      }
+      enum ECHO_FAILED {
+        description "Echo function failed.";
+      }
+      enum FORWARDING_RESET {
+        description "Neighbor signaled session down.";
+      }
+      enum PATH_DOWN {
+        description "Forwarding plane reset.";
+      }
+      enum CONCATENATED_PATH_DOWN {
+        description "Path down.";
+      }
+      enum ADMIN_DOWN {
+        description "Concatenated path down.";
+      }
+      enum REVERSE_CONCATENATED_PATH_DOWN {
+        description "Administratively down.";
+      }
+      enum NEIGHBOR_DOWN {
+        description "Reverse concatenated path down.";
+      }
+    }
+    reference "RFC 5880 §4.1";
+  }
+
+  grouping gobgp-bfd-state {
+    description
+      "Operational state leaves for a BFD session — state container only.";
+
+    leaf session-state {
+      type bfd-session-state;
+      description "Local view of the BFD session state.";
+    }
+
+    leaf remote-session-state {
+      type bfd-session-state;
+      description "Remote view of the BFD session state.";
+    }
+
+    leaf last-failure-time {
+      type uint64;
+      units nanoseconds;
+      description
+        "Nanoseconds since the Unix epoch at which the last session failure occurred.";
+    }
+
+    leaf failure-transitions {
+      type uint64;
+      description "Number of UP-to-DOWN transitions.";
+    }
+
+    leaf local-discriminator {
+      type string;
+      description "Unique local discriminator for this BFD session.";
+      reference "RFC 5880 §4.1";
+    }
+
+    leaf remote-discriminator {
+      type string;
+      description "Discriminator received from the remote system.";
+      reference "RFC 5880 §4.1";
+    }
+
+    leaf local-diagnostic-code {
+      type bfd-diagnostic-code;
+      description "Diagnostic code for the last local session failure.";
+    }
+
+    leaf remote-diagnostic-code {
+      type bfd-diagnostic-code;
+      description "Diagnostic code received from the remote system.";
+    }
+
+    leaf remote-minimum-receive-interval {
+      type uint32;
+      units microseconds;
+      description "Required minimum receive interval advertised by the remote system.";
+    }
+
+    container bfd-async {
+      description "Counters for BFD asynchronous-mode control packets.";
+
+      leaf last-packet-transmitted {
+        type uint64;
+        units nanoseconds;
+        description "Nanoseconds since the Unix epoch at which the last BFD packet was transmitted.";
+      }
+
+      leaf last-packet-received {
+        type uint64;
+        units nanoseconds;
+        description "Nanoseconds since the Unix epoch at which the last BFD packet was received.";
+      }
+
+      leaf transmitted-packets {
+        type uint64;
+        description "Total number of BFD control packets transmitted.";
+      }
+
+      leaf received-packets {
+        type uint64;
+        description "Total number of BFD control packets received.";
+      }
+    }
+  }
+
+  grouping gobgp-bfd-config {
+    description
+      "Per-neighbor BFD session parameters (RFC 5880).";
+
+    leaf enabled {
+      type boolean;
+      default "false";
+      description
+        "Enable BFD liveness detection for this BGP neighbor.";
+    }
+
+    leaf desired-minimum-tx-interval {
+      type uint32;
+      units microseconds;
+      default 1000000;
+      description
+        "Desired minimum transmission interval for BFD control packets.";
+      reference "RFC 5880 §6.8.7";
+    }
+
+    leaf required-minimum-receive {
+      type uint32;
+      units microseconds;
+      default 1000000;
+      description
+        "Required minimum receive interval for BFD control packets.";
+      reference "RFC 5880 §6.8.8";
+    }
+
+    leaf detection-multiplier {
+      type uint8 {
+        range "1..255";
+      }
+      default 3;
+      description
+        "Detection time multiplier.  The negotiated transmit interval
+        multiplied by this value gives the detection time.";
+      reference "RFC 5880 §6.8.5";
+    }
+  }
+
+  grouping gobgp-bfd-config-set {
+    description
+      "BFD configuration and state for a BGP neighbor or peer-group.";
+
+    container bfd {
+      description
+        "Configure BFD liveness detection for this BGP neighbor.";
+
+      container config {
+        description
+          "BFD configuration parameters.";
+        uses gobgp-bfd-config;
+      }
+
+      container state {
+        config false;
+        description
+          "BFD configuration and operational state.";
+        uses gobgp-bfd-config;
+        uses gobgp-bfd-state;
+      }
+    }
   }
 
   grouping gobgp-ttl-security-config {
@@ -921,23 +1109,28 @@ module gobgp {
 
   augment "/bgp:bgp/bgp:neighbors/bgp:neighbor/bgp:state" {
     leaf remote-router-id {
-        type string;
+        type inet:ipv4-address;
     }
   }
 
   augment "/bgp:bgp/bgp:neighbors/bgp:neighbor/bgp:transport/bgp:config" {
-    leaf remote-port {
+    leaf local-port {
+      description "Set the local port (if available) to use for the session.";
       type inet:port-number;
     }
 
-    leaf ttl {
-      description "TTL value for BGP packets";
-      type uint8;
+    leaf remote-port {
+      type inet:port-number;
     }
 
     leaf bind-interface {
       description "Interface name for binding.";
       type string;
+    }
+
+    leaf ip-tos {
+      description "IPv4 Type of Service/IPv6 Traffic Class value set on BGP TCP socket.";
+      type uint8;
     }
   }
 
@@ -958,6 +1151,9 @@ module gobgp {
       type boolean;
     }
     leaf end-of-rib-sent {
+      type boolean;
+    }
+    leaf running {
       type boolean;
     }
   }
@@ -988,6 +1184,18 @@ module gobgp {
     }
   }
 
+  augment "/bgp:bgp/bgp:neighbors/bgp:neighbor/bgp:config" {
+    leaf send-software-version {
+      type boolean;
+    }
+  }
+
+  augment "/bgp:bgp/bgp:peer-groups/bgp:peer-group/bgp:config" {
+    leaf send-software-version {
+      type boolean;
+    }
+  }
+
   augment "/bgp:bgp/bgp:peer-groups/bgp:peer-group" {
     description "route server configuration for peer-group";
     uses gobgp-route-server-config-set;
@@ -1008,16 +1216,14 @@ module gobgp {
     uses gobgp-ttl-security-config-set;
    }
 
-  augment "/bgp:bgp/bgp:global/bgp:apply-policy/bgp:config" {
-    description "addtional policy";
-    uses gobgp-in-policy;
-
+  augment "/bgp:bgp/bgp:peer-groups/bgp:peer-group" {
+    description "BFD configuration for peer-group";
+    uses gobgp-bfd-config-set;
   }
 
-  augment "/bgp:bgp/bgp:global/bgp:apply-policy/bgp:state" {
-    description "additional policy";
-    uses gobgp-in-policy;
-
+  augment "/bgp:bgp/bgp:neighbors/bgp:neighbor" {
+    description "BFD configuration for neighbor";
+    uses gobgp-bfd-config-set;
   }
 
   augment "/rpol:routing-policy/rpol:policy-definitions/" +
@@ -1044,7 +1250,7 @@ module gobgp {
     leaf-list neighbor-info {
       description
             "neighbor ip address or prefix";
-      type inet:ip-address;
+      type string;
     }
   }
 
@@ -1193,7 +1399,7 @@ module gobgp {
           "Configures a file name to be written";
       }
       leaf table-name {
-        type string;
+        type inet:ip-address;
         description
           "specify the table name with route server setup";
       }
@@ -1262,7 +1468,7 @@ module gobgp {
       type string;
       description
         "Configure zebra software name.
-        frr4, cumulus, frr6, frr7, frr7.2 and frr7.3 can be used.";
+        frr4, cumulus, frr6, frr7, frr7.2, frr7.3, frr7.4, frr7.5, frr8, frr8.1 can be used.";
     }
   }
 
@@ -1313,7 +1519,7 @@ module gobgp {
         type int32;
     }
     leaf-list local-address {
-        type string;
+        type inet:ip-address;
     }
   }
 
@@ -1353,7 +1559,7 @@ module gobgp {
      This configuration structure was taken from the latest openconfig.";
 
     leaf prefix {
-      type string;
+      type inet:ip-prefix;
     }
     leaf peer-group {
       type string;
@@ -1425,6 +1631,28 @@ module gobgp {
       container state {
           uses bgp:bgp-neighbor-add-paths_config;
       }
+    }
+  }
+
+  augment "/bgp:bgp/bgp:neighbors/bgp:neighbor/bgp:as-path-options/bgp:config" {
+    leaf allow-as-path-loop-local {
+      type boolean;
+      description
+        "Bypasses as-path loop detection on locally sourced (static) routes
+        when exporting towards iBGP neighbors. This is needed in some environments
+        where gobgp is functioning as a route injector. Non-local routes
+        are still checked for as-path loops.";
+    }
+  }
+
+  augment "/bgp:bgp/bgp:neighbors/bgp:neighbor/bgp:as-path-options/bgp:state" {
+    leaf allow-as-path-loop-local {
+      type boolean;
+      description
+        "Bypasses as-path loop detection on locally sourced (static) routes
+        when exporting towards iBGP neighbors. This is needed in some environments
+        where gobgp is functioning as a route injector. Non-local routes
+        are still checked for as-path loops.";
     }
   }
 }
