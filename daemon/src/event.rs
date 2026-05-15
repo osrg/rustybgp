@@ -149,6 +149,17 @@ struct PeerState {
 #[derive(Default)]
 struct CloseTx(Option<tokio::sync::oneshot::Sender<bgp::Message>>);
 
+/// Cancellation handle for the active-connect retry task.
+/// Cloning produces `None`; dropping the inner `Sender` signals the task to exit.
+#[derive(Default)]
+struct ActiveConnectCancel(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Clone for ActiveConnectCancel {
+    fn clone(&self) -> Self {
+        ActiveConnectCancel(None)
+    }
+}
+
 impl Clone for CloseTx {
     fn clone(&self) -> Self {
         CloseTx(None)
@@ -157,10 +168,6 @@ impl Clone for CloseTx {
 
 #[derive(Clone)]
 struct Peer {
-    /// if a peer was removed and created again quickly,
-    /// we could run multiple tasks for active connection
-    configured_time: u64,
-
     remote_addr: IpAddr,
     remote_port: u16,
     local_asn: u32,
@@ -199,9 +206,9 @@ struct Peer {
     /// only known in `Global` but not at `Peer` construction time
     /// (`PeerBuilder::build`). It is always `Some` after `Global::add_peer`.
     peer_fsm: Option<Arc<std::sync::Mutex<crate::fsm::PeerFsm>>>,
-    /// Set by StopActiveConnect (passive reached OpenConfirm); causes the
-    /// active connection retry loop to exit at its next iteration.
-    stop_active_connect: bool,
+    /// Cancels the active-connect retry loop spawned by `enable_active_connect`.
+    /// Dropping the inner sender signals the task to exit.
+    active_connect_cancel_tx: ActiveConnectCancel,
     /// One-shot channels used by the collision winner to deliver a CEASE
     /// Notification to the losing Handler. Each is consumed at most once.
     active_close_tx: CloseTx,
@@ -233,7 +240,7 @@ impl Peer {
             .fsm
             .store(SessionState::Idle as u8, Ordering::Relaxed);
         self.route_stats = FnvHashMap::default();
-        self.stop_active_connect = false;
+        self.active_connect_cancel_tx = ActiveConnectCancel::default();
         self.active_close_tx = CloseTx::default();
         self.passive_close_tx = CloseTx::default();
     }
@@ -419,10 +426,6 @@ impl PeerBuilder {
         }
         Peer {
             remote_addr: self.remote_addr,
-            configured_time: SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
             remote_port: if self.remote_port != 0 {
                 self.remote_port
             } else {
@@ -455,7 +458,7 @@ impl PeerBuilder {
             send_max: std::mem::take(&mut self.send_max),
             prefix_limits: std::mem::take(&mut self.prefix_limits),
             peer_fsm: None,
-            stop_active_connect: false,
+            active_connect_cancel_tx: ActiveConnectCancel::default(),
             active_close_tx: CloseTx::default(),
             passive_close_tx: CloseTx::default(),
         }
@@ -916,7 +919,7 @@ impl GoBgpService for GrpcService {
                 auth::set_md5sig(*fd, &peer.remote_addr, password);
             }
         }
-        global.add_peer(peer, Some(self.active_conn_tx.clone()), self.global.clone())?;
+        global.add_peer(peer, Some(self.active_conn_tx.clone()))?;
         Ok(tonic::Response::new(api::AddPeerResponse {}))
     }
     async fn delete_peer(
@@ -1031,8 +1034,7 @@ impl GoBgpService for GrpcService {
                 if addr == &peer_addr {
                     if p.admin_down {
                         p.admin_down = false;
-                        p.stop_active_connect = false;
-                        enable_active_connect(p, self.active_conn_tx.clone(), self.global.clone());
+                        enable_active_connect(p, self.active_conn_tx.clone());
                         return Ok(tonic::Response::new(api::EnablePeerResponse {}));
                     } else {
                         return Err(tonic::Status::new(
@@ -1066,6 +1068,7 @@ impl GoBgpService for GrpcService {
                         ));
                     } else {
                         p.admin_down = true;
+                        p.active_connect_cancel_tx.0.take();
                         let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
                             code: 6,
                             subcode: 2,
@@ -2020,16 +2023,16 @@ enum ToPeerEvent {
     Advertise(table::Change),
 }
 
-fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>, global: GlobalHandle) {
+fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) {
     if peer.admin_down || peer.passive || peer.delete_on_disconnected {
         return;
     }
     let peer_addr = peer.remote_addr;
-    let remote_port = peer.remote_port;
-    let configured_time = peer.configured_time;
-    let sockaddr = std::net::SocketAddr::new(peer_addr, remote_port);
+    let sockaddr = std::net::SocketAddr::new(peer_addr, peer.remote_port);
     let retry_time = peer.connect_retry_time;
     let password = peer.password.as_ref().map(|x| x.to_string());
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    peer.active_connect_cancel_tx = ActiveConnectCancel(Some(cancel_tx));
     tokio::spawn(async move {
         loop {
             let socket = match peer_addr {
@@ -2039,28 +2042,21 @@ fn enable_active_connect(peer: &Peer, ch: mpsc::UnboundedSender<TcpStream>, glob
             if let Some(key) = password.as_ref() {
                 auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key);
             }
-            if let Ok(Ok(stream)) = tokio::time::timeout(
-                tokio::time::Duration::from_secs(5),
-                socket.connect(sockaddr),
-            )
-            .await
-            {
-                let _ = ch.send(stream);
-                return;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(retry_time)).await;
-            {
-                let server = global.write().await;
-                if let Some(peer) = server.peers.get(&peer_addr) {
-                    if peer.configured_time != configured_time
-                        || peer.active_close_tx.0.is_some()
-                        || peer.stop_active_connect
-                    {
+            tokio::select! {
+                result = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    socket.connect(sockaddr),
+                ) => {
+                    if let Ok(Ok(stream)) = result {
+                        let _ = ch.send(stream);
                         return;
                     }
-                } else {
-                    return;
                 }
+                _ = &mut cancel_rx => return,
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(retry_time)) => {}
+                _ = &mut cancel_rx => return,
             }
         }
     });
@@ -2689,7 +2685,6 @@ impl Global {
         &mut self,
         mut peer: Peer,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
-        global: GlobalHandle,
     ) -> std::result::Result<(), Error> {
         if self.peers.contains_key(&peer.remote_addr) {
             return Err(Error::AlreadyExists(
@@ -2721,7 +2716,7 @@ impl Global {
                 .store(SessionState::Connect as u8, Ordering::Relaxed);
         }
         if let Some(tx) = tx {
-            enable_active_connect(&peer, tx, global);
+            enable_active_connect(&mut peer, tx);
         }
         self.peers.insert(peer.remote_addr, peer);
         Ok(())
@@ -2795,7 +2790,7 @@ impl Global {
                 if let Some(holdtime) = holdtime {
                     builder.holdtime(holdtime);
                 }
-                let _ = self.add_peer(builder.build(), None, global.clone());
+                let _ = self.add_peer(builder.build(), None);
                 self.peers.get_mut(&remote_addr).unwrap()
             }
         };
@@ -3106,9 +3101,7 @@ impl Global {
             for p in peers {
                 match Peer::try_from(p) {
                     Ok(peer) => {
-                        if let Err(e) =
-                            server.add_peer(peer, Some(active_tx.clone()), global.clone())
-                        {
+                        if let Err(e) = server.add_peer(peer, Some(active_tx.clone())) {
                             eprintln!("failed to add peer from config: {}", e);
                         }
                     }
@@ -3570,7 +3563,7 @@ fn peer_loop(
                     server.peers.remove(&peer_addr);
                 } else {
                     peer.reset();
-                    enable_active_connect(peer, active_conn_tx, global.clone());
+                    enable_active_connect(peer, active_conn_tx);
                 }
             }
         }
@@ -3920,7 +3913,7 @@ impl Handler {
                 crate::fsm::PeerFsmOutput::StopActiveConnect => {
                     let mut global = self.global.write().await;
                     if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
-                        peer.stop_active_connect = true;
+                        peer.active_connect_cancel_tx.0.take();
                     }
                 }
             }
