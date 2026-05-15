@@ -2721,110 +2721,112 @@ impl Global {
         self.peers.insert(peer.remote_addr, peer);
         Ok(())
     }
+}
 
-    async fn accept_connection(
-        &mut self,
-        stream: TcpStream,
-        role: crate::fsm::Role,
-        global: GlobalHandle,
-        tables: TableHandle,
-    ) -> Option<Handler> {
-        let local_sockaddr = stream.local_addr().ok()?;
-        let remote_sockaddr = stream.peer_addr().ok()?;
-        let remote_addr = remote_sockaddr.ip();
-        let peer = match self.peers.get_mut(&remote_addr) {
-            Some(peer) => {
-                if peer.admin_down {
-                    println!(
-                        "admin down; ignore a new passive connection from {}",
-                        remote_addr
-                    );
-                    return None;
-                }
-                let already_connected = match role {
-                    crate::fsm::Role::Active => peer.active_close_tx.0.is_some(),
-                    crate::fsm::Role::Passive => peer.passive_close_tx.0.is_some(),
-                };
-                if already_connected {
-                    println!("already has {:?} connection {}", role, remote_addr);
-                    return None;
-                }
-                peer.remote_sockaddr = remote_sockaddr;
-                peer.local_sockaddr = local_sockaddr;
-                peer.state
-                    .fsm
-                    .store(SessionState::Active as u8, Ordering::Relaxed);
-                peer
+async fn accept_connection(
+    global: &GlobalHandle,
+    tables: &TableHandle,
+    stream: TcpStream,
+    role: crate::fsm::Role,
+) -> Option<Handler> {
+    let local_sockaddr = stream.local_addr().ok()?;
+    let remote_sockaddr = stream.peer_addr().ok()?;
+    let remote_addr = remote_sockaddr.ip();
+    let mut g = global.write().await;
+    let peer = match g.peers.get_mut(&remote_addr) {
+        Some(peer) => {
+            if peer.admin_down {
+                println!(
+                    "admin down; ignore a new passive connection from {}",
+                    remote_addr
+                );
+                return None;
             }
-            None => {
-                let mut is_dynamic = false;
-                let mut rs_client = false;
-                let mut remote_asn = 0;
-                let mut holdtime = None;
-                for p in &self.peer_group {
-                    for d in &p.1.dynamic_peers {
-                        if d.prefix.contains(&remote_addr) {
-                            remote_asn = p.1.as_number;
-                            is_dynamic = true;
-                            rs_client = p.1.route_server_client;
-                            holdtime = p.1.holdtime;
-                            break;
-                        }
+            let already_connected = match role {
+                crate::fsm::Role::Active => peer.active_close_tx.0.is_some(),
+                crate::fsm::Role::Passive => peer.passive_close_tx.0.is_some(),
+            };
+            if already_connected {
+                println!("already has {:?} connection {}", role, remote_addr);
+                return None;
+            }
+            peer.remote_sockaddr = remote_sockaddr;
+            peer.local_sockaddr = local_sockaddr;
+            peer.state
+                .fsm
+                .store(SessionState::Active as u8, Ordering::Relaxed);
+            peer
+        }
+        None => {
+            let mut is_dynamic = false;
+            let mut rs_client = false;
+            let mut remote_asn = 0;
+            let mut holdtime = None;
+            for p in &g.peer_group {
+                for d in &p.1.dynamic_peers {
+                    if d.prefix.contains(&remote_addr) {
+                        remote_asn = p.1.as_number;
+                        is_dynamic = true;
+                        rs_client = p.1.route_server_client;
+                        holdtime = p.1.holdtime;
+                        break;
                     }
                 }
-                if !is_dynamic {
-                    println!(
-                        "can't find configuration a new passive connection {}",
-                        remote_addr
-                    );
-                    return None;
-                }
-                let mut builder = PeerBuilder::new(remote_addr);
-                builder
-                    .state(SessionState::Active)
-                    .remote_asn(remote_asn)
-                    .delete_on_disconnected(true)
-                    .rs_client(rs_client)
-                    .remote_sockaddr(remote_sockaddr)
-                    .local_sockaddr(local_sockaddr);
-                if let Some(holdtime) = holdtime {
-                    builder.holdtime(holdtime);
-                }
-                let _ = self.add_peer(builder.build(), None);
-                self.peers.get_mut(&remote_addr).unwrap()
             }
-        };
-        if let Some(ttl) = peer.multihop_ttl {
-            if peer.state.remote_asn.load(Ordering::Relaxed) != peer.local_asn {
-                let _ = stream.set_ttl(ttl.into());
+            if !is_dynamic {
+                println!(
+                    "can't find configuration a new passive connection {}",
+                    remote_addr
+                );
+                return None;
             }
-        } else {
-            let _ = stream.set_ttl(1);
+            let mut builder = PeerBuilder::new(remote_addr);
+            builder
+                .state(SessionState::Active)
+                .remote_asn(remote_asn)
+                .delete_on_disconnected(true)
+                .rs_client(rs_client)
+                .remote_sockaddr(remote_sockaddr)
+                .local_sockaddr(local_sockaddr);
+            if let Some(holdtime) = holdtime {
+                builder.holdtime(holdtime);
+            }
+            let _ = g.add_peer(builder.build(), None);
+            g.peers.get_mut(&remote_addr).unwrap()
         }
-        let peer_fsm = Arc::clone(peer.peer_fsm.as_ref().expect("peer_fsm set in add_peer"));
-        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<bgp::Message>();
-        match role {
-            crate::fsm::Role::Active => peer.active_close_tx = CloseTx(Some(close_tx)),
-            crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx(Some(close_tx)),
+    };
+    if let Some(ttl) = peer.multihop_ttl {
+        if peer.state.remote_asn.load(Ordering::Relaxed) != peer.local_asn {
+            let _ = stream.set_ttl(ttl.into());
         }
-        Handler::new(
-            stream,
-            remote_addr,
-            peer.local_asn,
-            peer.local_cap.to_owned(),
-            peer.route_server_client,
-            role,
-            peer_fsm,
-            Some(close_rx),
-            peer.state.clone(),
-            peer.counter_tx.clone(),
-            peer.counter_rx.clone(),
-            peer.prefix_limits.clone(),
-            global,
-            tables,
-        )
+    } else {
+        let _ = stream.set_ttl(1);
     }
+    let peer_fsm = Arc::clone(peer.peer_fsm.as_ref().expect("peer_fsm set in add_peer"));
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<bgp::Message>();
+    match role {
+        crate::fsm::Role::Active => peer.active_close_tx = CloseTx(Some(close_tx)),
+        crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx(Some(close_tx)),
+    }
+    Handler::new(
+        stream,
+        remote_addr,
+        peer.local_asn,
+        peer.local_cap.to_owned(),
+        peer.route_server_client,
+        role,
+        peer_fsm,
+        Some(close_rx),
+        peer.state.clone(),
+        peer.counter_tx.clone(),
+        peer.counter_rx.clone(),
+        peer.prefix_limits.clone(),
+        global.clone(),
+        tables.clone(),
+    )
+}
 
+impl Global {
     async fn serve(
         bgp: Option<config::BgpConfig>,
         any_peer: bool,
@@ -3184,21 +3186,17 @@ impl Global {
             }
             futures::select_biased! {
                 stream = bgp_listen_futures.next() => {
-                    if let Some(Some(Ok(stream))) = stream {
-                        let mut g = global.write().await;
-                        if let Some(h) = g.accept_connection(stream, crate::fsm::Role::Passive, global.clone(), tables.clone()).await {
-                            drop(g);
-                            peer_loop(h, global.clone(), active_tx.clone());
-                        }
+                    if let Some(Some(Ok(stream))) = stream
+                        && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Passive).await
+                    {
+                        peer_loop(h, global.clone(), active_tx.clone());
                     }
                 }
                 stream = active_rx.recv().fuse() => {
-                    if let Some(stream) = stream {
-                        let mut g = global.write().await;
-                        if let Some(h) = g.accept_connection(stream, crate::fsm::Role::Active, global.clone(), tables.clone()).await {
-                            drop(g);
-                            peer_loop(h, global.clone(), active_tx.clone());
-                        }
+                    if let Some(stream) = stream
+                        && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Active).await
+                    {
+                        peer_loop(h, global.clone(), active_tx.clone());
                     }
                 }
             }
