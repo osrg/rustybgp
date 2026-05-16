@@ -3792,7 +3792,9 @@ impl Connection {
                     }) {
                         continue;
                     }
+                    let (family, net) = (c.family, c.net);
                     pending.get_mut(f).unwrap().insert_change(c);
+                    self.export_map.mark_sent(family, net);
                 }
             }
 
