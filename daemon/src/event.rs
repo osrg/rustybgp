@@ -2842,7 +2842,6 @@ async fn accept_connection(
         peer.counter_tx.clone(),
         peer.counter_rx.clone(),
         peer.config.prefix_limits.clone(),
-        global.clone(),
         tables.clone(),
     )
 }
@@ -3571,7 +3570,7 @@ async fn peer_loop(
     global: GlobalHandle,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
 ) {
-    let info = h.run().await;
+    let info = h.run(&global).await;
     let mut server = global.write().await;
     if let Some(peer) = server.peers.get_mut(&info.remote_addr) {
         match info.role {
@@ -3642,7 +3641,6 @@ struct Connection {
     shutdown: Option<bmp::PeerDownReason>,
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
-    global: GlobalHandle,
     tables: TableHandle,
 }
 
@@ -3661,7 +3659,6 @@ impl Connection {
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
         prefix_limits: FnvHashMap<Family, u32>,
-        global: GlobalHandle,
         tables: TableHandle,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
@@ -3685,7 +3682,6 @@ impl Connection {
             peer_event_tx: Vec::new(),
             shutdown: None,
             prefix_limits,
-            global,
             tables,
         })
     }
@@ -3951,12 +3947,16 @@ impl Connection {
         effects
     }
 
-    async fn process_effects(&self, effects: Vec<GlobalEffect>) {
+    async fn process_effects(
+        effects: Vec<GlobalEffect>,
+        global: &GlobalHandle,
+        remote_addr: IpAddr,
+    ) {
         for effect in effects {
             match effect {
                 GlobalEffect::SendCease { role, msg } => {
-                    let mut global = self.global.write().await;
-                    if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
+                    let mut g = global.write().await;
+                    if let Some(peer) = g.peers.get_mut(&remote_addr) {
                         let tx = match role {
                             crate::fsm::Role::Active => peer.active_close_tx.0.take(),
                             crate::fsm::Role::Passive => peer.passive_close_tx.0.take(),
@@ -3967,8 +3967,8 @@ impl Connection {
                     }
                 }
                 GlobalEffect::StopActiveConnect => {
-                    let mut global = self.global.write().await;
-                    if let Some(peer) = global.peers.get_mut(&self.remote_addr) {
+                    let mut g = global.write().await;
+                    if let Some(peer) = g.peers.get_mut(&remote_addr) {
                         peer.active_connect_cancel_tx.0.take();
                     }
                 }
@@ -4098,6 +4098,7 @@ impl Connection {
     async fn rx_msg(
         &mut self,
         rs: &mut RunState,
+        global: &GlobalHandle,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
         msg: bgp::Message,
@@ -4130,7 +4131,7 @@ impl Connection {
         let effects = self
             .apply_outputs(outputs, rs, local_sockaddr, remote_sockaddr)
             .await;
-        self.process_effects(effects).await;
+        Self::process_effects(effects, global, self.remote_addr).await;
 
         // For UPDATE messages: if FSM didn't reject (no SessionDown), process routes.
         if let Some((reach, mp_reach, attr, unreach, mp_unreach, nexthop)) = update_fields {
@@ -4148,7 +4149,7 @@ impl Connection {
         Ok(())
     }
 
-    async fn run(&mut self) -> DisconnectInfo {
+    async fn run(&mut self, global: &GlobalHandle) -> DisconnectInfo {
         let disconnect = DisconnectInfo {
             role: self.role,
             remote_addr: self.remote_addr,
@@ -4209,7 +4210,7 @@ impl Connection {
         let effects = self
             .apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr)
             .await;
-        self.process_effects(effects).await;
+        Self::process_effects(effects, global, self.remote_addr).await;
 
         let mut close_rx: futures::future::OptionFuture<_> =
             self.close_rx.take().map(|rx| rx.fuse()).into();
@@ -4242,12 +4243,12 @@ impl Connection {
                     println!("{}: holdtime expired", self.remote_addr);
                     let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
                     let effects = self.apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr).await;
-                    self.process_effects(effects).await;
+                    Self::process_effects(effects, global, self.remote_addr).await;
                 }
                 _ = rs.keepalive_futures.next() => {
                     let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
                     let effects = self.apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr).await;
-                    self.process_effects(effects).await;
+                    Self::process_effects(effects, global, self.remote_addr).await;
                 }
                 msg = peer_event_futures.next().fuse() => {
                     if let Some(Some(msg)) = msg {
@@ -4315,7 +4316,7 @@ impl Connection {
                                     Ok(msg) => match msg {
                                         Some(msg) => {
                                             (*self.counter_rx).sync(&msg);
-                                            let _ = self.rx_msg(&mut rs, local_sockaddr, remote_sockaddr, msg).await;
+                                            let _ = self.rx_msg(&mut rs, global, local_sockaddr, remote_sockaddr, msg).await;
                                         }
                                         None => {
                                             // partial read
@@ -4648,7 +4649,7 @@ mod tests {
             txbuf_size: 1 << 16,
         };
         let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
-        conn.process_effects(effects).await;
+        Connection::process_effects(effects, &global, remote_addr).await;
 
         let received = active_close_rx
             .try_recv()
@@ -4721,7 +4722,7 @@ mod tests {
             txbuf_size: 1 << 16,
         };
         let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
-        conn.process_effects(effects).await;
+        Connection::process_effects(effects, &global, remote_addr).await;
 
         let received = active_close_rx
             .try_recv()
