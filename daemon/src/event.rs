@@ -200,6 +200,7 @@ struct Peer {
     /// Notification to the losing Connection. Each is consumed at most once.
     active_close_tx: CloseTx,
     passive_close_tx: CloseTx,
+    export_map: ExportMap,
 }
 
 /// Read-only view of a peer for gRPC list responses.
@@ -476,6 +477,7 @@ impl PeerBuilder {
             active_connect_cancel_tx: ActiveConnectCancel::default(),
             active_close_tx: CloseTx::default(),
             passive_close_tx: CloseTx::default(),
+            export_map: ExportMap::new(),
         }
     }
 }
@@ -2843,6 +2845,7 @@ async fn accept_connection(
         peer.counter_rx.clone(),
         peer.config.prefix_limits.clone(),
         tables.clone(),
+        peer.export_map.clone(),
     )
 }
 
@@ -3563,6 +3566,7 @@ fn find_link_local(local: &SocketAddr) -> Option<Ipv6Addr> {
 struct DisconnectInfo {
     role: crate::fsm::Role,
     remote_addr: IpAddr,
+    export_map: ExportMap,
 }
 
 async fn peer_loop(
@@ -3573,6 +3577,9 @@ async fn peer_loop(
     let info = h.run(&global).await;
     let mut server = global.write().await;
     if let Some(peer) = server.peers.get_mut(&info.remote_addr) {
+        // GR not yet implemented: always discard the export_map on disconnect.
+        // When GR is enabled, preserve it here for the next session.
+        drop(info.export_map);
         match info.role {
             crate::fsm::Role::Active => peer.active_close_tx = CloseTx::default(),
             crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx::default(),
@@ -3612,8 +3619,15 @@ struct RunState {
     txbuf_size: usize,
 }
 
+#[derive(Clone)]
 struct ExportMap {
     advertised: FnvHashMap<Family, FnvHashSet<packet::Nlri>>,
+}
+
+impl Default for ExportMap {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExportMap {
@@ -3689,6 +3703,7 @@ impl Connection {
         counter_rx: Arc<MessageCounter>,
         prefix_limits: FnvHashMap<Family, u32>,
         tables: TableHandle,
+        export_map: ExportMap,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
@@ -3712,7 +3727,7 @@ impl Connection {
             shutdown: None,
             prefix_limits,
             tables,
-            export_map: ExportMap::new(),
+            export_map,
         })
     }
 
@@ -4233,9 +4248,10 @@ impl Connection {
     }
 
     async fn run(&mut self, global: &GlobalHandle) -> DisconnectInfo {
-        let disconnect = DisconnectInfo {
+        let mut disconnect = DisconnectInfo {
             role: self.role,
             remote_addr: self.remote_addr,
+            export_map: ExportMap::new(),
         };
         let mut stream = self.stream.take().unwrap();
         let Ok(remote_sockaddr) = stream.peer_addr() else {
@@ -4427,6 +4443,7 @@ impl Connection {
                 }
             }
         }
+        disconnect.export_map = std::mem::take(&mut self.export_map);
         disconnect
     }
 }
