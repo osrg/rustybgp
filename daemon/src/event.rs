@@ -3776,26 +3776,14 @@ impl Connection {
                     .and_then(|s| s.send_max().get(f))
                     .copied()
                     .unwrap_or(1);
-                for mut c in t.rtable.best(f).into_iter() {
-                    if c.rank > effective_max {
-                        continue;
-                    }
-                    if export_policy.as_ref().is_some_and(|a| {
-                        t.rtable.apply_policy(
-                            a,
-                            &c.source,
-                            &c.net,
-                            &c.attr,
-                            &mut c.nexthop,
-                            c.source.local_addr,
-                        ) == table::Disposition::Reject
-                    }) {
-                        continue;
-                    }
-                    let (family, net) = (c.family, c.net);
-                    pending.get_mut(f).unwrap().insert_change(c);
-                    self.export_map.mark_sent(family, net);
-                }
+                Self::populate_from_shard(
+                    &t,
+                    *f,
+                    effective_max,
+                    &export_policy,
+                    pending,
+                    &mut self.export_map,
+                );
             }
 
             // Register per-peer prefix limits.
@@ -3859,6 +3847,36 @@ impl Connection {
         }
     }
 
+    fn populate_from_shard(
+        t: &Table,
+        family: Family,
+        effective_max: usize,
+        export_policy: &Option<Arc<table::PolicyAssignment>>,
+        pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
+        export_map: &mut ExportMap,
+    ) {
+        for mut c in t.rtable.best(&family).into_iter() {
+            if c.rank > effective_max {
+                continue;
+            }
+            if export_policy.as_ref().is_some_and(|a| {
+                t.rtable.apply_policy(
+                    a,
+                    &c.source,
+                    &c.net,
+                    &c.attr,
+                    &mut c.nexthop,
+                    c.source.local_addr,
+                ) == table::Disposition::Reject
+            }) {
+                continue;
+            }
+            let (fam, net) = (c.family, c.net);
+            pending.get_mut(&family).unwrap().insert_change(c);
+            export_map.mark_sent(fam, net);
+        }
+    }
+
     async fn do_route_refresh(&mut self, family: Family, rs: &mut RunState) {
         if !rs.pending.contains_key(&family) {
             return;
@@ -3874,26 +3892,14 @@ impl Connection {
             .unwrap_or(1);
         for i in 0..self.tables.shards.len() {
             let t = self.tables.shards[i].lock().await;
-            for mut c in t.rtable.best(&family).into_iter() {
-                if c.rank > effective_max {
-                    continue;
-                }
-                if export_policy.as_ref().is_some_and(|a| {
-                    t.rtable.apply_policy(
-                        a,
-                        &c.source,
-                        &c.net,
-                        &c.attr,
-                        &mut c.nexthop,
-                        c.source.local_addr,
-                    ) == table::Disposition::Reject
-                }) {
-                    continue;
-                }
-                let (fam, net) = (c.family, c.net);
-                rs.pending.get_mut(&family).unwrap().insert_change(c);
-                self.export_map.mark_sent(fam, net);
-            }
+            Self::populate_from_shard(
+                &t,
+                family,
+                effective_max,
+                &export_policy,
+                &mut rs.pending,
+                &mut self.export_map,
+            );
         }
         rs.pending.get_mut(&family).unwrap().schedule_eor();
     }
