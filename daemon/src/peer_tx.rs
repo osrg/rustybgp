@@ -53,6 +53,10 @@ impl PendingTx {
         self.reach.is_empty() && self.unreach.is_empty()
     }
 
+    pub(crate) fn schedule_eor(&mut self) {
+        self.pending_eor = true;
+    }
+
     pub(crate) fn insert_change(&mut self, change: rustybgp_table::Change) {
         let pid = if self.addpath_tx { change.path_id } else { 0 };
         let key: PendingKey = (change.net, pid);

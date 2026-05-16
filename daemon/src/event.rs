@@ -3859,6 +3859,45 @@ impl Connection {
         }
     }
 
+    async fn do_route_refresh(&mut self, family: Family, rs: &mut RunState) {
+        if !rs.pending.contains_key(&family) {
+            return;
+        }
+        let export_policy = self.tables.export_policy.load_full();
+        let effective_max = self
+            .peer_fsm
+            .lock()
+            .unwrap()
+            .session(self.role)
+            .and_then(|s| s.send_max().get(&family))
+            .copied()
+            .unwrap_or(1);
+        for i in 0..self.tables.shards.len() {
+            let t = self.tables.shards[i].lock().await;
+            for mut c in t.rtable.best(&family).into_iter() {
+                if c.rank > effective_max {
+                    continue;
+                }
+                if export_policy.as_ref().is_some_and(|a| {
+                    t.rtable.apply_policy(
+                        a,
+                        &c.source,
+                        &c.net,
+                        &c.attr,
+                        &mut c.nexthop,
+                        c.source.local_addr,
+                    ) == table::Disposition::Reject
+                }) {
+                    continue;
+                }
+                let (fam, net) = (c.family, c.net);
+                rs.pending.get_mut(&family).unwrap().insert_change(c);
+                self.export_map.mark_sent(fam, net);
+            }
+        }
+        rs.pending.get_mut(&family).unwrap().schedule_eor();
+    }
+
     async fn apply_outputs(
         &mut self,
         outputs: Vec<crate::fsm::PeerFsmOutput>,
@@ -3980,8 +4019,7 @@ impl Connection {
                     self.state.fsm.store(u8::from(s), Ordering::Relaxed);
                 }
                 crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::RouteRefresh(family)) => {
-                    // TODO: re-advertise full RIB-Out for `family` to this peer.
-                    let _ = family;
+                    self.do_route_refresh(family, rs).await;
                 }
                 crate::fsm::PeerFsmOutput::CloseConnection(_) => {
                     self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
