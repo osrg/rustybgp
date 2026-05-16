@@ -3612,6 +3612,36 @@ struct RunState {
     txbuf_size: usize,
 }
 
+#[allow(dead_code)]
+struct ExportMap {
+    advertised: FnvHashMap<Family, FnvHashSet<packet::Nlri>>,
+}
+
+#[allow(dead_code)]
+impl ExportMap {
+    fn new() -> Self {
+        ExportMap {
+            advertised: FnvHashMap::default(),
+        }
+    }
+
+    fn mark_sent(&mut self, family: Family, nlri: packet::Nlri) {
+        self.advertised.entry(family).or_default().insert(nlri);
+    }
+
+    fn mark_withdrawn(&mut self, family: Family, nlri: &packet::Nlri) {
+        if let Some(s) = self.advertised.get_mut(&family) {
+            s.remove(nlri);
+        }
+    }
+
+    fn was_sent(&self, family: Family, nlri: &packet::Nlri) -> bool {
+        self.advertised
+            .get(&family)
+            .is_some_and(|s| s.contains(nlri))
+    }
+}
+
 struct Connection {
     remote_addr: IpAddr,
     local_addr: IpAddr,
@@ -4728,5 +4758,44 @@ mod tests {
             .try_recv()
             .expect("CEASE not delivered to active (loser)");
         assert!(matches!(received, bgp::Message::Notification(_)));
+    }
+
+    #[test]
+    fn export_map_mark_and_check() {
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        let mut m = ExportMap::new();
+        assert!(!m.was_sent(Family::IPV4, &nlri));
+        m.mark_sent(Family::IPV4, nlri);
+        assert!(m.was_sent(Family::IPV4, &nlri));
+    }
+
+    #[test]
+    fn export_map_never_sent_returns_false() {
+        let nlri: packet::Nlri = "192.168.1.0/24".parse().unwrap();
+        let m = ExportMap::new();
+        assert!(!m.was_sent(Family::IPV4, &nlri));
+    }
+
+    #[test]
+    fn export_map_mark_withdrawn_clears() {
+        let nlri: packet::Nlri = "10.1.0.0/16".parse().unwrap();
+        let mut m = ExportMap::new();
+        m.mark_sent(Family::IPV4, nlri);
+        assert!(m.was_sent(Family::IPV4, &nlri));
+        m.mark_withdrawn(Family::IPV4, &nlri);
+        assert!(!m.was_sent(Family::IPV4, &nlri));
+    }
+
+    #[test]
+    fn export_map_multiple_families_independent() {
+        let v4: packet::Nlri = "10.0.0.0/8".parse().unwrap();
+        let v6: packet::Nlri = "2001:db8::/32".parse().unwrap();
+        let mut m = ExportMap::new();
+        m.mark_sent(Family::IPV4, v4);
+        assert!(m.was_sent(Family::IPV4, &v4));
+        assert!(!m.was_sent(Family::IPV6, &v4));
+        m.mark_sent(Family::IPV6, v6);
+        assert!(m.was_sent(Family::IPV6, &v6));
+        assert!(!m.was_sent(Family::IPV4, &v6));
     }
 }
