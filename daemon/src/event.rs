@@ -3612,12 +3612,10 @@ struct RunState {
     txbuf_size: usize,
 }
 
-#[allow(dead_code)]
 struct ExportMap {
     advertised: FnvHashMap<Family, FnvHashSet<packet::Nlri>>,
 }
 
-#[allow(dead_code)]
 impl ExportMap {
     fn new() -> Self {
         ExportMap {
@@ -3672,6 +3670,7 @@ struct Connection {
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
     tables: TableHandle,
+    export_map: ExportMap,
 }
 
 impl Connection {
@@ -3713,6 +3712,7 @@ impl Connection {
             shutdown: None,
             prefix_limits,
             tables,
+            export_map: ExportMap::new(),
         })
     }
 
@@ -4125,6 +4125,59 @@ impl Connection {
         }
     }
 
+    fn handle_advertise(&mut self, rs: &mut RunState, ri: table::Change) {
+        if self.peer_fsm.lock().unwrap().state(self.role) != SessionState::Established {
+            return;
+        }
+        if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
+            return;
+        }
+        if !rs.framer.inner().channel.contains_key(&ri.family) {
+            return;
+        }
+        let effective_max = self
+            .peer_fsm
+            .lock()
+            .unwrap()
+            .session(self.role)
+            .and_then(|s| s.send_max().get(&ri.family))
+            .copied()
+            .unwrap_or(1);
+        if ri.rank > effective_max {
+            if self
+                .peer_fsm
+                .lock()
+                .unwrap()
+                .session(self.role)
+                .is_some_and(|s| s.send_max().contains_key(&ri.family))
+                && ri.old_rank > 0
+                && ri.old_rank <= effective_max
+                && self.export_map.was_sent(ri.family, &ri.net)
+            {
+                let family = ri.family;
+                let net = ri.net;
+                self.export_map.mark_withdrawn(family, &net);
+                rs.pending
+                    .get_mut(&family)
+                    .unwrap()
+                    .insert_change(table::Change {
+                        attr: Arc::new(Vec::new()),
+                        ..ri
+                    });
+            }
+            return;
+        }
+        if ri.attr.is_empty() {
+            if self.export_map.was_sent(ri.family, &ri.net) {
+                self.export_map.mark_withdrawn(ri.family, &ri.net);
+                rs.pending.get_mut(&ri.family).unwrap().insert_change(ri);
+            }
+        } else {
+            self.export_map.mark_sent(ri.family, ri.net);
+            rs.pending.get_mut(&ri.family).unwrap().insert_change(ri);
+        }
+    }
+
     async fn rx_msg(
         &mut self,
         rs: &mut RunState,
@@ -4284,47 +4337,7 @@ impl Connection {
                     if let Some(Some(msg)) = msg {
                         match msg {
                             ToPeerEvent::Advertise(ri) => {
-                                if self.peer_fsm.lock().unwrap().state(self.role) != SessionState::Established {
-                                    continue;
-                                }
-                                if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
-                                    continue;
-                                }
-                                if !rs.framer.inner().channel.contains_key(&ri.family) {
-                                    continue;
-                                }
-                                // Filter changes that exceed this peer's effective send_max.
-                                // Note: ranks are 1-based for all changes (including withdrawals); there is no special rank=0.
-                                let effective_max = self
-                                    .peer_fsm
-                                    .lock()
-                                    .unwrap()
-                                    .session(self.role)
-                                    .and_then(|s| s.send_max().get(&ri.family))
-                                    .copied()
-                                    .unwrap_or(1);
-                                if ri.rank > effective_max {
-                                    // Only withdraw if the path was previously within
-                                    // this peer's window (old_rank <= effective_max).
-                                    if self
-                                        .peer_fsm
-                                        .lock()
-                                        .unwrap()
-                                        .session(self.role)
-                                        .is_some_and(|s| s.send_max().contains_key(&ri.family))
-                                        && ri.old_rank > 0
-                                        && ri.old_rank <= effective_max
-                                    {
-                                        rs.pending.get_mut(&ri.family).unwrap().insert_change(
-                                            table::Change {
-                                                attr: Arc::new(Vec::new()),
-                                                ..ri
-                                            },
-                                        );
-                                    }
-                                    continue;
-                                }
-                                rs.pending.get_mut(&ri.family).unwrap().insert_change(ri);
+                                self.handle_advertise(&mut rs, ri);
                             }
                         }
                     }
@@ -4606,6 +4619,178 @@ mod tests {
         accept_connection(global, tables, server, crate::fsm::Role::Passive)
             .await
             .unwrap()
+    }
+
+    /// Returns a Connection with the Passive FSM driven to Established and source set.
+    async fn established_connection(
+        global: &GlobalHandle,
+        tables: &TableHandle,
+        remote_addr: IpAddr,
+        server: TcpStream,
+    ) -> Connection {
+        let mut conn = passive_connection(global, tables, remote_addr, server).await;
+        {
+            let peer_fsm = Arc::clone(&conn.peer_fsm);
+            let open = bgp::Message::Open(bgp::Open {
+                as_number: 65002,
+                holdtime: HoldTime::new(90).unwrap(),
+                router_id: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+                capability: vec![],
+            });
+            let mut fsm = peer_fsm.lock().unwrap();
+            fsm.process(crate::fsm::Role::Passive, crate::fsm::Input::Connected);
+            fsm.process(
+                crate::fsm::Role::Passive,
+                crate::fsm::Input::MessageReceived(open),
+            );
+            fsm.process(
+                crate::fsm::Role::Passive,
+                crate::fsm::Input::MessageReceived(bgp::Message::Keepalive),
+            );
+        }
+        conn.source = Some(Arc::new(table::Source::new(
+            remote_addr,
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            65002,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            0,
+            false,
+        )));
+        conn
+    }
+
+    fn make_rs_ipv4() -> RunState {
+        let mut pending = FnvHashMap::default();
+        pending.insert(Family::IPV4, crate::peer_tx::PendingTx::new(false));
+        RunState {
+            urgent: Vec::new(),
+            framer: BgpFramer::new(
+                bgp::PeerCodecBuilder::new()
+                    .local_asn(65001)
+                    .local_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+                    .families(vec![Family::IPV4])
+                    .build(),
+            ),
+            keepalive_futures: make_timers(),
+            holdtime_futures: make_timers(),
+            pending,
+            txbuf_size: 1 << 16,
+        }
+    }
+
+    fn make_reach_change(nlri: packet::Nlri, source: Arc<table::Source>) -> table::Change {
+        table::Change {
+            source,
+            family: Family::IPV4,
+            net: nlri,
+            nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            attr: Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+            ]),
+            path_id: 0,
+            rank: 1,
+            old_rank: 0,
+        }
+    }
+
+    fn make_withdraw_change(nlri: packet::Nlri, source: Arc<table::Source>) -> table::Change {
+        table::Change {
+            source,
+            family: Family::IPV4,
+            net: nlri,
+            nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            attr: Arc::new(vec![]),
+            path_id: 0,
+            rank: 1,
+            old_rank: 0,
+        }
+    }
+
+    fn other_source() -> Arc<table::Source> {
+        Arc::new(table::Source::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            65002,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 2),
+            0,
+            false,
+        ))
+    }
+
+    #[tokio::test]
+    async fn handle_advertise_reach_tracked_in_export_map() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        let mut rs = make_rs_ipv4();
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        let ri = make_reach_change(nlri, other_source());
+
+        conn.handle_advertise(&mut rs, ri);
+
+        assert!(conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(!rs.pending[&Family::IPV4].is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_advertise_spurious_withdraw_suppressed() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        let mut rs = make_rs_ipv4();
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        let ri = make_withdraw_change(nlri, other_source());
+
+        conn.handle_advertise(&mut rs, ri);
+
+        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(rs.pending[&Family::IPV4].is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_advertise_known_withdraw_forwarded_and_export_map_cleared() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        let mut rs = make_rs_ipv4();
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+
+        conn.export_map.mark_sent(Family::IPV4, nlri);
+        let ri = make_withdraw_change(nlri, other_source());
+        conn.handle_advertise(&mut rs, ri);
+
+        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(!rs.pending[&Family::IPV4].is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_advertise_noop_when_not_established() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        // passive_connection gives Active state, not Established
+        let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
+        let mut rs = make_rs_ipv4();
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        let ri = make_reach_change(nlri, other_source());
+
+        conn.handle_advertise(&mut rs, ri);
+
+        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(rs.pending[&Family::IPV4].is_empty());
     }
 
     /// `apply_outputs` must return `GlobalEffect::SendCease` for a `SendMessage`
