@@ -37,12 +37,20 @@ pub(crate) enum GrInput {
         restart_time: Duration,
     },
     /// The peer reconnected and GR was re-negotiated for these families.
-    /// The timer should be stopped; the machine waits for EOR per family.
-    SessionEstablished { gr_families: Vec<Family> },
+    /// The restart timer is stopped; the machine waits for EOR per family.
+    /// `deferral_time` is a local config value (RFC 4724 §4.1 Selection
+    /// Deferral Timer); if EOR is not received within this duration, all
+    /// remaining stale routes are deleted.
+    SessionEstablished {
+        gr_families: Vec<Family>,
+        deferral_time: Duration,
+    },
     /// End-of-RIB received for this family; stale routes for it can be removed.
     EorReceived(Family),
     /// The restart timer fired; all stale routes must be removed.
     TimerExpired,
+    /// The Selection Deferral Timer fired; delete all remaining stale routes.
+    DeferralTimerExpired,
 }
 
 /// Actions the driver should perform in response to a GR input.
@@ -54,6 +62,10 @@ pub(crate) enum GrOutput {
     StartTimer(Duration),
     /// Cancel the restart timer.
     StopTimer,
+    /// Start the Selection Deferral Timer with the given duration.
+    StartDeferralTimer(Duration),
+    /// Cancel the Selection Deferral Timer.
+    StopDeferralTimer,
     /// Delete stale routes for the given families.
     DeleteStaleRoutes(Vec<Family>),
 }
@@ -63,7 +75,7 @@ enum Inner {
     Idle,
     /// Peer dropped; restart timer running. Stale routes have been marked.
     Restarting { stale_families: Vec<Family> },
-    /// Peer reconnected; waiting for EOR for each family in `pending`.
+    /// Peer reconnected; Selection Deferral Timer running; waiting for EOR.
     WaitingEor { pending: FnvHashSet<Family> },
 }
 
@@ -83,24 +95,36 @@ impl GrState {
         let state = std::mem::replace(&mut self.state, Inner::Idle);
         let (new_state, outputs) = match (state, input) {
             // Session drop from any state: mark stale and start restart timer.
+            // If dropping from WaitingEor, also stop the deferral timer.
             (
-                _,
+                state,
                 GrInput::SessionDropped {
                     families,
                     restart_time,
                 },
-            ) => (
-                Inner::Restarting {
-                    stale_families: families.clone(),
-                },
-                vec![
-                    GrOutput::MarkStale(families),
-                    GrOutput::StartTimer(restart_time),
-                ],
-            ),
+            ) => {
+                let mut outputs = Vec::new();
+                if matches!(state, Inner::WaitingEor { .. }) {
+                    outputs.push(GrOutput::StopDeferralTimer);
+                }
+                outputs.push(GrOutput::MarkStale(families.clone()));
+                outputs.push(GrOutput::StartTimer(restart_time));
+                (
+                    Inner::Restarting {
+                        stale_families: families,
+                    },
+                    outputs,
+                )
+            }
 
             // Peer reconnected while restart timer was running.
-            (Inner::Restarting { stale_families }, GrInput::SessionEstablished { gr_families }) => {
+            (
+                Inner::Restarting { stale_families },
+                GrInput::SessionEstablished {
+                    gr_families,
+                    deferral_time,
+                },
+            ) => {
                 let gr_set: FnvHashSet<Family> = gr_families.into_iter().collect();
 
                 // Families that were stale but are no longer in the new GR capability
@@ -118,6 +142,7 @@ impl GrState {
                 let new_state = if gr_set.is_empty() {
                     Inner::Idle
                 } else {
+                    outputs.push(GrOutput::StartDeferralTimer(deferral_time));
                     Inner::WaitingEor { pending: gr_set }
                 };
                 (new_state, outputs)
@@ -132,12 +157,20 @@ impl GrState {
             // EOR received for one family while waiting for all families.
             (Inner::WaitingEor { mut pending }, GrInput::EorReceived(family)) => {
                 pending.remove(&family);
+                let mut outputs = vec![GrOutput::DeleteStaleRoutes(vec![family])];
                 let new_state = if pending.is_empty() {
+                    outputs.push(GrOutput::StopDeferralTimer);
                     Inner::Idle
                 } else {
                     Inner::WaitingEor { pending }
                 };
-                (new_state, vec![GrOutput::DeleteStaleRoutes(vec![family])])
+                (new_state, outputs)
+            }
+
+            // Selection Deferral Timer fired; delete all remaining stale routes.
+            (Inner::WaitingEor { pending }, GrInput::DeferralTimerExpired) => {
+                let families: Vec<Family> = pending.into_iter().collect();
+                (Inner::Idle, vec![GrOutput::DeleteStaleRoutes(families)])
             }
 
             // All other combinations are no-ops (e.g., EOR in Idle/Restarting,
@@ -165,10 +198,21 @@ mod tests {
         Duration::from_secs(120)
     }
 
+    fn deferral_time() -> Duration {
+        Duration::from_secs(360)
+    }
+
     fn drop_ipv4(gr: &mut GrState) -> Vec<GrOutput> {
         gr.process(GrInput::SessionDropped {
             families: vec![ipv4()],
             restart_time: restart_time(),
+        })
+    }
+
+    fn establish_ipv4(gr: &mut GrState) -> Vec<GrOutput> {
+        gr.process(GrInput::SessionEstablished {
+            gr_families: vec![ipv4()],
+            deferral_time: deferral_time(),
         })
     }
 
@@ -196,36 +240,34 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_stops_timer_and_waits_for_eor() {
+    fn reconnect_stops_timer_starts_deferral_timer() {
         let mut gr = GrState::new();
         drop_ipv4(&mut gr);
 
-        let outputs = gr.process(GrInput::SessionEstablished {
-            gr_families: vec![ipv4()],
-        });
+        let outputs = establish_ipv4(&mut gr);
 
-        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs.len(), 2);
         assert!(matches!(outputs[0], GrOutput::StopTimer));
+        assert!(matches!(outputs[1], GrOutput::StartDeferralTimer(d) if d == deferral_time()));
         assert!(matches!(gr.state, Inner::WaitingEor { .. }));
     }
 
     #[test]
-    fn eor_deletes_stale_routes_for_family() {
+    fn eor_deletes_stale_routes_and_stops_deferral_timer() {
         let mut gr = GrState::new();
         drop_ipv4(&mut gr);
-        gr.process(GrInput::SessionEstablished {
-            gr_families: vec![ipv4()],
-        });
+        establish_ipv4(&mut gr);
 
         let outputs = gr.process(GrInput::EorReceived(ipv4()));
 
-        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs.len(), 2);
         assert!(matches!(&outputs[0], GrOutput::DeleteStaleRoutes(f) if f == &[ipv4()]));
+        assert!(matches!(outputs[1], GrOutput::StopDeferralTimer));
         assert!(matches!(gr.state, Inner::Idle));
     }
 
     #[test]
-    fn all_eor_received_returns_to_idle() {
+    fn partial_eor_does_not_stop_deferral_timer() {
         let mut gr = GrState::new();
         gr.process(GrInput::SessionDropped {
             families: vec![ipv4(), ipv6()],
@@ -233,12 +275,41 @@ mod tests {
         });
         gr.process(GrInput::SessionEstablished {
             gr_families: vec![ipv4(), ipv6()],
+            deferral_time: deferral_time(),
         });
 
-        gr.process(GrInput::EorReceived(ipv4()));
+        // First EOR: still waiting for IPv6
+        let outputs = gr.process(GrInput::EorReceived(ipv4()));
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(&outputs[0], GrOutput::DeleteStaleRoutes(f) if f == &[ipv4()]));
         assert!(matches!(gr.state, Inner::WaitingEor { .. }));
 
-        gr.process(GrInput::EorReceived(ipv6()));
+        // Second EOR: all done, deferral timer stopped
+        let outputs = gr.process(GrInput::EorReceived(ipv6()));
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(&outputs[0], GrOutput::DeleteStaleRoutes(f) if f == &[ipv6()]));
+        assert!(matches!(outputs[1], GrOutput::StopDeferralTimer));
+        assert!(matches!(gr.state, Inner::Idle));
+    }
+
+    #[test]
+    fn deferral_timer_expired_deletes_remaining_stale_routes() {
+        let mut gr = GrState::new();
+        gr.process(GrInput::SessionDropped {
+            families: vec![ipv4(), ipv6()],
+            restart_time: restart_time(),
+        });
+        gr.process(GrInput::SessionEstablished {
+            gr_families: vec![ipv4(), ipv6()],
+            deferral_time: deferral_time(),
+        });
+        // Only IPv4 EOR received; IPv6 never arrives
+        gr.process(GrInput::EorReceived(ipv4()));
+
+        let outputs = gr.process(GrInput::DeferralTimerExpired);
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(&outputs[0], GrOutput::DeleteStaleRoutes(f) if f == &[ipv6()]));
         assert!(matches!(gr.state, Inner::Idle));
     }
 
@@ -255,7 +326,6 @@ mod tests {
         let mut gr = GrState::new();
         drop_ipv4(&mut gr);
 
-        // Session drops again before reconnection
         let outputs = gr.process(GrInput::SessionDropped {
             families: vec![ipv4(), ipv6()],
             restart_time: Duration::from_secs(60),
@@ -279,13 +349,14 @@ mod tests {
 
         let outputs = gr.process(GrInput::SessionEstablished {
             gr_families: vec![ipv4()],
+            deferral_time: deferral_time(),
         });
 
-        // StopTimer + DeleteStaleRoutes([IPv6])
-        assert_eq!(outputs.len(), 2);
+        // StopTimer + DeleteStaleRoutes([IPv6]) + StartDeferralTimer
+        assert_eq!(outputs.len(), 3);
         assert!(matches!(outputs[0], GrOutput::StopTimer));
         assert!(matches!(&outputs[1], GrOutput::DeleteStaleRoutes(f) if f == &[ipv6()]));
-        // IPv4 still waiting for EOR
+        assert!(matches!(outputs[2], GrOutput::StartDeferralTimer(d) if d == deferral_time()));
         assert!(matches!(gr.state, Inner::WaitingEor { .. }));
     }
 
@@ -300,8 +371,10 @@ mod tests {
 
         let outputs = gr.process(GrInput::SessionEstablished {
             gr_families: vec![],
+            deferral_time: deferral_time(),
         });
 
+        // StopTimer + DeleteStaleRoutes([IPv4, IPv6]); no StartDeferralTimer
         assert_eq!(outputs.len(), 2);
         assert!(matches!(outputs[0], GrOutput::StopTimer));
         assert!(matches!(&outputs[1], GrOutput::DeleteStaleRoutes(f) if f.len() == 2));
@@ -309,19 +382,19 @@ mod tests {
     }
 
     #[test]
-    fn session_dropped_during_waiting_eor_restarts_gr() {
+    fn session_dropped_during_waiting_eor_stops_deferral_timer() {
         let mut gr = GrState::new();
         drop_ipv4(&mut gr);
-        gr.process(GrInput::SessionEstablished {
-            gr_families: vec![ipv4()],
-        });
+        establish_ipv4(&mut gr);
         assert!(matches!(gr.state, Inner::WaitingEor { .. }));
 
-        // Session drops again while waiting for EOR
         let outputs = drop_ipv4(&mut gr);
 
-        assert_eq!(outputs.len(), 2);
-        assert!(matches!(&outputs[0], GrOutput::MarkStale(f) if f == &[ipv4()]));
+        // StopDeferralTimer + MarkStale + StartTimer
+        assert_eq!(outputs.len(), 3);
+        assert!(matches!(outputs[0], GrOutput::StopDeferralTimer));
+        assert!(matches!(&outputs[1], GrOutput::MarkStale(f) if f == &[ipv4()]));
+        assert!(matches!(outputs[2], GrOutput::StartTimer(d) if d == restart_time()));
         assert!(matches!(gr.state, Inner::Restarting { .. }));
     }
 }
