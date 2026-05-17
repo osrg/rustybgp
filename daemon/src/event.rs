@@ -666,6 +666,52 @@ impl TryFrom<&api::Peer> for Peer {
                     .as_ref()
                     .map_or(0, |x| if x.enabled { x.multihop_ttl as u8 } else { 0 }),
             )
+            .graceful_restart({
+                const DEFAULT_RESTART_TIME: u16 = 120;
+                const DEFAULT_DEFERRAL_SECS: u64 = 360;
+
+                let gr = p.graceful_restart.as_ref();
+                if gr.is_some_and(|g| g.enabled) {
+                    let gr_families: Vec<Family> = p
+                        .afi_safis
+                        .iter()
+                        .filter(|a| {
+                            a.mp_graceful_restart
+                                .as_ref()
+                                .is_some_and(|m| m.config.as_ref().is_some_and(|c| c.enabled))
+                        })
+                        .filter_map(|a| {
+                            let f = a.config.as_ref()?.family.as_ref()?;
+                            Some(convert::family_from_api(f))
+                        })
+                        .collect();
+
+                    if !gr_families.is_empty() {
+                        let restart_time = gr
+                            .and_then(|g| u16::try_from(g.restart_time).ok())
+                            .unwrap_or(DEFAULT_RESTART_TIME);
+                        let deferral_secs = gr
+                            .map(|g| {
+                                if g.deferral_time > 0 {
+                                    g.deferral_time as u64
+                                } else {
+                                    g.stale_routes_time as u64
+                                }
+                            })
+                            .filter(|&v| v > 0)
+                            .unwrap_or(DEFAULT_DEFERRAL_SECS);
+                        Some(GrPeerConfig {
+                            restart_time,
+                            deferral_time: std::time::Duration::from_secs(deferral_secs),
+                            families: gr_families,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
             .build())
     }
 }
