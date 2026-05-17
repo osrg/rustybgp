@@ -218,6 +218,14 @@ struct Peer {
     active_close_tx: CloseTx,
     passive_close_tx: CloseTx,
     export_map: ExportMap,
+    /// GR helper state machine; persists across sessions.
+    gr_state: crate::gr::GrState,
+    /// The stale source from the previous session; Some while GR restart timer is running.
+    gr_source: Option<Arc<table::Source>>,
+    /// Abort handle for the GR restart timer task.
+    gr_restart_timer: Option<tokio::task::AbortHandle>,
+    /// Abort handle for the GR selection deferral timer task.
+    gr_deferral_timer: Option<tokio::task::AbortHandle>,
 }
 
 /// Read-only view of a peer for gRPC list responses.
@@ -510,6 +518,10 @@ impl PeerBuilder {
             active_close_tx: CloseTx::default(),
             passive_close_tx: CloseTx::default(),
             export_map: ExportMap::new(),
+            gr_state: crate::gr::GrState::new(),
+            gr_source: None,
+            gr_restart_timer: None,
+            gr_deferral_timer: None,
         }
     }
 }
@@ -3690,7 +3702,7 @@ fn find_link_local(local: &SocketAddr) -> Option<Ipv6Addr> {
 
 /// GR state negotiated during the last OPEN exchange.
 /// Stored in DisconnectInfo so peer_loop can drive GrState on session drop.
-#[allow(dead_code)]
+#[derive(Clone)]
 struct NegotiatedGr {
     /// Intersection of local and remote GR families.
     families: Vec<Family>,
@@ -3703,8 +3715,177 @@ struct DisconnectInfo {
     remote_addr: IpAddr,
     export_map: ExportMap,
     /// Set when GR was successfully negotiated for at least one family.
-    #[allow(dead_code)]
     negotiated_gr: Option<NegotiatedGr>,
+    /// Stale source preserved when GR is active (routes not dropped in Connection::run).
+    source: Option<Arc<table::Source>>,
+}
+
+async fn gr_drop_source(tables: &TableHandle, source: Arc<table::Source>) {
+    for i in 0..tables.shards.len() {
+        tables
+            .event(i, TableEvent::Disconnected(source.clone()))
+            .await;
+    }
+}
+
+async fn gr_restart_timer_expired(global: GlobalHandle, tables: TableHandle, remote_addr: IpAddr) {
+    let source = {
+        let mut server = global.write().await;
+        if let Some(peer) = server.peers.get_mut(&remote_addr) {
+            let outputs = peer.gr_state.process(crate::gr::GrInput::TimerExpired);
+            if outputs
+                .iter()
+                .any(|o| matches!(o, crate::gr::GrOutput::DeleteStaleRoutes(_)))
+            {
+                peer.gr_source.take()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(source) = source {
+        gr_drop_source(&tables, source).await;
+    }
+}
+
+async fn gr_deferral_timer_expired(global: GlobalHandle, tables: TableHandle, remote_addr: IpAddr) {
+    let source = {
+        let mut server = global.write().await;
+        if let Some(peer) = server.peers.get_mut(&remote_addr) {
+            let outputs = peer
+                .gr_state
+                .process(crate::gr::GrInput::DeferralTimerExpired);
+            if outputs
+                .iter()
+                .any(|o| matches!(o, crate::gr::GrOutput::DeleteStaleRoutes(_)))
+            {
+                peer.gr_source.take()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(source) = source {
+        gr_drop_source(&tables, source).await;
+    }
+}
+
+async fn gr_handle_session_established(
+    global: &GlobalHandle,
+    tables: &TableHandle,
+    remote_addr: IpAddr,
+    negotiated_gr: Option<NegotiatedGr>,
+) {
+    let (source_to_drop, deferral_duration) = {
+        let mut server = global.write().await;
+        if let Some(peer) = server.peers.get_mut(&remote_addr) {
+            // Cancel the restart timer — peer reconnected in time.
+            if let Some(h) = peer.gr_restart_timer.take() {
+                h.abort();
+            }
+
+            let deferral_time = peer
+                .config
+                .graceful_restart
+                .as_ref()
+                .map(|c| c.deferral_time)
+                .unwrap_or(Duration::from_secs(360));
+            let gr_families = negotiated_gr
+                .as_ref()
+                .map(|g| g.families.clone())
+                .unwrap_or_default();
+
+            let outputs = peer
+                .gr_state
+                .process(crate::gr::GrInput::SessionEstablished {
+                    gr_families,
+                    deferral_time,
+                });
+
+            let mut drop_source = false;
+            let mut start_deferral = false;
+            for output in &outputs {
+                match output {
+                    crate::gr::GrOutput::DeleteStaleRoutes(_) => drop_source = true,
+                    crate::gr::GrOutput::StartDeferralTimer(_) => start_deferral = true,
+                    _ => {}
+                }
+            }
+
+            let source = if drop_source {
+                peer.gr_source.take()
+            } else {
+                None
+            };
+
+            let deferral = if !drop_source && start_deferral {
+                Some(deferral_time)
+            } else {
+                None
+            };
+
+            if let Some(dur) = deferral {
+                let global_c = global.clone();
+                let tables_c = tables.clone();
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(dur).await;
+                    gr_deferral_timer_expired(global_c, tables_c, remote_addr).await;
+                })
+                .abort_handle();
+                peer.gr_deferral_timer = Some(handle);
+            }
+
+            (source, None::<Duration>)
+        } else {
+            (None, None)
+        }
+    };
+    let _ = deferral_duration; // already handled inside the lock
+    if let Some(source) = source_to_drop {
+        gr_drop_source(tables, source).await;
+    }
+}
+
+async fn gr_handle_eor_received(
+    global: &GlobalHandle,
+    tables: &TableHandle,
+    remote_addr: IpAddr,
+    family: Family,
+) {
+    let source = {
+        let mut server = global.write().await;
+        if let Some(peer) = server.peers.get_mut(&remote_addr) {
+            let outputs = peer
+                .gr_state
+                .process(crate::gr::GrInput::EorReceived(family));
+            let mut drop_source = false;
+            for output in &outputs {
+                match output {
+                    crate::gr::GrOutput::DeleteStaleRoutes(_) => drop_source = true,
+                    crate::gr::GrOutput::StopDeferralTimer => {
+                        if let Some(h) = peer.gr_deferral_timer.take() {
+                            h.abort();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if drop_source {
+                peer.gr_source.take()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(source) = source {
+        gr_drop_source(tables, source).await;
+    }
 }
 
 async fn peer_loop(
@@ -3712,16 +3893,67 @@ async fn peer_loop(
     global: GlobalHandle,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
 ) {
+    let tables = h.tables.clone();
     let info = h.run(&global).await;
     let mut server = global.write().await;
     if let Some(peer) = server.peers.get_mut(&info.remote_addr) {
-        // GR not yet implemented: always discard the export_map on disconnect.
-        // When GR is enabled, preserve it here for the next session.
-        drop(info.export_map);
         match info.role {
             crate::fsm::Role::Active => peer.active_close_tx = CloseTx::default(),
             crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx::default(),
         }
+
+        if let (Some(gr), Some(source)) = (&info.negotiated_gr, info.source) {
+            // GR active: mark source stale, start restart timer, preserve export_map.
+            if let Some(h) = peer.gr_deferral_timer.take() {
+                h.abort();
+            }
+            if let Some(h) = peer.gr_restart_timer.take() {
+                h.abort();
+            }
+            // Drop any lingering stale source from a previous GR cycle.
+            // (Handled async after releasing lock; spawn fire-and-forget.)
+            if let Some(old) = peer.gr_source.take() {
+                let tables_c = tables.clone();
+                tokio::spawn(async move { gr_drop_source(&tables_c, old).await });
+            }
+
+            source.mark_stale();
+            let outputs = peer.gr_state.process(crate::gr::GrInput::SessionDropped {
+                families: gr.families.clone(),
+                restart_time: gr.restart_time,
+            });
+            for output in &outputs {
+                if let crate::gr::GrOutput::StartTimer(duration) = output {
+                    let dur = *duration;
+                    let global_c = global.clone();
+                    let tables_c = tables.clone();
+                    let remote_addr = info.remote_addr;
+                    let handle = tokio::spawn(async move {
+                        tokio::time::sleep(dur).await;
+                        gr_restart_timer_expired(global_c, tables_c, remote_addr).await;
+                    })
+                    .abort_handle();
+                    peer.gr_restart_timer = Some(handle);
+                }
+            }
+            peer.gr_source = Some(source);
+            peer.export_map = info.export_map;
+        } else {
+            // Normal disconnect: routes were already dropped in Connection::run().
+            // Clean up any leftover GR state from a previous cycle that never recovered.
+            if let Some(h) = peer.gr_restart_timer.take() {
+                h.abort();
+            }
+            if let Some(h) = peer.gr_deferral_timer.take() {
+                h.abort();
+            }
+            if let Some(old) = peer.gr_source.take() {
+                let tables_c = tables.clone();
+                tokio::spawn(async move { gr_drop_source(&tables_c, old).await });
+            }
+            drop(info.export_map);
+        }
+
         // Only reset and reconnect when no Connection remains for this peer.
         if peer.active_close_tx.0.is_none() && peer.passive_close_tx.0.is_none() {
             if peer.config.delete_on_disconnected {
@@ -3746,6 +3978,10 @@ enum GlobalEffect {
     },
     /// Cancel the active-connect retry loop for this peer.
     StopActiveConnect,
+    /// Peer reconnected while GR was active; drive GrState::SessionEstablished.
+    GrSessionEstablished { negotiated_gr: Option<NegotiatedGr> },
+    /// EOR received for a family while GR deferral timer is running.
+    GrEorReceived { family: Family },
 }
 
 struct RunState {
@@ -4171,6 +4407,9 @@ impl Connection {
                     // Compute GR negotiation result before remote_capabilities
                     // is consumed by Arc::new below.
                     self.negotiated_gr = self.negotiate_gr(&remote_capabilities);
+                    effects.push(GlobalEffect::GrSessionEstablished {
+                        negotiated_gr: self.negotiated_gr.clone(),
+                    });
 
                     self.state
                         .remote_cap
@@ -4223,6 +4462,7 @@ impl Connection {
         effects: Vec<GlobalEffect>,
         global: &GlobalHandle,
         remote_addr: IpAddr,
+        tables: &TableHandle,
     ) {
         for effect in effects {
             match effect {
@@ -4243,6 +4483,12 @@ impl Connection {
                     if let Some(peer) = g.peers.get_mut(&remote_addr) {
                         peer.active_connect_cancel_tx.0.take();
                     }
+                }
+                GlobalEffect::GrSessionEstablished { negotiated_gr } => {
+                    gr_handle_session_established(global, tables, remote_addr, negotiated_gr).await;
+                }
+                GlobalEffect::GrEorReceived { family } => {
+                    gr_handle_eor_received(global, tables, remote_addr, family).await;
                 }
             }
         }
@@ -4456,7 +4702,7 @@ impl Connection {
         let effects = self
             .apply_outputs(outputs, rs, local_sockaddr, remote_sockaddr)
             .await;
-        Self::process_effects(effects, global, self.remote_addr).await;
+        Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
 
         // For UPDATE messages: if FSM didn't reject (no SessionDown), process routes.
         if let Some((reach, mp_reach, attr, unreach, mp_unreach, nexthop)) = update_fields {
@@ -4468,8 +4714,30 @@ impl Connection {
                     .into(),
                 ));
             }
-            self.rx_update(reach, unreach, attr.clone(), nexthop).await;
-            self.rx_update(mp_reach, mp_unreach, attr, nexthop).await;
+            self.rx_update(reach.clone(), unreach, attr.clone(), nexthop)
+                .await;
+            self.rx_update(mp_reach, mp_unreach.clone(), attr, nexthop)
+                .await;
+
+            // Detect End-of-RIB: empty NlriSet with no attributes.
+            // IPv4 EOR: reach has empty entries; other families: mp_unreach has empty entries.
+            if self.negotiated_gr.is_some() {
+                let mut eor_effects = Vec::new();
+                if let Some(r) = &reach
+                    && r.entries.is_empty()
+                {
+                    eor_effects.push(GlobalEffect::GrEorReceived { family: r.family });
+                }
+                if let Some(u) = &mp_unreach
+                    && u.entries.is_empty()
+                {
+                    eor_effects.push(GlobalEffect::GrEorReceived { family: u.family });
+                }
+                if !eor_effects.is_empty() {
+                    Self::process_effects(eor_effects, global, self.remote_addr, &self.tables)
+                        .await;
+                }
+            }
         }
         Ok(())
     }
@@ -4480,6 +4748,7 @@ impl Connection {
             remote_addr: self.remote_addr,
             export_map: ExportMap::new(),
             negotiated_gr: None,
+            source: None,
         };
         let mut stream = self.stream.take().unwrap();
         let Ok(remote_sockaddr) = stream.peer_addr() else {
@@ -4537,7 +4806,7 @@ impl Connection {
         let effects = self
             .apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr)
             .await;
-        Self::process_effects(effects, global, self.remote_addr).await;
+        Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
 
         let mut close_rx: futures::future::OptionFuture<_> =
             self.close_rx.take().map(|rx| rx.fuse()).into();
@@ -4570,12 +4839,12 @@ impl Connection {
                     println!("{}: holdtime expired", self.remote_addr);
                     let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
                     let effects = self.apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr).await;
-                    Self::process_effects(effects, global, self.remote_addr).await;
+                    Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
                 }
                 _ = rs.keepalive_futures.next() => {
                     let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
                     let effects = self.apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr).await;
-                    Self::process_effects(effects, global, self.remote_addr).await;
+                    Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
                 }
                 msg = peer_event_futures.next().fuse() => {
                     if let Some(Some(msg)) = msg {
@@ -4637,6 +4906,7 @@ impl Connection {
             // Hold timer setup is now handled by apply_outputs (SetHoldTimer).
         }
         if let Some(source) = self.source.take() {
+            let gr_active = self.negotiated_gr.is_some();
             let import_policy = self.tables.import_policy.load_full();
             let export_policy = self.tables.export_policy.load_full();
             let kernel_tx = self.tables.kernel_tx.load_full();
@@ -4644,12 +4914,14 @@ impl Connection {
                 let mut t = self.tables.shards[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
                 t.addpath.remove(&self.remote_addr);
-                t.event(
-                    TableEvent::Disconnected(source.clone()),
-                    kernel_tx.as_deref(),
-                    import_policy.as_deref(),
-                    export_policy.as_deref(),
-                );
+                if !gr_active {
+                    t.event(
+                        TableEvent::Disconnected(source.clone()),
+                        kernel_tx.as_deref(),
+                        import_policy.as_deref(),
+                        export_policy.as_deref(),
+                    );
+                }
                 let reason = self
                     .shutdown
                     .take()
@@ -4669,6 +4941,9 @@ impl Connection {
                         let _ = bmp_tx.send(m);
                     }
                 }
+            }
+            if gr_active {
+                disconnect.source = Some(source);
             }
         }
         disconnect.export_map = std::mem::take(&mut self.export_map);
@@ -5110,7 +5385,7 @@ mod tests {
             txbuf_size: 1 << 16,
         };
         let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
-        Connection::process_effects(effects, &global, remote_addr).await;
+        Connection::process_effects(effects, &global, remote_addr, &tables).await;
 
         let received = active_close_rx
             .try_recv()
@@ -5183,7 +5458,7 @@ mod tests {
             txbuf_size: 1 << 16,
         };
         let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
-        Connection::process_effects(effects, &global, remote_addr).await;
+        Connection::process_effects(effects, &global, remote_addr, &tables).await;
 
         let received = active_close_rx
             .try_recv()
