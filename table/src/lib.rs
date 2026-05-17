@@ -26,6 +26,7 @@ use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use bytes::BytesMut;
@@ -184,6 +185,8 @@ impl Ord for Path {
             .then_with(|| self.pa.attr_origin().cmp(&other.pa.attr_origin()))
             // eBGP preferred over iBGP
             .then_with(|| self.source.peer_type().cmp(&other.source.peer_type()))
+            // Non-stale is better than stale (false < true, and Less = better here)
+            .then_with(|| self.source.is_stale().cmp(&other.source.is_stale()))
             // Lower originator ID / router ID is better
             .then_with(|| self.originator_id().cmp(&other.originator_id()))
     }
@@ -354,6 +357,7 @@ pub struct Source {
     pub router_id: u32,
     pub uptime: u64,
     rs_client: bool,
+    stale: AtomicBool,
 }
 
 impl Hash for Source {
@@ -380,7 +384,16 @@ impl Source {
             router_id: router_id.into(),
             uptime,
             rs_client,
+            stale: AtomicBool::new(false),
         }
+    }
+
+    pub fn mark_stale(&self) {
+        self.stale.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.stale.load(Ordering::Relaxed)
     }
 
     fn peer_type(&self) -> PeerType {
@@ -3332,5 +3345,101 @@ mod tests {
         let ids: Vec<u32> = best.iter().map(|c| c.path_id).collect();
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
+    }
+
+    // --- GR stale ---
+
+    #[test]
+    fn mark_stale_sets_flag() {
+        let s = source(1, 65001, 65000, 1);
+        assert!(!s.is_stale());
+        s.mark_stale();
+        assert!(s.is_stale());
+    }
+
+    #[test]
+    fn stale_routes_still_returned_by_best() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s = source(1, 65001, 65000, 1);
+        rt.insert(
+            s.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+
+        s.mark_stale();
+
+        let best = rt.best(&Family::IPV4);
+        assert_eq!(best.len(), 1);
+        assert!(best[0].source.is_stale());
+    }
+
+    #[test]
+    fn fresh_and_stale_compete_in_best_path() {
+        // Simulate GR: existing route is marked stale, then a fresh route arrives
+        // from a different peer. The fresh peer has a higher router_id (worse
+        // tie-breaker) but must win because non-stale beats stale.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let stale_src = source(1, 65001, 65000, 1); // router_id=1 (better tie-breaker)
+        let fresh_src = source(2, 65002, 65000, 2); // router_id=2 (worse tie-breaker)
+
+        rt.insert(
+            stale_src.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+
+        // Mark stale before the fresh route arrives (as GR does after session drop)
+        stale_src.mark_stale();
+
+        rt.insert(
+            fresh_src.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+
+        let best = rt.best(&Family::IPV4);
+        assert_eq!(best.len(), 2);
+        // rank=1 (best) should be the fresh source despite worse router_id
+        let winner = best.iter().find(|c| c.rank == 1).unwrap();
+        assert!(!winner.source.is_stale());
+        let loser = best.iter().find(|c| c.rank == 2).unwrap();
+        assert!(loser.source.is_stale());
+    }
+
+    #[test]
+    fn drop_stale_source_removes_routes() {
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s = source(1, 65001, 65000, 1);
+        rt.insert(
+            s.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+
+        s.mark_stale();
+        assert_eq!(rt.best(&Family::IPV4).len(), 1);
+
+        rt.drop(s);
+        assert!(rt.best(&Family::IPV4).is_empty());
     }
 }
