@@ -21,6 +21,7 @@ mod convert;
 mod error;
 mod event;
 mod fsm;
+mod gr;
 mod peer_tx;
 mod policy;
 mod proto;
