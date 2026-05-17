@@ -4274,7 +4274,7 @@ impl Connection {
                     .peer_fsm
                     .lock()
                     .unwrap()
-                    .session(self.role)
+                    .connection(self.role)
                     .and_then(|s| s.send_max().get(f))
                     .copied()
                     .unwrap_or(1);
@@ -4388,7 +4388,7 @@ impl Connection {
             .peer_fsm
             .lock()
             .unwrap()
-            .session(self.role)
+            .connection(self.role)
             .and_then(|s| s.send_max().get(&family))
             .copied()
             .unwrap_or(1);
@@ -4416,14 +4416,14 @@ impl Connection {
         let mut effects = Vec::new();
         for output in outputs {
             match output {
-                crate::fsm::PeerFsmOutput::Session(role, crate::fsm::Output::SendMessage(m)) => {
+                crate::fsm::PeerFsmOutput::Connection(role, crate::fsm::Output::SendMessage(m)) => {
                     if role == self.role {
                         rs.urgent.push(m);
                     } else {
                         effects.push(GlobalEffect::SendCease { role, msg: m });
                     }
                 }
-                crate::fsm::PeerFsmOutput::Session(
+                crate::fsm::PeerFsmOutput::Connection(
                     _,
                     crate::fsm::Output::SetKeepaliveTimer(secs),
                 ) => {
@@ -4431,12 +4431,15 @@ impl Connection {
                         .into_iter()
                         .collect();
                 }
-                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SetHoldTimer(secs)) => {
+                crate::fsm::PeerFsmOutput::Connection(
+                    _,
+                    crate::fsm::Output::SetHoldTimer(secs),
+                ) => {
                     rs.holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
                 }
-                crate::fsm::PeerFsmOutput::Session(
+                crate::fsm::PeerFsmOutput::Connection(
                     _,
                     crate::fsm::Output::ChannelsNegotiated(channels),
                 ) => {
@@ -4479,7 +4482,7 @@ impl Connection {
                     }
                     rs.framer.inner_mut().channel = channels;
                 }
-                crate::fsm::PeerFsmOutput::Session(
+                crate::fsm::PeerFsmOutput::Connection(
                     _,
                     crate::fsm::Output::SessionEstablished {
                         remote_asn,
@@ -4512,7 +4515,10 @@ impl Connection {
                     )
                     .await;
                 }
-                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SessionDown(reason)) => {
+                crate::fsm::PeerFsmOutput::Connection(
+                    _,
+                    crate::fsm::Output::SessionDown(reason),
+                ) => {
                     self.shutdown = Some(match reason {
                         crate::fsm::SessionDownReason::HoldTimerExpired => {
                             bmp::PeerDownReason::LocalFsm(0)
@@ -4531,10 +4537,13 @@ impl Connection {
                         }
                     });
                 }
-                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::StateChanged(s)) => {
+                crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::StateChanged(s)) => {
                     self.state.fsm.store(u8::from(s), Ordering::Relaxed);
                 }
-                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::RouteRefresh(family)) => {
+                crate::fsm::PeerFsmOutput::Connection(
+                    _,
+                    crate::fsm::Output::RouteRefresh(family),
+                ) => {
                     self.do_route_refresh(family, rs).await;
                 }
                 crate::fsm::PeerFsmOutput::CloseConnection(_) => {
@@ -4645,7 +4654,7 @@ impl Connection {
                 .unwrap()
                 .process(self.role, crate::fsm::Input::UpdateSent);
             for output in outputs {
-                if let crate::fsm::PeerFsmOutput::Session(
+                if let crate::fsm::PeerFsmOutput::Connection(
                     _,
                     crate::fsm::Output::SetKeepaliveTimer(secs),
                 ) = output
@@ -4717,7 +4726,7 @@ impl Connection {
             .peer_fsm
             .lock()
             .unwrap()
-            .session(self.role)
+            .connection(self.role)
             .and_then(|s| s.send_max().get(&ri.family))
             .copied()
             .unwrap_or(1);
@@ -4726,7 +4735,7 @@ impl Connection {
                 .peer_fsm
                 .lock()
                 .unwrap()
-                .session(self.role)
+                .connection(self.role)
                 .is_some_and(|s| s.send_max().contains_key(&ri.family))
                 && ri.old_rank > 0
                 && ri.old_rank <= effective_max
@@ -4786,7 +4795,7 @@ impl Connection {
         let has_session_down = outputs.iter().any(|o| {
             matches!(
                 o,
-                crate::fsm::PeerFsmOutput::Session(_, crate::fsm::Output::SessionDown(_))
+                crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::SessionDown(_))
             )
         });
         let effects = self
@@ -5415,7 +5424,7 @@ mod tests {
 
         let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
 
-        let outputs = vec![crate::fsm::PeerFsmOutput::Session(
+        let outputs = vec![crate::fsm::PeerFsmOutput::Connection(
             crate::fsm::Role::Active,
             crate::fsm::Output::SendMessage(cease_notification()),
         )];
@@ -5461,7 +5470,7 @@ mod tests {
             g.peers.get_mut(&remote_addr).unwrap().active_close_tx = CloseTx(Some(active_close_tx));
         }
 
-        let outputs = vec![crate::fsm::PeerFsmOutput::Session(
+        let outputs = vec![crate::fsm::PeerFsmOutput::Connection(
             crate::fsm::Role::Active,
             crate::fsm::Output::SendMessage(cease_notification()),
         )];
