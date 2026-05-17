@@ -100,9 +100,27 @@ impl GrState {
             ),
 
             // Peer reconnected while restart timer was running.
-            (Inner::Restarting { .. }, GrInput::SessionEstablished { gr_families }) => {
-                let pending = gr_families.into_iter().collect();
-                (Inner::WaitingEor { pending }, vec![GrOutput::StopTimer])
+            (Inner::Restarting { stale_families }, GrInput::SessionEstablished { gr_families }) => {
+                let gr_set: FnvHashSet<Family> = gr_families.into_iter().collect();
+
+                // Families that were stale but are no longer in the new GR capability
+                // must be deleted immediately (RFC 4724 §4.2).
+                let dropped: Vec<Family> = stale_families
+                    .into_iter()
+                    .filter(|f| !gr_set.contains(f))
+                    .collect();
+
+                let mut outputs = vec![GrOutput::StopTimer];
+                if !dropped.is_empty() {
+                    outputs.push(GrOutput::DeleteStaleRoutes(dropped));
+                }
+
+                let new_state = if gr_set.is_empty() {
+                    Inner::Idle
+                } else {
+                    Inner::WaitingEor { pending: gr_set }
+                };
+                (new_state, outputs)
             }
 
             // Restart timer fired before peer reconnected.
@@ -247,6 +265,47 @@ mod tests {
         assert!(matches!(&outputs[0], GrOutput::MarkStale(f) if f.len() == 2));
         assert!(matches!(&outputs[1], GrOutput::StartTimer(d) if *d == Duration::from_secs(60)));
         assert!(matches!(gr.state, Inner::Restarting { .. }));
+    }
+
+    #[test]
+    fn reconnect_with_fewer_gr_families_deletes_dropped_families() {
+        // Stale: IPv4 + IPv6; new OPEN only declares IPv4 for GR.
+        // IPv6 stale routes must be deleted immediately (RFC 4724 §4.2).
+        let mut gr = GrState::new();
+        gr.process(GrInput::SessionDropped {
+            families: vec![ipv4(), ipv6()],
+            restart_time: restart_time(),
+        });
+
+        let outputs = gr.process(GrInput::SessionEstablished {
+            gr_families: vec![ipv4()],
+        });
+
+        // StopTimer + DeleteStaleRoutes([IPv6])
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(outputs[0], GrOutput::StopTimer));
+        assert!(matches!(&outputs[1], GrOutput::DeleteStaleRoutes(f) if f == &[ipv6()]));
+        // IPv4 still waiting for EOR
+        assert!(matches!(gr.state, Inner::WaitingEor { .. }));
+    }
+
+    #[test]
+    fn reconnect_with_no_gr_families_deletes_all_and_goes_idle() {
+        // New OPEN carries no GR families at all → all stale routes deleted.
+        let mut gr = GrState::new();
+        gr.process(GrInput::SessionDropped {
+            families: vec![ipv4(), ipv6()],
+            restart_time: restart_time(),
+        });
+
+        let outputs = gr.process(GrInput::SessionEstablished {
+            gr_families: vec![],
+        });
+
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(outputs[0], GrOutput::StopTimer));
+        assert!(matches!(&outputs[1], GrOutput::DeleteStaleRoutes(f) if f.len() == 2));
+        assert!(matches!(gr.state, Inner::Idle));
     }
 
     #[test]
