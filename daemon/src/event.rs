@@ -152,6 +152,20 @@ struct CloseTx(Option<tokio::sync::oneshot::Sender<bgp::Message>>);
 #[derive(Default)]
 struct ActiveConnectCancel(Option<tokio::sync::oneshot::Sender<()>>);
 
+/// GR helper configuration for a single peer.
+/// `None` in `PeerConfig::graceful_restart` means GR is disabled.
+#[derive(Clone)]
+#[allow(dead_code)]
+struct GrPeerConfig {
+    /// Restart Time advertised in our OPEN (12-bit, max 4095 s).
+    restart_time: u16,
+    /// Local Selection Deferral Timer: how long to wait for EOR after
+    /// the peer reconnects before deleting remaining stale routes.
+    deferral_time: std::time::Duration,
+    /// Families included in the GR capability (non-empty by construction).
+    families: Vec<Family>,
+}
+
 #[derive(Clone)]
 struct PeerConfig {
     remote_addr: IpAddr,
@@ -172,6 +186,9 @@ struct PeerConfig {
     send_max: FnvHashMap<Family, usize>,
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
+    /// GR helper config; None = GR disabled.
+    #[allow(dead_code)]
+    graceful_restart: Option<GrPeerConfig>,
 }
 
 struct Peer {
@@ -280,6 +297,7 @@ struct PeerBuilder {
     families: FnvHashMap<Family, u8>,
     send_max: FnvHashMap<Family, usize>,
     prefix_limits: FnvHashMap<Family, u32>,
+    graceful_restart: Option<GrPeerConfig>,
 }
 
 impl PeerBuilder {
@@ -307,6 +325,7 @@ impl PeerBuilder {
             families: Default::default(),
             send_max: Default::default(),
             prefix_limits: Default::default(),
+            graceful_restart: None,
         }
     }
 
@@ -395,6 +414,11 @@ impl PeerBuilder {
         self
     }
 
+    fn graceful_restart(&mut self, gr: Option<GrPeerConfig>) -> &mut Self {
+        self.graceful_restart = gr;
+        self
+    }
+
     fn addpath(&mut self, families: Vec<(packet::Family, u8, usize)>) -> &mut Self {
         for (f, mode, sm) in families {
             // RFC 7911 mode is 2 bits: bit 0 = receive, bit 1 = send
@@ -438,6 +462,13 @@ impl PeerBuilder {
                 }
             }
         }
+        if let Some(gr) = &self.graceful_restart {
+            self.local_cap.push(packet::Capability::GracefulRestart {
+                flags: 0,
+                restart_time: gr.restart_time,
+                families: gr.families.iter().map(|f| (*f, 0)).collect(),
+            });
+        }
         Peer {
             config: PeerConfig {
                 remote_addr: self.remote_addr,
@@ -458,6 +489,7 @@ impl PeerBuilder {
                 password: self.password.take(),
                 send_max: std::mem::take(&mut self.send_max),
                 prefix_limits: std::mem::take(&mut self.prefix_limits),
+                graceful_restart: self.graceful_restart.take(),
             },
             admin_down: self.admin_down,
             local_sockaddr: self.local_sockaddr,
@@ -728,6 +760,53 @@ impl TryFrom<&config::Neighbor> for Peer {
 
         builder.families(families);
         builder.addpath(addpath_families);
+
+        // Build GR helper config from graceful-restart + per-family mp-graceful-restart.
+        {
+            const DEFAULT_RESTART_TIME: u16 = 120;
+            const DEFAULT_DEFERRAL_SECS: u64 = 360;
+
+            let gr_config = n
+                .graceful_restart
+                .as_ref()
+                .and_then(|gr| gr.config.as_ref());
+            let gr_enabled = gr_config.and_then(|c| c.enabled).unwrap_or(false);
+
+            if gr_enabled {
+                let gr_families: Vec<Family> = afi_safis
+                    .iter()
+                    .filter(|a| {
+                        a.mp_graceful_restart
+                            .as_ref()
+                            .and_then(|gr| gr.config.as_ref())
+                            .and_then(|c| c.enabled)
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|a| {
+                        convert::family_from_config(a.config.as_ref()?.afi_safi_name.as_ref()?).ok()
+                    })
+                    .collect();
+
+                if !gr_families.is_empty() {
+                    let restart_time = gr_config
+                        .and_then(|c| c.restart_time)
+                        .unwrap_or(DEFAULT_RESTART_TIME);
+                    let deferral_secs = gr_config
+                        .and_then(|c| c.deferral_time.map(|v| v as u64))
+                        .or_else(|| {
+                            gr_config
+                                .and_then(|c| c.stale_routes_time)
+                                .map(|v| v as u64)
+                        })
+                        .unwrap_or(DEFAULT_DEFERRAL_SECS);
+                    builder.graceful_restart(Some(GrPeerConfig {
+                        restart_time,
+                        deferral_time: std::time::Duration::from_secs(deferral_secs),
+                        families: gr_families,
+                    }));
+                }
+            }
+        }
 
         // Extract per-family prefix limits.
         for afi_safi in afi_safis {
