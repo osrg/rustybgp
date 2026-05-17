@@ -3688,10 +3688,23 @@ fn find_link_local(local: &SocketAddr) -> Option<Ipv6Addr> {
     })
 }
 
+/// GR state negotiated during the last OPEN exchange.
+/// Stored in DisconnectInfo so peer_loop can drive GrState on session drop.
+#[allow(dead_code)]
+struct NegotiatedGr {
+    /// Intersection of local and remote GR families.
+    families: Vec<Family>,
+    /// Restart Time from the peer's OPEN GR capability.
+    restart_time: std::time::Duration,
+}
+
 struct DisconnectInfo {
     role: crate::fsm::Role,
     remote_addr: IpAddr,
     export_map: ExportMap,
+    /// Set when GR was successfully negotiated for at least one family.
+    #[allow(dead_code)]
+    negotiated_gr: Option<NegotiatedGr>,
 }
 
 async fn peer_loop(
@@ -3810,6 +3823,8 @@ struct Connection {
     prefix_limits: FnvHashMap<Family, u32>,
     tables: TableHandle,
     export_map: ExportMap,
+    /// GR negotiation result from the most recent OPEN exchange.
+    negotiated_gr: Option<NegotiatedGr>,
 }
 
 impl Connection {
@@ -3853,6 +3868,42 @@ impl Connection {
             prefix_limits,
             tables,
             export_map,
+            negotiated_gr: None,
+        })
+    }
+
+    /// Compute the intersection of local and remote GR families.
+    /// Returns None if local_cap has no GR capability, the peer sent none,
+    /// or if no families overlap.
+    fn negotiate_gr(&self, remote_capabilities: &[packet::Capability]) -> Option<NegotiatedGr> {
+        let local_families: Vec<Family> = self.local_cap.iter().find_map(|c| match c {
+            packet::Capability::GracefulRestart { families, .. } => {
+                Some(families.iter().map(|(f, _)| *f).collect())
+            }
+            _ => None,
+        })?;
+
+        let (peer_restart_time, peer_families) =
+            remote_capabilities.iter().find_map(|c| match c {
+                packet::Capability::GracefulRestart {
+                    restart_time,
+                    families,
+                    ..
+                } => Some((*restart_time, families.as_slice())),
+                _ => None,
+            })?;
+
+        let negotiated: Vec<Family> = local_families
+            .into_iter()
+            .filter(|f| peer_families.iter().any(|(pf, _)| pf == f))
+            .collect();
+
+        if negotiated.is_empty() {
+            return None;
+        }
+        Some(NegotiatedGr {
+            families: negotiated,
+            restart_time: std::time::Duration::from_secs(peer_restart_time as u64),
         })
     }
 
@@ -4116,6 +4167,11 @@ impl Connection {
                     self.state
                         .remote_holdtime
                         .store(remote_holdtime, Ordering::Relaxed);
+
+                    // Compute GR negotiation result before remote_capabilities
+                    // is consumed by Arc::new below.
+                    self.negotiated_gr = self.negotiate_gr(&remote_capabilities);
+
                     self.state
                         .remote_cap
                         .store(Some(Arc::new(remote_capabilities)));
@@ -4423,6 +4479,7 @@ impl Connection {
             role: self.role,
             remote_addr: self.remote_addr,
             export_map: ExportMap::new(),
+            negotiated_gr: None,
         };
         let mut stream = self.stream.take().unwrap();
         let Ok(remote_sockaddr) = stream.peer_addr() else {
@@ -4615,6 +4672,7 @@ impl Connection {
             }
         }
         disconnect.export_map = std::mem::take(&mut self.export_map);
+        disconnect.negotiated_gr = self.negotiated_gr.take();
         disconnect
     }
 }
