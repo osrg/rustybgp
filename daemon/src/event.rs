@@ -142,10 +142,67 @@ struct PeerState {
     remote_cap: ArcSwapOption<Vec<packet::Capability>>,
 }
 
-/// Wraps a oneshot Sender so that `Peer` can derive `Clone`.
-/// Cloning produces `None` — the clone is for read-only listing, not signalling.
-#[derive(Default)]
-struct CloseTx(Option<tokio::sync::oneshot::Sender<bgp::Message>>);
+/// Holds the connection FSM and the one-shot channels used to deliver
+/// a CEASE Notification to the active or passive connection (collision loser).
+/// A single mutex covers all three so that collision detection and
+/// CEASE delivery are atomic.
+struct ConnArbiter {
+    fsm: crate::fsm::PeerFsm,
+    active_close_tx: Option<tokio::sync::oneshot::Sender<bgp::Message>>,
+    passive_close_tx: Option<tokio::sync::oneshot::Sender<bgp::Message>>,
+}
+
+impl ConnArbiter {
+    fn new(fsm: crate::fsm::PeerFsm) -> Self {
+        ConnArbiter {
+            fsm,
+            active_close_tx: None,
+            passive_close_tx: None,
+        }
+    }
+
+    /// Process an FSM input for the given role.
+    ///
+    /// Collision CEASE outputs (SendMessage to the other role) are delivered
+    /// directly via the stored close_tx and are not returned to the caller.
+    /// CloseConnection outputs for the other role are also dropped; the losing
+    /// connection handles its own shutdown when it receives the CEASE.
+    fn process(
+        &mut self,
+        role: crate::fsm::Role,
+        input: crate::fsm::Input,
+    ) -> Vec<crate::fsm::PeerFsmOutput> {
+        let outputs = self.fsm.process(role, input);
+        let mut result = Vec::new();
+        for output in outputs {
+            match output {
+                crate::fsm::PeerFsmOutput::Connection(
+                    out_role,
+                    crate::fsm::Output::SendMessage(msg),
+                ) if out_role != role => {
+                    let tx = match out_role {
+                        crate::fsm::Role::Active => self.active_close_tx.take(),
+                        crate::fsm::Role::Passive => self.passive_close_tx.take(),
+                    };
+                    if let Some(tx) = tx {
+                        let _ = tx.send(msg);
+                    }
+                }
+                crate::fsm::PeerFsmOutput::CloseConnection(out_role) if out_role != role => {}
+                other => result.push(other),
+            }
+        }
+        result
+    }
+
+    fn state(&self, role: crate::fsm::Role) -> crate::fsm::State {
+        self.fsm.state(role)
+    }
+
+    fn connection(&self, role: crate::fsm::Role) -> Option<&crate::fsm::Connection> {
+        self.fsm.connection(role)
+    }
+}
 
 /// Cancellation handle for the active-connect retry task.
 /// Cloning produces `None`; dropping the inner `Sender` signals the task to exit.
@@ -203,20 +260,12 @@ struct Peer {
     counter_tx: Arc<MessageCounter>,
     counter_rx: Arc<MessageCounter>,
 
-    /// Shared FSM for this peer; active and passive Connections for the same peer
-    /// share one instance so collision detection sees both sessions.
-    ///
-    /// `Option` because `PeerFsm::new` requires `local_router_id`, which is
-    /// only known in `Global` but not at `Peer` construction time
-    /// (`PeerBuilder::build`). It is always `Some` after `Global::add_peer`.
-    peer_fsm: Option<Arc<std::sync::Mutex<crate::fsm::PeerFsm>>>,
+    /// Shared arbiter for this peer: holds PeerFsm and collision close-channels.
+    /// None until Global::add_peer initialises it (requires local_router_id).
+    conn_arbiter: Option<Arc<std::sync::Mutex<ConnArbiter>>>,
     /// Cancels the active-connect retry loop spawned by `enable_active_connect`.
     /// Dropping the inner sender signals the task to exit.
     active_connect_cancel_tx: ActiveConnectCancel,
-    /// One-shot channels used by the collision winner to deliver a CEASE
-    /// Notification to the losing Connection. Each is consumed at most once.
-    active_close_tx: CloseTx,
-    passive_close_tx: CloseTx,
     export_map: ExportMap,
     /// GR helper state machine; persists across sessions.
     gr_state: crate::gr::GrState,
@@ -285,8 +334,11 @@ impl Peer {
             .fsm
             .store(SessionState::Idle as u8, Ordering::Relaxed);
         self.active_connect_cancel_tx = ActiveConnectCancel::default();
-        self.active_close_tx = CloseTx::default();
-        self.passive_close_tx = CloseTx::default();
+        if let Some(arb) = &self.conn_arbiter {
+            let mut arb = arb.lock().unwrap();
+            arb.active_close_tx = None;
+            arb.passive_close_tx = None;
+        }
     }
 }
 
@@ -518,10 +570,8 @@ impl PeerBuilder {
             }),
             counter_tx: Default::default(),
             counter_rx: Default::default(),
-            peer_fsm: None,
+            conn_arbiter: None,
             active_connect_cancel_tx: ActiveConnectCancel::default(),
-            active_close_tx: CloseTx::default(),
-            passive_close_tx: CloseTx::default(),
             export_map: ExportMap::new(),
             gr_state: crate::gr::GrState::new(),
             gr_source: None,
@@ -1093,17 +1143,20 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::DeletePeerResponse>, tonic::Status> {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
             let mut global = self.global.write().await;
-            if let Some(mut p) = global.peers.remove(&peer_addr) {
+            if let Some(p) = global.peers.remove(&peer_addr) {
                 let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
                     code: 6,
                     subcode: 3,
                     data: vec![],
                 });
-                for tx in [p.active_close_tx.0.take(), p.passive_close_tx.0.take()]
-                    .into_iter()
-                    .flatten()
-                {
-                    let _ = tx.send(cease.clone());
+                if let Some(arb) = &p.conn_arbiter {
+                    let mut arb = arb.lock().unwrap();
+                    for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let _ = tx.send(cease.clone());
+                    }
                 }
                 if p.config.password.is_some() {
                     for fd in &global.listen_sockets {
@@ -1239,11 +1292,14 @@ impl GoBgpService for GrpcService {
                             subcode: 2,
                             data: vec![],
                         });
-                        for tx in [p.active_close_tx.0.take(), p.passive_close_tx.0.take()]
-                            .into_iter()
-                            .flatten()
-                        {
-                            let _ = tx.send(cease.clone());
+                        if let Some(arb) = &p.conn_arbiter {
+                            let mut arb = arb.lock().unwrap();
+                            for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                let _ = tx.send(cease.clone());
+                            }
                         }
                         return Ok(tonic::Response::new(api::DisablePeerResponse {}));
                     }
@@ -2881,13 +2937,15 @@ impl Global {
                 }
             }
         }
-        peer.peer_fsm = Some(Arc::new(std::sync::Mutex::new(crate::fsm::PeerFsm::new(
-            u32::from(self.router_id),
-            peer.config.local_asn,
-            peer.config.local_cap.clone(),
-            peer.config.holdtime,
-            peer.config.remote_asn,
-            peer.config.send_max.clone(),
+        peer.conn_arbiter = Some(Arc::new(std::sync::Mutex::new(ConnArbiter::new(
+            crate::fsm::PeerFsm::new(
+                u32::from(self.router_id),
+                peer.config.local_asn,
+                peer.config.local_cap.clone(),
+                peer.config.holdtime,
+                peer.config.remote_asn,
+                peer.config.send_max.clone(),
+            ),
         ))));
         if peer.admin_down {
             peer.state
@@ -2922,7 +2980,7 @@ async fn accept_connection(
     tables: &TableHandle,
     stream: TcpStream,
     role: crate::fsm::Role,
-) -> Option<Connection> {
+) -> Option<PeerSession> {
     let local_sockaddr = stream.local_addr().ok()?;
     let remote_sockaddr = stream.peer_addr().ok()?;
     let remote_addr = remote_sockaddr.ip();
@@ -2936,10 +2994,10 @@ async fn accept_connection(
                 );
                 return None;
             }
-            let already_connected = match role {
-                crate::fsm::Role::Active => peer.active_close_tx.0.is_some(),
-                crate::fsm::Role::Passive => peer.passive_close_tx.0.is_some(),
-            };
+            let already_connected = peer.conn_arbiter.as_ref().is_some_and(|arb| match role {
+                crate::fsm::Role::Active => arb.lock().unwrap().active_close_tx.is_some(),
+                crate::fsm::Role::Passive => arb.lock().unwrap().passive_close_tx.is_some(),
+            });
             if already_connected {
                 println!("already has {:?} connection {}", role, remote_addr);
                 return None;
@@ -2996,20 +3054,27 @@ async fn accept_connection(
     } else {
         let _ = stream.set_ttl(1);
     }
-    let peer_fsm = Arc::clone(peer.peer_fsm.as_ref().expect("peer_fsm set in add_peer"));
+    let conn_arbiter = Arc::clone(
+        peer.conn_arbiter
+            .as_ref()
+            .expect("conn_arbiter set in add_peer"),
+    );
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<bgp::Message>();
-    match role {
-        crate::fsm::Role::Active => peer.active_close_tx = CloseTx(Some(close_tx)),
-        crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx(Some(close_tx)),
+    {
+        let mut arb = conn_arbiter.lock().unwrap();
+        match role {
+            crate::fsm::Role::Active => arb.active_close_tx = Some(close_tx),
+            crate::fsm::Role::Passive => arb.passive_close_tx = Some(close_tx),
+        }
     }
-    Connection::new(
+    PeerSession::new(
         stream,
         remote_addr,
         peer.config.local_asn,
         peer.config.local_cap.to_owned(),
         peer.config.route_server_client,
         role,
-        peer_fsm,
+        conn_arbiter,
         Some(close_rx),
         peer.state.clone(),
         peer.counter_tx.clone(),
@@ -3971,7 +4036,7 @@ async fn gr_handle_eor_received(
 }
 
 async fn peer_loop(
-    mut h: Connection,
+    mut h: PeerSession,
     global: GlobalHandle,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
 ) {
@@ -3988,9 +4053,12 @@ async fn peer_loop(
 
     let mut server = global.write().await;
     if let Some(peer) = server.peers.get_mut(&info.remote_addr) {
-        match info.role {
-            crate::fsm::Role::Active => peer.active_close_tx = CloseTx::default(),
-            crate::fsm::Role::Passive => peer.passive_close_tx = CloseTx::default(),
+        if let Some(arb) = &peer.conn_arbiter {
+            let mut arb = arb.lock().unwrap();
+            match info.role {
+                crate::fsm::Role::Active => arb.active_close_tx = None,
+                crate::fsm::Role::Passive => arb.passive_close_tx = None,
+            }
         }
 
         if let (Some(gr), Some(source)) = (&info.negotiated_gr, info.source) {
@@ -4044,8 +4112,12 @@ async fn peer_loop(
             drop(info.export_map);
         }
 
-        // Only reset and reconnect when no Connection remains for this peer.
-        if peer.active_close_tx.0.is_none() && peer.passive_close_tx.0.is_none() {
+        // Only reset and reconnect when no PeerSession remains for this peer.
+        let no_sessions = peer.conn_arbiter.as_ref().is_none_or(|arb| {
+            let arb = arb.lock().unwrap();
+            arb.active_close_tx.is_none() && arb.passive_close_tx.is_none()
+        });
+        if no_sessions {
             if peer.config.delete_on_disconnected {
                 server.peers.remove(&info.remote_addr);
             } else {
@@ -4060,12 +4132,6 @@ async fn peer_loop(
 /// Returned by `apply_outputs` and processed by `process_effects` so that
 /// `apply_outputs` itself has no async global dependency and is unit-testable.
 enum GlobalEffect {
-    /// Send a CEASE Notification to the connection with the given role
-    /// (collision loser dispatch via that connection's close_tx).
-    SendCease {
-        role: crate::fsm::Role,
-        msg: bgp::Message,
-    },
     /// Cancel the active-connect retry loop for this peer.
     StopActiveConnect,
     /// Peer reconnected while GR was active; drive GrState::SessionEstablished.
@@ -4118,7 +4184,7 @@ impl ExportMap {
     }
 }
 
-struct Connection {
+struct PeerSession {
     remote_addr: IpAddr,
     local_addr: IpAddr,
     /// IPv6 link-local address of the local interface (for 32-byte MP_REACH nexthop).
@@ -4135,7 +4201,7 @@ struct Connection {
 
     rs_client: bool,
 
-    peer_fsm: Arc<std::sync::Mutex<crate::fsm::PeerFsm>>,
+    conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
     role: crate::fsm::Role,
     /// Receives a CEASE Notification from an external signal (collision winner
     /// or admin operation); on receipt this Connection sends the message and closes.
@@ -4153,7 +4219,7 @@ struct Connection {
     negotiated_gr: Option<NegotiatedGr>,
 }
 
-impl Connection {
+impl PeerSession {
     #[allow(clippy::too_many_arguments)]
     fn new(
         stream: TcpStream,
@@ -4162,7 +4228,7 @@ impl Connection {
         local_cap: Vec<packet::Capability>,
         rs_client: bool,
         role: crate::fsm::Role,
-        peer_fsm: Arc<std::sync::Mutex<crate::fsm::PeerFsm>>,
+        conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
         close_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
         state: Arc<PeerState>,
         counter_tx: Arc<MessageCounter>,
@@ -4174,7 +4240,7 @@ impl Connection {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
         let link_addr = find_link_local(&local_sockaddr);
-        Some(Connection {
+        Some(PeerSession {
             remote_addr,
             local_addr,
             link_addr,
@@ -4184,7 +4250,7 @@ impl Connection {
             counter_rx,
             local_cap,
             rs_client,
-            peer_fsm,
+            conn_arbiter,
             role,
             close_rx,
             stream: Some(stream),
@@ -4271,7 +4337,7 @@ impl Connection {
             // Populate initial routes for each negotiated family.
             for f in codec.channel.keys() {
                 let effective_max = self
-                    .peer_fsm
+                    .conn_arbiter
                     .lock()
                     .unwrap()
                     .connection(self.role)
@@ -4385,7 +4451,7 @@ impl Connection {
         }
         let export_policy = self.tables.export_policy.load_full();
         let effective_max = self
-            .peer_fsm
+            .conn_arbiter
             .lock()
             .unwrap()
             .connection(self.role)
@@ -4416,12 +4482,8 @@ impl Connection {
         let mut effects = Vec::new();
         for output in outputs {
             match output {
-                crate::fsm::PeerFsmOutput::Connection(role, crate::fsm::Output::SendMessage(m)) => {
-                    if role == self.role {
-                        rs.urgent.push(m);
-                    } else {
-                        effects.push(GlobalEffect::SendCease { role, msg: m });
-                    }
+                crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::SendMessage(m)) => {
+                    rs.urgent.push(m);
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -4565,18 +4627,6 @@ impl Connection {
     ) {
         for effect in effects {
             match effect {
-                GlobalEffect::SendCease { role, msg } => {
-                    let mut g = global.write().await;
-                    if let Some(peer) = g.peers.get_mut(&remote_addr) {
-                        let tx = match role {
-                            crate::fsm::Role::Active => peer.active_close_tx.0.take(),
-                            crate::fsm::Role::Passive => peer.passive_close_tx.0.take(),
-                        };
-                        if let Some(tx) = tx {
-                            let _ = tx.send(msg);
-                        }
-                    }
-                }
                 GlobalEffect::StopActiveConnect => {
                     let mut g = global.write().await;
                     if let Some(peer) = g.peers.get_mut(&remote_addr) {
@@ -4649,7 +4699,7 @@ impl Connection {
         }
         if any_update_pending {
             let outputs = self
-                .peer_fsm
+                .conn_arbiter
                 .lock()
                 .unwrap()
                 .process(self.role, crate::fsm::Input::UpdateSent);
@@ -4713,7 +4763,7 @@ impl Connection {
     }
 
     fn handle_advertise(&mut self, rs: &mut RunState, ri: table::Change) {
-        if self.peer_fsm.lock().unwrap().state(self.role) != SessionState::Established {
+        if self.conn_arbiter.lock().unwrap().state(self.role) != SessionState::Established {
             return;
         }
         if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
@@ -4723,7 +4773,7 @@ impl Connection {
             return;
         }
         let effective_max = self
-            .peer_fsm
+            .conn_arbiter
             .lock()
             .unwrap()
             .connection(self.role)
@@ -4732,7 +4782,7 @@ impl Connection {
             .unwrap_or(1);
         if ri.rank > effective_max {
             if self
-                .peer_fsm
+                .conn_arbiter
                 .lock()
                 .unwrap()
                 .connection(self.role)
@@ -4788,7 +4838,7 @@ impl Connection {
         };
 
         let outputs = self
-            .peer_fsm
+            .conn_arbiter
             .lock()
             .unwrap()
             .process(self.role, crate::fsm::Input::MessageReceived(msg));
@@ -4808,7 +4858,7 @@ impl Connection {
             if has_session_down {
                 return Err(Error::Packet(
                     rustybgp_packet::BgpError::FsmUnexpectedState {
-                        state: u8::from(self.peer_fsm.lock().unwrap().state(self.role)),
+                        state: u8::from(self.conn_arbiter.lock().unwrap().state(self.role)),
                     }
                     .into(),
                 ));
@@ -4898,7 +4948,7 @@ impl Connection {
 
         // Kick off the OPEN exchange via the FSM.
         let outputs = self
-            .peer_fsm
+            .conn_arbiter
             .lock()
             .unwrap()
             .process(self.role, crate::fsm::Input::Connected);
@@ -4936,12 +4986,12 @@ impl Connection {
                 }
                 _ = rs.holdtime_futures.next() => {
                     println!("{}: holdtime expired", self.remote_addr);
-                    let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
+                    let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
                     let effects = self.apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr).await;
                     Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
                 }
                 _ = rs.keepalive_futures.next() => {
-                    let outputs = self.peer_fsm.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
+                    let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
                     let effects = self.apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr).await;
                     Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
                 }
@@ -5100,7 +5150,15 @@ mod tests {
             peer.state.fsm.load(Ordering::Relaxed),
             SessionState::Active as u8
         );
-        assert!(peer.passive_close_tx.0.is_some());
+        assert!(
+            peer.conn_arbiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .passive_close_tx
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -5121,7 +5179,15 @@ mod tests {
 
         let g = global.read().await;
         let peer = g.peers.get(&remote_addr).unwrap();
-        assert!(peer.active_close_tx.0.is_some());
+        assert!(
+            peer.conn_arbiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .active_close_tx
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -5153,7 +5219,15 @@ mod tests {
             g.add_peer(PeerBuilder::new(remote_addr).build(), None)
                 .unwrap();
             let (tx, _rx) = tokio::sync::oneshot::channel::<bgp::Message>();
-            g.peers.get_mut(&remote_addr).unwrap().passive_close_tx = CloseTx(Some(tx));
+            g.peers
+                .get_mut(&remote_addr)
+                .unwrap()
+                .conn_arbiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .passive_close_tx = Some(tx);
         }
 
         let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
@@ -5224,13 +5298,13 @@ mod tests {
         })
     }
 
-    /// Helper: add a peer and return a passive Connection via accept_connection.
+    /// Helper: add a peer and return a passive PeerSession via accept_connection.
     async fn passive_connection(
         global: &GlobalHandle,
         tables: &TableHandle,
         remote_addr: IpAddr,
         server: TcpStream,
-    ) -> Connection {
+    ) -> PeerSession {
         {
             let mut g = global.write().await;
             g.add_peer(PeerBuilder::new(remote_addr).build(), None)
@@ -5241,29 +5315,28 @@ mod tests {
             .unwrap()
     }
 
-    /// Returns a Connection with the Passive FSM driven to Established and source set.
+    /// Returns a PeerSession with the Passive FSM driven to Established and source set.
     async fn established_connection(
         global: &GlobalHandle,
         tables: &TableHandle,
         remote_addr: IpAddr,
         server: TcpStream,
-    ) -> Connection {
+    ) -> PeerSession {
         let mut conn = passive_connection(global, tables, remote_addr, server).await;
         {
-            let peer_fsm = Arc::clone(&conn.peer_fsm);
             let open = bgp::Message::Open(bgp::Open {
                 as_number: 65002,
                 holdtime: HoldTime::new(90).unwrap(),
                 router_id: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
                 capability: vec![],
             });
-            let mut fsm = peer_fsm.lock().unwrap();
-            fsm.process(crate::fsm::Role::Passive, crate::fsm::Input::Connected);
-            fsm.process(
+            let mut arb = conn.conn_arbiter.lock().unwrap();
+            arb.process(crate::fsm::Role::Passive, crate::fsm::Input::Connected);
+            arb.process(
                 crate::fsm::Role::Passive,
                 crate::fsm::Input::MessageReceived(open),
             );
-            fsm.process(
+            arb.process(
                 crate::fsm::Role::Passive,
                 crate::fsm::Input::MessageReceived(bgp::Message::Keepalive),
             );
@@ -5413,10 +5486,11 @@ mod tests {
         assert!(rs.pending[&Family::IPV4].is_empty());
     }
 
-    /// `apply_outputs` must return `GlobalEffect::SendCease` for a `SendMessage`
-    /// output targeting the other role, without touching global state.
+    /// `apply_outputs` places any `SendMessage` output into `rs.urgent`.
+    /// Cross-role CEASE delivery is now handled atomically by `ConnArbiter::process`
+    /// before outputs reach `apply_outputs`, so `apply_outputs` just queues them.
     #[tokio::test]
-    async fn apply_outputs_returns_send_cease_for_other_role() {
+    async fn apply_outputs_send_message_goes_to_urgent() {
         let global = make_global();
         let tables = make_tables();
         let (client, server) = loopback_pair().await;
@@ -5425,7 +5499,7 @@ mod tests {
         let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
 
         let outputs = vec![crate::fsm::PeerFsmOutput::Connection(
-            crate::fsm::Role::Active,
+            crate::fsm::Role::Passive,
             crate::fsm::Output::SendMessage(cease_notification()),
         )];
         let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
@@ -5439,61 +5513,17 @@ mod tests {
         };
         let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
 
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(
-            effects[0],
-            GlobalEffect::SendCease {
-                role: crate::fsm::Role::Active,
-                ..
-            }
-        ));
-    }
-
-    /// `apply_outputs` + `process_effects` must deliver the CEASE message to the
-    /// losing connection's oneshot channel.
-    #[tokio::test]
-    async fn collision_cease_dispatched_to_loser() {
-        // NOTE: outputs are hand-crafted; router-ID comparison is NOT exercised here.
-        // See collision_loser_determined_by_router_id for end-to-end coverage.
-        let global = make_global();
-        let tables = make_tables();
-        let (client, server) = loopback_pair().await;
-        let remote_addr = client.local_addr().unwrap().ip();
-
-        let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
-
-        // Simulate the losing active connection by pre-installing its close_tx.
-        let (active_close_tx, mut active_close_rx) =
-            tokio::sync::oneshot::channel::<bgp::Message>();
-        {
-            let mut g = global.write().await;
-            g.peers.get_mut(&remote_addr).unwrap().active_close_tx = CloseTx(Some(active_close_tx));
-        }
-
-        let outputs = vec![crate::fsm::PeerFsmOutput::Connection(
-            crate::fsm::Role::Active,
-            crate::fsm::Output::SendMessage(cease_notification()),
-        )];
-        let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
-        let mut rs = RunState {
-            urgent: Vec::new(),
-            framer: make_framer(),
-            keepalive_futures: make_timers(),
-            holdtime_futures: make_timers(),
-            pending: FnvHashMap::default(),
-            txbuf_size: 1 << 16,
-        };
-        let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
-        Connection::process_effects(effects, &global, remote_addr, &tables).await;
-
-        let received = active_close_rx
-            .try_recv()
-            .expect("CEASE not delivered to loser");
-        assert!(matches!(received, bgp::Message::Notification(_)));
+        // No GlobalEffect::SendCease — CEASE goes into rs.urgent directly.
+        assert!(effects.is_empty());
+        assert_eq!(rs.urgent.len(), 1);
+        assert!(matches!(rs.urgent[0], bgp::Message::Notification(_)));
+        let _ = tables;
     }
 
     /// End-to-end collision test: the loser is determined by real router-ID comparison
     /// inside `PeerFsm::check_collision`, not by hand-crafted outputs.
+    /// ConnArbiter::process delivers the CEASE directly to the losing connection's
+    /// close channel; no GlobalEffect/process_effects call is needed.
     ///
     /// make_global() sets local router_id = 1.0.0.1.
     /// Remote router_id = 10.0.0.1 (higher) → passive wins → active is the loser.
@@ -5504,15 +5534,16 @@ mod tests {
         let (client, server) = loopback_pair().await;
         let remote_addr = client.local_addr().unwrap().ip();
 
-        let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
+        passive_connection(&global, &tables, remote_addr, server).await;
 
-        // Pre-install active_close_tx so process_effects can deliver to it.
+        // Pre-install active_close_tx inside the arbiter.
         let (active_close_tx, mut active_close_rx) =
             tokio::sync::oneshot::channel::<bgp::Message>();
-        {
-            let mut g = global.write().await;
-            g.peers.get_mut(&remote_addr).unwrap().active_close_tx = CloseTx(Some(active_close_tx));
-        }
+        let conn_arbiter = {
+            let g = global.read().await;
+            Arc::clone(g.peers[&remote_addr].conn_arbiter.as_ref().unwrap())
+        };
+        conn_arbiter.lock().unwrap().active_close_tx = Some(active_close_tx);
 
         // remote router_id 10.0.0.1 > local 1.0.0.1 → passive wins → active is loser
         let open_msg = bgp::Message::Open(bgp::Open {
@@ -5522,47 +5553,27 @@ mod tests {
             capability: vec![],
         });
 
-        let peer_fsm = {
-            let g = global.read().await;
-            Arc::clone(g.peers[&remote_addr].peer_fsm.as_ref().unwrap())
-        };
-
-        // Active → OpenConfirm
-        peer_fsm
-            .lock()
-            .unwrap()
-            .process(crate::fsm::Role::Active, crate::fsm::Input::Connected);
-        peer_fsm.lock().unwrap().process(
-            crate::fsm::Role::Active,
-            crate::fsm::Input::MessageReceived(open_msg.clone()),
-        );
-
-        // Passive → OpenConfirm → collision detected → outputs include SendMessage to Active
-        peer_fsm
-            .lock()
-            .unwrap()
-            .process(crate::fsm::Role::Passive, crate::fsm::Input::Connected);
-        let outputs = peer_fsm.lock().unwrap().process(
-            crate::fsm::Role::Passive,
-            crate::fsm::Input::MessageReceived(open_msg),
-        );
-
-        let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
-        let mut rs = RunState {
-            urgent: Vec::new(),
-            framer: make_framer(),
-            keepalive_futures: make_timers(),
-            holdtime_futures: make_timers(),
-            pending: FnvHashMap::default(),
-            txbuf_size: 1 << 16,
-        };
-        let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
-        Connection::process_effects(effects, &global, remote_addr, &tables).await;
+        {
+            let mut arb = conn_arbiter.lock().unwrap();
+            // Active → OpenConfirm
+            arb.process(crate::fsm::Role::Active, crate::fsm::Input::Connected);
+            arb.process(
+                crate::fsm::Role::Active,
+                crate::fsm::Input::MessageReceived(open_msg.clone()),
+            );
+            // Passive → OpenConfirm → collision detected → CEASE sent directly to active_close_tx
+            arb.process(crate::fsm::Role::Passive, crate::fsm::Input::Connected);
+            arb.process(
+                crate::fsm::Role::Passive,
+                crate::fsm::Input::MessageReceived(open_msg),
+            );
+        }
 
         let received = active_close_rx
             .try_recv()
             .expect("CEASE not delivered to active (loser)");
         assert!(matches!(received, bgp::Message::Notification(_)));
+        let _ = tables; // suppress unused warning
     }
 
     #[test]
