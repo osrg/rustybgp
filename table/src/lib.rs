@@ -931,6 +931,34 @@ impl RoutingTable {
         advertise
     }
 
+    /// Re-run best-path selection for all destinations that have paths from
+    /// `source`, after `source.mark_stale()` has been called.  Returns the
+    /// same `Vec<Change>` diff format as `drop()` so the caller can distribute
+    /// withdraws / updates to other peers.
+    pub fn restale(&mut self, source: &Arc<Source>) -> Vec<Change> {
+        let mut changes = Vec::new();
+        for (family, rt) in self.global.iter_mut() {
+            for (net, dst) in rt.iter_mut() {
+                if !dst.entry.iter().any(|p| Arc::ptr_eq(&p.source, source)) {
+                    continue;
+                }
+                let old_top: Vec<TopNEntry> = dst
+                    .unfiltered_all()
+                    .iter()
+                    .map(|p| TopNEntry {
+                        source: p.source.clone(),
+                        nexthop: p.nexthop,
+                        attr: p.pa.attr.clone(),
+                        local_path_id: p.local_path_id,
+                    })
+                    .collect();
+                dst.entry.sort_unstable();
+                changes.extend(Self::diff_top_n(dst, &old_top, *family, *net));
+            }
+        }
+        changes
+    }
+
     pub fn iter_roa(&self, family: Family) -> impl Iterator<Item = (packet::IpNet, &Roa)> + '_ {
         self.rpki
             .roas
@@ -3441,5 +3469,87 @@ mod tests {
 
         rt.drop(s);
         assert!(rt.best(&Family::IPV4).is_empty());
+    }
+
+    #[test]
+    fn restale_demotes_stale_when_fresh_alternative_exists() {
+        // stale source has lower router_id (normally wins), fresh source has higher.
+        // After mark_stale + restale(), fresh must be rank=1.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let stale_src = source(1, 65001, 65000, 1); // router_id 1 (better without stale)
+        let fresh_src = source(2, 65001, 65000, 2); // router_id 2 (worse without stale)
+
+        rt.insert(
+            stale_src.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+        rt.insert(
+            fresh_src.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+
+        // Without stale, stale_src wins (lower router_id).
+        let best = rt.best(&Family::IPV4);
+        assert!(
+            best.iter()
+                .find(|c| c.rank == 1)
+                .unwrap()
+                .source
+                .remote_addr
+                == stale_src.remote_addr
+        );
+
+        // Simulate GR session drop: mark stale then re-select.
+        stale_src.mark_stale();
+        let changes = rt.restale(&stale_src);
+
+        // restale() must emit changes: old rank-1 (stale) loses to fresh.
+        assert!(!changes.is_empty());
+
+        let best = rt.best(&Family::IPV4);
+        let winner = best.iter().find(|c| c.rank == 1).unwrap();
+        assert_eq!(winner.source.remote_addr, fresh_src.remote_addr);
+        let loser = best.iter().find(|c| c.rank == 2).unwrap();
+        assert_eq!(loser.source.remote_addr, stale_src.remote_addr);
+    }
+
+    #[test]
+    fn restale_no_alternative_keeps_stale_as_best() {
+        // Only one source; after mark_stale + restale(), it stays as rank=1.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let src = source(1, 65001, 65000, 1);
+
+        rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+
+        src.mark_stale();
+        let changes = rt.restale(&src);
+
+        // No rank change → no changes emitted.
+        assert!(changes.is_empty());
+
+        let best = rt.best(&Family::IPV4);
+        assert_eq!(best.len(), 1);
+        assert_eq!(best[0].rank, 1);
+        assert!(best[0].source.is_stale());
     }
 }

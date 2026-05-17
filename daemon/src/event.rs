@@ -3386,6 +3386,8 @@ enum TableEvent {
         Option<bgp::Nexthop>,
     ),
     Disconnected(Arc<table::Source>),
+    /// Re-run best-path selection after marking a source stale (GR helper).
+    MarkStale(Arc<table::Source>),
     // RPKI events
     InsertRoa(Vec<(packet::IpNet, Arc<table::Roa>)>),
     Drop(Arc<IpAddr>),
@@ -3649,6 +3651,10 @@ impl Table {
                 let changes = self.rtable.drop(source.clone());
                 self.distribute_changes(changes, kernel_tx, None);
             }
+            TableEvent::MarkStale(source) => {
+                let changes = self.rtable.restale(&source);
+                self.distribute_changes(changes, kernel_tx, export_policy);
+            }
             TableEvent::InsertRoa(v) => {
                 for (net, roa) in v {
                     self.rtable.roa_insert(net, roa);
@@ -3725,6 +3731,12 @@ async fn gr_drop_source(tables: &TableHandle, source: Arc<table::Source>) {
         tables
             .event(i, TableEvent::Disconnected(source.clone()))
             .await;
+    }
+}
+
+async fn gr_restale_source(tables: &TableHandle, source: Arc<table::Source>) {
+    for i in 0..tables.shards.len() {
+        tables.event(i, TableEvent::MarkStale(source.clone())).await;
     }
 }
 
@@ -3895,6 +3907,15 @@ async fn peer_loop(
 ) {
     let tables = h.tables.clone();
     let info = h.run(&global).await;
+
+    // mark_stale() and the table re-selection event need no global lock, so
+    // do them here before acquiring it to avoid holding the lock during async
+    // table I/O.
+    if let (Some(_), Some(source)) = (&info.negotiated_gr, &info.source) {
+        source.mark_stale();
+        gr_restale_source(&tables, source.clone()).await;
+    }
+
     let mut server = global.write().await;
     if let Some(peer) = server.peers.get_mut(&info.remote_addr) {
         match info.role {
@@ -3903,7 +3924,7 @@ async fn peer_loop(
         }
 
         if let (Some(gr), Some(source)) = (&info.negotiated_gr, info.source) {
-            // GR active: mark source stale, start restart timer, preserve export_map.
+            // GR active: start restart timer, preserve export_map.
             if let Some(h) = peer.gr_deferral_timer.take() {
                 h.abort();
             }
@@ -3917,7 +3938,6 @@ async fn peer_loop(
                 tokio::spawn(async move { gr_drop_source(&tables_c, old).await });
             }
 
-            source.mark_stale();
             let outputs = peer.gr_state.process(crate::gr::GrInput::SessionDropped {
                 families: gr.families.clone(),
                 restart_time: gr.restart_time,
