@@ -226,6 +226,11 @@ struct Peer {
     gr_restart_timer: Option<tokio::task::AbortHandle>,
     /// Abort handle for the GR selection deferral timer task.
     gr_deferral_timer: Option<tokio::task::AbortHandle>,
+    /// Restarting-speaker tracking: families for which we have not yet received
+    /// EOR from this peer. Set on session-established when `Global::is_restarting`
+    /// and GR was negotiated; cleared family-by-family as EOR arrives; becomes
+    /// `Some(empty)` when done. `None` means this peer is not being tracked.
+    restarting_pending_eor: Option<FnvHashSet<Family>>,
 }
 
 /// Read-only view of a peer for gRPC list responses.
@@ -522,6 +527,7 @@ impl PeerBuilder {
             gr_source: None,
             gr_restart_timer: None,
             gr_deferral_timer: None,
+            restarting_pending_eor: None,
         }
     }
 }
@@ -2800,6 +2806,9 @@ struct Global {
     rpki_clients: FnvHashMap<SocketAddr, RpkiClient>,
     bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
     mrt_filenames: FnvHashSet<String>,
+    /// True when started with `--graceful-restart`; set R bit in GR capability.
+    /// Cleared once all peers with GR capability have sent EOR.
+    is_restarting: bool,
 }
 
 impl From<&Global> for api::Global {
@@ -2838,6 +2847,7 @@ impl Global {
             rpki_clients: FnvHashMap::default(),
             bmp_clients: FnvHashMap::default(),
             mrt_filenames: FnvHashSet::default(),
+            is_restarting: false,
         }
     }
 
@@ -2862,6 +2872,15 @@ impl Global {
         if !caps.contains(&Into::<u8>::into(&c)) {
             peer.config.local_cap.push(c);
         }
+        // If we started with --graceful-restart, set the R bit in our GR capability
+        // so the peer knows we are a restarting speaker.
+        if self.is_restarting {
+            for cap in &mut peer.config.local_cap {
+                if let packet::Capability::GracefulRestart { flags, .. } = cap {
+                    *flags |= 0x8;
+                }
+            }
+        }
         peer.peer_fsm = Some(Arc::new(std::sync::Mutex::new(crate::fsm::PeerFsm::new(
             u32::from(self.router_id),
             peer.config.local_asn,
@@ -2880,6 +2899,21 @@ impl Global {
         }
         self.peers.insert(peer.config.remote_addr, peer);
         Ok(())
+    }
+
+    /// Clear the restarting-speaker state: set R=0 in all peers' GR capability
+    /// so future reconnections do not carry the Restart State bit.
+    fn clear_restarting(&mut self) {
+        self.is_restarting = false;
+        for peer in self.peers.values_mut() {
+            peer.restarting_pending_eor = None;
+            for cap in &mut peer.config.local_cap {
+                if let packet::Capability::GracefulRestart { flags, .. } = cap {
+                    *flags &= !0x8;
+                }
+            }
+        }
+        println!("graceful-restart: all peers sent EOR; cleared restarting state");
     }
 }
 
@@ -2990,6 +3024,7 @@ impl Global {
     async fn serve(
         bgp: Option<config::BgpConfig>,
         any_peer: bool,
+        is_restarting: bool,
         active_tx: mpsc::UnboundedSender<TcpStream>,
         mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
     ) {
@@ -3010,11 +3045,14 @@ impl Global {
                 Ipv4Addr::new(0, 0, 0, 0)
             };
         let notify = Arc::new(tokio::sync::Notify::new());
-        if as_number != 0 {
-            notify.clone().notify_one();
+        if as_number != 0 || is_restarting {
             let g = &mut global.write().await;
-            g.asn = as_number;
-            g.router_id = router_id;
+            g.is_restarting = is_restarting;
+            if as_number != 0 {
+                notify.clone().notify_one();
+                g.asn = as_number;
+                g.router_id = router_id;
+            }
         }
         if let Some(mrt) = bgp.as_ref().and_then(|x| x.mrt_dump.as_ref()) {
             for m in mrt {
@@ -3667,9 +3705,9 @@ impl Table {
     }
 }
 
-pub(crate) async fn main(bgp: Option<config::BgpConfig>, any_peer: bool) {
+pub(crate) async fn main(bgp: Option<config::BgpConfig>, any_peer: bool, is_restarting: bool) {
     let (active_tx, active_rx) = mpsc::unbounded_channel();
-    Global::serve(bgp, any_peer, active_tx, active_rx).await;
+    Global::serve(bgp, any_peer, is_restarting, active_tx, active_rx).await;
 }
 
 /// For an IPv6 socket, find the link-local address of the same interface.
@@ -3794,6 +3832,7 @@ async fn gr_handle_session_established(
 ) {
     let (source_to_drop, deferral_duration) = {
         let mut server = global.write().await;
+        let local_is_restarting = server.is_restarting;
         if let Some(peer) = server.peers.get_mut(&remote_addr) {
             // Cancel the restart timer — peer reconnected in time.
             if let Some(h) = peer.gr_restart_timer.take() {
@@ -3810,6 +3849,12 @@ async fn gr_handle_session_established(
                 .as_ref()
                 .map(|g| g.families.clone())
                 .unwrap_or_default();
+
+            // Restarting-speaker side: track EOR per family from this peer.
+            if local_is_restarting && !gr_families.is_empty() {
+                peer.restarting_pending_eor =
+                    Some(gr_families.iter().cloned().collect::<FnvHashSet<_>>());
+            }
 
             let outputs = peer
                 .gr_state
@@ -3886,6 +3931,12 @@ async fn gr_handle_eor_received(
                     _ => {}
                 }
             }
+
+            // Restarting-speaker side: mark this family as received.
+            if let Some(pending) = &mut peer.restarting_pending_eor {
+                pending.remove(&family);
+            }
+
             if drop_source {
                 peer.gr_source.take()
             } else {
@@ -3897,6 +3948,25 @@ async fn gr_handle_eor_received(
     };
     if let Some(source) = source {
         gr_drop_source(tables, source).await;
+    }
+
+    // Check if all tracked peers have finished sending EOR; if so, clear the
+    // restarting-speaker state so future reconnections use R=0.
+    {
+        let mut server = global.write().await;
+        if server.is_restarting {
+            let any_pending = server
+                .peers
+                .values()
+                .any(|p| matches!(&p.restarting_pending_eor, Some(s) if !s.is_empty()));
+            let any_done = server
+                .peers
+                .values()
+                .any(|p| matches!(&p.restarting_pending_eor, Some(s) if s.is_empty()));
+            if !any_pending && any_done {
+                server.clear_restarting();
+            }
+        }
     }
 }
 

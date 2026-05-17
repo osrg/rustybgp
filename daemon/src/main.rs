@@ -59,6 +59,12 @@ async fn main() -> Result<(), std::io::Error> {
                 .action(clap::ArgAction::SetTrue)
                 .help("accept any peers"),
         )
+        .arg(
+            Arg::new("graceful-restart")
+                .long("graceful-restart")
+                .action(clap::ArgAction::SetTrue)
+                .help("set Restart State bit (R) in GR capability; clear after all peers send EOR"),
+        )
         .get_matches();
 
     let conf = if let Some(conf) = args.get_one::<String>("config") {
@@ -98,6 +104,11 @@ async fn main() -> Result<(), std::io::Error> {
 
     println!("Hello, RustyBGPd ({} cpus)!", num_cpus::get());
 
-    event::main(conf, args.get_flag("any")).await;
+    event::main(
+        conf,
+        args.get_flag("any"),
+        args.get_flag("graceful-restart"),
+    )
+    .await;
     Ok(())
 }
