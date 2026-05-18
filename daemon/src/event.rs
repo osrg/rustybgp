@@ -5078,6 +5078,14 @@ impl PeerSession {
                     crate::fsm::Role::Active => arb.active_close_tx = None,
                     crate::fsm::Role::Passive => arb.passive_close_tx = None,
                 }
+                // Ensure the FSM slot is cleared regardless of how the session
+                // ended.  When shutdown was set directly (I/O error, EOF, cease)
+                // the FSM never received a SessionDown output and its Connection
+                // slot may still be occupied; a stuck slot causes the next
+                // reconnect's Input::Connected to return CloseConnection.
+                // If the slot is already None (e.g. HoldTimerExpired went through
+                // the FSM) process() is a no-op.
+                let _ = arb.process(info.role, crate::fsm::Input::Disconnected);
             }
 
             let old_stale_source =

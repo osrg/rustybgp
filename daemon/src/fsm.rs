@@ -1458,4 +1458,42 @@ mod tests {
             )
         )));
     }
+
+    fn reach_established(peer: &mut PeerFsm, role: Role) {
+        connect(peer, role);
+        peer.process(
+            role,
+            Input::MessageReceived(remote_open_msg(65002, remote_router_id())),
+        );
+        peer.process(role, Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(peer.connection(role).unwrap().state(), State::Established);
+    }
+
+    // After Input::Disconnected the slot is cleared and reconnect succeeds.
+    #[test]
+    fn disconnected_clears_slot_and_allows_reconnect() {
+        let mut peer = make_peer_fsm(local_router_id(), 65002);
+        reach_established(&mut peer, Role::Active);
+
+        let out = peer.process(Role::Active, Input::Disconnected);
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::Connection(
+                Role::Active,
+                Output::SessionDown(SessionDownReason::IoError)
+            )
+        )));
+        assert!(peer.connection(Role::Active).is_none());
+
+        // Reconnect succeeds: OPEN is sent, no CloseConnection.
+        let out = peer.process(Role::Active, Input::Connected);
+        assert!(!has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::CloseConnection(_)
+        )));
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::Connection(Role::Active, Output::SendMessage(bgp::Message::Open(_)))
+        )));
+    }
 }
