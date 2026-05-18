@@ -4481,9 +4481,7 @@ impl PeerSession {
                         crate::fsm::SessionDownReason::RemoteNotification(msg) => {
                             bmp::PeerDownReason::RemoteNotification(msg)
                         }
-                        crate::fsm::SessionDownReason::FsmError(_) => {
-                            bmp::PeerDownReason::LocalFsm(0)
-                        }
+                        crate::fsm::SessionDownReason::FsmError => bmp::PeerDownReason::LocalFsm(0),
                         crate::fsm::SessionDownReason::AdminShutdown => {
                             bmp::PeerDownReason::LocalFsm(0)
                         }

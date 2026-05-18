@@ -114,11 +114,10 @@ pub(crate) enum Output {
 
 /// Reason the session is going down.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) enum SessionDownReason {
     HoldTimerExpired,
     RemoteNotification(bgp::Message),
-    FsmError(State),
+    FsmError,
     AdminShutdown,
     IoError,
 }
@@ -240,7 +239,7 @@ impl Connection {
                         state: u8::from(self.state),
                     },
                 )),
-                Output::SessionDown(SessionDownReason::FsmError(self.state)),
+                Output::SessionDown(SessionDownReason::FsmError),
             ];
         }
 
@@ -317,7 +316,7 @@ impl Connection {
                         state: u8::from(self.state),
                     },
                 )),
-                Output::SessionDown(SessionDownReason::FsmError(self.state)),
+                Output::SessionDown(SessionDownReason::FsmError),
             ],
         }
     }
@@ -330,7 +329,7 @@ impl Connection {
                         state: u8::from(self.state),
                     },
                 )),
-                Output::SessionDown(SessionDownReason::FsmError(self.state)),
+                Output::SessionDown(SessionDownReason::FsmError),
             ];
         }
         vec![Output::SetHoldTimer(self.negotiated_holdtime)]
@@ -350,7 +349,7 @@ impl Connection {
                         state: u8::from(self.state),
                     },
                 )),
-                Output::SessionDown(SessionDownReason::FsmError(self.state)),
+                Output::SessionDown(SessionDownReason::FsmError),
             ];
         }
         vec![Output::RouteRefresh(family)]
@@ -750,7 +749,7 @@ mod tests {
         )));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::FsmError(_))
+            Output::SessionDown(SessionDownReason::FsmError)
         )));
     }
 
@@ -952,7 +951,7 @@ mod tests {
         )));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::FsmError(_))
+            Output::SessionDown(SessionDownReason::FsmError)
         )));
     }
 
@@ -992,7 +991,7 @@ mod tests {
         )));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::FsmError(_))
+            Output::SessionDown(SessionDownReason::FsmError)
         )));
     }
 
