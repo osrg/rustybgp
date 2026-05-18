@@ -251,8 +251,6 @@ struct PeerConfig {
     route_server_client: bool,
     multihop_ttl: Option<u8>,
     password: Option<String>,
-    /// Per-family send_max for Add-Path TX (RFC 7911).
-    send_max: FnvHashMap<Family, usize>,
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
     /// GR helper config; None = GR disabled.
@@ -271,8 +269,7 @@ struct PeerConfig {
 /// can operate on `PeerContext` without holding the global write lock.
 struct PeerContext {
     /// Shared arbiter for this peer: holds PeerFsm and collision close-channels.
-    /// None until Global::add_peer initialises it (requires local_router_id).
-    conn_arbiter: Option<Arc<std::sync::Mutex<ConnArbiter>>>,
+    conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
     /// Cancels the active-connect retry loop spawned by `enable_active_connect`.
     active_connect_cancel_tx: ActiveConnectCancel,
     export_map: ExportMap,
@@ -379,8 +376,8 @@ impl Peer {
             .store(SessionState::Idle as u8, Ordering::Relaxed);
         let mut ctx = self.context.lock().unwrap();
         ctx.active_connect_cancel_tx = ActiveConnectCancel::default();
-        if let Some(arb) = &ctx.conn_arbiter {
-            let mut arb = arb.lock().unwrap();
+        {
+            let mut arb = ctx.conn_arbiter.lock().unwrap();
             arb.active_close_tx = None;
             arb.passive_close_tx = None;
         }
@@ -419,7 +416,16 @@ impl PeerParams {
     const DEFAULT_HOLD_TIME: u64 = 180;
     const DEFAULT_CONNECT_RETRY_TIME: u64 = 3;
 
-    fn build(self) -> Peer {
+    /// Build a `Peer` from these params.
+    ///
+    /// `local_router_id` is needed to construct `PeerFsm` for collision
+    /// detection; it is only known once `Global::router_id` is set, so callers
+    /// always go through `Global::add_peer` rather than calling this directly.
+    fn build(mut self, local_router_id: u32, global_asn: u32, is_restarting: bool) -> Peer {
+        if self.local_asn == 0 {
+            self.local_asn = global_asn;
+        }
+
         let mut local_cap: Vec<packet::Capability> = Vec::new();
         if self.families.is_empty() {
             local_cap.push(match self.remote_addr {
@@ -452,12 +458,35 @@ impl PeerParams {
             }
         }
         if let Some(gr) = &self.graceful_restart {
+            let flags = if is_restarting { 0x8 } else { 0 };
             local_cap.push(packet::Capability::GracefulRestart {
-                flags: 0,
+                flags,
                 restart_time: gr.restart_time,
                 families: gr.families.iter().map(|f| (*f, 0)).collect(),
             });
         }
+
+        // Always advertise 4-byte ASN support.
+        let four_octet = packet::Capability::FourOctetAsNumber(self.local_asn);
+        let four_octet_code: u8 = (&four_octet).into();
+        if !local_cap
+            .iter()
+            .any(|c| Into::<u8>::into(c) == four_octet_code)
+        {
+            local_cap.push(four_octet);
+        }
+
+        let conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(
+            crate::fsm::PeerFsm::new(
+                local_router_id,
+                self.local_asn,
+                local_cap.clone(),
+                self.holdtime,
+                self.remote_asn,
+                self.send_max.clone(),
+            ),
+        )));
+
         Peer {
             config: PeerConfig {
                 remote_addr: self.remote_addr,
@@ -476,7 +505,6 @@ impl PeerParams {
                 route_server_client: self.rs_client,
                 multihop_ttl: self.multihop_ttl,
                 password: self.password,
-                send_max: self.send_max,
                 prefix_limits: self.prefix_limits,
                 graceful_restart: self.graceful_restart,
             },
@@ -495,14 +523,14 @@ impl PeerParams {
             counter_tx: Default::default(),
             counter_rx: Default::default(),
             context: Arc::new(std::sync::Mutex::new(PeerContext {
-                conn_arbiter: None,
+                conn_arbiter,
                 active_connect_cancel_tx: ActiveConnectCancel::default(),
                 export_map: ExportMap::new(),
                 gr_state: crate::gr::GrState::new(),
                 gr_source: None,
                 gr_restart_timer: None,
                 gr_deferral_timer: None,
-                local_restarting: false,
+                local_restarting: is_restarting,
             })),
         }
     }
@@ -622,7 +650,7 @@ impl From<&PeerView> for api::Peer {
     }
 }
 
-impl TryFrom<&api::Peer> for Peer {
+impl TryFrom<&api::Peer> for PeerParams {
     type Error = Error;
 
     fn try_from(p: &api::Peer) -> Result<Self, Self::Error> {
@@ -753,15 +781,14 @@ impl TryFrom<&api::Peer> for Peer {
             send_max: FnvHashMap::default(),
             prefix_limits: FnvHashMap::default(),
             graceful_restart,
-        }
-        .build())
+        })
     }
 }
 
-impl TryFrom<&config::Neighbor> for Peer {
+impl TryFrom<&config::Neighbor> for PeerParams {
     type Error = String;
 
-    fn try_from(n: &config::Neighbor) -> Result<Peer, Self::Error> {
+    fn try_from(n: &config::Neighbor) -> Result<PeerParams, Self::Error> {
         let c = n.config.as_ref().ok_or("missing neighbor config")?;
         let afi_safis = n.afi_safis.as_deref().unwrap_or_default();
 
@@ -926,8 +953,7 @@ impl TryFrom<&config::Neighbor> for Peer {
             send_max,
             prefix_limits,
             graceful_restart,
-        }
-        .build())
+        })
     }
 }
 
@@ -1120,14 +1146,14 @@ impl GoBgpService for GrpcService {
             .graceful_restart
             .as_ref()
             .is_some_and(|gr| gr.local_restarting);
-        let peer = Peer::try_from(&api_peer)?;
+        let params = PeerParams::try_from(&api_peer)?;
         let mut global = self.global.write().await;
-        if let Some(password) = peer.config.password.as_ref() {
+        if let Some(password) = params.password.as_ref() {
             for fd in &global.listen_sockets {
-                auth::set_md5sig(*fd, &peer.config.remote_addr, password);
+                auth::set_md5sig(*fd, &params.remote_addr, password);
             }
         }
-        global.add_peer(peer, Some(self.active_conn_tx.clone()), is_restarting)?;
+        global.add_peer(params, Some(self.active_conn_tx.clone()), is_restarting)?;
         Ok(tonic::Response::new(api::AddPeerResponse {}))
     }
     async fn delete_peer(
@@ -1154,8 +1180,8 @@ impl GoBgpService for GrpcService {
                     }
                     // Cancel the active-connect retry loop.
                     ctx.active_connect_cancel_tx.0.take();
-                    if let Some(arb) = &ctx.conn_arbiter {
-                        let mut arb = arb.lock().unwrap();
+                    {
+                        let mut arb = ctx.conn_arbiter.lock().unwrap();
                         for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
                             .into_iter()
                             .flatten()
@@ -1300,14 +1326,12 @@ impl GoBgpService for GrpcService {
                         {
                             let mut ctx = p.context.lock().unwrap();
                             ctx.active_connect_cancel_tx.0.take();
-                            if let Some(arb) = &ctx.conn_arbiter {
-                                let mut arb = arb.lock().unwrap();
-                                for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
-                                    .into_iter()
-                                    .flatten()
-                                {
-                                    let _ = tx.send(cease.clone());
-                                }
+                            let mut arb = ctx.conn_arbiter.lock().unwrap();
+                            for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                let _ = tx.send(cease.clone());
                             }
                         }
                         return Ok(tonic::Response::new(api::DisablePeerResponse {}));
@@ -2914,45 +2938,16 @@ impl Global {
 
     fn add_peer(
         &mut self,
-        mut peer: Peer,
+        params: PeerParams,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
         is_restarting: bool,
     ) -> std::result::Result<(), Error> {
-        if self.peers.contains_key(&peer.config.remote_addr) {
+        if self.peers.contains_key(&params.remote_addr) {
             return Err(Error::AlreadyExists(
                 "peer address already exists".to_string(),
             ));
         }
-        if peer.config.local_asn == 0 {
-            peer.config.local_asn = self.asn;
-        }
-        let mut caps = HashSet::new();
-        for c in &peer.config.local_cap {
-            caps.insert(Into::<u8>::into(c));
-        }
-        let c = packet::Capability::FourOctetAsNumber(peer.config.local_asn);
-        if !caps.contains(&Into::<u8>::into(&c)) {
-            peer.config.local_cap.push(c);
-        }
-        // Set the R bit in our GR capability if the daemon is currently a restarting speaker.
-        if is_restarting {
-            for cap in &mut peer.config.local_cap {
-                if let packet::Capability::GracefulRestart { flags, .. } = cap {
-                    *flags |= 0x8;
-                }
-            }
-        }
-        peer.context.lock().unwrap().local_restarting = is_restarting;
-        peer.context.lock().unwrap().conn_arbiter = Some(Arc::new(std::sync::Mutex::new(
-            ConnArbiter::new(crate::fsm::PeerFsm::new(
-                u32::from(self.router_id),
-                peer.config.local_asn,
-                peer.config.local_cap.clone(),
-                peer.config.holdtime,
-                peer.config.remote_asn,
-                peer.config.send_max.clone(),
-            )),
-        )));
+        let mut peer = params.build(u32::from(self.router_id), self.asn, is_restarting);
         if peer.admin_down {
             peer.state
                 .fsm
@@ -3000,16 +2995,14 @@ async fn accept_connection(
                 );
                 return None;
             }
-            let already_connected = peer
-                .context
-                .lock()
-                .unwrap()
-                .conn_arbiter
-                .as_ref()
-                .is_some_and(|arb| match role {
-                    crate::fsm::Role::Active => arb.lock().unwrap().active_close_tx.is_some(),
-                    crate::fsm::Role::Passive => arb.lock().unwrap().passive_close_tx.is_some(),
-                });
+            let already_connected = {
+                let arb = peer.context.lock().unwrap();
+                let arb = arb.conn_arbiter.lock().unwrap();
+                match role {
+                    crate::fsm::Role::Active => arb.active_close_tx.is_some(),
+                    crate::fsm::Role::Passive => arb.passive_close_tx.is_some(),
+                }
+            };
             if already_connected {
                 println!("already has {:?} connection {}", role, remote_addr);
                 return None;
@@ -3065,8 +3058,7 @@ async fn accept_connection(
                     send_max: FnvHashMap::default(),
                     prefix_limits: FnvHashMap::default(),
                     graceful_restart: None,
-                }
-                .build(),
+                },
                 None,
                 false,
             );
@@ -3083,11 +3075,7 @@ async fn accept_connection(
     let context = Arc::clone(&peer.context);
     let (conn_arbiter, export_map) = {
         let ctx = peer.context.lock().unwrap();
-        let conn_arbiter = Arc::clone(
-            ctx.conn_arbiter
-                .as_ref()
-                .expect("conn_arbiter set in add_peer"),
-        );
+        let conn_arbiter = Arc::clone(&ctx.conn_arbiter);
         let export_map = ctx.export_map.clone();
         (conn_arbiter, export_map)
     };
@@ -3401,10 +3389,10 @@ impl Global {
         if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
             let mut server = global.write().await;
             for p in peers {
-                match Peer::try_from(p) {
-                    Ok(peer) => {
+                match PeerParams::try_from(p) {
+                    Ok(params) => {
                         if let Err(e) =
-                            server.add_peer(peer, Some(active_tx.clone()), is_restarting)
+                            server.add_peer(params, Some(active_tx.clone()), is_restarting)
                         {
                             eprintln!("failed to add peer from config: {}", e);
                         }
@@ -4127,7 +4115,7 @@ impl PeerSession {
             FnvHashMap::default(),
         );
         let conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(fsm)));
-        context.lock().unwrap().conn_arbiter = Some(Arc::clone(&conn_arbiter));
+        context.lock().unwrap().conn_arbiter = Arc::clone(&conn_arbiter);
 
         let framer = BgpFramer::new(bgp::PeerCodecBuilder::new().build());
 
@@ -5086,8 +5074,8 @@ impl PeerSession {
         let (no_sessions, old_stale_source) = {
             let mut ctx = self.context.lock().unwrap();
 
-            if let Some(arb) = &ctx.conn_arbiter {
-                let mut arb = arb.lock().unwrap();
+            {
+                let mut arb = ctx.conn_arbiter.lock().unwrap();
                 match info.role {
                     crate::fsm::Role::Active => arb.active_close_tx = None,
                     crate::fsm::Role::Passive => arb.passive_close_tx = None,
@@ -5142,10 +5130,10 @@ impl PeerSession {
                 };
 
             // Only reset and reconnect when no PeerSession remains for this peer.
-            let no_sessions = ctx.conn_arbiter.as_ref().is_none_or(|arb| {
-                let arb = arb.lock().unwrap();
+            let no_sessions = {
+                let arb = ctx.conn_arbiter.lock().unwrap();
                 arb.active_close_tx.is_none() && arb.passive_close_tx.is_none()
-            });
+            };
             (no_sessions, old_stale_source)
         };
 
@@ -5229,7 +5217,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr).build(), None, false)
+            g.add_peer(default_peer_params(remote_addr), None, false)
                 .unwrap();
         }
 
@@ -5247,8 +5235,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .conn_arbiter
-                .as_ref()
-                .unwrap()
                 .lock()
                 .unwrap()
                 .passive_close_tx
@@ -5265,7 +5251,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr).build(), None, false)
+            g.add_peer(default_peer_params(remote_addr), None, false)
                 .unwrap();
         }
 
@@ -5279,8 +5265,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .conn_arbiter
-                .as_ref()
-                .unwrap()
                 .lock()
                 .unwrap()
                 .active_close_tx
@@ -5301,8 +5285,7 @@ mod tests {
                 PeerParams {
                     admin_down: true,
                     ..default_peer_params(remote_addr)
-                }
-                .build(),
+                },
                 None,
                 false,
             )
@@ -5322,7 +5305,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr).build(), None, false)
+            g.add_peer(default_peer_params(remote_addr), None, false)
                 .unwrap();
             let (tx, _rx) = tokio::sync::oneshot::channel::<bgp::Message>();
             g.peers
@@ -5332,8 +5315,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .conn_arbiter
-                .as_ref()
-                .unwrap()
                 .lock()
                 .unwrap()
                 .passive_close_tx = Some(tx);
@@ -5401,7 +5382,7 @@ mod tests {
     ) -> PeerSession {
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr).build(), None, false)
+            g.add_peer(default_peer_params(remote_addr), None, false)
                 .unwrap();
         }
         accept_connection(global, tables, server, crate::fsm::Role::Passive)
@@ -5619,15 +5600,7 @@ mod tests {
             tokio::sync::oneshot::channel::<bgp::Message>();
         let conn_arbiter = {
             let g = global.read().await;
-            Arc::clone(
-                g.peers[&remote_addr]
-                    .context
-                    .lock()
-                    .unwrap()
-                    .conn_arbiter
-                    .as_ref()
-                    .unwrap(),
-            )
+            Arc::clone(&g.peers[&remote_addr].context.lock().unwrap().conn_arbiter)
         };
         conn_arbiter.lock().unwrap().active_close_tx = Some(active_close_tx);
 
@@ -5702,8 +5675,18 @@ mod tests {
     }
 
     fn make_context(local_restarting: bool) -> Arc<std::sync::Mutex<PeerContext>> {
+        use std::net::Ipv4Addr;
+        let fsm = crate::fsm::PeerFsm::new(
+            u32::from(Ipv4Addr::new(1, 0, 0, 1)),
+            65001,
+            vec![],
+            90,
+            0,
+            FnvHashMap::default(),
+        );
+        let conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(fsm)));
         Arc::new(std::sync::Mutex::new(PeerContext {
-            conn_arbiter: None,
+            conn_arbiter,
             active_connect_cancel_tx: ActiveConnectCancel::default(),
             export_map: ExportMap::new(),
             gr_state: crate::gr::GrState::new(),
@@ -5910,7 +5893,7 @@ mod tests {
         // Add the peer to global and drive its context into LocalRestarting.
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr).build(), None, false)
+            g.add_peer(default_peer_params(remote_addr), None, false)
                 .unwrap();
             let peer = g.peers.get_mut(&remote_addr).unwrap();
             let mut ctx = peer.context.lock().unwrap();
