@@ -329,6 +329,10 @@ struct PeerView {
     counter_tx: Arc<MessageCounter>,
     counter_rx: Arc<MessageCounter>,
     route_stats: FnvHashMap<Family, (u64, u64)>,
+    /// True if the remote peer is currently restarting (we are acting as helper).
+    gr_peer_restarting: bool,
+    /// True if this router is the restarting speaker for this peer.
+    gr_local_restarting: bool,
 }
 
 impl PeerView {
@@ -343,6 +347,7 @@ impl PeerView {
 
 impl Peer {
     fn view(&self) -> PeerView {
+        let ctx = self.context.lock().unwrap();
         PeerView {
             config: self.config.clone(),
             admin_down: self.admin_down,
@@ -351,6 +356,8 @@ impl Peer {
             counter_tx: Arc::clone(&self.counter_tx),
             counter_rx: Arc::clone(&self.counter_rx),
             route_stats: FnvHashMap::default(),
+            gr_peer_restarting: ctx.gr_state.is_peer_restarting(),
+            gr_local_restarting: ctx.local_restarting,
         }
     }
 
@@ -583,6 +590,18 @@ impl From<&PeerView> for api::Peer {
                 ..Default::default()
             })
             .collect();
+        let graceful_restart = p
+            .config
+            .graceful_restart
+            .as_ref()
+            .map(|gr| api::GracefulRestart {
+                enabled: true,
+                restart_time: gr.restart_time as u32,
+                deferral_time: gr.deferral_time.as_secs() as u32,
+                peer_restarting: p.gr_peer_restarting,
+                local_restarting: p.gr_local_restarting,
+                ..Default::default()
+            });
         api::Peer {
             state: Some(ps),
             conf: Some(Default::default()),
@@ -597,6 +616,7 @@ impl From<&PeerView> for api::Peer {
                 secondary_route: false,
             }),
             afi_safis: afisafis,
+            graceful_restart,
             ..Default::default()
         }
     }

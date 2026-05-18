@@ -106,6 +106,15 @@ impl GrState {
         matches!(self.state, Inner::LocalRestarting { .. })
     }
 
+    /// Returns true while the remote peer is restarting (helper side: restart
+    /// timer running or waiting for EOR).
+    pub(crate) fn is_peer_restarting(&self) -> bool {
+        matches!(
+            self.state,
+            Inner::Restarting { .. } | Inner::WaitingEor { .. }
+        )
+    }
+
     pub(crate) fn process(&mut self, input: GrInput) -> Vec<GrOutput> {
         let state = std::mem::replace(&mut self.state, Inner::Idle);
         let (new_state, outputs) = match (state, input) {
