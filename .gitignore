@@ -19,3 +19,6 @@ tests/integration/functional/gobgpd
 tests/integration/functional/rustybgpd
 
 **/*.pyc
+
+.claude
+CLAUDE.md
