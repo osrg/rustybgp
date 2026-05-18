@@ -267,9 +267,8 @@ struct PeerConfig {
 /// route export tracking map.  Lifetime: peer lifetime (from `add_peer` to
 /// peer deletion).
 ///
-/// Currently embedded in `Peer` via `Arc<Mutex<>>` to prepare for a future
-/// split where this struct moves outside the global `RwLock`, allowing
-/// `peer_loop` to operate without holding the global write lock.
+/// Currently embedded in `Peer` via `Arc<Mutex<>>` so that `PeerSession::run`
+/// can operate on `PeerContext` without holding the global write lock.
 struct PeerContext {
     /// Shared arbiter for this peer: holds PeerFsm and collision close-channels.
     /// None until Global::add_peer initialises it (requires local_router_id).
@@ -3052,6 +3051,7 @@ async fn accept_connection(
     } else {
         let _ = stream.set_ttl(1);
     }
+    let context = Arc::clone(&peer.context);
     let (conn_arbiter, export_map) = {
         let ctx = peer.context.lock().unwrap();
         let conn_arbiter = Arc::clone(
@@ -3085,6 +3085,7 @@ async fn accept_connection(
         peer.config.prefix_limits.clone(),
         tables.clone(),
         export_map,
+        context,
     )
 }
 
@@ -3456,14 +3457,14 @@ impl Global {
                     if let Some(Some(Ok(stream))) = stream
                         && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Passive).await
                     {
-                        tokio::spawn(peer_loop(h, global.clone(), active_tx.clone()));
+                        tokio::spawn(h.run(global.clone(), active_tx.clone()));
                     }
                 }
                 stream = active_rx.recv().fuse() => {
                     if let Some(stream) = stream
                         && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Active).await
                     {
-                        tokio::spawn(peer_loop(h, global.clone(), active_tx.clone()));
+                        tokio::spawn(h.run(global.clone(), active_tx.clone()));
                     }
                 }
             }
@@ -3814,7 +3815,7 @@ fn find_link_local(local: &SocketAddr) -> Option<Ipv6Addr> {
 }
 
 /// GR state negotiated during the last OPEN exchange.
-/// Stored in DisconnectInfo so peer_loop can drive GrState on session drop.
+/// Stored in DisconnectInfo so PeerSession::run can drive GrState on session drop.
 #[derive(Clone)]
 struct NegotiatedGr {
     /// Intersection of local and remote GR families.
@@ -3847,20 +3848,18 @@ async fn gr_restale_source(tables: &TableHandle, source: Arc<table::Source>) {
     }
 }
 
-async fn gr_restart_timer_expired(global: GlobalHandle, tables: TableHandle, remote_addr: IpAddr) {
+async fn gr_restart_timer_expired(
+    context: Arc<std::sync::Mutex<PeerContext>>,
+    tables: TableHandle,
+) {
     let source = {
-        let mut server = global.write().await;
-        if let Some(peer) = server.peers.get_mut(&remote_addr) {
-            let mut ctx = peer.context.lock().unwrap();
-            let outputs = ctx.gr_state.process(crate::gr::GrInput::TimerExpired);
-            if outputs
-                .iter()
-                .any(|o| matches!(o, crate::gr::GrOutput::DeleteStaleRoutes(_)))
-            {
-                ctx.gr_source.take()
-            } else {
-                None
-            }
+        let mut ctx = context.lock().unwrap();
+        let outputs = ctx.gr_state.process(crate::gr::GrInput::TimerExpired);
+        if outputs
+            .iter()
+            .any(|o| matches!(o, crate::gr::GrOutput::DeleteStaleRoutes(_)))
+        {
+            ctx.gr_source.take()
         } else {
             None
         }
@@ -3870,22 +3869,20 @@ async fn gr_restart_timer_expired(global: GlobalHandle, tables: TableHandle, rem
     }
 }
 
-async fn gr_deferral_timer_expired(global: GlobalHandle, tables: TableHandle, remote_addr: IpAddr) {
+async fn gr_deferral_timer_expired(
+    context: Arc<std::sync::Mutex<PeerContext>>,
+    tables: TableHandle,
+) {
     let source = {
-        let mut server = global.write().await;
-        if let Some(peer) = server.peers.get_mut(&remote_addr) {
-            let mut ctx = peer.context.lock().unwrap();
-            let outputs = ctx
-                .gr_state
-                .process(crate::gr::GrInput::DeferralTimerExpired);
-            if outputs
-                .iter()
-                .any(|o| matches!(o, crate::gr::GrOutput::DeleteStaleRoutes(_)))
-            {
-                ctx.gr_source.take()
-            } else {
-                None
-            }
+        let mut ctx = context.lock().unwrap();
+        let outputs = ctx
+            .gr_state
+            .process(crate::gr::GrInput::DeferralTimerExpired);
+        if outputs
+            .iter()
+            .any(|o| matches!(o, crate::gr::GrOutput::DeleteStaleRoutes(_)))
+        {
+            ctx.gr_source.take()
         } else {
             None
         }
@@ -3915,6 +3912,7 @@ async fn gr_handle_session_established(
                 .map(|g| g.families.clone())
                 .unwrap_or_default();
 
+            let context_c = Arc::clone(&peer.context);
             let mut ctx = peer.context.lock().unwrap();
 
             // Cancel the restart timer — peer reconnected in time.
@@ -3958,11 +3956,10 @@ async fn gr_handle_session_established(
             };
 
             if let Some(dur) = deferral {
-                let global_c = global.clone();
                 let tables_c = tables.clone();
                 let handle = tokio::spawn(async move {
                     tokio::time::sleep(dur).await;
-                    gr_deferral_timer_expired(global_c, tables_c, remote_addr).await;
+                    gr_deferral_timer_expired(context_c, tables_c).await;
                 })
                 .abort_handle();
                 ctx.gr_deferral_timer = Some(handle);
@@ -4049,26 +4046,23 @@ async fn gr_handle_eor_received(
     }
 }
 
-async fn peer_loop(
-    mut h: PeerSession,
-    global: GlobalHandle,
-    active_conn_tx: mpsc::UnboundedSender<TcpStream>,
-) {
-    let tables = h.tables.clone();
-    let info = h.run(&global).await;
+impl PeerSession {
+    async fn run(mut self, global: GlobalHandle, active_conn_tx: mpsc::UnboundedSender<TcpStream>) {
+        let tables = self.tables.clone();
+        let info = self.run_session(&global).await;
 
-    // mark_stale() and the table re-selection event need no global lock, so
-    // do them here before acquiring it to avoid holding the lock during async
-    // table I/O.
-    if let (Some(_), Some(source)) = (&info.negotiated_gr, &info.source) {
-        source.mark_stale();
-        gr_restale_source(&tables, source.clone()).await;
-    }
+        // mark_stale() and the table re-selection event need no global lock, so
+        // do them here before acquiring it to avoid holding the lock during async
+        // table I/O.
+        if let (Some(_), Some(source)) = (&info.negotiated_gr, &info.source) {
+            source.mark_stale();
+            gr_restale_source(&tables, source.clone()).await;
+        }
 
-    let mut server = global.write().await;
-    if let Some(peer) = server.peers.get_mut(&info.remote_addr) {
+        // Operate on PeerContext directly via self.context — no global lock needed
+        // for the ctx-only operations.
         let no_sessions = {
-            let mut ctx = peer.context.lock().unwrap();
+            let mut ctx = self.context.lock().unwrap();
 
             if let Some(arb) = &ctx.conn_arbiter {
                 let mut arb = arb.lock().unwrap();
@@ -4100,12 +4094,11 @@ async fn peer_loop(
                 for output in &outputs {
                     if let crate::gr::GrOutput::StartTimer(duration) = output {
                         let dur = *duration;
-                        let global_c = global.clone();
+                        let context_c = Arc::clone(&self.context);
                         let tables_c = tables.clone();
-                        let remote_addr = info.remote_addr;
                         let handle = tokio::spawn(async move {
                             tokio::time::sleep(dur).await;
-                            gr_restart_timer_expired(global_c, tables_c, remote_addr).await;
+                            gr_restart_timer_expired(context_c, tables_c).await;
                         })
                         .abort_handle();
                         ctx.gr_restart_timer = Some(handle);
@@ -4135,7 +4128,12 @@ async fn peer_loop(
                 arb.active_close_tx.is_none() && arb.passive_close_tx.is_none()
             })
         };
-        if no_sessions {
+
+        // Peer-level operations still require the global write lock.
+        let mut server = global.write().await;
+        if let Some(peer) = server.peers.get_mut(&info.remote_addr)
+            && no_sessions
+        {
             if peer.config.delete_on_disconnected {
                 server.peers.remove(&info.remote_addr);
             } else {
@@ -4206,7 +4204,7 @@ impl ExportMap {
 ///
 /// Lifetime: a single BGP session — from `accept_connection` until the TCP
 /// connection closes or a CEASE is received.  Runs as an independent tokio
-/// task (`peer_loop`) and holds no reference back to the global `RwLock`
+/// task (`PeerSession::run`) and holds no reference back to the global `RwLock`
 /// during normal operation; it accesses shared state only through
 /// `Arc<PeerState>` (atomics), `Arc<MessageCounter>`, and
 /// `Arc<Mutex<ConnArbiter>>`.
@@ -4243,6 +4241,10 @@ struct PeerSession {
     export_map: ExportMap,
     /// GR negotiation result from the most recent OPEN exchange.
     negotiated_gr: Option<NegotiatedGr>,
+    /// Shared cross-session state for this peer; cloned from `Peer::context`
+    /// so that `PeerSession::run` can operate on `PeerContext` without taking
+    /// the global write lock.
+    context: Arc<std::sync::Mutex<PeerContext>>,
 }
 
 impl PeerSession {
@@ -4262,6 +4264,7 @@ impl PeerSession {
         prefix_limits: FnvHashMap<Family, u32>,
         tables: TableHandle,
         export_map: ExportMap,
+        context: Arc<std::sync::Mutex<PeerContext>>,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
@@ -4287,6 +4290,7 @@ impl PeerSession {
             tables,
             export_map,
             negotiated_gr: None,
+            context,
         })
     }
 
@@ -4922,7 +4926,7 @@ impl PeerSession {
         Ok(())
     }
 
-    async fn run(&mut self, global: &GlobalHandle) -> DisconnectInfo {
+    async fn run_session(&mut self, global: &GlobalHandle) -> DisconnectInfo {
         let mut disconnect = DisconnectInfo {
             role: self.role,
             remote_addr: self.remote_addr,
