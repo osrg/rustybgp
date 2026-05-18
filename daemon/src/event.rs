@@ -4981,7 +4981,7 @@ impl PeerSession {
 
         // Operate on PeerContext directly via self.context — no global lock needed
         // for the ctx-only operations.
-        let no_sessions = {
+        let (no_sessions, old_stale_source) = {
             let mut ctx = self.context.lock().unwrap();
 
             if let Some(arb) = &ctx.conn_arbiter {
@@ -4992,62 +4992,65 @@ impl PeerSession {
                 }
             }
 
-            if let (Some(gr), Some(source)) = (&info.negotiated_gr, info.source) {
-                // GR active: start restart timer, preserve export_map.
-                if let Some(h) = ctx.gr_deferral_timer.take() {
-                    h.abort();
-                }
-                if let Some(h) = ctx.gr_restart_timer.take() {
-                    h.abort();
-                }
-                // Drop any lingering stale source from a previous GR cycle.
-                // (Handled async after releasing lock; spawn fire-and-forget.)
-                if let Some(old) = ctx.gr_source.take() {
-                    let tables_c = tables.clone();
-                    tokio::spawn(async move { gr_drop_source(&tables_c, old).await });
-                }
-
-                let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
-                    families: gr.families.clone(),
-                    restart_time: gr.restart_time,
-                });
-                for output in &outputs {
-                    if let crate::gr::GrOutput::StartTimer(duration) = output {
-                        let dur = *duration;
-                        let context_c = Arc::clone(&self.context);
-                        let tables_c = tables.clone();
-                        let handle = tokio::spawn(async move {
-                            tokio::time::sleep(dur).await;
-                            gr_restart_timer_expired(context_c, tables_c).await;
-                        })
-                        .abort_handle();
-                        ctx.gr_restart_timer = Some(handle);
+            let old_stale_source =
+                if let (Some(gr), Some(source)) = (&info.negotiated_gr, info.source) {
+                    // GR active: start restart timer, preserve export_map.
+                    if let Some(h) = ctx.gr_deferral_timer.take() {
+                        h.abort();
                     }
-                }
-                ctx.gr_source = Some(source);
-                ctx.export_map = info.export_map;
-            } else {
-                // Normal disconnect: routes were already dropped in Connection::run().
-                // Clean up any leftover GR state from a previous cycle that never recovered.
-                if let Some(h) = ctx.gr_restart_timer.take() {
-                    h.abort();
-                }
-                if let Some(h) = ctx.gr_deferral_timer.take() {
-                    h.abort();
-                }
-                if let Some(old) = ctx.gr_source.take() {
-                    let tables_c = tables.clone();
-                    tokio::spawn(async move { gr_drop_source(&tables_c, old).await });
-                }
-                drop(info.export_map);
-            }
+                    if let Some(h) = ctx.gr_restart_timer.take() {
+                        h.abort();
+                    }
+                    // Take any lingering stale source from a previous GR cycle to drop
+                    // after the lock is released.
+                    let old = ctx.gr_source.take();
+
+                    let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
+                        families: gr.families.clone(),
+                        restart_time: gr.restart_time,
+                    });
+                    for output in &outputs {
+                        if let crate::gr::GrOutput::StartTimer(duration) = output {
+                            let dur = *duration;
+                            let context_c = Arc::clone(&self.context);
+                            let tables_c = tables.clone();
+                            let handle = tokio::spawn(async move {
+                                tokio::time::sleep(dur).await;
+                                gr_restart_timer_expired(context_c, tables_c).await;
+                            })
+                            .abort_handle();
+                            ctx.gr_restart_timer = Some(handle);
+                        }
+                    }
+                    ctx.gr_source = Some(source);
+                    ctx.export_map = info.export_map;
+                    old
+                } else {
+                    // Normal disconnect: routes were already dropped in Connection::run().
+                    // Clean up any leftover GR state from a previous cycle that never recovered.
+                    if let Some(h) = ctx.gr_restart_timer.take() {
+                        h.abort();
+                    }
+                    if let Some(h) = ctx.gr_deferral_timer.take() {
+                        h.abort();
+                    }
+                    let old = ctx.gr_source.take();
+                    drop(info.export_map);
+                    old
+                };
 
             // Only reset and reconnect when no PeerSession remains for this peer.
-            ctx.conn_arbiter.as_ref().is_none_or(|arb| {
+            let no_sessions = ctx.conn_arbiter.as_ref().is_none_or(|arb| {
                 let arb = arb.lock().unwrap();
                 arb.active_close_tx.is_none() && arb.passive_close_tx.is_none()
-            })
+            });
+            (no_sessions, old_stale_source)
         };
+
+        // Drop stale source outside the context lock so gr_drop_source can be awaited directly.
+        if let Some(old) = old_stale_source {
+            gr_drop_source(&tables, old).await;
+        }
 
         // Peer-level operations still require the global write lock.
         let mut server = global.write().await;
