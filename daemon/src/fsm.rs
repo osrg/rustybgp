@@ -593,20 +593,19 @@ impl PeerFsm {
         let winner = self.collision_winner(role);
         let loser = winner.other();
 
-        // Send CEASE to the loser
-        let outputs = vec![
-            PeerFsmOutput::Connection(
-                loser,
-                Output::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::BgpError::Other {
-                        code: 6,    // Cease
-                        subcode: 7, // Connection Collision Resolution
-                        data: vec![],
-                    },
-                )),
-            ),
-            PeerFsmOutput::CloseConnection(loser),
-        ];
+        // Send CEASE to the loser via its close channel.
+        // CloseConnection is intentionally omitted: the loser shuts itself down
+        // upon receiving the CEASE; only the losing role's SendMessage is needed.
+        let outputs = vec![PeerFsmOutput::Connection(
+            loser,
+            Output::SendMessage(bgp::Message::Notification(
+                rustybgp_packet::BgpError::Other {
+                    code: 6,    // Cease
+                    subcode: 7, // Connection Collision Resolution
+                    data: vec![],
+                },
+            )),
+        )];
 
         // Remove the loser's Connection
         self.close_connection(loser);
@@ -1269,10 +1268,10 @@ mod tests {
             Input::MessageReceived(remote_open_msg(65001, low_id)),
         );
 
-        // local_id > remote_id → active wins → passive closed
+        // local_id > remote_id → active wins → passive gets CEASE and is removed
         assert!(has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(Role::Passive)
+            PeerFsmOutput::Connection(Role::Passive, Output::SendMessage(_))
         )));
         assert!(peer.connection(Role::Active).is_some());
         assert!(peer.connection(Role::Passive).is_none());
@@ -1299,10 +1298,10 @@ mod tests {
             Input::MessageReceived(remote_open_msg(65001, high_id)),
         );
 
-        // local_id < remote_id → passive wins → active closed
+        // local_id < remote_id → passive wins → active gets CEASE and is removed
         assert!(has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(Role::Active)
+            PeerFsmOutput::Connection(Role::Active, Output::SendMessage(_))
         )));
         assert!(peer.connection(Role::Active).is_none());
         assert!(peer.connection(Role::Passive).is_some());
@@ -1337,10 +1336,10 @@ mod tests {
             Input::MessageReceived(remote_open_msg(65001, low_id)),
         );
 
-        // local_id > remote_id, active wins → passive closed
+        // local_id > remote_id, active wins → passive gets CEASE and is removed
         assert!(has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(Role::Passive)
+            PeerFsmOutput::Connection(Role::Passive, Output::SendMessage(_))
         )));
         assert!(peer.connection(Role::Active).is_some());
         assert!(peer.connection(Role::Passive).is_none());
@@ -1399,7 +1398,7 @@ mod tests {
         );
         assert!(!has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(_)
+            PeerFsmOutput::Connection(Role::Active, Output::SendMessage(_))
         )));
         assert_eq!(
             peer.connection(Role::Passive).unwrap().state(),
@@ -1413,7 +1412,7 @@ mod tests {
         );
         assert!(has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(Role::Passive)
+            PeerFsmOutput::Connection(Role::Passive, Output::SendMessage(_))
         )));
         assert!(peer.connection(Role::Active).is_some());
         assert!(peer.connection(Role::Passive).is_none());

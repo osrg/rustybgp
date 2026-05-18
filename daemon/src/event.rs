@@ -188,7 +188,6 @@ impl ConnArbiter {
                         let _ = tx.send(msg);
                     }
                 }
-                crate::fsm::PeerFsmOutput::CloseConnection(out_role) if out_role != role => {}
                 other => result.push(other),
             }
         }
