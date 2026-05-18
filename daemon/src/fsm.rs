@@ -65,7 +65,6 @@ impl TryFrom<u8> for State {
 }
 
 /// Events fed into the session FSM.
-#[allow(dead_code)]
 pub(crate) enum Input {
     /// TCP connection established; start the OPEN exchange.
     Connected,
@@ -78,6 +77,7 @@ pub(crate) enum Input {
     /// TCP stream closed or I/O error detected by the driver.
     Disconnected,
     /// Administrative shutdown (e.g., peer deconfigured).
+    #[allow(dead_code)]
     AdminShutdown,
     /// An UPDATE message was sent to the peer; reset the keepalive timer.
     UpdateSent,
