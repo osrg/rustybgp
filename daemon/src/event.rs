@@ -1122,13 +1122,26 @@ impl GoBgpService for GrpcService {
                     subcode: 3,
                     data: vec![],
                 });
-                if let Some(arb) = &p.context.lock().unwrap().conn_arbiter {
-                    let mut arb = arb.lock().unwrap();
-                    for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        let _ = tx.send(cease.clone());
+                {
+                    let mut ctx = p.context.lock().unwrap();
+                    // Abort GR timers immediately so they do not fire after the peer
+                    // is gone and operate on stale state.
+                    if let Some(h) = ctx.gr_deferral_timer.take() {
+                        h.abort();
+                    }
+                    if let Some(h) = ctx.gr_restart_timer.take() {
+                        h.abort();
+                    }
+                    // Cancel the active-connect retry loop.
+                    ctx.active_connect_cancel_tx.0.take();
+                    if let Some(arb) = &ctx.conn_arbiter {
+                        let mut arb = arb.lock().unwrap();
+                        for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            let _ = tx.send(cease.clone());
+                        }
                     }
                 }
                 if p.config.password.is_some() {
