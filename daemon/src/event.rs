@@ -287,8 +287,6 @@ struct PeerContext {
     /// True if the daemon started with --graceful-restart and this peer has not
     /// yet sent EOR.  Cleared by `clear_restarting` once all tracked peers finish.
     local_restarting: bool,
-    /// Restarting-speaker tracking: families for which we have not yet received EOR from this peer.
-    restarting_pending_eor: Option<FnvHashSet<Family>>,
 }
 
 /// Administrative peer record stored in `Global::peers` under the global
@@ -498,7 +496,6 @@ impl PeerParams {
                 gr_restart_timer: None,
                 gr_deferral_timer: None,
                 local_restarting: false,
-                restarting_pending_eor: None,
             })),
         }
     }
@@ -2941,7 +2938,6 @@ impl Global {
         for peer in self.peers.values_mut() {
             let mut ctx = peer.context.lock().unwrap();
             ctx.local_restarting = false;
-            ctx.restarting_pending_eor = None;
             for cap in &mut peer.config.local_cap {
                 if let packet::Capability::GracefulRestart { flags, .. } = cap {
                     *flags &= !0x8;
@@ -4454,17 +4450,18 @@ impl PeerSession {
                             .map(|g| g.families.clone())
                             .unwrap_or_default();
 
-                        if ctx.local_restarting && !gr_families.is_empty() {
-                            ctx.restarting_pending_eor =
-                                Some(gr_families.iter().cloned().collect::<FnvHashSet<_>>());
-                        }
-
-                        let outputs =
+                        let outputs = if ctx.local_restarting {
+                            ctx.gr_state
+                                .process(crate::gr::GrInput::LocalRestartEstablished {
+                                    gr_families,
+                                })
+                        } else {
                             ctx.gr_state
                                 .process(crate::gr::GrInput::SessionEstablished {
                                     gr_families,
                                     deferral_time,
-                                });
+                                })
+                        };
 
                         let mut drop_source = false;
                         let mut start_deferral = false;
@@ -4499,12 +4496,13 @@ impl PeerSession {
                     }
                 }
                 GlobalEffect::GrEorReceived { family } => {
-                    let source = {
+                    let (source, peer_eor_complete) = {
                         let mut ctx = self.context.lock().unwrap();
                         let outputs = ctx
                             .gr_state
                             .process(crate::gr::GrInput::EorReceived(family));
                         let mut drop_source = false;
+                        let mut peer_eor_complete = false;
                         for output in &outputs {
                             match output {
                                 crate::gr::GrOutput::DeleteStaleRoutes(_) => drop_source = true,
@@ -4513,41 +4511,30 @@ impl PeerSession {
                                         h.abort();
                                     }
                                 }
+                                crate::gr::GrOutput::PeerEorComplete => peer_eor_complete = true,
                                 _ => {}
                             }
                         }
-                        if let Some(pending) = &mut ctx.restarting_pending_eor {
-                            pending.remove(&family);
-                        }
-                        if drop_source {
+                        let source = if drop_source {
                             ctx.gr_source.take()
                         } else {
                             None
-                        }
+                        };
+                        (source, peer_eor_complete)
                     };
                     if let Some(s) = source {
                         gr_drop_source(&self.tables, s).await;
                     }
 
-                    // Check if all tracked peers have finished sending EOR; if so,
-                    // clear restarting-speaker state so future reconnections use R=0.
-                    let mut server = global.write().await;
-                    let any_local_restarting = server
-                        .peers
-                        .values()
-                        .any(|p| p.context.lock().unwrap().local_restarting);
-                    if any_local_restarting {
-                        let any_pending = server.peers.values().any(|p| {
+                    // If this peer completed its EOR (restarting-speaker side), check
+                    // whether all helper peers are done; if so, clear restarting state.
+                    if peer_eor_complete {
+                        let mut server = global.write().await;
+                        let any_still_pending = server.peers.values().any(|p| {
                             let ctx = p.context.lock().unwrap();
-                            ctx.local_restarting
-                                && matches!(&ctx.restarting_pending_eor, Some(s) if !s.is_empty())
+                            ctx.local_restarting && ctx.gr_state.is_local_restarting()
                         });
-                        let any_done = server.peers.values().any(|p| {
-                            let ctx = p.context.lock().unwrap();
-                            ctx.local_restarting
-                                && matches!(&ctx.restarting_pending_eor, Some(s) if s.is_empty())
-                        });
-                        if !any_pending && any_done {
+                        if !any_still_pending {
                             server.clear_restarting();
                         }
                     }
