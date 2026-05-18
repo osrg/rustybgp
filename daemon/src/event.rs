@@ -341,14 +341,18 @@ impl Peer {
     }
 }
 
-struct PeerBuilder {
+/// Plain-struct replacement for the old PeerBuilder.
+///
+/// Both TryFrom<&api::Peer> and TryFrom<&config::Neighbor> construct this as
+/// an exhaustive struct literal so that adding a new field causes a compile
+/// error at every construction site.
+struct PeerParams {
     remote_addr: IpAddr,
     remote_port: u16,
     remote_asn: u32,
     remote_sockaddr: SocketAddr,
     local_sockaddr: SocketAddr,
     local_asn: u32,
-    local_cap: Vec<packet::Capability>,
     passive: bool,
     rs_client: bool,
     delete_on_disconnected: bool,
@@ -358,145 +362,21 @@ struct PeerBuilder {
     connect_retry_time: u64,
     multihop_ttl: Option<u8>,
     password: Option<String>,
+    /// Per-family add-path mode (RFC 7911 2-bit flags); mode 0 means plain MP.
     families: FnvHashMap<Family, u8>,
     send_max: FnvHashMap<Family, usize>,
     prefix_limits: FnvHashMap<Family, u32>,
     graceful_restart: Option<GrPeerConfig>,
 }
 
-impl PeerBuilder {
+impl PeerParams {
     const DEFAULT_HOLD_TIME: u64 = 180;
     const DEFAULT_CONNECT_RETRY_TIME: u64 = 3;
 
-    fn new(remote_addr: IpAddr) -> Self {
-        PeerBuilder {
-            remote_addr,
-            remote_asn: 0,
-            remote_port: Global::BGP_PORT,
-            remote_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0)), 0),
-            local_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0)), 0),
-            local_asn: 0,
-            local_cap: Vec::new(),
-            passive: false,
-            rs_client: false,
-            delete_on_disconnected: false,
-            admin_down: false,
-            state: SessionState::Idle,
-            holdtime: Self::DEFAULT_HOLD_TIME,
-            connect_retry_time: Self::DEFAULT_CONNECT_RETRY_TIME,
-            multihop_ttl: None,
-            password: None,
-            families: Default::default(),
-            send_max: Default::default(),
-            prefix_limits: Default::default(),
-            graceful_restart: None,
-        }
-    }
-
-    fn families(&mut self, families: Vec<Family>) -> &mut Self {
-        for f in families {
-            self.families.insert(f, 0);
-        }
-        self
-    }
-
-    fn remote_port(&mut self, remote_port: u16) -> &mut Self {
-        self.remote_port = remote_port;
-        self
-    }
-
-    fn remote_asn(&mut self, remote_asn: u32) -> &mut Self {
-        self.remote_asn = remote_asn;
-        self
-    }
-
-    fn remote_sockaddr(&mut self, sockaddr: SocketAddr) -> &mut Self {
-        self.remote_sockaddr = sockaddr;
-        self
-    }
-
-    fn local_sockaddr(&mut self, sockaddr: SocketAddr) -> &mut Self {
-        self.local_sockaddr = sockaddr;
-        self
-    }
-
-    fn local_asn(&mut self, local_asn: u32) -> &mut Self {
-        self.local_asn = local_asn;
-        self
-    }
-
-    fn passive(&mut self, passive: bool) -> &mut Self {
-        self.passive = passive;
-        self
-    }
-
-    fn rs_client(&mut self, rs: bool) -> &mut Self {
-        self.rs_client = rs;
-        self
-    }
-
-    fn delete_on_disconnected(&mut self, delete: bool) -> &mut Self {
-        self.delete_on_disconnected = delete;
-        self
-    }
-
-    fn state(&mut self, state: SessionState) -> &mut Self {
-        self.state = state;
-        self
-    }
-
-    fn holdtime(&mut self, t: u64) -> &mut Self {
-        if t != 0 {
-            self.holdtime = t;
-        }
-        self
-    }
-
-    fn connect_retry_time(&mut self, t: u64) -> &mut Self {
-        if t != 0 {
-            self.connect_retry_time = t;
-        }
-        self
-    }
-
-    fn admin_down(&mut self, b: bool) -> &mut Self {
-        self.admin_down = b;
-        self
-    }
-
-    fn password(&mut self, password: &str) -> &mut Self {
-        self.password = Some(password.to_string());
-        self
-    }
-
-    fn multihop_ttl(&mut self, ttl: u8) -> &mut Self {
-        if ttl == 0 {
-            self.multihop_ttl = None;
-        } else {
-            self.multihop_ttl = Some(ttl);
-        }
-        self
-    }
-
-    fn graceful_restart(&mut self, gr: Option<GrPeerConfig>) -> &mut Self {
-        self.graceful_restart = gr;
-        self
-    }
-
-    fn addpath(&mut self, families: Vec<(packet::Family, u8, usize)>) -> &mut Self {
-        for (f, mode, sm) in families {
-            // RFC 7911 mode is 2 bits: bit 0 = receive, bit 1 = send
-            self.families.insert(f, mode & 0x3);
-            if sm > 0 {
-                self.send_max.insert(f, sm);
-            }
-        }
-        self
-    }
-
-    fn build(&mut self) -> Peer {
+    fn build(self) -> Peer {
+        let mut local_cap: Vec<packet::Capability> = Vec::new();
         if self.families.is_empty() {
-            self.local_cap.push(match self.remote_addr {
+            local_cap.push(match self.remote_addr {
                 IpAddr::V4(_) => packet::Capability::MultiProtocol(Family::IPV4),
                 IpAddr::V6(_) => packet::Capability::MultiProtocol(Family::IPV6),
             });
@@ -506,10 +386,10 @@ impl PeerBuilder {
                 if *mode > 0 {
                     addpath.push((*f, *mode));
                 }
-                self.local_cap.push(packet::Capability::MultiProtocol(*f));
+                local_cap.push(packet::Capability::MultiProtocol(*f));
             }
             if !addpath.is_empty() {
-                self.local_cap.push(packet::Capability::AddPath(addpath));
+                local_cap.push(packet::Capability::AddPath(addpath));
             }
             // RFC 8950: advertise ExtendedNexthop when peering over IPv6
             // with IPv4 address family configured
@@ -521,13 +401,12 @@ impl PeerBuilder {
                     .map(|f| (*f, Family::AFI_IP6))
                     .collect();
                 if !enh_families.is_empty() {
-                    self.local_cap
-                        .push(packet::Capability::ExtendedNexthop(enh_families));
+                    local_cap.push(packet::Capability::ExtendedNexthop(enh_families));
                 }
             }
         }
         if let Some(gr) = &self.graceful_restart {
-            self.local_cap.push(packet::Capability::GracefulRestart {
+            local_cap.push(packet::Capability::GracefulRestart {
                 flags: 0,
                 restart_time: gr.restart_time,
                 families: gr.families.iter().map(|f| (*f, 0)).collect(),
@@ -547,13 +426,13 @@ impl PeerBuilder {
                 delete_on_disconnected: self.delete_on_disconnected,
                 holdtime: self.holdtime,
                 connect_retry_time: self.connect_retry_time,
-                local_cap: self.local_cap.split_off(0),
+                local_cap,
                 route_server_client: self.rs_client,
-                multihop_ttl: self.multihop_ttl.take(),
-                password: self.password.take(),
-                send_max: std::mem::take(&mut self.send_max),
-                prefix_limits: std::mem::take(&mut self.prefix_limits),
-                graceful_restart: self.graceful_restart.take(),
+                multihop_ttl: self.multihop_ttl,
+                password: self.password,
+                send_max: self.send_max,
+                prefix_limits: self.prefix_limits,
+                graceful_restart: self.graceful_restart,
             },
             admin_down: self.admin_down,
             local_sockaddr: self.local_sockaddr,
@@ -687,99 +566,134 @@ impl TryFrom<&api::Peer> for Peer {
 
     fn try_from(p: &api::Peer) -> Result<Self, Self::Error> {
         let conf = p.conf.as_ref().ok_or(Error::EmptyArgument)?;
-        let peer_addr = IpAddr::from_str(&conf.neighbor_address).map_err(|_| {
+        let remote_addr = IpAddr::from_str(&conf.neighbor_address).map_err(|_| {
             Error::InvalidArgument(format!("invalid peer address: {}", conf.neighbor_address))
         })?;
-        let mut builder = PeerBuilder::new(peer_addr);
-        if !conf.auth_password.is_empty() {
-            builder.password(&conf.auth_password);
-        }
-        Ok(builder
-            .local_asn(conf.local_asn)
-            .remote_asn(conf.peer_asn)
-            .remote_port(p.transport.as_ref().map_or(0, |x| x.remote_port as u16))
-            .families(
-                p.afi_safis
+
+        let families: FnvHashMap<Family, u8> = p
+            .afi_safis
+            .iter()
+            .filter(|x| x.config.as_ref().is_some_and(|x| x.family.is_some()))
+            .map(|x| {
+                let f =
+                    convert::family_from_api(x.config.as_ref().unwrap().family.as_ref().unwrap());
+                (f, 0u8)
+            })
+            .collect();
+
+        let graceful_restart = {
+            const DEFAULT_RESTART_TIME: u16 = 120;
+            const DEFAULT_DEFERRAL_SECS: u64 = 360;
+
+            let gr = p.graceful_restart.as_ref();
+            if gr.is_some_and(|g| g.enabled) {
+                let gr_families: Vec<Family> = p
+                    .afi_safis
                     .iter()
-                    .filter(|x| x.config.as_ref().is_some_and(|x| x.family.is_some()))
-                    .map(|x| {
-                        convert::family_from_api(
-                            x.config.as_ref().unwrap().family.as_ref().unwrap(),
-                        )
+                    .filter(|a| {
+                        a.mp_graceful_restart
+                            .as_ref()
+                            .is_some_and(|m| m.config.as_ref().is_some_and(|c| c.enabled))
                     })
-                    .collect(),
-            )
-            .passive(p.transport.as_ref().is_some_and(|x| x.passive_mode))
-            .rs_client(
-                p.route_server
-                    .as_ref()
-                    .is_some_and(|x| x.route_server_client),
-            )
-            .holdtime(
-                p.timers
-                    .as_ref()
-                    .map(|x| &x.config)
-                    .map_or(0, |x| x.as_ref().map_or(0, |x| x.hold_time)),
-            )
-            .connect_retry_time(
-                p.timers
-                    .as_ref()
-                    .map(|x| &x.config)
-                    .map_or(0, |x| x.as_ref().map_or(0, |x| x.connect_retry)),
-            )
-            .admin_down(conf.admin_down)
-            .multihop_ttl(
-                p.ebgp_multihop
-                    .as_ref()
-                    .map_or(0, |x| if x.enabled { x.multihop_ttl as u8 } else { 0 }),
-            )
-            .graceful_restart({
-                const DEFAULT_RESTART_TIME: u16 = 120;
-                const DEFAULT_DEFERRAL_SECS: u64 = 360;
+                    .filter_map(|a| {
+                        let f = a.config.as_ref()?.family.as_ref()?;
+                        Some(convert::family_from_api(f))
+                    })
+                    .collect();
 
-                let gr = p.graceful_restart.as_ref();
-                if gr.is_some_and(|g| g.enabled) {
-                    let gr_families: Vec<Family> = p
-                        .afi_safis
-                        .iter()
-                        .filter(|a| {
-                            a.mp_graceful_restart
-                                .as_ref()
-                                .is_some_and(|m| m.config.as_ref().is_some_and(|c| c.enabled))
+                if !gr_families.is_empty() {
+                    let restart_time = gr
+                        .and_then(|g| u16::try_from(g.restart_time).ok())
+                        .unwrap_or(DEFAULT_RESTART_TIME);
+                    let deferral_secs = gr
+                        .map(|g| {
+                            if g.deferral_time > 0 {
+                                g.deferral_time as u64
+                            } else {
+                                g.stale_routes_time as u64
+                            }
                         })
-                        .filter_map(|a| {
-                            let f = a.config.as_ref()?.family.as_ref()?;
-                            Some(convert::family_from_api(f))
-                        })
-                        .collect();
-
-                    if !gr_families.is_empty() {
-                        let restart_time = gr
-                            .and_then(|g| u16::try_from(g.restart_time).ok())
-                            .unwrap_or(DEFAULT_RESTART_TIME);
-                        let deferral_secs = gr
-                            .map(|g| {
-                                if g.deferral_time > 0 {
-                                    g.deferral_time as u64
-                                } else {
-                                    g.stale_routes_time as u64
-                                }
-                            })
-                            .filter(|&v| v > 0)
-                            .unwrap_or(DEFAULT_DEFERRAL_SECS);
-                        Some(GrPeerConfig {
-                            restart_time,
-                            deferral_time: std::time::Duration::from_secs(deferral_secs),
-                            families: gr_families,
-                        })
-                    } else {
-                        None
-                    }
+                        .filter(|&v| v > 0)
+                        .unwrap_or(DEFAULT_DEFERRAL_SECS);
+                    Some(GrPeerConfig {
+                        restart_time,
+                        deferral_time: std::time::Duration::from_secs(deferral_secs),
+                        families: gr_families,
+                    })
                 } else {
                     None
                 }
-            })
-            .build())
+            } else {
+                None
+            }
+        };
+
+        let holdtime = {
+            let t = p
+                .timers
+                .as_ref()
+                .map(|x| &x.config)
+                .map_or(0, |x| x.as_ref().map_or(0, |x| x.hold_time));
+            if t != 0 {
+                t
+            } else {
+                PeerParams::DEFAULT_HOLD_TIME
+            }
+        };
+        let connect_retry_time = {
+            let t = p
+                .timers
+                .as_ref()
+                .map(|x| &x.config)
+                .map_or(0, |x| x.as_ref().map_or(0, |x| x.connect_retry));
+            if t != 0 {
+                t
+            } else {
+                PeerParams::DEFAULT_CONNECT_RETRY_TIME
+            }
+        };
+
+        Ok(PeerParams {
+            remote_addr,
+            remote_port: p.transport.as_ref().map_or(Global::BGP_PORT, |x| {
+                if x.remote_port != 0 {
+                    x.remote_port as u16
+                } else {
+                    Global::BGP_PORT
+                }
+            }),
+            remote_asn: conf.peer_asn,
+            remote_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            local_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            local_asn: conf.local_asn,
+            passive: p.transport.as_ref().is_some_and(|x| x.passive_mode),
+            rs_client: p
+                .route_server
+                .as_ref()
+                .is_some_and(|x| x.route_server_client),
+            delete_on_disconnected: false,
+            admin_down: conf.admin_down,
+            state: SessionState::Idle,
+            holdtime,
+            connect_retry_time,
+            multihop_ttl: p.ebgp_multihop.as_ref().and_then(|x| {
+                if x.enabled && x.multihop_ttl != 0 {
+                    Some(x.multihop_ttl as u8)
+                } else {
+                    None
+                }
+            }),
+            password: if conf.auth_password.is_empty() {
+                None
+            } else {
+                Some(conf.auth_password.clone())
+            },
+            families,
+            send_max: FnvHashMap::default(),
+            prefix_limits: FnvHashMap::default(),
+            graceful_restart,
+        }
+        .build())
     }
 }
 
@@ -790,15 +704,24 @@ impl TryFrom<&config::Neighbor> for Peer {
         let c = n.config.as_ref().ok_or("missing neighbor config")?;
         let afi_safis = n.afi_safis.as_deref().unwrap_or_default();
 
+        let remote_addr = c
+            .neighbor_address
+            .as_ref()
+            .ok_or("missing neighbor address")?;
+        let peer_as = c.peer_as.ok_or("missing peer-as")?;
+
+        let transport_config = n.transport.as_ref().and_then(|t| t.config.as_ref());
+        let timer_config = n.timers.as_ref().and_then(|t| t.config.as_ref());
+
         // Collect address families and add-path configuration.
-        let mut families = Vec::new();
-        let addpath_families: Vec<(packet::Family, u8, usize)> = afi_safis
+        let mut base_families: Vec<Family> = Vec::new();
+        let addpath_entries: Vec<(packet::Family, u8, usize)> = afi_safis
             .iter()
             .filter(|x| {
                 let name = x.config.as_ref().and_then(|c| c.afi_safi_name.as_ref());
                 let Some(f) = name else { return false };
                 if let Ok(family) = convert::family_from_config(f) {
-                    families.push(family);
+                    base_families.push(family);
                 }
                 true
             })
@@ -817,65 +740,20 @@ impl TryFrom<&config::Neighbor> for Peer {
             })
             .collect();
 
-        let addr = c
-            .neighbor_address
-            .as_ref()
-            .ok_or("missing neighbor address")?;
-        let peer_as = c.peer_as.ok_or("missing peer-as")?;
-
-        let transport_config = n.transport.as_ref().and_then(|t| t.config.as_ref());
-        let timer_config = n.timers.as_ref().and_then(|t| t.config.as_ref());
-
-        let mut builder = PeerBuilder::new(*addr);
-        builder
-            .local_asn(c.local_as.unwrap_or(0))
-            .remote_asn(peer_as)
-            .remote_port(
-                transport_config
-                    .and_then(|t| t.remote_port)
-                    .unwrap_or(Global::BGP_PORT),
-            )
-            .passive(
-                transport_config
-                    .and_then(|t| t.passive_mode)
-                    .unwrap_or(false),
-            )
-            .rs_client(
-                n.route_server
-                    .as_ref()
-                    .and_then(|r| r.config.as_ref())
-                    .and_then(|r| r.route_server_client)
-                    .unwrap_or(false),
-            )
-            .holdtime(
-                timer_config
-                    .and_then(|c| c.hold_time)
-                    .map(|v| v as u64)
-                    .unwrap_or(0),
-            )
-            .connect_retry_time(
-                timer_config
-                    .and_then(|c| c.connect_retry)
-                    .map(|v| v as u64)
-                    .unwrap_or(0),
-            )
-            .admin_down(c.admin_down.unwrap_or(false))
-            .multihop_ttl(
-                n.ebgp_multihop
-                    .as_ref()
-                    .and_then(|m| m.config.as_ref())
-                    .and_then(|c| c.enabled.and(c.multihop_ttl))
-                    .unwrap_or(0),
-            );
-        if let Some(password) = c.auth_password.as_ref() {
-            builder.password(password);
+        // Build families map: start with plain entries, then override with add-path modes.
+        let mut families: FnvHashMap<Family, u8> =
+            base_families.into_iter().map(|f| (f, 0u8)).collect();
+        let mut send_max: FnvHashMap<Family, usize> = FnvHashMap::default();
+        for (f, mode, sm) in addpath_entries {
+            // RFC 7911 mode is 2 bits: bit 0 = receive, bit 1 = send
+            families.insert(f, mode & 0x3);
+            if sm > 0 {
+                send_max.insert(f, sm);
+            }
         }
 
-        builder.families(families);
-        builder.addpath(addpath_families);
-
         // Build GR helper config from graceful-restart + per-family mp-graceful-restart.
-        {
+        let graceful_restart = {
             const DEFAULT_RESTART_TIME: u16 = 120;
             const DEFAULT_DEFERRAL_SECS: u64 = 360;
 
@@ -912,16 +790,21 @@ impl TryFrom<&config::Neighbor> for Peer {
                                 .map(|v| v as u64)
                         })
                         .unwrap_or(DEFAULT_DEFERRAL_SECS);
-                    builder.graceful_restart(Some(GrPeerConfig {
+                    Some(GrPeerConfig {
                         restart_time,
                         deferral_time: std::time::Duration::from_secs(deferral_secs),
                         families: gr_families,
-                    }));
+                    })
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-        }
+        };
 
         // Extract per-family prefix limits.
+        let mut prefix_limits: FnvHashMap<Family, u32> = FnvHashMap::default();
         for afi_safi in afi_safis {
             let prefix_max = |pl: &Option<config::generate::PrefixLimit>| -> Option<u32> {
                 pl.as_ref()?.config.as_ref()?.max_prefixes
@@ -929,16 +812,61 @@ impl TryFrom<&config::Neighbor> for Peer {
             if let Some(v4) = &afi_safi.ipv4_unicast
                 && let Some(max) = prefix_max(&v4.prefix_limit)
             {
-                builder.prefix_limits.insert(packet::Family::IPV4, max);
+                prefix_limits.insert(packet::Family::IPV4, max);
             }
             if let Some(v6) = &afi_safi.ipv6_unicast
                 && let Some(max) = prefix_max(&v6.prefix_limit)
             {
-                builder.prefix_limits.insert(packet::Family::IPV6, max);
+                prefix_limits.insert(packet::Family::IPV6, max);
             }
         }
 
-        Ok(builder.build())
+        let holdtime = timer_config
+            .and_then(|c| c.hold_time)
+            .map(|v| v as u64)
+            .filter(|&v| v != 0)
+            .unwrap_or(PeerParams::DEFAULT_HOLD_TIME);
+        let connect_retry_time = timer_config
+            .and_then(|c| c.connect_retry)
+            .map(|v| v as u64)
+            .filter(|&v| v != 0)
+            .unwrap_or(PeerParams::DEFAULT_CONNECT_RETRY_TIME);
+
+        Ok(PeerParams {
+            remote_addr: *remote_addr,
+            remote_port: transport_config
+                .and_then(|t| t.remote_port)
+                .unwrap_or(Global::BGP_PORT),
+            remote_asn: peer_as,
+            remote_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            local_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            local_asn: c.local_as.unwrap_or(0),
+            passive: transport_config
+                .and_then(|t| t.passive_mode)
+                .unwrap_or(false),
+            rs_client: n
+                .route_server
+                .as_ref()
+                .and_then(|r| r.config.as_ref())
+                .and_then(|r| r.route_server_client)
+                .unwrap_or(false),
+            delete_on_disconnected: false,
+            admin_down: c.admin_down.unwrap_or(false),
+            state: SessionState::Idle,
+            holdtime,
+            connect_retry_time,
+            multihop_ttl: n
+                .ebgp_multihop
+                .as_ref()
+                .and_then(|m| m.config.as_ref())
+                .and_then(|c| c.enabled.and(c.multihop_ttl)),
+            password: c.auth_password.clone(),
+            families,
+            send_max,
+            prefix_limits,
+            graceful_restart,
+        }
+        .build())
     }
 }
 
@@ -3031,18 +2959,31 @@ async fn accept_connection(
                 );
                 return None;
             }
-            let mut builder = PeerBuilder::new(remote_addr);
-            builder
-                .state(SessionState::Active)
-                .remote_asn(remote_asn)
-                .delete_on_disconnected(true)
-                .rs_client(rs_client)
-                .remote_sockaddr(remote_sockaddr)
-                .local_sockaddr(local_sockaddr);
-            if let Some(holdtime) = holdtime {
-                builder.holdtime(holdtime);
-            }
-            let _ = g.add_peer(builder.build(), None);
+            let _ = g.add_peer(
+                PeerParams {
+                    remote_addr,
+                    remote_port: Global::BGP_PORT,
+                    remote_asn,
+                    remote_sockaddr,
+                    local_sockaddr,
+                    local_asn: 0,
+                    passive: false,
+                    rs_client,
+                    delete_on_disconnected: true,
+                    admin_down: false,
+                    state: SessionState::Active,
+                    holdtime: holdtime.unwrap_or(PeerParams::DEFAULT_HOLD_TIME),
+                    connect_retry_time: PeerParams::DEFAULT_CONNECT_RETRY_TIME,
+                    multihop_ttl: None,
+                    password: None,
+                    families: FnvHashMap::default(),
+                    send_max: FnvHashMap::default(),
+                    prefix_limits: FnvHashMap::default(),
+                    graceful_restart: None,
+                }
+                .build(),
+                None,
+            );
             g.peers.get_mut(&remote_addr).unwrap()
         }
     };
@@ -5116,6 +5057,30 @@ mod tests {
         Arc::new(Tables::new(1))
     }
 
+    fn default_peer_params(remote_addr: IpAddr) -> PeerParams {
+        PeerParams {
+            remote_addr,
+            remote_port: Global::BGP_PORT,
+            remote_asn: 0,
+            remote_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            local_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            local_asn: 0,
+            passive: false,
+            rs_client: false,
+            delete_on_disconnected: false,
+            admin_down: false,
+            state: SessionState::Idle,
+            holdtime: PeerParams::DEFAULT_HOLD_TIME,
+            connect_retry_time: PeerParams::DEFAULT_CONNECT_RETRY_TIME,
+            multihop_ttl: None,
+            password: None,
+            families: FnvHashMap::default(),
+            send_max: FnvHashMap::default(),
+            prefix_limits: FnvHashMap::default(),
+            graceful_restart: None,
+        }
+    }
+
     /// Returns (client_stream, server_stream) connected over loopback.
     /// Pass `server_stream` to `accept_connection`; `remote_addr` is
     /// `client_stream.local_addr().ip()`.
@@ -5136,7 +5101,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(PeerBuilder::new(remote_addr).build(), None)
+            g.add_peer(default_peer_params(remote_addr).build(), None)
                 .unwrap();
         }
 
@@ -5169,7 +5134,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(PeerBuilder::new(remote_addr).build(), None)
+            g.add_peer(default_peer_params(remote_addr).build(), None)
                 .unwrap();
         }
 
@@ -5198,8 +5163,15 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(PeerBuilder::new(remote_addr).admin_down(true).build(), None)
-                .unwrap();
+            g.add_peer(
+                PeerParams {
+                    admin_down: true,
+                    ..default_peer_params(remote_addr)
+                }
+                .build(),
+                None,
+            )
+            .unwrap();
         }
 
         let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
@@ -5215,7 +5187,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(PeerBuilder::new(remote_addr).build(), None)
+            g.add_peer(default_peer_params(remote_addr).build(), None)
                 .unwrap();
             let (tx, _rx) = tokio::sync::oneshot::channel::<bgp::Message>();
             g.peers
@@ -5306,7 +5278,7 @@ mod tests {
     ) -> PeerSession {
         {
             let mut g = global.write().await;
-            g.add_peer(PeerBuilder::new(remote_addr).build(), None)
+            g.add_peer(default_peer_params(remote_addr).build(), None)
                 .unwrap();
         }
         accept_connection(global, tables, server, crate::fsm::Role::Passive)
