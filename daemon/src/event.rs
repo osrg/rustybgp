@@ -132,6 +132,10 @@ fn session_state_to_api(v: SessionState) -> api::peer_state::SessionState {
     }
 }
 
+/// Session-scoped counters and FSM state shared between `Peer` and the active
+/// `PeerSession` via `Arc`.  All fields are atomics so they can be updated by
+/// the session task without taking the global lock.  Reset at the start of each
+/// new BGP session; the `Arc` itself lives as long as either side holds a clone.
 struct PeerState {
     fsm: AtomicU8,
     uptime: AtomicU64,
@@ -142,10 +146,12 @@ struct PeerState {
     remote_cap: ArcSwapOption<Vec<packet::Capability>>,
 }
 
-/// Holds the connection FSM and the one-shot channels used to deliver
-/// a CEASE Notification to the active or passive connection (collision loser).
-/// A single mutex covers all three so that collision detection and
-/// CEASE delivery are atomic.
+/// Per-peer FSM coordinator.  Created once when `local_router_id` is known
+/// (inside `Global::add_peer`) and lives for the entire peer lifetime.
+///
+/// Bundles `PeerFsm` with the one-shot CEASE channels for both roles under a
+/// single `std::sync::Mutex` so that collision detection and CEASE delivery to
+/// the losing connection are atomic without touching the global `RwLock`.
 struct ConnArbiter {
     fsm: crate::fsm::PeerFsm,
     active_close_tx: Option<tokio::sync::oneshot::Sender<bgp::Message>>,
@@ -204,12 +210,16 @@ impl ConnArbiter {
 }
 
 /// Cancellation handle for the active-connect retry task.
-/// Cloning produces `None`; dropping the inner `Sender` signals the task to exit.
+///
+/// Lifetime: one active-connect attempt.  Replaced with a fresh instance on
+/// each reconnect; dropping the inner `Sender` signals the task to exit.
+/// `Clone` produces `None` (intentional: only one owner cancels the task).
 #[derive(Default)]
 struct ActiveConnectCancel(Option<tokio::sync::oneshot::Sender<()>>);
 
-/// GR helper configuration for a single peer.
-/// `None` in `PeerConfig::graceful_restart` means GR is disabled.
+/// Static GR configuration for a single peer, set at peer creation.
+/// `None` in `PeerConfig::graceful_restart` means GR is disabled for this peer.
+/// Cloned into capability negotiation at each session open.
 #[derive(Clone)]
 #[allow(dead_code)]
 struct GrPeerConfig {
@@ -222,6 +232,9 @@ struct GrPeerConfig {
     families: Vec<Family>,
 }
 
+/// Static per-peer configuration.  Set at peer creation (via `PeerParams::build`)
+/// and immutable for the lifetime of the peer.  Cloned into `PeerSession` at
+/// session start so the session task can access it without the global lock.
 #[derive(Clone)]
 struct PeerConfig {
     remote_addr: IpAddr,
@@ -247,6 +260,16 @@ struct PeerConfig {
     graceful_restart: Option<GrPeerConfig>,
 }
 
+/// Cross-session mutable state for a peer.
+///
+/// Holds everything that must survive individual BGP session boundaries:
+/// the FSM arbiter, GR state machine, stale-route source, timers, and the
+/// route export tracking map.  Lifetime: peer lifetime (from `add_peer` to
+/// peer deletion).
+///
+/// Currently embedded in `Peer` via `Arc<Mutex<>>` to prepare for a future
+/// split where this struct moves outside the global `RwLock`, allowing
+/// `peer_loop` to operate without holding the global write lock.
 struct PeerContext {
     /// Shared arbiter for this peer: holds PeerFsm and collision close-channels.
     /// None until Global::add_peer initialises it (requires local_router_id).
@@ -266,6 +289,17 @@ struct PeerContext {
     restarting_pending_eor: Option<FnvHashSet<Family>>,
 }
 
+/// Administrative peer record stored in `Global::peers` under the global
+/// `RwLock`.
+///
+/// Lifetime: from `add_peer` (config or gRPC) until the peer is deleted.
+/// Not tied to any specific BGP session; a single `Peer` lives across
+/// multiple connect/disconnect cycles.
+///
+/// Contains only the gRPC-visible snapshot (config, atomic state, message
+/// counters) plus a handle to `PeerContext` for cross-session mutable state.
+/// The split keeps the global lock section lean: gRPC reads never need to
+/// acquire the per-peer `PeerContext` mutex.
 struct Peer {
     config: PeerConfig,
     admin_down: bool,
@@ -273,16 +307,20 @@ struct Peer {
     remote_sockaddr: SocketAddr,
     local_sockaddr: SocketAddr,
 
+    /// Shared with the active `PeerSession`; updated atomically during a session.
     state: Arc<PeerState>,
 
     counter_tx: Arc<MessageCounter>,
     counter_rx: Arc<MessageCounter>,
 
+    /// Cross-session mutable state (FSM, GR, timers, export map).
     context: Arc<std::sync::Mutex<PeerContext>>,
 }
 
-/// Read-only view of a peer for gRPC list responses.
-/// Holds clones of the config and cheap Arc references to live session state.
+/// Ephemeral snapshot of a `Peer` for a single gRPC list/get response.
+///
+/// Lifetime: one gRPC handler invocation.  Cheap to construct: config is
+/// cloned once, state and counters are `Arc` references into the live peer.
 struct PeerView {
     config: PeerConfig,
     admin_down: bool,
@@ -4150,6 +4188,14 @@ impl ExportMap {
     }
 }
 
+/// I/O driver for one TCP connection (one BGP session).
+///
+/// Lifetime: a single BGP session — from `accept_connection` until the TCP
+/// connection closes or a CEASE is received.  Runs as an independent tokio
+/// task (`peer_loop`) and holds no reference back to the global `RwLock`
+/// during normal operation; it accesses shared state only through
+/// `Arc<PeerState>` (atomics), `Arc<MessageCounter>`, and
+/// `Arc<Mutex<ConnArbiter>>`.
 struct PeerSession {
     remote_addr: IpAddr,
     local_addr: IpAddr,
