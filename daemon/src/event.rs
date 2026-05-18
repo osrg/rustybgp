@@ -5933,4 +5933,42 @@ mod tests {
         let ctx = g.peers[&remote_addr].context.lock().unwrap();
         assert!(!ctx.local_restarting);
     }
+
+    // Regression test: after a session ends via EOF/I/O error (shutdown set
+    // directly, bypassing the FSM), run() must clear the FSM Connection slot via
+    // Input::Disconnected so that the next connection is not rejected.
+    #[tokio::test]
+    async fn fsm_slot_cleared_after_eof() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        {
+            let mut g = global.write().await;
+            g.add_peer(default_peer_params(remote_addr), None, false)
+                .unwrap();
+        }
+
+        let session = accept_connection(&global, &tables, server, crate::fsm::Role::Passive)
+            .await
+            .unwrap();
+
+        // Spawn the session task.  The session sends BGP OPEN and waits for I/O.
+        let (active_tx, _active_rx) = mpsc::unbounded_channel::<TcpStream>();
+        let global_clone = Arc::clone(&global);
+        let h = tokio::spawn(async move { session.run(global_clone, active_tx).await });
+
+        // Drop the client-side socket → the server sees EOF → shutdown is set
+        // directly without going through the FSM.
+        drop(client);
+        h.await.unwrap();
+
+        // After run() completes the passive FSM slot must be None.
+        // Without the Input::Disconnected fix this assertion fails.
+        let g = global.read().await;
+        let ctx = g.peers[&remote_addr].context.lock().unwrap();
+        let arb = ctx.conn_arbiter.lock().unwrap();
+        assert!(arb.fsm.connection(crate::fsm::Role::Passive).is_none());
+    }
 }
