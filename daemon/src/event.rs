@@ -221,7 +221,6 @@ struct ActiveConnectCancel(Option<tokio::sync::oneshot::Sender<()>>);
 /// `None` in `PeerConfig::graceful_restart` means GR is disabled for this peer.
 /// Cloned into capability negotiation at each session open.
 #[derive(Clone)]
-#[allow(dead_code)]
 struct GrPeerConfig {
     /// Restart Time advertised in our OPEN (12-bit, max 4095 s).
     restart_time: u16,
@@ -254,7 +253,6 @@ struct PeerConfig {
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
     /// GR helper config; None = GR disabled.
-    #[allow(dead_code)]
     graceful_restart: Option<GrPeerConfig>,
 }
 

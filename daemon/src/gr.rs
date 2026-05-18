@@ -28,7 +28,6 @@ use rustybgp_packet::bgp::Family;
 use std::time::Duration;
 
 /// Events fed into the GR state machine.
-#[allow(dead_code)]
 pub(crate) enum GrInput {
     /// The peer session dropped while GR was negotiated for these families.
     /// The caller provides the restart_time from the last OPEN exchange.
@@ -90,12 +89,10 @@ enum Inner {
 }
 
 /// GR helper state machine for a single BGP peer.
-#[allow(dead_code)]
 pub(crate) struct GrState {
     state: Inner,
 }
 
-#[allow(dead_code)]
 impl GrState {
     pub(crate) fn new() -> Self {
         GrState { state: Inner::Idle }

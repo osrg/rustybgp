@@ -27,7 +27,6 @@ const INITIAL_HOLD_SECS: u64 = 240;
 
 /// BGP session states (RFC 4271 §8.2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum State {
     Idle,
     Connect,
@@ -435,7 +434,6 @@ pub(crate) enum PeerFsmOutput {
 /// BGP peer. Handles collision detection per RFC 4271 §6.8.
 ///
 /// Pure logic — no async, no I/O.
-#[allow(dead_code)]
 pub(crate) struct PeerFsm {
     active: Option<Connection>,
     passive: Option<Connection>,
@@ -447,7 +445,6 @@ pub(crate) struct PeerFsm {
     send_max: FnvHashMap<Family, usize>,
 }
 
-#[allow(dead_code)]
 impl PeerFsm {
     pub(crate) fn new(
         local_router_id: u32,
