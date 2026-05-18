@@ -4105,6 +4105,75 @@ impl PeerSession {
         })
     }
 
+    /// Construct a minimal PeerSession for unit tests that do not need a real
+    /// TCP connection.  `stream` is set to `None`; all I/O fields are inert.
+    #[cfg(test)]
+    fn new_for_test(
+        remote_addr: IpAddr,
+        context: Arc<std::sync::Mutex<PeerContext>>,
+        tables: TableHandle,
+        gr_deferral_time: Duration,
+    ) -> Self {
+        use std::net::Ipv4Addr;
+
+        let local_asn = 65001u32;
+        let local_router_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+        let fsm = crate::fsm::PeerFsm::new(
+            local_router_id,
+            local_asn,
+            vec![],
+            90,
+            0,
+            FnvHashMap::default(),
+        );
+        let conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(fsm)));
+        context.lock().unwrap().conn_arbiter = Some(Arc::clone(&conn_arbiter));
+
+        let framer = BgpFramer::new(bgp::PeerCodecBuilder::new().build());
+
+        PeerSession {
+            remote_addr,
+            local_addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            local_asn,
+            state: Arc::new(PeerState {
+                fsm: AtomicU8::new(0),
+                uptime: AtomicU64::new(0),
+                downtime: AtomicU64::new(0),
+                remote_asn: AtomicU32::new(0),
+                remote_id: AtomicU32::new(0),
+                remote_holdtime: AtomicU16::new(0),
+                remote_cap: ArcSwapOption::empty(),
+            }),
+            counter_tx: Default::default(),
+            counter_rx: Default::default(),
+            local_cap: vec![],
+            rs_client: false,
+            conn_arbiter,
+            role: crate::fsm::Role::Passive,
+            close_rx: None,
+            stream: None,
+            source: None,
+            peer_event_tx: vec![],
+            shutdown: None,
+            prefix_limits: FnvHashMap::default(),
+            tables,
+            export_map: ExportMap::new(),
+            negotiated_gr: None,
+            gr_deferral_time,
+            context,
+            urgent: vec![],
+            framer,
+            keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
+                .into_iter()
+                .collect(),
+            holdtime_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
+                .into_iter()
+                .collect(),
+            pending: FnvHashMap::default(),
+            txbuf_size: 1 << 16,
+        }
+    }
+
     /// Compute the intersection of local and remote GR families.
     /// Returns None if local_cap has no GR capability, the peer sent none,
     /// or if no families overlap.
@@ -5630,5 +5699,249 @@ mod tests {
         m.mark_sent(Family::IPV6, v6);
         assert!(m.was_sent(Family::IPV6, &v6));
         assert!(!m.was_sent(Family::IPV4, &v6));
+    }
+
+    fn make_context(local_restarting: bool) -> Arc<std::sync::Mutex<PeerContext>> {
+        Arc::new(std::sync::Mutex::new(PeerContext {
+            conn_arbiter: None,
+            active_connect_cancel_tx: ActiveConnectCancel::default(),
+            export_map: ExportMap::new(),
+            gr_state: crate::gr::GrState::new(),
+            gr_source: None,
+            gr_restart_timer: None,
+            gr_deferral_timer: None,
+            local_restarting,
+        }))
+    }
+
+    // ---- process_effects: StopActiveConnect ----
+
+    #[tokio::test]
+    async fn process_effects_stop_active_connect_clears_cancel_tx() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let context = make_context(false);
+
+        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+        context.lock().unwrap().active_connect_cancel_tx = ActiveConnectCancel(Some(tx));
+
+        let mut session = PeerSession::new_for_test(
+            remote_addr,
+            context.clone(),
+            tables,
+            Duration::from_secs(120),
+        );
+        session
+            .process_effects(vec![GlobalEffect::StopActiveConnect], &global)
+            .await;
+
+        assert!(context.lock().unwrap().active_connect_cancel_tx.0.is_none());
+    }
+
+    // ---- process_effects: GrSessionEstablished (helper side) ----
+
+    #[tokio::test]
+    async fn process_effects_gr_session_established_helper_enters_waiting_eor() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let context = make_context(false);
+
+        // Drive GrState to Restarting (session drop with GR) so that the
+        // subsequent SessionEstablished can transition it to WaitingEor.
+        // SessionEstablished is a no-op from Idle.
+        {
+            let mut ctx = context.lock().unwrap();
+            ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
+                families: vec![Family::IPV4],
+                restart_time: Duration::from_secs(90),
+            });
+        }
+
+        // Pre-load a stale source so we can verify it is NOT dropped (reconnecting
+        // with the same GR families does not emit DeleteStaleRoutes).
+        let stale_source = Arc::new(table::Source::new(
+            remote_addr,
+            IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            65002,
+            65001,
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            0,
+            false,
+        ));
+        context.lock().unwrap().gr_source = Some(stale_source);
+
+        let negotiated_gr = Some(NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+        });
+
+        let mut session = PeerSession::new_for_test(
+            remote_addr,
+            context.clone(),
+            tables,
+            Duration::from_secs(120),
+        );
+        session
+            .process_effects(
+                vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
+                &global,
+            )
+            .await;
+
+        let ctx = context.lock().unwrap();
+        // GrState should now be in WaitingEor (helper side, deferral timer set).
+        assert!(ctx.gr_state.is_peer_restarting());
+        // Stale source is still present (not deleted until EOR or deferral timer).
+        assert!(ctx.gr_source.is_some());
+        // Deferral timer was started.
+        assert!(ctx.gr_deferral_timer.is_some());
+    }
+
+    // ---- process_effects: GrSessionEstablished (local_restarting=true) ----
+
+    #[tokio::test]
+    async fn process_effects_gr_session_established_local_restarting_enters_local_restarting() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let context = make_context(true);
+
+        let negotiated_gr = Some(NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+        });
+
+        let mut session = PeerSession::new_for_test(
+            remote_addr,
+            context.clone(),
+            tables,
+            Duration::from_secs(120),
+        );
+        session
+            .process_effects(
+                vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
+                &global,
+            )
+            .await;
+
+        let ctx = context.lock().unwrap();
+        // GrState should be LocalRestarting, not WaitingEor.
+        assert!(ctx.gr_state.is_local_restarting());
+        assert!(!ctx.gr_state.is_peer_restarting());
+        // No deferral timer on the local-restarting path.
+        assert!(ctx.gr_deferral_timer.is_none());
+    }
+
+    // ---- process_effects: GrEorReceived (helper side: deferral timer aborted) ----
+
+    #[tokio::test]
+    async fn process_effects_gr_eor_received_helper_aborts_deferral_timer() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let context = make_context(false);
+
+        // Drive GrState through SessionDropped → SessionEstablished to reach WaitingEor.
+        // SessionEstablished from Idle is a no-op, so the drop must happen first.
+        {
+            let mut ctx = context.lock().unwrap();
+            ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
+                families: vec![Family::IPV4],
+                restart_time: Duration::from_secs(90),
+            });
+            ctx.gr_state
+                .process(crate::gr::GrInput::SessionEstablished {
+                    gr_families: vec![Family::IPV4],
+                    deferral_time: Duration::from_secs(120),
+                });
+            // Plant a dummy abort handle to simulate the running deferral timer.
+            let handle = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            })
+            .abort_handle();
+            ctx.gr_deferral_timer = Some(handle);
+
+            // Also plant a stale source that should be dropped on EOR.
+            ctx.gr_source = Some(Arc::new(table::Source::new(
+                remote_addr,
+                IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                65002,
+                65001,
+                std::net::Ipv4Addr::new(10, 0, 0, 1),
+                0,
+                false,
+            )));
+        }
+
+        let mut session = PeerSession::new_for_test(
+            remote_addr,
+            context.clone(),
+            tables,
+            Duration::from_secs(120),
+        );
+        session
+            .process_effects(
+                vec![GlobalEffect::GrEorReceived {
+                    family: Family::IPV4,
+                }],
+                &global,
+            )
+            .await;
+
+        let ctx = context.lock().unwrap();
+        // Deferral timer cleared.
+        assert!(ctx.gr_deferral_timer.is_none());
+        // Stale source dropped.
+        assert!(ctx.gr_source.is_none());
+        // GrState is now Idle (EOR for only family received → WaitingEor→Idle).
+        assert!(!ctx.gr_state.is_peer_restarting());
+    }
+
+    // ---- process_effects: GrEorReceived + PeerEorComplete clears global restarting ----
+
+    #[tokio::test]
+    async fn process_effects_gr_eor_received_peer_eor_complete_clears_restarting() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Add the peer to global and drive its context into LocalRestarting.
+        {
+            let mut g = global.write().await;
+            g.add_peer(default_peer_params(remote_addr).build(), None, false)
+                .unwrap();
+            let peer = g.peers.get_mut(&remote_addr).unwrap();
+            let mut ctx = peer.context.lock().unwrap();
+            ctx.local_restarting = true;
+            ctx.gr_state
+                .process(crate::gr::GrInput::LocalRestartEstablished {
+                    gr_families: vec![Family::IPV4],
+                });
+        }
+
+        // Build a session whose context IS the same Arc as the peer in global.
+        let peer_context = {
+            let g = global.read().await;
+            Arc::clone(&g.peers[&remote_addr].context)
+        };
+
+        let mut session =
+            PeerSession::new_for_test(remote_addr, peer_context, tables, Duration::from_secs(120));
+        session
+            .process_effects(
+                vec![GlobalEffect::GrEorReceived {
+                    family: Family::IPV4,
+                }],
+                &global,
+            )
+            .await;
+
+        // PeerEorComplete was emitted (only peer done) → clear_restarting called
+        // → local_restarting on the peer context is now false.
+        let g = global.read().await;
+        let ctx = g.peers[&remote_addr].context.lock().unwrap();
+        assert!(!ctx.local_restarting);
     }
 }
