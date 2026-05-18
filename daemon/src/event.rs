@@ -247,6 +247,25 @@ struct PeerConfig {
     graceful_restart: Option<GrPeerConfig>,
 }
 
+struct PeerContext {
+    /// Shared arbiter for this peer: holds PeerFsm and collision close-channels.
+    /// None until Global::add_peer initialises it (requires local_router_id).
+    conn_arbiter: Option<Arc<std::sync::Mutex<ConnArbiter>>>,
+    /// Cancels the active-connect retry loop spawned by `enable_active_connect`.
+    active_connect_cancel_tx: ActiveConnectCancel,
+    export_map: ExportMap,
+    /// GR helper state machine; persists across sessions.
+    gr_state: crate::gr::GrState,
+    /// The stale source from the previous session; Some while GR restart timer is running.
+    gr_source: Option<Arc<table::Source>>,
+    /// Abort handle for the GR restart timer task.
+    gr_restart_timer: Option<tokio::task::AbortHandle>,
+    /// Abort handle for the GR selection deferral timer task.
+    gr_deferral_timer: Option<tokio::task::AbortHandle>,
+    /// Restarting-speaker tracking: families for which we have not yet received EOR from this peer.
+    restarting_pending_eor: Option<FnvHashSet<Family>>,
+}
+
 struct Peer {
     config: PeerConfig,
     admin_down: bool,
@@ -259,26 +278,7 @@ struct Peer {
     counter_tx: Arc<MessageCounter>,
     counter_rx: Arc<MessageCounter>,
 
-    /// Shared arbiter for this peer: holds PeerFsm and collision close-channels.
-    /// None until Global::add_peer initialises it (requires local_router_id).
-    conn_arbiter: Option<Arc<std::sync::Mutex<ConnArbiter>>>,
-    /// Cancels the active-connect retry loop spawned by `enable_active_connect`.
-    /// Dropping the inner sender signals the task to exit.
-    active_connect_cancel_tx: ActiveConnectCancel,
-    export_map: ExportMap,
-    /// GR helper state machine; persists across sessions.
-    gr_state: crate::gr::GrState,
-    /// The stale source from the previous session; Some while GR restart timer is running.
-    gr_source: Option<Arc<table::Source>>,
-    /// Abort handle for the GR restart timer task.
-    gr_restart_timer: Option<tokio::task::AbortHandle>,
-    /// Abort handle for the GR selection deferral timer task.
-    gr_deferral_timer: Option<tokio::task::AbortHandle>,
-    /// Restarting-speaker tracking: families for which we have not yet received
-    /// EOR from this peer. Set on session-established when `Global::is_restarting`
-    /// and GR was negotiated; cleared family-by-family as EOR arrives; becomes
-    /// `Some(empty)` when done. `None` means this peer is not being tracked.
-    restarting_pending_eor: Option<FnvHashSet<Family>>,
+    context: Arc<std::sync::Mutex<PeerContext>>,
 }
 
 /// Read-only view of a peer for gRPC list responses.
@@ -332,8 +332,9 @@ impl Peer {
         self.state
             .fsm
             .store(SessionState::Idle as u8, Ordering::Relaxed);
-        self.active_connect_cancel_tx = ActiveConnectCancel::default();
-        if let Some(arb) = &self.conn_arbiter {
+        let mut ctx = self.context.lock().unwrap();
+        ctx.active_connect_cancel_tx = ActiveConnectCancel::default();
+        if let Some(arb) = &ctx.conn_arbiter {
             let mut arb = arb.lock().unwrap();
             arb.active_close_tx = None;
             arb.passive_close_tx = None;
@@ -448,14 +449,16 @@ impl PeerParams {
             }),
             counter_tx: Default::default(),
             counter_rx: Default::default(),
-            conn_arbiter: None,
-            active_connect_cancel_tx: ActiveConnectCancel::default(),
-            export_map: ExportMap::new(),
-            gr_state: crate::gr::GrState::new(),
-            gr_source: None,
-            gr_restart_timer: None,
-            gr_deferral_timer: None,
-            restarting_pending_eor: None,
+            context: Arc::new(std::sync::Mutex::new(PeerContext {
+                conn_arbiter: None,
+                active_connect_cancel_tx: ActiveConnectCancel::default(),
+                export_map: ExportMap::new(),
+                gr_state: crate::gr::GrState::new(),
+                gr_source: None,
+                gr_restart_timer: None,
+                gr_deferral_timer: None,
+                restarting_pending_eor: None,
+            })),
         }
     }
 }
@@ -1076,7 +1079,7 @@ impl GoBgpService for GrpcService {
                     subcode: 3,
                     data: vec![],
                 });
-                if let Some(arb) = &p.conn_arbiter {
+                if let Some(arb) = &p.context.lock().unwrap().conn_arbiter {
                     let mut arb = arb.lock().unwrap();
                     for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
                         .into_iter()
@@ -1213,19 +1216,22 @@ impl GoBgpService for GrpcService {
                         ));
                     } else {
                         p.admin_down = true;
-                        p.active_connect_cancel_tx.0.take();
                         let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
                             code: 6,
                             subcode: 2,
                             data: vec![],
                         });
-                        if let Some(arb) = &p.conn_arbiter {
-                            let mut arb = arb.lock().unwrap();
-                            for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
-                                .into_iter()
-                                .flatten()
-                            {
-                                let _ = tx.send(cease.clone());
+                        {
+                            let mut ctx = p.context.lock().unwrap();
+                            ctx.active_connect_cancel_tx.0.take();
+                            if let Some(arb) = &ctx.conn_arbiter {
+                                let mut arb = arb.lock().unwrap();
+                                for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
+                                    .into_iter()
+                                    .flatten()
+                                {
+                                    let _ = tx.send(cease.clone());
+                                }
                             }
                         }
                         return Ok(tonic::Response::new(api::DisablePeerResponse {}));
@@ -2180,7 +2186,7 @@ fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) 
     let retry_time = peer.config.connect_retry_time;
     let password = peer.config.password.as_ref().map(|x| x.to_string());
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    peer.active_connect_cancel_tx = ActiveConnectCancel(Some(cancel_tx));
+    peer.context.lock().unwrap().active_connect_cancel_tx = ActiveConnectCancel(Some(cancel_tx));
     tokio::spawn(async move {
         loop {
             let socket = match peer_addr {
@@ -2864,16 +2870,16 @@ impl Global {
                 }
             }
         }
-        peer.conn_arbiter = Some(Arc::new(std::sync::Mutex::new(ConnArbiter::new(
-            crate::fsm::PeerFsm::new(
+        peer.context.lock().unwrap().conn_arbiter = Some(Arc::new(std::sync::Mutex::new(
+            ConnArbiter::new(crate::fsm::PeerFsm::new(
                 u32::from(self.router_id),
                 peer.config.local_asn,
                 peer.config.local_cap.clone(),
                 peer.config.holdtime,
                 peer.config.remote_asn,
                 peer.config.send_max.clone(),
-            ),
-        ))));
+            )),
+        )));
         if peer.admin_down {
             peer.state
                 .fsm
@@ -2891,7 +2897,7 @@ impl Global {
     fn clear_restarting(&mut self) {
         self.is_restarting = false;
         for peer in self.peers.values_mut() {
-            peer.restarting_pending_eor = None;
+            peer.context.lock().unwrap().restarting_pending_eor = None;
             for cap in &mut peer.config.local_cap {
                 if let packet::Capability::GracefulRestart { flags, .. } = cap {
                     *flags &= !0x8;
@@ -2921,10 +2927,16 @@ async fn accept_connection(
                 );
                 return None;
             }
-            let already_connected = peer.conn_arbiter.as_ref().is_some_and(|arb| match role {
-                crate::fsm::Role::Active => arb.lock().unwrap().active_close_tx.is_some(),
-                crate::fsm::Role::Passive => arb.lock().unwrap().passive_close_tx.is_some(),
-            });
+            let already_connected = peer
+                .context
+                .lock()
+                .unwrap()
+                .conn_arbiter
+                .as_ref()
+                .is_some_and(|arb| match role {
+                    crate::fsm::Role::Active => arb.lock().unwrap().active_close_tx.is_some(),
+                    crate::fsm::Role::Passive => arb.lock().unwrap().passive_close_tx.is_some(),
+                });
             if already_connected {
                 println!("already has {:?} connection {}", role, remote_addr);
                 return None;
@@ -2994,11 +3006,16 @@ async fn accept_connection(
     } else {
         let _ = stream.set_ttl(1);
     }
-    let conn_arbiter = Arc::clone(
-        peer.conn_arbiter
-            .as_ref()
-            .expect("conn_arbiter set in add_peer"),
-    );
+    let (conn_arbiter, export_map) = {
+        let ctx = peer.context.lock().unwrap();
+        let conn_arbiter = Arc::clone(
+            ctx.conn_arbiter
+                .as_ref()
+                .expect("conn_arbiter set in add_peer"),
+        );
+        let export_map = ctx.export_map.clone();
+        (conn_arbiter, export_map)
+    };
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<bgp::Message>();
     {
         let mut arb = conn_arbiter.lock().unwrap();
@@ -3021,7 +3038,7 @@ async fn accept_connection(
         peer.counter_rx.clone(),
         peer.config.prefix_limits.clone(),
         tables.clone(),
-        peer.export_map.clone(),
+        export_map,
     )
 }
 
@@ -3787,12 +3804,13 @@ async fn gr_restart_timer_expired(global: GlobalHandle, tables: TableHandle, rem
     let source = {
         let mut server = global.write().await;
         if let Some(peer) = server.peers.get_mut(&remote_addr) {
-            let outputs = peer.gr_state.process(crate::gr::GrInput::TimerExpired);
+            let mut ctx = peer.context.lock().unwrap();
+            let outputs = ctx.gr_state.process(crate::gr::GrInput::TimerExpired);
             if outputs
                 .iter()
                 .any(|o| matches!(o, crate::gr::GrOutput::DeleteStaleRoutes(_)))
             {
-                peer.gr_source.take()
+                ctx.gr_source.take()
             } else {
                 None
             }
@@ -3809,14 +3827,15 @@ async fn gr_deferral_timer_expired(global: GlobalHandle, tables: TableHandle, re
     let source = {
         let mut server = global.write().await;
         if let Some(peer) = server.peers.get_mut(&remote_addr) {
-            let outputs = peer
+            let mut ctx = peer.context.lock().unwrap();
+            let outputs = ctx
                 .gr_state
                 .process(crate::gr::GrInput::DeferralTimerExpired);
             if outputs
                 .iter()
                 .any(|o| matches!(o, crate::gr::GrOutput::DeleteStaleRoutes(_)))
             {
-                peer.gr_source.take()
+                ctx.gr_source.take()
             } else {
                 None
             }
@@ -3839,11 +3858,6 @@ async fn gr_handle_session_established(
         let mut server = global.write().await;
         let local_is_restarting = server.is_restarting;
         if let Some(peer) = server.peers.get_mut(&remote_addr) {
-            // Cancel the restart timer — peer reconnected in time.
-            if let Some(h) = peer.gr_restart_timer.take() {
-                h.abort();
-            }
-
             let deferral_time = peer
                 .config
                 .graceful_restart
@@ -3855,13 +3869,20 @@ async fn gr_handle_session_established(
                 .map(|g| g.families.clone())
                 .unwrap_or_default();
 
+            let mut ctx = peer.context.lock().unwrap();
+
+            // Cancel the restart timer — peer reconnected in time.
+            if let Some(h) = ctx.gr_restart_timer.take() {
+                h.abort();
+            }
+
             // Restarting-speaker side: track EOR per family from this peer.
             if local_is_restarting && !gr_families.is_empty() {
-                peer.restarting_pending_eor =
+                ctx.restarting_pending_eor =
                     Some(gr_families.iter().cloned().collect::<FnvHashSet<_>>());
             }
 
-            let outputs = peer
+            let outputs = ctx
                 .gr_state
                 .process(crate::gr::GrInput::SessionEstablished {
                     gr_families,
@@ -3879,7 +3900,7 @@ async fn gr_handle_session_established(
             }
 
             let source = if drop_source {
-                peer.gr_source.take()
+                ctx.gr_source.take()
             } else {
                 None
             };
@@ -3898,7 +3919,7 @@ async fn gr_handle_session_established(
                     gr_deferral_timer_expired(global_c, tables_c, remote_addr).await;
                 })
                 .abort_handle();
-                peer.gr_deferral_timer = Some(handle);
+                ctx.gr_deferral_timer = Some(handle);
             }
 
             (source, None::<Duration>)
@@ -3921,7 +3942,8 @@ async fn gr_handle_eor_received(
     let source = {
         let mut server = global.write().await;
         if let Some(peer) = server.peers.get_mut(&remote_addr) {
-            let outputs = peer
+            let mut ctx = peer.context.lock().unwrap();
+            let outputs = ctx
                 .gr_state
                 .process(crate::gr::GrInput::EorReceived(family));
             let mut drop_source = false;
@@ -3929,7 +3951,7 @@ async fn gr_handle_eor_received(
                 match output {
                     crate::gr::GrOutput::DeleteStaleRoutes(_) => drop_source = true,
                     crate::gr::GrOutput::StopDeferralTimer => {
-                        if let Some(h) = peer.gr_deferral_timer.take() {
+                        if let Some(h) = ctx.gr_deferral_timer.take() {
                             h.abort();
                         }
                     }
@@ -3938,12 +3960,12 @@ async fn gr_handle_eor_received(
             }
 
             // Restarting-speaker side: mark this family as received.
-            if let Some(pending) = &mut peer.restarting_pending_eor {
+            if let Some(pending) = &mut ctx.restarting_pending_eor {
                 pending.remove(&family);
             }
 
             if drop_source {
-                peer.gr_source.take()
+                ctx.gr_source.take()
             } else {
                 None
             }
@@ -3963,11 +3985,11 @@ async fn gr_handle_eor_received(
             let any_pending = server
                 .peers
                 .values()
-                .any(|p| matches!(&p.restarting_pending_eor, Some(s) if !s.is_empty()));
+                .any(|p| matches!(&p.context.lock().unwrap().restarting_pending_eor, Some(s) if !s.is_empty()));
             let any_done = server
                 .peers
                 .values()
-                .any(|p| matches!(&p.restarting_pending_eor, Some(s) if s.is_empty()));
+                .any(|p| matches!(&p.context.lock().unwrap().restarting_pending_eor, Some(s) if s.is_empty()));
             if !any_pending && any_done {
                 server.clear_restarting();
             }
@@ -3993,70 +4015,74 @@ async fn peer_loop(
 
     let mut server = global.write().await;
     if let Some(peer) = server.peers.get_mut(&info.remote_addr) {
-        if let Some(arb) = &peer.conn_arbiter {
-            let mut arb = arb.lock().unwrap();
-            match info.role {
-                crate::fsm::Role::Active => arb.active_close_tx = None,
-                crate::fsm::Role::Passive => arb.passive_close_tx = None,
-            }
-        }
+        let no_sessions = {
+            let mut ctx = peer.context.lock().unwrap();
 
-        if let (Some(gr), Some(source)) = (&info.negotiated_gr, info.source) {
-            // GR active: start restart timer, preserve export_map.
-            if let Some(h) = peer.gr_deferral_timer.take() {
-                h.abort();
-            }
-            if let Some(h) = peer.gr_restart_timer.take() {
-                h.abort();
-            }
-            // Drop any lingering stale source from a previous GR cycle.
-            // (Handled async after releasing lock; spawn fire-and-forget.)
-            if let Some(old) = peer.gr_source.take() {
-                let tables_c = tables.clone();
-                tokio::spawn(async move { gr_drop_source(&tables_c, old).await });
-            }
-
-            let outputs = peer.gr_state.process(crate::gr::GrInput::SessionDropped {
-                families: gr.families.clone(),
-                restart_time: gr.restart_time,
-            });
-            for output in &outputs {
-                if let crate::gr::GrOutput::StartTimer(duration) = output {
-                    let dur = *duration;
-                    let global_c = global.clone();
-                    let tables_c = tables.clone();
-                    let remote_addr = info.remote_addr;
-                    let handle = tokio::spawn(async move {
-                        tokio::time::sleep(dur).await;
-                        gr_restart_timer_expired(global_c, tables_c, remote_addr).await;
-                    })
-                    .abort_handle();
-                    peer.gr_restart_timer = Some(handle);
+            if let Some(arb) = &ctx.conn_arbiter {
+                let mut arb = arb.lock().unwrap();
+                match info.role {
+                    crate::fsm::Role::Active => arb.active_close_tx = None,
+                    crate::fsm::Role::Passive => arb.passive_close_tx = None,
                 }
             }
-            peer.gr_source = Some(source);
-            peer.export_map = info.export_map;
-        } else {
-            // Normal disconnect: routes were already dropped in Connection::run().
-            // Clean up any leftover GR state from a previous cycle that never recovered.
-            if let Some(h) = peer.gr_restart_timer.take() {
-                h.abort();
-            }
-            if let Some(h) = peer.gr_deferral_timer.take() {
-                h.abort();
-            }
-            if let Some(old) = peer.gr_source.take() {
-                let tables_c = tables.clone();
-                tokio::spawn(async move { gr_drop_source(&tables_c, old).await });
-            }
-            drop(info.export_map);
-        }
 
-        // Only reset and reconnect when no PeerSession remains for this peer.
-        let no_sessions = peer.conn_arbiter.as_ref().is_none_or(|arb| {
-            let arb = arb.lock().unwrap();
-            arb.active_close_tx.is_none() && arb.passive_close_tx.is_none()
-        });
+            if let (Some(gr), Some(source)) = (&info.negotiated_gr, info.source) {
+                // GR active: start restart timer, preserve export_map.
+                if let Some(h) = ctx.gr_deferral_timer.take() {
+                    h.abort();
+                }
+                if let Some(h) = ctx.gr_restart_timer.take() {
+                    h.abort();
+                }
+                // Drop any lingering stale source from a previous GR cycle.
+                // (Handled async after releasing lock; spawn fire-and-forget.)
+                if let Some(old) = ctx.gr_source.take() {
+                    let tables_c = tables.clone();
+                    tokio::spawn(async move { gr_drop_source(&tables_c, old).await });
+                }
+
+                let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
+                    families: gr.families.clone(),
+                    restart_time: gr.restart_time,
+                });
+                for output in &outputs {
+                    if let crate::gr::GrOutput::StartTimer(duration) = output {
+                        let dur = *duration;
+                        let global_c = global.clone();
+                        let tables_c = tables.clone();
+                        let remote_addr = info.remote_addr;
+                        let handle = tokio::spawn(async move {
+                            tokio::time::sleep(dur).await;
+                            gr_restart_timer_expired(global_c, tables_c, remote_addr).await;
+                        })
+                        .abort_handle();
+                        ctx.gr_restart_timer = Some(handle);
+                    }
+                }
+                ctx.gr_source = Some(source);
+                ctx.export_map = info.export_map;
+            } else {
+                // Normal disconnect: routes were already dropped in Connection::run().
+                // Clean up any leftover GR state from a previous cycle that never recovered.
+                if let Some(h) = ctx.gr_restart_timer.take() {
+                    h.abort();
+                }
+                if let Some(h) = ctx.gr_deferral_timer.take() {
+                    h.abort();
+                }
+                if let Some(old) = ctx.gr_source.take() {
+                    let tables_c = tables.clone();
+                    tokio::spawn(async move { gr_drop_source(&tables_c, old).await });
+                }
+                drop(info.export_map);
+            }
+
+            // Only reset and reconnect when no PeerSession remains for this peer.
+            ctx.conn_arbiter.as_ref().is_none_or(|arb| {
+                let arb = arb.lock().unwrap();
+                arb.active_close_tx.is_none() && arb.passive_close_tx.is_none()
+            })
+        };
         if no_sessions {
             if peer.config.delete_on_disconnected {
                 server.peers.remove(&info.remote_addr);
@@ -4570,7 +4596,12 @@ impl PeerSession {
                 GlobalEffect::StopActiveConnect => {
                     let mut g = global.write().await;
                     if let Some(peer) = g.peers.get_mut(&remote_addr) {
-                        peer.active_connect_cancel_tx.0.take();
+                        peer.context
+                            .lock()
+                            .unwrap()
+                            .active_connect_cancel_tx
+                            .0
+                            .take();
                     }
                 }
                 GlobalEffect::GrSessionEstablished { negotiated_gr } => {
@@ -5115,7 +5146,10 @@ mod tests {
             SessionState::Active as u8
         );
         assert!(
-            peer.conn_arbiter
+            peer.context
+                .lock()
+                .unwrap()
+                .conn_arbiter
                 .as_ref()
                 .unwrap()
                 .lock()
@@ -5144,7 +5178,10 @@ mod tests {
         let g = global.read().await;
         let peer = g.peers.get(&remote_addr).unwrap();
         assert!(
-            peer.conn_arbiter
+            peer.context
+                .lock()
+                .unwrap()
+                .conn_arbiter
                 .as_ref()
                 .unwrap()
                 .lock()
@@ -5192,6 +5229,9 @@ mod tests {
             let (tx, _rx) = tokio::sync::oneshot::channel::<bgp::Message>();
             g.peers
                 .get_mut(&remote_addr)
+                .unwrap()
+                .context
+                .lock()
                 .unwrap()
                 .conn_arbiter
                 .as_ref()
@@ -5512,7 +5552,15 @@ mod tests {
             tokio::sync::oneshot::channel::<bgp::Message>();
         let conn_arbiter = {
             let g = global.read().await;
-            Arc::clone(g.peers[&remote_addr].conn_arbiter.as_ref().unwrap())
+            Arc::clone(
+                g.peers[&remote_addr]
+                    .context
+                    .lock()
+                    .unwrap()
+                    .conn_arbiter
+                    .as_ref()
+                    .unwrap(),
+            )
         };
         conn_arbiter.lock().unwrap().active_close_tx = Some(active_close_tx);
 
