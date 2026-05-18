@@ -4848,7 +4848,7 @@ impl PeerSession {
         Ok(())
     }
 
-    async fn run_session(&mut self, global: &GlobalHandle) -> DisconnectInfo {
+    async fn session_loop(&mut self, global: &GlobalHandle) -> DisconnectInfo {
         let mut disconnect = DisconnectInfo {
             role: self.role,
             remote_addr: self.remote_addr,
@@ -5028,7 +5028,7 @@ impl PeerSession {
 
     async fn run(mut self, global: GlobalHandle, active_conn_tx: mpsc::UnboundedSender<TcpStream>) {
         let tables = self.tables.clone();
-        let info = self.run_session(&global).await;
+        let info = self.session_loop(&global).await;
 
         // mark_stale() and the table re-selection event need no global lock, so
         // do them here before acquiring it to avoid holding the lock during async
