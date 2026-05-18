@@ -4156,15 +4156,6 @@ enum GlobalEffect {
     GrEorReceived { family: Family },
 }
 
-struct RunState {
-    urgent: Vec<bgp::Message>,
-    framer: BgpFramer,
-    keepalive_futures: FuturesUnordered<tokio::time::Sleep>,
-    holdtime_futures: FuturesUnordered<tokio::time::Sleep>,
-    pending: FnvHashMap<Family, crate::peer_tx::PendingTx>,
-    txbuf_size: usize,
-}
-
 #[derive(Clone)]
 struct ExportMap {
     advertised: FnvHashMap<Family, FnvHashSet<packet::Nlri>>,
@@ -4211,8 +4202,6 @@ impl ExportMap {
 struct PeerSession {
     remote_addr: IpAddr,
     local_addr: IpAddr,
-    /// IPv6 link-local address of the local interface (for 32-byte MP_REACH nexthop).
-    link_addr: Option<Ipv6Addr>,
 
     local_asn: u32,
 
@@ -4245,6 +4234,14 @@ struct PeerSession {
     /// so that `PeerSession::run` can operate on `PeerContext` without taking
     /// the global write lock.
     context: Arc<std::sync::Mutex<PeerContext>>,
+
+    // --- session I/O state ---
+    urgent: Vec<bgp::Message>,
+    framer: BgpFramer,
+    keepalive_futures: FuturesUnordered<tokio::time::Sleep>,
+    holdtime_futures: FuturesUnordered<tokio::time::Sleep>,
+    pending: FnvHashMap<Family, crate::peer_tx::PendingTx>,
+    txbuf_size: usize,
 }
 
 impl PeerSession {
@@ -4269,10 +4266,27 @@ impl PeerSession {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
         let link_addr = find_link_local(&local_sockaddr);
+
+        let mut txbuf_size = 1usize << 16;
+        if let Ok(r) =
+            nix::sys::socket::getsockopt(&stream.as_fd(), nix::sys::socket::sockopt::SndBuf)
+        {
+            txbuf_size = std::cmp::min(txbuf_size, r / 2);
+        }
+
+        let mut builder = bgp::PeerCodecBuilder::new();
+        builder.local_asn(local_asn).local_addr(local_addr);
+        if let Some(ll) = link_addr {
+            builder.link_addr(ll);
+        }
+        if rs_client {
+            builder.keep_aspath(true).keep_nexthop(true);
+        }
+        let framer = BgpFramer::new(builder.build());
+
         Some(PeerSession {
             remote_addr,
             local_addr,
-            link_addr,
             local_asn,
             state,
             counter_tx,
@@ -4291,6 +4305,16 @@ impl PeerSession {
             export_map,
             negotiated_gr: None,
             context,
+            urgent: Vec::new(),
+            framer,
+            keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
+                .into_iter()
+                .collect(),
+            holdtime_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
+                .into_iter()
+                .collect(),
+            pending: FnvHashMap::default(),
+            txbuf_size,
         })
     }
 
@@ -4329,13 +4353,7 @@ impl PeerSession {
         })
     }
 
-    async fn on_established(
-        &mut self,
-        codec: &bgp::PeerCodec,
-        local_sockaddr: SocketAddr,
-        remote_sockaddr: SocketAddr,
-        pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
-    ) {
+    async fn on_established(&mut self, local_sockaddr: SocketAddr, remote_sockaddr: SocketAddr) {
         let uptime = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -4352,12 +4370,22 @@ impl PeerSession {
             self.rs_client,
         )));
 
+        // Collect channel info up front so we don't borrow self.framer across .await.
+        let channel_info: Vec<(Family, bool, bool)> = self
+            .framer
+            .inner()
+            .channel
+            .iter()
+            .map(|(f, c)| (*f, c.addpath_rx(), c.addpath_tx()))
+            .collect();
+
         let mut addpath = FnvHashSet::default();
-        for (family, c) in &codec.channel {
-            if c.addpath_rx() {
+        for (family, addpath_rx, addpath_tx) in &channel_info {
+            if *addpath_rx {
                 addpath.insert(*family);
             }
-            pending.insert(*family, crate::peer_tx::PendingTx::new(c.addpath_tx()));
+            self.pending
+                .insert(*family, crate::peer_tx::PendingTx::new(*addpath_tx));
         }
 
         let export_policy = self.tables.export_policy.load_full();
@@ -4365,7 +4393,7 @@ impl PeerSession {
             let mut t = self.tables.shards[i].lock().await;
 
             // Populate initial routes for each negotiated family.
-            for f in codec.channel.keys() {
+            for (f, _, _) in &channel_info {
                 let effective_max = self
                     .conn_arbiter
                     .lock()
@@ -4379,7 +4407,7 @@ impl PeerSession {
                     *f,
                     effective_max,
                     &export_policy,
-                    pending,
+                    &mut self.pending,
                     &mut self.export_map,
                 );
             }
@@ -4475,8 +4503,8 @@ impl PeerSession {
         }
     }
 
-    async fn do_route_refresh(&mut self, family: Family, rs: &mut RunState) {
-        if !rs.pending.contains_key(&family) {
+    async fn do_route_refresh(&mut self, family: Family) {
+        if !self.pending.contains_key(&family) {
             return;
         }
         let export_policy = self.tables.export_policy.load_full();
@@ -4495,17 +4523,16 @@ impl PeerSession {
                 family,
                 effective_max,
                 &export_policy,
-                &mut rs.pending,
+                &mut self.pending,
                 &mut self.export_map,
             );
         }
-        rs.pending.get_mut(&family).unwrap().schedule_eor();
+        self.pending.get_mut(&family).unwrap().schedule_eor();
     }
 
     async fn apply_outputs(
         &mut self,
         outputs: Vec<crate::fsm::PeerFsmOutput>,
-        rs: &mut RunState,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
     ) -> Vec<GlobalEffect> {
@@ -4513,13 +4540,13 @@ impl PeerSession {
         for output in outputs {
             match output {
                 crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::SendMessage(m)) => {
-                    rs.urgent.push(m);
+                    self.urgent.push(m);
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
                     crate::fsm::Output::SetKeepaliveTimer(secs),
                 ) => {
-                    rs.keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
+                    self.keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
                 }
@@ -4527,7 +4554,7 @@ impl PeerSession {
                     _,
                     crate::fsm::Output::SetHoldTimer(secs),
                 ) => {
-                    rs.holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
+                    self.holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
                 }
@@ -4572,7 +4599,7 @@ impl PeerSession {
                             }
                         }
                     }
-                    rs.framer.inner_mut().channel = channels;
+                    self.framer.inner_mut().channel = channels;
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -4599,13 +4626,7 @@ impl PeerSession {
                     self.state
                         .remote_cap
                         .store(Some(Arc::new(remote_capabilities)));
-                    self.on_established(
-                        rs.framer.inner(),
-                        local_sockaddr,
-                        remote_sockaddr,
-                        &mut rs.pending,
-                    )
-                    .await;
+                    self.on_established(local_sockaddr, remote_sockaddr).await;
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -4636,7 +4657,7 @@ impl PeerSession {
                     _,
                     crate::fsm::Output::RouteRefresh(family),
                 ) => {
-                    self.do_route_refresh(family, rs).await;
+                    self.do_route_refresh(family).await;
                 }
                 crate::fsm::PeerFsmOutput::CloseConnection(_) => {
                     self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
@@ -4678,17 +4699,17 @@ impl PeerSession {
         }
     }
 
-    async fn flush_tx(&mut self, stream: &mut TcpStream, rs: &mut RunState) {
+    async fn flush_tx(&mut self, stream: &mut TcpStream) {
         // 1. Flush urgent (open, keepalive, notification) messages.
-        let mut txbuf = bytes::BytesMut::with_capacity(rs.txbuf_size);
-        for _ in 0..rs.urgent.len() {
-            let msg = rs.urgent.remove(0);
-            let _ = rs.framer.encode_to(&msg, &mut txbuf);
+        let mut txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
+        for _ in 0..self.urgent.len() {
+            let msg = self.urgent.remove(0);
+            let _ = self.framer.encode_to(&msg, &mut txbuf);
             (*self.counter_tx).sync(&msg);
 
-            if txbuf.len() > rs.txbuf_size {
+            if txbuf.len() > self.txbuf_size {
                 let buf = txbuf.freeze();
-                txbuf = bytes::BytesMut::with_capacity(rs.txbuf_size);
+                txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
                 if stream.write_all(&buf).await.is_err() {
                     self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                     return;
@@ -4701,27 +4722,27 @@ impl PeerSession {
         }
 
         // 2. Drain pending updates (withdrawals, reach, EOR) via peer_tx.
-        txbuf = bytes::BytesMut::with_capacity(rs.txbuf_size);
-        let any_update_pending = rs.pending.values().any(|p| !p.is_empty());
-        for (family, p) in rs.pending.iter_mut() {
+        txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
+        let any_update_pending = self.pending.values().any(|p| !p.is_empty());
+        for (family, p) in self.pending.iter_mut() {
             // IPv4-unicast can carry reachability either in the UPDATE's
             // traditional NLRI section or via MP_REACH_NLRI (when RFC 8950
             // Extended Nexthop is negotiated). Every other family must use
             // MP_REACH_NLRI.
             let use_mp = *family != packet::Family::IPV4
-                || rs
+                || self
                     .framer
                     .inner()
                     .channel
                     .get(family)
                     .is_some_and(|c| c.extended_nexthop());
             for msg in p.drain_messages(*family, use_mp) {
-                let _ = rs.framer.encode_to(&msg, &mut txbuf);
+                let _ = self.framer.encode_to(&msg, &mut txbuf);
                 self.counter_tx.sync(&msg);
 
-                if txbuf.len() > rs.txbuf_size {
+                if txbuf.len() > self.txbuf_size {
                     let buf = txbuf.freeze();
-                    txbuf = bytes::BytesMut::with_capacity(rs.txbuf_size);
+                    txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
                     if stream.write_all(&buf).await.is_err() {
                         self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                         return;
@@ -4744,7 +4765,7 @@ impl PeerSession {
                     crate::fsm::Output::SetKeepaliveTimer(secs),
                 ) = output
                 {
-                    rs.keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
+                    self.keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
                         .into_iter()
                         .collect();
                 }
@@ -4797,14 +4818,14 @@ impl PeerSession {
         }
     }
 
-    fn handle_advertise(&mut self, rs: &mut RunState, ri: table::Change) {
+    fn handle_advertise(&mut self, ri: table::Change) {
         if self.conn_arbiter.lock().unwrap().state(self.role) != SessionState::Established {
             return;
         }
         if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
             return;
         }
-        if !rs.framer.inner().channel.contains_key(&ri.family) {
+        if !self.framer.inner().channel.contains_key(&ri.family) {
             return;
         }
         let effective_max = self
@@ -4829,7 +4850,7 @@ impl PeerSession {
                 let family = ri.family;
                 let net = ri.net;
                 self.export_map.mark_withdrawn(family, &net);
-                rs.pending
+                self.pending
                     .get_mut(&family)
                     .unwrap()
                     .insert_change(table::Change {
@@ -4842,17 +4863,16 @@ impl PeerSession {
         if ri.attr.is_empty() {
             if self.export_map.was_sent(ri.family, &ri.net) {
                 self.export_map.mark_withdrawn(ri.family, &ri.net);
-                rs.pending.get_mut(&ri.family).unwrap().insert_change(ri);
+                self.pending.get_mut(&ri.family).unwrap().insert_change(ri);
             }
         } else {
             self.export_map.mark_sent(ri.family, ri.net);
-            rs.pending.get_mut(&ri.family).unwrap().insert_change(ri);
+            self.pending.get_mut(&ri.family).unwrap().insert_change(ri);
         }
     }
 
     async fn rx_msg(
         &mut self,
-        rs: &mut RunState,
         global: &GlobalHandle,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
@@ -4884,7 +4904,7 @@ impl PeerSession {
             )
         });
         let effects = self
-            .apply_outputs(outputs, rs, local_sockaddr, remote_sockaddr)
+            .apply_outputs(outputs, local_sockaddr, remote_sockaddr)
             .await;
         Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
 
@@ -4942,24 +4962,6 @@ impl PeerSession {
             return disconnect;
         };
         let rxbuf_size = 1 << 16;
-        let mut txbuf_size = 1 << 16;
-        if let Ok(r) =
-            nix::sys::socket::getsockopt(&stream.as_fd(), nix::sys::socket::sockopt::SndBuf)
-        {
-            txbuf_size = std::cmp::min(txbuf_size, r / 2);
-        }
-
-        let mut builder = bgp::PeerCodecBuilder::new();
-        builder
-            .local_asn(self.local_asn)
-            .local_addr(self.local_addr);
-        if let Some(ll) = self.link_addr {
-            builder.link_addr(ll);
-        }
-        if self.rs_client {
-            builder.keep_aspath(true).keep_nexthop(true);
-        }
-        let framer = BgpFramer::new(builder.build());
 
         let mut peer_event_rx = Vec::new();
         for _ in 0..self.tables.shards.len() {
@@ -4968,19 +4970,6 @@ impl PeerSession {
             peer_event_rx.push(UnboundedReceiverStream::new(rx));
         }
 
-        let mut rs = RunState {
-            urgent: Vec::new(),
-            framer,
-            holdtime_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
-                .into_iter()
-                .collect(),
-            keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
-                .into_iter()
-                .collect(),
-            pending: FnvHashMap::default(),
-            txbuf_size,
-        };
-
         // Kick off the OPEN exchange via the FSM.
         let outputs = self
             .conn_arbiter
@@ -4988,7 +4977,7 @@ impl PeerSession {
             .unwrap()
             .process(self.role, crate::fsm::Input::Connected);
         let effects = self
-            .apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr)
+            .apply_outputs(outputs, local_sockaddr, remote_sockaddr)
             .await;
         Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
 
@@ -4999,9 +4988,9 @@ impl PeerSession {
             let mut peer_event_futures: FuturesUnordered<_> =
                 peer_event_rx.iter_mut().map(|rx| rx.next()).collect();
 
-            let interest = if rs.urgent.is_empty() {
+            let interest = if self.urgent.is_empty() {
                 let mut interest = tokio::io::Interest::READABLE;
-                for p in rs.pending.values_mut() {
+                for p in self.pending.values_mut() {
                     if !p.is_empty() {
                         interest |= tokio::io::Interest::WRITABLE;
                         break;
@@ -5015,26 +5004,26 @@ impl PeerSession {
             futures::select_biased! {
                 cease = &mut close_rx => {
                     if let Some(Ok(msg)) = cease {
-                        rs.urgent.insert(0, msg);
+                        self.urgent.insert(0, msg);
                         self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
                     }
                 }
-                _ = rs.holdtime_futures.next() => {
+                _ = self.holdtime_futures.next() => {
                     println!("{}: holdtime expired", self.remote_addr);
                     let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
-                    let effects = self.apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr).await;
+                    let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
                     Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
                 }
-                _ = rs.keepalive_futures.next() => {
+                _ = self.keepalive_futures.next() => {
                     let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
-                    let effects = self.apply_outputs(outputs, &mut rs, local_sockaddr, remote_sockaddr).await;
+                    let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
                     Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
                 }
                 msg = peer_event_futures.next().fuse() => {
                     if let Some(Some(msg)) = msg {
                         match msg {
                             ToPeerEvent::Advertise(ri) => {
-                                self.handle_advertise(&mut rs, ri);
+                                self.handle_advertise(ri);
                             }
                         }
                     }
@@ -5052,11 +5041,11 @@ impl PeerSession {
                                 self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
                             }
                             Ok(_) => loop {
-                                    match rs.framer.try_parse(&mut rxbuf) {
+                                    match self.framer.try_parse(&mut rxbuf) {
                                     Ok(msg) => match msg {
                                         Some(msg) => {
                                             (*self.counter_rx).sync(&msg);
-                                            let _ = self.rx_msg(&mut rs, global, local_sockaddr, remote_sockaddr, msg).await;
+                                            let _ = self.rx_msg(global, local_sockaddr, remote_sockaddr, msg).await;
                                         }
                                         None => {
                                             // partial read
@@ -5065,7 +5054,7 @@ impl PeerSession {
                                     }
                                     Err(e) => {
                                         if let rustybgp_packet::Error::Bgp(ref bgp_err) = e {
-                                            rs.urgent.insert(0, bgp::Message::Notification(bgp_err.clone()));
+                                            self.urgent.insert(0, bgp::Message::Notification(bgp_err.clone()));
                                             self.shutdown = Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification(bgp_err.clone())));
                                         } else {
                                             self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
@@ -5082,7 +5071,7 @@ impl PeerSession {
                     }
 
                     if ready.is_writable() {
-                        self.flush_tx(&mut stream, &mut rs).await;
+                        self.flush_tx(&mut stream).await;
                     }
                 }
             }
@@ -5351,21 +5340,6 @@ mod tests {
         assert!(peer.config.delete_on_disconnected);
     }
 
-    fn make_framer() -> BgpFramer {
-        BgpFramer::new(
-            bgp::PeerCodecBuilder::new()
-                .local_asn(65001)
-                .local_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
-                .build(),
-        )
-    }
-
-    fn make_timers() -> FuturesUnordered<tokio::time::Sleep> {
-        vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
-            .into_iter()
-            .collect()
-    }
-
     fn cease_notification() -> bgp::Message {
         bgp::Message::Notification(packet::BgpError::Other {
             code: 6,    // Cease
@@ -5429,23 +5403,15 @@ mod tests {
         conn
     }
 
-    fn make_rs_ipv4() -> RunState {
-        let mut pending = FnvHashMap::default();
-        pending.insert(Family::IPV4, crate::peer_tx::PendingTx::new(false));
-        RunState {
-            urgent: Vec::new(),
-            framer: BgpFramer::new(
-                bgp::PeerCodecBuilder::new()
-                    .local_asn(65001)
-                    .local_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
-                    .families(vec![Family::IPV4])
-                    .build(),
-            ),
-            keepalive_futures: make_timers(),
-            holdtime_futures: make_timers(),
-            pending,
-            txbuf_size: 1 << 16,
-        }
+    /// Prepare a PeerSession for handle_advertise tests: open the IPv4 channel
+    /// and insert an IPv4 pending bucket, matching what on_established would do.
+    fn setup_ipv4_session(conn: &mut PeerSession) {
+        conn.framer
+            .inner_mut()
+            .channel
+            .insert(Family::IPV4, bgp::Channel::new(Family::IPV4, false, false));
+        conn.pending
+            .insert(Family::IPV4, crate::peer_tx::PendingTx::new(false));
     }
 
     fn make_reach_change(nlri: packet::Nlri, source: Arc<table::Source>) -> table::Change {
@@ -5496,14 +5462,14 @@ mod tests {
         let remote_addr = client.local_addr().unwrap().ip();
 
         let mut conn = established_connection(&global, &tables, remote_addr, server).await;
-        let mut rs = make_rs_ipv4();
+        setup_ipv4_session(&mut conn);
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let ri = make_reach_change(nlri, other_source());
 
-        conn.handle_advertise(&mut rs, ri);
+        conn.handle_advertise(ri);
 
         assert!(conn.export_map.was_sent(Family::IPV4, &nlri));
-        assert!(!rs.pending[&Family::IPV4].is_empty());
+        assert!(!conn.pending[&Family::IPV4].is_empty());
     }
 
     #[tokio::test]
@@ -5514,14 +5480,14 @@ mod tests {
         let remote_addr = client.local_addr().unwrap().ip();
 
         let mut conn = established_connection(&global, &tables, remote_addr, server).await;
-        let mut rs = make_rs_ipv4();
+        setup_ipv4_session(&mut conn);
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let ri = make_withdraw_change(nlri, other_source());
 
-        conn.handle_advertise(&mut rs, ri);
+        conn.handle_advertise(ri);
 
         assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
-        assert!(rs.pending[&Family::IPV4].is_empty());
+        assert!(conn.pending[&Family::IPV4].is_empty());
     }
 
     #[tokio::test]
@@ -5532,15 +5498,15 @@ mod tests {
         let remote_addr = client.local_addr().unwrap().ip();
 
         let mut conn = established_connection(&global, &tables, remote_addr, server).await;
-        let mut rs = make_rs_ipv4();
+        setup_ipv4_session(&mut conn);
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
 
         conn.export_map.mark_sent(Family::IPV4, nlri);
         let ri = make_withdraw_change(nlri, other_source());
-        conn.handle_advertise(&mut rs, ri);
+        conn.handle_advertise(ri);
 
         assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
-        assert!(!rs.pending[&Family::IPV4].is_empty());
+        assert!(!conn.pending[&Family::IPV4].is_empty());
     }
 
     #[tokio::test]
@@ -5552,14 +5518,14 @@ mod tests {
 
         // passive_connection gives Active state, not Established
         let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
-        let mut rs = make_rs_ipv4();
+        setup_ipv4_session(&mut conn);
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let ri = make_reach_change(nlri, other_source());
 
-        conn.handle_advertise(&mut rs, ri);
+        conn.handle_advertise(ri);
 
         assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
-        assert!(rs.pending[&Family::IPV4].is_empty());
+        assert!(conn.pending[&Family::IPV4].is_empty());
     }
 
     /// `apply_outputs` places any `SendMessage` output into `rs.urgent`.
@@ -5579,20 +5545,12 @@ mod tests {
             crate::fsm::Output::SendMessage(cease_notification()),
         )];
         let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
-        let mut rs = RunState {
-            urgent: Vec::new(),
-            framer: make_framer(),
-            keepalive_futures: make_timers(),
-            holdtime_futures: make_timers(),
-            pending: FnvHashMap::default(),
-            txbuf_size: 1 << 16,
-        };
-        let effects = conn.apply_outputs(outputs, &mut rs, dummy, dummy).await;
+        let effects = conn.apply_outputs(outputs, dummy, dummy).await;
 
-        // No GlobalEffect::SendCease — CEASE goes into rs.urgent directly.
+        // No GlobalEffect::SendCease — CEASE goes into conn.urgent directly.
         assert!(effects.is_empty());
-        assert_eq!(rs.urgent.len(), 1);
-        assert!(matches!(rs.urgent[0], bgp::Message::Notification(_)));
+        assert_eq!(conn.urgent.len(), 1);
+        assert!(matches!(conn.urgent[0], bgp::Message::Notification(_)));
         let _ = tables;
     }
 
