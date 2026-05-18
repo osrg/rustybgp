@@ -3086,6 +3086,11 @@ async fn accept_connection(
         tables.clone(),
         export_map,
         context,
+        peer.config
+            .graceful_restart
+            .as_ref()
+            .map(|c| c.deferral_time)
+            .unwrap_or(Duration::from_secs(360)),
     )
 }
 
@@ -3892,160 +3897,6 @@ async fn gr_deferral_timer_expired(
     }
 }
 
-async fn gr_handle_session_established(
-    global: &GlobalHandle,
-    tables: &TableHandle,
-    remote_addr: IpAddr,
-    negotiated_gr: Option<NegotiatedGr>,
-) {
-    let (source_to_drop, deferral_duration) = {
-        let mut server = global.write().await;
-        if let Some(peer) = server.peers.get_mut(&remote_addr) {
-            let deferral_time = peer
-                .config
-                .graceful_restart
-                .as_ref()
-                .map(|c| c.deferral_time)
-                .unwrap_or(Duration::from_secs(360));
-            let gr_families = negotiated_gr
-                .as_ref()
-                .map(|g| g.families.clone())
-                .unwrap_or_default();
-
-            let context_c = Arc::clone(&peer.context);
-            let mut ctx = peer.context.lock().unwrap();
-
-            // Cancel the restart timer — peer reconnected in time.
-            if let Some(h) = ctx.gr_restart_timer.take() {
-                h.abort();
-            }
-
-            // Restarting-speaker side: track EOR per family from this peer.
-            if ctx.local_restarting && !gr_families.is_empty() {
-                ctx.restarting_pending_eor =
-                    Some(gr_families.iter().cloned().collect::<FnvHashSet<_>>());
-            }
-
-            let outputs = ctx
-                .gr_state
-                .process(crate::gr::GrInput::SessionEstablished {
-                    gr_families,
-                    deferral_time,
-                });
-
-            let mut drop_source = false;
-            let mut start_deferral = false;
-            for output in &outputs {
-                match output {
-                    crate::gr::GrOutput::DeleteStaleRoutes(_) => drop_source = true,
-                    crate::gr::GrOutput::StartDeferralTimer(_) => start_deferral = true,
-                    _ => {}
-                }
-            }
-
-            let source = if drop_source {
-                ctx.gr_source.take()
-            } else {
-                None
-            };
-
-            let deferral = if !drop_source && start_deferral {
-                Some(deferral_time)
-            } else {
-                None
-            };
-
-            if let Some(dur) = deferral {
-                let tables_c = tables.clone();
-                let handle = tokio::spawn(async move {
-                    tokio::time::sleep(dur).await;
-                    gr_deferral_timer_expired(context_c, tables_c).await;
-                })
-                .abort_handle();
-                ctx.gr_deferral_timer = Some(handle);
-            }
-
-            (source, None::<Duration>)
-        } else {
-            (None, None)
-        }
-    };
-    let _ = deferral_duration; // already handled inside the lock
-    if let Some(source) = source_to_drop {
-        gr_drop_source(tables, source).await;
-    }
-}
-
-async fn gr_handle_eor_received(
-    global: &GlobalHandle,
-    tables: &TableHandle,
-    remote_addr: IpAddr,
-    family: Family,
-) {
-    let source = {
-        let mut server = global.write().await;
-        if let Some(peer) = server.peers.get_mut(&remote_addr) {
-            let mut ctx = peer.context.lock().unwrap();
-            let outputs = ctx
-                .gr_state
-                .process(crate::gr::GrInput::EorReceived(family));
-            let mut drop_source = false;
-            for output in &outputs {
-                match output {
-                    crate::gr::GrOutput::DeleteStaleRoutes(_) => drop_source = true,
-                    crate::gr::GrOutput::StopDeferralTimer => {
-                        if let Some(h) = ctx.gr_deferral_timer.take() {
-                            h.abort();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // Restarting-speaker side: mark this family as received.
-            if let Some(pending) = &mut ctx.restarting_pending_eor {
-                pending.remove(&family);
-            }
-
-            if drop_source {
-                ctx.gr_source.take()
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
-    if let Some(source) = source {
-        gr_drop_source(tables, source).await;
-    }
-
-    // Check if all tracked peers have finished sending EOR; if so, clear the
-    // restarting-speaker state so future reconnections use R=0.
-    {
-        let mut server = global.write().await;
-        let any_local_restarting = server
-            .peers
-            .values()
-            .any(|p| p.context.lock().unwrap().local_restarting);
-        if any_local_restarting {
-            let any_pending = server.peers.values().any(|p| {
-                let ctx = p.context.lock().unwrap();
-                ctx.local_restarting
-                    && matches!(&ctx.restarting_pending_eor, Some(s) if !s.is_empty())
-            });
-            let any_done = server.peers.values().any(|p| {
-                let ctx = p.context.lock().unwrap();
-                ctx.local_restarting
-                    && matches!(&ctx.restarting_pending_eor, Some(s) if s.is_empty())
-            });
-            if !any_pending && any_done {
-                server.clear_restarting();
-            }
-        }
-    }
-}
-
 /// Side effects from `apply_outputs` that require mutating global peer state.
 /// Returned by `apply_outputs` and processed by `process_effects` so that
 /// `apply_outputs` itself has no async global dependency and is unit-testable.
@@ -4132,6 +3983,9 @@ struct PeerSession {
     export_map: ExportMap,
     /// GR negotiation result from the most recent OPEN exchange.
     negotiated_gr: Option<NegotiatedGr>,
+    /// Deferral time for graceful restart, taken from peer config at session
+    /// creation so that `process_effects` needs no global lock to read it.
+    gr_deferral_time: Duration,
     /// Shared cross-session state for this peer; cloned from `Peer::context`
     /// so that `PeerSession::run` can operate on `PeerContext` without taking
     /// the global write lock.
@@ -4164,6 +4018,7 @@ impl PeerSession {
         tables: TableHandle,
         export_map: ExportMap,
         context: Arc<std::sync::Mutex<PeerContext>>,
+        gr_deferral_time: Duration,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
@@ -4206,6 +4061,7 @@ impl PeerSession {
             tables,
             export_map,
             negotiated_gr: None,
+            gr_deferral_time,
             context,
             urgent: Vec::new(),
             framer,
@@ -4572,30 +4428,129 @@ impl PeerSession {
         effects
     }
 
-    async fn process_effects(
-        effects: Vec<GlobalEffect>,
-        global: &GlobalHandle,
-        remote_addr: IpAddr,
-        tables: &TableHandle,
-    ) {
+    async fn process_effects(&mut self, effects: Vec<GlobalEffect>, global: &GlobalHandle) {
         for effect in effects {
             match effect {
                 GlobalEffect::StopActiveConnect => {
-                    let mut g = global.write().await;
-                    if let Some(peer) = g.peers.get_mut(&remote_addr) {
-                        peer.context
-                            .lock()
-                            .unwrap()
-                            .active_connect_cancel_tx
-                            .0
-                            .take();
-                    }
+                    self.context
+                        .lock()
+                        .unwrap()
+                        .active_connect_cancel_tx
+                        .0
+                        .take();
                 }
                 GlobalEffect::GrSessionEstablished { negotiated_gr } => {
-                    gr_handle_session_established(global, tables, remote_addr, negotiated_gr).await;
+                    let context_c = Arc::clone(&self.context);
+                    let deferral_time = self.gr_deferral_time;
+                    let source = {
+                        let mut ctx = self.context.lock().unwrap();
+
+                        if let Some(h) = ctx.gr_restart_timer.take() {
+                            h.abort();
+                        }
+
+                        let gr_families = negotiated_gr
+                            .as_ref()
+                            .map(|g| g.families.clone())
+                            .unwrap_or_default();
+
+                        if ctx.local_restarting && !gr_families.is_empty() {
+                            ctx.restarting_pending_eor =
+                                Some(gr_families.iter().cloned().collect::<FnvHashSet<_>>());
+                        }
+
+                        let outputs =
+                            ctx.gr_state
+                                .process(crate::gr::GrInput::SessionEstablished {
+                                    gr_families,
+                                    deferral_time,
+                                });
+
+                        let mut drop_source = false;
+                        let mut start_deferral = false;
+                        for output in &outputs {
+                            match output {
+                                crate::gr::GrOutput::DeleteStaleRoutes(_) => drop_source = true,
+                                crate::gr::GrOutput::StartDeferralTimer(_) => start_deferral = true,
+                                _ => {}
+                            }
+                        }
+
+                        let source = if drop_source {
+                            ctx.gr_source.take()
+                        } else {
+                            None
+                        };
+
+                        if !drop_source && start_deferral {
+                            let tables_c = self.tables.clone();
+                            let handle = tokio::spawn(async move {
+                                tokio::time::sleep(deferral_time).await;
+                                gr_deferral_timer_expired(context_c, tables_c).await;
+                            })
+                            .abort_handle();
+                            ctx.gr_deferral_timer = Some(handle);
+                        }
+
+                        source
+                    };
+                    if let Some(s) = source {
+                        gr_drop_source(&self.tables, s).await;
+                    }
                 }
                 GlobalEffect::GrEorReceived { family } => {
-                    gr_handle_eor_received(global, tables, remote_addr, family).await;
+                    let source = {
+                        let mut ctx = self.context.lock().unwrap();
+                        let outputs = ctx
+                            .gr_state
+                            .process(crate::gr::GrInput::EorReceived(family));
+                        let mut drop_source = false;
+                        for output in &outputs {
+                            match output {
+                                crate::gr::GrOutput::DeleteStaleRoutes(_) => drop_source = true,
+                                crate::gr::GrOutput::StopDeferralTimer => {
+                                    if let Some(h) = ctx.gr_deferral_timer.take() {
+                                        h.abort();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(pending) = &mut ctx.restarting_pending_eor {
+                            pending.remove(&family);
+                        }
+                        if drop_source {
+                            ctx.gr_source.take()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(s) = source {
+                        gr_drop_source(&self.tables, s).await;
+                    }
+
+                    // Check if all tracked peers have finished sending EOR; if so,
+                    // clear restarting-speaker state so future reconnections use R=0.
+                    let mut server = global.write().await;
+                    let any_local_restarting = server
+                        .peers
+                        .values()
+                        .any(|p| p.context.lock().unwrap().local_restarting);
+                    if any_local_restarting {
+                        let any_pending = server.peers.values().any(|p| {
+                            let ctx = p.context.lock().unwrap();
+                            ctx.local_restarting
+                                && matches!(&ctx.restarting_pending_eor, Some(s) if !s.is_empty())
+                        });
+                        let any_done = server.peers.values().any(|p| {
+                            let ctx = p.context.lock().unwrap();
+                            ctx.local_restarting
+                                && matches!(&ctx.restarting_pending_eor, Some(s) if s.is_empty())
+                        });
+                        if !any_pending && any_done {
+                            server.clear_restarting();
+                        }
+                    }
                 }
             }
         }
@@ -4808,7 +4763,7 @@ impl PeerSession {
         let effects = self
             .apply_outputs(outputs, local_sockaddr, remote_sockaddr)
             .await;
-        Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
+        self.process_effects(effects, global).await;
 
         // For UPDATE messages: if FSM didn't reject (no SessionDown), process routes.
         if let Some((reach, mp_reach, attr, unreach, mp_unreach, nexthop)) = update_fields {
@@ -4840,8 +4795,7 @@ impl PeerSession {
                     eor_effects.push(GlobalEffect::GrEorReceived { family: u.family });
                 }
                 if !eor_effects.is_empty() {
-                    Self::process_effects(eor_effects, global, self.remote_addr, &self.tables)
-                        .await;
+                    self.process_effects(eor_effects, global).await;
                 }
             }
         }
@@ -4881,7 +4835,7 @@ impl PeerSession {
         let effects = self
             .apply_outputs(outputs, local_sockaddr, remote_sockaddr)
             .await;
-        Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
+        self.process_effects(effects, global).await;
 
         let mut close_rx: futures::future::OptionFuture<_> =
             self.close_rx.take().map(|rx| rx.fuse()).into();
@@ -4914,12 +4868,12 @@ impl PeerSession {
                     println!("{}: holdtime expired", self.remote_addr);
                     let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
                     let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
-                    Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
+                    self.process_effects(effects, global).await;
                 }
                 _ = self.keepalive_futures.next() => {
                     let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
                     let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
-                    Self::process_effects(effects, global, self.remote_addr, &self.tables).await;
+                    self.process_effects(effects, global).await;
                 }
                 msg = peer_event_futures.next().fuse() => {
                     if let Some(Some(msg)) = msg {
