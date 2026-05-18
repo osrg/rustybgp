@@ -285,6 +285,9 @@ struct PeerContext {
     gr_restart_timer: Option<tokio::task::AbortHandle>,
     /// Abort handle for the GR selection deferral timer task.
     gr_deferral_timer: Option<tokio::task::AbortHandle>,
+    /// True if the daemon started with --graceful-restart and this peer has not
+    /// yet sent EOR.  Cleared by `clear_restarting` once all tracked peers finish.
+    local_restarting: bool,
     /// Restarting-speaker tracking: families for which we have not yet received EOR from this peer.
     restarting_pending_eor: Option<FnvHashSet<Family>>,
 }
@@ -495,6 +498,7 @@ impl PeerParams {
                 gr_source: None,
                 gr_restart_timer: None,
                 gr_deferral_timer: None,
+                local_restarting: false,
                 restarting_pending_eor: None,
             })),
         }
@@ -1095,14 +1099,19 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::AddPeerRequest>,
     ) -> Result<tonic::Response<api::AddPeerResponse>, tonic::Status> {
-        let peer = Peer::try_from(&request.into_inner().peer.ok_or(Error::EmptyArgument)?)?;
+        let api_peer = request.into_inner().peer.ok_or(Error::EmptyArgument)?;
+        let is_restarting = api_peer
+            .graceful_restart
+            .as_ref()
+            .is_some_and(|gr| gr.local_restarting);
+        let peer = Peer::try_from(&api_peer)?;
         let mut global = self.global.write().await;
         if let Some(password) = peer.config.password.as_ref() {
             for fd in &global.listen_sockets {
                 auth::set_md5sig(*fd, &peer.config.remote_addr, password);
             }
         }
-        global.add_peer(peer, Some(self.active_conn_tx.clone()))?;
+        global.add_peer(peer, Some(self.active_conn_tx.clone()), is_restarting)?;
         Ok(tonic::Response::new(api::AddPeerResponse {}))
     }
     async fn delete_peer(
@@ -2833,9 +2842,6 @@ struct Global {
     rpki_clients: FnvHashMap<SocketAddr, RpkiClient>,
     bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
     mrt_filenames: FnvHashSet<String>,
-    /// True when started with `--graceful-restart`; set R bit in GR capability.
-    /// Cleared once all peers with GR capability have sent EOR.
-    is_restarting: bool,
 }
 
 impl From<&Global> for api::Global {
@@ -2874,7 +2880,6 @@ impl Global {
             rpki_clients: FnvHashMap::default(),
             bmp_clients: FnvHashMap::default(),
             mrt_filenames: FnvHashSet::default(),
-            is_restarting: false,
         }
     }
 
@@ -2882,6 +2887,7 @@ impl Global {
         &mut self,
         mut peer: Peer,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
+        is_restarting: bool,
     ) -> std::result::Result<(), Error> {
         if self.peers.contains_key(&peer.config.remote_addr) {
             return Err(Error::AlreadyExists(
@@ -2899,15 +2905,15 @@ impl Global {
         if !caps.contains(&Into::<u8>::into(&c)) {
             peer.config.local_cap.push(c);
         }
-        // If we started with --graceful-restart, set the R bit in our GR capability
-        // so the peer knows we are a restarting speaker.
-        if self.is_restarting {
+        // Set the R bit in our GR capability if the daemon is currently a restarting speaker.
+        if is_restarting {
             for cap in &mut peer.config.local_cap {
                 if let packet::Capability::GracefulRestart { flags, .. } = cap {
                     *flags |= 0x8;
                 }
             }
         }
+        peer.context.lock().unwrap().local_restarting = is_restarting;
         peer.context.lock().unwrap().conn_arbiter = Some(Arc::new(std::sync::Mutex::new(
             ConnArbiter::new(crate::fsm::PeerFsm::new(
                 u32::from(self.router_id),
@@ -2933,9 +2939,10 @@ impl Global {
     /// Clear the restarting-speaker state: set R=0 in all peers' GR capability
     /// so future reconnections do not carry the Restart State bit.
     fn clear_restarting(&mut self) {
-        self.is_restarting = false;
         for peer in self.peers.values_mut() {
-            peer.context.lock().unwrap().restarting_pending_eor = None;
+            let mut ctx = peer.context.lock().unwrap();
+            ctx.local_restarting = false;
+            ctx.restarting_pending_eor = None;
             for cap in &mut peer.config.local_cap {
                 if let packet::Capability::GracefulRestart { flags, .. } = cap {
                     *flags &= !0x8;
@@ -3033,6 +3040,7 @@ async fn accept_connection(
                 }
                 .build(),
                 None,
+                false,
             );
             g.peers.get_mut(&remote_addr).unwrap()
         }
@@ -3105,9 +3113,8 @@ impl Global {
                 Ipv4Addr::new(0, 0, 0, 0)
             };
         let notify = Arc::new(tokio::sync::Notify::new());
-        if as_number != 0 || is_restarting {
+        if as_number != 0 {
             let g = &mut global.write().await;
-            g.is_restarting = is_restarting;
             if as_number != 0 {
                 notify.clone().notify_one();
                 g.asn = as_number;
@@ -3361,7 +3368,9 @@ impl Global {
             for p in peers {
                 match Peer::try_from(p) {
                     Ok(peer) => {
-                        if let Err(e) = server.add_peer(peer, Some(active_tx.clone())) {
+                        if let Err(e) =
+                            server.add_peer(peer, Some(active_tx.clone()), is_restarting)
+                        {
                             eprintln!("failed to add peer from config: {}", e);
                         }
                     }
@@ -3894,7 +3903,6 @@ async fn gr_handle_session_established(
 ) {
     let (source_to_drop, deferral_duration) = {
         let mut server = global.write().await;
-        let local_is_restarting = server.is_restarting;
         if let Some(peer) = server.peers.get_mut(&remote_addr) {
             let deferral_time = peer
                 .config
@@ -3915,7 +3923,7 @@ async fn gr_handle_session_established(
             }
 
             // Restarting-speaker side: track EOR per family from this peer.
-            if local_is_restarting && !gr_families.is_empty() {
+            if ctx.local_restarting && !gr_families.is_empty() {
                 ctx.restarting_pending_eor =
                     Some(gr_families.iter().cloned().collect::<FnvHashSet<_>>());
             }
@@ -4019,15 +4027,21 @@ async fn gr_handle_eor_received(
     // restarting-speaker state so future reconnections use R=0.
     {
         let mut server = global.write().await;
-        if server.is_restarting {
-            let any_pending = server
-                .peers
-                .values()
-                .any(|p| matches!(&p.context.lock().unwrap().restarting_pending_eor, Some(s) if !s.is_empty()));
-            let any_done = server
-                .peers
-                .values()
-                .any(|p| matches!(&p.context.lock().unwrap().restarting_pending_eor, Some(s) if s.is_empty()));
+        let any_local_restarting = server
+            .peers
+            .values()
+            .any(|p| p.context.lock().unwrap().local_restarting);
+        if any_local_restarting {
+            let any_pending = server.peers.values().any(|p| {
+                let ctx = p.context.lock().unwrap();
+                ctx.local_restarting
+                    && matches!(&ctx.restarting_pending_eor, Some(s) if !s.is_empty())
+            });
+            let any_done = server.peers.values().any(|p| {
+                let ctx = p.context.lock().unwrap();
+                ctx.local_restarting
+                    && matches!(&ctx.restarting_pending_eor, Some(s) if s.is_empty())
+            });
             if !any_pending && any_done {
                 server.clear_restarting();
             }
@@ -5178,7 +5192,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr).build(), None)
+            g.add_peer(default_peer_params(remote_addr).build(), None, false)
                 .unwrap();
         }
 
@@ -5214,7 +5228,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr).build(), None)
+            g.add_peer(default_peer_params(remote_addr).build(), None, false)
                 .unwrap();
         }
 
@@ -5253,6 +5267,7 @@ mod tests {
                 }
                 .build(),
                 None,
+                false,
             )
             .unwrap();
         }
@@ -5270,7 +5285,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr).build(), None)
+            g.add_peer(default_peer_params(remote_addr).build(), None, false)
                 .unwrap();
             let (tx, _rx) = tokio::sync::oneshot::channel::<bgp::Message>();
             g.peers
@@ -5364,7 +5379,7 @@ mod tests {
     ) -> PeerSession {
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr).build(), None)
+            g.add_peer(default_peer_params(remote_addr).build(), None, false)
                 .unwrap();
         }
         accept_connection(global, tables, server, crate::fsm::Role::Passive)
