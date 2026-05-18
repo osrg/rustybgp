@@ -4499,7 +4499,7 @@ impl PeerSession {
                 ) => {
                     self.do_route_refresh(family).await;
                 }
-                crate::fsm::PeerFsmOutput::CloseConnection(_) => {
+                crate::fsm::PeerFsmOutput::CloseConnection => {
                     self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
                 }
                 crate::fsm::PeerFsmOutput::StopActiveConnect => {

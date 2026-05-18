@@ -418,12 +418,11 @@ impl Role {
 
 /// Output from PeerFsm, wrapping Connection outputs with role information
 /// and collision detection results.
-#[allow(dead_code)]
 pub(crate) enum PeerFsmOutput {
     /// An output from the Connection for the given role.
     Connection(Role, Output),
-    /// Collision detected: close the connection for this role.
-    CloseConnection(Role),
+    /// The driver should close this session; the FSM rejected the connection.
+    CloseConnection,
     /// Passive connection reached OpenConfirm; Driver should stop active
     /// connection attempts (no new TCP connect while passive is progressing).
     StopActiveConnect,
@@ -546,7 +545,7 @@ impl PeerFsm {
             Role::Passive => &mut self.passive,
         };
         if slot.is_some() {
-            return vec![PeerFsmOutput::CloseConnection(role)];
+            return vec![PeerFsmOutput::CloseConnection];
         }
         *slot = Some(Connection::new(
             self.local_asn,
@@ -1145,7 +1144,7 @@ mod tests {
         );
         assert!(!has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(_)
+            PeerFsmOutput::CloseConnection
         )));
 
         let out = peer.process(
@@ -1158,7 +1157,7 @@ mod tests {
         );
         assert!(!has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(_)
+            PeerFsmOutput::CloseConnection
         )));
     }
 
@@ -1237,7 +1236,7 @@ mod tests {
         );
         assert!(!has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(_)
+            PeerFsmOutput::CloseConnection
         )));
         assert!(peer.connection(Role::Active).is_some());
         assert!(peer.connection(Role::Passive).is_some());
@@ -1420,13 +1419,13 @@ mod tests {
         let out = connect(&mut peer, Role::Active);
         assert!(!has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(_)
+            PeerFsmOutput::CloseConnection
         )));
         // Second Connected on same role → CloseConnection returned
         let out = connect(&mut peer, Role::Active);
         assert!(has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(Role::Active)
+            PeerFsmOutput::CloseConnection
         )));
     }
 
@@ -1488,7 +1487,7 @@ mod tests {
         let out = peer.process(Role::Active, Input::Connected);
         assert!(!has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::CloseConnection(_)
+            PeerFsmOutput::CloseConnection
         )));
         assert!(has_peer_output(&out, |o| matches!(
             o,
