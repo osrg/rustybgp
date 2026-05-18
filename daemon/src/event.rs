@@ -273,8 +273,9 @@ struct PeerContext {
     export_map: ExportMap,
     /// GR helper state machine; persists across sessions.
     gr_state: crate::gr::GrState,
-    /// The stale source from the previous session; Some while GR restart timer is running.
-    gr_source: Option<Arc<table::Source>>,
+    /// Stale sources from the previous session, keyed by family; non-empty while GR restart
+    /// timer is running.
+    gr_source: FnvHashMap<Family, Arc<table::Source>>,
     /// Abort handle for the GR restart timer task.
     gr_restart_timer: Option<tokio::task::AbortHandle>,
     /// Abort handle for the GR selection deferral timer task.
@@ -525,7 +526,7 @@ impl PeerParams {
                 active_connect_cancel_tx: ActiveConnectCancel::default(),
                 export_map: ExportMap::new(),
                 gr_state: crate::gr::GrState::new(),
-                gr_source: None,
+                gr_source: FnvHashMap::default(),
                 gr_restart_timer: None,
                 gr_deferral_timer: None,
                 local_restarting: is_restarting,
@@ -3850,21 +3851,26 @@ struct DisconnectInfo {
     export_map: ExportMap,
     /// Set when GR was successfully negotiated for at least one family.
     negotiated_gr: Option<NegotiatedGr>,
-    /// Stale source preserved when GR is active (routes not dropped in Connection::run).
-    source: Option<Arc<table::Source>>,
+    /// Stale sources preserved when GR is active (routes not dropped in Connection::run),
+    /// keyed by the family each source covers.
+    source: FnvHashMap<Family, Arc<table::Source>>,
 }
 
-async fn gr_drop_source(tables: &TableHandle, source: Arc<table::Source>) {
+async fn gr_drop_source(tables: &TableHandle, sources: FnvHashMap<Family, Arc<table::Source>>) {
     for i in 0..tables.shards.len() {
-        tables
-            .event(i, TableEvent::Disconnected(source.clone()))
-            .await;
+        for source in sources.values() {
+            tables
+                .event(i, TableEvent::Disconnected(source.clone()))
+                .await;
+        }
     }
 }
 
-async fn gr_restale_source(tables: &TableHandle, source: Arc<table::Source>) {
+async fn gr_restale_source(tables: &TableHandle, sources: &FnvHashMap<Family, Arc<table::Source>>) {
     for i in 0..tables.shards.len() {
-        tables.event(i, TableEvent::MarkStale(source.clone())).await;
+        for source in sources.values() {
+            tables.event(i, TableEvent::MarkStale(source.clone())).await;
+        }
     }
 }
 
@@ -3872,20 +3878,20 @@ async fn gr_restart_timer_expired(
     context: Arc<std::sync::Mutex<PeerContext>>,
     tables: TableHandle,
 ) {
-    let source = {
+    let sources = {
         let mut ctx = context.lock().unwrap();
         let outputs = ctx.gr_state.process(crate::gr::GrInput::TimerExpired);
         if outputs
             .iter()
             .any(|o| matches!(o, crate::gr::GrOutput::DeleteStaleRoutes(_)))
         {
-            ctx.gr_source.take()
+            std::mem::take(&mut ctx.gr_source)
         } else {
-            None
+            FnvHashMap::default()
         }
     };
-    if let Some(source) = source {
-        gr_drop_source(&tables, source).await;
+    if !sources.is_empty() {
+        gr_drop_source(&tables, sources).await;
     }
 }
 
@@ -3893,7 +3899,7 @@ async fn gr_deferral_timer_expired(
     context: Arc<std::sync::Mutex<PeerContext>>,
     tables: TableHandle,
 ) {
-    let source = {
+    let sources = {
         let mut ctx = context.lock().unwrap();
         let outputs = ctx
             .gr_state
@@ -3902,13 +3908,13 @@ async fn gr_deferral_timer_expired(
             .iter()
             .any(|o| matches!(o, crate::gr::GrOutput::DeleteStaleRoutes(_)))
         {
-            ctx.gr_source.take()
+            std::mem::take(&mut ctx.gr_source)
         } else {
-            None
+            FnvHashMap::default()
         }
     };
-    if let Some(source) = source {
-        gr_drop_source(&tables, source).await;
+    if !sources.is_empty() {
+        gr_drop_source(&tables, sources).await;
     }
 }
 
@@ -3989,7 +3995,7 @@ struct PeerSession {
     close_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
 
     stream: Option<TcpStream>,
-    source: Option<Arc<table::Source>>,
+    source: FnvHashMap<Family, Arc<table::Source>>,
     peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
     shutdown: Option<bmp::PeerDownReason>,
     /// Per-family prefix limits from config.
@@ -4069,7 +4075,7 @@ impl PeerSession {
             role,
             close_rx,
             stream: Some(stream),
-            source: None,
+            source: FnvHashMap::default(),
             peer_event_tx: Vec::new(),
             shutdown: None,
             prefix_limits,
@@ -4138,7 +4144,7 @@ impl PeerSession {
             role: crate::fsm::Role::Passive,
             close_rx: None,
             stream: None,
-            source: None,
+            source: FnvHashMap::default(),
             peer_event_tx: vec![],
             shutdown: None,
             prefix_limits: FnvHashMap::default(),
@@ -4202,15 +4208,7 @@ impl PeerSession {
             .as_secs();
         self.state.uptime.store(uptime, Ordering::Relaxed);
         let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
-        self.source = Some(Arc::new(table::Source::new(
-            self.remote_addr,
-            self.local_addr,
-            remote_asn,
-            self.local_asn,
-            Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed)),
-            uptime,
-            self.rs_client,
-        )));
+        let router_id = Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed));
 
         // Collect channel info up front so we don't borrow self.framer across .await.
         let channel_info: Vec<(Family, bool, bool)> = self
@@ -4220,6 +4218,22 @@ impl PeerSession {
             .iter()
             .map(|(f, c)| (*f, c.addpath_rx(), c.addpath_tx()))
             .collect();
+
+        // Create one Source per negotiated family so GR can stale individual families.
+        for (family, _, _) in &channel_info {
+            self.source.insert(
+                *family,
+                Arc::new(table::Source::new(
+                    self.remote_addr,
+                    self.local_addr,
+                    remote_asn,
+                    self.local_asn,
+                    router_id,
+                    uptime,
+                    self.rs_client,
+                )),
+            );
+        }
 
         let mut addpath = FnvHashSet::default();
         for (family, addpath_rx, addpath_tx) in &channel_info {
@@ -4524,7 +4538,7 @@ impl PeerSession {
                 GlobalEffect::GrSessionEstablished { negotiated_gr } => {
                     let context_c = Arc::clone(&self.context);
                     let deferral_time = self.gr_deferral_time;
-                    let source = {
+                    let sources = {
                         let mut ctx = self.context.lock().unwrap();
 
                         if let Some(h) = ctx.gr_restart_timer.take() {
@@ -4559,10 +4573,10 @@ impl PeerSession {
                             }
                         }
 
-                        let source = if drop_source {
-                            ctx.gr_source.take()
+                        let sources = if drop_source {
+                            std::mem::take(&mut ctx.gr_source)
                         } else {
-                            None
+                            FnvHashMap::default()
                         };
 
                         if !drop_source && start_deferral {
@@ -4575,14 +4589,14 @@ impl PeerSession {
                             ctx.gr_deferral_timer = Some(handle);
                         }
 
-                        source
+                        sources
                     };
-                    if let Some(s) = source {
-                        gr_drop_source(&self.tables, s).await;
+                    if !sources.is_empty() {
+                        gr_drop_source(&self.tables, sources).await;
                     }
                 }
                 GlobalEffect::GrEorReceived { family } => {
-                    let (source, peer_eor_complete) = {
+                    let (sources, peer_eor_complete) = {
                         let mut ctx = self.context.lock().unwrap();
                         let outputs = ctx
                             .gr_state
@@ -4601,15 +4615,15 @@ impl PeerSession {
                                 _ => {}
                             }
                         }
-                        let source = if drop_source {
-                            ctx.gr_source.take()
+                        let sources = if drop_source {
+                            std::mem::take(&mut ctx.gr_source)
                         } else {
-                            None
+                            FnvHashMap::default()
                         };
-                        (source, peer_eor_complete)
+                        (sources, peer_eor_complete)
                     };
-                    if let Some(s) = source {
-                        gr_drop_source(&self.tables, s).await;
+                    if !sources.is_empty() {
+                        gr_drop_source(&self.tables, sources).await;
                     }
 
                     // If this peer completed its EOR (restarting-speaker side), check
@@ -4712,13 +4726,14 @@ impl PeerSession {
     ) {
         if let Some(s) = reach {
             let family = s.family;
+            let source = self.source[&family].clone();
             for net in s.entries {
                 let idx = self.tables.dealer(net.nlri);
                 self.tables
                     .event(
                         idx,
                         TableEvent::PassUpdate(
-                            self.source.as_ref().unwrap().clone(),
+                            source.clone(),
                             family,
                             vec![net],
                             Some(attr.clone()),
@@ -4730,18 +4745,13 @@ impl PeerSession {
         }
         if let Some(s) = unreach {
             let family = s.family;
+            let source = self.source[&family].clone();
             for net in s.entries {
                 let idx = self.tables.dealer(net.nlri);
                 self.tables
                     .event(
                         idx,
-                        TableEvent::PassUpdate(
-                            self.source.as_ref().unwrap().clone(),
-                            family,
-                            vec![net],
-                            None,
-                            None,
-                        ),
+                        TableEvent::PassUpdate(source.clone(), family, vec![net], None, None),
                     )
                     .await;
             }
@@ -4752,7 +4762,11 @@ impl PeerSession {
         if self.conn_arbiter.lock().unwrap().state(self.role) != SessionState::Established {
             return;
         }
-        if Arc::ptr_eq(&ri.source, self.source.as_ref().unwrap()) {
+        if self
+            .source
+            .get(&ri.family)
+            .is_some_and(|s| Arc::ptr_eq(&ri.source, s))
+        {
             return;
         }
         if !self.framer.inner().channel.contains_key(&ri.family) {
@@ -4881,7 +4895,7 @@ impl PeerSession {
             remote_addr: self.remote_addr,
             export_map: ExportMap::new(),
             negotiated_gr: None,
-            source: None,
+            source: FnvHashMap::default(),
         };
         let mut stream = self.stream.take().unwrap();
         let Ok(remote_sockaddr) = stream.peer_addr() else {
@@ -5007,22 +5021,26 @@ impl PeerSession {
 
             // Hold timer setup is now handled by apply_outputs (SetHoldTimer).
         }
-        if let Some(source) = self.source.take() {
+        if !self.source.is_empty() {
             let gr_active = self.negotiated_gr.is_some();
             let import_policy = self.tables.import_policy.load_full();
             let export_policy = self.tables.export_policy.load_full();
             let kernel_tx = self.tables.kernel_tx.load_full();
+            // All per-family Sources share the same peer-level fields; use any for BMP.
+            let any_source = self.source.values().next().unwrap().clone();
             for i in 0..self.tables.shards.len() {
                 let mut t = self.tables.shards[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
                 t.addpath.remove(&self.remote_addr);
                 if !gr_active {
-                    t.event(
-                        TableEvent::Disconnected(source.clone()),
-                        kernel_tx.as_deref(),
-                        import_policy.as_deref(),
-                        export_policy.as_deref(),
-                    );
+                    for source in self.source.values() {
+                        t.event(
+                            TableEvent::Disconnected(source.clone()),
+                            kernel_tx.as_deref(),
+                            import_policy.as_deref(),
+                            export_policy.as_deref(),
+                        );
+                    }
                 }
                 let reason = self
                     .shutdown
@@ -5032,11 +5050,11 @@ impl PeerSession {
                     for bmp_tx in t.bmp_event_tx.values() {
                         let m = bmp::Message::PeerDown {
                             header: bmp::PerPeerHeader::new(
-                                source.remote_asn,
-                                Ipv4Addr::from(source.router_id),
+                                any_source.remote_asn,
+                                Ipv4Addr::from(any_source.router_id),
                                 0,
-                                source.remote_addr,
-                                source.uptime as u32,
+                                any_source.remote_addr,
+                                any_source.uptime as u32,
                             ),
                             reason: reason.clone(),
                         };
@@ -5045,7 +5063,7 @@ impl PeerSession {
                 }
             }
             if gr_active {
-                disconnect.source = Some(source);
+                disconnect.source = std::mem::take(&mut self.source);
             }
         }
         disconnect.export_map = std::mem::take(&mut self.export_map);
@@ -5060,9 +5078,11 @@ impl PeerSession {
         // mark_stale() and the table re-selection event need no global lock, so
         // do them here before acquiring it to avoid holding the lock during async
         // table I/O.
-        if let (Some(_), Some(source)) = (&info.negotiated_gr, &info.source) {
-            source.mark_stale();
-            gr_restale_source(&tables, source.clone()).await;
+        if info.negotiated_gr.is_some() && !info.source.is_empty() {
+            for source in info.source.values() {
+                source.mark_stale();
+            }
+            gr_restale_source(&tables, &info.source).await;
         }
 
         // Operate on PeerContext directly via self.context — no global lock needed
@@ -5086,52 +5106,53 @@ impl PeerSession {
                 let _ = arb.process(info.role, crate::fsm::Input::Disconnected);
             }
 
-            let old_stale_source =
-                if let (Some(gr), Some(source)) = (&info.negotiated_gr, info.source) {
-                    // GR active: start restart timer, preserve export_map.
-                    if let Some(h) = ctx.gr_deferral_timer.take() {
-                        h.abort();
-                    }
-                    if let Some(h) = ctx.gr_restart_timer.take() {
-                        h.abort();
-                    }
-                    // Take any lingering stale source from a previous GR cycle to drop
-                    // after the lock is released.
-                    let old = ctx.gr_source.take();
+            let old_stale_source = if let Some(gr) = &info.negotiated_gr
+                && !info.source.is_empty()
+            {
+                // GR active: start restart timer, preserve export_map.
+                if let Some(h) = ctx.gr_deferral_timer.take() {
+                    h.abort();
+                }
+                if let Some(h) = ctx.gr_restart_timer.take() {
+                    h.abort();
+                }
+                // Take any lingering stale source from a previous GR cycle to drop
+                // after the lock is released.
+                let old = std::mem::take(&mut ctx.gr_source);
 
-                    let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
-                        families: gr.families.clone(),
-                        restart_time: gr.restart_time,
-                    });
-                    for output in &outputs {
-                        if let crate::gr::GrOutput::StartTimer(duration) = output {
-                            let dur = *duration;
-                            let context_c = Arc::clone(&self.context);
-                            let tables_c = tables.clone();
-                            let handle = tokio::spawn(async move {
-                                tokio::time::sleep(dur).await;
-                                gr_restart_timer_expired(context_c, tables_c).await;
-                            })
-                            .abort_handle();
-                            ctx.gr_restart_timer = Some(handle);
-                        }
+                let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
+                    families: gr.families.clone(),
+                    restart_time: gr.restart_time,
+                });
+                for output in &outputs {
+                    if let crate::gr::GrOutput::StartTimer(duration) = output {
+                        let dur = *duration;
+                        let context_c = Arc::clone(&self.context);
+                        let tables_c = tables.clone();
+                        let handle = tokio::spawn(async move {
+                            tokio::time::sleep(dur).await;
+                            gr_restart_timer_expired(context_c, tables_c).await;
+                        })
+                        .abort_handle();
+                        ctx.gr_restart_timer = Some(handle);
                     }
-                    ctx.gr_source = Some(source);
-                    ctx.export_map = info.export_map;
-                    old
-                } else {
-                    // Normal disconnect: routes were already dropped in Connection::run().
-                    // Clean up any leftover GR state from a previous cycle that never recovered.
-                    if let Some(h) = ctx.gr_restart_timer.take() {
-                        h.abort();
-                    }
-                    if let Some(h) = ctx.gr_deferral_timer.take() {
-                        h.abort();
-                    }
-                    let old = ctx.gr_source.take();
-                    drop(info.export_map);
-                    old
-                };
+                }
+                ctx.gr_source = info.source;
+                ctx.export_map = info.export_map;
+                old
+            } else {
+                // Normal disconnect: routes were already dropped in Connection::run().
+                // Clean up any leftover GR state from a previous cycle that never recovered.
+                if let Some(h) = ctx.gr_restart_timer.take() {
+                    h.abort();
+                }
+                if let Some(h) = ctx.gr_deferral_timer.take() {
+                    h.abort();
+                }
+                let old = std::mem::take(&mut ctx.gr_source);
+                drop(info.export_map);
+                old
+            };
 
             // Only reset and reconnect when no PeerSession remains for this peer.
             let no_sessions = {
@@ -5142,8 +5163,8 @@ impl PeerSession {
         };
 
         // Drop stale source outside the context lock so gr_drop_source can be awaited directly.
-        if let Some(old) = old_stale_source {
-            gr_drop_source(&tables, old).await;
+        if !old_stale_source.is_empty() {
+            gr_drop_source(&tables, old_stale_source).await;
         }
 
         // Peer-level operations still require the global write lock.
@@ -5420,15 +5441,18 @@ mod tests {
                 crate::fsm::Input::MessageReceived(bgp::Message::Keepalive),
             );
         }
-        conn.source = Some(Arc::new(table::Source::new(
-            remote_addr,
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            65002,
-            65001,
-            Ipv4Addr::new(10, 0, 0, 1),
-            0,
-            false,
-        )));
+        conn.source.insert(
+            Family::IPV4,
+            Arc::new(table::Source::new(
+                remote_addr,
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                65002,
+                65001,
+                Ipv4Addr::new(10, 0, 0, 1),
+                0,
+                false,
+            )),
+        );
         conn
     }
 
@@ -5694,7 +5718,7 @@ mod tests {
             active_connect_cancel_tx: ActiveConnectCancel::default(),
             export_map: ExportMap::new(),
             gr_state: crate::gr::GrState::new(),
-            gr_source: None,
+            gr_source: FnvHashMap::default(),
             gr_restart_timer: None,
             gr_deferral_timer: None,
             local_restarting,
@@ -5757,7 +5781,11 @@ mod tests {
             0,
             false,
         ));
-        context.lock().unwrap().gr_source = Some(stale_source);
+        context
+            .lock()
+            .unwrap()
+            .gr_source
+            .insert(Family::IPV4, stale_source);
 
         let negotiated_gr = Some(NegotiatedGr {
             families: vec![Family::IPV4],
@@ -5781,7 +5809,7 @@ mod tests {
         // GrState should now be in WaitingEor (helper side, deferral timer set).
         assert!(ctx.gr_state.is_peer_restarting());
         // Stale source is still present (not deleted until EOR or deferral timer).
-        assert!(ctx.gr_source.is_some());
+        assert!(!ctx.gr_source.is_empty());
         // Deferral timer was started.
         assert!(ctx.gr_deferral_timer.is_some());
     }
@@ -5851,15 +5879,18 @@ mod tests {
             ctx.gr_deferral_timer = Some(handle);
 
             // Also plant a stale source that should be dropped on EOR.
-            ctx.gr_source = Some(Arc::new(table::Source::new(
-                remote_addr,
-                IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-                65002,
-                65001,
-                std::net::Ipv4Addr::new(10, 0, 0, 1),
-                0,
-                false,
-            )));
+            ctx.gr_source.insert(
+                Family::IPV4,
+                Arc::new(table::Source::new(
+                    remote_addr,
+                    IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                    65002,
+                    65001,
+                    std::net::Ipv4Addr::new(10, 0, 0, 1),
+                    0,
+                    false,
+                )),
+            );
         }
 
         let mut session = PeerSession::new_for_test(
@@ -5881,7 +5912,7 @@ mod tests {
         // Deferral timer cleared.
         assert!(ctx.gr_deferral_timer.is_none());
         // Stale source dropped.
-        assert!(ctx.gr_source.is_none());
+        assert!(ctx.gr_source.is_empty());
         // GrState is now Idle (EOR for only family received → WaitingEor→Idle).
         assert!(!ctx.gr_state.is_peer_restarting());
     }
