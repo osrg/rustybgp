@@ -58,8 +58,6 @@ pub(crate) enum GrInput {
 
 /// Actions the driver should perform in response to a GR input.
 pub(crate) enum GrOutput {
-    /// Mark routes from this peer stale for the given families.
-    MarkStale(Vec<Family>),
     /// Start (or restart) the restart timer with the given duration.
     StartTimer(Duration),
     /// Cancel the restart timer.
@@ -154,7 +152,6 @@ impl GrState {
                 if matches!(state, Inner::WaitingEor { .. }) {
                     outputs.push(GrOutput::StopDeferralTimer);
                 }
-                outputs.push(GrOutput::MarkStale(families.clone()));
                 outputs.push(GrOutput::StartTimer(restart_time));
                 (
                     Inner::Restarting {
@@ -264,13 +261,12 @@ mod tests {
     }
 
     #[test]
-    fn session_dropped_marks_stale_and_starts_timer() {
+    fn session_dropped_starts_timer() {
         let mut gr = GrState::new();
         let outputs = drop_ipv4(&mut gr);
 
-        assert_eq!(outputs.len(), 2);
-        assert!(matches!(&outputs[0], GrOutput::MarkStale(f) if f == &[ipv4()]));
-        assert!(matches!(&outputs[1], GrOutput::StartTimer(d) if *d == restart_time()));
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(&outputs[0], GrOutput::StartTimer(d) if *d == restart_time()));
         assert!(matches!(gr.state, Inner::Restarting { .. }));
     }
 
@@ -378,9 +374,8 @@ mod tests {
             restart_time: Duration::from_secs(60),
         });
 
-        assert_eq!(outputs.len(), 2);
-        assert!(matches!(&outputs[0], GrOutput::MarkStale(f) if f.len() == 2));
-        assert!(matches!(&outputs[1], GrOutput::StartTimer(d) if *d == Duration::from_secs(60)));
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(&outputs[0], GrOutput::StartTimer(d) if *d == Duration::from_secs(60)));
         assert!(matches!(gr.state, Inner::Restarting { .. }));
     }
 
@@ -437,11 +432,10 @@ mod tests {
 
         let outputs = drop_ipv4(&mut gr);
 
-        // StopDeferralTimer + MarkStale + StartTimer
-        assert_eq!(outputs.len(), 3);
+        // StopDeferralTimer + StartTimer
+        assert_eq!(outputs.len(), 2);
         assert!(matches!(outputs[0], GrOutput::StopDeferralTimer));
-        assert!(matches!(&outputs[1], GrOutput::MarkStale(f) if f == &[ipv4()]));
-        assert!(matches!(outputs[2], GrOutput::StartTimer(d) if d == restart_time()));
+        assert!(matches!(outputs[1], GrOutput::StartTimer(d) if d == restart_time()));
         assert!(matches!(gr.state, Inner::Restarting { .. }));
     }
 
