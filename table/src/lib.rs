@@ -888,11 +888,21 @@ impl RoutingTable {
         changes
     }
 
-    pub fn drop(&mut self, source: Arc<Source>) -> Vec<Change> {
+    pub fn drop(&mut self, addr: IpAddr, family: Family) -> Vec<Change> {
         let mut advertise = Vec::new();
-        self.route_stats.remove(&source.remote_addr);
-        self.prefix_limits.remove(&source.remote_addr);
-        for (family, rt) in self.global.iter_mut() {
+        if let Some(fm) = self.route_stats.get_mut(&addr) {
+            fm.remove(&family);
+            if fm.is_empty() {
+                self.route_stats.remove(&addr);
+            }
+        }
+        if let Some(fm) = self.prefix_limits.get_mut(&addr) {
+            fm.remove(&family);
+            if fm.is_empty() {
+                self.prefix_limits.remove(&addr);
+            }
+        }
+        if let Some(rt) = self.global.get_mut(&family) {
             rt.retain(|net, dst| {
                 let old_top: Vec<TopNEntry> = dst
                     .unfiltered_all()
@@ -905,14 +915,13 @@ impl RoutingTable {
                     })
                     .collect();
 
-                dst.entry.retain(|e| !Arc::ptr_eq(&e.source, &source));
+                dst.entry.retain(|e| e.source.remote_addr != addr);
 
                 if dst.entry.is_empty() {
-                    // Withdraw all previously-advertised paths using their stable IDs
                     for (i, e) in old_top.iter().enumerate() {
                         advertise.push(Change {
                             source: e.source.clone(),
-                            family: *family,
+                            family,
                             net: *net,
                             nexthop: e.nexthop,
                             attr: Arc::new(Vec::new()),
@@ -924,23 +933,79 @@ impl RoutingTable {
                     return false;
                 }
 
-                advertise.extend(Self::diff_top_n(dst, &old_top, *family, *net));
+                advertise.extend(Self::diff_top_n(dst, &old_top, family, *net));
                 true
             });
         }
         advertise
     }
 
-    /// Re-run best-path selection for all destinations that have paths from
-    /// `source`, after `source.mark_stale()` has been called.  Returns the
-    /// same `Vec<Change>` diff format as `drop()` so the caller can distribute
-    /// withdraws / updates to other peers.
-    pub fn restale(&mut self, source: &Arc<Source>) -> Vec<Change> {
+    /// Remove only stale paths from `addr` in `family` and re-run best-path
+    /// selection.  Used by GR helpers after EOR or deferral timer expiry, where
+    /// the peer may have already sent fresh routes in the new session that must
+    /// not be disturbed.
+    pub fn drop_stale(&mut self, addr: IpAddr, family: Family) -> Vec<Change> {
+        let mut advertise = Vec::new();
+        if let Some(rt) = self.global.get_mut(&family) {
+            rt.retain(|net, dst| {
+                if !dst
+                    .entry
+                    .iter()
+                    .any(|e| e.source.remote_addr == addr && e.source.is_stale())
+                {
+                    return true;
+                }
+                let old_top: Vec<TopNEntry> = dst
+                    .unfiltered_all()
+                    .iter()
+                    .map(|p| TopNEntry {
+                        source: p.source.clone(),
+                        nexthop: p.nexthop,
+                        attr: p.pa.attr.clone(),
+                        local_path_id: p.local_path_id,
+                    })
+                    .collect();
+
+                dst.entry
+                    .retain(|e| !(e.source.remote_addr == addr && e.source.is_stale()));
+
+                if dst.entry.is_empty() {
+                    for (i, e) in old_top.iter().enumerate() {
+                        advertise.push(Change {
+                            source: e.source.clone(),
+                            family,
+                            net: *net,
+                            nexthop: e.nexthop,
+                            attr: Arc::new(Vec::new()),
+                            path_id: e.local_path_id,
+                            rank: i + 1,
+                            old_rank: i + 1,
+                        });
+                    }
+                    return false;
+                }
+
+                advertise.extend(Self::diff_top_n(dst, &old_top, family, *net));
+                true
+            });
+        }
+        advertise
+    }
+
+    /// Mark all paths from `addr` in `family` as stale and re-run best-path
+    /// selection.  Returns the same `Vec<Change>` diff format as `drop()` so
+    /// the caller can distribute withdraws / updates to other peers.
+    pub fn restale(&mut self, addr: IpAddr, family: Family) -> Vec<Change> {
         let mut changes = Vec::new();
-        for (family, rt) in self.global.iter_mut() {
+        if let Some(rt) = self.global.get_mut(&family) {
             for (net, dst) in rt.iter_mut() {
-                if !dst.entry.iter().any(|p| Arc::ptr_eq(&p.source, source)) {
+                if !dst.entry.iter().any(|p| p.source.remote_addr == addr) {
                     continue;
+                }
+                for p in dst.entry.iter() {
+                    if p.source.remote_addr == addr {
+                        p.source.mark_stale();
+                    }
                 }
                 let old_top: Vec<TopNEntry> = dst
                     .unfiltered_all()
@@ -953,7 +1018,7 @@ impl RoutingTable {
                     })
                     .collect();
                 dst.entry.sort_unstable();
-                changes.extend(Self::diff_top_n(dst, &old_top, *family, *net));
+                changes.extend(Self::diff_top_n(dst, &old_top, family, *net));
             }
         }
         changes
@@ -2225,7 +2290,7 @@ mod tests {
         rt.insert(s1.clone(), family, n3, 0, nh(), attrs.clone(), false);
 
         assert_eq!(rt.global.get(&family).unwrap().len(), 3);
-        rt.drop(s1);
+        rt.drop(s1.remote_addr, family);
         assert_eq!(rt.global.get(&family).unwrap().len(), 1);
     }
 
@@ -3180,7 +3245,7 @@ mod tests {
         let s3 = source(3, 65003, 65000, 3);
         rt.insert(s3.clone(), Family::IPV4, net, 0, nh(), attrs.clone(), false);
         // drop s2 → s3 becomes new best (withdraw old + advertise new)
-        let changes = rt.drop(s2);
+        let changes = rt.drop(s2.remote_addr, Family::IPV4);
         let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 3));
         assert!(Arc::ptr_eq(&adv.source, &s3));
     }
@@ -3196,7 +3261,7 @@ mod tests {
         let s2 = source(2, 65002, 65000, 2);
         rt.insert(s2, Family::IPV4, net, 0, nh(), empty_attrs(), false);
         // drop s1 (filtered) → no best change
-        let changes = rt.drop(s1);
+        let changes = rt.drop(s1.remote_addr, Family::IPV4);
         assert!(changes.is_empty());
     }
 
@@ -3467,9 +3532,96 @@ mod tests {
         s.mark_stale();
         assert_eq!(rt.best(&Family::IPV4).len(), 1);
 
-        rt.drop(s);
+        rt.drop(s.remote_addr, Family::IPV4);
         assert!(rt.best(&Family::IPV4).is_empty());
     }
+
+    // --- drop_stale ---
+
+    #[test]
+    fn drop_stale_removes_only_stale_paths_keeps_fresh() {
+        // fresh_src and stale_src have routes for the same prefix.
+        // drop_stale should remove the stale route but leave the fresh one.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let stale_src = source(1, 65001, 65000, 1);
+        let fresh_src = source(2, 65001, 65000, 2);
+
+        rt.insert(
+            stale_src.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+        rt.insert(
+            fresh_src.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+
+        stale_src.mark_stale();
+        let changes = rt.drop_stale(stale_src.remote_addr, Family::IPV4);
+
+        // The stale path is gone but the fresh one remains as rank=1.
+        let best = rt.best(&Family::IPV4);
+        assert_eq!(best.len(), 1);
+        assert_eq!(best[0].rank, 1);
+        assert_eq!(best[0].source.remote_addr, fresh_src.remote_addr);
+
+        // A path-change event is emitted because the best path shifted.
+        assert!(!changes.is_empty());
+    }
+
+    #[test]
+    fn drop_stale_removes_route_when_no_fresh_alternative() {
+        // Only one source; after mark_stale, drop_stale removes it completely.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s = source(1, 65001, 65000, 1);
+        rt.insert(
+            s.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+
+        s.mark_stale();
+        rt.drop_stale(s.remote_addr, Family::IPV4);
+        assert!(rt.best(&Family::IPV4).is_empty());
+    }
+
+    #[test]
+    fn drop_stale_leaves_fresh_routes_untouched() {
+        // Source has fresh (not stale) routes; drop_stale must not remove them.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s = source(1, 65001, 65000, 1);
+        rt.insert(
+            s.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+        );
+
+        let changes = rt.drop_stale(s.remote_addr, Family::IPV4);
+        assert!(changes.is_empty());
+        assert_eq!(rt.best(&Family::IPV4).len(), 1);
+    }
+
+    // --- restale ---
 
     #[test]
     fn restale_demotes_stale_when_fresh_alternative_exists() {
@@ -3510,9 +3662,7 @@ mod tests {
                 == stale_src.remote_addr
         );
 
-        // Simulate GR session drop: mark stale then re-select.
-        stale_src.mark_stale();
-        let changes = rt.restale(&stale_src);
+        let changes = rt.restale(stale_src.remote_addr, Family::IPV4);
 
         // restale() must emit changes: old rank-1 (stale) loses to fresh.
         assert!(!changes.is_empty());
@@ -3541,8 +3691,7 @@ mod tests {
             false,
         );
 
-        src.mark_stale();
-        let changes = rt.restale(&src);
+        let changes = rt.restale(src.remote_addr, Family::IPV4);
 
         // No rank change → no changes emitted.
         assert!(changes.is_empty());

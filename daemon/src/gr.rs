@@ -57,7 +57,6 @@ pub(crate) enum GrInput {
 }
 
 /// Actions the driver should perform in response to a GR input.
-#[allow(dead_code)]
 pub(crate) enum GrOutput {
     /// Mark routes from this peer stale for the given families.
     MarkStale(Vec<Family>),
