@@ -3941,6 +3941,24 @@ enum GlobalEffect {
     GrEorReceived { family: Family },
 }
 
+/// Returns the families whose routes must be dropped immediately on disconnect.
+///
+/// GR families are preserved (routes are kept stale until the restart timer
+/// fires or EOR is received).  Every other session family is dropped right away,
+/// even when GR is active for the peer.
+fn families_to_drop_on_disconnect<'a>(
+    session_families: impl Iterator<Item = &'a Family>,
+    negotiated_gr: Option<&NegotiatedGr>,
+) -> Vec<Family> {
+    let gr_families: FnvHashSet<Family> = negotiated_gr
+        .map(|g| g.families.iter().copied().collect())
+        .unwrap_or_default();
+    session_families
+        .filter(|f| !gr_families.contains(f))
+        .copied()
+        .collect()
+}
+
 #[derive(Clone)]
 struct ExportMap {
     advertised: FnvHashMap<Family, FnvHashSet<packet::Nlri>>,
@@ -5017,7 +5035,8 @@ impl PeerSession {
             // Hold timer setup is now handled by apply_outputs (SetHoldTimer).
         }
         if !self.source.is_empty() {
-            let gr_active = self.negotiated_gr.is_some();
+            let drop_families =
+                families_to_drop_on_disconnect(self.source.keys(), self.negotiated_gr.as_ref());
             let import_policy = self.tables.import_policy.load_full();
             let export_policy = self.tables.export_policy.load_full();
             let kernel_tx = self.tables.kernel_tx.load_full();
@@ -5027,15 +5046,13 @@ impl PeerSession {
                 let mut t = self.tables.shards[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
                 t.addpath.remove(&self.remote_addr);
-                if !gr_active {
-                    for &family in self.source.keys() {
-                        t.event(
-                            TableEvent::Disconnected(self.remote_addr, family),
-                            kernel_tx.as_deref(),
-                            import_policy.as_deref(),
-                            export_policy.as_deref(),
-                        );
-                    }
+                for &family in &drop_families {
+                    t.event(
+                        TableEvent::Disconnected(self.remote_addr, family),
+                        kernel_tx.as_deref(),
+                        import_policy.as_deref(),
+                        export_policy.as_deref(),
+                    );
                 }
                 let reason = self
                     .shutdown
@@ -5908,6 +5925,162 @@ mod tests {
         let g = global.read().await;
         let ctx = g.peers[&remote_addr].context.lock().unwrap();
         assert!(!ctx.local_restarting);
+    }
+
+    // ---- families_to_drop_on_disconnect ----
+
+    #[test]
+    fn drop_on_disconnect_no_gr_drops_all_families() {
+        let families = vec![Family::IPV4, Family::IPV6];
+        let result = families_to_drop_on_disconnect(families.iter(), None);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&Family::IPV4));
+        assert!(result.contains(&Family::IPV6));
+    }
+
+    #[test]
+    fn drop_on_disconnect_gr_for_all_drops_nothing() {
+        let families = vec![Family::IPV4, Family::IPV6];
+        let negotiated_gr = NegotiatedGr {
+            families: vec![Family::IPV4, Family::IPV6],
+            restart_time: Duration::from_secs(90),
+        };
+        let result = families_to_drop_on_disconnect(families.iter(), Some(&negotiated_gr));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn drop_on_disconnect_gr_for_ipv4_only_drops_ipv6() {
+        let families = vec![Family::IPV4, Family::IPV6];
+        let negotiated_gr = NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+        };
+        let result = families_to_drop_on_disconnect(families.iter(), Some(&negotiated_gr));
+        assert_eq!(result, vec![Family::IPV6]);
+    }
+
+    // ---- disconnect drops non-GR family routes in the routing table ----
+
+    #[tokio::test]
+    async fn disconnect_with_gr_drops_non_gr_family_routes() {
+        use std::net::Ipv4Addr;
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
+        let local_addr: IpAddr = "127.0.0.1".parse().unwrap();
+
+        let source = Arc::new(table::Source::new(
+            remote_addr,
+            local_addr,
+            65002,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 2),
+            0,
+            false,
+        ));
+        let ipv4_net: packet::Nlri = "10.1.0.0/24".parse().unwrap();
+        let ipv6_net: packet::Nlri = "2001:db8::/32".parse().unwrap();
+        let attrs = Arc::new(Vec::new());
+        let nh4 = packet::bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let nh6 =
+            packet::bgp::Nexthop::V6(std::net::Ipv6Addr::new(0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1));
+
+        // Insert one IPv4 route and one IPv6 route for the peer.
+        {
+            let mut t = tables.shards[0].lock().await;
+            t.rtable.insert(
+                source.clone(),
+                Family::IPV4,
+                ipv4_net,
+                0,
+                nh4,
+                attrs.clone(),
+                false,
+            );
+            t.rtable.insert(
+                source.clone(),
+                Family::IPV6,
+                ipv6_net,
+                0,
+                nh6,
+                attrs.clone(),
+                false,
+            );
+        }
+
+        // GR active for IPv4 only: IPv6 must be dropped immediately, IPv4 preserved.
+        let negotiated_gr = NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+        };
+        let session_families = vec![Family::IPV4, Family::IPV6];
+        let drop_families =
+            families_to_drop_on_disconnect(session_families.iter(), Some(&negotiated_gr));
+        for &family in &drop_families {
+            tables
+                .event(0, TableEvent::Disconnected(remote_addr, family))
+                .await;
+        }
+
+        let t = tables.shards[0].lock().await;
+        // IPv4 route (GR family) must still be in the table.
+        assert_eq!(t.rtable.best(&Family::IPV4).len(), 1);
+        // IPv6 route (non-GR family) must have been removed.
+        assert!(t.rtable.best(&Family::IPV6).is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_without_gr_drops_all_routes() {
+        use std::net::Ipv4Addr;
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.3".parse().unwrap();
+        let local_addr: IpAddr = "127.0.0.1".parse().unwrap();
+
+        let source = Arc::new(table::Source::new(
+            remote_addr,
+            local_addr,
+            65003,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 3),
+            0,
+            false,
+        ));
+        let ipv4_net: packet::Nlri = "10.2.0.0/24".parse().unwrap();
+        let attrs = Arc::new(Vec::new());
+        let nh4 = packet::bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 3));
+
+        {
+            let mut t = tables.shards[0].lock().await;
+            t.rtable
+                .insert(source, Family::IPV4, ipv4_net, 0, nh4, attrs, false);
+        }
+        assert_eq!(
+            tables.shards[0]
+                .lock()
+                .await
+                .rtable
+                .best(&Family::IPV4)
+                .len(),
+            1
+        );
+
+        // No GR: all families dropped.
+        let session_families = vec![Family::IPV4];
+        let drop_families = families_to_drop_on_disconnect(session_families.iter(), None);
+        for &family in &drop_families {
+            tables
+                .event(0, TableEvent::Disconnected(remote_addr, family))
+                .await;
+        }
+
+        assert!(
+            tables.shards[0]
+                .lock()
+                .await
+                .rtable
+                .best(&Family::IPV4)
+                .is_empty()
+        );
     }
 
     // Regression test: after a session ends via EOF/I/O error (shutdown set
