@@ -23,8 +23,9 @@
 //! routes from a restarting peer until the peer either reconnects and sends
 //! End-of-RIB, or the restart timer expires.
 
-use fnv::FnvHashSet;
+use fnv::{FnvHashMap, FnvHashSet};
 use rustybgp_packet::bgp::Family;
+use std::net::IpAddr;
 use std::time::Duration;
 
 /// Events fed into the GR state machine.
@@ -223,6 +224,324 @@ impl GrState {
         };
         self.state = new_state;
         outputs
+    }
+}
+
+// ============================================================================
+// Restarting Speaker deferral state machine (RFC 4724 §4.2)
+// ============================================================================
+
+/// Events for the Restarting Speaker deferral state machine.
+#[allow(dead_code)]
+pub(crate) enum RestartingInput {
+    /// A peer session established.  `families` is the set of GR families
+    /// negotiated in the OPEN; empty means this peer does not support GR.
+    PeerEstablished(IpAddr, Vec<Family>),
+    /// End-of-RIB received from `addr` for `family`.
+    EorReceived(IpAddr, Family),
+    /// The peer dropped or was removed from configuration.
+    PeerWithdrawn(IpAddr),
+    /// The global Selection Deferral Timer expired.
+    TimerExpired,
+}
+
+/// Actions the driver performs for the Restarting Speaker deferral machine.
+#[allow(dead_code)]
+pub(crate) enum RestartingOutput {
+    /// Emitted from `new()`: set the table deferral flag for these families.
+    DeferFamilies(Vec<Family>),
+    /// Start the global Selection Deferral Timer with this duration.
+    StartDeferralTimer(Duration),
+    /// This family is fully acknowledged: clear its table flag and re-advertise.
+    FamilyDeferralComplete(Family),
+    /// All deferral is done.  Remaining families (non-empty only on timer expiry)
+    /// need their table flags cleared; driver must then call `clear_restarting()`.
+    EndDeferral(Vec<Family>),
+}
+
+// Restarting Speaker state diagram:
+//
+//   new(gr_peers={p:fams,...}) --> AwaitingStart
+//     output: [DeferFamilies(all_families)]
+//
+//   new(gr_peers={}) --> Completed  (no output)
+//
+//   AwaitingStart
+//     + PeerEstablished(addr, non-empty, known)
+//         update pending[addr] = negotiated families
+//         output: [FamilyDeferralComplete*, StartDeferralTimer]
+//         --> Deferring
+//     + PeerWithdrawn(addr) | PeerEstablished(addr, [])
+//         remove addr from pending; check newly-complete families
+//         output: [FamilyDeferralComplete*]
+//         if pending empty: output += [EndDeferral([])]  --> Completed
+//         else:                                          --> AwaitingStart
+//     + EorReceived | TimerExpired: no-op
+//
+//   Deferring
+//     + EorReceived(addr, fam)
+//         remove fam from pending[addr] (drop entry if empty)
+//         if fam no longer in any pending entry: output [FamilyDeferralComplete(fam)]
+//         if pending empty: output += [EndDeferral([])]  --> Completed
+//         else:                                          --> Deferring
+//     + PeerWithdrawn(addr) | PeerEstablished(addr, [])
+//         remove addr from pending; check newly-complete families
+//         output: [FamilyDeferralComplete*]
+//         if pending empty: output += [EndDeferral([])]  --> Completed
+//         else:                                          --> Deferring
+//     + TimerExpired
+//         output: [EndDeferral(remaining_families)]  --> Completed
+//
+//   Completed: all inputs are no-ops
+
+#[allow(dead_code)]
+enum RestartingInner {
+    AwaitingStart {
+        pending: FnvHashMap<IpAddr, FnvHashSet<Family>>,
+        duration: Duration,
+    },
+    Deferring {
+        pending: FnvHashMap<IpAddr, FnvHashSet<Family>>,
+    },
+    Completed,
+}
+
+/// Restarting Speaker Selection Deferral state machine (RFC 4724 §4.2).
+///
+/// Created at startup with the configured GR-capable peers.  Emits
+/// `DeferFamilies` immediately so the driver can flag the right table families
+/// before any peer connects.  Advances to `Completed` once all expected EOR
+/// has arrived or the timer fires.
+#[allow(dead_code)]
+pub(crate) struct RestartingDeferral {
+    state: RestartingInner,
+}
+
+#[allow(dead_code)]
+impl RestartingDeferral {
+    /// Create the state machine.
+    ///
+    /// `gr_peers`: each peer's configured GR families (peers with an empty
+    /// list are skipped).  Returns `(machine, outputs)` where outputs contains
+    /// at most one `DeferFamilies` action.
+    pub(crate) fn new(
+        gr_peers: FnvHashMap<IpAddr, Vec<Family>>,
+        duration: Duration,
+    ) -> (Self, Vec<RestartingOutput>) {
+        let pending: FnvHashMap<IpAddr, FnvHashSet<Family>> = gr_peers
+            .into_iter()
+            .filter_map(|(addr, fams)| {
+                if fams.is_empty() {
+                    None
+                } else {
+                    Some((addr, fams.into_iter().collect()))
+                }
+            })
+            .collect();
+
+        if pending.is_empty() {
+            return (
+                Self {
+                    state: RestartingInner::Completed,
+                },
+                vec![],
+            );
+        }
+
+        let all_families: FnvHashSet<Family> = pending.values().flatten().copied().collect();
+        let mut fam_vec: Vec<Family> = all_families.into_iter().collect();
+        fam_vec.sort_unstable_by_key(|f| (f.afi(), f.safi()));
+
+        (
+            Self {
+                state: RestartingInner::AwaitingStart { pending, duration },
+            },
+            vec![RestartingOutput::DeferFamilies(fam_vec)],
+        )
+    }
+
+    pub(crate) fn is_completed(&self) -> bool {
+        matches!(self.state, RestartingInner::Completed)
+    }
+
+    pub(crate) fn process(&mut self, input: RestartingInput) -> Vec<RestartingOutput> {
+        let state = std::mem::replace(&mut self.state, RestartingInner::Completed);
+        let (new_state, outputs) = match (state, input) {
+            // AwaitingStart: first GR peer establishes -> transition to Deferring
+            (
+                RestartingInner::AwaitingStart {
+                    mut pending,
+                    duration,
+                },
+                RestartingInput::PeerEstablished(addr, families),
+            ) => {
+                if families.is_empty() {
+                    let out = Self::remove_peer(&mut pending, addr);
+                    Self::finish_awaiting(pending, duration, out)
+                } else if let std::collections::hash_map::Entry::Occupied(mut e) =
+                    pending.entry(addr)
+                {
+                    let new_set: FnvHashSet<Family> = families.into_iter().collect();
+                    let old_set = e.insert(new_set);
+                    let removed: Vec<Family> = old_set
+                        .iter()
+                        .filter(|f| !e.get().contains(f))
+                        .copied()
+                        .collect();
+                    let mut out = Self::complete_for(&pending, &removed);
+                    out.push(RestartingOutput::StartDeferralTimer(duration));
+                    (RestartingInner::Deferring { pending }, out)
+                } else {
+                    // Unknown peer: ignore
+                    (RestartingInner::AwaitingStart { pending, duration }, vec![])
+                }
+            }
+
+            // AwaitingStart: peer withdrawn before any establish
+            (
+                RestartingInner::AwaitingStart {
+                    mut pending,
+                    duration,
+                },
+                RestartingInput::PeerWithdrawn(addr),
+            ) => {
+                let out = Self::remove_peer(&mut pending, addr);
+                Self::finish_awaiting(pending, duration, out)
+            }
+
+            // Deferring: EOR received for one family from one peer
+            (
+                RestartingInner::Deferring { mut pending },
+                RestartingInput::EorReceived(addr, family),
+            ) => {
+                let mut out = vec![];
+                if let Some(peer_set) = pending.get_mut(&addr) {
+                    peer_set.remove(&family);
+                    if peer_set.is_empty() {
+                        pending.remove(&addr);
+                    }
+                    if !pending.values().any(|fs| fs.contains(&family)) {
+                        out.push(RestartingOutput::FamilyDeferralComplete(family));
+                    }
+                }
+                if pending.is_empty() {
+                    out.push(RestartingOutput::EndDeferral(vec![]));
+                    (RestartingInner::Completed, out)
+                } else {
+                    (RestartingInner::Deferring { pending }, out)
+                }
+            }
+
+            // Deferring: peer established without GR or re-established with GR
+            (
+                RestartingInner::Deferring { mut pending },
+                RestartingInput::PeerEstablished(addr, families),
+            ) => {
+                if families.is_empty() {
+                    let out = Self::remove_peer(&mut pending, addr);
+                    Self::finish_deferring(pending, out)
+                } else if let std::collections::hash_map::Entry::Occupied(mut e) =
+                    pending.entry(addr)
+                {
+                    // Update to negotiated families; emit completions for dropped families
+                    let new_set: FnvHashSet<Family> = families.into_iter().collect();
+                    let old_set = e.insert(new_set);
+                    let removed: Vec<Family> = old_set
+                        .iter()
+                        .filter(|f| !e.get().contains(f))
+                        .copied()
+                        .collect();
+                    let out = Self::complete_for(&pending, &removed);
+                    (RestartingInner::Deferring { pending }, out)
+                } else {
+                    // Unknown peer: ignore
+                    (RestartingInner::Deferring { pending }, vec![])
+                }
+            }
+
+            // Deferring: peer dropped
+            (RestartingInner::Deferring { mut pending }, RestartingInput::PeerWithdrawn(addr)) => {
+                let out = Self::remove_peer(&mut pending, addr);
+                Self::finish_deferring(pending, out)
+            }
+
+            // Deferring: timer fired; end all remaining deferral immediately
+            (RestartingInner::Deferring { pending }, RestartingInput::TimerExpired) => {
+                let remaining: Vec<Family> = pending
+                    .into_values()
+                    .flatten()
+                    .collect::<FnvHashSet<Family>>()
+                    .into_iter()
+                    .collect();
+                (
+                    RestartingInner::Completed,
+                    vec![RestartingOutput::EndDeferral(remaining)],
+                )
+            }
+
+            // Completed: all inputs are no-ops
+            (RestartingInner::Completed, _) => (RestartingInner::Completed, vec![]),
+
+            // Everything else (e.g. EorReceived/TimerExpired in AwaitingStart) is a no-op
+            (state, _) => (state, vec![]),
+        };
+        self.state = new_state;
+        outputs
+    }
+
+    /// Remove `addr` from `pending` and return `FamilyDeferralComplete` for
+    /// each family no longer present in any remaining pending entry.
+    fn remove_peer(
+        pending: &mut FnvHashMap<IpAddr, FnvHashSet<Family>>,
+        addr: IpAddr,
+    ) -> Vec<RestartingOutput> {
+        if let Some(removed_set) = pending.remove(&addr) {
+            let candidates: Vec<Family> = removed_set.into_iter().collect();
+            Self::complete_for(pending, &candidates)
+        } else {
+            vec![]
+        }
+    }
+
+    /// For each family in `candidates` not found in any `pending` entry,
+    /// emit `FamilyDeferralComplete`.
+    fn complete_for(
+        pending: &FnvHashMap<IpAddr, FnvHashSet<Family>>,
+        candidates: &[Family],
+    ) -> Vec<RestartingOutput> {
+        candidates
+            .iter()
+            .filter(|f| !pending.values().any(|fs| fs.contains(f)))
+            .map(|&f| RestartingOutput::FamilyDeferralComplete(f))
+            .collect()
+    }
+
+    fn finish_awaiting(
+        pending: FnvHashMap<IpAddr, FnvHashSet<Family>>,
+        duration: Duration,
+        mut outputs: Vec<RestartingOutput>,
+    ) -> (RestartingInner, Vec<RestartingOutput>) {
+        if pending.is_empty() {
+            outputs.push(RestartingOutput::EndDeferral(vec![]));
+            (RestartingInner::Completed, outputs)
+        } else {
+            (
+                RestartingInner::AwaitingStart { pending, duration },
+                outputs,
+            )
+        }
+    }
+
+    fn finish_deferring(
+        pending: FnvHashMap<IpAddr, FnvHashSet<Family>>,
+        mut outputs: Vec<RestartingOutput>,
+    ) -> (RestartingInner, Vec<RestartingOutput>) {
+        if pending.is_empty() {
+            outputs.push(RestartingOutput::EndDeferral(vec![]));
+            (RestartingInner::Completed, outputs)
+        } else {
+            (RestartingInner::Deferring { pending }, outputs)
+        }
     }
 }
 
@@ -517,5 +836,296 @@ mod tests {
         });
         assert!(outputs.is_empty());
         assert!(matches!(gr.state, Inner::Restarting { .. }));
+    }
+
+    // =========================================================================
+    // RestartingDeferral tests
+    // =========================================================================
+
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn peer(n: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, n))
+    }
+
+    fn make_deferral(
+        peers: &[(IpAddr, Vec<Family>)],
+    ) -> (RestartingDeferral, Vec<RestartingOutput>) {
+        let map: FnvHashMap<IpAddr, Vec<Family>> = peers.iter().cloned().collect();
+        RestartingDeferral::new(map, deferral_time())
+    }
+
+    fn rd_deferred_families(outputs: &[RestartingOutput]) -> Vec<Family> {
+        for o in outputs {
+            if let RestartingOutput::DeferFamilies(v) = o {
+                return v.clone();
+            }
+        }
+        vec![]
+    }
+
+    fn rd_complete_families(outputs: &[RestartingOutput]) -> Vec<Family> {
+        outputs
+            .iter()
+            .filter_map(|o| {
+                if let RestartingOutput::FamilyDeferralComplete(f) = o {
+                    Some(*f)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn rd_end_deferral(outputs: &[RestartingOutput]) -> Option<Vec<Family>> {
+        for o in outputs {
+            if let RestartingOutput::EndDeferral(v) = o {
+                return Some(v.clone());
+            }
+        }
+        None
+    }
+
+    fn has_start_timer(outputs: &[RestartingOutput]) -> bool {
+        outputs
+            .iter()
+            .any(|o| matches!(o, RestartingOutput::StartDeferralTimer(_)))
+    }
+
+    #[test]
+    fn rd_new_empty_peers_returns_completed() {
+        let (rd, outputs) = make_deferral(&[]);
+        assert!(outputs.is_empty());
+        assert!(rd.is_completed());
+    }
+
+    #[test]
+    fn rd_new_all_empty_families_returns_completed() {
+        let (rd, outputs) = make_deferral(&[(peer(1), vec![])]);
+        assert!(outputs.is_empty());
+        assert!(rd.is_completed());
+    }
+
+    #[test]
+    fn rd_new_single_peer_emits_defer_families() {
+        let (rd, outputs) = make_deferral(&[(peer(1), vec![ipv4()])]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(rd_deferred_families(&outputs), vec![ipv4()]);
+        assert!(!rd.is_completed());
+        assert!(matches!(rd.state, RestartingInner::AwaitingStart { .. }));
+    }
+
+    #[test]
+    fn rd_new_two_peers_union_of_families() {
+        let (rd, outputs) = make_deferral(&[(peer(1), vec![ipv4()]), (peer(2), vec![ipv6()])]);
+        let mut fams = rd_deferred_families(&outputs);
+        fams.sort_unstable_by_key(|f| (f.afi(), f.safi()));
+        assert_eq!(fams, vec![ipv4(), ipv6()]);
+        assert!(!rd.is_completed());
+    }
+
+    #[test]
+    fn rd_awaiting_first_establish_starts_timer() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()])]);
+        let outputs = rd.process(RestartingInput::PeerEstablished(peer(1), vec![ipv4()]));
+        assert!(has_start_timer(&outputs));
+        assert!(matches!(
+            outputs.last(),
+            Some(RestartingOutput::StartDeferralTimer(d)) if *d == deferral_time()
+        ));
+        assert!(matches!(rd.state, RestartingInner::Deferring { .. }));
+    }
+
+    #[test]
+    fn rd_awaiting_unknown_peer_noop() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()])]);
+        let outputs = rd.process(RestartingInput::PeerEstablished(peer(9), vec![ipv4()]));
+        assert!(outputs.is_empty());
+        assert!(matches!(rd.state, RestartingInner::AwaitingStart { .. }));
+    }
+
+    #[test]
+    fn rd_awaiting_withdraw_only_peer_completes() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()])]);
+        let outputs = rd.process(RestartingInput::PeerWithdrawn(peer(1)));
+        // FamilyDeferralComplete(IPv4) + EndDeferral([])
+        let complete = rd_complete_families(&outputs);
+        assert!(complete.contains(&ipv4()));
+        assert!(rd_end_deferral(&outputs).is_some());
+        assert!(rd.is_completed());
+    }
+
+    #[test]
+    fn rd_awaiting_withdraw_one_of_two_stays_awaiting() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()]), (peer(2), vec![ipv4()])]);
+        let outputs = rd.process(RestartingInput::PeerWithdrawn(peer(1)));
+        // IPv4 still pending in peer(2): no FamilyDeferralComplete
+        assert!(rd_complete_families(&outputs).is_empty());
+        assert!(rd_end_deferral(&outputs).is_none());
+        assert!(matches!(rd.state, RestartingInner::AwaitingStart { .. }));
+    }
+
+    #[test]
+    fn rd_awaiting_establish_empty_families_same_as_withdraw() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()])]);
+        let outputs = rd.process(RestartingInput::PeerEstablished(peer(1), vec![]));
+        assert!(rd_end_deferral(&outputs).is_some());
+        assert!(rd.is_completed());
+    }
+
+    #[test]
+    fn rd_awaiting_establish_negotiated_subset_emits_complete_for_dropped() {
+        // Configured: IPv4+IPv6 for peer(1). Negotiated: only IPv4.
+        // IPv6 should become FamilyDeferralComplete immediately.
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4(), ipv6()])]);
+        let outputs = rd.process(RestartingInput::PeerEstablished(peer(1), vec![ipv4()]));
+        let complete = rd_complete_families(&outputs);
+        assert!(complete.contains(&ipv6()));
+        assert!(!complete.contains(&ipv4()));
+        assert!(has_start_timer(&outputs));
+        assert!(matches!(rd.state, RestartingInner::Deferring { .. }));
+    }
+
+    #[test]
+    fn rd_awaiting_timer_expired_noop() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()])]);
+        let outputs = rd.process(RestartingInput::TimerExpired);
+        assert!(outputs.is_empty());
+        assert!(matches!(rd.state, RestartingInner::AwaitingStart { .. }));
+    }
+
+    #[test]
+    fn rd_deferring_eor_single_peer_single_family_completes() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()])]);
+        rd.process(RestartingInput::PeerEstablished(peer(1), vec![ipv4()]));
+
+        let outputs = rd.process(RestartingInput::EorReceived(peer(1), ipv4()));
+        assert!(rd_complete_families(&outputs).contains(&ipv4()));
+        assert!(rd_end_deferral(&outputs).is_some());
+        assert!(rd.is_completed());
+    }
+
+    #[test]
+    fn rd_deferring_partial_eor_stays_deferring() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4(), ipv6()])]);
+        rd.process(RestartingInput::PeerEstablished(
+            peer(1),
+            vec![ipv4(), ipv6()],
+        ));
+
+        let outputs = rd.process(RestartingInput::EorReceived(peer(1), ipv4()));
+        assert!(rd_complete_families(&outputs).contains(&ipv4()));
+        assert!(rd_end_deferral(&outputs).is_none());
+        assert!(matches!(rd.state, RestartingInner::Deferring { .. }));
+
+        let outputs = rd.process(RestartingInput::EorReceived(peer(1), ipv6()));
+        assert!(rd_complete_families(&outputs).contains(&ipv6()));
+        assert!(rd_end_deferral(&outputs).is_some());
+        assert!(rd.is_completed());
+    }
+
+    #[test]
+    fn rd_deferring_shared_family_waits_for_all_peers() {
+        // Both peers carry IPv4. EOR from peer(1) alone does not complete IPv4.
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()]), (peer(2), vec![ipv4()])]);
+        rd.process(RestartingInput::PeerEstablished(peer(1), vec![ipv4()]));
+        rd.process(RestartingInput::PeerEstablished(peer(2), vec![ipv4()]));
+
+        let outputs = rd.process(RestartingInput::EorReceived(peer(1), ipv4()));
+        assert!(rd_complete_families(&outputs).is_empty());
+        assert!(rd_end_deferral(&outputs).is_none());
+        assert!(matches!(rd.state, RestartingInner::Deferring { .. }));
+
+        let outputs = rd.process(RestartingInput::EorReceived(peer(2), ipv4()));
+        assert!(rd_complete_families(&outputs).contains(&ipv4()));
+        assert!(rd_end_deferral(&outputs).is_some());
+        assert!(rd.is_completed());
+    }
+
+    #[test]
+    fn rd_deferring_withdraw_frees_exclusive_family() {
+        // peer(1):{IPv4}, peer(2):{IPv6}. Withdraw peer(2) -> IPv6 complete.
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()]), (peer(2), vec![ipv6()])]);
+        rd.process(RestartingInput::PeerEstablished(peer(1), vec![ipv4()]));
+        rd.process(RestartingInput::PeerEstablished(peer(2), vec![ipv6()]));
+
+        let outputs = rd.process(RestartingInput::PeerWithdrawn(peer(2)));
+        assert!(rd_complete_families(&outputs).contains(&ipv6()));
+        assert!(rd_end_deferral(&outputs).is_none());
+        assert!(matches!(rd.state, RestartingInner::Deferring { .. }));
+    }
+
+    #[test]
+    fn rd_deferring_withdraw_last_peer_completes() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()])]);
+        rd.process(RestartingInput::PeerEstablished(peer(1), vec![ipv4()]));
+
+        let outputs = rd.process(RestartingInput::PeerWithdrawn(peer(1)));
+        assert!(rd_complete_families(&outputs).contains(&ipv4()));
+        assert!(rd_end_deferral(&outputs).is_some());
+        assert!(rd.is_completed());
+    }
+
+    #[test]
+    fn rd_deferring_timer_expired_ends_remaining() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4(), ipv6()])]);
+        rd.process(RestartingInput::PeerEstablished(
+            peer(1),
+            vec![ipv4(), ipv6()],
+        ));
+        rd.process(RestartingInput::EorReceived(peer(1), ipv4()));
+
+        let outputs = rd.process(RestartingInput::TimerExpired);
+        assert!(rd_end_deferral(&outputs).is_some());
+        let remaining = rd_end_deferral(&outputs).unwrap();
+        assert!(remaining.contains(&ipv6()));
+        assert!(!remaining.contains(&ipv4()));
+        assert!(rd.is_completed());
+    }
+
+    #[test]
+    fn rd_completed_all_inputs_noop() {
+        let (mut rd, _) = make_deferral(&[]);
+        assert!(rd.is_completed());
+
+        assert!(
+            rd.process(RestartingInput::PeerEstablished(peer(1), vec![ipv4()]))
+                .is_empty()
+        );
+        assert!(
+            rd.process(RestartingInput::EorReceived(peer(1), ipv4()))
+                .is_empty()
+        );
+        assert!(
+            rd.process(RestartingInput::PeerWithdrawn(peer(1)))
+                .is_empty()
+        );
+        assert!(rd.process(RestartingInput::TimerExpired).is_empty());
+        assert!(rd.is_completed());
+    }
+
+    #[test]
+    fn rd_deferring_eor_unknown_peer_noop() {
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4()])]);
+        rd.process(RestartingInput::PeerEstablished(peer(1), vec![ipv4()]));
+
+        let outputs = rd.process(RestartingInput::EorReceived(peer(9), ipv4()));
+        assert!(outputs.is_empty());
+        assert!(matches!(rd.state, RestartingInner::Deferring { .. }));
+    }
+
+    #[test]
+    fn rd_second_establish_in_deferring_updates_families() {
+        // peer(1) re-establishes with fewer GR families; dropped ones become complete.
+        let (mut rd, _) = make_deferral(&[(peer(1), vec![ipv4(), ipv6()])]);
+        rd.process(RestartingInput::PeerEstablished(
+            peer(1),
+            vec![ipv4(), ipv6()],
+        ));
+
+        // Re-establish with only IPv4
+        let outputs = rd.process(RestartingInput::PeerEstablished(peer(1), vec![ipv4()]));
+        assert!(rd_complete_families(&outputs).contains(&ipv6()));
+        assert!(matches!(rd.state, RestartingInner::Deferring { .. }));
     }
 }
