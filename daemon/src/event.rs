@@ -2890,6 +2890,12 @@ struct Global {
     rpki_clients: FnvHashMap<SocketAddr, RpkiClient>,
     bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
     mrt_filenames: FnvHashSet<String>,
+
+    /// Selection Deferral state machine for the Restarting Speaker (RFC 4724 §4.1).
+    /// Present only when the daemon started with --graceful-restart.
+    selection_deferral: Option<crate::gr::RestartingDeferral>,
+    /// Abort handle for the global Selection_Deferral_Timer (RFC 4724 §4.1).
+    selection_deferral_timer: Option<tokio::task::AbortHandle>,
 }
 
 impl From<&Global> for api::Global {
@@ -2928,6 +2934,9 @@ impl Global {
             rpki_clients: FnvHashMap::default(),
             bmp_clients: FnvHashMap::default(),
             mrt_filenames: FnvHashSet::default(),
+
+            selection_deferral: None,
+            selection_deferral_timer: None,
         }
     }
 
@@ -3399,6 +3408,39 @@ impl Global {
                 }
             }
         }
+        // Initialize Restarting Speaker deferral when started with --graceful-restart
+        // and a config file (file-based startup only).
+        if is_restarting && bgp.is_some() {
+            let gr_peers: fnv::FnvHashMap<IpAddr, Vec<Family>> = {
+                let server = global.read().await;
+                server
+                    .peers
+                    .iter()
+                    .filter_map(|(addr, peer)| {
+                        peer.config
+                            .graceful_restart
+                            .as_ref()
+                            .map(|gr| (*addr, gr.families.clone()))
+                    })
+                    .collect()
+            };
+            let duration = std::time::Duration::from_secs(360);
+            let (deferral, init_outputs) = crate::gr::RestartingDeferral::new(gr_peers, duration);
+            if !deferral.is_completed() {
+                for output in &init_outputs {
+                    if let crate::gr::RestartingOutput::DeferFamilies(families) = output {
+                        for i in 0..tables.shards.len() {
+                            let mut t = tables.shards[i].lock().await;
+                            for &family in families {
+                                t.rtable.start_deferral(family);
+                            }
+                        }
+                    }
+                }
+                global.write().await.selection_deferral = Some(deferral);
+            }
+        }
+
         if any_peer {
             let mut server = global.write().await;
             server.peer_group.insert(
@@ -3874,6 +3916,68 @@ async fn gr_drop_families(tables: &TableHandle, addr: IpAddr, families: &[Family
                 .await;
         }
     }
+}
+
+/// Apply outputs from [`crate::gr::RestartingDeferral::process`].
+///
+/// Handles FamilyDeferralComplete and EndDeferral immediately.
+/// Returns `Some(duration)` when `StartDeferralTimer` was emitted so the
+/// caller can spawn the timer; this avoids a circular Send dependency between
+/// this function and `gr_selection_deferral_timer_expired`.
+async fn process_restarting_outputs(
+    outputs: Vec<crate::gr::RestartingOutput>,
+    global: &GlobalHandle,
+    tables: &TableHandle,
+) -> Option<std::time::Duration> {
+    let mut complete_families: Vec<Family> = vec![];
+    let mut end_remaining: Option<Vec<Family>> = None;
+    let mut start_timer: Option<std::time::Duration> = None;
+
+    for output in outputs {
+        match output {
+            crate::gr::RestartingOutput::StartDeferralTimer(dur) => {
+                start_timer = Some(dur);
+            }
+            crate::gr::RestartingOutput::FamilyDeferralComplete(family) => {
+                complete_families.push(family);
+            }
+            crate::gr::RestartingOutput::EndDeferral(remaining) => {
+                end_remaining = Some(remaining);
+            }
+            crate::gr::RestartingOutput::DeferFamilies(_) => {}
+        }
+    }
+
+    if !complete_families.is_empty() {
+        gr_end_deferral_families(tables, &complete_families).await;
+    }
+
+    if let Some(remaining) = end_remaining {
+        if !remaining.is_empty() {
+            gr_end_deferral_families(tables, &remaining).await;
+        }
+        let mut server = global.write().await;
+        if let Some(h) = server.selection_deferral_timer.take() {
+            h.abort();
+        }
+        server.selection_deferral = None;
+        server.clear_restarting();
+    }
+
+    start_timer
+}
+
+async fn gr_selection_deferral_timer_expired(global: GlobalHandle, tables: TableHandle) {
+    let outputs = {
+        let mut server = global.write().await;
+        if let Some(deferral) = &mut server.selection_deferral {
+            deferral.process(crate::gr::RestartingInput::TimerExpired)
+        } else {
+            return;
+        }
+    };
+    // TimerExpired never produces StartDeferralTimer, so we discard the return value.
+    let _ = process_restarting_outputs(outputs, &global, &tables).await;
 }
 
 /// Clear the deferral flag for each family across all shards and distribute
@@ -4567,7 +4671,7 @@ impl PeerSession {
         effects
     }
 
-    async fn process_effects(&mut self, effects: Vec<GlobalEffect>, _global: &GlobalHandle) {
+    async fn process_effects(&mut self, effects: Vec<GlobalEffect>, global: &GlobalHandle) {
         for effect in effects {
             match effect {
                 GlobalEffect::StopActiveConnect => {
@@ -4581,57 +4685,104 @@ impl PeerSession {
                 GlobalEffect::GrSessionEstablished { negotiated_gr } => {
                     let context_c = Arc::clone(&self.context);
                     let deferral_time = self.gr_deferral_time;
-                    let delete_families = {
-                        let mut ctx = self.context.lock().unwrap();
+                    let gr_families = negotiated_gr
+                        .as_ref()
+                        .map(|g| g.families.clone())
+                        .unwrap_or_default();
 
+                    // Cancel any previous restart timer (no ctx lock held across await).
+                    {
+                        let mut ctx = self.context.lock().unwrap();
                         if let Some(h) = ctx.gr_restart_timer.take() {
                             h.abort();
                         }
+                    }
 
-                        let gr_families = negotiated_gr
-                            .as_ref()
-                            .map(|g| g.families.clone())
-                            .unwrap_or_default();
-
-                        let outputs = if ctx.local_restarting {
-                            // Restarting Speaker: GrState is not used for EOR tracking;
-                            // RestartingDeferral handles it globally.
-                            vec![]
+                    // Check global state to decide role: Restarting Speaker or Helper.
+                    let (is_restarting, rd_outputs) = {
+                        let mut server = global.write().await;
+                        if let Some(rd) = &mut server.selection_deferral {
+                            let out = rd.process(crate::gr::RestartingInput::PeerEstablished(
+                                self.remote_addr,
+                                gr_families.clone(),
+                            ));
+                            (true, out)
                         } else {
-                            ctx.gr_state
-                                .process(crate::gr::GrInput::SessionEstablished {
-                                    gr_families,
-                                    deferral_time,
-                                })
-                        };
+                            (false, vec![])
+                        }
+                    };
 
-                        let delete_families = collect_delete_families(&outputs);
-                        let deferral_dur = outputs.iter().find_map(|o| {
-                            if let crate::gr::GrOutput::StartDeferralTimer(dur) = o {
-                                Some(*dur)
-                            } else {
-                                None
-                            }
-                        });
-                        if let Some(dur) = deferral_dur {
-                            let addr = self.remote_addr;
+                    if is_restarting {
+                        // Restarting Speaker: delegate EOR tracking to RestartingDeferral.
+                        if let Some(dur) =
+                            process_restarting_outputs(rd_outputs, global, &self.tables).await
+                        {
+                            let global_c = global.clone();
                             let tables_c = self.tables.clone();
                             let handle = tokio::spawn(async move {
                                 tokio::time::sleep(dur).await;
-                                gr_deferral_timer_expired(context_c, tables_c, addr).await;
+                                gr_selection_deferral_timer_expired(global_c, tables_c).await;
                             })
                             .abort_handle();
-                            ctx.gr_deferral_timer = Some(handle);
+                            global.write().await.selection_deferral_timer = Some(handle);
                         }
-
-                        delete_families
-                    };
-                    if !delete_families.is_empty() {
-                        gr_drop_stale_families(&self.tables, self.remote_addr, &delete_families)
+                    } else {
+                        // Helper side: advance GrState and start deferral timer.
+                        let delete_families = {
+                            let mut ctx = self.context.lock().unwrap();
+                            let outputs =
+                                ctx.gr_state
+                                    .process(crate::gr::GrInput::SessionEstablished {
+                                        gr_families,
+                                        deferral_time,
+                                    });
+                            let delete_families = collect_delete_families(&outputs);
+                            let deferral_dur = outputs.iter().find_map(|o| {
+                                if let crate::gr::GrOutput::StartDeferralTimer(dur) = o {
+                                    Some(*dur)
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(dur) = deferral_dur {
+                                let addr = self.remote_addr;
+                                let tables_c = self.tables.clone();
+                                let handle = tokio::spawn(async move {
+                                    tokio::time::sleep(dur).await;
+                                    gr_deferral_timer_expired(context_c, tables_c, addr).await;
+                                })
+                                .abort_handle();
+                                ctx.gr_deferral_timer = Some(handle);
+                            }
+                            delete_families
+                        };
+                        if !delete_families.is_empty() {
+                            gr_drop_stale_families(
+                                &self.tables,
+                                self.remote_addr,
+                                &delete_families,
+                            )
                             .await;
+                        }
                     }
                 }
                 GlobalEffect::GrEorReceived { family } => {
+                    // Restarting Speaker path: feed into RestartingDeferral if active.
+                    let rd_outputs = {
+                        let mut server = global.write().await;
+                        if let Some(rd) = &mut server.selection_deferral {
+                            rd.process(crate::gr::RestartingInput::EorReceived(
+                                self.remote_addr,
+                                family,
+                            ))
+                        } else {
+                            vec![]
+                        }
+                    };
+                    // EorReceived never produces StartDeferralTimer.
+                    let _ = process_restarting_outputs(rd_outputs, global, &self.tables).await;
+
+                    // Helper side: GrState EOR handling (no-op when GrState is Idle).
                     let delete_families = {
                         let mut ctx = self.context.lock().unwrap();
                         let outputs = ctx
@@ -5161,6 +5312,18 @@ impl PeerSession {
             let arb = ctx.conn_arbiter.lock().unwrap();
             arb.active_close_tx.is_none() && arb.passive_close_tx.is_none()
         };
+
+        // Notify RestartingDeferral that this peer has disconnected, if active.
+        let rd_outputs = {
+            let mut server = global.write().await;
+            if let Some(rd) = &mut server.selection_deferral {
+                rd.process(crate::gr::RestartingInput::PeerWithdrawn(self.remote_addr))
+            } else {
+                vec![]
+            }
+        };
+        // PeerWithdrawn never produces StartDeferralTimer.
+        let _ = process_restarting_outputs(rd_outputs, &global, &tables).await;
 
         // Peer-level operations still require the global write lock.
         let mut server = global.write().await;
