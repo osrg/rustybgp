@@ -277,9 +277,6 @@ struct PeerContext {
     gr_restart_timer: Option<tokio::task::AbortHandle>,
     /// Abort handle for the GR selection deferral timer task.
     gr_deferral_timer: Option<tokio::task::AbortHandle>,
-    /// True if the daemon started with --graceful-restart and this peer has not
-    /// yet sent EOR.  Cleared by `clear_restarting` once all tracked peers finish.
-    local_restarting: bool,
 }
 
 /// Administrative peer record stored in `Global::peers` under the global
@@ -339,7 +336,7 @@ impl PeerView {
 }
 
 impl Peer {
-    fn view(&self) -> PeerView {
+    fn view(&self, is_restarting: bool) -> PeerView {
         let ctx = self.context.lock().unwrap();
         PeerView {
             config: self.config.clone(),
@@ -350,7 +347,7 @@ impl Peer {
             counter_rx: Arc::clone(&self.counter_rx),
             route_stats: FnvHashMap::default(),
             gr_peer_restarting: ctx.gr_state.is_peer_restarting(),
-            gr_local_restarting: ctx.local_restarting,
+            gr_local_restarting: is_restarting,
         }
     }
 
@@ -525,7 +522,6 @@ impl PeerParams {
                 gr_state: crate::gr::GrState::new(),
                 gr_restart_timer: None,
                 gr_deferral_timer: None,
-                local_restarting: is_restarting,
             })),
         }
     }
@@ -1214,14 +1210,14 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<Self::ListPeerStream>, tonic::Status> {
         self.is_available(false).await?;
         let peer_addr = IpAddr::from_str(&request.into_inner().address);
-        let mut peers: FnvHashMap<IpAddr, PeerView> = self
-            .global
-            .read()
-            .await
-            .peers
-            .iter()
-            .map(|(a, p)| (*a, p.view()))
-            .collect();
+        let mut peers: FnvHashMap<IpAddr, PeerView> = {
+            let g = self.global.read().await;
+            let is_restarting = g.selection_deferral.is_some();
+            g.peers
+                .iter()
+                .map(|(a, p)| (*a, p.view(is_restarting)))
+                .collect()
+        };
 
         for i in 0..self.tables.shards.len() {
             let t = self.tables.shards[i].lock().await;
@@ -5868,7 +5864,7 @@ mod tests {
         assert!(!m.was_sent(Family::IPV4, &v6));
     }
 
-    fn make_context(local_restarting: bool) -> Arc<std::sync::Mutex<PeerContext>> {
+    fn make_context() -> Arc<std::sync::Mutex<PeerContext>> {
         use std::net::Ipv4Addr;
         let fsm = crate::fsm::PeerFsm::new(
             u32::from(Ipv4Addr::new(1, 0, 0, 1)),
@@ -5886,7 +5882,6 @@ mod tests {
             gr_state: crate::gr::GrState::new(),
             gr_restart_timer: None,
             gr_deferral_timer: None,
-            local_restarting,
         }))
     }
 
@@ -5897,7 +5892,7 @@ mod tests {
         let global = make_global();
         let tables = make_tables();
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
-        let context = make_context(false);
+        let context = make_context();
 
         let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
         context.lock().unwrap().active_connect_cancel_tx = ActiveConnectCancel(Some(tx));
@@ -5922,7 +5917,7 @@ mod tests {
         let global = make_global();
         let tables = make_tables();
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
-        let context = make_context(false);
+        let context = make_context();
 
         // Drive GrState to Restarting (session drop with GR) so that the
         // subsequent SessionEstablished can transition it to WaitingEor.
@@ -5967,7 +5962,7 @@ mod tests {
         let global = make_global();
         let tables = make_tables();
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
-        let context = make_context(false);
+        let context = make_context();
 
         // Drive GrState through SessionDropped → SessionEstablished to reach WaitingEor.
         // SessionEstablished from Idle is a no-op, so the drop must happen first.
@@ -6219,7 +6214,7 @@ mod tests {
         let global = make_global();
         let tables = make_tables();
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
-        let context = make_context(false);
+        let context = make_context();
 
         // Install a selection_deferral with this peer as the sole GR peer.
         global.write().await.selection_deferral = Some(make_selection_deferral(&[(
@@ -6252,7 +6247,7 @@ mod tests {
         let global = make_global();
         let tables = make_tables();
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
-        let context = make_context(false);
+        let context = make_context();
 
         // Install selection_deferral: one peer, one family.
         global.write().await.selection_deferral = Some(make_selection_deferral(&[(
@@ -6323,7 +6318,7 @@ mod tests {
         let tables = make_tables();
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
         let unknown_addr: IpAddr = "10.0.0.99".parse().unwrap();
-        let context = make_context(false);
+        let context = make_context();
 
         // Install selection_deferral with remote_addr, but session is from unknown_addr.
         global.write().await.selection_deferral = Some(make_selection_deferral(&[(
