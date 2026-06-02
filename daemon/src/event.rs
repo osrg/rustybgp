@@ -3517,6 +3517,11 @@ enum TableEvent {
     DropStale(IpAddr, Family),
     /// Re-run best-path selection after marking routes from this peer stale (GR helper).
     MarkStale(IpAddr, Family),
+    /// Clear the deferral flag for `family` and distribute all accumulated best
+    /// paths to peers.  Used by the Restarting Speaker when deferral ends for a
+    /// family (FamilyDeferralComplete or EndDeferral from RestartingDeferral).
+    #[allow(dead_code)]
+    EndDeferral(Family),
     // RPKI events
     InsertRoa(Vec<(packet::IpNet, Arc<table::Roa>)>),
     Drop(Arc<IpAddr>),
@@ -3788,6 +3793,10 @@ impl Table {
                 let changes = self.rtable.restale(addr, family);
                 self.distribute_changes(changes, kernel_tx, export_policy);
             }
+            TableEvent::EndDeferral(family) => {
+                let changes = self.rtable.end_deferral(family);
+                self.distribute_changes(changes, kernel_tx, export_policy);
+            }
             TableEvent::InsertRoa(v) => {
                 for (net, roa) in v {
                     self.rtable.roa_insert(net, roa);
@@ -3863,6 +3872,18 @@ async fn gr_drop_families(tables: &TableHandle, addr: IpAddr, families: &[Family
             tables
                 .event(i, TableEvent::Disconnected(addr, family))
                 .await;
+        }
+    }
+}
+
+/// Clear the deferral flag for each family across all shards and distribute
+/// the accumulated best paths to all connected peers.  Called when
+/// RestartingDeferral emits FamilyDeferralComplete or EndDeferral.
+#[allow(dead_code)]
+async fn gr_end_deferral_families(tables: &TableHandle, families: &[Family]) {
+    for i in 0..tables.shards.len() {
+        for &family in families {
+            tables.event(i, TableEvent::EndDeferral(family)).await;
         }
     }
 }
