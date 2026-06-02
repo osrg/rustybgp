@@ -6197,4 +6197,148 @@ mod tests {
         let arb = ctx.conn_arbiter.lock().unwrap();
         assert!(arb.fsm.connection(crate::fsm::Role::Passive).is_none());
     }
+
+    // ---- Selection Deferral (Restarting Speaker, RFC 4724 section 4.1) ----
+
+    fn make_selection_deferral(peers: &[(IpAddr, Vec<Family>)]) -> crate::gr::RestartingDeferral {
+        let map: fnv::FnvHashMap<IpAddr, Vec<Family>> = peers.iter().cloned().collect();
+        let (deferral, _) = crate::gr::RestartingDeferral::new(map, Duration::from_secs(360));
+        deferral
+    }
+
+    #[tokio::test]
+    async fn selection_deferral_peer_established_starts_timer() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let context = make_context(false);
+
+        // Install a selection_deferral with this peer as the sole GR peer.
+        global.write().await.selection_deferral = Some(make_selection_deferral(&[(
+            remote_addr,
+            vec![Family::IPV4],
+        )]));
+
+        let negotiated_gr = Some(NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+        });
+        let mut session =
+            PeerSession::new_for_test(remote_addr, context, tables, Duration::from_secs(120));
+        session
+            .process_effects(
+                vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
+                &global,
+            )
+            .await;
+
+        let g = global.read().await;
+        // Timer must have been started.
+        assert!(g.selection_deferral_timer.is_some());
+        // selection_deferral is still Some (waiting for EOR).
+        assert!(g.selection_deferral.is_some());
+    }
+
+    #[tokio::test]
+    async fn selection_deferral_eor_received_completes_deferral() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let context = make_context(false);
+
+        // Install selection_deferral: one peer, one family.
+        global.write().await.selection_deferral = Some(make_selection_deferral(&[(
+            remote_addr,
+            vec![Family::IPV4],
+        )]));
+
+        let negotiated_gr = Some(NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+        });
+        let mut session =
+            PeerSession::new_for_test(remote_addr, context, tables, Duration::from_secs(120));
+
+        // Establish → starts timer and moves to Deferring.
+        session
+            .process_effects(
+                vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
+                &global,
+            )
+            .await;
+
+        // EOR received → deferral completes.
+        session
+            .process_effects(
+                vec![GlobalEffect::GrEorReceived {
+                    family: Family::IPV4,
+                }],
+                &global,
+            )
+            .await;
+
+        let g = global.read().await;
+        // Deferral must be cleared after all EOR received.
+        assert!(g.selection_deferral.is_none());
+        assert!(g.selection_deferral_timer.is_none());
+    }
+
+    #[tokio::test]
+    async fn selection_deferral_timer_expired_clears_deferral() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Install selection_deferral in Deferring state by processing PeerEstablished.
+        {
+            let mut g = global.write().await;
+            let mut deferral = make_selection_deferral(&[(remote_addr, vec![Family::IPV4])]);
+            // Advance to Deferring by feeding PeerEstablished.
+            deferral.process(crate::gr::RestartingInput::PeerEstablished(
+                remote_addr,
+                vec![Family::IPV4],
+            ));
+            g.selection_deferral = Some(deferral);
+        }
+
+        // Fire the timer directly.
+        gr_selection_deferral_timer_expired(global.clone(), tables).await;
+
+        let g = global.read().await;
+        // Deferral must be cleared after timer expiry.
+        assert!(g.selection_deferral.is_none());
+    }
+
+    #[tokio::test]
+    async fn selection_deferral_unknown_peer_established_is_noop() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let unknown_addr: IpAddr = "10.0.0.99".parse().unwrap();
+        let context = make_context(false);
+
+        // Install selection_deferral with remote_addr, but session is from unknown_addr.
+        global.write().await.selection_deferral = Some(make_selection_deferral(&[(
+            remote_addr,
+            vec![Family::IPV4],
+        )]));
+
+        let negotiated_gr = Some(NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+        });
+        let mut session =
+            PeerSession::new_for_test(unknown_addr, context, tables, Duration::from_secs(120));
+        session
+            .process_effects(
+                vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
+                &global,
+            )
+            .await;
+
+        let g = global.read().await;
+        // Unknown peer: timer must NOT be started, deferral still in AwaitingStart.
+        assert!(g.selection_deferral_timer.is_none());
+        assert!(g.selection_deferral.is_some());
+    }
 }

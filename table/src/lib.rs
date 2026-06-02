@@ -3736,4 +3736,96 @@ mod tests {
         assert_eq!(best[0].rank, 1);
         assert!(best[0].source.is_stale());
     }
+
+    // ---- Selection Deferral (RFC 4724 section 4.1) ----
+
+    #[test]
+    fn deferral_suppresses_insert_changes() {
+        // While deferring, insert() stores the route but returns no changes.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let src = source(1, 65001, 65000, 1);
+
+        rt.start_deferral(Family::IPV4);
+
+        let changes = rt.insert(src, Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        assert!(changes.is_empty(), "deferral must suppress insert changes");
+        assert!(
+            rt.global.get(&Family::IPV4).unwrap().deferring,
+            "deferring flag must be set"
+        );
+    }
+
+    #[test]
+    fn deferral_does_not_affect_other_families() {
+        // Deferring IPv4 must not suppress IPv6 inserts.
+        let mut rt = RoutingTable::new();
+        let net6 = packet::Nlri::V6(packet::bgp::Ipv6Net {
+            addr: std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+            mask: 32,
+        });
+        let src = source(1, 65001, 65000, 1);
+
+        rt.start_deferral(Family::IPV4);
+
+        let nh6 = bgp::Nexthop::V6(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        let changes = rt.insert(src, Family::IPV6, net6, 0, nh6, empty_attrs(), false);
+        assert!(!changes.is_empty(), "IPv6 insert must not be suppressed");
+    }
+
+    #[test]
+    fn end_deferral_returns_accumulated_routes() {
+        // Routes inserted during deferral are returned by end_deferral().
+        let mut rt = RoutingTable::new();
+        let n1 = nlri(10, 0, 0, 0, 24);
+        let n2 = nlri(10, 0, 1, 0, 24);
+        let src = source(1, 65001, 65000, 1);
+
+        rt.start_deferral(Family::IPV4);
+
+        // Both inserts are suppressed.
+        assert!(
+            rt.insert(src.clone(), Family::IPV4, n1, 0, nh(), empty_attrs(), false)
+                .is_empty()
+        );
+        assert!(
+            rt.insert(src, Family::IPV4, n2, 0, nh(), empty_attrs(), false)
+                .is_empty()
+        );
+
+        // end_deferral clears flag and returns all accumulated best paths.
+        let changes = rt.end_deferral(Family::IPV4);
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|c| c.rank == 1));
+        assert!(changes.iter().all(|c| c.old_rank == 0));
+        assert!(
+            !rt.global.get(&Family::IPV4).unwrap().deferring,
+            "deferring flag must be cleared"
+        );
+    }
+
+    #[test]
+    fn end_deferral_on_non_deferred_family_is_noop() {
+        // end_deferral on a family that was never deferred returns empty.
+        let mut rt = RoutingTable::new();
+        let changes = rt.end_deferral(Family::IPV4);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn insert_after_end_deferral_distributes_normally() {
+        // After deferral ends, subsequent inserts produce changes as usual.
+        let mut rt = RoutingTable::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let src = source(1, 65001, 65000, 1);
+
+        rt.start_deferral(Family::IPV4);
+        rt.end_deferral(Family::IPV4);
+
+        let changes = rt.insert(src, Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        assert!(
+            !changes.is_empty(),
+            "insert after end_deferral must produce changes"
+        );
+    }
 }
