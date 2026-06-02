@@ -2957,6 +2957,7 @@ impl Global {
 
     /// Clear the restarting-speaker state: set R=0 in all peers' GR capability
     /// so future reconnections do not carry the Restart State bit.
+    #[allow(dead_code)]
     fn clear_restarting(&mut self) {
         for peer in self.peers.values_mut() {
             let mut ctx = peer.context.lock().unwrap();
@@ -4545,7 +4546,7 @@ impl PeerSession {
         effects
     }
 
-    async fn process_effects(&mut self, effects: Vec<GlobalEffect>, global: &GlobalHandle) {
+    async fn process_effects(&mut self, effects: Vec<GlobalEffect>, _global: &GlobalHandle) {
         for effect in effects {
             match effect {
                 GlobalEffect::StopActiveConnect => {
@@ -4572,10 +4573,9 @@ impl PeerSession {
                             .unwrap_or_default();
 
                         let outputs = if ctx.local_restarting {
-                            ctx.gr_state
-                                .process(crate::gr::GrInput::LocalRestartEstablished {
-                                    gr_families,
-                                })
+                            // Restarting Speaker: GrState is not used for EOR tracking;
+                            // RestartingDeferral handles it globally.
+                            vec![]
                         } else {
                             ctx.gr_state
                                 .process(crate::gr::GrInput::SessionEstablished {
@@ -4611,42 +4611,24 @@ impl PeerSession {
                     }
                 }
                 GlobalEffect::GrEorReceived { family } => {
-                    let (delete_families, peer_eor_complete) = {
+                    let delete_families = {
                         let mut ctx = self.context.lock().unwrap();
                         let outputs = ctx
                             .gr_state
                             .process(crate::gr::GrInput::EorReceived(family));
-                        let mut peer_eor_complete = false;
-                        for output in &outputs {
-                            match output {
-                                crate::gr::GrOutput::StopDeferralTimer => {
-                                    if let Some(h) = ctx.gr_deferral_timer.take() {
-                                        h.abort();
-                                    }
-                                }
-                                crate::gr::GrOutput::PeerEorComplete => peer_eor_complete = true,
-                                _ => {}
-                            }
+                        if let Some(h) = outputs
+                            .iter()
+                            .any(|o| matches!(o, crate::gr::GrOutput::StopDeferralTimer))
+                            .then(|| ctx.gr_deferral_timer.take())
+                            .flatten()
+                        {
+                            h.abort();
                         }
-                        let delete_families = collect_delete_families(&outputs);
-                        (delete_families, peer_eor_complete)
+                        collect_delete_families(&outputs)
                     };
                     if !delete_families.is_empty() {
                         gr_drop_stale_families(&self.tables, self.remote_addr, &delete_families)
                             .await;
-                    }
-
-                    // If this peer completed its EOR (restarting-speaker side), check
-                    // whether all helper peers are done; if so, clear restarting state.
-                    if peer_eor_complete {
-                        let mut server = global.write().await;
-                        let any_still_pending = server.peers.values().any(|p| {
-                            let ctx = p.context.lock().unwrap();
-                            ctx.local_restarting && ctx.gr_state.is_local_restarting()
-                        });
-                        if !any_still_pending {
-                            server.clear_restarting();
-                        }
                     }
                 }
             }
@@ -5786,41 +5768,6 @@ mod tests {
         assert!(ctx.gr_deferral_timer.is_some());
     }
 
-    // ---- process_effects: GrSessionEstablished (local_restarting=true) ----
-
-    #[tokio::test]
-    async fn process_effects_gr_session_established_local_restarting_enters_local_restarting() {
-        let global = make_global();
-        let tables = make_tables();
-        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
-        let context = make_context(true);
-
-        let negotiated_gr = Some(NegotiatedGr {
-            families: vec![Family::IPV4],
-            restart_time: Duration::from_secs(90),
-        });
-
-        let mut session = PeerSession::new_for_test(
-            remote_addr,
-            context.clone(),
-            tables,
-            Duration::from_secs(120),
-        );
-        session
-            .process_effects(
-                vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
-                &global,
-            )
-            .await;
-
-        let ctx = context.lock().unwrap();
-        // GrState should be LocalRestarting, not WaitingEor.
-        assert!(ctx.gr_state.is_local_restarting());
-        assert!(!ctx.gr_state.is_peer_restarting());
-        // No deferral timer on the local-restarting path.
-        assert!(ctx.gr_deferral_timer.is_none());
-    }
-
     // ---- process_effects: GrEorReceived (helper side: deferral timer aborted) ----
 
     #[tokio::test]
@@ -5871,52 +5818,6 @@ mod tests {
         assert!(ctx.gr_deferral_timer.is_none());
         // GrState is now Idle (EOR for only family received -> WaitingEor->Idle).
         assert!(!ctx.gr_state.is_peer_restarting());
-    }
-
-    // ---- process_effects: GrEorReceived + PeerEorComplete clears global restarting ----
-
-    #[tokio::test]
-    async fn process_effects_gr_eor_received_peer_eor_complete_clears_restarting() {
-        let global = make_global();
-        let tables = make_tables();
-        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
-
-        // Add the peer to global and drive its context into LocalRestarting.
-        {
-            let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr), None, false)
-                .unwrap();
-            let peer = g.peers.get_mut(&remote_addr).unwrap();
-            let mut ctx = peer.context.lock().unwrap();
-            ctx.local_restarting = true;
-            ctx.gr_state
-                .process(crate::gr::GrInput::LocalRestartEstablished {
-                    gr_families: vec![Family::IPV4],
-                });
-        }
-
-        // Build a session whose context IS the same Arc as the peer in global.
-        let peer_context = {
-            let g = global.read().await;
-            Arc::clone(&g.peers[&remote_addr].context)
-        };
-
-        let mut session =
-            PeerSession::new_for_test(remote_addr, peer_context, tables, Duration::from_secs(120));
-        session
-            .process_effects(
-                vec![GlobalEffect::GrEorReceived {
-                    family: Family::IPV4,
-                }],
-                &global,
-            )
-            .await;
-
-        // PeerEorComplete was emitted (only peer done) → clear_restarting called
-        // → local_restarting on the peer context is now false.
-        let g = global.read().await;
-        let ctx = g.peers[&remote_addr].context.lock().unwrap();
-        assert!(!ctx.local_restarting);
     }
 
     // ---- families_to_drop_on_disconnect ----

@@ -51,10 +51,6 @@ pub(crate) enum GrInput {
     TimerExpired,
     /// The Selection Deferral Timer fired; delete all remaining stale routes.
     DeferralTimerExpired,
-    /// We are the restarting speaker; this peer reconnected as our helper.
-    /// Track EOR receipt per family (RFC 4724 §4.2).  If `gr_families` is
-    /// empty the machine stays Idle (no tracking needed for this peer).
-    LocalRestartEstablished { gr_families: Vec<Family> },
 }
 
 /// Actions the driver should perform in response to a GR input.
@@ -69,10 +65,6 @@ pub(crate) enum GrOutput {
     StopDeferralTimer,
     /// Delete stale routes for the given families.
     DeleteStaleRoutes(Vec<Family>),
-    /// All expected EOR has been received from this peer (restarting-speaker
-    /// side).  The driver should check whether all local-restarting peers have
-    /// completed and call `clear_restarting` if so.
-    PeerEorComplete,
 }
 
 enum Inner {
@@ -82,8 +74,6 @@ enum Inner {
     Restarting { stale_families: Vec<Family> },
     /// Peer reconnected; Selection Deferral Timer running; waiting for EOR.
     WaitingEor { pending: FnvHashSet<Family> },
-    /// We are the restarting speaker; waiting for EOR from this helper peer.
-    LocalRestarting { pending: FnvHashSet<Family> },
 }
 
 /// GR helper state machine for a single BGP peer.
@@ -94,11 +84,6 @@ pub(crate) struct GrState {
 impl GrState {
     pub(crate) fn new() -> Self {
         GrState { state: Inner::Idle }
-    }
-
-    /// Returns true while waiting for EOR from a helper peer (restarting-speaker side).
-    pub(crate) fn is_local_restarting(&self) -> bool {
-        matches!(self.state, Inner::LocalRestarting { .. })
     }
 
     /// Returns true while the remote peer is restarting (helper side: restart
@@ -113,33 +98,6 @@ impl GrState {
     pub(crate) fn process(&mut self, input: GrInput) -> Vec<GrOutput> {
         let state = std::mem::replace(&mut self.state, Inner::Idle);
         let (new_state, outputs) = match (state, input) {
-            // LocalRestarting + SessionDropped: peer dropped before sending all EOR;
-            // give up waiting (no stale routes to mark on our side).
-            (Inner::LocalRestarting { .. }, GrInput::SessionDropped { .. }) => {
-                (Inner::Idle, vec![])
-            }
-
-            // LocalRestartEstablished from Idle: enter LocalRestarting if families
-            // are non-empty, otherwise stay Idle.
-            (Inner::Idle, GrInput::LocalRestartEstablished { gr_families }) => {
-                let pending: FnvHashSet<Family> = gr_families.into_iter().collect();
-                if pending.is_empty() {
-                    (Inner::Idle, vec![])
-                } else {
-                    (Inner::LocalRestarting { pending }, vec![])
-                }
-            }
-
-            // EOR received while we are the restarting speaker.
-            (Inner::LocalRestarting { mut pending }, GrInput::EorReceived(family)) => {
-                pending.remove(&family);
-                if pending.is_empty() {
-                    (Inner::Idle, vec![GrOutput::PeerEorComplete])
-                } else {
-                    (Inner::LocalRestarting { pending }, vec![])
-                }
-            }
-
             // Session drop from any state: mark stale and start restart timer.
             // If dropping from WaitingEor, also stop the deferral timer.
             (
@@ -755,86 +713,6 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert!(matches!(outputs[0], GrOutput::StopDeferralTimer));
         assert!(matches!(outputs[1], GrOutput::StartTimer(d) if d == restart_time()));
-        assert!(matches!(gr.state, Inner::Restarting { .. }));
-    }
-
-    // --- restarting-speaker side ---
-
-    #[test]
-    fn local_restart_single_family_eor_emits_peer_eor_complete() {
-        let mut gr = GrState::new();
-        let outputs = gr.process(GrInput::LocalRestartEstablished {
-            gr_families: vec![ipv4()],
-        });
-        assert!(outputs.is_empty());
-        assert!(gr.is_local_restarting());
-
-        let outputs = gr.process(GrInput::EorReceived(ipv4()));
-        assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0], GrOutput::PeerEorComplete));
-        assert!(!gr.is_local_restarting());
-        assert!(matches!(gr.state, Inner::Idle));
-    }
-
-    #[test]
-    fn local_restart_two_families_partial_eor_no_complete() {
-        let mut gr = GrState::new();
-        gr.process(GrInput::LocalRestartEstablished {
-            gr_families: vec![ipv4(), ipv6()],
-        });
-        assert!(gr.is_local_restarting());
-
-        // First EOR: still waiting for IPv6
-        let outputs = gr.process(GrInput::EorReceived(ipv4()));
-        assert!(outputs.is_empty());
-        assert!(gr.is_local_restarting());
-
-        // Second EOR: all done
-        let outputs = gr.process(GrInput::EorReceived(ipv6()));
-        assert_eq!(outputs.len(), 1);
-        assert!(matches!(outputs[0], GrOutput::PeerEorComplete));
-        assert!(!gr.is_local_restarting());
-    }
-
-    #[test]
-    fn local_restart_empty_families_stays_idle() {
-        let mut gr = GrState::new();
-        let outputs = gr.process(GrInput::LocalRestartEstablished {
-            gr_families: vec![],
-        });
-        assert!(outputs.is_empty());
-        assert!(!gr.is_local_restarting());
-        assert!(matches!(gr.state, Inner::Idle));
-    }
-
-    #[test]
-    fn local_restart_session_dropped_goes_idle_without_peer_eor_complete() {
-        let mut gr = GrState::new();
-        gr.process(GrInput::LocalRestartEstablished {
-            gr_families: vec![ipv4()],
-        });
-        assert!(gr.is_local_restarting());
-
-        let outputs = gr.process(GrInput::SessionDropped {
-            families: vec![ipv4()],
-            restart_time: restart_time(),
-        });
-        assert!(outputs.is_empty());
-        assert!(!gr.is_local_restarting());
-        assert!(matches!(gr.state, Inner::Idle));
-    }
-
-    #[test]
-    fn local_restart_established_from_non_idle_is_noop() {
-        // LocalRestartEstablished only works from Idle; from Restarting it is ignored.
-        let mut gr = GrState::new();
-        drop_ipv4(&mut gr);
-        assert!(matches!(gr.state, Inner::Restarting { .. }));
-
-        let outputs = gr.process(GrInput::LocalRestartEstablished {
-            gr_families: vec![ipv4()],
-        });
-        assert!(outputs.is_empty());
         assert!(matches!(gr.state, Inner::Restarting { .. }));
     }
 
