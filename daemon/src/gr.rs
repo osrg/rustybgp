@@ -224,7 +224,6 @@ impl GrState {
 // ============================================================================
 
 /// Events for the Restarting Speaker deferral state machine.
-#[allow(dead_code)]
 pub(crate) enum RestartingInput {
     /// A peer session established.  `families` is the set of GR families
     /// negotiated in the OPEN; empty means this peer does not support GR.
@@ -238,7 +237,6 @@ pub(crate) enum RestartingInput {
 }
 
 /// Actions the driver performs for the Restarting Speaker deferral machine.
-#[allow(dead_code)]
 pub(crate) enum RestartingOutput {
     /// Emitted from `new()`: set the table deferral flag for these families.
     DeferFamilies(Vec<Family>),
@@ -287,7 +285,6 @@ pub(crate) enum RestartingOutput {
 //
 //   Completed: all inputs are no-ops
 
-#[allow(dead_code)]
 enum RestartingInner {
     AwaitingStart {
         pending: FnvHashMap<IpAddr, FnvHashSet<Family>>,
@@ -306,12 +303,10 @@ enum RestartingInner {
 /// `DeferFamilies` immediately so the driver can flag the right table families
 /// before any peer connects.  Advances to `Completed` once all expected EOR
 /// has arrived or the timer fires.
-#[allow(dead_code)]
 pub(crate) struct RestartingDeferral {
     state: RestartingInner,
 }
 
-#[allow(dead_code)]
 impl RestartingDeferral {
     /// Create the state machine.
     ///

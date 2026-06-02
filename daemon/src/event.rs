@@ -2966,7 +2966,6 @@ impl Global {
 
     /// Clear the restarting-speaker state: set R=0 in all peers' GR capability
     /// so future reconnections do not carry the Restart State bit.
-    #[allow(dead_code)]
     fn clear_restarting(&mut self) {
         for peer in self.peers.values_mut() {
             let mut ctx = peer.context.lock().unwrap();
@@ -3577,7 +3576,6 @@ enum TableEvent {
     /// Clear the deferral flag for `family` and distribute all accumulated best
     /// paths to peers.  Used by the Restarting Speaker when deferral ends for a
     /// family (FamilyDeferralComplete or EndDeferral from RestartingDeferral).
-    #[allow(dead_code)]
     EndDeferral(Family),
     // RPKI events
     InsertRoa(Vec<(packet::IpNet, Arc<table::Roa>)>),
@@ -4000,7 +3998,6 @@ async fn gr_selection_deferral_timer_expired(global: GlobalHandle, tables: Table
 /// Clear the deferral flag for each family across all shards and distribute
 /// the accumulated best paths to all connected peers.  Called when
 /// RestartingDeferral emits FamilyDeferralComplete or EndDeferral.
-#[allow(dead_code)]
 async fn gr_end_deferral_families(tables: &TableHandle, families: &[Family]) {
     for i in 0..tables.shards.len() {
         for &family in families {
