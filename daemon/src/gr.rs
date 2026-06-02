@@ -33,27 +33,27 @@
 //!   Idle
 //!     + SessionDropped(families, restart_time)
 //!         mark routes stale; output: [StartTimer(restart_time)]
-//!         --> Restarting { stale_families }
+//!         --> PeerRestarting { stale_families }
 //!
-//!   Restarting
+//!   PeerRestarting  (remote peer has restarted; we are the helper)
 //!     + SessionEstablished(gr_families, deferral_time)
 //!         output: [StopTimer, DeleteStaleRoutes(dropped)?, StartDeferralTimer?]
 //!         if gr_families empty: --> Idle
-//!         else:                 --> WaitingEor { pending = gr_families }
+//!         else:                 --> PeerReconnected { pending = gr_families }
 //!     + TimerExpired
 //!         output: [DeleteStaleRoutes(stale_families)] --> Idle
 //!     + SessionDropped
-//!         output: [StartTimer] --> Restarting  (restart timer reset)
+//!         output: [StartTimer] --> PeerRestarting  (restart timer reset)
 //!
-//!   WaitingEor
+//!   PeerReconnected  (remote peer reconnected; waiting for EOR per family)
 //!     + EorReceived(family)
 //!         output: [DeleteStaleRoutes([family])]
 //!         if all families done: output += [StopDeferralTimer] --> Idle
-//!         else:                                               --> WaitingEor
+//!         else:                                               --> PeerReconnected
 //!     + DeferralTimerExpired
 //!         output: [DeleteStaleRoutes(remaining)] --> Idle
 //!     + SessionDropped
-//!         output: [StopDeferralTimer, StartTimer] --> Restarting
+//!         output: [StopDeferralTimer, StartTimer] --> PeerRestarting
 //!
 //!   All other (state, input) combinations are no-ops.
 
@@ -104,10 +104,10 @@ pub(crate) enum GrOutput {
 enum Inner {
     /// No GR in progress.
     Idle,
-    /// Peer dropped; restart timer running. Stale routes have been marked.
-    Restarting { stale_families: Vec<Family> },
-    /// Peer reconnected; Selection Deferral Timer running; waiting for EOR.
-    WaitingEor { pending: FnvHashSet<Family> },
+    /// Remote peer dropped; restart timer running. Stale routes have been marked.
+    PeerRestarting { stale_families: Vec<Family> },
+    /// Remote peer reconnected; Selection Deferral Timer running; waiting for EOR.
+    PeerReconnected { pending: FnvHashSet<Family> },
 }
 
 /// GR helper state machine for a single BGP peer.
@@ -125,7 +125,7 @@ impl GrState {
     pub(crate) fn is_peer_restarting(&self) -> bool {
         matches!(
             self.state,
-            Inner::Restarting { .. } | Inner::WaitingEor { .. }
+            Inner::PeerRestarting { .. } | Inner::PeerReconnected { .. }
         )
     }
 
@@ -133,7 +133,7 @@ impl GrState {
         let state = std::mem::replace(&mut self.state, Inner::Idle);
         let (new_state, outputs) = match (state, input) {
             // Session drop from any state: mark stale and start restart timer.
-            // If dropping from WaitingEor, also stop the deferral timer.
+            // If dropping from PeerReconnected, also stop the deferral timer.
             (
                 state,
                 GrInput::SessionDropped {
@@ -142,12 +142,12 @@ impl GrState {
                 },
             ) => {
                 let mut outputs = Vec::new();
-                if matches!(state, Inner::WaitingEor { .. }) {
+                if matches!(state, Inner::PeerReconnected { .. }) {
                     outputs.push(GrOutput::StopDeferralTimer);
                 }
                 outputs.push(GrOutput::StartTimer(restart_time));
                 (
-                    Inner::Restarting {
+                    Inner::PeerRestarting {
                         stale_families: families,
                     },
                     outputs,
@@ -156,7 +156,7 @@ impl GrState {
 
             // Peer reconnected while restart timer was running.
             (
-                Inner::Restarting { stale_families },
+                Inner::PeerRestarting { stale_families },
                 GrInput::SessionEstablished {
                     gr_families,
                     deferral_time,
@@ -180,38 +180,38 @@ impl GrState {
                     Inner::Idle
                 } else {
                     outputs.push(GrOutput::StartDeferralTimer(deferral_time));
-                    Inner::WaitingEor { pending: gr_set }
+                    Inner::PeerReconnected { pending: gr_set }
                 };
                 (new_state, outputs)
             }
 
             // Restart timer fired before peer reconnected.
-            (Inner::Restarting { stale_families }, GrInput::TimerExpired) => (
+            (Inner::PeerRestarting { stale_families }, GrInput::TimerExpired) => (
                 Inner::Idle,
                 vec![GrOutput::DeleteStaleRoutes(stale_families)],
             ),
 
             // EOR received for one family while waiting for all families.
-            (Inner::WaitingEor { mut pending }, GrInput::EorReceived(family)) => {
+            (Inner::PeerReconnected { mut pending }, GrInput::EorReceived(family)) => {
                 pending.remove(&family);
                 let mut outputs = vec![GrOutput::DeleteStaleRoutes(vec![family])];
                 let new_state = if pending.is_empty() {
                     outputs.push(GrOutput::StopDeferralTimer);
                     Inner::Idle
                 } else {
-                    Inner::WaitingEor { pending }
+                    Inner::PeerReconnected { pending }
                 };
                 (new_state, outputs)
             }
 
             // Selection Deferral Timer fired; delete all remaining stale routes.
-            (Inner::WaitingEor { pending }, GrInput::DeferralTimerExpired) => {
+            (Inner::PeerReconnected { pending }, GrInput::DeferralTimerExpired) => {
                 let families: Vec<Family> = pending.into_iter().collect();
                 (Inner::Idle, vec![GrOutput::DeleteStaleRoutes(families)])
             }
 
             // All other combinations are no-ops (e.g., EOR in Idle/Restarting,
-            // TimerExpired in WaitingEor, SessionEstablished in Idle).
+            // TimerExpired in PeerReconnected, SessionEstablished in Idle).
             (state, _) => (state, vec![]),
         };
         self.state = new_state;
@@ -578,7 +578,7 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0], GrOutput::StartTimer(d) if *d == restart_time()));
-        assert!(matches!(gr.state, Inner::Restarting { .. }));
+        assert!(matches!(gr.state, Inner::PeerRestarting { .. }));
     }
 
     #[test]
@@ -603,7 +603,7 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert!(matches!(outputs[0], GrOutput::StopTimer));
         assert!(matches!(outputs[1], GrOutput::StartDeferralTimer(d) if d == deferral_time()));
-        assert!(matches!(gr.state, Inner::WaitingEor { .. }));
+        assert!(matches!(gr.state, Inner::PeerReconnected { .. }));
     }
 
     #[test]
@@ -636,7 +636,7 @@ mod tests {
         let outputs = gr.process(GrInput::EorReceived(ipv4()));
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0], GrOutput::DeleteStaleRoutes(f) if f == &[ipv4()]));
-        assert!(matches!(gr.state, Inner::WaitingEor { .. }));
+        assert!(matches!(gr.state, Inner::PeerReconnected { .. }));
 
         // Second EOR: all done, deferral timer stopped
         let outputs = gr.process(GrInput::EorReceived(ipv6()));
@@ -687,7 +687,7 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert!(matches!(&outputs[0], GrOutput::StartTimer(d) if *d == Duration::from_secs(60)));
-        assert!(matches!(gr.state, Inner::Restarting { .. }));
+        assert!(matches!(gr.state, Inner::PeerRestarting { .. }));
     }
 
     #[test]
@@ -710,7 +710,7 @@ mod tests {
         assert!(matches!(outputs[0], GrOutput::StopTimer));
         assert!(matches!(&outputs[1], GrOutput::DeleteStaleRoutes(f) if f == &[ipv6()]));
         assert!(matches!(outputs[2], GrOutput::StartDeferralTimer(d) if d == deferral_time()));
-        assert!(matches!(gr.state, Inner::WaitingEor { .. }));
+        assert!(matches!(gr.state, Inner::PeerReconnected { .. }));
     }
 
     #[test]
@@ -739,7 +739,7 @@ mod tests {
         let mut gr = GrState::new();
         drop_ipv4(&mut gr);
         establish_ipv4(&mut gr);
-        assert!(matches!(gr.state, Inner::WaitingEor { .. }));
+        assert!(matches!(gr.state, Inner::PeerReconnected { .. }));
 
         let outputs = drop_ipv4(&mut gr);
 
@@ -747,7 +747,7 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert!(matches!(outputs[0], GrOutput::StopDeferralTimer));
         assert!(matches!(outputs[1], GrOutput::StartTimer(d) if d == restart_time()));
-        assert!(matches!(gr.state, Inner::Restarting { .. }));
+        assert!(matches!(gr.state, Inner::PeerRestarting { .. }));
     }
 
     // =========================================================================
