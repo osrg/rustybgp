@@ -405,8 +405,19 @@ impl Source {
     }
 }
 
+/// Per-family routing table slot.
+///
+/// `deferring` is set while the local speaker is in Restarting Speaker mode
+/// (RFC 4724 §4.2): best-path selection is suppressed for this family until
+/// EOR has been received from all helper peers or the deferral timer fires.
+#[derive(Default)]
+pub struct FamilyTable {
+    pub deferring: bool,
+    destinations: FnvHashMap<packet::Nlri, Destination>,
+}
+
 pub struct RoutingTable {
-    global: FnvHashMap<Family, FnvHashMap<packet::Nlri, Destination>>,
+    global: FnvHashMap<Family, FamilyTable>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, (u64, u64)>>,
     /// Per-peer per-family maximum prefix limits.
     prefix_limits: FnvHashMap<IpAddr, FnvHashMap<Family, u32>>,
@@ -422,7 +433,7 @@ impl Default for RoutingTable {
 impl RoutingTable {
     pub fn new() -> Self {
         RoutingTable {
-            global: vec![(Family::EMPTY, FnvHashMap::default())]
+            global: vec![(Family::EMPTY, FamilyTable::default())]
                 .into_iter()
                 .collect(),
             route_stats: FnvHashMap::default(),
@@ -445,8 +456,8 @@ impl RoutingTable {
     pub fn best(&self, family: &Family) -> Vec<Change> {
         match self.global.get(family) {
             Some(t) => {
-                let mut v = Vec::with_capacity(t.len());
-                for (net, dst) in t {
+                let mut v = Vec::with_capacity(t.destinations.len());
+                for (net, dst) in &t.destinations {
                     for (i, p) in dst.unfiltered_all().iter().enumerate() {
                         v.push(Change {
                             source: p.source.clone(),
@@ -469,7 +480,7 @@ impl RoutingTable {
     pub fn state(&self, family: Family) -> RoutingTableState {
         match self.global.get(&family) {
             Some(t) => {
-                let entries = t.values().flat_map(|x| x.entry.iter());
+                let entries = t.destinations.values().flat_map(|x| x.entry.iter());
                 let mut num_path = 0;
                 let mut num_accepted = 0;
                 for p in entries {
@@ -479,7 +490,7 @@ impl RoutingTable {
                     }
                 }
                 RoutingTableState {
-                    num_destination: t.len(),
+                    num_destination: t.destinations.len(),
                     num_path,
                     num_accepted,
                 }
@@ -502,6 +513,7 @@ impl RoutingTable {
         self.global
             .get(&family)
             .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
+            .destinations
             .iter()
             .flat_map(move |(net, dst)| {
                 dst.entry.iter().map(move |e| Reach {
@@ -527,6 +539,7 @@ impl RoutingTable {
         self.global
             .get(&family)
             .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
+            .destinations
             .iter()
             .filter(move |(net, _dst)| {
                 prefixes.is_empty() || {
@@ -663,7 +676,7 @@ impl RoutingTable {
         let flags = if filtered { Path::FLAG_FILTERED } else { 0 };
 
         let rt = self.global.entry(family).or_default();
-        let dst = rt.entry(net).or_insert_with(Destination::new);
+        let dst = rt.destinations.entry(net).or_insert_with(Destination::new);
 
         // Snapshot all unfiltered paths before modification
         let old_top: Vec<TopNEntry> = dst
@@ -756,7 +769,7 @@ impl RoutingTable {
         let Some(rt) = self.global.get_mut(&family) else {
             return Vec::new();
         };
-        let Some(dst) = rt.get_mut(&net) else {
+        let Some(dst) = rt.destinations.get_mut(&net) else {
             return Vec::new();
         };
 
@@ -792,7 +805,7 @@ impl RoutingTable {
         }
 
         if dst.entry.is_empty() {
-            rt.remove(&net);
+            rt.destinations.remove(&net);
             // Withdraw all previously-advertised paths using their stable IDs
             return old_top
                 .iter()
@@ -903,7 +916,7 @@ impl RoutingTable {
             }
         }
         if let Some(rt) = self.global.get_mut(&family) {
-            rt.retain(|net, dst| {
+            rt.destinations.retain(|net, dst| {
                 let old_top: Vec<TopNEntry> = dst
                     .unfiltered_all()
                     .iter()
@@ -947,7 +960,7 @@ impl RoutingTable {
     pub fn drop_stale(&mut self, addr: IpAddr, family: Family) -> Vec<Change> {
         let mut advertise = Vec::new();
         if let Some(rt) = self.global.get_mut(&family) {
-            rt.retain(|net, dst| {
+            rt.destinations.retain(|net, dst| {
                 if !dst
                     .entry
                     .iter()
@@ -998,7 +1011,7 @@ impl RoutingTable {
     pub fn restale(&mut self, addr: IpAddr, family: Family) -> Vec<Change> {
         let mut changes = Vec::new();
         if let Some(rt) = self.global.get_mut(&family) {
-            for (net, dst) in rt.iter_mut() {
+            for (net, dst) in rt.destinations.iter_mut() {
                 if !dst.entry.iter().any(|p| p.source.remote_addr == addr) {
                     continue;
                 }
@@ -2289,9 +2302,9 @@ mod tests {
         rt.insert(s1.clone(), family, n2, 0, nh(), attrs.clone(), false);
         rt.insert(s1.clone(), family, n3, 0, nh(), attrs.clone(), false);
 
-        assert_eq!(rt.global.get(&family).unwrap().len(), 3);
+        assert_eq!(rt.global.get(&family).unwrap().destinations.len(), 3);
         rt.drop(s1.remote_addr, family);
-        assert_eq!(rt.global.get(&family).unwrap().len(), 1);
+        assert_eq!(rt.global.get(&family).unwrap().destinations.len(), 1);
     }
 
     // --- single_aspath_match ---
