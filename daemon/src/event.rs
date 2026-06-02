@@ -2963,21 +2963,6 @@ impl Global {
         self.peers.insert(peer.config.remote_addr, peer);
         Ok(())
     }
-
-    /// Clear the restarting-speaker state: set R=0 in all peers' GR capability
-    /// so future reconnections do not carry the Restart State bit.
-    fn clear_restarting(&mut self) {
-        for peer in self.peers.values_mut() {
-            let mut ctx = peer.context.lock().unwrap();
-            ctx.local_restarting = false;
-            for cap in &mut peer.config.local_cap {
-                if let packet::Capability::GracefulRestart { flags, .. } = cap {
-                    *flags &= !0x8;
-                }
-            }
-        }
-        println!("graceful-restart: all peers sent EOR; cleared restarting state");
-    }
 }
 
 async fn accept_connection(
@@ -3975,7 +3960,16 @@ async fn process_restarting_outputs(
             h.abort();
         }
         server.selection_deferral = None;
-        server.clear_restarting();
+        // Clear the Restart State (R) bit so future OPENs no longer
+        // advertise the restarting-speaker state.
+        for peer in server.peers.values_mut() {
+            for cap in &mut peer.config.local_cap {
+                if let packet::Capability::GracefulRestart { flags, .. } = cap {
+                    *flags &= !0x8;
+                }
+            }
+        }
+        println!("graceful-restart: all peers sent EOR; cleared restarting state");
     }
 
     // Flatten: None (no output) and Some(None) (disabled) both mean "don't start timer".
