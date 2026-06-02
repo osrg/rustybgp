@@ -224,9 +224,6 @@ struct ActiveConnectCancel(Option<tokio::sync::oneshot::Sender<()>>);
 struct GrPeerConfig {
     /// Restart Time advertised in our OPEN (12-bit, max 4095 s).
     restart_time: u16,
-    /// Local Selection Deferral Timer: how long to wait for EOR after
-    /// the peer reconnects before deleting remaining stale routes.
-    deferral_time: std::time::Duration,
     /// Families included in the GR capability (non-empty by construction).
     families: Vec<Family>,
 }
@@ -275,8 +272,6 @@ struct PeerContext {
     gr_state: crate::gr::GrState,
     /// Abort handle for the GR restart timer task.
     gr_restart_timer: Option<tokio::task::AbortHandle>,
-    /// Abort handle for the GR selection deferral timer task.
-    gr_deferral_timer: Option<tokio::task::AbortHandle>,
 }
 
 /// Administrative peer record stored in `Global::peers` under the global
@@ -521,7 +516,6 @@ impl PeerParams {
                 export_map: ExportMap::new(),
                 gr_state: crate::gr::GrState::new(),
                 gr_restart_timer: None,
-                gr_deferral_timer: None,
             })),
         }
     }
@@ -616,7 +610,6 @@ impl From<&PeerView> for api::Peer {
             .map(|gr| api::GracefulRestart {
                 enabled: true,
                 restart_time: gr.restart_time as u32,
-                deferral_time: gr.deferral_time.as_secs() as u32,
                 peer_restarting: p.gr_peer_restarting,
                 local_restarting: p.gr_local_restarting,
                 ..Default::default()
@@ -663,7 +656,6 @@ impl TryFrom<&api::Peer> for PeerParams {
 
         let graceful_restart = {
             const DEFAULT_RESTART_TIME: u16 = 120;
-            const DEFAULT_DEFERRAL_SECS: u64 = 360;
 
             let gr = p.graceful_restart.as_ref();
             if gr.is_some_and(|g| g.enabled) {
@@ -685,19 +677,8 @@ impl TryFrom<&api::Peer> for PeerParams {
                     let restart_time = gr
                         .and_then(|g| u16::try_from(g.restart_time).ok())
                         .unwrap_or(DEFAULT_RESTART_TIME);
-                    let deferral_secs = gr
-                        .map(|g| {
-                            if g.deferral_time > 0 {
-                                g.deferral_time as u64
-                            } else {
-                                g.stale_routes_time as u64
-                            }
-                        })
-                        .filter(|&v| v > 0)
-                        .unwrap_or(DEFAULT_DEFERRAL_SECS);
                     Some(GrPeerConfig {
                         restart_time,
-                        deferral_time: std::time::Duration::from_secs(deferral_secs),
                         families: gr_families,
                     })
                 } else {
@@ -834,7 +815,6 @@ impl TryFrom<&config::Neighbor> for PeerParams {
         // Build GR helper config from graceful-restart + per-family mp-graceful-restart.
         let graceful_restart = {
             const DEFAULT_RESTART_TIME: u16 = 120;
-            const DEFAULT_DEFERRAL_SECS: u64 = 360;
 
             let gr_config = n
                 .graceful_restart
@@ -861,17 +841,8 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                     let restart_time = gr_config
                         .and_then(|c| c.restart_time)
                         .unwrap_or(DEFAULT_RESTART_TIME);
-                    let deferral_secs = gr_config
-                        .and_then(|c| c.deferral_time.map(|v| v as u64))
-                        .or_else(|| {
-                            gr_config
-                                .and_then(|c| c.stale_routes_time)
-                                .map(|v| v as u64)
-                        })
-                        .unwrap_or(DEFAULT_DEFERRAL_SECS);
                     Some(GrPeerConfig {
                         restart_time,
-                        deferral_time: std::time::Duration::from_secs(deferral_secs),
                         families: gr_families,
                     })
                 } else {
@@ -1161,11 +1132,8 @@ impl GoBgpService for GrpcService {
                 });
                 {
                     let mut ctx = p.context.lock().unwrap();
-                    // Abort GR timers immediately so they do not fire after the peer
-                    // is gone and operate on stale state.
-                    if let Some(h) = ctx.gr_deferral_timer.take() {
-                        h.abort();
-                    }
+                    // Abort the GR restart timer immediately so it does not fire after
+                    // the peer is gone and operate on stale state.
                     if let Some(h) = ctx.gr_restart_timer.take() {
                         h.abort();
                     }
@@ -3088,11 +3056,6 @@ async fn accept_connection(
         tables.clone(),
         export_map,
         context,
-        peer.config
-            .graceful_restart
-            .as_ref()
-            .map(|c| c.deferral_time)
-            .unwrap_or(Duration::from_secs(360)),
     )
 }
 
@@ -4034,23 +3997,6 @@ async fn gr_restart_timer_expired(
     }
 }
 
-async fn gr_deferral_timer_expired(
-    context: Arc<std::sync::Mutex<PeerContext>>,
-    tables: TableHandle,
-    addr: IpAddr,
-) {
-    let families = {
-        let mut ctx = context.lock().unwrap();
-        let outputs = ctx
-            .gr_state
-            .process(crate::gr::GrInput::DeferralTimerExpired);
-        collect_delete_families(&outputs)
-    };
-    if !families.is_empty() {
-        gr_drop_stale_families(&tables, addr, &families).await;
-    }
-}
-
 /// Side effects from `apply_outputs` that require mutating global peer state.
 /// Returned by `apply_outputs` and processed by `process_effects` so that
 /// `apply_outputs` itself has no async global dependency and is unit-testable.
@@ -4155,9 +4101,6 @@ struct PeerSession {
     export_map: ExportMap,
     /// GR negotiation result from the most recent OPEN exchange.
     negotiated_gr: Option<NegotiatedGr>,
-    /// Deferral time for graceful restart, taken from peer config at session
-    /// creation so that `process_effects` needs no global lock to read it.
-    gr_deferral_time: Duration,
     /// Shared cross-session state for this peer; cloned from `Peer::context`
     /// so that `PeerSession::run` can operate on `PeerContext` without taking
     /// the global write lock.
@@ -4190,7 +4133,6 @@ impl PeerSession {
         tables: TableHandle,
         export_map: ExportMap,
         context: Arc<std::sync::Mutex<PeerContext>>,
-        gr_deferral_time: Duration,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
@@ -4233,7 +4175,6 @@ impl PeerSession {
             tables,
             export_map,
             negotiated_gr: None,
-            gr_deferral_time,
             context,
             urgent: Vec::new(),
             framer,
@@ -4255,7 +4196,6 @@ impl PeerSession {
         remote_addr: IpAddr,
         context: Arc<std::sync::Mutex<PeerContext>>,
         tables: TableHandle,
-        gr_deferral_time: Duration,
     ) -> Self {
         use std::net::Ipv4Addr;
 
@@ -4302,7 +4242,6 @@ impl PeerSession {
             tables,
             export_map: ExportMap::new(),
             negotiated_gr: None,
-            gr_deferral_time,
             context,
             urgent: vec![],
             framer,
@@ -4687,8 +4626,6 @@ impl PeerSession {
                         .take();
                 }
                 GlobalEffect::GrSessionEstablished { negotiated_gr } => {
-                    let context_c = Arc::clone(&self.context);
-                    let deferral_time = self.gr_deferral_time;
                     let gr_families = negotiated_gr
                         .as_ref()
                         .map(|g| g.families.clone())
@@ -4731,34 +4668,14 @@ impl PeerSession {
                             global.write().await.selection_deferral_timer = Some(handle);
                         }
                     } else {
-                        // Helper side: advance GrState and start deferral timer.
+                        // Helper side: advance GrState (no deferral timer — restart timer
+                        // started at session drop covers the full stale-route window).
                         let delete_families = {
                             let mut ctx = self.context.lock().unwrap();
-                            let outputs =
-                                ctx.gr_state
-                                    .process(crate::gr::GrInput::SessionEstablished {
-                                        gr_families,
-                                        deferral_time,
-                                    });
-                            let delete_families = collect_delete_families(&outputs);
-                            let deferral_dur = outputs.iter().find_map(|o| {
-                                if let crate::gr::GrOutput::StartDeferralTimer(dur) = o {
-                                    Some(*dur)
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(dur) = deferral_dur {
-                                let addr = self.remote_addr;
-                                let tables_c = self.tables.clone();
-                                let handle = tokio::spawn(async move {
-                                    tokio::time::sleep(dur).await;
-                                    gr_deferral_timer_expired(context_c, tables_c, addr).await;
-                                })
-                                .abort_handle();
-                                ctx.gr_deferral_timer = Some(handle);
-                            }
-                            delete_families
+                            let outputs = ctx
+                                .gr_state
+                                .process(crate::gr::GrInput::SessionEstablished { gr_families });
+                            collect_delete_families(&outputs)
                         };
                         if !delete_families.is_empty() {
                             gr_drop_stale_families(
@@ -4792,14 +4709,6 @@ impl PeerSession {
                         let outputs = ctx
                             .gr_state
                             .process(crate::gr::GrInput::EorReceived(family));
-                        if let Some(h) = outputs
-                            .iter()
-                            .any(|o| matches!(o, crate::gr::GrOutput::StopDeferralTimer))
-                            .then(|| ctx.gr_deferral_timer.take())
-                            .flatten()
-                        {
-                            h.abort();
-                        }
                         collect_delete_families(&outputs)
                     };
                     if !delete_families.is_empty() {
@@ -5274,9 +5183,6 @@ impl PeerSession {
                 // MarkStale table events were already sent in session_loop() under
                 // the same shard locks as peer_event_tx.remove(), so no second pass
                 // over the table is needed here.
-                if let Some(h) = ctx.gr_deferral_timer.take() {
-                    h.abort();
-                }
                 if let Some(h) = ctx.gr_restart_timer.take() {
                     h.abort();
                 }
@@ -5304,9 +5210,6 @@ impl PeerSession {
                 // Normal disconnect: routes were already dropped in session_loop().
                 // Clean up any leftover GR state from a previous cycle that never recovered.
                 if let Some(h) = ctx.gr_restart_timer.take() {
-                    h.abort();
-                }
-                if let Some(h) = ctx.gr_deferral_timer.take() {
                     h.abort();
                 }
                 drop(info.export_map);
@@ -5881,7 +5784,6 @@ mod tests {
             export_map: ExportMap::new(),
             gr_state: crate::gr::GrState::new(),
             gr_restart_timer: None,
-            gr_deferral_timer: None,
         }))
     }
 
@@ -5897,12 +5799,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
         context.lock().unwrap().active_connect_cancel_tx = ActiveConnectCancel(Some(tx));
 
-        let mut session = PeerSession::new_for_test(
-            remote_addr,
-            context.clone(),
-            tables,
-            Duration::from_secs(120),
-        );
+        let mut session = PeerSession::new_for_test(remote_addr, context.clone(), tables);
         session
             .process_effects(vec![GlobalEffect::StopActiveConnect], &global)
             .await;
@@ -5935,12 +5832,7 @@ mod tests {
             restart_time: Duration::from_secs(90),
         });
 
-        let mut session = PeerSession::new_for_test(
-            remote_addr,
-            context.clone(),
-            tables,
-            Duration::from_secs(120),
-        );
+        let mut session = PeerSession::new_for_test(remote_addr, context.clone(), tables);
         session
             .process_effects(
                 vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
@@ -5949,23 +5841,20 @@ mod tests {
             .await;
 
         let ctx = context.lock().unwrap();
-        // GrState should now be in WaitingEor (helper side, deferral timer set).
+        // GrState should now be in PeerReconnected (helper side, waiting for EOR).
         assert!(ctx.gr_state.is_peer_restarting());
-        // Deferral timer was started.
-        assert!(ctx.gr_deferral_timer.is_some());
     }
 
-    // ---- process_effects: GrEorReceived (helper side: deferral timer aborted) ----
+    // ---- process_effects: GrEorReceived (helper side) ----
 
     #[tokio::test]
-    async fn process_effects_gr_eor_received_helper_aborts_deferral_timer() {
+    async fn process_effects_gr_eor_received_helper_clears_restarting() {
         let global = make_global();
         let tables = make_tables();
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
         let context = make_context();
 
-        // Drive GrState through SessionDropped → SessionEstablished to reach WaitingEor.
-        // SessionEstablished from Idle is a no-op, so the drop must happen first.
+        // Drive GrState through SessionDropped → SessionEstablished to reach PeerReconnected.
         {
             let mut ctx = context.lock().unwrap();
             ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
@@ -5975,22 +5864,10 @@ mod tests {
             ctx.gr_state
                 .process(crate::gr::GrInput::SessionEstablished {
                     gr_families: vec![Family::IPV4],
-                    deferral_time: Duration::from_secs(120),
                 });
-            // Plant a dummy abort handle to simulate the running deferral timer.
-            let handle = tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            })
-            .abort_handle();
-            ctx.gr_deferral_timer = Some(handle);
         }
 
-        let mut session = PeerSession::new_for_test(
-            remote_addr,
-            context.clone(),
-            tables,
-            Duration::from_secs(120),
-        );
+        let mut session = PeerSession::new_for_test(remote_addr, context.clone(), tables);
         session
             .process_effects(
                 vec![GlobalEffect::GrEorReceived {
@@ -6001,9 +5878,7 @@ mod tests {
             .await;
 
         let ctx = context.lock().unwrap();
-        // Deferral timer cleared.
-        assert!(ctx.gr_deferral_timer.is_none());
-        // GrState is now Idle (EOR for only family received -> WaitingEor->Idle).
+        // GrState is now Idle (EOR for only family received).
         assert!(!ctx.gr_state.is_peer_restarting());
     }
 
@@ -6226,8 +6101,7 @@ mod tests {
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
         });
-        let mut session =
-            PeerSession::new_for_test(remote_addr, context, tables, Duration::from_secs(120));
+        let mut session = PeerSession::new_for_test(remote_addr, context, tables);
         session
             .process_effects(
                 vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
@@ -6259,8 +6133,7 @@ mod tests {
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
         });
-        let mut session =
-            PeerSession::new_for_test(remote_addr, context, tables, Duration::from_secs(120));
+        let mut session = PeerSession::new_for_test(remote_addr, context, tables);
 
         // Establish → starts timer and moves to Deferring.
         session
@@ -6330,8 +6203,7 @@ mod tests {
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
         });
-        let mut session =
-            PeerSession::new_for_test(unknown_addr, context, tables, Duration::from_secs(120));
+        let mut session = PeerSession::new_for_test(unknown_addr, context, tables);
         session
             .process_effects(
                 vec![GlobalEffect::GrSessionEstablished { negotiated_gr }],
