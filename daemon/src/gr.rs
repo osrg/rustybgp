@@ -242,8 +242,9 @@ pub(crate) enum RestartingInput {
 pub(crate) enum RestartingOutput {
     /// Emitted from `new()`: set the table deferral flag for these families.
     DeferFamilies(Vec<Family>),
-    /// Start the global Selection Deferral Timer with this duration.
-    StartDeferralTimer(Duration),
+    /// Start the global Selection Deferral Timer.
+    /// `None` means the timer is disabled (wait indefinitely for EOR).
+    StartDeferralTimer(Option<Duration>),
     /// This family is fully acknowledged: clear its table flag and re-advertise.
     FamilyDeferralComplete(Family),
     /// All deferral is done.  Remaining families (non-empty only on timer expiry)
@@ -290,7 +291,8 @@ pub(crate) enum RestartingOutput {
 enum RestartingInner {
     AwaitingStart {
         pending: FnvHashMap<IpAddr, FnvHashSet<Family>>,
-        duration: Duration,
+        /// `None` means the Selection Deferral Timer is disabled.
+        duration: Option<Duration>,
     },
     Deferring {
         pending: FnvHashMap<IpAddr, FnvHashSet<Family>>,
@@ -316,9 +318,11 @@ impl RestartingDeferral {
     /// `gr_peers`: each peer's configured GR families (peers with an empty
     /// list are skipped).  Returns `(machine, outputs)` where outputs contains
     /// at most one `DeferFamilies` action.
+    /// `duration`: how long to run the Selection Deferral Timer after the first
+    /// peer establishes.  `None` disables the timer (EOR is awaited indefinitely).
     pub(crate) fn new(
         gr_peers: FnvHashMap<IpAddr, Vec<Family>>,
-        duration: Duration,
+        duration: Option<Duration>,
     ) -> (Self, Vec<RestartingOutput>) {
         let pending: FnvHashMap<IpAddr, FnvHashSet<Family>> = gr_peers
             .into_iter()
@@ -510,7 +514,7 @@ impl RestartingDeferral {
 
     fn finish_awaiting(
         pending: FnvHashMap<IpAddr, FnvHashSet<Family>>,
-        duration: Duration,
+        duration: Option<Duration>,
         mut outputs: Vec<RestartingOutput>,
     ) -> (RestartingInner, Vec<RestartingOutput>) {
         if pending.is_empty() {
@@ -764,7 +768,7 @@ mod tests {
         peers: &[(IpAddr, Vec<Family>)],
     ) -> (RestartingDeferral, Vec<RestartingOutput>) {
         let map: FnvHashMap<IpAddr, Vec<Family>> = peers.iter().cloned().collect();
-        RestartingDeferral::new(map, deferral_time())
+        RestartingDeferral::new(map, Some(deferral_time()))
     }
 
     fn rd_deferred_families(outputs: &[RestartingOutput]) -> Vec<Family> {
@@ -843,7 +847,7 @@ mod tests {
         assert!(has_start_timer(&outputs));
         assert!(matches!(
             outputs.last(),
-            Some(RestartingOutput::StartDeferralTimer(d)) if *d == deferral_time()
+            Some(RestartingOutput::StartDeferralTimer(Some(d))) if *d == deferral_time()
         ));
         assert!(matches!(rd.state, RestartingInner::Deferring { .. }));
     }

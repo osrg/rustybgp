@@ -3424,8 +3424,23 @@ impl Global {
                     })
                     .collect()
             };
-            let duration = std::time::Duration::from_secs(360);
-            let (deferral, init_outputs) = crate::gr::RestartingDeferral::new(gr_peers, duration);
+            // Read Selection_Deferral_Timer from Global GR config (stale_routes_time).
+            // None → default 360 s; 0 → disabled (wait indefinitely); >0 → use that value.
+            let selection_deferral_time: Option<std::time::Duration> = bgp
+                .as_ref()
+                .and_then(|b| b.global.as_ref())
+                .and_then(|g| g.graceful_restart.as_ref())
+                .and_then(|gr| gr.config.as_ref())
+                .and_then(|c| c.stale_routes_time)
+                .map_or(Some(std::time::Duration::from_secs(360)), |secs| {
+                    if secs == 0.0 {
+                        None
+                    } else {
+                        Some(std::time::Duration::from_secs_f64(secs))
+                    }
+                });
+            let (deferral, init_outputs) =
+                crate::gr::RestartingDeferral::new(gr_peers, selection_deferral_time);
             if !deferral.is_completed() {
                 for output in &init_outputs {
                     if let crate::gr::RestartingOutput::DeferFamilies(families) = output {
@@ -3931,7 +3946,8 @@ async fn process_restarting_outputs(
 ) -> Option<std::time::Duration> {
     let mut complete_families: Vec<Family> = vec![];
     let mut end_remaining: Option<Vec<Family>> = None;
-    let mut start_timer: Option<std::time::Duration> = None;
+    // None: no StartDeferralTimer output; Some(None): timer disabled; Some(Some(d)): start timer
+    let mut start_timer: Option<Option<std::time::Duration>> = None;
 
     for output in outputs {
         match output {
@@ -3964,7 +3980,8 @@ async fn process_restarting_outputs(
         server.clear_restarting();
     }
 
-    start_timer
+    // Flatten: None (no output) and Some(None) (disabled) both mean "don't start timer".
+    start_timer.flatten()
 }
 
 async fn gr_selection_deferral_timer_expired(global: GlobalHandle, tables: TableHandle) {
@@ -6202,7 +6219,7 @@ mod tests {
 
     fn make_selection_deferral(peers: &[(IpAddr, Vec<Family>)]) -> crate::gr::RestartingDeferral {
         let map: fnv::FnvHashMap<IpAddr, Vec<Family>> = peers.iter().cloned().collect();
-        let (deferral, _) = crate::gr::RestartingDeferral::new(map, Duration::from_secs(360));
+        let (deferral, _) = crate::gr::RestartingDeferral::new(map, Some(Duration::from_secs(360)));
         deferral
     }
 
