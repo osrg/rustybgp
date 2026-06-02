@@ -676,6 +676,7 @@ impl RoutingTable {
         let flags = if filtered { Path::FLAG_FILTERED } else { 0 };
 
         let rt = self.global.entry(family).or_default();
+        let deferring = rt.deferring;
         let dst = rt.destinations.entry(net).or_insert_with(Destination::new);
 
         // Snapshot all unfiltered paths before modification
@@ -755,8 +756,29 @@ impl RoutingTable {
         let idx = dst.entry.partition_point(|a| path.cmp(a).is_ge());
         dst.entry.insert(idx, path);
 
+        // During Restarting Speaker deferral, routes are accumulated but
+        // best-path changes are suppressed; end_deferral() emits them all at once.
+        if deferring {
+            return vec![];
+        }
+
         // Compare old vs new unfiltered paths and emit changes for each affected rank
         Self::diff_top_n(dst, &old_top, family, net)
+    }
+
+    /// Set the deferral flag for `family`: best-path changes from `insert()` are
+    /// suppressed until `end_deferral()` is called.
+    pub fn start_deferral(&mut self, family: Family) {
+        self.global.entry(family).or_default().deferring = true;
+    }
+
+    /// Clear the deferral flag for `family` and return all current best paths as
+    /// `Change` entries (with `old_rank = 0`) ready for distribution to peers.
+    pub fn end_deferral(&mut self, family: Family) -> Vec<Change> {
+        if let Some(ft) = self.global.get_mut(&family) {
+            ft.deferring = false;
+        }
+        self.best(&family)
     }
 
     pub fn remove(
