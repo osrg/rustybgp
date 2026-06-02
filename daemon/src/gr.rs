@@ -13,15 +13,49 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Graceful Restart helper state machine (RFC 4724).
+//! Graceful Restart state machines (RFC 4724).
 //!
-//! Pure logic — no async, no I/O. Processes [`GrInput`] events and returns
-//! [`GrOutput`] actions that the driver translates into real I/O and table
-//! mutations.
+//! Pure logic — no async, no I/O. All types process events and return actions
+//! that the driver translates into real I/O and table mutations.
 //!
-//! This implements the *helper* side of GR: the local speaker preserves stale
-//! routes from a restarting peer until the peer either reconnects and sends
-//! End-of-RIB, or the restart timer expires.
+//! Two independent state machines live here:
+//!
+//! * [`GrState`] — **Helper side**, one instance per peer.  Preserves stale
+//!   routes from a restarting remote peer until the peer reconnects and sends
+//!   End-of-RIB, or the restart timer expires.
+//!
+//! * [`RestartingDeferral`] — **Restarting Speaker side**, one global instance.
+//!   Defers best-path selection for GR families until EOR is received from all
+//!   configured helper peers, or the Selection Deferral Timer fires.
+//!
+//! # GrState state diagram
+//!
+//!   Idle
+//!     + SessionDropped(families, restart_time)
+//!         mark routes stale; output: [StartTimer(restart_time)]
+//!         --> Restarting { stale_families }
+//!
+//!   Restarting
+//!     + SessionEstablished(gr_families, deferral_time)
+//!         output: [StopTimer, DeleteStaleRoutes(dropped)?, StartDeferralTimer?]
+//!         if gr_families empty: --> Idle
+//!         else:                 --> WaitingEor { pending = gr_families }
+//!     + TimerExpired
+//!         output: [DeleteStaleRoutes(stale_families)] --> Idle
+//!     + SessionDropped
+//!         output: [StartTimer] --> Restarting  (restart timer reset)
+//!
+//!   WaitingEor
+//!     + EorReceived(family)
+//!         output: [DeleteStaleRoutes([family])]
+//!         if all families done: output += [StopDeferralTimer] --> Idle
+//!         else:                                               --> WaitingEor
+//!     + DeferralTimerExpired
+//!         output: [DeleteStaleRoutes(remaining)] --> Idle
+//!     + SessionDropped
+//!         output: [StopDeferralTimer, StartTimer] --> Restarting
+//!
+//!   All other (state, input) combinations are no-ops.
 
 use fnv::{FnvHashMap, FnvHashSet};
 use rustybgp_packet::bgp::Family;
