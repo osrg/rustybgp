@@ -208,10 +208,6 @@ impl PartialEq for Path {
 
 impl Eq for Path {}
 
-/// Maximum number of paths stored per prefix per destination.
-/// Limits memory usage when Add-Path peers advertise many path IDs.
-const MAX_PATHS_PER_DESTINATION: usize = 32;
-
 struct Destination {
     entry: Vec<Path>,
     next_path_id: u32,
@@ -632,21 +628,13 @@ impl Table {
         filtered: bool,
         prefix_limit: Option<(u32, &Arc<AtomicU64>)>,
     ) -> Vec<Change> {
-        let mut replaced = None;
         let flags = if filtered { Path::FLAG_FILTERED } else { 0 };
 
         let rt = self.ribs.entry(family).or_default();
         let deferring = rt.deferring;
         let dst = rt.destinations.entry(net).or_insert_with(Destination::new);
 
-        // Check if this peer already has any path for this prefix (needed for
-        // per-peer prefix limit and add-path correctness).
-        let peer_had_path = dst
-            .entry
-            .iter()
-            .any(|p| p.source.remote_addr == source.remote_addr);
-
-        // Snapshot all unfiltered paths before modification
+        // 1. Snapshot all unfiltered paths before modification.
         let old_top: Vec<TopNEntry> = dst
             .unfiltered_all()
             .iter()
@@ -658,21 +646,27 @@ impl Table {
             })
             .collect();
 
-        for i in 0..dst.entry.len() {
-            if Arc::ptr_eq(&dst.entry[i].source, &source) && dst.entry[i].id == remote_id {
-                replaced = Some(dst.entry.remove(i));
-                break;
-            }
-        }
+        // 2. Find and remove any existing path from this (source, path_id) pair.
+        let replaced = (0..dst.entry.len())
+            .find(|&i| Arc::ptr_eq(&dst.entry[i].source, &source) && dst.entry[i].id == remote_id)
+            .map(|i| dst.entry.remove(i));
 
-        // Per-peer prefix limit: enforce only for truly new prefixes (not
-        // replacements, and not add-path second paths for the same prefix).
+        // A prefix is "new" for this peer when neither a replacement was found nor
+        // does the peer have any other path for this prefix (including Add-Path paths
+        // with different path IDs).  This correctly counts unique prefixes per peer.
+        let is_new = replaced.is_none()
+            && !dst
+                .entry
+                .iter()
+                .any(|p| p.source.remote_addr == source.remote_addr);
+
+        // 3. Check the per-peer prefix limit for new prefixes.
+        //    Replacements and additional Add-Path paths for an already-known prefix
+        //    are always accepted regardless of the limit.
         #[allow(clippy::collapsible_if)]
-        if !peer_had_path {
+        if is_new {
             if let Some((max, counter)) = prefix_limit {
-                let prev = counter.fetch_add(1, Ordering::Relaxed);
-                if prev >= max as u64 {
-                    counter.fetch_sub(1, Ordering::Relaxed);
+                if counter.load(Ordering::Relaxed) >= max as u64 {
                     // Still count as received so stats reflect actual wire traffic.
                     let (rx, _) = self
                         .route_stats
@@ -690,30 +684,10 @@ impl Table {
             }
         }
 
-        // Reject new paths (not replacements) when the per-prefix path limit is reached.
-        // Check before allocating a path ID to avoid wasting IDs on dropped paths.
-        if replaced.is_none() && dst.entry.len() >= MAX_PATHS_PER_DESTINATION {
-            // Still count the route as received so stats reflect actual wire traffic.
-            let (received, _accepted) = self
-                .route_stats
-                .entry(source.remote_addr)
-                .or_default()
-                .entry(family)
-                .or_insert((0, 0));
-            *received += 1;
-            eprintln!(
-                "add-path: per-prefix path limit ({}) reached for {:?}, dropping path from {}",
-                MAX_PATHS_PER_DESTINATION, net, source.remote_addr
-            );
-            return Vec::new();
-        }
-
-        // Reuse the old stable path ID on replacement; allocate a new one otherwise.
-        let local_path_id = if let Some(ref old) = replaced {
-            old.local_path_id
-        } else {
-            dst.alloc_path_id()
-        };
+        // 4. Build and insert the path.
+        let local_path_id = replaced
+            .as_ref()
+            .map_or_else(|| dst.alloc_path_id(), |old| old.local_path_id);
 
         let path = Path {
             source: source.clone(),
@@ -748,13 +722,21 @@ impl Table {
         let idx = dst.entry.partition_point(|a| path.cmp(a).is_ge());
         dst.entry.insert(idx, path);
 
+        // 5. Increment prefix counter after successful insert of a new prefix.
+        #[allow(clippy::collapsible_if)]
+        if is_new {
+            if let Some((_, counter)) = prefix_limit {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         // During Restarting Speaker deferral, routes are accumulated but
         // best-path changes are suppressed; end_deferral() emits them all at once.
         if deferring {
             return vec![];
         }
 
-        // Compare old vs new unfiltered paths and emit changes for each affected rank
+        // Compare old vs new unfiltered paths and emit changes for each affected rank.
         Self::diff_top_n(dst, &old_top, family, net)
     }
 
