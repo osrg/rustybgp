@@ -3879,6 +3879,30 @@ struct DisconnectInfo {
     negotiated_gr: Option<NegotiatedGr>,
 }
 
+/// Decide whether GR helper mode applies for a session disconnect.
+///
+/// RFC 4724: GR applies to unexpected TCP/IO drops.
+/// RFC 8538: when the N-bit is negotiated, GR also applies to
+/// NOTIFICATION (sent or received, unless Hard Reset) and Hold Timer expiry.
+/// AdminShutdown and FsmError never trigger GR.
+fn gr_on_disconnect(
+    shutdown: &Option<crate::fsm::SessionDownReason>,
+    gr: NegotiatedGr,
+) -> Option<NegotiatedGr> {
+    let applies = match shutdown {
+        None | Some(crate::fsm::SessionDownReason::IoError) => true,
+        Some(crate::fsm::SessionDownReason::RemoteNotification(bgp::Message::Notification(
+            err,
+        ))) => gr.notification_enabled && !err.is_hard_reset(),
+        Some(crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(err))) => {
+            gr.notification_enabled && !err.is_hard_reset()
+        }
+        Some(crate::fsm::SessionDownReason::HoldTimerExpired) => gr.notification_enabled,
+        _ => false,
+    };
+    if applies { Some(gr) } else { None }
+}
+
 /// Convert a `SessionDownReason` to the BMP `PeerDownReason` encoding.
 fn session_down_to_bmp(reason: Option<crate::fsm::SessionDownReason>) -> bmp::PeerDownReason {
     match reason {
@@ -5173,30 +5197,10 @@ impl PeerSession {
         }
         disconnect.export_map = std::mem::take(&mut self.export_map);
 
-        // Determine whether GR helper mode applies for this disconnect.
-        //
-        // RFC 4724: GR applies only to unexpected TCP disconnects.
-        // RFC 8538: when N-bit is negotiated, GR also applies to NOTIFICATION
-        //           (sent or received) and Hold Timer expiry, EXCEPT Hard Reset.
-        disconnect.negotiated_gr = self.negotiated_gr.take().and_then(|gr| {
-            let gr_applies = match &shutdown_reason {
-                // Unexpected TCP/IO drop: always GR if GR negotiated (RFC 4724).
-                None | Some(crate::fsm::SessionDownReason::IoError) => true,
-                // NOTIFICATION from peer: GR only with N-bit and not Hard Reset (RFC 8538).
-                Some(crate::fsm::SessionDownReason::RemoteNotification(
-                    bgp::Message::Notification(err),
-                )) => gr.notification_enabled && !err.is_hard_reset(),
-                // NOTIFICATION we sent: GR only with N-bit and not Hard Reset (RFC 8538).
-                Some(crate::fsm::SessionDownReason::LocalNotification(
-                    bgp::Message::Notification(err),
-                )) => gr.notification_enabled && !err.is_hard_reset(),
-                // Hold Timer expired + N-bit: GR applies (RFC 8538).
-                Some(crate::fsm::SessionDownReason::HoldTimerExpired) => gr.notification_enabled,
-                // AdminShutdown, FsmError: no GR.
-                _ => false,
-            };
-            if gr_applies { Some(gr) } else { None }
-        });
+        disconnect.negotiated_gr = self
+            .negotiated_gr
+            .take()
+            .and_then(|gr| gr_on_disconnect(&shutdown_reason, gr));
         disconnect
     }
 
