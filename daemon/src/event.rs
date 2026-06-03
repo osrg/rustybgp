@@ -250,6 +250,8 @@ struct PeerConfig {
     multihop_ttl: Option<u8>,
     password: Option<String>,
     /// Per-family prefix limits from config.
+    /// Used when initializing PeerContext::prefix_counters on session establish.
+    #[allow(dead_code)]
     prefix_limits: FnvHashMap<Family, u32>,
     /// GR helper config; None = GR disabled.
     graceful_restart: Option<GrPeerConfig>,
@@ -3063,7 +3065,6 @@ async fn accept_connection(
         peer.state.clone(),
         peer.counter_tx.clone(),
         peer.counter_rx.clone(),
-        peer.config.prefix_limits.clone(),
         tables.clone(),
         export_map,
         context,
@@ -3777,15 +3778,20 @@ impl TableShard {
                                 nh,
                                 attrs.clone(),
                                 filtered,
+                                None,
                             );
                             self.distribute_changes(changes, kernel_tx, export_policy);
                         }
                     }
                     None => {
                         for net in nets {
-                            let changes =
-                                self.rtable
-                                    .remove(source.clone(), family, net.nlri, net.path_id);
+                            let changes = self.rtable.remove(
+                                source.clone(),
+                                family,
+                                net.nlri,
+                                net.path_id,
+                                None,
+                            );
                             self.distribute_changes(changes, kernel_tx, export_policy);
                         }
                     }
@@ -3796,7 +3802,7 @@ impl TableShard {
                 self.distribute_changes(changes, kernel_tx, None);
             }
             TableEvent::DropStale(addr, family) => {
-                let changes = self.rtable.drop_stale(addr, family);
+                let changes = self.rtable.drop_stale(addr, family, None);
                 self.distribute_changes(changes, kernel_tx, None);
             }
             TableEvent::MarkStale(addr, family) => {
@@ -4150,8 +4156,6 @@ struct PeerSession {
     source: FnvHashMap<Family, Arc<table::Source>>,
     peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
     shutdown: Option<crate::fsm::SessionDownReason>,
-    /// Per-family prefix limits from config.
-    prefix_limits: FnvHashMap<Family, u32>,
     tables: TableHandle,
     export_map: ExportMap,
     /// GR negotiation result from the most recent OPEN exchange.
@@ -4184,7 +4188,6 @@ impl PeerSession {
         state: Arc<PeerState>,
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
-        prefix_limits: FnvHashMap<Family, u32>,
         tables: TableHandle,
         export_map: ExportMap,
         context: Arc<std::sync::Mutex<PeerContext>>,
@@ -4226,7 +4229,6 @@ impl PeerSession {
             source: FnvHashMap::default(),
             peer_event_tx: Vec::new(),
             shutdown: None,
-            prefix_limits,
             tables,
             export_map,
             negotiated_gr: None,
@@ -4293,7 +4295,6 @@ impl PeerSession {
             source: FnvHashMap::default(),
             peer_event_tx: vec![],
             shutdown: None,
-            prefix_limits: FnvHashMap::default(),
             tables,
             export_map: ExportMap::new(),
             negotiated_gr: None,
@@ -4417,11 +4418,6 @@ impl PeerSession {
                     &mut self.pending,
                     &mut self.export_map,
                 );
-            }
-
-            // Register per-peer prefix limits.
-            for (f, max) in &self.prefix_limits {
-                t.rtable.set_prefix_limit(self.remote_addr, *f, *max);
             }
 
             t.peer_event_tx
@@ -6006,6 +6002,7 @@ mod tests {
                 nh4,
                 attrs.clone(),
                 false,
+                None,
             );
             t.rtable.insert(
                 source.clone(),
@@ -6015,6 +6012,7 @@ mod tests {
                 nh6,
                 attrs.clone(),
                 false,
+                None,
             );
         }
 
@@ -6063,7 +6061,7 @@ mod tests {
         {
             let mut t = tables.shards[0].lock().await;
             t.rtable
-                .insert(source, Family::IPV4, ipv4_net, 0, nh4, attrs, false);
+                .insert(source, Family::IPV4, ipv4_net, 0, nh4, attrs, false, None);
         }
         assert_eq!(
             tables.shards[0]

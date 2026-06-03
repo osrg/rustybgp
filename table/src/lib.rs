@@ -26,7 +26,7 @@ use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bytes::BytesMut;
@@ -421,8 +421,6 @@ pub struct Rib {
 pub struct Table {
     ribs: FnvHashMap<Family, Rib>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, (u64, u64)>>,
-    /// Per-peer per-family maximum prefix limits.
-    prefix_limits: FnvHashMap<IpAddr, FnvHashMap<Family, u32>>,
     rpki: RpkiTable,
 }
 
@@ -437,20 +435,8 @@ impl Table {
         Table {
             ribs: vec![(Family::EMPTY, Rib::default())].into_iter().collect(),
             route_stats: FnvHashMap::default(),
-            prefix_limits: FnvHashMap::default(),
             rpki: RpkiTable::new(),
         }
-    }
-
-    pub fn set_prefix_limit(&mut self, peer: IpAddr, family: Family, max: u32) {
-        self.prefix_limits
-            .entry(peer)
-            .or_default()
-            .insert(family, max);
-    }
-
-    pub fn remove_prefix_limits(&mut self, peer: &IpAddr) {
-        self.prefix_limits.remove(peer);
     }
 
     pub fn best(&self, family: &Family) -> Vec<Change> {
@@ -644,41 +630,21 @@ impl Table {
         nexthop: bgp::Nexthop,
         attr: Arc<Vec<packet::Attribute>>,
         filtered: bool,
+        prefix_limit: Option<(u32, &Arc<AtomicU64>)>,
     ) -> Vec<Change> {
-        // Enforce per-peer per-family prefix limit
-        if let Some(limit) = self
-            .prefix_limits
-            .get(&source.remote_addr)
-            .and_then(|m| m.get(&family))
-        {
-            let received = self
-                .route_stats
-                .get(&source.remote_addr)
-                .and_then(|m| m.get(&family))
-                .map_or(0, |(r, _)| *r);
-            if received >= *limit as u64 {
-                // Still count as received so the stat reflects wire traffic
-                let (rx, _) = self
-                    .route_stats
-                    .entry(source.remote_addr)
-                    .or_default()
-                    .entry(family)
-                    .or_insert((0, 0));
-                *rx += 1;
-                eprintln!(
-                    "prefix limit ({}) reached for peer {} family {:?}, dropping route",
-                    limit, source.remote_addr, family
-                );
-                return Vec::new();
-            }
-        }
-
         let mut replaced = None;
         let flags = if filtered { Path::FLAG_FILTERED } else { 0 };
 
         let rt = self.ribs.entry(family).or_default();
         let deferring = rt.deferring;
         let dst = rt.destinations.entry(net).or_insert_with(Destination::new);
+
+        // Check if this peer already has any path for this prefix (needed for
+        // per-peer prefix limit and add-path correctness).
+        let peer_had_path = dst
+            .entry
+            .iter()
+            .any(|p| p.source.remote_addr == source.remote_addr);
 
         // Snapshot all unfiltered paths before modification
         let old_top: Vec<TopNEntry> = dst
@@ -699,7 +665,32 @@ impl Table {
             }
         }
 
-        // Reject new paths (not replacements) when the per-prefix limit is reached.
+        // Per-peer prefix limit: enforce only for truly new prefixes (not
+        // replacements, and not add-path second paths for the same prefix).
+        #[allow(clippy::collapsible_if)]
+        if !peer_had_path {
+            if let Some((max, counter)) = prefix_limit {
+                let prev = counter.fetch_add(1, Ordering::Relaxed);
+                if prev >= max as u64 {
+                    counter.fetch_sub(1, Ordering::Relaxed);
+                    // Still count as received so stats reflect actual wire traffic.
+                    let (rx, _) = self
+                        .route_stats
+                        .entry(source.remote_addr)
+                        .or_default()
+                        .entry(family)
+                        .or_insert((0, 0));
+                    *rx += 1;
+                    eprintln!(
+                        "prefix limit ({}) reached for peer {} family {:?}, dropping route",
+                        max, source.remote_addr, family
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+
+        // Reject new paths (not replacements) when the per-prefix path limit is reached.
         // Check before allocating a path ID to avoid wasting IDs on dropped paths.
         if replaced.is_none() && dst.entry.len() >= MAX_PATHS_PER_DESTINATION {
             // Still count the route as received so stats reflect actual wire traffic.
@@ -788,6 +779,7 @@ impl Table {
         family: Family,
         net: packet::Nlri,
         remote_id: u32,
+        prefix_counter: Option<&Arc<AtomicU64>>,
     ) -> Vec<Change> {
         let Some(rt) = self.ribs.get_mut(&family) else {
             return Vec::new();
@@ -825,6 +817,18 @@ impl Table {
         *received -= 1;
         if !dst.entry.remove(i).is_filtered() {
             *accepted -= 1;
+        }
+
+        // Decrement prefix counter if this peer has no more paths for this prefix.
+        let peer_still_has_path = dst
+            .entry
+            .iter()
+            .any(|p| p.source.remote_addr == source.remote_addr);
+        #[allow(clippy::collapsible_if)]
+        if !peer_still_has_path {
+            if let Some(counter) = prefix_counter {
+                counter.fetch_sub(1, Ordering::Relaxed);
+            }
         }
 
         if dst.entry.is_empty() {
@@ -932,12 +936,6 @@ impl Table {
                 self.route_stats.remove(&addr);
             }
         }
-        if let Some(fm) = self.prefix_limits.get_mut(&addr) {
-            fm.remove(&family);
-            if fm.is_empty() {
-                self.prefix_limits.remove(&addr);
-            }
-        }
         if let Some(rt) = self.ribs.get_mut(&family) {
             rt.destinations.retain(|net, dst| {
                 let old_top: Vec<TopNEntry> = dst
@@ -980,7 +978,12 @@ impl Table {
     /// selection.  Used by GR helpers after EOR or deferral timer expiry, where
     /// the peer may have already sent fresh routes in the new session that must
     /// not be disturbed.
-    pub fn drop_stale(&mut self, addr: IpAddr, family: Family) -> Vec<Change> {
+    pub fn drop_stale(
+        &mut self,
+        addr: IpAddr,
+        family: Family,
+        prefix_counter: Option<&Arc<AtomicU64>>,
+    ) -> Vec<Change> {
         let mut advertise = Vec::new();
         if let Some(rt) = self.ribs.get_mut(&family) {
             rt.destinations.retain(|net, dst| {
@@ -1004,6 +1007,15 @@ impl Table {
 
                 dst.entry
                     .retain(|e| !(e.source.remote_addr == addr && e.source.is_stale()));
+
+                // Decrement prefix counter if peer has no more paths for this prefix.
+                let peer_still_has_path = dst.entry.iter().any(|p| p.source.remote_addr == addr);
+                #[allow(clippy::collapsible_if)]
+                if !peer_still_has_path {
+                    if let Some(counter) = prefix_counter {
+                        counter.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
 
                 if dst.entry.is_empty() {
                     for (i, e) in old_top.iter().enumerate() {
@@ -2320,10 +2332,10 @@ mod tests {
         let family = Family::IPV4;
         let attrs = Arc::new(Vec::new());
 
-        rt.insert(s1.clone(), family, n1, 0, nh(), attrs.clone(), false);
-        rt.insert(s2, family, n1, 0, nh(), attrs.clone(), false);
-        rt.insert(s1.clone(), family, n2, 0, nh(), attrs.clone(), false);
-        rt.insert(s1.clone(), family, n3, 0, nh(), attrs.clone(), false);
+        rt.insert(s1.clone(), family, n1, 0, nh(), attrs.clone(), false, None);
+        rt.insert(s2, family, n1, 0, nh(), attrs.clone(), false, None);
+        rt.insert(s1.clone(), family, n2, 0, nh(), attrs.clone(), false, None);
+        rt.insert(s1.clone(), family, n3, 0, nh(), attrs.clone(), false, None);
 
         assert_eq!(rt.ribs.get(&family).unwrap().destinations.len(), 3);
         rt.drop(s1.remote_addr, family);
@@ -2365,6 +2377,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         assert!(!change.is_empty());
     }
@@ -2382,6 +2395,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         // Insert with router_id=2 (higher, won't become best) → emits rank=2
         let change = rt.insert(
@@ -2392,6 +2406,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         assert_eq!(change.len(), 1);
         assert_eq!(change[0].rank, 2);
@@ -2420,6 +2435,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(100),
             false,
+            None,
         );
         let changes = rt.insert(
             source(2, 65002, 65000, 2),
@@ -2429,6 +2445,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(200),
             false,
+            None,
         );
         // Higher local_pref wins → best path changes; stable IDs produce
         // a withdraw for the old best + an advertise for the new best.
@@ -2451,6 +2468,7 @@ mod tests {
             nh(),
             attrs_with_as_path_len(3),
             false,
+            None,
         );
         let changes = rt.insert(
             source(2, 65002, 65000, 2),
@@ -2460,6 +2478,7 @@ mod tests {
             nh(),
             attrs_with_as_path_len(1),
             false,
+            None,
         );
         // Shorter AS path wins
         let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
@@ -2482,6 +2501,7 @@ mod tests {
             nh(),
             attrs_with_origin(2),
             false,
+            None,
         );
         // Insert with ORIGIN=IGP(0), router_id=2
         let changes = rt.insert(
@@ -2492,6 +2512,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
         // IGP (lower origin value) wins
         let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
@@ -2514,6 +2535,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         // eBGP peer (remote_asn != local_asn), router_id=2 (higher)
         let changes = rt.insert(
@@ -2524,6 +2546,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         // eBGP wins even though router_id is higher
         let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
@@ -2546,6 +2569,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         // router_id=5 (lower wins)
         let changes = rt.insert(
@@ -2556,6 +2580,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(
@@ -2572,10 +2597,28 @@ mod tests {
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         // Remove best (router_id=1) → s2 promoted to best
-        let changes = rt.remove(s1, Family::IPV4, net, 0);
+        let changes = rt.remove(s1, Family::IPV4, net, 0, None);
         let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(
             adv.source.remote_addr,
@@ -2589,10 +2632,28 @@ mod tests {
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         // Remove non-best (router_id=2) → withdrawal for the removed path
-        let change = rt.remove(s2, Family::IPV4, net, 0);
+        let change = rt.remove(s2, Family::IPV4, net, 0, None);
         assert_eq!(change.len(), 1);
         assert!(change[0].attr.is_empty()); // withdrawal
     }
@@ -2602,8 +2663,17 @@ mod tests {
         let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
-        rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
-        let change = rt.remove(s1, Family::IPV4, net, 0);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
+        let change = rt.remove(s1, Family::IPV4, net, 0, None);
         let change = change.into_iter().next().unwrap();
         // Withdrawal: empty attrs
         assert!(change.attr.is_empty());
@@ -2624,12 +2694,22 @@ mod tests {
             nh(),
             empty_attrs(),
             true,
+            None,
         );
         assert!(change.is_empty());
 
         // Unfiltered path added → Change points to the unfiltered path
         let s2 = source(2, 65002, 65000, 2);
-        let change = rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        let change = rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         let change = change.into_iter().next().unwrap();
         assert!(Arc::ptr_eq(&change.source, &s2));
     }
@@ -2648,10 +2728,20 @@ mod tests {
             nh(),
             empty_attrs(),
             true,
+            None,
         );
         // unfiltered best (router_id=2)
         let s2 = source(2, 65002, 65000, 2);
-        let change = rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        let change = rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         let change = change.into_iter().next().unwrap();
         assert!(Arc::ptr_eq(&change.source, &s2));
         // another unfiltered but worse (router_id=3) → emits rank=2 (filtered paths skipped)
@@ -2663,6 +2753,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         assert_eq!(change.len(), 1);
         assert_eq!(change[0].rank, 2);
@@ -2675,7 +2766,16 @@ mod tests {
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // filtered at head
-        rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), true);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            true,
+            None,
+        );
         // unfiltered best
         rt.insert(
             source(2, 65002, 65000, 2),
@@ -2685,6 +2785,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         // replace the filtered head with updated attrs (still filtered) → no best change
         let change = rt.insert(
@@ -2695,6 +2796,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(200),
             true,
+            None,
         );
         assert!(change.is_empty());
     }
@@ -2714,14 +2816,33 @@ mod tests {
             nh(),
             empty_attrs(),
             true,
+            None,
         );
         // unfiltered best (router_id=1)
-        rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         // another unfiltered (router_id=2)
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         // replace s1 as filtered → s2 becomes unfiltered best
-        let changes = rt.insert(s1, Family::IPV4, net, 0, nh(), empty_attrs(), true);
+        let changes = rt.insert(s1, Family::IPV4, net, 0, nh(), empty_attrs(), true, None);
         let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 2));
         assert!(Arc::ptr_eq(&adv.source, &s2));
     }
@@ -2740,6 +2861,7 @@ mod tests {
             nh(),
             empty_attrs(),
             true,
+            None,
         );
         // unfiltered best (router_id=1)
         rt.insert(
@@ -2750,10 +2872,20 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         // unfiltered non-best (router_id=2)
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         // replace s2 with different attrs → still non-best, but attrs changed so re-advertised
         let change = rt.insert(
             s2,
@@ -2763,6 +2895,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(50),
             false,
+            None,
         );
         assert_eq!(change.len(), 1);
         assert_eq!(change[0].rank, 2);
@@ -2773,7 +2906,16 @@ mod tests {
         let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
-        rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), true);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            true,
+            None,
+        );
         // peer_stats tracks (received, accepted) — filtered path: received=1, accepted=0
         let stats: Vec<_> = rt.peer_stats(&s1.remote_addr).unwrap().collect();
         assert_eq!(stats.len(), 1);
@@ -2796,6 +2938,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         rt.insert(
             s1.clone(),
@@ -2805,6 +2948,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         rt.insert(
             s1.clone(),
@@ -2814,6 +2958,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         let best = rt.best(&Family::IPV4);
         assert_eq!(best.len(), 3);
@@ -3103,6 +3248,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(200),
             false,
+            None,
         );
         // s2: local_pref=50, router_id=1 (better router_id, worse local_pref)
         let s2 = source(2, 65002, 65000, 1);
@@ -3114,6 +3260,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(50),
             false,
+            None,
         );
         // s1 must remain best (higher local_pref wins over lower router_id)
         // s2 enters as rank=2
@@ -3127,10 +3274,19 @@ mod tests {
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // Insert unfiltered path
-        let change = rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        let change = rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         assert!(!change.is_empty());
         // Replace with filtered → no unfiltered best remains → withdraw
-        let change = rt.insert(s1, Family::IPV4, net, 0, nh(), empty_attrs(), true);
+        let change = rt.insert(s1, Family::IPV4, net, 0, nh(), empty_attrs(), true, None);
         let change = change
             .into_iter()
             .next()
@@ -3146,13 +3302,40 @@ mod tests {
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // s1 is unfiltered best
-        rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         // s2 inserts a filtered path
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), true);
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            true,
+            None,
+        );
         // s1 gets replaced as filtered → all filtered → withdrawal
         let change = rt
-            .insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), true)
+            .insert(
+                s1.clone(),
+                Family::IPV4,
+                net,
+                0,
+                nh(),
+                empty_attrs(),
+                true,
+                None,
+            )
             .into_iter()
             .next()
             .expect("should return withdrawal");
@@ -3176,10 +3359,20 @@ mod tests {
             nh(),
             empty_attrs(),
             true,
+            None,
         );
         // unfiltered path
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         let bests = rt.best(&Family::IPV4);
         assert_eq!(bests.len(), 1);
         assert!(Arc::ptr_eq(&bests[0].source, &s2));
@@ -3197,6 +3390,7 @@ mod tests {
             nh(),
             empty_attrs(),
             true,
+            None,
         );
         let bests = rt.best(&Family::IPV4);
         assert!(bests.is_empty());
@@ -3218,15 +3412,34 @@ mod tests {
             nh(),
             attrs.clone(),
             true,
+            None,
         );
         // unfiltered best (router_id=2)
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), attrs.clone(), false);
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs.clone(),
+            false,
+            None,
+        );
         // unfiltered non-best (router_id=3)
         let s3 = source(3, 65003, 65000, 3);
-        rt.insert(s3.clone(), Family::IPV4, net, 0, nh(), attrs.clone(), false);
+        rt.insert(
+            s3.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs.clone(),
+            false,
+            None,
+        );
         // remove s2 (best) → s3 becomes new best
-        let changes = rt.remove(s2, Family::IPV4, net, 0);
+        let changes = rt.remove(s2, Family::IPV4, net, 0, None);
         let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 3));
         assert!(Arc::ptr_eq(&adv.source, &s3));
     }
@@ -3244,13 +3457,23 @@ mod tests {
             nh(),
             empty_attrs(),
             true,
+            None,
         );
         // only unfiltered path
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         // remove s2 → all filtered → withdrawal
         let change = rt
-            .remove(s2, Family::IPV4, net, 0)
+            .remove(s2, Family::IPV4, net, 0, None)
             .into_iter()
             .next()
             .expect("should return withdrawal");
@@ -3273,13 +3496,32 @@ mod tests {
             nh(),
             attrs.clone(),
             true,
+            None,
         );
         // unfiltered best
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), attrs.clone(), false);
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs.clone(),
+            false,
+            None,
+        );
         // unfiltered non-best
         let s3 = source(3, 65003, 65000, 3);
-        rt.insert(s3.clone(), Family::IPV4, net, 0, nh(), attrs.clone(), false);
+        rt.insert(
+            s3.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs.clone(),
+            false,
+            None,
+        );
         // drop s2 → s3 becomes new best (withdraw old + advertise new)
         let changes = rt.drop(s2.remote_addr, Family::IPV4);
         let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 3));
@@ -3292,10 +3534,19 @@ mod tests {
         let net = nlri(10, 0, 0, 0, 24);
         // filtered path from s1
         let s1 = source(1, 65001, 65000, 1);
-        rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), true);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            true,
+            None,
+        );
         // unfiltered best from s2
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s2, Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(s2, Family::IPV4, net, 0, nh(), empty_attrs(), false, None);
         // drop s1 (filtered) → no best change
         let changes = rt.drop(s1.remote_addr, Family::IPV4);
         assert!(changes.is_empty());
@@ -3317,10 +3568,20 @@ mod tests {
             nh(),
             attrs.clone(),
             true,
+            None,
         );
         // unfiltered path → should be the AdjOut best
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), attrs.clone(), false);
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs.clone(),
+            false,
+            None,
+        );
 
         // peer_addr=10.0.0.99 (different from both sources)
         let peer_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)));
@@ -3346,6 +3607,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(100),
             true,
+            None,
         );
 
         let peer_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)));
@@ -3371,6 +3633,7 @@ mod tests {
             nh(),
             empty_attrs(),
             true,
+            None,
         );
         // 1 unfiltered path
         rt.insert(
@@ -3381,6 +3644,7 @@ mod tests {
             nh(),
             empty_attrs(),
             false,
+            None,
         );
         let s = rt.state(Family::IPV4);
         assert_eq!(s.num_destination, 1);
@@ -3399,12 +3663,30 @@ mod tests {
         let s2 = source(2, 65002, 65000, 5); // router_id=5, better
 
         // Insert s1 → best, path_id=1
-        let changes = rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        let changes = rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path_id, 1);
 
         // Insert s2 → new best (lower router_id); s1 rank shifts 1→2
-        let changes = rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        let changes = rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         assert_eq!(changes.len(), 2);
         // s2 is the new best at rank 1
         let s2_change = changes.iter().find(|c| c.path_id == 2).unwrap();
@@ -3423,7 +3705,16 @@ mod tests {
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
 
-        let changes = rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        let changes = rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
         let original_id = changes[0].path_id;
 
         // Replace with new attributes
@@ -3435,6 +3726,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(200),
             false,
+            None,
         );
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path_id, original_id); // same stable ID
@@ -3448,11 +3740,29 @@ mod tests {
 
         let s1 = source(1, 65001, 65000, 1); // best (router_id=1)
         let s2 = source(2, 65002, 65000, 2);
-        rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
 
         // Remove s1 → withdraw should carry s1's path_id (1)
-        let changes = rt.remove(s1, Family::IPV4, net, 0);
+        let changes = rt.remove(s1, Family::IPV4, net, 0, None);
         let withdrawal = changes.iter().find(|c| c.attr.is_empty());
         assert!(withdrawal.is_some());
         assert_eq!(withdrawal.unwrap().path_id, 1);
@@ -3465,8 +3775,26 @@ mod tests {
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
 
-        rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
-        rt.insert(s2.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
 
         let best = rt.best(&Family::IPV4);
         assert_eq!(best.len(), 2);
@@ -3499,6 +3827,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
 
         s.mark_stale();
@@ -3526,6 +3855,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
 
         // Mark stale before the fresh route arrives (as GR does after session drop)
@@ -3539,6 +3869,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
 
         let best = rt.best(&Family::IPV4);
@@ -3563,6 +3894,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
 
         s.mark_stale();
@@ -3591,6 +3923,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
         rt.insert(
             fresh_src.clone(),
@@ -3600,10 +3933,11 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
 
         stale_src.mark_stale();
-        let changes = rt.drop_stale(stale_src.remote_addr, Family::IPV4);
+        let changes = rt.drop_stale(stale_src.remote_addr, Family::IPV4, None);
 
         // The stale path is gone but the fresh one remains as rank=1.
         let best = rt.best(&Family::IPV4);
@@ -3629,10 +3963,11 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
 
         s.mark_stale();
-        rt.drop_stale(s.remote_addr, Family::IPV4);
+        rt.drop_stale(s.remote_addr, Family::IPV4, None);
         assert!(rt.best(&Family::IPV4).is_empty());
     }
 
@@ -3650,9 +3985,10 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
 
-        let changes = rt.drop_stale(s.remote_addr, Family::IPV4);
+        let changes = rt.drop_stale(s.remote_addr, Family::IPV4, None);
         assert!(changes.is_empty());
         assert_eq!(rt.best(&Family::IPV4).len(), 1);
     }
@@ -3676,6 +4012,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
         rt.insert(
             fresh_src.clone(),
@@ -3685,6 +4022,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
 
         // Without stale, stale_src wins (lower router_id).
@@ -3725,6 +4063,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             false,
+            None,
         );
 
         let changes = rt.restale(src.remote_addr, Family::IPV4);
@@ -3749,7 +4088,7 @@ mod tests {
 
         rt.start_deferral(Family::IPV4);
 
-        let changes = rt.insert(src, Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        let changes = rt.insert(src, Family::IPV4, net, 0, nh(), empty_attrs(), false, None);
         assert!(changes.is_empty(), "deferral must suppress insert changes");
         assert!(
             rt.ribs.get(&Family::IPV4).unwrap().deferring,
@@ -3770,7 +4109,7 @@ mod tests {
         rt.start_deferral(Family::IPV4);
 
         let nh6 = bgp::Nexthop::V6(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
-        let changes = rt.insert(src, Family::IPV6, net6, 0, nh6, empty_attrs(), false);
+        let changes = rt.insert(src, Family::IPV6, net6, 0, nh6, empty_attrs(), false, None);
         assert!(!changes.is_empty(), "IPv6 insert must not be suppressed");
     }
 
@@ -3786,11 +4125,20 @@ mod tests {
 
         // Both inserts are suppressed.
         assert!(
-            rt.insert(src.clone(), Family::IPV4, n1, 0, nh(), empty_attrs(), false)
-                .is_empty()
+            rt.insert(
+                src.clone(),
+                Family::IPV4,
+                n1,
+                0,
+                nh(),
+                empty_attrs(),
+                false,
+                None
+            )
+            .is_empty()
         );
         assert!(
-            rt.insert(src, Family::IPV4, n2, 0, nh(), empty_attrs(), false)
+            rt.insert(src, Family::IPV4, n2, 0, nh(), empty_attrs(), false, None)
                 .is_empty()
         );
 
@@ -3823,7 +4171,7 @@ mod tests {
         rt.start_deferral(Family::IPV4);
         rt.end_deferral(Family::IPV4);
 
-        let changes = rt.insert(src, Family::IPV4, net, 0, nh(), empty_attrs(), false);
+        let changes = rt.insert(src, Family::IPV4, net, 0, nh(), empty_attrs(), false, None);
         assert!(
             !changes.is_empty(),
             "insert after end_deferral must produce changes"
