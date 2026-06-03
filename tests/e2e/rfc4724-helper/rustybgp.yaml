@@ -1,0 +1,20 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.5.1"
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.5.2"
+      peer-as: 65002
+    # GR helper: preserve stale routes for restart-time seconds after session drop.
+    graceful-restart:
+      config:
+        enabled: true
+        restart-time: 30
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+        mp-graceful-restart:
+          config:
+            enabled: true

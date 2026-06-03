@@ -1,0 +1,36 @@
+networks:
+  bgp-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.5.0/24
+          gateway: 172.30.5.254
+
+services:
+  # FRR peer (AS 65002): advertises routes with GR enabled.
+  frr-peer:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: frr-peer
+    privileged: true
+    volumes:
+      - ./frr-peer/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
+    networks:
+      bgp-net:
+        ipv4_address: 172.30.5.2
+
+  # rustybgp: acts as GR helper, preserves stale routes after frr-peer drops.
+  router-rusty:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: router-rusty
+    privileged: true
+    networks:
+      bgp-net:
+        ipv4_address: 172.30.5.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
