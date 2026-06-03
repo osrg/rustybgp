@@ -70,6 +70,8 @@ pub struct PathEntry {
     pub timestamp: SystemTime,
     pub attr: Arc<Vec<packet::Attribute>>,
     pub validation: Option<RpkiValidation>,
+    /// True when this path is marked stale during Graceful Restart (RFC 4724).
+    pub stale: bool,
 }
 
 pub struct RpkiValidation {
@@ -625,6 +627,7 @@ impl RoutingTable {
                                 timestamp: p.timestamp,
                                 attr,
                                 validation,
+                                stale: p.source.is_stale(),
                             }
                         })
                         .collect()

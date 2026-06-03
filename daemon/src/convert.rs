@@ -1437,6 +1437,7 @@ pub(crate) fn destination_to_api(
                 age: Some(p.timestamp.to_api()),
                 pattrs: p.attr.iter().map(attr_to_api).collect(),
                 validation: p.validation.map(rpki_validation_to_api),
+                stale: p.stale,
                 ..Default::default()
             })
             .collect(),
