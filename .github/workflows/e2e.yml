@@ -1,0 +1,90 @@
+name: e2e
+
+on: [pull_request]
+
+jobs:
+  build:
+    name: Build rustybgpd (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: build rustybgpd
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: target/x86_64-unknown-linux-musl/release/rustybgpd
+          retention-days: 1
+
+  e2e-rfc7911:
+    name: RFC 7911 (Add-Path) end-to-end
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run RFC 7911 e2e test
+        working-directory: tests/e2e/rfc7911
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-rfc8950:
+    name: RFC 8950 (Extended Nexthop) end-to-end
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run RFC 8950 e2e test
+        working-directory: tests/e2e/rfc8950
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-rfc4724-helper:
+    name: RFC 4724 Graceful Restart (helper side) end-to-end
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run RFC 4724 helper e2e test
+        working-directory: tests/e2e/rfc4724-helper
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
