@@ -109,6 +109,19 @@ impl BgpError {
         }
     }
 
+    /// Returns true if this is a CEASE Hard Reset (RFC 8538 §3: code 6, subcode 9).
+    /// Hard Reset terminates GR even when the N-bit is negotiated.
+    pub fn is_hard_reset(&self) -> bool {
+        matches!(
+            self,
+            Self::Other {
+                code: 6,
+                subcode: 9,
+                ..
+            }
+        )
+    }
+
     /// Constructs a `BgpError` from a received NOTIFICATION message.
     pub fn from_notification(code: u8, subcode: u8, data: Vec<u8>) -> Self {
         match (code, subcode) {

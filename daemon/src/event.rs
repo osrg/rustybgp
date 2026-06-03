@@ -224,6 +224,8 @@ struct ActiveConnectCancel(Option<tokio::sync::oneshot::Sender<()>>);
 struct GrPeerConfig {
     /// Restart Time advertised in our OPEN (12-bit, max 4095 s).
     restart_time: u16,
+    /// Whether to set the N-bit (RFC 8538): GR applies to NOTIFICATION and Hold Timer expiry.
+    notification_enabled: bool,
     /// Families included in the GR capability (non-empty by construction).
     families: Vec<Family>,
 }
@@ -446,7 +448,10 @@ impl PeerParams {
             }
         }
         if let Some(gr) = &self.graceful_restart {
-            let flags = if is_restarting { 0x8 } else { 0 };
+            // R-bit (0x8): local speaker is currently restarting (RFC 4724).
+            // N-bit (0x4): supports GR for NOTIFICATION and Hold Timer (RFC 8538).
+            let flags =
+                if is_restarting { 0x8 } else { 0 } | if gr.notification_enabled { 0x4 } else { 0 };
             local_cap.push(packet::Capability::GracefulRestart {
                 flags,
                 restart_time: gr.restart_time,
@@ -677,8 +682,10 @@ impl TryFrom<&api::Peer> for PeerParams {
                     let restart_time = gr
                         .and_then(|g| u16::try_from(g.restart_time).ok())
                         .unwrap_or(DEFAULT_RESTART_TIME);
+                    let notification_enabled = gr.is_some_and(|g| g.notification_enabled);
                     Some(GrPeerConfig {
                         restart_time,
+                        notification_enabled,
                         families: gr_families,
                     })
                 } else {
@@ -841,8 +848,12 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                     let restart_time = gr_config
                         .and_then(|c| c.restart_time)
                         .unwrap_or(DEFAULT_RESTART_TIME);
+                    let notification_enabled = gr_config
+                        .and_then(|c| c.notification_enabled)
+                        .unwrap_or(false);
                     Some(GrPeerConfig {
                         restart_time,
+                        notification_enabled,
                         families: gr_families,
                     })
                 } else {
@@ -3855,6 +3866,9 @@ struct NegotiatedGr {
     families: Vec<Family>,
     /// Restart Time from the peer's OPEN GR capability.
     restart_time: std::time::Duration,
+    /// Both sides advertised the N-bit (RFC 8538): GR applies to NOTIFICATION
+    /// and Hold Timer expiry in addition to unplanned TCP disconnects.
+    notification_enabled: bool,
 }
 
 struct DisconnectInfo {
@@ -4260,20 +4274,21 @@ impl PeerSession {
     /// Returns None if local_cap has no GR capability, the peer sent none,
     /// or if no families overlap.
     fn negotiate_gr(&self, remote_capabilities: &[packet::Capability]) -> Option<NegotiatedGr> {
-        let local_families: Vec<Family> = self.local_cap.iter().find_map(|c| match c {
-            packet::Capability::GracefulRestart { families, .. } => {
-                Some(families.iter().map(|(f, _)| *f).collect())
-            }
-            _ => None,
-        })?;
+        let (local_flags, local_families): (u8, Vec<Family>) =
+            self.local_cap.iter().find_map(|c| match c {
+                packet::Capability::GracefulRestart {
+                    flags, families, ..
+                } => Some((*flags, families.iter().map(|(f, _)| *f).collect())),
+                _ => None,
+            })?;
 
-        let (peer_restart_time, peer_families) =
+        let (peer_flags, peer_restart_time, peer_families) =
             remote_capabilities.iter().find_map(|c| match c {
                 packet::Capability::GracefulRestart {
+                    flags,
                     restart_time,
                     families,
-                    ..
-                } => Some((*restart_time, families.as_slice())),
+                } => Some((*flags, *restart_time, families.as_slice())),
                 _ => None,
             })?;
 
@@ -4285,9 +4300,14 @@ impl PeerSession {
         if negotiated.is_empty() {
             return None;
         }
+
+        // N-bit (0x4): both sides must advertise it for RFC 8538 behavior.
+        let notification_enabled = (local_flags & 0x4 != 0) && (peer_flags & 0x4 != 0);
+
         Some(NegotiatedGr {
             families: negotiated,
             restart_time: std::time::Duration::from_secs(peer_restart_time as u64),
+            notification_enabled,
         })
     }
 
@@ -5093,6 +5113,10 @@ impl PeerSession {
 
             // Hold timer setup is now handled by apply_outputs (SetHoldTimer).
         }
+        // Capture shutdown reason before the shard loop consumes it.
+        // Used below to decide whether N-bit GR applies to this disconnect.
+        let shutdown_reason = self.shutdown.clone();
+
         if !self.source.is_empty() {
             let drop_families =
                 families_to_drop_on_disconnect(self.source.keys(), self.negotiated_gr.as_ref());
@@ -5148,7 +5172,31 @@ impl PeerSession {
             }
         }
         disconnect.export_map = std::mem::take(&mut self.export_map);
-        disconnect.negotiated_gr = self.negotiated_gr.take();
+
+        // Determine whether GR helper mode applies for this disconnect.
+        //
+        // RFC 4724: GR applies only to unexpected TCP disconnects.
+        // RFC 8538: when N-bit is negotiated, GR also applies to NOTIFICATION
+        //           (sent or received) and Hold Timer expiry, EXCEPT Hard Reset.
+        disconnect.negotiated_gr = self.negotiated_gr.take().and_then(|gr| {
+            let gr_applies = match &shutdown_reason {
+                // Unexpected TCP/IO drop: always GR if GR negotiated (RFC 4724).
+                None | Some(bmp::PeerDownReason::RemoteUnexpected) => true,
+                // NOTIFICATION from peer: GR only with N-bit and not Hard Reset.
+                Some(bmp::PeerDownReason::RemoteNotification(bgp::Message::Notification(err))) => {
+                    gr.notification_enabled && !err.is_hard_reset()
+                }
+                // NOTIFICATION we sent: GR only with N-bit and not Hard Reset.
+                Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification(err))) => {
+                    gr.notification_enabled && !err.is_hard_reset()
+                }
+                // FSM errors (Hold Timer, AdminShutdown, etc.): no GR for now.
+                // Full Hold Timer + N-bit support requires distinguishing the
+                // FSM reason more precisely (tracked as a separate TODO).
+                _ => false,
+            };
+            if gr_applies { Some(gr) } else { None }
+        });
         disconnect
     }
 
@@ -5830,6 +5878,7 @@ mod tests {
         let negotiated_gr = Some(NegotiatedGr {
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
+            notification_enabled: false,
         });
 
         let mut session = PeerSession::new_for_test(remote_addr, context.clone(), tables);
@@ -5899,6 +5948,7 @@ mod tests {
         let negotiated_gr = NegotiatedGr {
             families: vec![Family::IPV4, Family::IPV6],
             restart_time: Duration::from_secs(90),
+            notification_enabled: false,
         };
         let result = families_to_drop_on_disconnect(families.iter(), Some(&negotiated_gr));
         assert!(result.is_empty());
@@ -5910,6 +5960,7 @@ mod tests {
         let negotiated_gr = NegotiatedGr {
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
+            notification_enabled: false,
         };
         let result = families_to_drop_on_disconnect(families.iter(), Some(&negotiated_gr));
         assert_eq!(result, vec![Family::IPV6]);
@@ -5967,6 +6018,7 @@ mod tests {
         let negotiated_gr = NegotiatedGr {
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
+            notification_enabled: false,
         };
         let session_families = vec![Family::IPV4, Family::IPV6];
         let drop_families =
@@ -6100,6 +6152,7 @@ mod tests {
         let negotiated_gr = Some(NegotiatedGr {
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
+            notification_enabled: false,
         });
         let mut session = PeerSession::new_for_test(remote_addr, context, tables);
         session
@@ -6132,6 +6185,7 @@ mod tests {
         let negotiated_gr = Some(NegotiatedGr {
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
+            notification_enabled: false,
         });
         let mut session = PeerSession::new_for_test(remote_addr, context, tables);
 
@@ -6202,6 +6256,7 @@ mod tests {
         let negotiated_gr = Some(NegotiatedGr {
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
+            notification_enabled: false,
         });
         let mut session = PeerSession::new_for_test(unknown_addr, context, tables);
         session
