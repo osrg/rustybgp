@@ -250,8 +250,7 @@ struct PeerConfig {
     multihop_ttl: Option<u8>,
     password: Option<String>,
     /// Per-family prefix limits from config.
-    /// Used when initializing PeerContext::prefix_counters on session establish.
-    #[allow(dead_code)]
+    /// Used to initialize PeerSession::prefix_counters in accept_connection().
     prefix_limits: FnvHashMap<Family, u32>,
     /// GR helper config; None = GR disabled.
     graceful_restart: Option<GrPeerConfig>,
@@ -3053,7 +3052,7 @@ async fn accept_connection(
             crate::fsm::Role::Passive => arb.passive_close_tx = Some(close_tx),
         }
     }
-    PeerSession::new(
+    let mut session = PeerSession::new(
         stream,
         remote_addr,
         peer.config.local_asn,
@@ -3068,7 +3067,20 @@ async fn accept_connection(
         tables.clone(),
         export_map,
         context,
-    )
+    )?;
+    // Initialize per-family prefix counters from config.
+    session.prefix_counters = peer
+        .config
+        .prefix_limits
+        .iter()
+        .map(|(family, max)| {
+            (
+                *family,
+                (*max, Arc::new(std::sync::atomic::AtomicU64::new(0))),
+            )
+        })
+        .collect();
+    Some(session)
 }
 
 impl Global {
@@ -3571,6 +3583,68 @@ impl Tables {
         let mut hasher = FnvHasher::default();
         a.hash(&mut hasher);
         hasher.finish() as usize % self.shards.len()
+    }
+
+    /// Insert a route into the appropriate shard and distribute changes to peers.
+    /// Applies import policy and handles BMP/MRT notification internally.
+    async fn insert_route(
+        &self,
+        source: Arc<table::Source>,
+        family: Family,
+        net: packet::PathNlri,
+        nexthop: bgp::Nexthop,
+        attr: Arc<Vec<packet::Attribute>>,
+        prefix_limit: Option<(u32, Arc<std::sync::atomic::AtomicU64>)>,
+    ) {
+        let import_policy = self.import_policy.load_full();
+        let export_policy = self.export_policy.load_full();
+        let kernel_tx = self.kernel_tx.load_full();
+        let idx = self.dealer(net.nlri);
+        let mut t = self.shards[idx].lock().await;
+        t.send_bmp_update(&source, family, &[net], Some(&attr), Some(nexthop));
+        t.send_mrt_update(&source, family, &[net], Some(&attr), Some(nexthop));
+        let mut nh = nexthop;
+        let filtered = crate::policy::apply_import(
+            import_policy.as_deref(),
+            &t.rtable,
+            &source,
+            &net.nlri,
+            &attr,
+            &mut nh,
+        );
+        let pl = prefix_limit.as_ref().map(|(max, counter)| (*max, counter));
+        let changes = t.rtable.insert(
+            source,
+            family,
+            net.nlri,
+            net.path_id,
+            nh,
+            attr,
+            filtered,
+            pl,
+        );
+        t.distribute_changes(changes, kernel_tx.as_deref(), export_policy.as_deref());
+    }
+
+    /// Remove a route from the appropriate shard and distribute changes to peers.
+    async fn remove_route(
+        &self,
+        source: Arc<table::Source>,
+        family: Family,
+        net: packet::PathNlri,
+        prefix_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) {
+        let export_policy = self.export_policy.load_full();
+        let kernel_tx = self.kernel_tx.load_full();
+        let idx = self.dealer(net.nlri);
+        let mut t = self.shards[idx].lock().await;
+        t.send_bmp_update(&source, family, &[net], None, None);
+        t.send_mrt_update(&source, family, &[net], None, None);
+        let counter_ref = prefix_counter.as_ref();
+        let changes = t
+            .rtable
+            .remove(source, family, net.nlri, net.path_id, counter_ref);
+        t.distribute_changes(changes, kernel_tx.as_deref(), export_policy.as_deref());
     }
 
     async fn event(&self, idx: usize, msg: TableEvent) {
@@ -4158,6 +4232,10 @@ struct PeerSession {
     shutdown: Option<crate::fsm::SessionDownReason>,
     tables: TableHandle,
     export_map: ExportMap,
+    /// Per-family prefix counters: (max_prefixes, current_count).
+    /// Created from PeerConfig::prefix_limits at session construction;
+    /// counts unique prefixes currently accepted from this peer.
+    prefix_counters: FnvHashMap<Family, (u32, Arc<std::sync::atomic::AtomicU64>)>,
     /// GR negotiation result from the most recent OPEN exchange.
     negotiated_gr: Option<NegotiatedGr>,
     /// Shared cross-session state for this peer; cloned from `Peer::context`
@@ -4231,6 +4309,7 @@ impl PeerSession {
             shutdown: None,
             tables,
             export_map,
+            prefix_counters: FnvHashMap::default(),
             negotiated_gr: None,
             context,
             urgent: Vec::new(),
@@ -4297,6 +4376,7 @@ impl PeerSession {
             shutdown: None,
             tables,
             export_map: ExportMap::new(),
+            prefix_counters: FnvHashMap::default(),
             negotiated_gr: None,
             context,
             urgent: vec![],
@@ -4847,18 +4927,19 @@ impl PeerSession {
         if let Some(s) = reach {
             let family = s.family;
             let source = self.source[&family].clone();
+            let prefix_limit = self
+                .prefix_counters
+                .get(&family)
+                .map(|(max, counter)| (*max, Arc::clone(counter)));
             for net in s.entries {
-                let idx = self.tables.dealer(net.nlri);
                 self.tables
-                    .event(
-                        idx,
-                        TableEvent::PassUpdate(
-                            source.clone(),
-                            family,
-                            vec![net],
-                            Some(attr.clone()),
-                            nexthop,
-                        ),
+                    .insert_route(
+                        source.clone(),
+                        family,
+                        net,
+                        nexthop.unwrap(),
+                        attr.clone(),
+                        prefix_limit.clone(),
                     )
                     .await;
             }
@@ -4866,13 +4947,13 @@ impl PeerSession {
         if let Some(s) = unreach {
             let family = s.family;
             let source = self.source[&family].clone();
+            let prefix_counter = self
+                .prefix_counters
+                .get(&family)
+                .map(|(_, counter)| Arc::clone(counter));
             for net in s.entries {
-                let idx = self.tables.dealer(net.nlri);
                 self.tables
-                    .event(
-                        idx,
-                        TableEvent::PassUpdate(source.clone(), family, vec![net], None, None),
-                    )
+                    .remove_route(source.clone(), family, net, prefix_counter.clone())
                     .await;
             }
         }
