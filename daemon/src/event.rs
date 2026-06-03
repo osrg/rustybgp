@@ -6275,4 +6275,194 @@ mod tests {
         assert!(g.selection_deferral_timer.is_none());
         assert!(g.selection_deferral.is_some());
     }
+
+    // ---- RFC 8538 N-bit: session_down_to_bmp conversion ----
+
+    #[test]
+    fn session_down_to_bmp_none_is_remote_unexpected() {
+        assert!(matches!(
+            session_down_to_bmp(None),
+            bmp::PeerDownReason::RemoteUnexpected
+        ));
+    }
+
+    #[test]
+    fn session_down_to_bmp_io_error_is_remote_unexpected() {
+        assert!(matches!(
+            session_down_to_bmp(Some(crate::fsm::SessionDownReason::IoError)),
+            bmp::PeerDownReason::RemoteUnexpected
+        ));
+    }
+
+    #[test]
+    fn session_down_to_bmp_hold_timer_is_local_fsm() {
+        assert!(matches!(
+            session_down_to_bmp(Some(crate::fsm::SessionDownReason::HoldTimerExpired)),
+            bmp::PeerDownReason::LocalFsm(0)
+        ));
+    }
+
+    #[test]
+    fn session_down_to_bmp_admin_shutdown_is_local_fsm() {
+        assert!(matches!(
+            session_down_to_bmp(Some(crate::fsm::SessionDownReason::AdminShutdown)),
+            bmp::PeerDownReason::LocalFsm(0)
+        ));
+    }
+
+    #[test]
+    fn session_down_to_bmp_remote_notification_preserved() {
+        let msg = bgp::Message::Notification(rustybgp_packet::error::BgpError::Other {
+            code: 6,
+            subcode: 0,
+            data: vec![],
+        });
+        assert!(matches!(
+            session_down_to_bmp(Some(crate::fsm::SessionDownReason::RemoteNotification(msg))),
+            bmp::PeerDownReason::RemoteNotification(_)
+        ));
+    }
+
+    #[test]
+    fn session_down_to_bmp_local_notification_preserved() {
+        let msg = bgp::Message::Notification(rustybgp_packet::error::BgpError::Other {
+            code: 6,
+            subcode: 0,
+            data: vec![],
+        });
+        assert!(matches!(
+            session_down_to_bmp(Some(crate::fsm::SessionDownReason::LocalNotification(msg))),
+            bmp::PeerDownReason::LocalNotification(_)
+        ));
+    }
+
+    // ---- RFC 8538 N-bit: negotiate_gr N-bit extraction ----
+
+    async fn make_gr_cap(local_flags: u8, peer_flags: u8) -> Option<NegotiatedGr> {
+        let tables = make_tables();
+        let context = make_context();
+        let mut session = PeerSession::new_for_test("10.0.0.1".parse().unwrap(), context, tables);
+        session.local_cap = vec![packet::Capability::GracefulRestart {
+            flags: local_flags,
+            restart_time: 120,
+            families: vec![(Family::IPV4, 0)],
+        }];
+        let remote_caps = vec![packet::Capability::GracefulRestart {
+            flags: peer_flags,
+            restart_time: 90,
+            families: vec![(Family::IPV4, 0)],
+        }];
+        session.negotiate_gr(&remote_caps)
+    }
+
+    #[tokio::test]
+    async fn negotiate_gr_both_n_bit_sets_notification_enabled() {
+        let gr = make_gr_cap(0x4, 0x4).await.unwrap();
+        assert!(gr.notification_enabled);
+    }
+
+    #[tokio::test]
+    async fn negotiate_gr_only_local_n_bit_not_enabled() {
+        let gr = make_gr_cap(0x4, 0x0).await.unwrap();
+        assert!(!gr.notification_enabled);
+    }
+
+    #[tokio::test]
+    async fn negotiate_gr_only_peer_n_bit_not_enabled() {
+        let gr = make_gr_cap(0x0, 0x4).await.unwrap();
+        assert!(!gr.notification_enabled);
+    }
+
+    #[tokio::test]
+    async fn negotiate_gr_neither_n_bit_not_enabled() {
+        let gr = make_gr_cap(0x0, 0x0).await.unwrap();
+        assert!(!gr.notification_enabled);
+    }
+
+    // ---- RFC 8538 N-bit: gr_on_disconnect logic ----
+
+    fn make_negotiated_gr(notification_enabled: bool) -> NegotiatedGr {
+        NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+            notification_enabled,
+        }
+    }
+
+    fn cease(subcode: u8) -> crate::fsm::SessionDownReason {
+        crate::fsm::SessionDownReason::RemoteNotification(bgp::Message::Notification(
+            rustybgp_packet::error::BgpError::Other {
+                code: 6,
+                subcode,
+                data: vec![],
+            },
+        ))
+    }
+
+    fn local_cease(subcode: u8) -> crate::fsm::SessionDownReason {
+        crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(
+            rustybgp_packet::error::BgpError::Other {
+                code: 6,
+                subcode,
+                data: vec![],
+            },
+        ))
+    }
+
+    #[test]
+    fn gr_on_disconnect_tcp_drop_always_applies() {
+        assert!(gr_on_disconnect(&None, make_negotiated_gr(false)).is_some());
+        assert!(gr_on_disconnect(&None, make_negotiated_gr(true)).is_some());
+    }
+
+    #[test]
+    fn gr_on_disconnect_io_error_always_applies() {
+        let r = Some(crate::fsm::SessionDownReason::IoError);
+        assert!(gr_on_disconnect(&r, make_negotiated_gr(false)).is_some());
+        assert!(gr_on_disconnect(&r, make_negotiated_gr(true)).is_some());
+    }
+
+    #[test]
+    fn gr_on_disconnect_remote_notification_requires_n_bit() {
+        assert!(gr_on_disconnect(&Some(cease(0)), make_negotiated_gr(false)).is_none());
+        assert!(gr_on_disconnect(&Some(cease(0)), make_negotiated_gr(true)).is_some());
+    }
+
+    #[test]
+    fn gr_on_disconnect_hard_reset_never_applies() {
+        assert!(gr_on_disconnect(&Some(cease(9)), make_negotiated_gr(false)).is_none());
+        assert!(gr_on_disconnect(&Some(cease(9)), make_negotiated_gr(true)).is_none());
+    }
+
+    #[test]
+    fn gr_on_disconnect_local_notification_requires_n_bit() {
+        assert!(gr_on_disconnect(&Some(local_cease(0)), make_negotiated_gr(false)).is_none());
+        assert!(gr_on_disconnect(&Some(local_cease(0)), make_negotiated_gr(true)).is_some());
+    }
+
+    #[test]
+    fn gr_on_disconnect_local_hard_reset_never_applies() {
+        assert!(gr_on_disconnect(&Some(local_cease(9)), make_negotiated_gr(true)).is_none());
+    }
+
+    #[test]
+    fn gr_on_disconnect_hold_timer_requires_n_bit() {
+        let r = Some(crate::fsm::SessionDownReason::HoldTimerExpired);
+        assert!(gr_on_disconnect(&r, make_negotiated_gr(false)).is_none());
+        assert!(gr_on_disconnect(&r, make_negotiated_gr(true)).is_some());
+    }
+
+    #[test]
+    fn gr_on_disconnect_admin_shutdown_never_applies() {
+        let r = Some(crate::fsm::SessionDownReason::AdminShutdown);
+        assert!(gr_on_disconnect(&r, make_negotiated_gr(false)).is_none());
+        assert!(gr_on_disconnect(&r, make_negotiated_gr(true)).is_none());
+    }
+
+    #[test]
+    fn gr_on_disconnect_fsm_error_never_applies() {
+        let r = Some(crate::fsm::SessionDownReason::FsmError);
+        assert!(gr_on_disconnect(&r, make_negotiated_gr(false)).is_none());
+        assert!(gr_on_disconnect(&r, make_negotiated_gr(true)).is_none());
+    }
 }

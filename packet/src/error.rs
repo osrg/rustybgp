@@ -142,3 +142,48 @@ impl BgpError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hard_reset_is_cease_subcode_9() {
+        let err = BgpError::Other {
+            code: 6,
+            subcode: 9,
+            data: vec![],
+        };
+        assert!(err.is_hard_reset());
+    }
+
+    #[test]
+    fn cease_other_subcodes_are_not_hard_reset() {
+        for subcode in [0u8, 1, 2, 3, 4, 5, 6, 7, 8] {
+            let err = BgpError::Other {
+                code: 6,
+                subcode,
+                data: vec![],
+            };
+            assert!(
+                !err.is_hard_reset(),
+                "subcode {subcode} should not be hard reset"
+            );
+        }
+    }
+
+    #[test]
+    fn non_cease_codes_are_not_hard_reset() {
+        for code in [1u8, 2, 3, 5, 7] {
+            let err = BgpError::Other {
+                code,
+                subcode: 9,
+                data: vec![],
+            };
+            assert!(
+                !err.is_hard_reset(),
+                "code {code} subcode 9 should not be hard reset"
+            );
+        }
+    }
+}
