@@ -1,0 +1,50 @@
+networks:
+  bgp-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.5.0/24
+          gateway: 172.30.5.254
+
+services:
+  # frr-helper (AS 65002): GR-capable peer that advertises routes and
+  # preserves stale routes while rustybgp is restarting.
+  frr-helper:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: frr-helper
+    privileged: true
+    volumes:
+      - ./frr-helper/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
+    networks:
+      bgp-net:
+        ipv4_address: 172.30.5.2
+
+  # rustybgp: restarting speaker under test.
+  router-rusty:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: router-rusty
+    privileged: true
+    networks:
+      bgp-net:
+        ipv4_address: 172.30.5.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+
+  # frr-receiver (AS 65003): plain eBGP peer that receives routes from
+  # rustybgp only after the Selection Deferral Timer completes.
+  frr-receiver:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: frr-receiver
+    privileged: true
+    volumes:
+      - ./frr-receiver/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
+    networks:
+      bgp-net:
+        ipv4_address: 172.30.5.3

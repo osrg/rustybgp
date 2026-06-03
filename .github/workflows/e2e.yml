@@ -67,6 +67,28 @@ jobs:
           RUSTYBGP_DOCKERFILE: Dockerfile
         run: ./run-test.sh
 
+  e2e-rfc4724-restarting:
+    name: RFC 4724 Graceful Restart (restarting speaker) end-to-end
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run RFC 4724 restarting speaker e2e test
+        working-directory: tests/e2e/rfc4724-restarting
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
   e2e-rfc4724-helper:
     name: RFC 4724 Graceful Restart (helper side) end-to-end
     needs: build

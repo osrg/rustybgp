@@ -1,0 +1,29 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.5.1"
+
+neighbors:
+  # frr-helper: GR-capable peer. RustyBGP defers route selection until
+  # EOR is received from this peer when started with --graceful-restart.
+  - config:
+      neighbor-address: "172.30.5.2"
+      peer-as: 65002
+    graceful-restart:
+      config:
+        enabled: true
+        restart-time: 30
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+        mp-graceful-restart:
+          config:
+            enabled: true
+
+  # frr-receiver: plain eBGP peer, receives routes after deferral ends.
+  - config:
+      neighbor-address: "172.30.5.3"
+      peer-as: 65003
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
