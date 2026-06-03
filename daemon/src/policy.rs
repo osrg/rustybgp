@@ -18,14 +18,14 @@
 //! Pure logic — no async, no I/O.
 
 use rustybgp_packet::bgp::Nexthop;
-use rustybgp_table::{Change, Disposition, PolicyAssignment, RoutingTable};
+use rustybgp_table::{Change, Disposition, PolicyAssignment, Table};
 use std::sync::Arc;
 
 /// Apply import policy to a route and return whether it should be filtered
 /// (rejected). Also applies any nexthop rewriting action.
 pub(crate) fn apply_import(
     import_policy: Option<&PolicyAssignment>,
-    rtable: &RoutingTable,
+    rtable: &Table,
     source: &Arc<rustybgp_table::Source>,
     nlri: &rustybgp_packet::Nlri,
     attrs: &Arc<Vec<rustybgp_packet::Attribute>>,
@@ -46,7 +46,7 @@ pub(crate) fn apply_import(
 pub(crate) fn filter_export(
     changes: Vec<Change>,
     export_policy: Option<&PolicyAssignment>,
-    rtable: &RoutingTable,
+    rtable: &Table,
 ) -> Vec<Change> {
     let mut peer_changes = Vec::with_capacity(changes.len());
 
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn reach_passes_without_policy() {
-        let rtable = RoutingTable::new();
+        let rtable = Table::new();
         let changes = vec![reach_change("10.0.0.0/24", 1)];
         let result = filter_export(changes, None, &rtable);
         assert_eq!(result.len(), 1);
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn reach_rejected_by_export_policy() {
-        let rtable = RoutingTable::new();
+        let rtable = Table::new();
         let policy = reject_policy();
         let changes = vec![reach_change("10.0.0.0/24", 1)];
         let result = filter_export(changes, Some(&policy), &rtable);
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn withdrawal_always_propagated() {
-        let rtable = RoutingTable::new();
+        let rtable = Table::new();
         let policy = reject_policy();
         let changes = vec![withdrawal_change("10.0.0.0/24", 1)];
         let result = filter_export(changes, Some(&policy), &rtable);
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn no_policy_passes_all() {
-        let rtable = RoutingTable::new();
+        let rtable = Table::new();
         let changes = vec![
             reach_change("10.0.0.0/24", 1),
             reach_change("20.0.0.0/24", 2),
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn nexthop_rewritten_by_policy() {
-        let rtable = RoutingTable::new();
+        let rtable = Table::new();
         let policy = nexthop_self_policy();
         let changes = vec![reach_change("10.0.0.0/24", 1)];
         let result = filter_export(changes, Some(&policy), &rtable);
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn import_no_policy_accepts() {
-        let rtable = RoutingTable::new();
+        let rtable = Table::new();
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]);
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn import_rejected_by_policy() {
-        let rtable = RoutingTable::new();
+        let rtable = Table::new();
         let policy = reject_policy();
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),

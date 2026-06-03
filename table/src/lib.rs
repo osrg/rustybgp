@@ -269,13 +269,13 @@ fn same_top_entry(a: &TopNEntry, b: &Path) -> bool {
 }
 
 #[derive(Default, Clone, Debug)]
-pub struct RoutingTableState {
+pub struct TableState {
     pub num_destination: usize,
     pub num_path: usize,
     pub num_accepted: usize,
 }
 
-impl AddAssign for RoutingTableState {
+impl AddAssign for TableState {
     fn add_assign(&mut self, other: Self) {
         *self = Self {
             num_destination: self.num_destination + other.num_destination,
@@ -413,31 +413,29 @@ impl Source {
 /// (RFC 4724 §4.2): best-path selection is suppressed for this family until
 /// EOR has been received from all helper peers or the deferral timer fires.
 #[derive(Default)]
-pub struct FamilyTable {
+pub struct Rib {
     pub deferring: bool,
     destinations: FnvHashMap<packet::Nlri, Destination>,
 }
 
-pub struct RoutingTable {
-    global: FnvHashMap<Family, FamilyTable>,
+pub struct Table {
+    ribs: FnvHashMap<Family, Rib>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, (u64, u64)>>,
     /// Per-peer per-family maximum prefix limits.
     prefix_limits: FnvHashMap<IpAddr, FnvHashMap<Family, u32>>,
     rpki: RpkiTable,
 }
 
-impl Default for RoutingTable {
+impl Default for Table {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RoutingTable {
+impl Table {
     pub fn new() -> Self {
-        RoutingTable {
-            global: vec![(Family::EMPTY, FamilyTable::default())]
-                .into_iter()
-                .collect(),
+        Table {
+            ribs: vec![(Family::EMPTY, Rib::default())].into_iter().collect(),
             route_stats: FnvHashMap::default(),
             prefix_limits: FnvHashMap::default(),
             rpki: RpkiTable::new(),
@@ -456,7 +454,7 @@ impl RoutingTable {
     }
 
     pub fn best(&self, family: &Family) -> Vec<Change> {
-        match self.global.get(family) {
+        match self.ribs.get(family) {
             Some(t) => {
                 let mut v = Vec::with_capacity(t.destinations.len());
                 for (net, dst) in &t.destinations {
@@ -479,8 +477,8 @@ impl RoutingTable {
         }
     }
 
-    pub fn state(&self, family: Family) -> RoutingTableState {
-        match self.global.get(&family) {
+    pub fn state(&self, family: Family) -> TableState {
+        match self.ribs.get(&family) {
             Some(t) => {
                 let entries = t.destinations.values().flat_map(|x| x.entry.iter());
                 let mut num_path = 0;
@@ -491,14 +489,14 @@ impl RoutingTable {
                         num_accepted += 1;
                     }
                 }
-                RoutingTableState {
+                TableState {
                     num_destination: t.destinations.len(),
                     num_path,
                     num_accepted,
                 }
             }
 
-            None => RoutingTableState::default(),
+            None => TableState::default(),
         }
     }
 
@@ -512,9 +510,9 @@ impl RoutingTable {
     }
 
     pub fn iter_reach(&self, family: Family) -> impl Iterator<Item = Reach> + '_ {
-        self.global
+        self.ribs
             .get(&family)
-            .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
+            .unwrap_or_else(|| self.ribs.get(&Family::EMPTY).unwrap())
             .destinations
             .iter()
             .flat_map(move |(net, dst)| {
@@ -538,9 +536,9 @@ impl RoutingTable {
         prefixes: Vec<packet::Nlri>,
         export_policy: Option<Arc<PolicyAssignment>>,
     ) -> impl Iterator<Item = DestinationEntry> + '_ {
-        self.global
+        self.ribs
             .get(&family)
-            .unwrap_or_else(|| self.global.get(&Family::EMPTY).unwrap())
+            .unwrap_or_else(|| self.ribs.get(&Family::EMPTY).unwrap())
             .destinations
             .iter()
             .filter(move |(net, _dst)| {
@@ -678,7 +676,7 @@ impl RoutingTable {
         let mut replaced = None;
         let flags = if filtered { Path::FLAG_FILTERED } else { 0 };
 
-        let rt = self.global.entry(family).or_default();
+        let rt = self.ribs.entry(family).or_default();
         let deferring = rt.deferring;
         let dst = rt.destinations.entry(net).or_insert_with(Destination::new);
 
@@ -772,13 +770,13 @@ impl RoutingTable {
     /// Set the deferral flag for `family`: best-path changes from `insert()` are
     /// suppressed until `end_deferral()` is called.
     pub fn start_deferral(&mut self, family: Family) {
-        self.global.entry(family).or_default().deferring = true;
+        self.ribs.entry(family).or_default().deferring = true;
     }
 
     /// Clear the deferral flag for `family` and return all current best paths as
     /// `Change` entries (with `old_rank = 0`) ready for distribution to peers.
     pub fn end_deferral(&mut self, family: Family) -> Vec<Change> {
-        if let Some(ft) = self.global.get_mut(&family) {
+        if let Some(ft) = self.ribs.get_mut(&family) {
             ft.deferring = false;
         }
         self.best(&family)
@@ -791,7 +789,7 @@ impl RoutingTable {
         net: packet::Nlri,
         remote_id: u32,
     ) -> Vec<Change> {
-        let Some(rt) = self.global.get_mut(&family) else {
+        let Some(rt) = self.ribs.get_mut(&family) else {
             return Vec::new();
         };
         let Some(dst) = rt.destinations.get_mut(&net) else {
@@ -940,7 +938,7 @@ impl RoutingTable {
                 self.prefix_limits.remove(&addr);
             }
         }
-        if let Some(rt) = self.global.get_mut(&family) {
+        if let Some(rt) = self.ribs.get_mut(&family) {
             rt.destinations.retain(|net, dst| {
                 let old_top: Vec<TopNEntry> = dst
                     .unfiltered_all()
@@ -984,7 +982,7 @@ impl RoutingTable {
     /// not be disturbed.
     pub fn drop_stale(&mut self, addr: IpAddr, family: Family) -> Vec<Change> {
         let mut advertise = Vec::new();
-        if let Some(rt) = self.global.get_mut(&family) {
+        if let Some(rt) = self.ribs.get_mut(&family) {
             rt.destinations.retain(|net, dst| {
                 if !dst
                     .entry
@@ -1035,7 +1033,7 @@ impl RoutingTable {
     /// the caller can distribute withdraws / updates to other peers.
     pub fn restale(&mut self, addr: IpAddr, family: Family) -> Vec<Change> {
         let mut changes = Vec::new();
-        if let Some(rt) = self.global.get_mut(&family) {
+        if let Some(rt) = self.ribs.get_mut(&family) {
             for (net, dst) in rt.destinations.iter_mut() {
                 if !dst.entry.iter().any(|p| p.source.remote_addr == addr) {
                     continue;
@@ -2318,7 +2316,7 @@ mod tests {
         let n2 = nlri(2, 0, 0, 0, 24);
         let n3 = nlri(3, 0, 0, 0, 24);
 
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let family = Family::IPV4;
         let attrs = Arc::new(Vec::new());
 
@@ -2327,9 +2325,9 @@ mod tests {
         rt.insert(s1.clone(), family, n2, 0, nh(), attrs.clone(), false);
         rt.insert(s1.clone(), family, n3, 0, nh(), attrs.clone(), false);
 
-        assert_eq!(rt.global.get(&family).unwrap().destinations.len(), 3);
+        assert_eq!(rt.ribs.get(&family).unwrap().destinations.len(), 3);
         rt.drop(s1.remote_addr, family);
-        assert_eq!(rt.global.get(&family).unwrap().destinations.len(), 1);
+        assert_eq!(rt.ribs.get(&family).unwrap().destinations.len(), 1);
     }
 
     // --- single_aspath_match ---
@@ -2358,7 +2356,7 @@ mod tests {
 
     #[test]
     fn insert_single() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let change = rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
@@ -2373,7 +2371,7 @@ mod tests {
 
     #[test]
     fn insert_same_nlri_no_best_change() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // Insert with router_id=1 (lower, so this is best)
         rt.insert(
@@ -2412,7 +2410,7 @@ mod tests {
 
     #[test]
     fn best_path_local_pref() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         rt.insert(
             source(1, 65001, 65000, 1),
@@ -2443,7 +2441,7 @@ mod tests {
 
     #[test]
     fn best_path_as_path_length() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         rt.insert(
             source(1, 65001, 65000, 1),
@@ -2473,7 +2471,7 @@ mod tests {
 
     #[test]
     fn best_path_origin() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // Insert with ORIGIN=Incomplete(2), router_id=1
         rt.insert(
@@ -2505,7 +2503,7 @@ mod tests {
 
     #[test]
     fn best_path_ebgp_over_ibgp() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // iBGP peer (remote_asn == local_asn), router_id=1 (lower)
         rt.insert(
@@ -2537,7 +2535,7 @@ mod tests {
 
     #[test]
     fn best_path_router_id() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // router_id=10
         rt.insert(
@@ -2570,7 +2568,7 @@ mod tests {
 
     #[test]
     fn remove_best_path() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
@@ -2587,7 +2585,7 @@ mod tests {
 
     #[test]
     fn remove_non_best_path() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
@@ -2601,7 +2599,7 @@ mod tests {
 
     #[test]
     fn remove_last_path() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), false);
@@ -2615,7 +2613,7 @@ mod tests {
 
     #[test]
     fn filtered_path_no_change() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // Only filtered path → no Change (no unfiltered best)
         let change = rt.insert(
@@ -2639,7 +2637,7 @@ mod tests {
     // A2: filtered at head, insert unfiltered behind existing unfiltered best
     #[test]
     fn filtered_head_insert_unfiltered_non_best() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // filtered path at head (router_id=1)
         rt.insert(
@@ -2673,7 +2671,7 @@ mod tests {
     // B1: replace filtered path at index 0 → unfiltered best unchanged
     #[test]
     fn replace_filtered_head_no_best_change() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // filtered at head
@@ -2704,7 +2702,7 @@ mod tests {
     // B2: replace unfiltered best with filtered → best changes to another unfiltered
     #[test]
     fn replace_unfiltered_best_changes() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // filtered at head (router_id=3, won't be best)
@@ -2731,7 +2729,7 @@ mod tests {
     // B3: replace unfiltered non-best → no best change
     #[test]
     fn replace_unfiltered_non_best_no_change() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // filtered at head
         rt.insert(
@@ -2772,7 +2770,7 @@ mod tests {
 
     #[test]
     fn filtered_path_peer_stats() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         rt.insert(s1.clone(), Family::IPV4, net, 0, nh(), empty_attrs(), true);
@@ -2788,7 +2786,7 @@ mod tests {
 
     #[test]
     fn best_returns_all_prefixes() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let s1 = source(1, 65001, 65000, 1);
         rt.insert(
             s1.clone(),
@@ -2825,7 +2823,7 @@ mod tests {
 
     #[test]
     fn policy_prefix_reject() {
-        let rt = RoutingTable::new();
+        let rt = Table::new();
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -2852,7 +2850,7 @@ mod tests {
         ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
         let (_, assignment) = ptable
             .add_assignment(
-                "global",
+                "ribs",
                 PolicyDirection::Import,
                 Disposition::Accept,
                 vec!["pol1".to_string()],
@@ -2874,7 +2872,7 @@ mod tests {
 
     #[test]
     fn policy_default_accept() {
-        let rt = RoutingTable::new();
+        let rt = Table::new();
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -2901,7 +2899,7 @@ mod tests {
         ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
         let (_, assignment) = ptable
             .add_assignment(
-                "global",
+                "ribs",
                 PolicyDirection::Import,
                 Disposition::Accept,
                 vec!["pol1".to_string()],
@@ -2924,7 +2922,7 @@ mod tests {
 
     #[test]
     fn policy_nexthop_action_address() {
-        let rt = RoutingTable::new();
+        let rt = Table::new();
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -2955,7 +2953,7 @@ mod tests {
         ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
         let (_, assignment) = ptable
             .add_assignment(
-                "global",
+                "ribs",
                 PolicyDirection::Export,
                 Disposition::Accept,
                 vec!["pol1".to_string()],
@@ -2979,7 +2977,7 @@ mod tests {
 
     #[test]
     fn policy_nexthop_action_self() {
-        let rt = RoutingTable::new();
+        let rt = Table::new();
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3008,7 +3006,7 @@ mod tests {
         ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
         let (_, assignment) = ptable
             .add_assignment(
-                "global",
+                "ribs",
                 PolicyDirection::Export,
                 Disposition::Accept,
                 vec!["pol1".to_string()],
@@ -3033,7 +3031,7 @@ mod tests {
 
     #[test]
     fn policy_nexthop_no_match_unchanged() {
-        let rt = RoutingTable::new();
+        let rt = Table::new();
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3064,7 +3062,7 @@ mod tests {
         ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
         let (_, assignment) = ptable
             .add_assignment(
-                "global",
+                "ribs",
                 PolicyDirection::Export,
                 Disposition::Accept,
                 vec!["pol1".to_string()],
@@ -3093,7 +3091,7 @@ mod tests {
     fn best_path_local_pref_over_router_id() {
         // Regression: previously, a path losing on LOCAL_PREF could still
         // win on router_id due to missing "lose" checks in the comparison loop.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // s1: local_pref=200, router_id=2
         let s1 = source(1, 65001, 65000, 2);
@@ -3125,7 +3123,7 @@ mod tests {
 
     #[test]
     fn replace_unfiltered_to_filtered_withdraws() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // Insert unfiltered path
@@ -3144,7 +3142,7 @@ mod tests {
     fn withdraw_source_is_old_best() {
         // When all paths become filtered, the withdrawal source must be the
         // old unfiltered best's source, not the inserting peer's source.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // s1 is unfiltered best
@@ -3167,7 +3165,7 @@ mod tests {
 
     #[test]
     fn best_skips_filtered_paths() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // filtered path (better router_id)
         rt.insert(
@@ -3189,7 +3187,7 @@ mod tests {
 
     #[test]
     fn best_skips_all_filtered_destination() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         rt.insert(
             source(1, 65001, 65000, 1),
@@ -3208,7 +3206,7 @@ mod tests {
 
     #[test]
     fn remove_best_with_filtered_head() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let attrs = attrs_with_local_pref(100);
         // filtered at head
@@ -3235,7 +3233,7 @@ mod tests {
 
     #[test]
     fn remove_last_unfiltered_withdraws() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // filtered path
         rt.insert(
@@ -3263,7 +3261,7 @@ mod tests {
 
     #[test]
     fn drop_best_with_filtered_head() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let attrs = attrs_with_local_pref(100);
         // filtered at head
@@ -3290,7 +3288,7 @@ mod tests {
 
     #[test]
     fn drop_filtered_no_change() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // filtered path from s1
         let s1 = source(1, 65001, 65000, 1);
@@ -3307,7 +3305,7 @@ mod tests {
 
     #[test]
     fn adj_out_skips_filtered_head() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let attrs = attrs_with_local_pref(100);
         // filtered path with better router_id → sorts at index 0
@@ -3337,7 +3335,7 @@ mod tests {
 
     #[test]
     fn adj_out_skips_all_filtered_destination() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // only filtered paths
         rt.insert(
@@ -3362,7 +3360,7 @@ mod tests {
 
     #[test]
     fn state_counts_filtered_as_not_accepted() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         // 1 filtered path
         rt.insert(
@@ -3395,7 +3393,7 @@ mod tests {
     #[test]
     fn stable_id_new_best_no_churn() {
         // Inserting a new best should re-advertise the old path at its new rank.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 10); // router_id=10
         let s2 = source(2, 65002, 65000, 5); // router_id=5, better
@@ -3421,7 +3419,7 @@ mod tests {
     #[test]
     fn stable_id_preserved_on_replacement() {
         // Replacing a path's attributes preserves its stable local_path_id.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
 
@@ -3445,7 +3443,7 @@ mod tests {
     #[test]
     fn stable_id_withdraw_uses_original_id() {
         // When a path is removed, the withdrawal uses its original ID.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
 
         let s1 = source(1, 65001, 65000, 1); // best (router_id=1)
@@ -3462,7 +3460,7 @@ mod tests {
 
     #[test]
     fn stable_id_best_uses_stored_ids() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
@@ -3490,7 +3488,7 @@ mod tests {
 
     #[test]
     fn stale_routes_still_returned_by_best() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         rt.insert(
@@ -3515,7 +3513,7 @@ mod tests {
         // Simulate GR: existing route is marked stale, then a fresh route arrives
         // from a different peer. The fresh peer has a higher router_id (worse
         // tie-breaker) but must win because non-stale beats stale.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let stale_src = source(1, 65001, 65000, 1); // router_id=1 (better tie-breaker)
         let fresh_src = source(2, 65002, 65000, 2); // router_id=2 (worse tie-breaker)
@@ -3554,7 +3552,7 @@ mod tests {
 
     #[test]
     fn drop_stale_source_removes_routes() {
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         rt.insert(
@@ -3580,7 +3578,7 @@ mod tests {
     fn drop_stale_removes_only_stale_paths_keeps_fresh() {
         // fresh_src and stale_src have routes for the same prefix.
         // drop_stale should remove the stale route but leave the fresh one.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let stale_src = source(1, 65001, 65000, 1);
         let fresh_src = source(2, 65001, 65000, 2);
@@ -3620,7 +3618,7 @@ mod tests {
     #[test]
     fn drop_stale_removes_route_when_no_fresh_alternative() {
         // Only one source; after mark_stale, drop_stale removes it completely.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         rt.insert(
@@ -3641,7 +3639,7 @@ mod tests {
     #[test]
     fn drop_stale_leaves_fresh_routes_untouched() {
         // Source has fresh (not stale) routes; drop_stale must not remove them.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         rt.insert(
@@ -3665,7 +3663,7 @@ mod tests {
     fn restale_demotes_stale_when_fresh_alternative_exists() {
         // stale source has lower router_id (normally wins), fresh source has higher.
         // After mark_stale + restale(), fresh must be rank=1.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let stale_src = source(1, 65001, 65000, 1); // router_id 1 (better without stale)
         let fresh_src = source(2, 65001, 65000, 2); // router_id 2 (worse without stale)
@@ -3715,7 +3713,7 @@ mod tests {
     #[test]
     fn restale_no_alternative_keeps_stale_as_best() {
         // Only one source; after mark_stale + restale(), it stays as rank=1.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let src = source(1, 65001, 65000, 1);
 
@@ -3745,7 +3743,7 @@ mod tests {
     #[test]
     fn deferral_suppresses_insert_changes() {
         // While deferring, insert() stores the route but returns no changes.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let src = source(1, 65001, 65000, 1);
 
@@ -3754,7 +3752,7 @@ mod tests {
         let changes = rt.insert(src, Family::IPV4, net, 0, nh(), empty_attrs(), false);
         assert!(changes.is_empty(), "deferral must suppress insert changes");
         assert!(
-            rt.global.get(&Family::IPV4).unwrap().deferring,
+            rt.ribs.get(&Family::IPV4).unwrap().deferring,
             "deferring flag must be set"
         );
     }
@@ -3762,7 +3760,7 @@ mod tests {
     #[test]
     fn deferral_does_not_affect_other_families() {
         // Deferring IPv4 must not suppress IPv6 inserts.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net6 = packet::Nlri::V6(packet::bgp::Ipv6Net {
             addr: std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
             mask: 32,
@@ -3779,7 +3777,7 @@ mod tests {
     #[test]
     fn end_deferral_returns_accumulated_routes() {
         // Routes inserted during deferral are returned by end_deferral().
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let n1 = nlri(10, 0, 0, 0, 24);
         let n2 = nlri(10, 0, 1, 0, 24);
         let src = source(1, 65001, 65000, 1);
@@ -3802,7 +3800,7 @@ mod tests {
         assert!(changes.iter().all(|c| c.rank == 1));
         assert!(changes.iter().all(|c| c.old_rank == 0));
         assert!(
-            !rt.global.get(&Family::IPV4).unwrap().deferring,
+            !rt.ribs.get(&Family::IPV4).unwrap().deferring,
             "deferring flag must be cleared"
         );
     }
@@ -3810,7 +3808,7 @@ mod tests {
     #[test]
     fn end_deferral_on_non_deferred_family_is_noop() {
         // end_deferral on a family that was never deferred returns empty.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let changes = rt.end_deferral(Family::IPV4);
         assert!(changes.is_empty());
     }
@@ -3818,7 +3816,7 @@ mod tests {
     #[test]
     fn insert_after_end_deferral_distributes_normally() {
         // After deferral ends, subsequent inserts produce changes as usual.
-        let mut rt = RoutingTable::new();
+        let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
         let src = source(1, 65001, 65000, 1);
 

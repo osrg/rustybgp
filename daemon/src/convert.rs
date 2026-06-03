@@ -1402,9 +1402,7 @@ pub(crate) fn policy_assignment_from_api(
     Ok((req.name, direction, default_action, policy_names))
 }
 
-pub(crate) fn routing_table_state_to_api(
-    s: rustybgp_table::RoutingTableState,
-) -> api::GetTableResponse {
+pub(crate) fn routing_table_state_to_api(s: rustybgp_table::TableState) -> api::GetTableResponse {
     api::GetTableResponse {
         num_destination: s.num_destination as u64,
         num_path: s.num_path as u64,

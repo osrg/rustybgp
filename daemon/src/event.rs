@@ -1666,7 +1666,7 @@ impl GoBgpService for GrpcService {
             Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
-        let mut info = table::RoutingTableState::default();
+        let mut info = table::TableState::default();
         for i in 0..self.tables.shards.len() {
             let t = self.tables.shards[i].lock().await;
             info += t.rtable.state(family);
@@ -3540,7 +3540,7 @@ enum TableEvent {
 type TableHandle = Arc<Tables>;
 
 struct Tables {
-    shards: Vec<Mutex<Table>>,
+    shards: Vec<Mutex<TableShard>>,
     kernel_tx: ArcSwapOption<mpsc::UnboundedSender<KernelRouteEvent>>,
     import_policy: ArcSwapOption<table::PolicyAssignment>,
     export_policy: ArcSwapOption<table::PolicyAssignment>,
@@ -3551,8 +3551,8 @@ impl Tables {
         Tables {
             shards: (0..num_shards)
                 .map(|_| {
-                    Mutex::new(Table {
-                        rtable: table::RoutingTable::new(),
+                    Mutex::new(TableShard {
+                        rtable: table::Table::new(),
                         peer_event_tx: FnvHashMap::default(),
                         bmp_event_tx: FnvHashMap::default(),
                         mrt_event_tx: FnvHashMap::default(),
@@ -3585,15 +3585,15 @@ impl Tables {
     }
 }
 
-struct Table {
-    rtable: table::RoutingTable,
+struct TableShard {
+    rtable: table::Table,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
     bmp_event_tx: FnvHashMap<SocketAddr, mpsc::UnboundedSender<bmp::Message>>,
     mrt_event_tx: FnvHashMap<String, mpsc::UnboundedSender<mrt::Message>>,
     addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
 }
 
-impl Table {
+impl TableShard {
     fn has_addpath(&self, addr: &IpAddr, family: &Family) -> bool {
         self.addpath.get(addr).is_some_and(|e| e.contains(family))
     }
@@ -4440,7 +4440,7 @@ impl PeerSession {
 
     async fn send_bmp_peer_up(
         &self,
-        t: &Table,
+        t: &TableShard,
         remote_asn: u32,
         uptime: u64,
         local_sockaddr: SocketAddr,
@@ -4481,7 +4481,7 @@ impl PeerSession {
     }
 
     fn populate_from_shard(
-        t: &Table,
+        t: &TableShard,
         family: Family,
         effective_max: usize,
         export_policy: &Option<Arc<table::PolicyAssignment>>,
