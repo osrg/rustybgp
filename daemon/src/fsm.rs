@@ -116,7 +116,10 @@ pub(crate) enum Output {
 #[derive(Clone)]
 pub(crate) enum SessionDownReason {
     HoldTimerExpired,
+    /// Peer sent a NOTIFICATION message.
     RemoteNotification(bgp::Message),
+    /// We sent a NOTIFICATION message (e.g. parse error, capability mismatch).
+    LocalNotification(bgp::Message),
     FsmError,
     AdminShutdown,
     IoError,

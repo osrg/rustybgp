@@ -3879,6 +3879,23 @@ struct DisconnectInfo {
     negotiated_gr: Option<NegotiatedGr>,
 }
 
+/// Convert a `SessionDownReason` to the BMP `PeerDownReason` encoding.
+fn session_down_to_bmp(reason: Option<crate::fsm::SessionDownReason>) -> bmp::PeerDownReason {
+    match reason {
+        None => bmp::PeerDownReason::RemoteUnexpected,
+        Some(crate::fsm::SessionDownReason::HoldTimerExpired) => bmp::PeerDownReason::LocalFsm(0),
+        Some(crate::fsm::SessionDownReason::RemoteNotification(msg)) => {
+            bmp::PeerDownReason::RemoteNotification(msg)
+        }
+        Some(crate::fsm::SessionDownReason::LocalNotification(msg)) => {
+            bmp::PeerDownReason::LocalNotification(msg)
+        }
+        Some(crate::fsm::SessionDownReason::FsmError) => bmp::PeerDownReason::LocalFsm(0),
+        Some(crate::fsm::SessionDownReason::AdminShutdown) => bmp::PeerDownReason::LocalFsm(0),
+        Some(crate::fsm::SessionDownReason::IoError) => bmp::PeerDownReason::RemoteUnexpected,
+    }
+}
+
 async fn gr_drop_families(tables: &TableHandle, addr: IpAddr, families: &[Family]) {
     for i in 0..tables.shards.len() {
         for &family in families {
@@ -4108,7 +4125,7 @@ struct PeerSession {
     stream: Option<TcpStream>,
     source: FnvHashMap<Family, Arc<table::Source>>,
     peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
-    shutdown: Option<bmp::PeerDownReason>,
+    shutdown: Option<crate::fsm::SessionDownReason>,
     /// Per-family prefix limits from config.
     prefix_limits: FnvHashMap<Family, u32>,
     tables: TableHandle,
@@ -4598,21 +4615,7 @@ impl PeerSession {
                     _,
                     crate::fsm::Output::SessionDown(reason),
                 ) => {
-                    self.shutdown = Some(match reason {
-                        crate::fsm::SessionDownReason::HoldTimerExpired => {
-                            bmp::PeerDownReason::LocalFsm(0)
-                        }
-                        crate::fsm::SessionDownReason::RemoteNotification(msg) => {
-                            bmp::PeerDownReason::RemoteNotification(msg)
-                        }
-                        crate::fsm::SessionDownReason::FsmError => bmp::PeerDownReason::LocalFsm(0),
-                        crate::fsm::SessionDownReason::AdminShutdown => {
-                            bmp::PeerDownReason::LocalFsm(0)
-                        }
-                        crate::fsm::SessionDownReason::IoError => {
-                            bmp::PeerDownReason::RemoteUnexpected
-                        }
-                    });
+                    self.shutdown = Some(reason);
                 }
                 crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::StateChanged(s)) => {
                     self.state.fsm.store(u8::from(s), Ordering::Relaxed);
@@ -4624,7 +4627,7 @@ impl PeerSession {
                     self.do_route_refresh(family).await;
                 }
                 crate::fsm::PeerFsmOutput::CloseConnection => {
-                    self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
+                    self.shutdown = Some(crate::fsm::SessionDownReason::FsmError);
                 }
                 crate::fsm::PeerFsmOutput::StopActiveConnect => {
                     effects.push(GlobalEffect::StopActiveConnect);
@@ -4752,13 +4755,13 @@ impl PeerSession {
                 let buf = txbuf.freeze();
                 txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
                 if stream.write_all(&buf).await.is_err() {
-                    self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                    self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
                     return;
                 }
             }
         }
         if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
-            self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+            self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
             return;
         }
 
@@ -4785,14 +4788,14 @@ impl PeerSession {
                     let buf = txbuf.freeze();
                     txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
                     if stream.write_all(&buf).await.is_err() {
-                        self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                        self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
                         return;
                     }
                 }
             }
         }
         if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
-            self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+            self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
         }
         if any_update_pending {
             let outputs = self
@@ -5040,7 +5043,7 @@ impl PeerSession {
                 cease = &mut close_rx => {
                     if let Some(Ok(msg)) = cease {
                         self.urgent.insert(0, msg);
-                        self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
+                        self.shutdown = Some(crate::fsm::SessionDownReason::AdminShutdown);
                     }
                 }
                 _ = self.holdtime_futures.next() => {
@@ -5073,7 +5076,7 @@ impl PeerSession {
                         rxbuf.reserve(rxbuf_size);
                         match stream.try_read_buf(&mut rxbuf) {
                             Ok(0) => {
-                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                                self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
                             }
                             Ok(_) => loop {
                                     match self.framer.try_parse(&mut rxbuf) {
@@ -5090,9 +5093,9 @@ impl PeerSession {
                                     Err(e) => {
                                         if let rustybgp_packet::Error::Bgp(ref bgp_err) = e {
                                             self.urgent.insert(0, bgp::Message::Notification(bgp_err.clone()));
-                                            self.shutdown = Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification(bgp_err.clone())));
+                                            self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(bgp_err.clone())));
                                         } else {
-                                            self.shutdown = Some(bmp::PeerDownReason::LocalFsm(0));
+                                            self.shutdown = Some(crate::fsm::SessionDownReason::FsmError);
                                         }
                                         break;
                                     },
@@ -5100,7 +5103,7 @@ impl PeerSession {
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
                             Err(_e) => {
-                                self.shutdown = Some(bmp::PeerDownReason::RemoteUnexpected);
+                                self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
                             }
                         }
                     }
@@ -5150,10 +5153,7 @@ impl PeerSession {
                         export_policy.as_deref(),
                     );
                 }
-                let reason = self
-                    .shutdown
-                    .take()
-                    .unwrap_or(bmp::PeerDownReason::RemoteUnexpected);
+                let bmp_reason = session_down_to_bmp(self.shutdown.take());
                 if i == 0 {
                     for bmp_tx in t.bmp_event_tx.values() {
                         let m = bmp::Message::PeerDown {
@@ -5164,7 +5164,7 @@ impl PeerSession {
                                 any_source.remote_addr,
                                 any_source.uptime as u32,
                             ),
-                            reason: reason.clone(),
+                            reason: bmp_reason.clone(),
                         };
                         let _ = bmp_tx.send(m);
                     }
@@ -5181,18 +5181,18 @@ impl PeerSession {
         disconnect.negotiated_gr = self.negotiated_gr.take().and_then(|gr| {
             let gr_applies = match &shutdown_reason {
                 // Unexpected TCP/IO drop: always GR if GR negotiated (RFC 4724).
-                None | Some(bmp::PeerDownReason::RemoteUnexpected) => true,
-                // NOTIFICATION from peer: GR only with N-bit and not Hard Reset.
-                Some(bmp::PeerDownReason::RemoteNotification(bgp::Message::Notification(err))) => {
-                    gr.notification_enabled && !err.is_hard_reset()
-                }
-                // NOTIFICATION we sent: GR only with N-bit and not Hard Reset.
-                Some(bmp::PeerDownReason::LocalNotification(bgp::Message::Notification(err))) => {
-                    gr.notification_enabled && !err.is_hard_reset()
-                }
-                // FSM errors (Hold Timer, AdminShutdown, etc.): no GR for now.
-                // Full Hold Timer + N-bit support requires distinguishing the
-                // FSM reason more precisely (tracked as a separate TODO).
+                None | Some(crate::fsm::SessionDownReason::IoError) => true,
+                // NOTIFICATION from peer: GR only with N-bit and not Hard Reset (RFC 8538).
+                Some(crate::fsm::SessionDownReason::RemoteNotification(
+                    bgp::Message::Notification(err),
+                )) => gr.notification_enabled && !err.is_hard_reset(),
+                // NOTIFICATION we sent: GR only with N-bit and not Hard Reset (RFC 8538).
+                Some(crate::fsm::SessionDownReason::LocalNotification(
+                    bgp::Message::Notification(err),
+                )) => gr.notification_enabled && !err.is_hard_reset(),
+                // Hold Timer expired + N-bit: GR applies (RFC 8538).
+                Some(crate::fsm::SessionDownReason::HoldTimerExpired) => gr.notification_enabled,
+                // AdminShutdown, FsmError: no GR.
                 _ => false,
             };
             if gr_applies { Some(gr) } else { None }
