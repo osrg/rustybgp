@@ -2817,6 +2817,57 @@ mod tests {
         assert!(Arc::ptr_eq(&best.source, &s2));
     }
 
+    // B2b: replace unfiltered best with worse attrs → another path becomes best
+    #[test]
+    fn replace_unfiltered_best_with_worse_attrs_changes_best() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+
+        // s1 is best (local_pref=200 wins over s2's local_pref=100)
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_local_pref(200),
+            false,
+            None,
+        );
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_local_pref(100),
+            false,
+            None,
+        );
+
+        // Replace s1 with worse attrs (local_pref=50) → s2 (local_pref=100) becomes best.
+        let update = rt.insert(
+            s1,
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_local_pref(50),
+            false,
+            None,
+        );
+
+        let update = update.expect("replacement must produce NlriChange");
+        assert!(
+            update.best_changed,
+            "best must change when attrs demote the old best"
+        );
+        let best = update.new_best().unwrap();
+        assert!(Arc::ptr_eq(&best.source, &s2), "s2 must be the new best");
+    }
+
     // B3: replace unfiltered non-best → no best change, but any_changed
     #[test]
     fn replace_unfiltered_non_best_no_change() {
