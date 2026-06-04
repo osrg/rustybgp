@@ -651,14 +651,6 @@ impl Table {
         // with different path IDs).  This correctly counts unique prefixes per peer.
         let is_new = replaced.is_none() && !peer_has_path;
 
-        // Get mutable stats entry once for this (peer, family).
-        let (received, accepted) = self
-            .route_stats
-            .entry(source.remote_addr)
-            .or_default()
-            .entry(family)
-            .or_insert((0, 0));
-
         // 3. Check the per-peer prefix limit and increment counter for new prefixes.
         //    Replacements and additional Add-Path paths for an already-known prefix
         //    are always accepted regardless of the limit.
@@ -691,6 +683,13 @@ impl Table {
             timestamp: SystemTime::now(),
             flags,
         };
+
+        let (received, accepted) = self
+            .route_stats
+            .entry(source.remote_addr)
+            .or_default()
+            .entry(family)
+            .or_insert((0, 0));
 
         if let Some(ref old) = replaced {
             match (old.is_filtered(), filtered) {
