@@ -6304,9 +6304,9 @@ mod tests {
 
         let t = tables.shards[0].lock().await;
         // IPv4 route (GR family) must still be in the table.
-        assert_eq!(t.rtable.best(&Family::IPV4).len(), 1);
+        assert_eq!(t.rtable.best_paths(&Family::IPV4).len(), 1);
         // IPv6 route (non-GR family) must have been removed.
-        assert!(t.rtable.best(&Family::IPV6).is_empty());
+        assert!(t.rtable.best_paths(&Family::IPV6).is_empty());
     }
 
     #[tokio::test]
@@ -6339,7 +6339,7 @@ mod tests {
                 .lock()
                 .await
                 .rtable
-                .best(&Family::IPV4)
+                .best_paths(&Family::IPV4)
                 .len(),
             1
         );
@@ -6358,7 +6358,7 @@ mod tests {
                 .lock()
                 .await
                 .rtable
-                .best(&Family::IPV4)
+                .best_paths(&Family::IPV4)
                 .is_empty()
         );
     }

@@ -309,43 +309,6 @@ impl From<Reach> for bgp::Message {
     }
 }
 
-#[derive(Clone)]
-pub struct Change {
-    pub source: Arc<Source>,
-    pub family: Family,
-    pub net: packet::Nlri,
-    pub nexthop: bgp::Nexthop,
-    pub attr: Arc<Vec<packet::Attribute>>,
-    /// Stable per-path identifier for Add-Path TX. 0 when Add-Path is not used.
-    pub path_id: u32,
-    /// 1-based rank within the top-N (1 = best). Peers use this to filter
-    /// changes that exceed their effective send_max.
-    pub rank: usize,
-    /// Previous 1-based rank before this change (0 = path was not previously present).
-    pub old_rank: usize,
-}
-
-impl From<Change> for bgp::Message {
-    fn from(c: Change) -> bgp::Message {
-        // Extended nexthop (RFC 8950) reach/mp_reach routing is handled
-        // at the daemon tx path, not in this conversion.
-        bgp::Message::Update(bgp::Update {
-            reach: Some(packet::bgp::NlriSet {
-                family: c.family,
-                entries: vec![packet::bgp::PathNlri {
-                    nlri: c.net,
-                    path_id: c.path_id,
-                }],
-            }),
-            mp_reach: None,
-            attr: c.attr,
-            unreach: None,
-            mp_unreach: None,
-            nexthop: None,
-        })
-    }
-}
-
 /// Result of a single `Table::insert()` or `Table::remove()` operation.
 ///
 /// Non-Add-Path peers can skip processing when `best_changed` is false.
@@ -492,30 +455,6 @@ impl Table {
                     }
                 })
                 .collect(),
-            None => Vec::new(),
-        }
-    }
-
-    pub fn best(&self, family: &Family) -> Vec<Change> {
-        match self.ribs.get(family) {
-            Some(t) => {
-                let mut v = Vec::with_capacity(t.destinations.len());
-                for (net, dst) in &t.destinations {
-                    for (i, p) in dst.unfiltered_all().iter().enumerate() {
-                        v.push(Change {
-                            source: p.path.source.clone(),
-                            family: *family,
-                            net: *net,
-                            nexthop: p.path.nexthop,
-                            attr: p.path.attr.clone(),
-                            path_id: p.path.local_path_id,
-                            rank: i + 1,
-                            old_rank: 0,
-                        });
-                    }
-                }
-                v
-            }
             None => Vec::new(),
         }
     }
@@ -2337,6 +2276,18 @@ mod tests {
         ])
     }
 
+    /// Flat list of (nlri, path, rank) from best_paths(), sorted by nlri then rank.
+    /// Replaces old rt.best() which returned a flat Vec<Change>.
+    fn flat_best(rt: &Table, family: &Family) -> Vec<(packet::Nlri, Path, usize)> {
+        let mut result = Vec::new();
+        for (net, paths) in rt.best_paths(family) {
+            for (i, path) in paths.into_iter().enumerate() {
+                result.push((net, path, i + 1));
+            }
+        }
+        result
+    }
+
     // --- drop ---
 
     #[test]
@@ -3011,8 +2962,7 @@ mod tests {
             false,
             None,
         );
-        let best = rt.best(&Family::IPV4);
-        assert_eq!(best.len(), 3);
+        assert_eq!(flat_best(&rt, &Family::IPV4).len(), 3);
     }
 
     // --- policy ---
@@ -3417,9 +3367,9 @@ mod tests {
             false,
             None,
         );
-        let bests = rt.best(&Family::IPV4);
+        let bests = flat_best(&rt, &Family::IPV4);
         assert_eq!(bests.len(), 1);
-        assert!(Arc::ptr_eq(&bests[0].source, &s2));
+        assert!(Arc::ptr_eq(&bests[0].1.source, &s2));
     }
 
     #[test]
@@ -3436,8 +3386,7 @@ mod tests {
             true,
             None,
         );
-        let bests = rt.best(&Family::IPV4);
-        assert!(bests.is_empty());
+        assert!(rt.best_paths(&Family::IPV4).is_empty());
     }
 
     // --- remove() with filtered head ---
@@ -3865,10 +3814,10 @@ mod tests {
             None,
         );
 
-        let best = rt.best(&Family::IPV4);
+        let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best.len(), 2);
         // IDs should be stable (1 and 2), not re-computed from rank
-        let ids: Vec<u32> = best.iter().map(|c| c.path_id).collect();
+        let ids: Vec<u32> = best.iter().map(|(_, p, _)| p.local_path_id).collect();
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
     }
@@ -3901,9 +3850,9 @@ mod tests {
 
         s.mark_stale();
 
-        let best = rt.best(&Family::IPV4);
+        let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best.len(), 1);
-        assert!(best[0].source.is_stale());
+        assert!(best[0].1.source.is_stale());
     }
 
     #[test]
@@ -3941,13 +3890,13 @@ mod tests {
             None,
         );
 
-        let best = rt.best(&Family::IPV4);
+        let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best.len(), 2);
         // rank=1 (best) should be the fresh source despite worse router_id
-        let winner = best.iter().find(|c| c.rank == 1).unwrap();
-        assert!(!winner.source.is_stale());
-        let loser = best.iter().find(|c| c.rank == 2).unwrap();
-        assert!(loser.source.is_stale());
+        let winner = best.iter().find(|(_, _, r)| *r == 1).unwrap();
+        assert!(!winner.1.source.is_stale());
+        let loser = best.iter().find(|(_, _, r)| *r == 2).unwrap();
+        assert!(loser.1.source.is_stale());
     }
 
     #[test]
@@ -3967,10 +3916,10 @@ mod tests {
         );
 
         s.mark_stale();
-        assert_eq!(rt.best(&Family::IPV4).len(), 1);
+        assert_eq!(flat_best(&rt, &Family::IPV4).len(), 1);
 
         rt.drop(s.remote_addr, Family::IPV4);
-        assert!(rt.best(&Family::IPV4).is_empty());
+        assert!(rt.best_paths(&Family::IPV4).is_empty());
     }
 
     // --- drop_stale ---
@@ -4009,10 +3958,10 @@ mod tests {
         let changes = rt.drop_stale(stale_src.remote_addr, Family::IPV4, None);
 
         // The stale path is gone but the fresh one remains as rank=1.
-        let best = rt.best(&Family::IPV4);
+        let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best.len(), 1);
-        assert_eq!(best[0].rank, 1);
-        assert_eq!(best[0].source.remote_addr, fresh_src.remote_addr);
+        assert_eq!(best[0].2, 1);
+        assert_eq!(best[0].1.source.remote_addr, fresh_src.remote_addr);
 
         // A path-change event is emitted because the best path shifted.
         assert!(!changes.is_empty());
@@ -4037,7 +3986,7 @@ mod tests {
 
         s.mark_stale();
         rt.drop_stale(s.remote_addr, Family::IPV4, None);
-        assert!(rt.best(&Family::IPV4).is_empty());
+        assert!(rt.best_paths(&Family::IPV4).is_empty());
     }
 
     #[test]
@@ -4059,7 +4008,7 @@ mod tests {
 
         let changes = rt.drop_stale(s.remote_addr, Family::IPV4, None);
         assert!(changes.is_empty());
-        assert_eq!(rt.best(&Family::IPV4).len(), 1);
+        assert_eq!(flat_best(&rt, &Family::IPV4).len(), 1);
     }
 
     // --- restale ---
@@ -4095,11 +4044,12 @@ mod tests {
         );
 
         // Without stale, stale_src wins (lower router_id).
-        let best = rt.best(&Family::IPV4);
+        let best = flat_best(&rt, &Family::IPV4);
         assert!(
             best.iter()
-                .find(|c| c.rank == 1)
+                .find(|(_, _, r)| *r == 1)
                 .unwrap()
+                .1
                 .source
                 .remote_addr
                 == stale_src.remote_addr
@@ -4110,11 +4060,11 @@ mod tests {
         // restale() must emit changes: old rank-1 (stale) loses to fresh.
         assert!(!changes.is_empty());
 
-        let best = rt.best(&Family::IPV4);
-        let winner = best.iter().find(|c| c.rank == 1).unwrap();
-        assert_eq!(winner.source.remote_addr, fresh_src.remote_addr);
-        let loser = best.iter().find(|c| c.rank == 2).unwrap();
-        assert_eq!(loser.source.remote_addr, stale_src.remote_addr);
+        let best = flat_best(&rt, &Family::IPV4);
+        let winner = best.iter().find(|(_, _, r)| *r == 1).unwrap();
+        assert_eq!(winner.1.source.remote_addr, fresh_src.remote_addr);
+        let loser = best.iter().find(|(_, _, r)| *r == 2).unwrap();
+        assert_eq!(loser.1.source.remote_addr, stale_src.remote_addr);
     }
 
     #[test]
@@ -4140,10 +4090,10 @@ mod tests {
         // No rank change → no changes emitted.
         assert!(changes.is_empty());
 
-        let best = rt.best(&Family::IPV4);
+        let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best.len(), 1);
-        assert_eq!(best[0].rank, 1);
-        assert!(best[0].source.is_stale());
+        assert_eq!(best[0].2, 1);
+        assert!(best[0].1.source.is_stale());
     }
 
     // ---- Selection Deferral (RFC 4724 section 4.1) ----
