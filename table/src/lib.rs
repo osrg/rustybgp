@@ -437,26 +437,16 @@ impl Table {
     /// Returns all current unfiltered paths grouped by destination.
     /// Each tuple is (nlri, paths_sorted_by_preference).
     pub fn best_paths(&self, family: &Family) -> Vec<(packet::Nlri, Vec<Path>)> {
-        match self.ribs.get(family) {
-            Some(t) => t
-                .destinations
-                .iter()
-                .filter_map(|(net, dst)| {
-                    let paths: Vec<Path> = dst
-                        .entry
-                        .iter()
-                        .filter(|e| !e.is_filtered())
-                        .map(|e| e.path.clone())
-                        .collect();
-                    if paths.is_empty() {
-                        None
-                    } else {
-                        Some((*net, paths))
-                    }
-                })
-                .collect(),
-            None => Vec::new(),
-        }
+        let Some(t) = self.ribs.get(family) else {
+            return Vec::new();
+        };
+        t.destinations
+            .iter()
+            .filter_map(|(net, dst)| {
+                let paths: Vec<Path> = dst.unfiltered_iter().map(|e| e.path.clone()).collect();
+                (!paths.is_empty()).then_some((*net, paths))
+            })
+            .collect()
     }
 
     pub fn state(&self, family: Family) -> TableState {
