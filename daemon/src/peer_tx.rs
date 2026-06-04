@@ -100,14 +100,6 @@ impl PendingTx {
         self.unreach.insert(key);
     }
 
-    pub(crate) fn insert_change(&mut self, change: rustybgp_table::Change) {
-        if change.attr.is_empty() {
-            self.unreach(change.net, change.path_id);
-        } else {
-            self.reach(change.net, change.path_id, change.nexthop, change.attr);
-        }
-    }
-
     /// Drain pending changes into BGP UPDATE messages.
     ///
     /// `family` is the address family for this PendingTx.
@@ -223,30 +215,25 @@ mod tests {
         ))
     }
 
-    fn change(net: &str, path_id: u32, origin: u32, withdraw: bool) -> table::Change {
-        table::Change {
-            source: src(),
-            family: Family::IPV4,
-            net: packet::Nlri::from_str(net).unwrap(),
-            nexthop: Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            attr: if withdraw {
-                Arc::new(Vec::new())
-            } else {
-                Arc::new(vec![
-                    packet::Attribute::new_with_value(packet::Attribute::ORIGIN, origin).unwrap(),
-                ])
-            },
-            path_id,
-            rank: 1,
-            old_rank: 0,
-        }
+    fn nlri(net: &str) -> packet::Nlri {
+        packet::Nlri::from_str(net).unwrap()
+    }
+
+    fn attr(origin: u32) -> Arc<Vec<packet::Attribute>> {
+        Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, origin).unwrap(),
+        ])
+    }
+
+    fn nh() -> Nexthop {
+        Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1))
     }
 
     #[test]
     fn insert_and_drain_reach() {
         let mut p = PendingTx::new(false);
-        p.insert_change(change("10.0.0.0/24", 0, 0, false));
-        p.insert_change(change("20.0.0.0/24", 0, 0, false));
+        p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
+        p.reach(nlri("20.0.0.0/24"), 0, nh(), attr(0));
 
         assert!(!p.is_empty());
         let msgs = p.drain_messages(Family::IPV4, false);
@@ -264,7 +251,7 @@ mod tests {
     #[test]
     fn insert_and_drain_withdrawal() {
         let mut p = PendingTx::new(false);
-        p.insert_change(change("10.0.0.0/24", 0, 0, true));
+        p.unreach(nlri("10.0.0.0/24"), 0);
 
         let msgs = p.drain_messages(Family::IPV4, false);
         // withdrawal + EOR
@@ -280,8 +267,8 @@ mod tests {
     #[test]
     fn withdrawal_cancels_pending_reach() {
         let mut p = PendingTx::new(false);
-        p.insert_change(change("10.0.0.0/24", 0, 0, false));
-        p.insert_change(change("10.0.0.0/24", 0, 0, true));
+        p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
+        p.unreach(nlri("10.0.0.0/24"), 0);
 
         let msgs = p.drain_messages(Family::IPV4, false);
         // withdrawal + EOR
@@ -297,8 +284,8 @@ mod tests {
     #[test]
     fn different_attrs_separate_buckets() {
         let mut p = PendingTx::new(false);
-        p.insert_change(change("10.0.0.0/24", 0, 0, false)); // origin=IGP
-        p.insert_change(change("20.0.0.0/24", 0, 1, false)); // origin=EGP
+        p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0)); // origin=IGP
+        p.reach(nlri("20.0.0.0/24"), 0, nh(), attr(1)); // origin=EGP
 
         let msgs = p.drain_messages(Family::IPV4, false);
         // Different attributes → 2 UPDATEs + EOR
@@ -308,13 +295,13 @@ mod tests {
     #[test]
     fn same_attr_reinsert_is_noop() {
         let mut p = PendingTx::new(true);
-        p.insert_change(change("10.0.0.0/24", 1, 0, false));
-        p.insert_change(change("20.0.0.0/24", 1, 0, false));
+        p.reach(nlri("10.0.0.0/24"), 1, nh(), attr(0));
+        p.reach(nlri("20.0.0.0/24"), 1, nh(), attr(0));
         assert_eq!(p.bucket.len(), 1);
         assert_eq!(p.bucket.values().next().unwrap().len(), 2);
 
         // Re-insert 20.0.0.0/24 with same attr → no change
-        p.insert_change(change("20.0.0.0/24", 1, 0, false));
+        p.reach(nlri("20.0.0.0/24"), 1, nh(), attr(0));
         assert_eq!(p.bucket.len(), 1);
         assert_eq!(p.bucket.values().next().unwrap().len(), 2);
     }
@@ -322,14 +309,14 @@ mod tests {
     #[test]
     fn attr_update_moves_between_buckets() {
         let mut p = PendingTx::new(true);
-        p.insert_change(change("10.0.0.0/24", 1, 0, false)); // origin=IGP
-        p.insert_change(change("20.0.0.0/24", 1, 0, false)); // origin=IGP
+        p.reach(nlri("10.0.0.0/24"), 1, nh(), attr(0)); // origin=IGP
+        p.reach(nlri("20.0.0.0/24"), 1, nh(), attr(0)); // origin=IGP
         // Same attrs → 1 bucket with 2 entries
         assert_eq!(p.bucket.len(), 1);
         assert_eq!(p.bucket.values().next().unwrap().len(), 2);
 
         // Change 20.0.0.0/24 to origin=EGP → moves to new bucket
-        p.insert_change(change("20.0.0.0/24", 1, 1, false));
+        p.reach(nlri("20.0.0.0/24"), 1, nh(), attr(1));
         assert_eq!(p.bucket.len(), 2);
         // Old bucket has only 10.0.0.0/24
         let old_attr = Arc::new(vec![
@@ -362,9 +349,9 @@ mod tests {
     #[test]
     fn withdraw_then_readvertise() {
         let mut p = PendingTx::new(false);
-        p.insert_change(change("10.0.0.0/24", 0, 0, false));
-        p.insert_change(change("10.0.0.0/24", 0, 0, true));
-        p.insert_change(change("10.0.0.0/24", 0, 0, false));
+        p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
+        p.unreach(nlri("10.0.0.0/24"), 0);
+        p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
 
         // The final state is a reach (withdrawal was cancelled by re-advertisement)
         let msgs = p.drain_messages(Family::IPV4, false);
@@ -398,7 +385,7 @@ mod tests {
     #[test]
     fn eor_follows_last_reach() {
         let mut p = PendingTx::new(false);
-        p.insert_change(change("10.0.0.0/24", 0, 0, false));
+        p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
         // Drain produces reach UPDATE + EOR
         let msgs = p.drain_messages(Family::IPV4, false);
         assert_eq!(msgs.len(), 2);
@@ -419,7 +406,7 @@ mod tests {
     #[test]
     fn use_mp_routes_through_mp_reach() {
         let mut p = PendingTx::new(false);
-        p.insert_change(change("10.0.0.0/24", 0, 0, false));
+        p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
 
         let msgs = p.drain_messages(Family::IPV4, true);
         // reach via MP_REACH + EOR
@@ -435,7 +422,7 @@ mod tests {
     #[test]
     fn addpath_includes_path_id() {
         let mut p = PendingTx::new(true);
-        p.insert_change(change("10.0.0.0/24", 42, 0, false));
+        p.reach(nlri("10.0.0.0/24"), 42, nh(), attr(0));
 
         let msgs = p.drain_messages(Family::IPV4, false);
         if let bgp::Message::Update(u) = &msgs[0] {

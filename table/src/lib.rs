@@ -471,6 +471,31 @@ impl Table {
         }
     }
 
+    /// Returns all current unfiltered paths grouped by destination.
+    /// Each tuple is (nlri, paths_sorted_by_preference).
+    pub fn best_paths(&self, family: &Family) -> Vec<(packet::Nlri, Vec<Path>)> {
+        match self.ribs.get(family) {
+            Some(t) => t
+                .destinations
+                .iter()
+                .filter_map(|(net, dst)| {
+                    let paths: Vec<Path> = dst
+                        .entry
+                        .iter()
+                        .filter(|e| !e.is_filtered())
+                        .map(|e| e.path.clone())
+                        .collect();
+                    if paths.is_empty() {
+                        None
+                    } else {
+                        Some((*net, paths))
+                    }
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     pub fn best(&self, family: &Family) -> Vec<Change> {
         match self.ribs.get(family) {
             Some(t) => {
@@ -803,13 +828,23 @@ impl Table {
         self.ribs.entry(family).or_default().deferring = true;
     }
 
-    /// Clear the deferral flag for `family` and return all current best paths as
-    /// `Change` entries (with `old_rank = 0`) ready for distribution to peers.
-    pub fn end_deferral(&mut self, family: Family) -> Vec<Change> {
+    /// Clear the deferral flag for `family` and return one NlriChange per
+    /// destination with all current unfiltered paths ready for distribution.
+    pub fn end_deferral(&mut self, family: Family) -> Vec<NlriChange> {
         if let Some(ft) = self.ribs.get_mut(&family) {
             ft.deferring = false;
         }
-        self.best(&family)
+        self.best_paths(&family)
+            .into_iter()
+            .map(|(net, paths)| NlriChange {
+                family,
+                net,
+                best_changed: true,
+                any_changed: true,
+                replaced_path_id: None,
+                current_paths: Arc::new(paths),
+            })
+            .collect()
     }
 
     pub fn remove(
@@ -4182,8 +4217,9 @@ mod tests {
         // end_deferral clears flag and returns all accumulated best paths.
         let changes = rt.end_deferral(Family::IPV4);
         assert_eq!(changes.len(), 2);
-        assert!(changes.iter().all(|c| c.rank == 1));
-        assert!(changes.iter().all(|c| c.old_rank == 0));
+        assert!(changes.iter().all(|c| c.best_changed));
+        assert!(changes.iter().all(|c| c.any_changed));
+        assert!(changes.iter().all(|c| c.new_best().is_some()));
         assert!(
             !rt.ribs.get(&Family::IPV4).unwrap().deferring,
             "deferring flag must be cleared"
