@@ -1017,6 +1017,11 @@ impl Table {
                     continue;
                 }
                 let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                // Track whether any unfiltered path from addr exists (any rank may shift).
+                let any_unfiltered_from_addr = dst
+                    .entry
+                    .iter()
+                    .any(|e| e.path.source.remote_addr == addr && !e.is_filtered());
                 for p in dst.entry.iter() {
                     if p.path.source.remote_addr == addr {
                         p.path.source.mark_stale();
@@ -1025,7 +1030,9 @@ impl Table {
                 dst.entry.sort_unstable();
                 let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
                 let best_changed = old_best_id != new_best_id;
-                if best_changed {
+                // Emit NlriChange when best changed (non-Add-Path) or any unfiltered
+                // path from addr existed (Add-Path peers may need rank-boundary updates).
+                if best_changed || any_unfiltered_from_addr {
                     let current_paths = Arc::new(
                         dst.entry
                             .iter()
@@ -1036,8 +1043,8 @@ impl Table {
                     changes.push(NlriChange {
                         family,
                         net: *net,
-                        best_changed: true,
-                        any_changed: true,
+                        best_changed,
+                        any_changed: any_unfiltered_from_addr,
                         replaced_path_id: None,
                         current_paths,
                     });
@@ -4087,8 +4094,11 @@ mod tests {
 
         let changes = rt.restale(src.remote_addr, Family::IPV4);
 
-        // No rank change → no changes emitted.
-        assert!(changes.is_empty());
+        // best_changed=false (sole path stays rank-1), but any_changed=true so
+        // Add-Path peers can diff and confirm no boundary shift occurred.
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].best_changed);
+        assert!(changes[0].any_changed);
 
         let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best.len(), 1);
