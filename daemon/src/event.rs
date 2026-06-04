@@ -2246,6 +2246,7 @@ async fn add_policy_assignment(
 
 enum ToPeerEvent {
     Advertise(table::Change),
+    NlriChange(table::NlriChange),
 }
 
 fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) {
@@ -3613,7 +3614,7 @@ impl Tables {
             &mut nh,
         );
         let pl = prefix_limit.as_ref().map(|(max, counter)| (*max, counter));
-        let changes = t.rtable.insert(
+        if let Some(update) = t.rtable.insert(
             source,
             family,
             net.nlri,
@@ -3622,8 +3623,9 @@ impl Tables {
             attr,
             filtered,
             pl,
-        );
-        t.distribute_changes(changes, kernel_tx.as_deref(), export_policy.as_deref());
+        ) {
+            t.distribute_update(update, kernel_tx.as_deref(), export_policy.as_deref());
+        }
     }
 
     /// Remove a route from the appropriate shard and distribute changes to peers.
@@ -3641,10 +3643,12 @@ impl Tables {
         t.send_bmp_update(&source, family, &[net], None, None);
         t.send_mrt_update(&source, family, &[net], None, None);
         let counter_ref = prefix_counter.as_ref();
-        let changes = t
+        if let Some(update) = t
             .rtable
-            .remove(source, family, net.nlri, net.path_id, counter_ref);
-        t.distribute_changes(changes, kernel_tx.as_deref(), export_policy.as_deref());
+            .remove(source, family, net.nlri, net.path_id, counter_ref)
+        {
+            t.distribute_update(update, kernel_tx.as_deref(), export_policy.as_deref());
+        }
     }
 
     async fn event(&self, idx: usize, msg: TableEvent) {
@@ -3820,6 +3824,124 @@ impl TableShard {
         }
     }
 
+    fn distribute_update(
+        &self,
+        update: table::NlriChange,
+        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        export_policy: Option<&table::PolicyAssignment>,
+    ) {
+        // Apply export policy to new_best.
+        let filtered_new_best = if let Some(ref best) = update.new_best {
+            let mut nexthop = best.nexthop;
+            if export_policy.is_some_and(|policy| {
+                self.rtable.apply_policy(
+                    policy,
+                    &best.source,
+                    &update.net,
+                    &best.attr,
+                    &mut nexthop,
+                    best.source.local_addr,
+                ) == table::Disposition::Reject
+            }) {
+                None
+            } else {
+                Some(table::BestPath {
+                    nexthop,
+                    ..best.clone()
+                })
+            }
+        } else {
+            None
+        };
+
+        // Apply export policy to current_paths (for Add-Path peers).
+        let filtered_current_paths: Arc<Vec<table::BestPath>> = if export_policy.is_none() {
+            Arc::clone(&update.current_paths)
+        } else {
+            Arc::new(
+                update
+                    .current_paths
+                    .iter()
+                    .filter_map(|p| {
+                        let mut nexthop = p.nexthop;
+                        if export_policy.is_some_and(|policy| {
+                            self.rtable.apply_policy(
+                                policy,
+                                &p.source,
+                                &update.net,
+                                &p.attr,
+                                &mut nexthop,
+                                p.source.local_addr,
+                            ) == table::Disposition::Reject
+                        }) {
+                            None
+                        } else {
+                            Some(table::BestPath {
+                                nexthop,
+                                ..p.clone()
+                            })
+                        }
+                    })
+                    .collect(),
+            )
+        };
+
+        let best_changed =
+            update.best_changed || update.new_best.is_some() != filtered_new_best.is_some();
+        let any_changed =
+            update.any_changed || update.current_paths.len() != filtered_current_paths.len();
+
+        let filtered_update = table::NlriChange {
+            best_changed,
+            any_changed,
+            new_best: filtered_new_best,
+            current_paths: filtered_current_paths,
+            ..update
+        };
+
+        // Kernel route update for rank-1 best.
+        if filtered_update.best_changed
+            && let Some(tx) = kernel_tx
+        {
+            let (dst, prefix_len) = match filtered_update.net {
+                packet::Nlri::V4(net) => (IpAddr::from(net.addr), net.mask),
+                packet::Nlri::V6(net) => (IpAddr::from(net.addr), net.mask),
+                packet::Nlri::Mup(_) => {
+                    // Send to peers but skip kernel for MUP NLRIs.
+                    for tx in self.peer_event_tx.values() {
+                        let _ = tx.send(ToPeerEvent::NlriChange(filtered_update.clone()));
+                    }
+                    return;
+                }
+            };
+            match &filtered_update.new_best {
+                None => {
+                    let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
+                }
+                Some(best) => {
+                    let nexthop = best.nexthop.addr();
+                    if matches!(
+                        (dst, nexthop),
+                        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+                    ) {
+                        let _ = tx.send(KernelRouteEvent::Install {
+                            dst,
+                            prefix_len,
+                            nexthop,
+                        });
+                    } else {
+                        let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
+                    }
+                }
+            }
+        }
+
+        // Fan out to all peer channels.
+        for tx in self.peer_event_tx.values() {
+            let _ = tx.send(ToPeerEvent::NlriChange(filtered_update.clone()));
+        }
+    }
+
     fn event(
         &mut self,
         msg: TableEvent,
@@ -3844,7 +3966,7 @@ impl TableShard {
                                 &attrs,
                                 &mut nh,
                             );
-                            let changes = self.rtable.insert(
+                            if let Some(update) = self.rtable.insert(
                                 source.clone(),
                                 family,
                                 net.nlri,
@@ -3853,20 +3975,22 @@ impl TableShard {
                                 attrs.clone(),
                                 filtered,
                                 None,
-                            );
-                            self.distribute_changes(changes, kernel_tx, export_policy);
+                            ) {
+                                self.distribute_update(update, kernel_tx, export_policy);
+                            }
                         }
                     }
                     None => {
                         for net in nets {
-                            let changes = self.rtable.remove(
+                            if let Some(update) = self.rtable.remove(
                                 source.clone(),
                                 family,
                                 net.nlri,
                                 net.path_id,
                                 None,
-                            );
-                            self.distribute_changes(changes, kernel_tx, export_policy);
+                            ) {
+                                self.distribute_update(update, kernel_tx, export_policy);
+                            }
                         }
                     }
                 }
@@ -4164,7 +4288,10 @@ fn families_to_drop_on_disconnect<'a>(
 
 #[derive(Clone)]
 struct ExportMap {
-    advertised: FnvHashMap<Family, FnvHashSet<packet::Nlri>>,
+    // family -> nlri -> set of sent path_ids
+    // Non-Add-Path: inner set is {0} when prefix is advertised
+    // Add-Path: inner set contains each local_path_id that was sent
+    advertised: FnvHashMap<Family, FnvHashMap<packet::Nlri, FnvHashSet<u32>>>,
 }
 
 impl Default for ExportMap {
@@ -4180,20 +4307,45 @@ impl ExportMap {
         }
     }
 
-    fn mark_sent(&mut self, family: Family, nlri: packet::Nlri) {
-        self.advertised.entry(family).or_default().insert(nlri);
+    fn mark_sent(&mut self, family: Family, nlri: packet::Nlri, path_id: u32) {
+        self.advertised
+            .entry(family)
+            .or_default()
+            .entry(nlri)
+            .or_default()
+            .insert(path_id);
     }
 
-    fn mark_withdrawn(&mut self, family: Family, nlri: &packet::Nlri) {
-        if let Some(s) = self.advertised.get_mut(&family) {
-            s.remove(nlri);
+    fn mark_withdrawn(&mut self, family: Family, nlri: &packet::Nlri, path_id: u32) {
+        if let Some(m) = self.advertised.get_mut(&family)
+            && let Some(s) = m.get_mut(nlri)
+        {
+            s.remove(&path_id);
+            if s.is_empty() {
+                m.remove(nlri);
+            }
         }
     }
 
     fn was_sent(&self, family: Family, nlri: &packet::Nlri) -> bool {
         self.advertised
             .get(&family)
-            .is_some_and(|s| s.contains(nlri))
+            .is_some_and(|m| m.contains_key(nlri))
+    }
+
+    fn contains_path(&self, family: Family, nlri: &packet::Nlri, path_id: u32) -> bool {
+        self.advertised
+            .get(&family)
+            .and_then(|m| m.get(nlri))
+            .is_some_and(|s| s.contains(&path_id))
+    }
+
+    fn sent_path_ids(&self, family: Family, nlri: &packet::Nlri) -> FnvHashSet<u32> {
+        self.advertised
+            .get(&family)
+            .and_then(|m| m.get(nlri))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -4580,9 +4732,10 @@ impl PeerSession {
             }) {
                 continue;
             }
+            let pid = if effective_max > 1 { c.path_id } else { 0 };
             let (fam, net) = (c.family, c.net);
             pending.get_mut(&family).unwrap().insert_change(c);
-            export_map.mark_sent(fam, net);
+            export_map.mark_sent(fam, net, pid);
         }
     }
 
@@ -4977,6 +5130,9 @@ impl PeerSession {
             .and_then(|s| s.send_max().get(&ri.family))
             .copied()
             .unwrap_or(1);
+        // For the Advertise path (drop/stale/restale), path_id from Change is the right key.
+        // Non-Add-Path uses path_id=0; Add-Path uses ri.path_id.
+        let pid = if effective_max <= 1 { 0 } else { ri.path_id };
         if ri.rank > effective_max {
             if self
                 .conn_arbiter
@@ -4990,7 +5146,7 @@ impl PeerSession {
             {
                 let family = ri.family;
                 let net = ri.net;
-                self.export_map.mark_withdrawn(family, &net);
+                self.export_map.mark_withdrawn(family, &net, pid);
                 self.pending
                     .get_mut(&family)
                     .unwrap()
@@ -5003,12 +5159,153 @@ impl PeerSession {
         }
         if ri.attr.is_empty() {
             if self.export_map.was_sent(ri.family, &ri.net) {
-                self.export_map.mark_withdrawn(ri.family, &ri.net);
+                self.export_map.mark_withdrawn(ri.family, &ri.net, pid);
                 self.pending.get_mut(&ri.family).unwrap().insert_change(ri);
             }
         } else {
-            self.export_map.mark_sent(ri.family, ri.net);
+            self.export_map.mark_sent(ri.family, ri.net, pid);
             self.pending.get_mut(&ri.family).unwrap().insert_change(ri);
+        }
+    }
+
+    fn handle_prefix_update(&mut self, update: table::NlriChange) {
+        if self.conn_arbiter.lock().unwrap().state(self.role) != SessionState::Established {
+            return;
+        }
+        if !self.framer.inner().channel.contains_key(&update.family) {
+            return;
+        }
+
+        let effective_max = self
+            .conn_arbiter
+            .lock()
+            .unwrap()
+            .connection(self.role)
+            .and_then(|s| s.send_max().get(&update.family))
+            .copied()
+            .unwrap_or(1);
+
+        if effective_max == 1 {
+            // Non-Add-Path fast path: O(1) skip when best unchanged.
+            if !update.best_changed {
+                return;
+            }
+            match &update.new_best {
+                None => {
+                    // Best gone → WITHDRAW if we had advertised this prefix.
+                    if self.export_map.was_sent(update.family, &update.net) {
+                        self.export_map
+                            .mark_withdrawn(update.family, &update.net, 0);
+                        self.pending.get_mut(&update.family).unwrap().insert_change(
+                            table::Change {
+                                source: Arc::new(table::Source::new(
+                                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                                    0,
+                                    0,
+                                    Ipv4Addr::UNSPECIFIED,
+                                    0,
+                                    false,
+                                )),
+                                family: update.family,
+                                net: update.net,
+                                nexthop: bgp::Nexthop::V4(Ipv4Addr::UNSPECIFIED),
+                                attr: Arc::new(vec![]),
+                                path_id: 0,
+                                rank: 0,
+                                old_rank: 0,
+                            },
+                        );
+                    }
+                }
+                Some(best) => {
+                    if best.source.remote_addr == self.remote_addr {
+                        return;
+                    }
+                    // New best → ADVERTISE.
+                    self.export_map.mark_sent(update.family, update.net, 0);
+                    self.pending
+                        .get_mut(&update.family)
+                        .unwrap()
+                        .insert_change(table::Change {
+                            source: best.source.clone(),
+                            family: update.family,
+                            net: update.net,
+                            nexthop: best.nexthop,
+                            attr: best.attr.clone(),
+                            path_id: 0,
+                            rank: 1,
+                            old_rank: 0,
+                        });
+                }
+            }
+        } else {
+            // Add-Path path: compare current_paths vs export_map.
+            if !update.any_changed {
+                return;
+            }
+
+            let current_top_n: Vec<&table::BestPath> = update
+                .current_paths
+                .iter()
+                .filter(|p| p.source.remote_addr != self.remote_addr)
+                .take(effective_max)
+                .collect();
+
+            // Withdraw paths that were sent but are no longer in top-N.
+            let sent_ids = self.export_map.sent_path_ids(update.family, &update.net);
+            let current_ids: FnvHashSet<u32> =
+                current_top_n.iter().map(|p| p.local_path_id).collect();
+            for &pid in sent_ids.difference(&current_ids) {
+                self.export_map
+                    .mark_withdrawn(update.family, &update.net, pid);
+                self.pending
+                    .get_mut(&update.family)
+                    .unwrap()
+                    .insert_change(table::Change {
+                        source: Arc::new(table::Source::new(
+                            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                            0,
+                            0,
+                            Ipv4Addr::UNSPECIFIED,
+                            0,
+                            false,
+                        )),
+                        family: update.family,
+                        net: update.net,
+                        nexthop: bgp::Nexthop::V4(Ipv4Addr::UNSPECIFIED),
+                        attr: Arc::new(vec![]),
+                        path_id: pid,
+                        rank: 0,
+                        old_rank: 0,
+                    });
+            }
+
+            // Advertise new or updated paths.
+            for best in &current_top_n {
+                let already_sent =
+                    self.export_map
+                        .contains_path(update.family, &update.net, best.local_path_id);
+                let was_replaced = update.replaced_path_id == Some(best.local_path_id);
+                if !already_sent || was_replaced {
+                    self.export_map
+                        .mark_sent(update.family, update.net, best.local_path_id);
+                    self.pending
+                        .get_mut(&update.family)
+                        .unwrap()
+                        .insert_change(table::Change {
+                            source: best.source.clone(),
+                            family: update.family,
+                            net: update.net,
+                            nexthop: best.nexthop,
+                            attr: best.attr.clone(),
+                            path_id: best.local_path_id,
+                            rank: 1,
+                            old_rank: 0,
+                        });
+                }
+            }
         }
     }
 
@@ -5163,6 +5460,9 @@ impl PeerSession {
                         match msg {
                             ToPeerEvent::Advertise(ri) => {
                                 self.handle_advertise(ri);
+                            }
+                            ToPeerEvent::NlriChange(update) => {
+                                self.handle_prefix_update(update);
                             }
                         }
                     }
@@ -5748,7 +6048,7 @@ mod tests {
         setup_ipv4_session(&mut conn);
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
 
-        conn.export_map.mark_sent(Family::IPV4, nlri);
+        conn.export_map.mark_sent(Family::IPV4, nlri, 0);
         let ri = make_withdraw_change(nlri, other_source());
         conn.handle_advertise(ri);
 
@@ -5770,6 +6070,142 @@ mod tests {
         let ri = make_reach_change(nlri, other_source());
 
         conn.handle_advertise(ri);
+
+        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(conn.pending[&Family::IPV4].is_empty());
+    }
+
+    // ---- handle_prefix_update tests ----
+
+    fn make_prefix_update_reach(
+        nlri: packet::Nlri,
+        source: Arc<table::Source>,
+    ) -> table::NlriChange {
+        let best = table::BestPath {
+            local_path_id: 1,
+            source,
+            nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            attr: Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+            ]),
+        };
+        table::NlriChange {
+            family: Family::IPV4,
+            net: nlri,
+            best_changed: true,
+            any_changed: true,
+            replaced_path_id: None,
+            new_best: Some(best.clone()),
+            current_paths: Arc::new(vec![best]),
+        }
+    }
+
+    fn make_prefix_update_withdraw(nlri: packet::Nlri) -> table::NlriChange {
+        table::NlriChange {
+            family: Family::IPV4,
+            net: nlri,
+            best_changed: true,
+            any_changed: true,
+            replaced_path_id: None,
+            new_best: None,
+            current_paths: Arc::new(vec![]),
+        }
+    }
+
+    fn make_prefix_update_no_change(
+        nlri: packet::Nlri,
+        source: Arc<table::Source>,
+    ) -> table::NlriChange {
+        let best = table::BestPath {
+            local_path_id: 1,
+            source,
+            nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            attr: Arc::new(vec![]),
+        };
+        table::NlriChange {
+            family: Family::IPV4,
+            net: nlri,
+            best_changed: false,
+            any_changed: false,
+            replaced_path_id: None,
+            new_best: Some(best.clone()),
+            current_paths: Arc::new(vec![best]),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_prefix_update_reach_tracked_in_export_map() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        setup_ipv4_session(&mut conn);
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        let update = make_prefix_update_reach(nlri, other_source());
+
+        conn.handle_prefix_update(update);
+
+        // path_id=0 stored in export_map for non-Add-Path
+        assert!(conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(conn.export_map.contains_path(Family::IPV4, &nlri, 0));
+        assert!(!conn.pending[&Family::IPV4].is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_prefix_update_noop_when_best_unchanged() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        setup_ipv4_session(&mut conn);
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        let update = make_prefix_update_no_change(nlri, other_source());
+
+        conn.handle_prefix_update(update);
+
+        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(conn.pending[&Family::IPV4].is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_prefix_update_withdraw_when_best_gone() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        setup_ipv4_session(&mut conn);
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+
+        // Pre-mark as sent so the withdraw fires.
+        conn.export_map.mark_sent(Family::IPV4, nlri, 0);
+
+        let update = make_prefix_update_withdraw(nlri);
+        conn.handle_prefix_update(update);
+
+        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(!conn.pending[&Family::IPV4].is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_prefix_update_spurious_withdraw_suppressed() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        setup_ipv4_session(&mut conn);
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+
+        // Never advertised → spurious withdraw should be suppressed.
+        let update = make_prefix_update_withdraw(nlri);
+        conn.handle_prefix_update(update);
 
         assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
         assert!(conn.pending[&Family::IPV4].is_empty());
@@ -5862,7 +6298,7 @@ mod tests {
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let mut m = ExportMap::new();
         assert!(!m.was_sent(Family::IPV4, &nlri));
-        m.mark_sent(Family::IPV4, nlri);
+        m.mark_sent(Family::IPV4, nlri, 0);
         assert!(m.was_sent(Family::IPV4, &nlri));
     }
 
@@ -5877,9 +6313,9 @@ mod tests {
     fn export_map_mark_withdrawn_clears() {
         let nlri: packet::Nlri = "10.1.0.0/16".parse().unwrap();
         let mut m = ExportMap::new();
-        m.mark_sent(Family::IPV4, nlri);
+        m.mark_sent(Family::IPV4, nlri, 0);
         assert!(m.was_sent(Family::IPV4, &nlri));
-        m.mark_withdrawn(Family::IPV4, &nlri);
+        m.mark_withdrawn(Family::IPV4, &nlri, 0);
         assert!(!m.was_sent(Family::IPV4, &nlri));
     }
 
@@ -5888,10 +6324,10 @@ mod tests {
         let v4: packet::Nlri = "10.0.0.0/8".parse().unwrap();
         let v6: packet::Nlri = "2001:db8::/32".parse().unwrap();
         let mut m = ExportMap::new();
-        m.mark_sent(Family::IPV4, v4);
+        m.mark_sent(Family::IPV4, v4, 0);
         assert!(m.was_sent(Family::IPV4, &v4));
         assert!(!m.was_sent(Family::IPV6, &v4));
-        m.mark_sent(Family::IPV6, v6);
+        m.mark_sent(Family::IPV6, v6, 0);
         assert!(m.was_sent(Family::IPV6, &v6));
         assert!(!m.was_sent(Family::IPV4, &v6));
     }
@@ -6075,7 +6511,7 @@ mod tests {
         // Insert one IPv4 route and one IPv6 route for the peer.
         {
             let mut t = tables.shards[0].lock().await;
-            t.rtable.insert(
+            let _ = t.rtable.insert(
                 source.clone(),
                 Family::IPV4,
                 ipv4_net,
@@ -6085,7 +6521,7 @@ mod tests {
                 false,
                 None,
             );
-            t.rtable.insert(
+            let _ = t.rtable.insert(
                 source.clone(),
                 Family::IPV6,
                 ipv6_net,
