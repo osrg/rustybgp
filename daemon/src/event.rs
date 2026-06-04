@@ -4733,7 +4733,10 @@ impl PeerSession {
             }
             let pid = if effective_max > 1 { c.path_id } else { 0 };
             let (fam, net) = (c.family, c.net);
-            pending.get_mut(&family).unwrap().insert_change(c);
+            pending
+                .get_mut(&family)
+                .unwrap()
+                .reach(net, pid, c.nexthop, c.attr);
             export_map.mark_sent(fam, net, pid);
         }
     }
@@ -5195,26 +5198,10 @@ impl PeerSession {
                     if self.export_map.was_sent(update.family, &update.net) {
                         self.export_map
                             .mark_withdrawn(update.family, &update.net, 0);
-                        self.pending.get_mut(&update.family).unwrap().insert_change(
-                            table::Change {
-                                source: Arc::new(table::Source::new(
-                                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                                    0,
-                                    0,
-                                    Ipv4Addr::UNSPECIFIED,
-                                    0,
-                                    false,
-                                )),
-                                family: update.family,
-                                net: update.net,
-                                nexthop: bgp::Nexthop::V4(Ipv4Addr::UNSPECIFIED),
-                                attr: Arc::new(vec![]),
-                                path_id: 0,
-                                rank: 0,
-                                old_rank: 0,
-                            },
-                        );
+                        self.pending
+                            .get_mut(&update.family)
+                            .unwrap()
+                            .unreach(update.net, 0);
                     }
                 }
                 Some(best) => {
@@ -5223,19 +5210,12 @@ impl PeerSession {
                     }
                     // New best → ADVERTISE.
                     self.export_map.mark_sent(update.family, update.net, 0);
-                    self.pending
-                        .get_mut(&update.family)
-                        .unwrap()
-                        .insert_change(table::Change {
-                            source: best.source.clone(),
-                            family: update.family,
-                            net: update.net,
-                            nexthop: best.nexthop,
-                            attr: best.attr.clone(),
-                            path_id: 0,
-                            rank: 1,
-                            old_rank: 0,
-                        });
+                    self.pending.get_mut(&update.family).unwrap().reach(
+                        update.net,
+                        0,
+                        best.nexthop,
+                        best.attr.clone(),
+                    );
                 }
             }
         } else {
@@ -5261,24 +5241,7 @@ impl PeerSession {
                 self.pending
                     .get_mut(&update.family)
                     .unwrap()
-                    .insert_change(table::Change {
-                        source: Arc::new(table::Source::new(
-                            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                            0,
-                            0,
-                            Ipv4Addr::UNSPECIFIED,
-                            0,
-                            false,
-                        )),
-                        family: update.family,
-                        net: update.net,
-                        nexthop: bgp::Nexthop::V4(Ipv4Addr::UNSPECIFIED),
-                        attr: Arc::new(vec![]),
-                        path_id: pid,
-                        rank: 0,
-                        old_rank: 0,
-                    });
+                    .unreach(update.net, pid);
             }
 
             // Advertise new or updated paths.
@@ -5290,19 +5253,12 @@ impl PeerSession {
                 if !already_sent || was_replaced {
                     self.export_map
                         .mark_sent(update.family, update.net, best.local_path_id);
-                    self.pending
-                        .get_mut(&update.family)
-                        .unwrap()
-                        .insert_change(table::Change {
-                            source: best.source.clone(),
-                            family: update.family,
-                            net: update.net,
-                            nexthop: best.nexthop,
-                            attr: best.attr.clone(),
-                            path_id: best.local_path_id,
-                            rank: 1,
-                            old_rank: 0,
-                        });
+                    self.pending.get_mut(&update.family).unwrap().reach(
+                        update.net,
+                        best.local_path_id,
+                        best.nexthop,
+                        best.attr.clone(),
+                    );
                 }
             }
         }

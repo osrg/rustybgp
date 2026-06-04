@@ -57,46 +57,54 @@ impl PendingTx {
         self.pending_eor = true;
     }
 
-    pub(crate) fn insert_change(&mut self, change: rustybgp_table::Change) {
-        let pid = if self.addpath_tx { change.path_id } else { 0 };
-        let key: PendingKey = (change.net, pid);
-        if change.attr.is_empty() {
-            if let Some((attr, _)) = self.reach.remove(&key) {
-                let set = self.bucket.get_mut(&attr).unwrap();
-                let b = set.remove(&key);
-                assert!(b);
-                if set.is_empty() {
-                    self.bucket.remove(&attr);
-                }
+    pub(crate) fn reach(
+        &mut self,
+        nlri: packet::Nlri,
+        path_id: u32,
+        nexthop: Nexthop,
+        attr: Arc<Vec<packet::Attribute>>,
+    ) {
+        let pid = if self.addpath_tx { path_id } else { 0 };
+        let key: PendingKey = (nlri, pid);
+        self.unreach.remove(&key);
+        if let Some((old_attr, _)) = self.reach.insert(key, (attr.clone(), nexthop)) {
+            // b-1) same attr → no-op
+            if old_attr == attr {
+                return;
             }
-            self.unreach.insert(key);
+            // b-2) different attr → move between buckets
+            let old_bucket = self.bucket.get_mut(&old_attr).unwrap();
+            let b = old_bucket.remove(&key);
+            assert!(b);
+            if old_bucket.is_empty() {
+                self.bucket.remove(&old_attr);
+            }
+            self.bucket.entry(attr).or_default().insert(key);
         } else {
-            self.unreach.remove(&key);
+            // a) new key
+            self.bucket.entry(attr).or_default().insert(key);
+        }
+    }
 
-            if let Some((old_attr, _)) = self
-                .reach
-                .insert(key, (change.attr.clone(), change.nexthop))
-            {
-                // b-1) same attr → no-op
-                if old_attr == change.attr {
-                    return;
-                }
-
-                // b-2) different attr → move between buckets
-                let old_bucket = self.bucket.get_mut(&old_attr).unwrap();
-                let b = old_bucket.remove(&key);
-                assert!(b);
-                if old_bucket.is_empty() {
-                    self.bucket.remove(&old_attr);
-                }
-
-                let bucket = self.bucket.entry(change.attr).or_default();
-                bucket.insert(key);
-            } else {
-                // a) new key
-                let bucket = self.bucket.entry(change.attr).or_default();
-                bucket.insert(key);
+    pub(crate) fn unreach(&mut self, nlri: packet::Nlri, path_id: u32) {
+        let pid = if self.addpath_tx { path_id } else { 0 };
+        let key: PendingKey = (nlri, pid);
+        if let Some((attr, _)) = self.reach.remove(&key) {
+            let set = self.bucket.get_mut(&attr).unwrap();
+            let b = set.remove(&key);
+            assert!(b);
+            if set.is_empty() {
+                self.bucket.remove(&attr);
             }
+        }
+        self.unreach.insert(key);
+    }
+
+    pub(crate) fn insert_change(&mut self, change: rustybgp_table::Change) {
+        if change.attr.is_empty() {
+            self.unreach(change.net, change.path_id);
+        } else {
+            self.reach(change.net, change.path_id, change.nexthop, change.attr);
         }
     }
 
