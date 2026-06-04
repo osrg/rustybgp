@@ -6744,494 +6744,402 @@ mod tests {
         assert!(gr_on_disconnect(&r, make_negotiated_gr(true)).is_none());
     }
 
-    // ---- process_nlri_change unit tests ----
-    //
-    // These tests drive the pure process_nlri_change() function directly,
-    // bypassing session setup.  drain_messages() is used to inspect the
-    // actual BGP UPDATE/WITHDRAW content queued into PendingTx.
+    /// Tests for process_nlri_change() — the pure routing-update function.
+    /// drain_messages() is used to inspect the actual BGP UPDATE/WITHDRAW content.
+    mod process_nlri_change {
+        use super::*;
 
-    fn pnc_nlri(s: &str) -> packet::Nlri {
-        s.parse().unwrap()
-    }
-
-    fn pnc_source(addr: &str) -> Arc<table::Source> {
-        let ip: IpAddr = addr.parse().unwrap();
-        Arc::new(table::Source::new(
-            ip,
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            65002,
-            65001,
-            Ipv4Addr::new(10, 0, 0, 1),
-            0,
-            false,
-        ))
-    }
-
-    fn pnc_path(local_path_id: u32, source: Arc<table::Source>) -> table::Path {
-        table::Path {
-            local_path_id,
-            source,
-            nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            attr: Arc::new(vec![
-                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-            ]),
+        fn nlri(s: &str) -> packet::Nlri {
+            s.parse().unwrap()
         }
-    }
 
-    fn pnc_change(
-        nlri: packet::Nlri,
-        best_changed: bool,
-        any_changed: bool,
-        replaced_path_id: Option<u32>,
-        paths: Vec<table::Path>,
-    ) -> table::NlriChange {
-        table::NlriChange {
-            family: Family::IPV4,
-            net: nlri,
-            best_changed,
-            any_changed,
-            replaced_path_id,
-            current_paths: Arc::new(paths),
+        fn source(addr: &str) -> Arc<table::Source> {
+            let ip: IpAddr = addr.parse().unwrap();
+            Arc::new(table::Source::new(
+                ip,
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                65002,
+                65001,
+                Ipv4Addr::new(10, 0, 0, 1),
+                0,
+                false,
+            ))
         }
-    }
 
-    /// Extract (nlri, path_id) pairs from reach entries in UPDATE messages.
-    fn reach_entries(msgs: &[bgp::Message]) -> Vec<(packet::Nlri, u32)> {
-        let mut out = Vec::new();
-        for msg in msgs {
-            if let bgp::Message::Update(u) = msg {
-                if let Some(set) = &u.reach {
-                    for e in &set.entries {
-                        out.push((e.nlri, e.path_id));
-                    }
-                }
-                if let Some(set) = &u.mp_reach {
-                    for e in &set.entries {
+        fn path(local_path_id: u32, source: Arc<table::Source>) -> table::Path {
+            table::Path {
+                local_path_id,
+                source,
+                nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                attr: Arc::new(vec![
+                    packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                ]),
+            }
+        }
+
+        fn change(
+            nlri: packet::Nlri,
+            best_changed: bool,
+            any_changed: bool,
+            replaced_path_id: Option<u32>,
+            paths: Vec<table::Path>,
+        ) -> table::NlriChange {
+            table::NlriChange {
+                family: Family::IPV4,
+                net: nlri,
+                best_changed,
+                any_changed,
+                replaced_path_id,
+                current_paths: Arc::new(paths),
+            }
+        }
+
+        /// Extract (nlri, path_id) pairs from reach entries in UPDATE messages.
+        fn reach_entries(msgs: &[bgp::Message]) -> Vec<(packet::Nlri, u32)> {
+            let mut out = Vec::new();
+            for msg in msgs {
+                if let bgp::Message::Update(u) = msg {
+                    for e in u
+                        .reach
+                        .iter()
+                        .chain(u.mp_reach.iter())
+                        .flat_map(|s| &s.entries)
+                    {
                         out.push((e.nlri, e.path_id));
                     }
                 }
             }
+            out
         }
-        out
-    }
 
-    /// Extract (nlri, path_id) pairs from unreach entries in UPDATE messages.
-    fn unreach_entries(msgs: &[bgp::Message]) -> Vec<(packet::Nlri, u32)> {
-        let mut out = Vec::new();
-        for msg in msgs {
-            if let bgp::Message::Update(u) = msg {
-                if let Some(set) = &u.unreach {
-                    for e in &set.entries {
-                        out.push((e.nlri, e.path_id));
-                    }
-                }
-                if let Some(set) = &u.mp_unreach {
-                    for e in &set.entries {
+        /// Extract (nlri, path_id) pairs from unreach entries in UPDATE messages.
+        fn unreach_entries(msgs: &[bgp::Message]) -> Vec<(packet::Nlri, u32)> {
+            let mut out = Vec::new();
+            for msg in msgs {
+                if let bgp::Message::Update(u) = msg {
+                    for e in u
+                        .unreach
+                        .iter()
+                        .chain(u.mp_unreach.iter())
+                        .flat_map(|s| &s.entries)
+                    {
                         out.push((e.nlri, e.path_id));
                     }
                 }
             }
+            out
         }
-        out
-    }
 
-    const SELF_ADDR: &str = "10.0.0.1";
-    const PEER_ADDR: &str = "10.0.0.2";
+        const SELF: &str = "10.0.0.1";
+        const PEER: &str = "10.0.0.2";
 
-    // ---- Non-Add-Path (effective_max=1) ----
+        // ---- Non-Add-Path (effective_max=1) ----
 
-    #[test]
-    fn pnc_nonaddpath_noop_when_best_unchanged() {
-        let mut em = ExportMap::new();
-        let mut pending = crate::peer_tx::PendingTx::new(false);
-        let net = pnc_nlri("10.0.0.0/24");
-        let update = pnc_change(net, false, false, None, vec![]);
+        #[test]
+        fn noop_when_best_unchanged() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let update = change(net, false, false, None, vec![]);
 
-        process_nlri_change(
-            &update,
-            1,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 1, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(pending.is_empty());
-        assert!(!em.was_sent(Family::IPV4, &net));
-    }
+            assert!(pending.is_empty());
+            assert!(!em.was_sent(Family::IPV4, &net));
+        }
 
-    #[test]
-    fn pnc_nonaddpath_new_best_sends_update() {
-        let mut em = ExportMap::new();
-        let mut pending = crate::peer_tx::PendingTx::new(false);
-        let net = pnc_nlri("10.0.0.0/24");
-        let path = pnc_path(1, pnc_source(PEER_ADDR));
-        let update = pnc_change(net, true, true, None, vec![path]);
+        #[test]
+        fn new_best_sends_update() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let path = path(1, source(PEER));
+            let update = change(net, true, true, None, vec![path]);
 
-        process_nlri_change(
-            &update,
-            1,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 1, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(em.was_sent(Family::IPV4, &net));
-        assert!(em.contains_path(Family::IPV4, &net, 0)); // non-addpath uses path_id=0
-        let msgs = pending.drain_messages(Family::IPV4, false);
-        let reach = reach_entries(&msgs);
-        assert_eq!(reach.len(), 1);
-        assert_eq!(reach[0].0, net);
-        assert_eq!(reach[0].1, 0); // path_id=0 on wire for non-addpath
-    }
+            assert!(em.was_sent(Family::IPV4, &net));
+            assert!(em.contains_path(Family::IPV4, &net, 0)); // non-addpath uses path_id=0
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            let reach = reach_entries(&msgs);
+            assert_eq!(reach.len(), 1);
+            assert_eq!(reach[0].0, net);
+            assert_eq!(reach[0].1, 0); // path_id=0 on wire for non-addpath
+        }
 
-    #[test]
-    fn pnc_nonaddpath_withdraw_when_best_gone_and_was_sent() {
-        let mut em = ExportMap::new();
-        em.mark_sent(Family::IPV4, pnc_nlri("10.0.0.0/24"), 0);
-        let mut pending = crate::peer_tx::PendingTx::new(false);
-        let net = pnc_nlri("10.0.0.0/24");
-        let update = pnc_change(net, true, true, None, vec![]);
+        #[test]
+        fn withdraw_when_best_gone_and_was_sent() {
+            let mut em = ExportMap::new();
+            em.mark_sent(Family::IPV4, nlri("10.0.0.0/24"), 0);
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let update = change(net, true, true, None, vec![]);
 
-        process_nlri_change(
-            &update,
-            1,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 1, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(!em.was_sent(Family::IPV4, &net));
-        let msgs = pending.drain_messages(Family::IPV4, false);
-        let unreach = unreach_entries(&msgs);
-        assert_eq!(unreach.len(), 1);
-        assert_eq!(unreach[0].0, net);
-    }
+            assert!(!em.was_sent(Family::IPV4, &net));
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            let unreach = unreach_entries(&msgs);
+            assert_eq!(unreach.len(), 1);
+            assert_eq!(unreach[0].0, net);
+        }
 
-    #[test]
-    fn pnc_nonaddpath_spurious_withdraw_suppressed() {
-        let mut em = ExportMap::new();
-        let mut pending = crate::peer_tx::PendingTx::new(false);
-        let net = pnc_nlri("10.0.0.0/24");
-        let update = pnc_change(net, true, true, None, vec![]);
+        #[test]
+        fn spurious_withdraw_suppressed() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let update = change(net, true, true, None, vec![]);
 
-        process_nlri_change(
-            &update,
-            1,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 1, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(pending.is_empty());
-        assert!(!em.was_sent(Family::IPV4, &net));
-    }
+            assert!(pending.is_empty());
+            assert!(!em.was_sent(Family::IPV4, &net));
+        }
 
-    #[test]
-    fn pnc_nonaddpath_echo_prevention() {
-        let mut em = ExportMap::new();
-        let mut pending = crate::peer_tx::PendingTx::new(false);
-        let net = pnc_nlri("10.0.0.0/24");
-        // Path from self — must not be echoed back
-        let path = pnc_path(1, pnc_source(SELF_ADDR));
-        let update = pnc_change(net, true, true, None, vec![path]);
+        #[test]
+        fn nonaddpath_echo_prevention() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            // Path from self — must not be echoed back
+            let path = path(1, source(SELF));
+            let update = change(net, true, true, None, vec![path]);
 
-        process_nlri_change(
-            &update,
-            1,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 1, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(pending.is_empty());
-        assert!(!em.was_sent(Family::IPV4, &net));
-    }
+            assert!(pending.is_empty());
+            assert!(!em.was_sent(Family::IPV4, &net));
+        }
 
-    #[test]
-    fn pnc_nonaddpath_advertise_then_withdraw_sequence() {
-        let mut em = ExportMap::new();
-        let mut pending = crate::peer_tx::PendingTx::new(false);
-        let net = pnc_nlri("10.0.0.0/24");
-        let remote = SELF_ADDR.parse().unwrap();
+        #[test]
+        fn advertise_then_withdraw_sequence() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let remote = SELF.parse().unwrap();
 
-        // 1. Advertise
-        let path = pnc_path(1, pnc_source(PEER_ADDR));
-        process_nlri_change(
-            &pnc_change(net, true, true, None, vec![path]),
-            1,
-            remote,
-            &mut em,
-            &mut pending,
-        );
-        assert!(em.was_sent(Family::IPV4, &net));
-        pending.drain_messages(Family::IPV4, false); // flush
+            // 1. Advertise
+            let path = path(1, source(PEER));
+            process_nlri_change(
+                &change(net, true, true, None, vec![path]),
+                1,
+                remote,
+                &mut em,
+                &mut pending,
+            );
+            assert!(em.was_sent(Family::IPV4, &net));
+            pending.drain_messages(Family::IPV4, false); // flush
 
-        // 2. Withdraw
-        process_nlri_change(
-            &pnc_change(net, true, true, None, vec![]),
-            1,
-            remote,
-            &mut em,
-            &mut pending,
-        );
-        assert!(!em.was_sent(Family::IPV4, &net));
-        let msgs = pending.drain_messages(Family::IPV4, false);
-        assert_eq!(unreach_entries(&msgs).len(), 1);
-    }
+            // 2. Withdraw
+            process_nlri_change(
+                &change(net, true, true, None, vec![]),
+                1,
+                remote,
+                &mut em,
+                &mut pending,
+            );
+            assert!(!em.was_sent(Family::IPV4, &net));
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            assert_eq!(unreach_entries(&msgs).len(), 1);
+        }
 
-    // ---- Add-Path (effective_max=2) ----
+        // ---- Add-Path (effective_max=2) ----
 
-    #[test]
-    fn pnc_addpath_noop_when_any_unchanged() {
-        let mut em = ExportMap::new();
-        let mut pending = crate::peer_tx::PendingTx::new(true);
-        let net = pnc_nlri("10.0.0.0/24");
-        let path = pnc_path(1, pnc_source(PEER_ADDR));
-        let update = pnc_change(net, false, false, None, vec![path]);
+        #[test]
+        fn noop_when_any_unchanged() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let net = nlri("10.0.0.0/24");
+            let path = path(1, source(PEER));
+            let update = change(net, false, false, None, vec![path]);
 
-        process_nlri_change(
-            &update,
-            2,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(pending.is_empty());
-    }
+            assert!(pending.is_empty());
+        }
 
-    #[test]
-    fn pnc_addpath_new_paths_send_updates() {
-        let mut em = ExportMap::new();
-        let mut pending = crate::peer_tx::PendingTx::new(true);
-        let net = pnc_nlri("10.0.0.0/24");
-        let src = pnc_source(PEER_ADDR);
-        let paths = vec![pnc_path(1, src.clone()), pnc_path(2, src.clone())];
-        let update = pnc_change(net, true, true, None, paths);
+        #[test]
+        fn new_paths_send_updates() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let net = nlri("10.0.0.0/24");
+            let src = source(PEER);
+            let paths = vec![path(1, src.clone()), path(2, src.clone())];
+            let update = change(net, true, true, None, paths);
 
-        process_nlri_change(
-            &update,
-            2,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(em.contains_path(Family::IPV4, &net, 1));
-        assert!(em.contains_path(Family::IPV4, &net, 2));
-        let msgs = pending.drain_messages(Family::IPV4, false);
-        let reach = reach_entries(&msgs);
-        let pids: std::collections::HashSet<u32> = reach.iter().map(|e| e.1).collect();
-        assert!(pids.contains(&1));
-        assert!(pids.contains(&2));
-        assert!(reach.iter().all(|e| e.0 == net));
-    }
+            assert!(em.contains_path(Family::IPV4, &net, 1));
+            assert!(em.contains_path(Family::IPV4, &net, 2));
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            let reach = reach_entries(&msgs);
+            let pids: std::collections::HashSet<u32> = reach.iter().map(|e| e.1).collect();
+            assert!(pids.contains(&1));
+            assert!(pids.contains(&2));
+            assert!(reach.iter().all(|e| e.0 == net));
+        }
 
-    #[test]
-    fn pnc_addpath_path_removed_sends_withdraw() {
-        let mut em = ExportMap::new();
-        let net = pnc_nlri("10.0.0.0/24");
-        em.mark_sent(Family::IPV4, net, 1);
-        em.mark_sent(Family::IPV4, net, 2);
-        let mut pending = crate::peer_tx::PendingTx::new(true);
-        let src = pnc_source(PEER_ADDR);
-        // path_id=2 is removed; only path_id=1 remains
-        let update = pnc_change(net, true, true, None, vec![pnc_path(1, src)]);
+        #[test]
+        fn path_removed_sends_withdraw() {
+            let mut em = ExportMap::new();
+            let net = nlri("10.0.0.0/24");
+            em.mark_sent(Family::IPV4, net, 1);
+            em.mark_sent(Family::IPV4, net, 2);
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let src = source(PEER);
+            // path_id=2 is removed; only path_id=1 remains
+            let update = change(net, true, true, None, vec![path(1, src)]);
 
-        process_nlri_change(
-            &update,
-            2,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(em.contains_path(Family::IPV4, &net, 1));
-        assert!(!em.contains_path(Family::IPV4, &net, 2));
-        let msgs = pending.drain_messages(Family::IPV4, false);
-        let unreach = unreach_entries(&msgs);
-        assert_eq!(unreach.len(), 1);
-        assert_eq!(unreach[0].1, 2);
-    }
+            assert!(em.contains_path(Family::IPV4, &net, 1));
+            assert!(!em.contains_path(Family::IPV4, &net, 2));
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            let unreach = unreach_entries(&msgs);
+            assert_eq!(unreach.len(), 1);
+            assert_eq!(unreach[0].1, 2);
+        }
 
-    #[test]
-    fn pnc_addpath_replaced_path_readvertised() {
-        let mut em = ExportMap::new();
-        let net = pnc_nlri("10.0.0.0/24");
-        em.mark_sent(Family::IPV4, net, 1);
-        em.mark_sent(Family::IPV4, net, 2);
-        let mut pending = crate::peer_tx::PendingTx::new(true);
-        let src = pnc_source(PEER_ADDR);
-        // path_id=1 was replaced (new attributes); path_id=2 unchanged
-        let paths = vec![pnc_path(1, src.clone()), pnc_path(2, src)];
-        let update = pnc_change(net, false, true, Some(1), paths);
+        #[test]
+        fn replaced_path_readvertised() {
+            let mut em = ExportMap::new();
+            let net = nlri("10.0.0.0/24");
+            em.mark_sent(Family::IPV4, net, 1);
+            em.mark_sent(Family::IPV4, net, 2);
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let src = source(PEER);
+            // path_id=1 was replaced (new attributes); path_id=2 unchanged
+            let paths = vec![path(1, src.clone()), path(2, src)];
+            let update = change(net, false, true, Some(1), paths);
 
-        process_nlri_change(
-            &update,
-            2,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        let msgs = pending.drain_messages(Family::IPV4, false);
-        let reach = reach_entries(&msgs);
-        // Only path_id=1 re-advertised; path_id=2 unchanged
-        assert_eq!(reach.len(), 1);
-        assert_eq!(reach[0].1, 1);
-        assert!(unreach_entries(&msgs).is_empty());
-    }
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            let reach = reach_entries(&msgs);
+            // Only path_id=1 re-advertised; path_id=2 unchanged
+            assert_eq!(reach.len(), 1);
+            assert_eq!(reach[0].1, 1);
+            assert!(unreach_entries(&msgs).is_empty());
+        }
 
-    #[test]
-    fn pnc_addpath_new_path_pushes_existing_out_of_send_max() {
-        // Before: export_map = {pid=1(rank1), pid=2(rank2)}, send_max=2
-        // New path pid=3 arrives at rank1 → current_paths = [pid=3, pid=1, pid=2]
-        // top-2 = [pid=3, pid=1]; pid=2 pushed out → WITHDRAW pid=2, UPDATE pid=3
-        let mut em = ExportMap::new();
-        let net = pnc_nlri("10.0.0.0/24");
-        em.mark_sent(Family::IPV4, net, 1);
-        em.mark_sent(Family::IPV4, net, 2);
-        let mut pending = crate::peer_tx::PendingTx::new(true);
-        let src = pnc_source(PEER_ADDR);
-        let paths = vec![
-            pnc_path(3, src.clone()),
-            pnc_path(1, src.clone()),
-            pnc_path(2, src),
-        ];
-        let update = pnc_change(net, true, true, None, paths);
+        #[test]
+        fn new_path_pushes_existing_out_of_send_max() {
+            // Before: export_map = {pid=1(rank1), pid=2(rank2)}, send_max=2
+            // New path pid=3 arrives at rank1 → current_paths = [pid=3, pid=1, pid=2]
+            // top-2 = [pid=3, pid=1]; pid=2 pushed out → WITHDRAW pid=2, UPDATE pid=3
+            let mut em = ExportMap::new();
+            let net = nlri("10.0.0.0/24");
+            em.mark_sent(Family::IPV4, net, 1);
+            em.mark_sent(Family::IPV4, net, 2);
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let src = source(PEER);
+            let paths = vec![path(3, src.clone()), path(1, src.clone()), path(2, src)];
+            let update = change(net, true, true, None, paths);
 
-        process_nlri_change(
-            &update,
-            2,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(em.contains_path(Family::IPV4, &net, 3));
-        assert!(em.contains_path(Family::IPV4, &net, 1));
-        assert!(!em.contains_path(Family::IPV4, &net, 2)); // pushed out
-        let msgs = pending.drain_messages(Family::IPV4, false);
-        let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
-        let unreach_pids: Vec<u32> = unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
-        assert!(reach_pids.contains(&3));
-        assert!(!reach_pids.contains(&1)); // already sent, no re-advertise
-        assert_eq!(unreach_pids, vec![2]);
-    }
+            assert!(em.contains_path(Family::IPV4, &net, 3));
+            assert!(em.contains_path(Family::IPV4, &net, 1));
+            assert!(!em.contains_path(Family::IPV4, &net, 2)); // pushed out
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
+            let unreach_pids: Vec<u32> = unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
+            assert!(reach_pids.contains(&3));
+            assert!(!reach_pids.contains(&1)); // already sent, no re-advertise
+            assert_eq!(unreach_pids, vec![2]);
+        }
 
-    #[test]
-    fn pnc_addpath_path_deleted_pulls_outside_path_into_send_max() {
-        // Before: export_map = {pid=1(rank1), pid=2(rank2)}, send_max=2
-        // paths = [pid=1(rank1), pid=2(rank2), pid=3(rank3)] — pid=3 outside window
-        // Delete pid=1 → current_paths = [pid=2(rank1), pid=3(rank2)]
-        // top-2 = [pid=2, pid=3]: WITHDRAW pid=1, UPDATE pid=3 (enters window)
-        let mut em = ExportMap::new();
-        let net = pnc_nlri("10.0.0.0/24");
-        em.mark_sent(Family::IPV4, net, 1);
-        em.mark_sent(Family::IPV4, net, 2);
-        let mut pending = crate::peer_tx::PendingTx::new(true);
-        let src = pnc_source(PEER_ADDR);
-        // pid=1 was removed; remaining: pid=2, pid=3
-        let paths = vec![pnc_path(2, src.clone()), pnc_path(3, src)];
-        let update = pnc_change(net, true, true, None, paths);
+        #[test]
+        fn path_deleted_pulls_outside_path_into_send_max() {
+            // Before: export_map = {pid=1(rank1), pid=2(rank2)}, send_max=2
+            // paths = [pid=1(rank1), pid=2(rank2), pid=3(rank3)] — pid=3 outside window
+            // Delete pid=1 → current_paths = [pid=2(rank1), pid=3(rank2)]
+            // top-2 = [pid=2, pid=3]: WITHDRAW pid=1, UPDATE pid=3 (enters window)
+            let mut em = ExportMap::new();
+            let net = nlri("10.0.0.0/24");
+            em.mark_sent(Family::IPV4, net, 1);
+            em.mark_sent(Family::IPV4, net, 2);
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let src = source(PEER);
+            // pid=1 was removed; remaining: pid=2, pid=3
+            let paths = vec![path(2, src.clone()), path(3, src)];
+            let update = change(net, true, true, None, paths);
 
-        process_nlri_change(
-            &update,
-            2,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(!em.contains_path(Family::IPV4, &net, 1)); // withdrawn
-        assert!(em.contains_path(Family::IPV4, &net, 2)); // kept
-        assert!(em.contains_path(Family::IPV4, &net, 3)); // entered window
-        let msgs = pending.drain_messages(Family::IPV4, false);
-        let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
-        let unreach_pids: Vec<u32> = unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
-        assert!(reach_pids.contains(&3));
-        assert!(!reach_pids.contains(&2)); // already sent
-        assert_eq!(unreach_pids, vec![1]);
-    }
+            assert!(!em.contains_path(Family::IPV4, &net, 1)); // withdrawn
+            assert!(em.contains_path(Family::IPV4, &net, 2)); // kept
+            assert!(em.contains_path(Family::IPV4, &net, 3)); // entered window
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
+            let unreach_pids: Vec<u32> = unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
+            assert!(reach_pids.contains(&3));
+            assert!(!reach_pids.contains(&2)); // already sent
+            assert_eq!(unreach_pids, vec![1]);
+        }
 
-    #[test]
-    fn pnc_addpath_all_paths_removed_withdraws_all() {
-        let mut em = ExportMap::new();
-        let net = pnc_nlri("10.0.0.0/24");
-        em.mark_sent(Family::IPV4, net, 1);
-        em.mark_sent(Family::IPV4, net, 2);
-        let mut pending = crate::peer_tx::PendingTx::new(true);
-        let update = pnc_change(net, true, true, None, vec![]);
+        #[test]
+        fn all_paths_removed_withdraws_all() {
+            let mut em = ExportMap::new();
+            let net = nlri("10.0.0.0/24");
+            em.mark_sent(Family::IPV4, net, 1);
+            em.mark_sent(Family::IPV4, net, 2);
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let update = change(net, true, true, None, vec![]);
 
-        process_nlri_change(
-            &update,
-            2,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(!em.was_sent(Family::IPV4, &net));
-        let msgs = pending.drain_messages(Family::IPV4, false);
-        let unreach_pids: std::collections::HashSet<u32> =
-            unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
-        assert!(unreach_pids.contains(&1));
-        assert!(unreach_pids.contains(&2));
-    }
+            assert!(!em.was_sent(Family::IPV4, &net));
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            let unreach_pids: std::collections::HashSet<u32> =
+                unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
+            assert!(unreach_pids.contains(&1));
+            assert!(unreach_pids.contains(&2));
+        }
 
-    #[test]
-    fn pnc_addpath_echo_prevention() {
-        let mut em = ExportMap::new();
-        let mut pending = crate::peer_tx::PendingTx::new(true);
-        let net = pnc_nlri("10.0.0.0/24");
-        // Both paths from self — neither should be sent
-        let self_src = pnc_source(SELF_ADDR);
-        let paths = vec![pnc_path(1, self_src.clone()), pnc_path(2, self_src)];
-        let update = pnc_change(net, true, true, None, paths);
+        #[test]
+        fn addpath_echo_prevention() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let net = nlri("10.0.0.0/24");
+            // Both paths from self — neither should be sent
+            let self_src = source(SELF);
+            let paths = vec![path(1, self_src.clone()), path(2, self_src)];
+            let update = change(net, true, true, None, paths);
 
-        process_nlri_change(
-            &update,
-            2,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(pending.is_empty());
-        assert!(!em.was_sent(Family::IPV4, &net));
-    }
+            assert!(pending.is_empty());
+            assert!(!em.was_sent(Family::IPV4, &net));
+        }
 
-    #[test]
-    fn pnc_addpath_mixed_self_and_peer_paths() {
-        // Only peer paths should be sent; self paths filtered out
-        let mut em = ExportMap::new();
-        let mut pending = crate::peer_tx::PendingTx::new(true);
-        let net = pnc_nlri("10.0.0.0/24");
-        let self_src = pnc_source(SELF_ADDR);
-        let peer_src = pnc_source(PEER_ADDR);
-        let paths = vec![
-            pnc_path(1, peer_src.clone()),
-            pnc_path(2, self_src), // filtered
-            pnc_path(3, peer_src),
-        ];
-        let update = pnc_change(net, true, true, None, paths);
+        #[test]
+        fn mixed_self_and_peer_paths() {
+            // Only peer paths should be sent; self paths filtered out
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let net = nlri("10.0.0.0/24");
+            let self_src = source(SELF);
+            let peer_src = source(PEER);
+            let paths = vec![
+                path(1, peer_src.clone()),
+                path(2, self_src), // filtered
+                path(3, peer_src),
+            ];
+            let update = change(net, true, true, None, paths);
 
-        // send_max=3 but only 2 peer paths after echo filter
-        process_nlri_change(
-            &update,
-            3,
-            SELF_ADDR.parse().unwrap(),
-            &mut em,
-            &mut pending,
-        );
+            // send_max=3 but only 2 peer paths after echo filter
+            process_nlri_change(&update, 3, SELF.parse().unwrap(), &mut em, &mut pending);
 
-        assert!(em.contains_path(Family::IPV4, &net, 1));
-        assert!(!em.contains_path(Family::IPV4, &net, 2)); // self path not sent
-        assert!(em.contains_path(Family::IPV4, &net, 3));
-        let msgs = pending.drain_messages(Family::IPV4, false);
-        let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
-        assert_eq!(reach_pids.len(), 2);
-        assert!(reach_pids.contains(&1));
-        assert!(reach_pids.contains(&3));
-    }
+            assert!(em.contains_path(Family::IPV4, &net, 1));
+            assert!(!em.contains_path(Family::IPV4, &net, 2)); // self path not sent
+            assert!(em.contains_path(Family::IPV4, &net, 3));
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
+            assert_eq!(reach_pids.len(), 2);
+            assert!(reach_pids.contains(&1));
+            assert!(reach_pids.contains(&3));
+        }
+    } // mod process_nlri_change
 }
