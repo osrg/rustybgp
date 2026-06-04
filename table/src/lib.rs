@@ -269,19 +269,6 @@ impl Destination {
     }
 }
 
-/// Snapshot of a path in the top-N used for diffing before/after mutations.
-struct TopNEntry {
-    source: Arc<Source>,
-    nexthop: bgp::Nexthop,
-    attr: Arc<Vec<packet::Attribute>>,
-    local_path_id: u32,
-}
-
-fn same_top_entry(a: &TopNEntry, b: &RibEntry) -> bool {
-    (Arc::ptr_eq(&a.source, &b.path.source) && Arc::ptr_eq(&a.attr, &b.path.attr))
-        || (Arc::ptr_eq(&a.source, &b.path.source) && a.attr.as_ref() == b.path.attr.as_ref())
-}
-
 #[derive(Default, Clone, Debug)]
 pub struct TableState {
     pub num_destination: usize,
@@ -908,87 +895,8 @@ impl Table {
         })
     }
 
-    /// Compare old path snapshot against the current destination state and
-    /// produce `Change` entries for paths that were added, removed, or modified.
-    /// Uses stable `local_path_id` rather than positional rank.
-    fn diff_top_n(
-        dst: &Destination,
-        old_top: &[TopNEntry],
-        family: Family,
-        net: packet::Nlri,
-    ) -> Vec<Change> {
-        let new_top = dst.unfiltered_all();
+    pub fn drop(&mut self, addr: IpAddr, family: Family) -> Vec<NlriChange> {
         let mut changes = Vec::new();
-
-        // Withdraw: paths in old_top whose local_path_id is absent from new_top
-        for (i, old) in old_top.iter().enumerate() {
-            let still_present = new_top
-                .iter()
-                .any(|p| p.path.local_path_id == old.local_path_id);
-            if !still_present {
-                changes.push(Change {
-                    source: old.source.clone(),
-                    family,
-                    net,
-                    nexthop: old.nexthop,
-                    attr: Arc::new(Vec::new()),
-                    path_id: old.local_path_id,
-                    rank: i + 1,
-                    old_rank: i + 1,
-                });
-            }
-        }
-
-        // Advertise: paths in new_top that are new or have changed attributes
-        for (i, p) in new_top.iter().enumerate() {
-            let rank = i + 1;
-            let old_entry = old_top
-                .iter()
-                .find(|o| o.local_path_id == p.path.local_path_id);
-            match old_entry {
-                None => {
-                    // Newly entered top-N — advertise
-                    changes.push(Change {
-                        source: p.path.source.clone(),
-                        family,
-                        net,
-                        nexthop: p.path.nexthop,
-                        attr: p.path.attr.clone(),
-                        path_id: p.path.local_path_id,
-                        rank,
-                        old_rank: 0,
-                    });
-                }
-                Some(_) => {
-                    let old_rank = old_top
-                        .iter()
-                        .position(|o| o.local_path_id == p.path.local_path_id)
-                        .unwrap()
-                        + 1;
-                    if !same_top_entry(&old_top[old_rank - 1], p) || rank != old_rank {
-                        // Attributes changed or rank shifted — re-advertise so
-                        // peers whose send_max window now includes (or excludes)
-                        // this path can update accordingly.
-                        changes.push(Change {
-                            source: p.path.source.clone(),
-                            family,
-                            net,
-                            nexthop: p.path.nexthop,
-                            attr: p.path.attr.clone(),
-                            path_id: p.path.local_path_id,
-                            rank,
-                            old_rank,
-                        });
-                    }
-                }
-            }
-        }
-
-        changes
-    }
-
-    pub fn drop(&mut self, addr: IpAddr, family: Family) -> Vec<Change> {
-        let mut advertise = Vec::new();
         if let Some(fm) = self.route_stats.get_mut(&addr) {
             fm.remove(&family);
             if fm.is_empty() {
@@ -997,40 +905,53 @@ impl Table {
         }
         if let Some(rt) = self.ribs.get_mut(&family) {
             rt.destinations.retain(|net, dst| {
-                let old_top: Vec<TopNEntry> = dst
-                    .unfiltered_all()
+                if !dst.entry.iter().any(|e| e.path.source.remote_addr == addr) {
+                    return true;
+                }
+                let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let removed_any_unfiltered = dst
+                    .entry
                     .iter()
-                    .map(|p| TopNEntry {
-                        source: p.path.source.clone(),
-                        nexthop: p.path.nexthop,
-                        attr: p.path.attr.clone(),
-                        local_path_id: p.path.local_path_id,
-                    })
-                    .collect();
+                    .any(|e| e.path.source.remote_addr == addr && !e.is_filtered());
 
                 dst.entry.retain(|e| e.path.source.remote_addr != addr);
 
+                if !removed_any_unfiltered {
+                    return !dst.entry.is_empty();
+                }
+
                 if dst.entry.is_empty() {
-                    for (i, e) in old_top.iter().enumerate() {
-                        advertise.push(Change {
-                            source: e.source.clone(),
-                            family,
-                            net: *net,
-                            nexthop: e.nexthop,
-                            attr: Arc::new(Vec::new()),
-                            path_id: e.local_path_id,
-                            rank: i + 1,
-                            old_rank: i + 1,
-                        });
-                    }
+                    changes.push(NlriChange {
+                        family,
+                        net: *net,
+                        best_changed: true,
+                        any_changed: true,
+                        replaced_path_id: None,
+                        current_paths: Arc::new(vec![]),
+                    });
                     return false;
                 }
 
-                advertise.extend(Self::diff_top_n(dst, &old_top, family, *net));
+                let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let current_paths = Arc::new(
+                    dst.entry
+                        .iter()
+                        .filter(|e| !e.is_filtered())
+                        .map(|e| e.path.clone())
+                        .collect(),
+                );
+                changes.push(NlriChange {
+                    family,
+                    net: *net,
+                    best_changed: old_best_id != new_best_id,
+                    any_changed: true,
+                    replaced_path_id: None,
+                    current_paths,
+                });
                 true
             });
         }
-        advertise
+        changes
     }
 
     /// Remove only stale paths from `addr` in `family` and re-run best-path
@@ -1042,8 +963,8 @@ impl Table {
         addr: IpAddr,
         family: Family,
         prefix_counter: Option<&Arc<AtomicU64>>,
-    ) -> Vec<Change> {
-        let mut advertise = Vec::new();
+    ) -> Vec<NlriChange> {
+        let mut changes = Vec::new();
         if let Some(rt) = self.ribs.get_mut(&family) {
             rt.destinations.retain(|net, dst| {
                 if !dst
@@ -1053,16 +974,13 @@ impl Table {
                 {
                     return true;
                 }
-                let old_top: Vec<TopNEntry> = dst
-                    .unfiltered_all()
-                    .iter()
-                    .map(|p| TopNEntry {
-                        source: p.path.source.clone(),
-                        nexthop: p.path.nexthop,
-                        attr: p.path.attr.clone(),
-                        local_path_id: p.path.local_path_id,
-                    })
-                    .collect();
+
+                let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let removed_any_unfiltered = dst.entry.iter().any(|e| {
+                    e.path.source.remote_addr == addr
+                        && e.path.source.is_stale()
+                        && !e.is_filtered()
+                });
 
                 dst.entry
                     .retain(|e| !(e.path.source.remote_addr == addr && e.path.source.is_stale()));
@@ -1077,56 +995,79 @@ impl Table {
                     }
                 }
 
+                if !removed_any_unfiltered {
+                    return !dst.entry.is_empty();
+                }
+
                 if dst.entry.is_empty() {
-                    for (i, e) in old_top.iter().enumerate() {
-                        advertise.push(Change {
-                            source: e.source.clone(),
-                            family,
-                            net: *net,
-                            nexthop: e.nexthop,
-                            attr: Arc::new(Vec::new()),
-                            path_id: e.local_path_id,
-                            rank: i + 1,
-                            old_rank: i + 1,
-                        });
-                    }
+                    changes.push(NlriChange {
+                        family,
+                        net: *net,
+                        best_changed: true,
+                        any_changed: true,
+                        replaced_path_id: None,
+                        current_paths: Arc::new(vec![]),
+                    });
                     return false;
                 }
 
-                advertise.extend(Self::diff_top_n(dst, &old_top, family, *net));
+                let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let current_paths = Arc::new(
+                    dst.entry
+                        .iter()
+                        .filter(|e| !e.is_filtered())
+                        .map(|e| e.path.clone())
+                        .collect(),
+                );
+                changes.push(NlriChange {
+                    family,
+                    net: *net,
+                    best_changed: old_best_id != new_best_id,
+                    any_changed: true,
+                    replaced_path_id: None,
+                    current_paths,
+                });
                 true
             });
         }
-        advertise
+        changes
     }
 
     /// Mark all paths from `addr` in `family` as stale and re-run best-path
-    /// selection.  Returns the same `Vec<Change>` diff format as `drop()` so
-    /// the caller can distribute withdraws / updates to other peers.
-    pub fn restale(&mut self, addr: IpAddr, family: Family) -> Vec<Change> {
+    /// selection.  Returns one NlriChange per destination that changed.
+    pub fn restale(&mut self, addr: IpAddr, family: Family) -> Vec<NlriChange> {
         let mut changes = Vec::new();
         if let Some(rt) = self.ribs.get_mut(&family) {
             for (net, dst) in rt.destinations.iter_mut() {
                 if !dst.entry.iter().any(|p| p.path.source.remote_addr == addr) {
                     continue;
                 }
+                let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
                 for p in dst.entry.iter() {
                     if p.path.source.remote_addr == addr {
                         p.path.source.mark_stale();
                     }
                 }
-                let old_top: Vec<TopNEntry> = dst
-                    .unfiltered_all()
-                    .iter()
-                    .map(|p| TopNEntry {
-                        source: p.path.source.clone(),
-                        nexthop: p.path.nexthop,
-                        attr: p.path.attr.clone(),
-                        local_path_id: p.path.local_path_id,
-                    })
-                    .collect();
                 dst.entry.sort_unstable();
-                changes.extend(Self::diff_top_n(dst, &old_top, family, *net));
+                let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let best_changed = old_best_id != new_best_id;
+                if best_changed {
+                    let current_paths = Arc::new(
+                        dst.entry
+                            .iter()
+                            .filter(|e| !e.is_filtered())
+                            .map(|e| e.path.clone())
+                            .collect(),
+                    );
+                    changes.push(NlriChange {
+                        family,
+                        net: *net,
+                        best_changed: true,
+                        any_changed: true,
+                        replaced_path_id: None,
+                        current_paths,
+                    });
+                }
             }
         }
         changes
@@ -2477,16 +2418,6 @@ mod tests {
 
     // --- best path selection ---
 
-    /// Find the Change whose source matches the given address in a Vec<Change>
-    /// (used for drop/drop_stale which still return Vec<Change>).
-    fn find_change_for(changes: Vec<Change>, addr: Ipv4Addr) -> Change {
-        let target = IpAddr::V4(addr);
-        changes
-            .into_iter()
-            .find(|c| c.source.remote_addr == target)
-            .expect("expected a Change for the given source")
-    }
-
     #[test]
     fn best_path_local_pref() {
         let mut rt = Table::new();
@@ -3598,10 +3529,12 @@ mod tests {
             false,
             None,
         );
-        // drop s2 → s3 becomes new best (withdraw old + advertise new)
+        // drop s2 → s3 becomes new best
         let changes = rt.drop(s2.remote_addr, Family::IPV4);
-        let adv = find_change_for(changes, Ipv4Addr::new(10, 0, 0, 3));
-        assert!(Arc::ptr_eq(&adv.source, &s3));
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].best_changed);
+        let best = changes[0].new_best().unwrap();
+        assert!(Arc::ptr_eq(&best.source, &s3));
     }
 
     #[test]

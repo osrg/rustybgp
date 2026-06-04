@@ -3995,16 +3995,19 @@ impl TableShard {
                 }
             }
             TableEvent::Disconnected(addr, family) => {
-                let changes = self.rtable.drop(addr, family);
-                self.distribute_changes(changes, kernel_tx, None);
+                for change in self.rtable.drop(addr, family) {
+                    self.distribute_update(change, kernel_tx, None);
+                }
             }
             TableEvent::DropStale(addr, family) => {
-                let changes = self.rtable.drop_stale(addr, family, None);
-                self.distribute_changes(changes, kernel_tx, None);
+                for change in self.rtable.drop_stale(addr, family, None) {
+                    self.distribute_update(change, kernel_tx, None);
+                }
             }
             TableEvent::MarkStale(addr, family) => {
-                let changes = self.rtable.restale(addr, family);
-                self.distribute_changes(changes, kernel_tx, export_policy);
+                for change in self.rtable.restale(addr, family) {
+                    self.distribute_update(change, kernel_tx, export_policy);
+                }
             }
             TableEvent::EndDeferral(family) => {
                 let changes = self.rtable.end_deferral(family);
