@@ -144,72 +144,90 @@ impl PathAttribute {
     }
 }
 
-struct Path {
-    source: Arc<Source>,
+/// A path snapshot shared outside the table crate.
+/// All fields are Arc-backed so cloning is cheap.
+#[derive(Clone)]
+pub struct Path {
+    pub local_path_id: u32,
+    pub source: Arc<Source>,
+    pub nexthop: bgp::Nexthop,
+    pub attr: Arc<Vec<packet::Attribute>>,
+}
+
+struct RibEntry {
+    path: Path,
     /// Remote peer's inbound path ID (from the sending peer's Add-Path).
     id: u32,
-    /// Stable outbound path ID assigned locally for Add-Path TX.
-    local_path_id: u32,
-    nexthop: bgp::Nexthop,
-    pa: PathAttribute,
     timestamp: SystemTime,
     flags: u8,
 }
 
-impl Path {
+impl RibEntry {
     const FLAG_FILTERED: u8 = 1 << 0;
 
     fn is_filtered(&self) -> bool {
-        self.flags & Path::FLAG_FILTERED != 0
+        self.flags & RibEntry::FLAG_FILTERED != 0
     }
 
     fn originator_id(&self) -> u32 {
-        self.pa
+        PathAttribute::new(self.path.attr.clone())
             .attr_originator_id()
-            .unwrap_or(self.source.router_id)
+            .unwrap_or(self.path.source.router_id)
     }
 }
 
-impl Ord for Path {
+impl Ord for RibEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_pa = PathAttribute::new(self.path.attr.clone());
+        let other_pa = PathAttribute::new(other.path.attr.clone());
         // Higher LOCAL_PREF is better (reverse order)
-        self.pa
+        self_pa
             .attr_local_preference()
-            .cmp(&other.pa.attr_local_preference())
+            .cmp(&other_pa.attr_local_preference())
             .reverse()
             // Shorter AS path is better
             .then_with(|| {
-                self.pa
+                self_pa
                     .attr_as_path_length()
-                    .cmp(&other.pa.attr_as_path_length())
+                    .cmp(&other_pa.attr_as_path_length())
             })
             // Lower origin is better (IGP=0 < EGP=1 < Incomplete=2)
-            .then_with(|| self.pa.attr_origin().cmp(&other.pa.attr_origin()))
+            .then_with(|| self_pa.attr_origin().cmp(&other_pa.attr_origin()))
             // eBGP preferred over iBGP
-            .then_with(|| self.source.peer_type().cmp(&other.source.peer_type()))
+            .then_with(|| {
+                self.path
+                    .source
+                    .peer_type()
+                    .cmp(&other.path.source.peer_type())
+            })
             // Non-stale is better than stale (false < true, and Less = better here)
-            .then_with(|| self.source.is_stale().cmp(&other.source.is_stale()))
+            .then_with(|| {
+                self.path
+                    .source
+                    .is_stale()
+                    .cmp(&other.path.source.is_stale())
+            })
             // Lower originator ID / router ID is better
             .then_with(|| self.originator_id().cmp(&other.originator_id()))
     }
 }
 
-impl PartialOrd for Path {
+impl PartialOrd for RibEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl PartialEq for Path {
+impl PartialEq for RibEntry {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == std::cmp::Ordering::Equal
     }
 }
 
-impl Eq for Path {}
+impl Eq for RibEntry {}
 
 struct Destination {
-    entry: Vec<Path>,
+    entry: Vec<RibEntry>,
     next_path_id: u32,
 }
 
@@ -236,17 +254,17 @@ impl Destination {
             }
 
             // Ensure we do not reuse an ID that is still in use by an active path.
-            if !self.entry.iter().any(|p| p.local_path_id == id) {
+            if !self.entry.iter().any(|p| p.path.local_path_id == id) {
                 return id;
             }
         }
     }
 
-    fn unfiltered_best(&self) -> Option<&Path> {
+    fn unfiltered_best(&self) -> Option<&RibEntry> {
         self.entry.iter().find(|p| !p.is_filtered())
     }
 
-    fn unfiltered_all(&self) -> Vec<&Path> {
+    fn unfiltered_all(&self) -> Vec<&RibEntry> {
         self.entry.iter().filter(|p| !p.is_filtered()).collect()
     }
 }
@@ -259,9 +277,9 @@ struct TopNEntry {
     local_path_id: u32,
 }
 
-fn same_top_entry(a: &TopNEntry, b: &Path) -> bool {
-    (Arc::ptr_eq(&a.source, &b.source) && Arc::ptr_eq(&a.attr, &b.pa.attr))
-        || (Arc::ptr_eq(&a.source, &b.source) && a.attr.as_ref() == b.pa.attr.as_ref())
+fn same_top_entry(a: &TopNEntry, b: &RibEntry) -> bool {
+    (Arc::ptr_eq(&a.source, &b.path.source) && Arc::ptr_eq(&a.attr, &b.path.attr))
+        || (Arc::ptr_eq(&a.source, &b.path.source) && a.attr.as_ref() == b.path.attr.as_ref())
 }
 
 #[derive(Default, Clone, Debug)]
@@ -341,15 +359,6 @@ impl From<Change> for bgp::Message {
     }
 }
 
-/// A single path snapshot for use in `NlriChange`.
-#[derive(Clone)]
-pub struct BestPath {
-    pub local_path_id: u32,
-    pub source: Arc<Source>,
-    pub nexthop: bgp::Nexthop,
-    pub attr: Arc<Vec<packet::Attribute>>,
-}
-
 /// Result of a single `Table::insert()` or `Table::remove()` operation.
 ///
 /// Non-Add-Path peers can skip processing when `best_changed` is false.
@@ -362,8 +371,6 @@ pub struct NlriChange {
     // Non-Add-Path peers use the following two fields only.
     /// True when the best path changed. Non-Add-Path peers skip if false.
     pub best_changed: bool,
-    /// Best path after mutation. None when all paths filtered or prefix gone.
-    pub new_best: Option<BestPath>,
 
     // Add-Path peers use the following three fields.
     /// True when any path change may affect what is advertised to peers.
@@ -373,7 +380,14 @@ pub struct NlriChange {
     /// Used by Add-Path peers to detect re-advertisement needs.
     pub replaced_path_id: Option<u32>,
     /// All current unfiltered paths sorted by preference. Shared via Arc.
-    pub current_paths: Arc<Vec<BestPath>>,
+    pub current_paths: Arc<Vec<Path>>,
+}
+
+impl NlriChange {
+    /// Best path after mutation. None when all paths filtered or prefix gone.
+    pub fn new_best(&self) -> Option<&Path> {
+        self.current_paths.first()
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -477,12 +491,12 @@ impl Table {
                 for (net, dst) in &t.destinations {
                     for (i, p) in dst.unfiltered_all().iter().enumerate() {
                         v.push(Change {
-                            source: p.source.clone(),
+                            source: p.path.source.clone(),
                             family: *family,
                             net: *net,
-                            nexthop: p.nexthop,
-                            attr: p.pa.attr.clone(),
-                            path_id: p.local_path_id,
+                            nexthop: p.path.nexthop,
+                            attr: p.path.attr.clone(),
+                            path_id: p.path.local_path_id,
                             rank: i + 1,
                             old_rank: 0,
                         });
@@ -534,13 +548,13 @@ impl Table {
             .iter()
             .flat_map(move |(net, dst)| {
                 dst.entry.iter().map(move |e| Reach {
-                    source: e.source.clone(),
+                    source: e.path.source.clone(),
                     family,
                     net: packet::bgp::PathNlri {
                         nlri: *net,
                         path_id: e.id,
                     },
-                    attr: e.pa.attr.clone(),
+                    attr: e.path.attr.clone(),
                 })
             })
     }
@@ -573,29 +587,30 @@ impl Table {
             .map(move |(net, dst)| DestinationEntry {
                 net: *net,
                 paths: {
-                    let best = dst.unfiltered_best().map(|p| p as *const Path);
+                    let best = dst.unfiltered_best().map(|p| p as *const RibEntry);
                     dst.entry
                         .iter()
                         .enumerate()
                         .filter(|(_, p)| {
                             if table_type == TableType::AdjIn {
-                                return p.source.remote_addr == peer_addr.unwrap();
+                                return p.path.source.remote_addr == peer_addr.unwrap();
                             } else if table_type == TableType::AdjOut {
-                                return best == Some(*p as *const Path)
-                                    && p.source.remote_addr != peer_addr.unwrap();
+                                return best == Some(*p as *const RibEntry)
+                                    && p.path.source.remote_addr != peer_addr.unwrap();
                             }
                             true
                         })
                         .filter_map(|(_, p)| {
                             if table_type == TableType::AdjOut {
                                 let codec = bgp::PeerCodecBuilder::new()
-                                    .local_asn(p.source.local_asn)
-                                    .local_addr(p.source.local_addr)
-                                    .keep_aspath(p.source.rs_client)
-                                    .keep_nexthop(p.source.rs_client)
+                                    .local_asn(p.path.source.local_asn)
+                                    .local_addr(p.path.source.local_addr)
+                                    .keep_aspath(p.path.source.rs_client)
+                                    .keep_nexthop(p.path.source.rs_client)
                                     .build();
                                 let attr = Arc::new(
-                                    p.pa.attr
+                                    p.path
+                                        .attr
                                         .iter()
                                         .cloned()
                                         .map(|a| {
@@ -610,14 +625,14 @@ impl Table {
                                         .collect::<Vec<packet::Attribute>>(),
                                 );
                                 if let Some(pa) = &export_policy {
-                                    let mut nh = p.nexthop;
+                                    let mut nh = p.path.nexthop;
                                     if self.apply_policy(
                                         pa,
-                                        &p.source,
+                                        &p.path.source,
                                         net,
                                         &attr,
                                         &mut nh,
-                                        p.source.local_addr,
+                                        p.path.source.local_addr,
                                     ) == Disposition::Reject
                                     {
                                         None
@@ -628,11 +643,11 @@ impl Table {
                                     Some((p, attr))
                                 }
                             } else {
-                                Some((p, p.pa.attr.clone()))
+                                Some((p, p.path.attr.clone()))
                             }
                         })
                         .map(|(p, attr)| {
-                            let validation = self.rpki.validate(family, &p.source, net, &attr);
+                            let validation = self.rpki.validate(family, &p.path.source, net, &attr);
                             PathEntry {
                                 id: if table_type == TableType::AdjOut {
                                     0
@@ -642,7 +657,7 @@ impl Table {
                                 timestamp: p.timestamp,
                                 attr,
                                 validation,
-                                stale: p.source.is_stale(),
+                                stale: p.path.source.is_stale(),
                             }
                         })
                         .collect()
@@ -663,18 +678,20 @@ impl Table {
         filtered: bool,
         prefix_limit: Option<(u32, &Arc<AtomicU64>)>,
     ) -> Option<NlriChange> {
-        let flags = if filtered { Path::FLAG_FILTERED } else { 0 };
+        let flags = if filtered { RibEntry::FLAG_FILTERED } else { 0 };
 
         let rt = self.ribs.entry(family).or_default();
         let deferring = rt.deferring;
         let dst = rt.destinations.entry(net).or_insert_with(Destination::new);
 
         // 1. Capture old best path id before modification.
-        let old_best_id: Option<u32> = dst.unfiltered_best().map(|p| p.local_path_id);
+        let old_best_id: Option<u32> = dst.unfiltered_best().map(|p| p.path.local_path_id);
 
         // 2. Find and remove any existing path from this (source, path_id) pair.
         let replaced = (0..dst.entry.len())
-            .find(|&i| Arc::ptr_eq(&dst.entry[i].source, &source) && dst.entry[i].id == remote_id)
+            .find(|&i| {
+                Arc::ptr_eq(&dst.entry[i].path.source, &source) && dst.entry[i].id == remote_id
+            })
             .map(|i| dst.entry.remove(i));
 
         // A prefix is "new" for this peer when neither a replacement was found nor
@@ -684,7 +701,7 @@ impl Table {
             && !dst
                 .entry
                 .iter()
-                .any(|p| p.source.remote_addr == source.remote_addr);
+                .any(|p| p.path.source.remote_addr == source.remote_addr);
 
         // 3. Check the per-peer prefix limit for new prefixes.
         //    Replacements and additional Add-Path paths for an already-known prefix
@@ -713,14 +730,16 @@ impl Table {
         // 4. Build and insert the path.
         let local_path_id = replaced
             .as_ref()
-            .map_or_else(|| dst.alloc_path_id(), |old| old.local_path_id);
+            .map_or_else(|| dst.alloc_path_id(), |old| old.path.local_path_id);
 
-        let path = Path {
-            source: source.clone(),
+        let entry = RibEntry {
+            path: Path {
+                local_path_id,
+                source: source.clone(),
+                nexthop,
+                attr,
+            },
             id: remote_id,
-            local_path_id,
-            nexthop,
-            pa: PathAttribute::new(attr),
             timestamp: SystemTime::now(),
             flags,
         };
@@ -745,8 +764,8 @@ impl Table {
             }
         }
 
-        let idx = dst.entry.partition_point(|a| path.cmp(a).is_ge());
-        dst.entry.insert(idx, path);
+        let idx = dst.entry.partition_point(|a| entry.cmp(a).is_ge());
+        dst.entry.insert(idx, entry);
 
         // 5. Increment prefix counter after successful insert of a new prefix.
         #[allow(clippy::collapsible_if)]
@@ -763,32 +782,21 @@ impl Table {
         }
 
         // Compute change flags.
-        let new_best_id = dst.unfiltered_best().map(|p| p.local_path_id);
+        let new_best_id = dst.unfiltered_best().map(|p| p.path.local_path_id);
         let replaced_was_best = replaced
             .as_ref()
-            .is_some_and(|r| Some(r.local_path_id) == old_best_id && !r.is_filtered());
+            .is_some_and(|r| Some(r.path.local_path_id) == old_best_id && !r.is_filtered());
         let best_changed = old_best_id != new_best_id || replaced_was_best;
         let any_changed = !filtered || replaced.as_ref().is_some_and(|r| !r.is_filtered());
         if !best_changed && !any_changed {
             return None;
         }
-        let replaced_path_id = replaced.as_ref().map(|r| r.local_path_id);
+        let replaced_path_id = replaced.as_ref().map(|r| r.path.local_path_id);
 
-        let new_best = dst.unfiltered_best().map(|p| BestPath {
-            local_path_id: p.local_path_id,
-            source: p.source.clone(),
-            nexthop: p.nexthop,
-            attr: p.pa.attr.clone(),
-        });
         let current_paths = Arc::new(
             dst.unfiltered_all()
                 .iter()
-                .map(|p| BestPath {
-                    local_path_id: p.local_path_id,
-                    source: p.source.clone(),
-                    nexthop: p.nexthop,
-                    attr: p.pa.attr.clone(),
-                })
+                .map(|e| e.path.clone())
                 .collect(),
         );
 
@@ -798,7 +806,6 @@ impl Table {
             best_changed,
             any_changed,
             replaced_path_id,
-            new_best,
             current_paths,
         })
     }
@@ -831,10 +838,10 @@ impl Table {
         let i = dst
             .entry
             .iter()
-            .position(|e| Arc::ptr_eq(&e.source, &source) && e.id == remote_id)?;
+            .position(|e| Arc::ptr_eq(&e.path.source, &source) && e.id == remote_id)?;
 
         // Capture old best path id and whether the removed path was unfiltered.
-        let old_best_id: Option<u32> = dst.unfiltered_best().map(|p| p.local_path_id);
+        let old_best_id: Option<u32> = dst.unfiltered_best().map(|p| p.path.local_path_id);
         let was_unfiltered = !dst.entry[i].is_filtered();
 
         let (received, accepted) = self
@@ -852,7 +859,7 @@ impl Table {
         let peer_still_has_path = dst
             .entry
             .iter()
-            .any(|p| p.source.remote_addr == source.remote_addr);
+            .any(|p| p.path.source.remote_addr == source.remote_addr);
         #[allow(clippy::collapsible_if)]
         if !peer_still_has_path {
             if let Some(counter) = prefix_counter {
@@ -869,7 +876,6 @@ impl Table {
                     best_changed: true,
                     any_changed: true,
                     replaced_path_id: None,
-                    new_best: None,
                     current_paths: Arc::new(vec![]),
                 })
             } else {
@@ -877,7 +883,7 @@ impl Table {
             };
         }
 
-        let new_best_id = dst.unfiltered_best().map(|p| p.local_path_id);
+        let new_best_id = dst.unfiltered_best().map(|p| p.path.local_path_id);
         let best_changed = old_best_id != new_best_id;
         let any_changed = was_unfiltered;
 
@@ -885,21 +891,10 @@ impl Table {
             return None;
         }
 
-        let new_best = dst.unfiltered_best().map(|p| BestPath {
-            local_path_id: p.local_path_id,
-            source: p.source.clone(),
-            nexthop: p.nexthop,
-            attr: p.pa.attr.clone(),
-        });
         let current_paths = Arc::new(
             dst.unfiltered_all()
                 .iter()
-                .map(|p| BestPath {
-                    local_path_id: p.local_path_id,
-                    source: p.source.clone(),
-                    nexthop: p.nexthop,
-                    attr: p.pa.attr.clone(),
-                })
+                .map(|e| e.path.clone())
                 .collect(),
         );
 
@@ -909,7 +904,6 @@ impl Table {
             best_changed,
             any_changed,
             replaced_path_id: None,
-            new_best,
             current_paths,
         })
     }
@@ -928,7 +922,9 @@ impl Table {
 
         // Withdraw: paths in old_top whose local_path_id is absent from new_top
         for (i, old) in old_top.iter().enumerate() {
-            let still_present = new_top.iter().any(|p| p.local_path_id == old.local_path_id);
+            let still_present = new_top
+                .iter()
+                .any(|p| p.path.local_path_id == old.local_path_id);
             if !still_present {
                 changes.push(Change {
                     source: old.source.clone(),
@@ -946,17 +942,19 @@ impl Table {
         // Advertise: paths in new_top that are new or have changed attributes
         for (i, p) in new_top.iter().enumerate() {
             let rank = i + 1;
-            let old_entry = old_top.iter().find(|o| o.local_path_id == p.local_path_id);
+            let old_entry = old_top
+                .iter()
+                .find(|o| o.local_path_id == p.path.local_path_id);
             match old_entry {
                 None => {
                     // Newly entered top-N — advertise
                     changes.push(Change {
-                        source: p.source.clone(),
+                        source: p.path.source.clone(),
                         family,
                         net,
-                        nexthop: p.nexthop,
-                        attr: p.pa.attr.clone(),
-                        path_id: p.local_path_id,
+                        nexthop: p.path.nexthop,
+                        attr: p.path.attr.clone(),
+                        path_id: p.path.local_path_id,
                         rank,
                         old_rank: 0,
                     });
@@ -964,7 +962,7 @@ impl Table {
                 Some(_) => {
                     let old_rank = old_top
                         .iter()
-                        .position(|o| o.local_path_id == p.local_path_id)
+                        .position(|o| o.local_path_id == p.path.local_path_id)
                         .unwrap()
                         + 1;
                     if !same_top_entry(&old_top[old_rank - 1], p) || rank != old_rank {
@@ -972,12 +970,12 @@ impl Table {
                         // peers whose send_max window now includes (or excludes)
                         // this path can update accordingly.
                         changes.push(Change {
-                            source: p.source.clone(),
+                            source: p.path.source.clone(),
                             family,
                             net,
-                            nexthop: p.nexthop,
-                            attr: p.pa.attr.clone(),
-                            path_id: p.local_path_id,
+                            nexthop: p.path.nexthop,
+                            attr: p.path.attr.clone(),
+                            path_id: p.path.local_path_id,
                             rank,
                             old_rank,
                         });
@@ -1003,14 +1001,14 @@ impl Table {
                     .unfiltered_all()
                     .iter()
                     .map(|p| TopNEntry {
-                        source: p.source.clone(),
-                        nexthop: p.nexthop,
-                        attr: p.pa.attr.clone(),
-                        local_path_id: p.local_path_id,
+                        source: p.path.source.clone(),
+                        nexthop: p.path.nexthop,
+                        attr: p.path.attr.clone(),
+                        local_path_id: p.path.local_path_id,
                     })
                     .collect();
 
-                dst.entry.retain(|e| e.source.remote_addr != addr);
+                dst.entry.retain(|e| e.path.source.remote_addr != addr);
 
                 if dst.entry.is_empty() {
                     for (i, e) in old_top.iter().enumerate() {
@@ -1051,7 +1049,7 @@ impl Table {
                 if !dst
                     .entry
                     .iter()
-                    .any(|e| e.source.remote_addr == addr && e.source.is_stale())
+                    .any(|e| e.path.source.remote_addr == addr && e.path.source.is_stale())
                 {
                     return true;
                 }
@@ -1059,18 +1057,19 @@ impl Table {
                     .unfiltered_all()
                     .iter()
                     .map(|p| TopNEntry {
-                        source: p.source.clone(),
-                        nexthop: p.nexthop,
-                        attr: p.pa.attr.clone(),
-                        local_path_id: p.local_path_id,
+                        source: p.path.source.clone(),
+                        nexthop: p.path.nexthop,
+                        attr: p.path.attr.clone(),
+                        local_path_id: p.path.local_path_id,
                     })
                     .collect();
 
                 dst.entry
-                    .retain(|e| !(e.source.remote_addr == addr && e.source.is_stale()));
+                    .retain(|e| !(e.path.source.remote_addr == addr && e.path.source.is_stale()));
 
                 // Decrement prefix counter if peer has no more paths for this prefix.
-                let peer_still_has_path = dst.entry.iter().any(|p| p.source.remote_addr == addr);
+                let peer_still_has_path =
+                    dst.entry.iter().any(|p| p.path.source.remote_addr == addr);
                 #[allow(clippy::collapsible_if)]
                 if !peer_still_has_path {
                     if let Some(counter) = prefix_counter {
@@ -1108,22 +1107,22 @@ impl Table {
         let mut changes = Vec::new();
         if let Some(rt) = self.ribs.get_mut(&family) {
             for (net, dst) in rt.destinations.iter_mut() {
-                if !dst.entry.iter().any(|p| p.source.remote_addr == addr) {
+                if !dst.entry.iter().any(|p| p.path.source.remote_addr == addr) {
                     continue;
                 }
                 for p in dst.entry.iter() {
-                    if p.source.remote_addr == addr {
-                        p.source.mark_stale();
+                    if p.path.source.remote_addr == addr {
+                        p.path.source.mark_stale();
                     }
                 }
                 let old_top: Vec<TopNEntry> = dst
                     .unfiltered_all()
                     .iter()
                     .map(|p| TopNEntry {
-                        source: p.source.clone(),
-                        nexthop: p.nexthop,
-                        attr: p.pa.attr.clone(),
-                        local_path_id: p.local_path_id,
+                        source: p.path.source.clone(),
+                        nexthop: p.path.nexthop,
+                        attr: p.path.attr.clone(),
+                        local_path_id: p.path.local_path_id,
                     })
                     .collect();
                 dst.entry.sort_unstable();
@@ -2514,7 +2513,7 @@ mod tests {
         );
         // Higher local_pref wins → best changes to source 2
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2547,7 +2546,7 @@ mod tests {
         );
         // Shorter AS path wins
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2582,7 +2581,7 @@ mod tests {
         );
         // IGP (lower origin value) wins
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2617,7 +2616,7 @@ mod tests {
         );
         // eBGP wins even though router_id is higher
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2651,7 +2650,7 @@ mod tests {
             None,
         );
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2689,7 +2688,7 @@ mod tests {
         // Remove best (router_id=1) → s2 promoted to best
         let update = rt.remove(s1, Family::IPV4, net, 0, None);
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2726,7 +2725,7 @@ mod tests {
         let update = rt.remove(s2, Family::IPV4, net, 0, None);
         assert!(!update.as_ref().unwrap().best_changed);
         assert!(update.as_ref().unwrap().any_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
@@ -2751,7 +2750,7 @@ mod tests {
         let update = rt.remove(s1, Family::IPV4, net, 0, None);
         // Withdrawal: best gone
         assert!(update.as_ref().unwrap().best_changed);
-        assert!(update.as_ref().unwrap().new_best.is_none());
+        assert!(update.as_ref().unwrap().new_best().is_none());
     }
 
     // --- filtered ---
@@ -2786,7 +2785,7 @@ mod tests {
             None,
         );
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s2));
     }
 
@@ -2819,7 +2818,7 @@ mod tests {
             None,
         );
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s2));
         // another unfiltered but worse (router_id=3) → best unchanged, but any_changed
         let update = rt.insert(
@@ -2925,7 +2924,7 @@ mod tests {
         // replace s1 as filtered → s2 becomes unfiltered best
         let update = rt.insert(s1, Family::IPV4, net, 0, nh(), empty_attrs(), true, None);
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s2));
     }
 
@@ -2983,7 +2982,7 @@ mod tests {
         assert!(!update.as_ref().unwrap().best_changed);
         assert!(update.as_ref().unwrap().any_changed);
         // s1 is still best
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s1));
     }
 
@@ -3352,7 +3351,7 @@ mod tests {
         // s2 enters as a new current path, best unchanged
         assert!(!update.as_ref().unwrap().best_changed);
         assert!(update.as_ref().unwrap().any_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s1));
     }
 
@@ -3376,7 +3375,7 @@ mod tests {
         // Replace with filtered → no unfiltered best remains → best_changed, new_best=None
         let update = rt.insert(s1, Family::IPV4, net, 0, nh(), empty_attrs(), true, None);
         assert!(update.as_ref().unwrap().best_changed);
-        assert!(update.as_ref().unwrap().new_best.is_none());
+        assert!(update.as_ref().unwrap().new_best().is_none());
     }
 
     #[test]
@@ -3420,7 +3419,7 @@ mod tests {
             None,
         );
         assert!(update.as_ref().unwrap().best_changed);
-        assert!(update.as_ref().unwrap().new_best.is_none());
+        assert!(update.as_ref().unwrap().new_best().is_none());
     }
 
     // --- best() with filtered head ---
@@ -3520,7 +3519,7 @@ mod tests {
         // remove s2 (best) → s3 becomes new best
         let update = rt.remove(s2, Family::IPV4, net, 0, None);
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s3));
     }
 
@@ -3554,7 +3553,7 @@ mod tests {
         // remove s2 → all filtered → withdrawal (best_changed=true, new_best=None)
         let update = rt.remove(s2, Family::IPV4, net, 0, None);
         assert!(update.as_ref().unwrap().best_changed);
-        assert!(update.as_ref().unwrap().new_best.is_none());
+        assert!(update.as_ref().unwrap().new_best().is_none());
     }
 
     // --- drop() with filtered head ---
@@ -3751,7 +3750,7 @@ mod tests {
             None,
         );
         assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(best.local_path_id, 1);
 
         // Insert s2 → new best (lower router_id)
@@ -3769,17 +3768,11 @@ mod tests {
         assert_eq!(update.as_ref().unwrap().current_paths.len(), 2);
         // s2 is the new best (rank 0 in current_paths)
         assert_eq!(
-            update
-                .as_ref()
-                .unwrap()
-                .new_best
-                .as_ref()
-                .unwrap()
-                .local_path_id,
+            update.as_ref().unwrap().new_best().unwrap().local_path_id,
             2
         );
         assert!(Arc::ptr_eq(
-            &update.as_ref().unwrap().new_best.as_ref().unwrap().source,
+            &update.as_ref().unwrap().new_best().unwrap().source,
             &s2
         ));
         // s1 is at index 1 in current_paths
@@ -3810,13 +3803,7 @@ mod tests {
             false,
             None,
         );
-        let original_id = update
-            .as_ref()
-            .unwrap()
-            .new_best
-            .as_ref()
-            .unwrap()
-            .local_path_id;
+        let original_id = update.as_ref().unwrap().new_best().unwrap().local_path_id;
 
         // Replace with new attributes
         let update = rt.insert(
@@ -3831,7 +3818,7 @@ mod tests {
         );
         // Same path_id preserved, replaced_path_id indicates what was replaced
         assert_eq!(update.as_ref().unwrap().replaced_path_id, Some(original_id));
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(best.local_path_id, original_id);
     }
 
@@ -3853,13 +3840,7 @@ mod tests {
             false,
             None,
         );
-        let s1_id = u1
-            .as_ref()
-            .unwrap()
-            .new_best
-            .as_ref()
-            .unwrap()
-            .local_path_id;
+        let s1_id = u1.as_ref().unwrap().new_best().unwrap().local_path_id;
         rt.insert(
             s2.clone(),
             Family::IPV4,
@@ -3884,7 +3865,7 @@ mod tests {
                 .any(|p| p.local_path_id == s1_id)
         );
         // s2 is the new best
-        let best = update.as_ref().unwrap().new_best.as_ref().unwrap();
+        let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(best.local_path_id, 2);
     }
 

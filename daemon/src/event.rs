@@ -3831,7 +3831,7 @@ impl TableShard {
         export_policy: Option<&table::PolicyAssignment>,
     ) {
         // Apply export policy to new_best.
-        let filtered_new_best = if let Some(ref best) = update.new_best {
+        let filtered_new_best: Option<table::Path> = if let Some(best) = update.new_best() {
             let mut nexthop = best.nexthop;
             if export_policy.is_some_and(|policy| {
                 self.rtable.apply_policy(
@@ -3845,7 +3845,7 @@ impl TableShard {
             }) {
                 None
             } else {
-                Some(table::BestPath {
+                Some(table::Path {
                     nexthop,
                     ..best.clone()
                 })
@@ -3855,7 +3855,7 @@ impl TableShard {
         };
 
         // Apply export policy to current_paths (for Add-Path peers).
-        let filtered_current_paths: Arc<Vec<table::BestPath>> = if export_policy.is_none() {
+        let filtered_current_paths: Arc<Vec<table::Path>> = if export_policy.is_none() {
             Arc::clone(&update.current_paths)
         } else {
             Arc::new(
@@ -3876,7 +3876,7 @@ impl TableShard {
                         }) {
                             None
                         } else {
-                            Some(table::BestPath {
+                            Some(table::Path {
                                 nexthop,
                                 ..p.clone()
                             })
@@ -3887,14 +3887,13 @@ impl TableShard {
         };
 
         let best_changed =
-            update.best_changed || update.new_best.is_some() != filtered_new_best.is_some();
+            update.best_changed || update.new_best().is_some() != filtered_new_best.is_some();
         let any_changed =
             update.any_changed || update.current_paths.len() != filtered_current_paths.len();
 
         let filtered_update = table::NlriChange {
             best_changed,
             any_changed,
-            new_best: filtered_new_best,
             current_paths: filtered_current_paths,
             ..update
         };
@@ -3914,7 +3913,7 @@ impl TableShard {
                     return;
                 }
             };
-            match &filtered_update.new_best {
+            match &filtered_new_best {
                 None => {
                     let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
                 }
@@ -5190,7 +5189,7 @@ impl PeerSession {
             if !update.best_changed {
                 return;
             }
-            match &update.new_best {
+            match update.new_best().cloned() {
                 None => {
                     // Best gone → WITHDRAW if we had advertised this prefix.
                     if self.export_map.was_sent(update.family, &update.net) {
@@ -5245,7 +5244,7 @@ impl PeerSession {
                 return;
             }
 
-            let current_top_n: Vec<&table::BestPath> = update
+            let current_top_n: Vec<&table::Path> = update
                 .current_paths
                 .iter()
                 .filter(|p| p.source.remote_addr != self.remote_addr)
@@ -6081,7 +6080,7 @@ mod tests {
         nlri: packet::Nlri,
         source: Arc<table::Source>,
     ) -> table::NlriChange {
-        let best = table::BestPath {
+        let best = table::Path {
             local_path_id: 1,
             source,
             nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
@@ -6095,7 +6094,6 @@ mod tests {
             best_changed: true,
             any_changed: true,
             replaced_path_id: None,
-            new_best: Some(best.clone()),
             current_paths: Arc::new(vec![best]),
         }
     }
@@ -6107,7 +6105,6 @@ mod tests {
             best_changed: true,
             any_changed: true,
             replaced_path_id: None,
-            new_best: None,
             current_paths: Arc::new(vec![]),
         }
     }
@@ -6116,7 +6113,7 @@ mod tests {
         nlri: packet::Nlri,
         source: Arc<table::Source>,
     ) -> table::NlriChange {
-        let best = table::BestPath {
+        let best = table::Path {
             local_path_id: 1,
             source,
             nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
@@ -6128,7 +6125,6 @@ mod tests {
             best_changed: false,
             any_changed: false,
             replaced_path_id: None,
-            new_best: Some(best.clone()),
             current_paths: Arc::new(vec![best]),
         }
     }
