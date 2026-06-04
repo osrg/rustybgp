@@ -260,12 +260,12 @@ impl Destination {
         }
     }
 
-    fn unfiltered_best(&self) -> Option<&RibEntry> {
-        self.entry.iter().find(|p| !p.is_filtered())
+    fn unfiltered_iter(&self) -> impl Iterator<Item = &RibEntry> + '_ {
+        self.entry.iter().filter(|p| !p.is_filtered())
     }
 
-    fn unfiltered_all(&self) -> Vec<&RibEntry> {
-        self.entry.iter().filter(|p| !p.is_filtered()).collect()
+    fn unfiltered_best(&self) -> Option<&RibEntry> {
+        self.unfiltered_iter().next()
     }
 }
 
@@ -635,24 +635,34 @@ impl Table {
         let deferring = rt.deferring;
         let dst = rt.destinations.entry(net).or_insert_with(Destination::new);
 
-        // 1. Capture old best path id before modification.
-        let old_best_id: Option<u32> = dst.unfiltered_best().map(|p| p.path.local_path_id);
-
-        // 2. Find and remove any existing path from this (source, path_id) pair.
-        let replaced = (0..dst.entry.len())
-            .find(|&i| {
-                Arc::ptr_eq(&dst.entry[i].path.source, &source) && dst.entry[i].id == remote_id
-            })
-            .map(|i| dst.entry.remove(i));
-
+        // Single pass: compute old_best_id, find replaced index, check peer_has_path.
+        let mut old_best_id: Option<u32> = None;
+        let mut replaced_idx: Option<usize> = None;
+        let mut peer_has_path = false;
+        for (i, e) in dst.entry.iter().enumerate() {
+            if old_best_id.is_none() && !e.is_filtered() {
+                old_best_id = Some(e.path.local_path_id);
+            }
+            if Arc::ptr_eq(&e.path.source, &source) && e.id == remote_id {
+                replaced_idx = Some(i);
+            } else if e.path.source.remote_addr == source.remote_addr {
+                // Count peer paths that are NOT the one being replaced.
+                peer_has_path = true;
+            }
+        }
+        let replaced = replaced_idx.map(|i| dst.entry.remove(i));
         // A prefix is "new" for this peer when neither a replacement was found nor
         // does the peer have any other path for this prefix (including Add-Path paths
         // with different path IDs).  This correctly counts unique prefixes per peer.
-        let is_new = replaced.is_none()
-            && !dst
-                .entry
-                .iter()
-                .any(|p| p.path.source.remote_addr == source.remote_addr);
+        let is_new = replaced.is_none() && !peer_has_path;
+
+        // Get mutable stats entry once for this (peer, family).
+        let (received, accepted) = self
+            .route_stats
+            .entry(source.remote_addr)
+            .or_default()
+            .entry(family)
+            .or_insert((0, 0));
 
         // 3. Check the per-peer prefix limit for new prefixes.
         //    Replacements and additional Add-Path paths for an already-known prefix
@@ -662,13 +672,7 @@ impl Table {
             if let Some((max, counter)) = prefix_limit {
                 if counter.load(Ordering::Relaxed) >= max as u64 {
                     // Still count as received so stats reflect actual wire traffic.
-                    let (rx, _) = self
-                        .route_stats
-                        .entry(source.remote_addr)
-                        .or_default()
-                        .entry(family)
-                        .or_insert((0, 0));
-                    *rx += 1;
+                    *received += 1;
                     eprintln!(
                         "prefix limit ({}) reached for peer {} family {:?}, dropping route",
                         max, source.remote_addr, family
@@ -694,13 +698,6 @@ impl Table {
             timestamp: SystemTime::now(),
             flags,
         };
-
-        let (received, accepted) = self
-            .route_stats
-            .entry(source.remote_addr)
-            .or_default()
-            .entry(family)
-            .or_insert((0, 0));
 
         if let Some(ref old) = replaced {
             match (old.is_filtered(), filtered) {
@@ -744,12 +741,7 @@ impl Table {
         }
         let replaced_path_id = replaced.as_ref().map(|r| r.path.local_path_id);
 
-        let current_paths = Arc::new(
-            dst.unfiltered_all()
-                .iter()
-                .map(|e| e.path.clone())
-                .collect(),
-        );
+        let current_paths = Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
 
         Some(NlriChange {
             family,
@@ -852,12 +844,7 @@ impl Table {
             return None;
         }
 
-        let current_paths = Arc::new(
-            dst.unfiltered_all()
-                .iter()
-                .map(|e| e.path.clone())
-                .collect(),
-        );
+        let current_paths = Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
 
         Some(NlriChange {
             family,
