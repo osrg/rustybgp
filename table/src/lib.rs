@@ -659,21 +659,20 @@ impl Table {
             .entry(family)
             .or_insert((0, 0));
 
-        // 3. Check the per-peer prefix limit for new prefixes.
+        // 3. Check the per-peer prefix limit and increment counter for new prefixes.
         //    Replacements and additional Add-Path paths for an already-known prefix
         //    are always accepted regardless of the limit.
-        // 3. Check the per-peer prefix limit for new prefixes.
-        if is_new
-            && let Some((max, counter)) = prefix_limit
-            && counter.load(Ordering::Relaxed) >= max as u64
-        {
-            // Do not count in received: the path is not stored in the
-            // Adj-RIB-In (received reflects Adj-RIB-In current state).
-            eprintln!(
-                "prefix limit ({}) reached for peer {} family {:?}, dropping route",
-                max, source.remote_addr, family
-            );
-            return None;
+        if is_new && let Some((max, counter)) = prefix_limit {
+            if counter.load(Ordering::Relaxed) >= max as u64 {
+                // Do not count in received: the path is not stored in the
+                // Adj-RIB-In (received reflects Adj-RIB-In current state).
+                eprintln!(
+                    "prefix limit ({}) reached for peer {} family {:?}, dropping route",
+                    max, source.remote_addr, family
+                );
+                return None;
+            }
+            counter.fetch_add(1, Ordering::Relaxed);
         }
 
         // 4. Build and insert the path.
@@ -708,11 +707,6 @@ impl Table {
 
         let idx = dst.entry.partition_point(|a| entry.cmp(a).is_ge());
         dst.entry.insert(idx, entry);
-
-        // 5. Increment prefix counter after successful insert of a new prefix.
-        if is_new && let Some((_, counter)) = prefix_limit {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
 
         // During Restarting Speaker deferral, routes are accumulated but
         // best-path changes are suppressed; end_deferral() emits them all at once.
