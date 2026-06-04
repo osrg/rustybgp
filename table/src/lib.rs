@@ -666,8 +666,8 @@ impl Table {
         if is_new {
             if let Some((max, counter)) = prefix_limit {
                 if counter.load(Ordering::Relaxed) >= max as u64 {
-                    // Still count as received so stats reflect actual wire traffic.
-                    *received += 1;
+                    // Do not count in received: the path is not stored in the
+                    // Adj-RIB-In (received reflects Adj-RIB-In current state).
                     eprintln!(
                         "prefix limit ({}) reached for peer {} family {:?}, dropping route",
                         max, source.remote_addr, family
