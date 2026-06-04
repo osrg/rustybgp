@@ -633,7 +633,12 @@ impl Table {
             if old_best_id.is_none() && !e.is_filtered() {
                 old_best_id = Some(e.path.local_path_id);
             }
-            if Arc::ptr_eq(&e.path.source, &source) && e.id == remote_id {
+            // Match by remote_addr + path_id, not by Arc identity.  This correctly
+            // replaces a stale path from a previous session (different Source Arc but
+            // same peer) when the peer reconnects after GR and re-sends the same route.
+            // For non-GR sessions there is at most one Source per remote_addr in the
+            // RIB, so the result is identical to an Arc::ptr_eq check.
+            if e.path.source.remote_addr == source.remote_addr && e.id == remote_id {
                 replaced_idx = Some(i);
             } else if e.path.source.remote_addr == source.remote_addr {
                 // Count peer paths that are NOT the one being replaced.
@@ -4049,6 +4054,135 @@ mod tests {
         assert_eq!(winner.1.source.remote_addr, fresh_src.remote_addr);
         let loser = best.iter().find(|(_, _, r)| *r == 2).unwrap();
         assert_eq!(loser.1.source.remote_addr, stale_src.remote_addr);
+    }
+
+    /// GR helper: when the same peer reconnects after a session drop and re-sends
+    /// the same NLRI with the same path_id, the stale path from the old session
+    /// must be replaced by the fresh path (not accumulated alongside it).
+    ///
+    /// Concretely: the replacement check uses remote_addr + path_id, not Arc
+    /// identity, so a fresh Source (new session) correctly supersedes the stale
+    /// Source (old session) for the same (peer, path_id) pair.
+    #[test]
+    fn gr_fresh_path_replaces_stale_on_reconnect() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+
+        // Session 1: insert a path, then mark it stale (simulating TCP drop + GR).
+        let s1 = source(1, 65001, 65000, 1);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0, // remote_id / path_id
+            nh(),
+            attrs_with_origin(0),
+            false,
+            None,
+        );
+        s1.mark_stale();
+
+        // Verify: one stale path in the table.
+        {
+            let best = flat_best(&rt, &Family::IPV4);
+            assert_eq!(best.len(), 1);
+            assert!(best[0].1.source.is_stale());
+        }
+
+        // Session 2: same peer re-establishes and re-sends the same NLRI (id=0).
+        // A new Source object is created for the new session.
+        let s2 = source(1, 65001, 65000, 1); // same remote_addr, different Arc
+        assert!(
+            !Arc::ptr_eq(&s1, &s2),
+            "precondition: different Arc objects"
+        );
+
+        let update = rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            0, // same remote_id as session 1
+            nh(),
+            attrs_with_origin(0),
+            false,
+            None,
+        );
+
+        // The stale path from session 1 must be replaced, not accumulated.
+        // After insert, there should be exactly one path for this NLRI.
+        let best = flat_best(&rt, &Family::IPV4);
+        assert_eq!(
+            best.len(),
+            1,
+            "stale path must be replaced, not accumulated alongside fresh path"
+        );
+        assert!(
+            !best[0].1.source.is_stale(),
+            "surviving path must be the fresh one"
+        );
+        assert!(
+            Arc::ptr_eq(&best[0].1.source, &s2),
+            "surviving path must belong to session 2"
+        );
+
+        // NlriChange must signal a best-path change (old stale -> new fresh).
+        let update = update.expect("insert of fresh path must produce NlriChange");
+        assert!(update.best_changed);
+    }
+
+    /// GR helper, Add-Path: only the path with a matching remote_id is replaced;
+    /// stale paths with other path_ids survive until drop_stale.
+    #[test]
+    fn gr_fresh_path_replaces_only_matching_path_id() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+
+        // Session 1: insert two Add-Path paths (id=1 and id=2), then go stale.
+        let s1 = source(1, 65001, 65000, 1);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            1,
+            nh(),
+            attrs_with_origin(0),
+            false,
+            None,
+        );
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            2,
+            nh(),
+            attrs_with_origin(0),
+            false,
+            None,
+        );
+        s1.mark_stale();
+        assert_eq!(flat_best(&rt, &Family::IPV4).len(), 2);
+
+        // Session 2: re-sends only id=1.
+        let s2 = source(1, 65001, 65000, 1);
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            net,
+            1,
+            nh(),
+            attrs_with_origin(0),
+            false,
+            None,
+        );
+
+        // id=1 replaced (now fresh), id=2 still stale.
+        let best = flat_best(&rt, &Family::IPV4);
+        assert_eq!(best.len(), 2, "id=1 replaced + id=2 still stale = 2 paths");
+        let fresh: Vec<_> = best.iter().filter(|e| !e.1.source.is_stale()).collect();
+        let stale: Vec<_> = best.iter().filter(|e| e.1.source.is_stale()).collect();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(stale.len(), 1);
+        assert!(Arc::ptr_eq(&fresh[0].1.source, &s2));
     }
 
     #[test]
