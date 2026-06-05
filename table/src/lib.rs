@@ -625,11 +625,16 @@ impl Table {
         let deferring = rt.deferring;
         let dst = rt.destinations.entry(net).or_insert_with(Destination::new);
 
-        // Capture the current best's attr Arc pointer before any modification.
-        // Comparing it with the post-insertion best detects all best-path changes:
+        // Capture the current best's (source, attr) Arc pointers before any modification.
+        // Comparing them with the post-insertion best detects all best-path changes:
         // new path wins, old best replaced (same local_path_id, new attrs), or
         // old best displaced by a different path after attribute update.
-        let old_best_attr_ptr = dst.unfiltered_best().map(|p| Arc::as_ptr(&p.path.attr));
+        // Both source and attr are needed: paths may share the same attr Arc when
+        // attrs.clone() is used within one UPDATE message (same allocation, same ptr),
+        // so attr alone cannot distinguish a different path becoming best.
+        let old_best_key = dst
+            .unfiltered_best()
+            .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
 
         // Single pass: find replaced index, check peer_has_path.
         let mut replaced_idx: Option<usize> = None;
@@ -716,8 +721,10 @@ impl Table {
         }
 
         // Compute change flags.
-        let new_best_attr_ptr = dst.unfiltered_best().map(|p| Arc::as_ptr(&p.path.attr));
-        let best_changed = old_best_attr_ptr != new_best_attr_ptr;
+        let new_best_key = dst
+            .unfiltered_best()
+            .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
+        let best_changed = old_best_key != new_best_key;
         let any_changed = !filtered || replaced.as_ref().is_some_and(|r| !r.is_filtered());
         if !best_changed && !any_changed {
             return None;
@@ -771,13 +778,18 @@ impl Table {
     ) -> Option<NlriChange> {
         let rt = self.ribs.get_mut(&family)?;
         let dst = rt.destinations.get_mut(&net)?;
+        // Match by remote_addr + path_id, not by Arc identity.  This correctly
+        // removes a stale path from a previous GR session (different Source Arc
+        // but same peer) when the peer reconnects and sends a WITHDRAW.
         let i = dst
             .entry
             .iter()
-            .position(|e| Arc::ptr_eq(&e.path.source, &source) && e.id == remote_id)?;
+            .position(|e| e.path.source.remote_addr == source.remote_addr && e.id == remote_id)?;
 
-        // Capture old best path id and whether the removed path was unfiltered.
-        let old_best_id: Option<u32> = dst.unfiltered_best().map(|p| p.path.local_path_id);
+        // Capture (source, attr) Arc pointers before removal for best_changed detection.
+        let old_best_key = dst
+            .unfiltered_best()
+            .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
         let was_unfiltered = !dst.entry[i].is_filtered();
 
         let (received, accepted) = self
@@ -816,8 +828,10 @@ impl Table {
             };
         }
 
-        let new_best_id = dst.unfiltered_best().map(|p| p.path.local_path_id);
-        let best_changed = old_best_id != new_best_id;
+        let new_best_key = dst
+            .unfiltered_best()
+            .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
+        let best_changed = old_best_key != new_best_key;
         let any_changed = was_unfiltered;
 
         if !best_changed && !any_changed {
@@ -4161,6 +4175,49 @@ mod tests {
         // NlriChange must signal a best-path change (old stale -> new fresh).
         let update = update.expect("insert of fresh path must produce NlriChange");
         assert!(update.best_changed);
+    }
+
+    /// GR helper: when the peer reconnects and sends a WITHDRAW for a route
+    /// that is still in the RIB as a stale path from the old session, the
+    /// stale path must be removed even though the Source Arc differs.
+    #[test]
+    fn gr_withdraw_removes_stale_path_from_prior_session() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+
+        // Session 1: insert path, then mark stale.
+        let s1 = source(1, 65001, 65000, 1);
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_origin(0),
+            false,
+            None,
+        );
+        s1.mark_stale();
+
+        // Session 2 establishes (new Source Arc, same remote_addr).
+        let s2 = source(1, 65001, 65000, 1);
+        assert!(
+            !Arc::ptr_eq(&s1, &s2),
+            "precondition: different Arc objects"
+        );
+
+        // Session 2 sends WITHDRAW (id=0) for the same prefix.
+        let update = rt.remove(s2, Family::IPV4, net, 0, None);
+
+        // The stale path must be removed.
+        assert!(
+            update.is_some(),
+            "WITHDRAW of stale path must produce NlriChange"
+        );
+        assert!(
+            rt.best_paths(&Family::IPV4).is_empty(),
+            "RIB must be empty after withdraw"
+        );
     }
 
     /// GR helper, Add-Path: only the path with a matching remote_id is replaced;
