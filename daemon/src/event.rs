@@ -3092,7 +3092,7 @@ impl Global {
         mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
     ) {
         let global: GlobalHandle = Arc::new(tokio::sync::RwLock::new(Global::new()));
-        let tables: TableHandle = Arc::new(Tables::new(num_cpus::get()));
+        let tables: TableHandle = Arc::new(TableManager::new(num_cpus::get()));
         let global_config = bgp
             .as_ref()
             .and_then(|x| x.global.as_ref())
@@ -3550,18 +3550,72 @@ enum TableEvent {
     Drop(Arc<IpAddr>),
 }
 
-type TableHandle = Arc<Tables>;
+/// Opaque subscription handle returned by [`TableManager::subscribe`].
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SubscriptionId(u64);
 
-struct Tables {
+/// A batch of Adj-RIB-In routes received from one peer (pre-import-policy).
+/// `attrs` is `None` for withdrawals.
+#[allow(dead_code)]
+struct AdjRibInChange {
+    source: Arc<table::Source>,
+    family: Family,
+    nlris: Vec<packet::PathNlri>,
+    attrs: Option<Arc<Vec<packet::Attribute>>>,
+    nexthop: Option<bgp::Nexthop>,
+}
+
+#[allow(dead_code)]
+struct PeerUpData {
+    peer_addr: IpAddr,
+    peer_asn: u32,
+    peer_id: u32,
+    uptime: u64,
+    local_addr: IpAddr,
+    local_port: u16,
+    remote_port: u16,
+    sent_open: bgp::Message,
+    received_open: bgp::Message,
+}
+
+#[allow(dead_code)]
+struct PeerDownData {
+    peer_addr: IpAddr,
+    peer_asn: u32,
+    peer_id: u32,
+    uptime: u64,
+    reason: bmp::PeerDownReason,
+}
+
+#[allow(dead_code)]
+enum BgpEvent {
+    AdjRibIn(AdjRibInChange),
+    PeerUp(PeerUpData),
+    PeerDown(PeerDownData),
+    EndOfRib(Family),
+}
+
+#[allow(dead_code)]
+struct Subscription {
+    rx: mpsc::UnboundedReceiver<BgpEvent>,
+    id: SubscriptionId,
+}
+
+type TableHandle = Arc<TableManager>;
+
+struct TableManager {
     shards: Vec<Mutex<TableShard>>,
     kernel_tx: ArcSwapOption<mpsc::UnboundedSender<KernelRouteEvent>>,
     import_policy: ArcSwapOption<table::PolicyAssignment>,
     export_policy: ArcSwapOption<table::PolicyAssignment>,
+    #[allow(dead_code)]
+    next_sub_id: std::sync::atomic::AtomicU64,
 }
 
-impl Tables {
+impl TableManager {
     fn new(num_shards: usize) -> Self {
-        Tables {
+        TableManager {
             shards: (0..num_shards)
                 .map(|_| {
                     Mutex::new(TableShard {
@@ -3576,6 +3630,7 @@ impl Tables {
             kernel_tx: ArcSwapOption::const_empty(),
             import_policy: ArcSwapOption::const_empty(),
             export_policy: ArcSwapOption::const_empty(),
+            next_sub_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -5583,7 +5638,7 @@ mod tests {
     }
 
     fn make_tables() -> TableHandle {
-        Arc::new(Tables::new(1))
+        Arc::new(TableManager::new(1))
     }
 
     fn default_peer_params(remote_addr: IpAddr) -> PeerParams {
