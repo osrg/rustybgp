@@ -4450,4 +4450,119 @@ mod tests {
             "insert after end_deferral must produce changes"
         );
     }
+
+    // --- prefix_limit ---
+
+    #[test]
+    fn prefix_limit_blocks_new_prefix_when_exceeded() {
+        // A fresh prefix must be rejected when the counter is already at max.
+        let mut rt = Table::new();
+        let src = source(1, 65001, 65000, 1);
+        let counter = Arc::new(AtomicU64::new(1));
+        let max: u32 = 1;
+        let pl = Some((max, &counter));
+
+        let net = nlri(10, 0, 0, 0, 24);
+        let result = rt.insert(src, Family::IPV4, net, 0, nh(), empty_attrs(), false, pl);
+        assert!(
+            matches!(result, InsertResult::PrefixLimitExceeded),
+            "insert must return PrefixLimitExceeded when counter >= max"
+        );
+        // Route must not be stored.
+        assert!(rt.best_paths(&Family::IPV4).is_empty());
+        // Counter must not be incremented further.
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prefix_limit_allows_replacement_when_exceeded() {
+        // Replacing an existing path for the same peer/path_id is always
+        // allowed even when the counter is at max.
+        let mut rt = Table::new();
+        let src = source(1, 65001, 65000, 1);
+        let counter = Arc::new(AtomicU64::new(0));
+        let max: u32 = 1;
+
+        // Insert first prefix (counter 0 → 1).
+        let net1 = nlri(10, 0, 0, 0, 24);
+        rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net1,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            Some((max, &counter)),
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Re-insert the same prefix (replacement, not new) must succeed even though counter == max.
+        let result = rt.insert(
+            src,
+            Family::IPV4,
+            net1,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            Some((max, &counter)),
+        );
+        assert!(
+            !matches!(result, InsertResult::PrefixLimitExceeded),
+            "replacement of existing prefix must not be blocked by prefix limit"
+        );
+        // Counter unchanged (replacement, not new).
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prefix_limit_increments_counter_for_new_prefixes() {
+        // Each genuinely new prefix increments the counter.
+        let mut rt = Table::new();
+        let src = source(1, 65001, 65000, 1);
+        let counter = Arc::new(AtomicU64::new(0));
+        let max: u32 = 3;
+
+        for (i, net) in [
+            nlri(10, 0, 0, 0, 24),
+            nlri(10, 0, 1, 0, 24),
+            nlri(10, 0, 2, 0, 24),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = rt.insert(
+                src.clone(),
+                Family::IPV4,
+                net,
+                0,
+                nh(),
+                empty_attrs(),
+                false,
+                Some((max, &counter)),
+            );
+            assert!(
+                !matches!(result, InsertResult::PrefixLimitExceeded),
+                "prefix {} must be accepted",
+                i + 1
+            );
+            assert_eq!(counter.load(Ordering::Relaxed), (i + 1) as u64);
+        }
+
+        // Fourth prefix must be rejected.
+        let net_extra = nlri(10, 0, 3, 0, 24);
+        let result = rt.insert(
+            src,
+            Family::IPV4,
+            net_extra,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            Some((max, &counter)),
+        );
+        assert!(matches!(result, InsertResult::PrefixLimitExceeded));
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
 }
