@@ -625,14 +625,16 @@ impl Table {
         let deferring = rt.deferring;
         let dst = rt.destinations.entry(net).or_insert_with(Destination::new);
 
-        // Single pass: compute old_best_id, find replaced index, check peer_has_path.
-        let mut old_best_id: Option<u32> = None;
+        // Capture the current best's attr Arc pointer before any modification.
+        // Comparing it with the post-insertion best detects all best-path changes:
+        // new path wins, old best replaced (same local_path_id, new attrs), or
+        // old best displaced by a different path after attribute update.
+        let old_best_attr_ptr = dst.unfiltered_best().map(|p| Arc::as_ptr(&p.path.attr));
+
+        // Single pass: find replaced index, check peer_has_path.
         let mut replaced_idx: Option<usize> = None;
         let mut peer_has_path = false;
         for (i, e) in dst.entry.iter().enumerate() {
-            if old_best_id.is_none() && !e.is_filtered() {
-                old_best_id = Some(e.path.local_path_id);
-            }
             // Match by remote_addr + path_id, not by Arc identity.  This correctly
             // replaces a stale path from a previous session (different Source Arc but
             // same peer) when the peer reconnects after GR and re-sends the same route.
@@ -714,11 +716,8 @@ impl Table {
         }
 
         // Compute change flags.
-        let new_best_id = dst.unfiltered_best().map(|p| p.path.local_path_id);
-        let replaced_was_best = replaced
-            .as_ref()
-            .is_some_and(|r| Some(r.path.local_path_id) == old_best_id && !r.is_filtered());
-        let best_changed = old_best_id != new_best_id || replaced_was_best;
+        let new_best_attr_ptr = dst.unfiltered_best().map(|p| Arc::as_ptr(&p.path.attr));
+        let best_changed = old_best_attr_ptr != new_best_attr_ptr;
         let any_changed = !filtered || replaced.as_ref().is_some_and(|r| !r.is_filtered());
         if !best_changed && !any_changed {
             return None;
