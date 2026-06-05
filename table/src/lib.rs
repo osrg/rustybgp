@@ -303,6 +303,7 @@ pub struct Reach {
     pub family: Family,
     pub net: packet::PathNlri,
     pub attr: Arc<Vec<packet::Attribute>>,
+    pub nexthop: bgp::Nexthop,
 }
 
 impl From<Reach> for bgp::Message {
@@ -316,7 +317,7 @@ impl From<Reach> for bgp::Message {
             attr: c.attr,
             unreach: None,
             mp_unreach: None,
-            nexthop: None,
+            nexthop: Some(c.nexthop),
         })
     }
 }
@@ -530,6 +531,7 @@ impl Table {
                         path_id: e.id,
                     },
                     attr: e.path.attr.clone(),
+                    nexthop: e.path.nexthop,
                 })
             })
     }

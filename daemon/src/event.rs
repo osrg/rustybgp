@@ -1331,61 +1331,62 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::WatchEventRequest>,
     ) -> Result<tonic::Response<Self::WatchEventStream>, tonic::Status> {
-        let (bmp_tx, bmp_rx) = mpsc::unbounded_channel();
-
-        if let Some(sockaddr) = request.remote_addr() {
-            for i in 0..self.tables.shards.len() {
-                let mut t = self.tables.shards[i].lock().await;
-                t.bmp_event_tx.insert(sockaddr, bmp_tx.clone());
-            }
-
-            let tables = self.tables.clone();
+        let tables2 = self.tables.clone();
+        if let Some(_sockaddr) = request.remote_addr() {
+            let subscription = self.tables.subscribe_live().await;
             let (tx, rx) = mpsc::channel(1024);
             tokio::spawn(async move {
-                let mut bmp_rx = UnboundedReceiverStream::new(bmp_rx);
-                while let Some(msg) = bmp_rx.next().await {
-                    match &msg {
-                        bmp::Message::PeerUp { header, .. }
-                        | bmp::Message::PeerDown { header, .. } => {
-                            let state = match &msg {
-                                bmp::Message::PeerUp { .. } => 6,
-                                _ => 1,
-                            };
-
-                            let r = api::WatchEventResponse {
-                                event: Some(api::watch_event_response::Event::Peer(
-                                    api::watch_event_response::PeerEvent {
-                                        r#type: api::watch_event_response::peer_event::Type::State
-                                            .into(),
-                                        peer: Some(api::Peer {
-                                            conf: Some(api::PeerConf {
-                                                peer_asn: header.asn,
-                                                neighbor_address: header.remote_addr.to_string(),
-                                                ..Default::default()
-                                            }),
-                                            state: Some(api::PeerState {
-                                                session_state: state,
-                                                ..Default::default()
-                                            }),
+                let mut rx = UnboundedReceiverStream::new(subscription.rx);
+                while let Some(event) = rx.next().await {
+                    let r = match event {
+                        BgpEvent::PeerUp(data) => api::WatchEventResponse {
+                            event: Some(api::watch_event_response::Event::Peer(
+                                api::watch_event_response::PeerEvent {
+                                    r#type: api::watch_event_response::peer_event::Type::State
+                                        .into(),
+                                    peer: Some(api::Peer {
+                                        conf: Some(api::PeerConf {
+                                            peer_asn: data.peer_asn,
+                                            neighbor_address: data.peer_addr.to_string(),
                                             ..Default::default()
                                         }),
-                                    },
-                                )),
-                            };
-                            if tx.send(Ok(r)).await.is_err() {
-                                break;
-                            }
-                        }
-                        bmp::Message::RouteMonitoring {
-                            header: _, update, ..
-                        } => {
+                                        state: Some(api::PeerState {
+                                            session_state: 6,
+                                            ..Default::default()
+                                        }),
+                                        ..Default::default()
+                                    }),
+                                },
+                            )),
+                        },
+                        BgpEvent::PeerDown(data) => api::WatchEventResponse {
+                            event: Some(api::watch_event_response::Event::Peer(
+                                api::watch_event_response::PeerEvent {
+                                    r#type: api::watch_event_response::peer_event::Type::State
+                                        .into(),
+                                    peer: Some(api::Peer {
+                                        conf: Some(api::PeerConf {
+                                            peer_asn: data.peer_asn,
+                                            neighbor_address: data.peer_addr.to_string(),
+                                            ..Default::default()
+                                        }),
+                                        state: Some(api::PeerState {
+                                            session_state: 1,
+                                            ..Default::default()
+                                        }),
+                                        ..Default::default()
+                                    }),
+                                },
+                            )),
+                        },
+                        BgpEvent::AdjRibIn(change) => {
                             let mut paths = Vec::new();
                             if let bgp::Message::Update(bgp::Update {
                                 reach,
                                 unreach,
                                 attr,
                                 ..
-                            }) = update
+                            }) = change.update
                             {
                                 if let Some(s) = reach {
                                     for net in &s.entries {
@@ -1409,23 +1410,19 @@ impl GoBgpService for GrpcService {
                                     }
                                 }
                             }
-
-                            let r = api::WatchEventResponse {
+                            api::WatchEventResponse {
                                 event: Some(api::watch_event_response::Event::Table(
                                     api::watch_event_response::TableEvent { paths },
                                 )),
-                            };
-                            if tx.send(Ok(r)).await.is_err() {
-                                break;
                             }
                         }
-                        _ => {}
+                        BgpEvent::EndOfRib => continue,
+                    };
+                    if tx.send(Ok(r)).await.is_err() {
+                        break;
                     }
                 }
-                for i in 0..tables.shards.len() {
-                    let mut t = tables.shards[i].lock().await;
-                    t.bmp_event_tx.remove(&sockaddr);
-                }
+                tables2.unsubscribe(subscription.id).await;
             });
             Ok(tonic::Response::new(Box::pin(
                 tokio_stream::wrappers::ReceiverStream::new(rx),
@@ -2387,7 +2384,7 @@ impl BmpClient {
 
     async fn serve(
         stream: TcpStream,
-        sockaddr: SocketAddr,
+        _sockaddr: SocketAddr,
         global: GlobalHandle,
         tables: TableHandle,
     ) {
@@ -2419,23 +2416,32 @@ impl BmpClient {
             ]))
             .await;
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut adjin = FnvHashMap::default();
-        for i in 0..tables.shards.len() {
-            let mut t = tables.shards[i].lock().await;
-            t.bmp_event_tx.insert(sockaddr, tx.clone());
-            for f in &[Family::IPV4, Family::IPV6] {
-                for c in t.rtable.iter_reach(*f) {
-                    let e = adjin.entry(c.source.remote_addr).or_insert_with(Vec::new);
-                    let addpath = if let Some(e) = t.addpath.get(&c.source.remote_addr) {
-                        e.contains(f)
-                    } else {
-                        false
-                    };
-                    e.push((c, addpath));
+        let subscription = tables.subscribe().await;
+        let mut rx = subscription.rx;
+
+        // Buffer all snapshot events until EndOfRib.
+        let mut snapshot: FnvHashMap<IpAddr, Vec<AdjRibInChange>> = FnvHashMap::default();
+        let mut eof_count = 0;
+        loop {
+            match rx.recv().await {
+                Some(BgpEvent::AdjRibIn(change)) => {
+                    snapshot
+                        .entry(change.source.remote_addr)
+                        .or_default()
+                        .push(change);
                 }
+                Some(BgpEvent::PeerUp(_)) | Some(BgpEvent::PeerDown(_)) => {}
+                Some(BgpEvent::EndOfRib) => {
+                    eof_count += 1;
+                    if eof_count >= 2 {
+                        break;
+                    }
+                }
+                None => return,
             }
         }
+
+        // Send PeerUp for all established peers.
         let local_id = global.read().await.router_id;
         let mut established_peers = Vec::new();
         for peer in global.read().await.peers.values() {
@@ -2476,38 +2482,42 @@ impl BmpClient {
                     }),
                 };
                 if lines.send(&m).await.is_err() {
+                    tables.unsubscribe(subscription.id).await;
                     return;
                 }
             }
         }
+
+        // Send RouteMonitoring for buffered snapshot routes (per established peer).
         for addr in established_peers {
-            let mut header = None;
-            if let Some(v) = adjin.remove(&addr) {
-                for (m, addpath) in v {
+            let mut header: Option<bmp::PerPeerHeader> = None;
+            if let Some(changes) = snapshot.remove(&addr) {
+                for change in changes {
                     if header.is_none() {
                         header = Some(bmp::PerPeerHeader::new(
-                            m.source.remote_asn,
-                            Ipv4Addr::from(m.source.router_id),
+                            change.source.remote_asn,
+                            Ipv4Addr::from(change.source.router_id),
                             0,
-                            m.source.remote_addr,
-                            m.source.uptime as u32,
+                            change.source.remote_addr,
+                            change.source.uptime as u32,
                         ));
                     }
                     if lines
                         .send(&bmp::Message::RouteMonitoring {
                             header: bmp::PerPeerHeader::new(
-                                m.source.remote_asn,
-                                Ipv4Addr::from(m.source.router_id),
+                                change.source.remote_asn,
+                                Ipv4Addr::from(change.source.router_id),
                                 0,
-                                m.source.remote_addr,
-                                m.source.uptime as u32,
+                                change.source.remote_addr,
+                                change.source.uptime as u32,
                             ),
-                            update: m.into(),
-                            addpath,
+                            update: change.update,
+                            addpath: change.addpath,
                         })
                         .await
                         .is_err()
                     {
+                        tables.unsubscribe(subscription.id).await;
                         return;
                     }
                 }
@@ -2520,37 +2530,85 @@ impl BmpClient {
                     .await
                     .is_err()
                 {
+                    tables.unsubscribe(subscription.id).await;
                     return;
                 }
             }
         }
+
+        // Live event loop.
         let mut rx = UnboundedReceiverStream::new(rx);
         loop {
             tokio::select! {
                 msg = lines.next() => {
-                    let _msg = match msg {
-                        Some(msg) => match msg {
-                            Ok(msg) => msg,
-                            Err(_) => break,
-                        },
-                        None => break,
-                    };
+                    match msg {
+                        Some(Ok(_)) => {}
+                        _ => break,
+                    }
                 }
-                msg = rx.next() => {
-                    if let Some(msg) = msg {
-                        if lines.send(&msg).await.is_err() {
-                            break;
+                event = rx.next() => {
+                    match event {
+                        Some(BgpEvent::AdjRibIn(change)) => {
+                            if lines
+                                .send(&bmp::Message::RouteMonitoring {
+                                    header: bmp::PerPeerHeader::new(
+                                        change.source.remote_asn,
+                                        Ipv4Addr::from(change.source.router_id),
+                                        0,
+                                        change.source.remote_addr,
+                                        change.source.uptime as u32,
+                                    ),
+                                    update: change.update,
+                                    addpath: change.addpath,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
-                    } else {
-                        break;
+                        Some(BgpEvent::PeerUp(data)) => {
+                            let remote_id = Ipv4Addr::from(data.peer_id);
+                            let m = bmp::Message::PeerUp {
+                                header: bmp::PerPeerHeader::new(
+                                    data.peer_asn,
+                                    remote_id,
+                                    0,
+                                    data.peer_addr,
+                                    data.uptime as u32,
+                                ),
+                                local_addr: data.local_addr,
+                                local_port: data.local_port,
+                                remote_port: data.remote_port,
+                                remote_open: data.received_open,
+                                local_open: data.sent_open,
+                            };
+                            if lines.send(&m).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(BgpEvent::PeerDown(data)) => {
+                            let m = bmp::Message::PeerDown {
+                                header: bmp::PerPeerHeader::new(
+                                    data.peer_asn,
+                                    Ipv4Addr::from(data.peer_id),
+                                    0,
+                                    data.peer_addr,
+                                    data.uptime as u32,
+                                ),
+                                reason: data.reason,
+                            };
+                            if lines.send(&m).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(BgpEvent::EndOfRib) => {}
+                        None => break,
                     }
                 }
             }
         }
-        for i in 0..tables.shards.len() {
-            let mut t = tables.shards[i].lock().await;
-            let _ = t.bmp_event_tx.remove(&sockaddr);
-        }
+        tables.unsubscribe(subscription.id).await;
     }
 
     fn try_connect(
@@ -3551,22 +3609,18 @@ enum TableEvent {
 }
 
 /// Opaque subscription handle returned by [`TableManager::subscribe`].
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SubscriptionId(u64);
 
-/// A batch of Adj-RIB-In routes received from one peer (pre-import-policy).
-/// `attrs` is `None` for withdrawals.
-#[allow(dead_code)]
+/// A pre-import-policy Adj-RIB-In update from one peer.
+/// `update` holds either a reach (announce) or unreach (withdraw) BGP message.
 struct AdjRibInChange {
     source: Arc<table::Source>,
-    family: Family,
-    nlris: Vec<packet::PathNlri>,
-    attrs: Option<Arc<Vec<packet::Attribute>>>,
-    nexthop: Option<bgp::Nexthop>,
+    addpath: bool,
+    update: bgp::Message,
 }
 
-#[allow(dead_code)]
+#[derive(Clone)]
 struct PeerUpData {
     peer_addr: IpAddr,
     peer_asn: u32,
@@ -3579,7 +3633,7 @@ struct PeerUpData {
     received_open: bgp::Message,
 }
 
-#[allow(dead_code)]
+#[derive(Clone)]
 struct PeerDownData {
     peer_addr: IpAddr,
     peer_asn: u32,
@@ -3588,15 +3642,13 @@ struct PeerDownData {
     reason: bmp::PeerDownReason,
 }
 
-#[allow(dead_code)]
 enum BgpEvent {
     AdjRibIn(AdjRibInChange),
     PeerUp(PeerUpData),
     PeerDown(PeerDownData),
-    EndOfRib(Family),
+    EndOfRib,
 }
 
-#[allow(dead_code)]
 struct Subscription {
     rx: mpsc::UnboundedReceiver<BgpEvent>,
     id: SubscriptionId,
@@ -3609,8 +3661,8 @@ struct TableManager {
     kernel_tx: ArcSwapOption<mpsc::UnboundedSender<KernelRouteEvent>>,
     import_policy: ArcSwapOption<table::PolicyAssignment>,
     export_policy: ArcSwapOption<table::PolicyAssignment>,
-    #[allow(dead_code)]
     next_sub_id: std::sync::atomic::AtomicU64,
+    subscribers: tokio::sync::Mutex<FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>>,
 }
 
 impl TableManager {
@@ -3621,7 +3673,7 @@ impl TableManager {
                     Mutex::new(TableShard {
                         rtable: table::Table::new(),
                         peer_event_tx: FnvHashMap::default(),
-                        bmp_event_tx: FnvHashMap::default(),
+                        subscribers: FnvHashMap::default(),
                         mrt_event_tx: FnvHashMap::default(),
                         addpath: FnvHashMap::default(),
                     })
@@ -3631,6 +3683,7 @@ impl TableManager {
             import_policy: ArcSwapOption::const_empty(),
             export_policy: ArcSwapOption::const_empty(),
             next_sub_id: std::sync::atomic::AtomicU64::new(0),
+            subscribers: tokio::sync::Mutex::new(FnvHashMap::default()),
         }
     }
 
@@ -3658,7 +3711,7 @@ impl TableManager {
         let kernel_tx = self.kernel_tx.load_full();
         let idx = self.dealer(net.nlri);
         let mut t = self.shards[idx].lock().await;
-        t.send_bmp_update(&source, family, &[net], Some(&attr), Some(nexthop));
+        t.notify_adj_rib_in(source.clone(), family, &[net], Some(&attr), Some(nexthop));
         t.send_mrt_update(&source, family, &[net], Some(&attr), Some(nexthop));
         let mut nh = nexthop;
         let filtered = crate::policy::apply_import(
@@ -3701,7 +3754,7 @@ impl TableManager {
         let kernel_tx = self.kernel_tx.load_full();
         let idx = self.dealer(net.nlri);
         let mut t = self.shards[idx].lock().await;
-        t.send_bmp_update(&source, family, &[net], None, None);
+        t.notify_adj_rib_in(source.clone(), family, &[net], None, None);
         t.send_mrt_update(&source, family, &[net], None, None);
         let counter_ref = prefix_counter.as_ref();
         if let Some(update) = t
@@ -3723,12 +3776,91 @@ impl TableManager {
             export_policy.as_deref(),
         );
     }
+
+    /// Subscribe with full snapshot: sends all current routes as AdjRibIn events per shard,
+    /// then two EndOfRib signals. Registers for live events atomically per shard.
+    async fn subscribe(&self) -> Subscription {
+        let id = SubscriptionId(
+            self.next_sub_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Register for peer events (PeerUp/PeerDown) first to avoid missing events.
+        {
+            let mut subs = self.subscribers.lock().await;
+            subs.insert(id, tx.clone());
+        }
+        // Snapshot each shard atomically and register for AdjRibIn events.
+        for i in 0..self.shards.len() {
+            let mut shard = self.shards[i].lock().await;
+            for f in &[Family::IPV4, Family::IPV6] {
+                for reach in shard.rtable.iter_reach(*f) {
+                    let addpath = shard.has_addpath(&reach.source.remote_addr, f);
+                    let source = reach.source.clone();
+                    let update: bgp::Message = reach.into();
+                    let _ = tx.send(BgpEvent::AdjRibIn(AdjRibInChange {
+                        source,
+                        addpath,
+                        update,
+                    }));
+                }
+            }
+            shard.subscribers.insert(id, tx.clone());
+        }
+        // Signal end of initial snapshot.
+        let _ = tx.send(BgpEvent::EndOfRib);
+        let _ = tx.send(BgpEvent::EndOfRib);
+        Subscription { rx, id }
+    }
+
+    /// Subscribe for live events only (no snapshot). Used by watch_event gRPC.
+    async fn subscribe_live(&self) -> Subscription {
+        let id = SubscriptionId(
+            self.next_sub_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        {
+            let mut subs = self.subscribers.lock().await;
+            subs.insert(id, tx.clone());
+        }
+        for shard in &self.shards {
+            let mut shard = shard.lock().await;
+            shard.subscribers.insert(id, tx.clone());
+        }
+        Subscription { rx, id }
+    }
+
+    async fn unsubscribe(&self, id: SubscriptionId) {
+        {
+            let mut subs = self.subscribers.lock().await;
+            subs.remove(&id);
+        }
+        for shard in &self.shards {
+            let mut shard = shard.lock().await;
+            shard.subscribers.remove(&id);
+        }
+    }
+
+    async fn peer_up(&self, data: PeerUpData) {
+        let subs = self.subscribers.lock().await;
+        for tx in subs.values() {
+            let _ = tx.send(BgpEvent::PeerUp(data.clone()));
+        }
+    }
+
+    async fn peer_down(&self, data: PeerDownData) {
+        let subs = self.subscribers.lock().await;
+        for tx in subs.values() {
+            let _ = tx.send(BgpEvent::PeerDown(data.clone()));
+        }
+    }
 }
 
 struct TableShard {
     rtable: table::Table,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
-    bmp_event_tx: FnvHashMap<SocketAddr, mpsc::UnboundedSender<bmp::Message>>,
+    subscribers: FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>,
     mrt_event_tx: FnvHashMap<String, mpsc::UnboundedSender<mrt::Message>>,
     addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
 }
@@ -3738,22 +3870,15 @@ impl TableShard {
         self.addpath.get(addr).is_some_and(|e| e.contains(family))
     }
 
-    fn send_bmp_update(
+    fn notify_adj_rib_in(
         &self,
-        source: &table::Source,
+        source: Arc<table::Source>,
         family: Family,
         nets: &[packet::PathNlri],
         attrs: Option<&Arc<Vec<packet::Attribute>>>,
         nexthop: Option<bgp::Nexthop>,
     ) {
         let addpath = self.has_addpath(&source.remote_addr, &family);
-        let header = bmp::PerPeerHeader::new(
-            source.remote_asn,
-            Ipv4Addr::from(source.router_id),
-            0,
-            source.remote_addr,
-            source.uptime as u32,
-        );
         let update = if let Some(attrs) = attrs {
             bgp::Message::Update(bgp::Update {
                 reach: Some(packet::bgp::NlriSet {
@@ -3779,12 +3904,12 @@ impl TableShard {
                 nexthop: None,
             })
         };
-        for bmp_tx in self.bmp_event_tx.values() {
-            let _ = bmp_tx.send(bmp::Message::RouteMonitoring {
-                header: header.clone(),
-                update: update.clone(),
+        for tx in self.subscribers.values() {
+            let _ = tx.send(BgpEvent::AdjRibIn(AdjRibInChange {
+                source: source.clone(),
                 addpath,
-            });
+                update: update.clone(),
+            }));
         }
     }
 
@@ -3968,7 +4093,7 @@ impl TableShard {
     ) {
         match msg {
             TableEvent::PassUpdate(source, family, nets, attrs, nexthop) => {
-                self.send_bmp_update(&source, family, &nets, attrs.as_ref(), nexthop);
+                self.notify_adj_rib_in(source.clone(), family, &nets, attrs.as_ref(), nexthop);
                 self.send_mrt_update(&source, family, &nets, attrs.as_ref(), nexthop);
 
                 match attrs {
@@ -4678,55 +4803,34 @@ impl PeerSession {
             if !addpath.is_empty() {
                 t.addpath.insert(self.remote_addr, addpath.clone());
             }
-
-            // Send BMP PeerUp from the first table partition only.
-            if i == 0 {
-                self.send_bmp_peer_up(&t, remote_asn, uptime, local_sockaddr, remote_sockaddr)
-                    .await;
-            }
         }
-    }
-
-    async fn send_bmp_peer_up(
-        &self,
-        t: &TableShard,
-        remote_asn: u32,
-        uptime: u64,
-        local_sockaddr: SocketAddr,
-        remote_sockaddr: SocketAddr,
-    ) {
-        let remote_id = self.state.remote_id.load(Ordering::Relaxed);
         let remote_holdtime = HoldTime::new(self.state.remote_holdtime.load(Ordering::Relaxed))
             .unwrap_or(HoldTime::DISABLED);
-        for bmp_tx in t.bmp_event_tx.values() {
-            let bmp_msg = bmp::Message::PeerUp {
-                header: bmp::PerPeerHeader::new(
-                    remote_asn,
-                    Ipv4Addr::from(remote_id),
-                    0,
-                    remote_sockaddr.ip(),
-                    uptime as u32,
-                ),
+        self.tables
+            .peer_up(PeerUpData {
+                peer_addr: remote_sockaddr.ip(),
+                peer_asn: remote_asn,
+                peer_id: self.state.remote_id.load(Ordering::Relaxed),
+                uptime,
                 local_addr: self.local_addr,
                 local_port: local_sockaddr.port(),
                 remote_port: remote_sockaddr.port(),
-                remote_open: bgp::Message::Open(bgp::Open {
+                sent_open: bgp::Message::Open(bgp::Open {
                     as_number: remote_asn,
                     holdtime: remote_holdtime,
-                    router_id: remote_id,
+                    router_id: self.state.remote_id.load(Ordering::Relaxed),
+                    capability: self.local_cap.to_owned(),
+                }),
+                received_open: bgp::Message::Open(bgp::Open {
+                    as_number: remote_asn,
+                    holdtime: remote_holdtime,
+                    router_id: self.state.remote_id.load(Ordering::Relaxed),
                     // Safe to unwrap: called from on_established() where
                     // remote_cap has just been set by apply_outputs().
                     capability: self.state.remote_cap.load().as_deref().cloned().unwrap(),
                 }),
-                local_open: bgp::Message::Open(bgp::Open {
-                    as_number: remote_asn,
-                    holdtime: remote_holdtime,
-                    router_id: remote_id,
-                    capability: self.local_cap.to_owned(),
-                }),
-            };
-            let _ = bmp_tx.send(bmp_msg);
-        }
+            })
+            .await;
     }
 
     fn populate_from_shard(
@@ -5407,6 +5511,7 @@ impl PeerSession {
             let kernel_tx = self.tables.kernel_tx.load_full();
             // All per-family Sources share the same peer-level fields; use any for BMP.
             let any_source = self.source.values().next().unwrap().clone();
+            let bmp_reason = session_down_to_bmp(self.shutdown.take());
             for i in 0..self.tables.shards.len() {
                 let mut t = self.tables.shards[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
@@ -5427,23 +5532,16 @@ impl PeerSession {
                         export_policy.as_deref(),
                     );
                 }
-                let bmp_reason = session_down_to_bmp(self.shutdown.take());
-                if i == 0 {
-                    for bmp_tx in t.bmp_event_tx.values() {
-                        let m = bmp::Message::PeerDown {
-                            header: bmp::PerPeerHeader::new(
-                                any_source.remote_asn,
-                                Ipv4Addr::from(any_source.router_id),
-                                0,
-                                any_source.remote_addr,
-                                any_source.uptime as u32,
-                            ),
-                            reason: bmp_reason.clone(),
-                        };
-                        let _ = bmp_tx.send(m);
-                    }
-                }
             }
+            self.tables
+                .peer_down(PeerDownData {
+                    peer_addr: any_source.remote_addr,
+                    peer_asn: any_source.remote_asn,
+                    peer_id: any_source.router_id,
+                    uptime: any_source.uptime,
+                    reason: bmp_reason,
+                })
+                .await;
         }
         disconnect.export_map = std::mem::take(&mut self.export_map);
 
