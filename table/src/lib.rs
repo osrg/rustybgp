@@ -3007,6 +3007,100 @@ mod tests {
         assert_eq!(s.accepted, 0);
     }
 
+    #[test]
+    fn addpath_peer_stats_counts_prefixes_not_paths() {
+        // Add-Path: two paths (path_id=1, path_id=2) for the same prefix from
+        // the same peer must count as received=1, not received=2.
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let src = source(1, 65001, 65000, 1);
+
+        // First path (path_id=1): new prefix -> received++, accepted++
+        rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net,
+            1,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
+        // Second path (path_id=2): same prefix, additional Add-Path path.
+        // received must NOT increment again.
+        rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net,
+            2,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
+
+        let stats: Vec<_> = rt.peer_stats(&src.remote_addr).unwrap().collect();
+        let (_, s) = stats[0];
+        assert_eq!(
+            s.received, 1,
+            "two Add-Path paths for same prefix must count as one received"
+        );
+        assert_eq!(
+            s.accepted, 2,
+            "each unfiltered path contributes to accepted"
+        );
+    }
+
+    #[test]
+    fn addpath_remove_last_path_decrements_received() {
+        // Removing the last path for a prefix must decrement received.
+        // Removing one of two Add-Path paths must NOT decrement received.
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let src = source(1, 65001, 65000, 1);
+
+        rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net,
+            1,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
+        rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net,
+            2,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
+
+        // Remove path_id=1: path_id=2 still exists -> received must stay 1
+        rt.remove(src.clone(), Family::IPV4, net, 1, None);
+        let stats: Vec<_> = rt.peer_stats(&src.remote_addr).unwrap().collect();
+        let (_, s) = stats[0];
+        assert_eq!(
+            s.received, 1,
+            "received must stay 1 while a path for the prefix remains"
+        );
+        assert_eq!(s.accepted, 1);
+
+        // Remove path_id=2: no more paths -> received must drop to 0
+        rt.remove(src.clone(), Family::IPV4, net, 2, None);
+        let stats: Vec<_> = rt.peer_stats(&src.remote_addr).unwrap().collect();
+        let (_, s) = stats[0];
+        assert_eq!(
+            s.received, 0,
+            "received must drop to 0 when last path is removed"
+        );
+        assert_eq!(s.accepted, 0);
+    }
+
     // --- best() ---
 
     #[test]
