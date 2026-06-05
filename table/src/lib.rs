@@ -309,6 +309,28 @@ impl From<Reach> for bgp::Message {
     }
 }
 
+/// Return value of `Rib::insert()`.
+pub enum InsertResult {
+    /// No routing change; caller need not act.
+    NoChange,
+    /// Per-peer prefix limit (RFC 4486 §2) exceeded; caller must send CEASE
+    /// NOTIFICATION (Error Code 6, Subcode 1) and close the session.
+    PrefixLimitExceeded,
+    /// Routing table changed; caller should distribute the update.
+    Changed(NlriChange),
+}
+
+impl InsertResult {
+    /// Returns a reference to the inner `NlriChange` if this is `Changed`,
+    /// or `None` otherwise.  Mirrors `Option::as_ref` for ergonomic test code.
+    pub fn as_changed(&self) -> Option<&NlriChange> {
+        match self {
+            Self::Changed(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
 /// Result of a single `Table::insert()` or `Table::remove()` operation.
 ///
 /// Non-Add-Path peers can skip processing when `best_changed` is false.
@@ -618,7 +640,7 @@ impl Table {
         attr: Arc<Vec<packet::Attribute>>,
         filtered: bool,
         prefix_limit: Option<(u32, &Arc<AtomicU64>)>,
-    ) -> Option<NlriChange> {
+    ) -> InsertResult {
         let flags = if filtered { RibEntry::FLAG_FILTERED } else { 0 };
 
         let rt = self.ribs.entry(family).or_default();
@@ -663,13 +685,7 @@ impl Table {
         //    are always accepted regardless of the limit.
         if is_new && let Some((max, counter)) = prefix_limit {
             if counter.load(Ordering::Relaxed) >= max as u64 {
-                // Do not count in received: the path is not stored in the
-                // Adj-RIB-In (received reflects Adj-RIB-In current state).
-                eprintln!(
-                    "prefix limit ({}) reached for peer {} family {:?}, dropping route",
-                    max, source.remote_addr, family
-                );
-                return None;
+                return InsertResult::PrefixLimitExceeded;
             }
             counter.fetch_add(1, Ordering::Relaxed);
         }
@@ -717,7 +733,7 @@ impl Table {
         // During Restarting Speaker deferral, routes are accumulated but
         // best-path changes are suppressed; end_deferral() emits them all at once.
         if deferring {
-            return None;
+            return InsertResult::NoChange;
         }
 
         // Compute change flags.
@@ -727,13 +743,13 @@ impl Table {
         let best_changed = old_best_key != new_best_key;
         let any_changed = !filtered || replaced.as_ref().is_some_and(|r| !r.is_filtered());
         if !best_changed && !any_changed {
-            return None;
+            return InsertResult::NoChange;
         }
         let replaced_path_id = replaced.as_ref().map(|r| r.path.local_path_id);
 
         let current_paths = Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
 
-        Some(NlriChange {
+        InsertResult::Changed(NlriChange {
             family,
             net,
             best_changed,
@@ -2351,8 +2367,8 @@ mod tests {
             false,
             None,
         );
-        assert!(update.as_ref().unwrap().any_changed);
-        assert!(update.as_ref().unwrap().best_changed);
+        assert!(update.as_changed().unwrap().any_changed);
+        assert!(update.as_changed().unwrap().best_changed);
     }
 
     #[test]
@@ -2382,9 +2398,9 @@ mod tests {
             None,
         );
         // Best did not change; second path entered current_paths at index 1
-        assert!(!update.as_ref().unwrap().best_changed);
-        assert!(update.as_ref().unwrap().any_changed);
-        assert_eq!(update.as_ref().unwrap().current_paths.len(), 2);
+        assert!(!update.as_changed().unwrap().best_changed);
+        assert!(update.as_changed().unwrap().any_changed);
+        assert_eq!(update.as_changed().unwrap().current_paths.len(), 2);
     }
 
     // --- best path selection ---
@@ -2414,8 +2430,8 @@ mod tests {
             None,
         );
         // Higher local_pref wins → best changes to source 2
-        assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2447,8 +2463,8 @@ mod tests {
             None,
         );
         // Shorter AS path wins
-        assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2482,8 +2498,8 @@ mod tests {
             None,
         );
         // IGP (lower origin value) wins
-        assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2517,8 +2533,8 @@ mod tests {
             None,
         );
         // eBGP wins even though router_id is higher
-        assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2551,8 +2567,8 @@ mod tests {
             false,
             None,
         );
-        assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
@@ -2672,7 +2688,10 @@ mod tests {
             true,
             None,
         );
-        assert!(update.is_none(), "filtered-only insert must be a no-op");
+        assert!(
+            update.as_changed().is_none(),
+            "filtered-only insert must be a no-op"
+        );
 
         // Unfiltered path added → best changes, new_best points to the unfiltered path
         let s2 = source(2, 65002, 65000, 2);
@@ -2686,8 +2705,8 @@ mod tests {
             false,
             None,
         );
-        assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s2));
     }
 
@@ -2719,8 +2738,8 @@ mod tests {
             false,
             None,
         );
-        assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s2));
         // another unfiltered but worse (router_id=3) → best unchanged, but any_changed
         let update = rt.insert(
@@ -2733,9 +2752,9 @@ mod tests {
             false,
             None,
         );
-        assert!(!update.as_ref().unwrap().best_changed);
-        assert!(update.as_ref().unwrap().any_changed);
-        assert_eq!(update.as_ref().unwrap().current_paths.len(), 2);
+        assert!(!update.as_changed().unwrap().best_changed);
+        assert!(update.as_changed().unwrap().any_changed);
+        assert_eq!(update.as_changed().unwrap().current_paths.len(), 2);
     }
 
     // B1: replace filtered path at index 0 → unfiltered best unchanged
@@ -2778,7 +2797,7 @@ mod tests {
             None,
         );
         assert!(
-            update.is_none(),
+            update.as_changed().is_none(),
             "filtered-to-filtered replace must be a no-op"
         );
     }
@@ -2825,8 +2844,8 @@ mod tests {
         );
         // replace s1 as filtered → s2 becomes unfiltered best
         let update = rt.insert(s1, Family::IPV4, net, 0, nh(), empty_attrs(), true, None);
-        assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s2));
     }
 
@@ -2872,7 +2891,9 @@ mod tests {
             None,
         );
 
-        let update = update.expect("replacement must produce NlriChange");
+        let update = update
+            .as_changed()
+            .expect("replacement must produce NlriChange");
         assert!(
             update.best_changed,
             "best must change when attrs demote the old best"
@@ -2932,10 +2953,10 @@ mod tests {
             false,
             None,
         );
-        assert!(!update.as_ref().unwrap().best_changed);
-        assert!(update.as_ref().unwrap().any_changed);
+        assert!(!update.as_changed().unwrap().best_changed);
+        assert!(update.as_changed().unwrap().any_changed);
         // s1 is still best
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s1));
     }
 
@@ -3301,9 +3322,9 @@ mod tests {
         );
         // s1 must remain best (higher local_pref wins over lower router_id)
         // s2 enters as a new current path, best unchanged
-        assert!(!update.as_ref().unwrap().best_changed);
-        assert!(update.as_ref().unwrap().any_changed);
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert!(!update.as_changed().unwrap().best_changed);
+        assert!(update.as_changed().unwrap().any_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s1));
     }
 
@@ -3323,11 +3344,11 @@ mod tests {
             false,
             None,
         );
-        assert!(update.as_ref().unwrap().best_changed);
+        assert!(update.as_changed().unwrap().best_changed);
         // Replace with filtered → no unfiltered best remains → best_changed, new_best=None
         let update = rt.insert(s1, Family::IPV4, net, 0, nh(), empty_attrs(), true, None);
-        assert!(update.as_ref().unwrap().best_changed);
-        assert!(update.as_ref().unwrap().new_best().is_none());
+        assert!(update.as_changed().unwrap().best_changed);
+        assert!(update.as_changed().unwrap().new_best().is_none());
     }
 
     #[test]
@@ -3370,8 +3391,8 @@ mod tests {
             true,
             None,
         );
-        assert!(update.as_ref().unwrap().best_changed);
-        assert!(update.as_ref().unwrap().new_best().is_none());
+        assert!(update.as_changed().unwrap().best_changed);
+        assert!(update.as_changed().unwrap().new_best().is_none());
     }
 
     // --- best() with filtered head ---
@@ -3702,8 +3723,8 @@ mod tests {
             false,
             None,
         );
-        assert!(update.as_ref().unwrap().best_changed);
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert_eq!(best.local_path_id, 1);
 
         // Insert s2 → new best (lower router_id)
@@ -3717,20 +3738,25 @@ mod tests {
             false,
             None,
         );
-        assert!(update.as_ref().unwrap().best_changed);
-        assert_eq!(update.as_ref().unwrap().current_paths.len(), 2);
+        assert!(update.as_changed().unwrap().best_changed);
+        assert_eq!(update.as_changed().unwrap().current_paths.len(), 2);
         // s2 is the new best (rank 0 in current_paths)
         assert_eq!(
-            update.as_ref().unwrap().new_best().unwrap().local_path_id,
+            update
+                .as_changed()
+                .unwrap()
+                .new_best()
+                .unwrap()
+                .local_path_id,
             2
         );
         assert!(Arc::ptr_eq(
-            &update.as_ref().unwrap().new_best().unwrap().source,
+            &update.as_changed().unwrap().new_best().unwrap().source,
             &s2
         ));
         // s1 is at index 1 in current_paths
         let s1_path = update
-            .as_ref()
+            .as_changed()
             .unwrap()
             .current_paths
             .iter()
@@ -3756,7 +3782,12 @@ mod tests {
             false,
             None,
         );
-        let original_id = update.as_ref().unwrap().new_best().unwrap().local_path_id;
+        let original_id = update
+            .as_changed()
+            .unwrap()
+            .new_best()
+            .unwrap()
+            .local_path_id;
 
         // Replace with new attributes
         let update = rt.insert(
@@ -3770,8 +3801,11 @@ mod tests {
             None,
         );
         // Same path_id preserved, replaced_path_id indicates what was replaced
-        assert_eq!(update.as_ref().unwrap().replaced_path_id, Some(original_id));
-        let best = update.as_ref().unwrap().new_best().unwrap();
+        assert_eq!(
+            update.as_changed().unwrap().replaced_path_id,
+            Some(original_id)
+        );
+        let best = update.as_changed().unwrap().new_best().unwrap();
         assert_eq!(best.local_path_id, original_id);
     }
 
@@ -3793,7 +3827,7 @@ mod tests {
             false,
             None,
         );
-        let s1_id = u1.as_ref().unwrap().new_best().unwrap().local_path_id;
+        let s1_id = u1.as_changed().unwrap().new_best().unwrap().local_path_id;
         rt.insert(
             s2.clone(),
             Family::IPV4,
@@ -4173,7 +4207,9 @@ mod tests {
         );
 
         // NlriChange must signal a best-path change (old stale -> new fresh).
-        let update = update.expect("insert of fresh path must produce NlriChange");
+        let update = update
+            .as_changed()
+            .expect("insert of fresh path must produce NlriChange");
         assert!(update.best_changed);
     }
 
@@ -4319,7 +4355,10 @@ mod tests {
         rt.start_deferral(Family::IPV4);
 
         let update = rt.insert(src, Family::IPV4, net, 0, nh(), empty_attrs(), false, None);
-        assert!(update.is_none(), "deferral must suppress insert changes");
+        assert!(
+            update.as_changed().is_none(),
+            "deferral must suppress insert changes"
+        );
         assert!(
             rt.ribs.get(&Family::IPV4).unwrap().deferring,
             "deferring flag must be set"
@@ -4341,7 +4380,7 @@ mod tests {
         let nh6 = bgp::Nexthop::V6(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
         let update = rt.insert(src, Family::IPV6, net6, 0, nh6, empty_attrs(), false, None);
         assert!(
-            update.as_ref().unwrap().best_changed || update.as_ref().unwrap().any_changed,
+            update.as_changed().unwrap().best_changed || update.as_changed().unwrap().any_changed,
             "IPv6 insert must not be suppressed"
         );
     }
@@ -4368,11 +4407,11 @@ mod tests {
                 false,
                 None,
             );
-            assert!(u.is_none());
+            assert!(u.as_changed().is_none());
         }
         {
             let u = rt.insert(src, Family::IPV4, n2, 0, nh(), empty_attrs(), false, None);
-            assert!(u.is_none());
+            assert!(u.as_changed().is_none());
         }
 
         // end_deferral clears flag and returns all accumulated best paths.
@@ -4407,7 +4446,7 @@ mod tests {
 
         let update = rt.insert(src, Family::IPV4, net, 0, nh(), empty_attrs(), false, None);
         assert!(
-            update.as_ref().unwrap().best_changed || update.as_ref().unwrap().any_changed,
+            update.as_changed().unwrap().best_changed || update.as_changed().unwrap().any_changed,
             "insert after end_deferral must produce changes"
         );
     }

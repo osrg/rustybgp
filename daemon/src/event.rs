@@ -3587,6 +3587,8 @@ impl Tables {
 
     /// Insert a route into the appropriate shard and distribute changes to peers.
     /// Applies import policy and handles BMP/MRT notification internally.
+    /// Returns `true` if the per-peer prefix limit (RFC 4486 §2) was exceeded.
+    /// The caller must send a CEASE NOTIFICATION and close the session.
     async fn insert_route(
         &self,
         source: Arc<table::Source>,
@@ -3595,7 +3597,7 @@ impl Tables {
         nexthop: bgp::Nexthop,
         attr: Arc<Vec<packet::Attribute>>,
         prefix_limit: Option<(u32, Arc<std::sync::atomic::AtomicU64>)>,
-    ) {
+    ) -> bool {
         let import_policy = self.import_policy.load_full();
         let export_policy = self.export_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
@@ -3613,7 +3615,7 @@ impl Tables {
             &mut nh,
         );
         let pl = prefix_limit.as_ref().map(|(max, counter)| (*max, counter));
-        if let Some(update) = t.rtable.insert(
+        match t.rtable.insert(
             source,
             family,
             net.nlri,
@@ -3623,8 +3625,13 @@ impl Tables {
             filtered,
             pl,
         ) {
-            t.distribute_update(update, kernel_tx.as_deref(), export_policy.as_deref());
+            table::InsertResult::PrefixLimitExceeded => return true,
+            table::InsertResult::Changed(update) => {
+                t.distribute_update(update, kernel_tx.as_deref(), export_policy.as_deref());
+            }
+            table::InsertResult::NoChange => {}
         }
+        false
     }
 
     /// Remove a route from the appropriate shard and distribute changes to peers.
@@ -3921,7 +3928,7 @@ impl TableShard {
                                 &attrs,
                                 &mut nh,
                             );
-                            if let Some(update) = self.rtable.insert(
+                            if let table::InsertResult::Changed(update) = self.rtable.insert(
                                 source.clone(),
                                 family,
                                 net.nlri,
@@ -5035,13 +5042,15 @@ impl PeerSession {
         }
     }
 
+    /// Returns `true` if the per-peer prefix limit was exceeded (RFC 4486 §2).
+    /// The caller must send a CEASE NOTIFICATION and close the session.
     async fn rx_update(
         &mut self,
         reach: Option<packet::NlriSet>,
         unreach: Option<packet::NlriSet>,
         attr: Arc<Vec<packet::Attribute>>,
         nexthop: Option<bgp::Nexthop>,
-    ) {
+    ) -> bool {
         if let Some(s) = reach {
             let family = s.family;
             let source = self.source[&family].clone();
@@ -5050,7 +5059,8 @@ impl PeerSession {
                 .get(&family)
                 .map(|(max, counter)| (*max, Arc::clone(counter)));
             for net in s.entries {
-                self.tables
+                if self
+                    .tables
                     .insert_route(
                         source.clone(),
                         family,
@@ -5059,7 +5069,10 @@ impl PeerSession {
                         attr.clone(),
                         prefix_limit.clone(),
                     )
-                    .await;
+                    .await
+                {
+                    return true;
+                }
             }
         }
         if let Some(s) = unreach {
@@ -5075,6 +5088,7 @@ impl PeerSession {
                     .await;
             }
         }
+        false
     }
 
     fn handle_prefix_update(&mut self, update: table::NlriChange) {
@@ -5151,10 +5165,22 @@ impl PeerSession {
                     .into(),
                 ));
             }
-            self.rx_update(reach.clone(), unreach, attr.clone(), nexthop)
-                .await;
-            self.rx_update(mp_reach, mp_unreach.clone(), attr, nexthop)
-                .await;
+            let prefix_limit_exceeded = self
+                .rx_update(reach.clone(), unreach, attr.clone(), nexthop)
+                .await
+                || self
+                    .rx_update(mp_reach, mp_unreach.clone(), attr, nexthop)
+                    .await;
+            if prefix_limit_exceeded {
+                let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
+                    code: 6,
+                    subcode: 1,
+                    data: vec![],
+                });
+                self.urgent.insert(0, cease.clone());
+                self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(cease));
+                return Ok(());
+            }
 
             // Detect End-of-RIB: empty NlriSet with no attributes.
             // IPv4 EOR: reach has empty entries; other families: mp_unreach has empty entries.
