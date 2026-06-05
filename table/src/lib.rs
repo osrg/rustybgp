@@ -3431,7 +3431,7 @@ mod tests {
     fn remove_best_with_filtered_head() {
         let mut rt = Table::new();
         let net = nlri(10, 0, 0, 0, 24);
-        let attrs = attrs_with_local_pref(100);
+        // Each peer produces its own Arc<Vec<Attribute>> (realistic: separate UPDATE messages).
         // filtered at head
         rt.insert(
             source(1, 65001, 65000, 1),
@@ -3439,7 +3439,7 @@ mod tests {
             net,
             0,
             nh(),
-            attrs.clone(),
+            attrs_with_local_pref(100),
             true,
             None,
         );
@@ -3451,7 +3451,7 @@ mod tests {
             net,
             0,
             nh(),
-            attrs.clone(),
+            attrs_with_local_pref(100),
             false,
             None,
         );
@@ -3463,7 +3463,7 @@ mod tests {
             net,
             0,
             nh(),
-            attrs.clone(),
+            attrs_with_local_pref(100),
             false,
             None,
         );
