@@ -316,7 +316,7 @@ struct PeerView {
     state: Arc<PeerState>,
     counter_tx: Arc<MessageCounter>,
     counter_rx: Arc<MessageCounter>,
-    route_stats: FnvHashMap<Family, (u64, u64)>,
+    route_stats: FnvHashMap<Family, table::PrefixStats>,
     /// True if the remote peer is currently restarting (we are acting as helper).
     gr_peer_restarting: bool,
     /// True if this router is the restarting speaker for this peer.
@@ -324,11 +324,11 @@ struct PeerView {
 }
 
 impl PeerView {
-    fn update_stats(&mut self, rti: FnvHashMap<Family, (u64, u64)>) {
+    fn update_stats(&mut self, rti: FnvHashMap<Family, table::PrefixStats>) {
         for (f, v) in rti {
-            let stats = self.route_stats.entry(f).or_insert((0, 0));
-            stats.0 += v.0;
-            stats.1 += v.1;
+            let stats = self.route_stats.entry(f).or_default();
+            stats.received += v.received;
+            stats.accepted += v.accepted;
         }
     }
 }
@@ -602,8 +602,8 @@ impl From<&PeerView> for api::Peer {
                 state: Some(api::AfiSafiState {
                     family: Some(convert::family_to_api(*f)),
                     enabled: true,
-                    received: stats.0,
-                    accepted: stats.1,
+                    received: stats.received,
+                    accepted: stats.accepted,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1203,7 +1203,7 @@ impl GoBgpService for GrpcService {
             let t = self.tables.shards[i].lock().await;
             for (peer_addr, peer) in &mut peers {
                 if let Some(m) = t.rtable.peer_stats(peer_addr) {
-                    peer.update_stats(m.collect());
+                    peer.update_stats(m.map(|(f, s)| (f, s.clone())).collect());
                 }
             }
         }

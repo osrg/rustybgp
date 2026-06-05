@@ -286,6 +286,18 @@ impl AddAssign for TableState {
     }
 }
 
+/// Per-peer, per-family prefix counters in the Rib.
+///
+/// GoBGP API naming : received  / accepted
+/// OpenConfig YANG  : received-pre-policy / received
+#[derive(Default, Clone, Debug)]
+pub struct PrefixStats {
+    /// Unique prefixes received from this peer (pre import-policy).
+    pub received: u64,
+    /// Prefixes that passed import policy.
+    pub accepted: u64,
+}
+
 pub struct Reach {
     pub source: Arc<Source>,
     pub family: Family,
@@ -437,7 +449,7 @@ pub struct Rib {
 
 pub struct Table {
     ribs: FnvHashMap<Family, Rib>,
-    route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, (u64, u64)>>,
+    route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, PrefixStats>>,
     rpki: RpkiTable,
 }
 
@@ -497,10 +509,10 @@ impl Table {
     pub fn peer_stats(
         &self,
         peer_addr: &IpAddr,
-    ) -> Option<impl Iterator<Item = (Family, (u64, u64))> + '_> {
+    ) -> Option<impl Iterator<Item = (Family, &PrefixStats)> + '_> {
         self.route_stats
             .get(peer_addr)
-            .map(|m| m.iter().map(|(x, y)| (*x, *y)))
+            .map(|m| m.iter().map(|(f, s)| (*f, s)))
     }
 
     pub fn iter_reach(&self, family: Family) -> impl Iterator<Item = Reach> + '_ {
@@ -707,23 +719,30 @@ impl Table {
             flags,
         };
 
-        let (received, accepted) = self
+        let stats = self
             .route_stats
             .entry(source.remote_addr)
             .or_default()
             .entry(family)
-            .or_insert((0, 0));
+            .or_default();
 
         if let Some(ref old) = replaced {
             match (old.is_filtered(), filtered) {
-                (true, false) => *accepted += 1,
-                (false, true) => *accepted -= 1,
+                (true, false) => stats.accepted += 1,
+                (false, true) => stats.accepted -= 1,
                 _ => {}
             }
-        } else {
-            *received += 1;
+        } else if is_new {
+            // First path for this prefix from this peer: count the prefix.
+            stats.received += 1;
             if !filtered {
-                *accepted += 1;
+                stats.accepted += 1;
+            }
+        } else {
+            // Add-Path: additional path for an already-counted prefix.
+            // received stays unchanged; accepted tracks unfiltered paths.
+            if !filtered {
+                stats.accepted += 1;
             }
         }
 
@@ -808,24 +827,29 @@ impl Table {
             .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
         let was_unfiltered = !dst.entry[i].is_filtered();
 
-        let (received, accepted) = self
-            .route_stats
-            .get_mut(&source.remote_addr)
-            .unwrap()
-            .get_mut(&family)
-            .unwrap();
-        *received -= 1;
-        if !dst.entry.remove(i).is_filtered() {
-            *accepted -= 1;
-        }
+        let removed_was_unfiltered = !dst.entry.remove(i).is_filtered();
 
         // Decrement prefix counter if this peer has no more paths for this prefix.
         let peer_still_has_path = dst
             .entry
             .iter()
             .any(|p| p.path.source.remote_addr == source.remote_addr);
-        if !peer_still_has_path && let Some(counter) = prefix_counter {
-            counter.fetch_sub(1, Ordering::Relaxed);
+
+        let stats = self
+            .route_stats
+            .get_mut(&source.remote_addr)
+            .unwrap()
+            .get_mut(&family)
+            .unwrap();
+        if !peer_still_has_path {
+            // Last path for this prefix: decrement the prefix counter.
+            stats.received -= 1;
+            if !peer_still_has_path && let Some(counter) = prefix_counter {
+                counter.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        if removed_was_unfiltered {
+            stats.accepted -= 1;
         }
 
         if dst.entry.is_empty() {
@@ -2975,12 +2999,12 @@ mod tests {
             true,
             None,
         );
-        // peer_stats tracks (received, accepted) — filtered path: received=1, accepted=0
+        // filtered path: received=1, accepted=0
         let stats: Vec<_> = rt.peer_stats(&s1.remote_addr).unwrap().collect();
         assert_eq!(stats.len(), 1);
-        let (_, (received, accepted)) = stats[0];
-        assert_eq!(received, 1);
-        assert_eq!(accepted, 0);
+        let (_, s) = stats[0];
+        assert_eq!(s.received, 1);
+        assert_eq!(s.accepted, 0);
     }
 
     // --- best() ---
