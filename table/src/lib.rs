@@ -536,6 +536,10 @@ impl Table {
             })
     }
 
+    pub fn families(&self) -> impl Iterator<Item = Family> + '_ {
+        self.ribs.keys().filter(|f| **f != Family::EMPTY).copied()
+    }
+
     pub fn iter_destinations(
         &self,
         table_type: TableType,

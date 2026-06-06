@@ -1381,34 +1381,24 @@ impl GoBgpService for GrpcService {
                         },
                         BgpEvent::AdjRibIn(change) => {
                             let mut paths = Vec::new();
-                            if let bgp::Message::Update(bgp::Update {
-                                reach,
-                                unreach,
-                                attr,
-                                ..
-                            }) = change.update
-                            {
-                                if let Some(s) = reach {
-                                    for net in &s.entries {
-                                        paths.push(api::Path {
-                                            nlri: Some(convert::nlri_to_api(&net.nlri)),
-                                            family: Some(convert::family_to_api(s.family)),
-                                            identifier: net.path_id,
-                                            pattrs: attr.iter().map(convert::attr_to_api).collect(),
-                                            ..Default::default()
-                                        });
+                            for net in &change.nlris {
+                                let path = if let Some(ref attrs) = change.attrs {
+                                    api::Path {
+                                        nlri: Some(convert::nlri_to_api(&net.nlri)),
+                                        family: Some(convert::family_to_api(change.family)),
+                                        identifier: net.path_id,
+                                        pattrs: attrs.iter().map(convert::attr_to_api).collect(),
+                                        ..Default::default()
                                     }
-                                }
-                                if let Some(s) = unreach {
-                                    for net in &s.entries {
-                                        paths.push(api::Path {
-                                            nlri: Some(convert::nlri_to_api(&net.nlri)),
-                                            family: Some(convert::family_to_api(s.family)),
-                                            identifier: net.path_id,
-                                            ..Default::default()
-                                        });
+                                } else {
+                                    api::Path {
+                                        nlri: Some(convert::nlri_to_api(&net.nlri)),
+                                        family: Some(convert::family_to_api(change.family)),
+                                        identifier: net.path_id,
+                                        ..Default::default()
                                     }
-                                }
+                                };
+                                paths.push(path);
                             }
                             api::WatchEventResponse {
                                 event: Some(api::watch_event_response::Event::Table(
@@ -1416,7 +1406,7 @@ impl GoBgpService for GrpcService {
                                 )),
                             }
                         }
-                        BgpEvent::EndOfRib => continue,
+                        BgpEvent::EndOfInitDump => continue,
                     };
                     if tx.send(Ok(r)).await.is_err() {
                         break;
@@ -2419,44 +2409,57 @@ impl BmpClient {
         let subscription = tables.subscribe().await;
         let mut rx = subscription.rx;
 
-        // Buffer all snapshot events until EndOfRib.
-        let mut snapshot: FnvHashMap<IpAddr, Vec<AdjRibInChange>> = FnvHashMap::default();
-        let mut eof_count = 0;
+        // Buffer all snapshot events until EndOfInitDump.
+        // Net-state: latest state per (peer, family, nlri). Withdrawals remove entries.
+        let mut snapshot: FnvHashMap<
+            IpAddr,
+            FnvHashMap<(Family, packet::PathNlri), AdjRibInChange>,
+        > = FnvHashMap::default();
         loop {
             match rx.recv().await {
                 Some(BgpEvent::AdjRibIn(change)) => {
-                    snapshot
-                        .entry(change.source.remote_addr)
-                        .or_default()
-                        .push(change);
-                }
-                Some(BgpEvent::PeerUp(_)) | Some(BgpEvent::PeerDown(_)) => {}
-                Some(BgpEvent::EndOfRib) => {
-                    eof_count += 1;
-                    if eof_count >= 2 {
-                        break;
+                    let peer_map = snapshot.entry(change.source.remote_addr).or_default();
+                    for &nlri in &change.nlris {
+                        if change.attrs.is_some() {
+                            peer_map.insert(
+                                (change.family, nlri),
+                                AdjRibInChange {
+                                    source: change.source.clone(),
+                                    family: change.family,
+                                    addpath: change.addpath,
+                                    nlris: vec![nlri],
+                                    attrs: change.attrs.clone(),
+                                    nexthop: change.nexthop,
+                                },
+                            );
+                        } else {
+                            peer_map.remove(&(change.family, nlri));
+                        }
                     }
                 }
+                Some(BgpEvent::PeerUp(_)) | Some(BgpEvent::PeerDown(_)) => {}
+                Some(BgpEvent::EndOfInitDump) => break,
                 None => return,
             }
         }
 
         // Send PeerUp for all established peers.
         let local_id = global.read().await.router_id;
-        let mut established_peers = Vec::new();
+        let mut established_peers: Vec<(IpAddr, bmp::PerPeerHeader)> = Vec::new();
         for peer in global.read().await.peers.values() {
             if peer.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
-                established_peers.push(peer.config.remote_addr);
                 let remote_asn = peer.state.remote_asn.load(Ordering::Relaxed);
                 let remote_id = Ipv4Addr::from(peer.state.remote_id.load(Ordering::Relaxed));
+                let peer_header = bmp::PerPeerHeader::new(
+                    remote_asn,
+                    remote_id,
+                    0,
+                    peer.config.remote_addr,
+                    peer.state.uptime.load(Ordering::Relaxed) as u32,
+                );
+                established_peers.push((peer.config.remote_addr, peer_header.clone()));
                 let m = bmp::Message::PeerUp {
-                    header: bmp::PerPeerHeader::new(
-                        remote_asn,
-                        remote_id,
-                        0,
-                        peer.config.remote_addr,
-                        peer.state.uptime.load(Ordering::Relaxed) as u32,
-                    ),
+                    header: peer_header,
                     local_addr: peer.local_sockaddr.ip(),
                     local_port: peer.local_sockaddr.port(),
                     remote_port: peer.remote_sockaddr.port(),
@@ -2489,19 +2492,23 @@ impl BmpClient {
         }
 
         // Send RouteMonitoring for buffered snapshot routes (per established peer).
-        for addr in established_peers {
-            let mut header: Option<bmp::PerPeerHeader> = None;
-            if let Some(changes) = snapshot.remove(&addr) {
-                for change in changes {
-                    if header.is_none() {
-                        header = Some(bmp::PerPeerHeader::new(
-                            change.source.remote_asn,
-                            Ipv4Addr::from(change.source.router_id),
-                            0,
-                            change.source.remote_addr,
-                            change.source.uptime as u32,
-                        ));
-                    }
+        for (addr, peer_header) in &established_peers {
+            let mut families_seen: FnvHashSet<Family> = FnvHashSet::default();
+            if let Some(peer_routes) = snapshot.remove(addr) {
+                for ((family, _), change) in &peer_routes {
+                    families_seen.insert(*family);
+                    let attrs = change.attrs.as_ref().unwrap();
+                    let update = bgp::Message::Update(bgp::Update {
+                        reach: Some(packet::bgp::NlriSet {
+                            family: *family,
+                            entries: change.nlris.clone(),
+                        }),
+                        mp_reach: None,
+                        attr: attrs.clone(),
+                        unreach: None,
+                        mp_unreach: None,
+                        nexthop: change.nexthop,
+                    });
                     if lines
                         .send(&bmp::Message::RouteMonitoring {
                             header: bmp::PerPeerHeader::new(
@@ -2511,7 +2518,7 @@ impl BmpClient {
                                 change.source.remote_addr,
                                 change.source.uptime as u32,
                             ),
-                            update: change.update,
+                            update,
                             addpath: change.addpath,
                         })
                         .await
@@ -2521,10 +2528,13 @@ impl BmpClient {
                         return;
                     }
                 }
+            }
+            // Send EoR per family observed in the snapshot for this peer.
+            for family in families_seen {
                 if lines
                     .send(&bmp::Message::RouteMonitoring {
-                        header: header.unwrap(),
-                        update: bgp::Message::eor(Family::IPV4),
+                        header: peer_header.clone(),
+                        update: bgp::Message::eor(family),
                         addpath: false,
                     })
                     .await
@@ -2549,6 +2559,31 @@ impl BmpClient {
                 event = rx.next() => {
                     match event {
                         Some(BgpEvent::AdjRibIn(change)) => {
+                            let update = if let Some(ref attrs) = change.attrs {
+                                bgp::Message::Update(bgp::Update {
+                                    reach: Some(packet::bgp::NlriSet {
+                                        family: change.family,
+                                        entries: change.nlris.clone(),
+                                    }),
+                                    mp_reach: None,
+                                    attr: attrs.clone(),
+                                    unreach: None,
+                                    mp_unreach: None,
+                                    nexthop: change.nexthop,
+                                })
+                            } else {
+                                bgp::Message::Update(bgp::Update {
+                                    reach: None,
+                                    mp_reach: None,
+                                    attr: Arc::new(Vec::new()),
+                                    unreach: None,
+                                    mp_unreach: Some(packet::bgp::NlriSet {
+                                        family: change.family,
+                                        entries: change.nlris.clone(),
+                                    }),
+                                    nexthop: None,
+                                })
+                            };
                             if lines
                                 .send(&bmp::Message::RouteMonitoring {
                                     header: bmp::PerPeerHeader::new(
@@ -2558,7 +2593,7 @@ impl BmpClient {
                                         change.source.remote_addr,
                                         change.source.uptime as u32,
                                     ),
-                                    update: change.update,
+                                    update,
                                     addpath: change.addpath,
                                 })
                                 .await
@@ -2602,7 +2637,7 @@ impl BmpClient {
                                 break;
                             }
                         }
-                        Some(BgpEvent::EndOfRib) => {}
+                        Some(BgpEvent::EndOfInitDump) => {}
                         None => break,
                     }
                 }
@@ -3613,11 +3648,14 @@ enum TableEvent {
 struct SubscriptionId(u64);
 
 /// A pre-import-policy Adj-RIB-In update from one peer.
-/// `update` holds either a reach (announce) or unreach (withdraw) BGP message.
+/// `attrs` is `None` for withdrawals.
 struct AdjRibInChange {
     source: Arc<table::Source>,
+    family: Family,
     addpath: bool,
-    update: bgp::Message,
+    nlris: Vec<packet::PathNlri>,
+    attrs: Option<Arc<Vec<packet::Attribute>>>,
+    nexthop: Option<bgp::Nexthop>,
 }
 
 #[derive(Clone)]
@@ -3646,7 +3684,8 @@ enum BgpEvent {
     AdjRibIn(AdjRibInChange),
     PeerUp(PeerUpData),
     PeerDown(PeerDownData),
-    EndOfRib,
+    /// Signals that the initial snapshot from `subscribe()` is fully delivered.
+    EndOfInitDump,
 }
 
 struct Subscription {
@@ -3793,23 +3832,23 @@ impl TableManager {
         // Snapshot each shard atomically and register for AdjRibIn events.
         for i in 0..self.shards.len() {
             let mut shard = self.shards[i].lock().await;
-            for f in &[Family::IPV4, Family::IPV6] {
-                for reach in shard.rtable.iter_reach(*f) {
-                    let addpath = shard.has_addpath(&reach.source.remote_addr, f);
-                    let source = reach.source.clone();
-                    let update: bgp::Message = reach.into();
+            for f in shard.rtable.families().collect::<Vec<_>>() {
+                for reach in shard.rtable.iter_reach(f) {
+                    let addpath = shard.has_addpath(&reach.source.remote_addr, &f);
                     let _ = tx.send(BgpEvent::AdjRibIn(AdjRibInChange {
-                        source,
+                        source: reach.source,
+                        family: f,
                         addpath,
-                        update,
+                        nlris: vec![reach.net],
+                        attrs: Some(reach.attr),
+                        nexthop: Some(reach.nexthop),
                     }));
                 }
             }
             shard.subscribers.insert(id, tx.clone());
         }
         // Signal end of initial snapshot.
-        let _ = tx.send(BgpEvent::EndOfRib);
-        let _ = tx.send(BgpEvent::EndOfRib);
+        let _ = tx.send(BgpEvent::EndOfInitDump);
         Subscription { rx, id }
     }
 
@@ -3879,36 +3918,14 @@ impl TableShard {
         nexthop: Option<bgp::Nexthop>,
     ) {
         let addpath = self.has_addpath(&source.remote_addr, &family);
-        let update = if let Some(attrs) = attrs {
-            bgp::Message::Update(bgp::Update {
-                reach: Some(packet::bgp::NlriSet {
-                    family,
-                    entries: nets.to_owned(),
-                }),
-                mp_reach: None,
-                attr: attrs.clone(),
-                unreach: None,
-                mp_unreach: None,
-                nexthop,
-            })
-        } else {
-            bgp::Message::Update(bgp::Update {
-                reach: None,
-                mp_reach: None,
-                attr: Arc::new(Vec::new()),
-                unreach: None,
-                mp_unreach: Some(packet::bgp::NlriSet {
-                    family,
-                    entries: nets.to_owned(),
-                }),
-                nexthop: None,
-            })
-        };
         for tx in self.subscribers.values() {
             let _ = tx.send(BgpEvent::AdjRibIn(AdjRibInChange {
                 source: source.clone(),
+                family,
                 addpath,
-                update: update.clone(),
+                nlris: nets.to_owned(),
+                attrs: attrs.cloned(),
+                nexthop,
             }));
         }
     }
