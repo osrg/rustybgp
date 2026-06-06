@@ -46,6 +46,7 @@ use rustybgp_packet::{self as packet, BgpFramer, Family, HoldTime, bgp, bmp, mrt
 
 use crate::api;
 use crate::auth;
+use crate::bmp::BmpClient;
 use crate::config;
 use crate::convert;
 use crate::error::Error;
@@ -288,7 +289,7 @@ struct PeerContext {
 /// counters) plus a handle to `PeerContext` for cross-session mutable state.
 /// The split keeps the global lock section lean: gRPC reads never need to
 /// acquire the per-peer `PeerContext` mutex.
-struct Peer {
+pub(crate) struct Peer {
     config: PeerConfig,
     admin_down: bool,
 
@@ -334,6 +335,53 @@ impl PeerView {
 }
 
 impl Peer {
+    /// Returns `(remote_addr, PerPeerHeader, PeerUp message)` if this peer is
+    /// currently Established, or `None` otherwise.  Used by BMP to build the
+    /// initial PeerUp burst without exposing private `Peer` fields.
+    pub(crate) fn bmp_peer_up(
+        &self,
+        local_router_id: Ipv4Addr,
+    ) -> Option<(IpAddr, bmp::PerPeerHeader, bmp::Message)> {
+        if self.state.fsm.load(Ordering::Relaxed) != SessionState::Established as u8 {
+            return None;
+        }
+        let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
+        let remote_id = Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed));
+        let peer_header = bmp::PerPeerHeader::new(
+            remote_asn,
+            remote_id,
+            0,
+            self.config.remote_addr,
+            self.state.uptime.load(Ordering::Relaxed) as u32,
+        );
+        let msg = bmp::Message::PeerUp {
+            header: peer_header.clone(),
+            local_addr: self.local_sockaddr.ip(),
+            local_port: self.local_sockaddr.port(),
+            remote_port: self.remote_sockaddr.port(),
+            remote_open: bgp::Message::Open(bgp::Open {
+                as_number: remote_asn,
+                holdtime: HoldTime::new(self.state.remote_holdtime.load(Ordering::Relaxed))
+                    .unwrap_or(HoldTime::DISABLED),
+                router_id: u32::from(remote_id),
+                capability: self
+                    .state
+                    .remote_cap
+                    .load()
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_default(),
+            }),
+            local_open: bgp::Message::Open(bgp::Open {
+                as_number: self.config.local_asn,
+                holdtime: HoldTime::new(self.config.holdtime as u16).unwrap_or(HoldTime::DISABLED),
+                router_id: u32::from(local_router_id),
+                capability: self.config.local_cap.to_owned(),
+            }),
+        };
+        Some((self.config.remote_addr, peer_header, msg))
+    }
+
     fn view(&self, is_restarting: bool) -> PeerView {
         let ctx = self.context.lock().unwrap();
         PeerView {
@@ -2355,344 +2403,6 @@ impl MrtDumper {
 }
 
 #[derive(Default)]
-struct BmpClient {
-    configured_time: u64,
-    uptime: u64,
-    downtime: u64,
-}
-
-impl BmpClient {
-    fn new() -> Self {
-        BmpClient {
-            configured_time: SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            ..Default::default()
-        }
-    }
-
-    async fn serve(
-        stream: TcpStream,
-        _sockaddr: SocketAddr,
-        global: GlobalHandle,
-        tables: TableHandle,
-    ) {
-        let mut lines = Framed::new(stream, bmp::BmpCodec::new());
-        let sysname = hostname::get().unwrap_or_else(|_| std::ffi::OsString::from("unknown"));
-        let _ = lines
-            .send(&bmp::Message::Initiation(vec![
-                (
-                    bmp::Message::INFO_TYPE_SYSDESCR,
-                    ascii::AsciiStr::from_ascii(
-                        format!(
-                            "RustyBGP v{}-{}",
-                            env!("CARGO_PKG_VERSION"),
-                            env!("GIT_HASH")
-                        )
-                        .as_str(),
-                    )
-                    .unwrap()
-                    .as_bytes()
-                    .to_vec(),
-                ),
-                (
-                    bmp::Message::INFO_TYPE_SYSNAME,
-                    ascii::AsciiStr::from_ascii(sysname.to_ascii_lowercase().to_str().unwrap())
-                        .unwrap()
-                        .as_bytes()
-                        .to_vec(),
-                ),
-            ]))
-            .await;
-
-        let subscription = tables.subscribe().await;
-        let mut rx = subscription.rx;
-
-        // Buffer all snapshot events until EndOfInitDump.
-        // Net-state: latest state per (peer, family, nlri). Withdrawals remove entries.
-        let mut snapshot: FnvHashMap<
-            IpAddr,
-            FnvHashMap<(Family, packet::PathNlri), AdjRibInChange>,
-        > = FnvHashMap::default();
-        loop {
-            match rx.recv().await {
-                Some(BgpEvent::AdjRibIn(change)) => {
-                    let peer_map = snapshot.entry(change.source.remote_addr).or_default();
-                    for &nlri in &change.nlris {
-                        if change.attrs.is_some() {
-                            peer_map.insert(
-                                (change.family, nlri),
-                                AdjRibInChange {
-                                    source: change.source.clone(),
-                                    family: change.family,
-                                    addpath: change.addpath,
-                                    nlris: vec![nlri],
-                                    attrs: change.attrs.clone(),
-                                    nexthop: change.nexthop,
-                                },
-                            );
-                        } else {
-                            peer_map.remove(&(change.family, nlri));
-                        }
-                    }
-                }
-                Some(BgpEvent::PeerUp(_)) | Some(BgpEvent::PeerDown(_)) => {}
-                Some(BgpEvent::EndOfInitDump) => break,
-                None => return,
-            }
-        }
-
-        // Send PeerUp for all established peers.
-        let local_id = global.read().await.router_id;
-        let mut established_peers: Vec<(IpAddr, bmp::PerPeerHeader)> = Vec::new();
-        for peer in global.read().await.peers.values() {
-            if peer.state.fsm.load(Ordering::Relaxed) == SessionState::Established as u8 {
-                let remote_asn = peer.state.remote_asn.load(Ordering::Relaxed);
-                let remote_id = Ipv4Addr::from(peer.state.remote_id.load(Ordering::Relaxed));
-                let peer_header = bmp::PerPeerHeader::new(
-                    remote_asn,
-                    remote_id,
-                    0,
-                    peer.config.remote_addr,
-                    peer.state.uptime.load(Ordering::Relaxed) as u32,
-                );
-                established_peers.push((peer.config.remote_addr, peer_header.clone()));
-                let m = bmp::Message::PeerUp {
-                    header: peer_header,
-                    local_addr: peer.local_sockaddr.ip(),
-                    local_port: peer.local_sockaddr.port(),
-                    remote_port: peer.remote_sockaddr.port(),
-                    remote_open: bgp::Message::Open(bgp::Open {
-                        as_number: peer.state.remote_asn.load(Ordering::Relaxed),
-                        holdtime: HoldTime::new(peer.state.remote_holdtime.load(Ordering::Relaxed))
-                            .unwrap_or(HoldTime::DISABLED),
-                        router_id: u32::from(remote_id),
-                        capability: peer
-                            .state
-                            .remote_cap
-                            .load()
-                            .as_deref()
-                            .cloned()
-                            .unwrap_or_default(),
-                    }),
-                    local_open: bgp::Message::Open(bgp::Open {
-                        as_number: peer.config.local_asn,
-                        holdtime: HoldTime::new(peer.config.holdtime as u16)
-                            .unwrap_or(HoldTime::DISABLED),
-                        router_id: u32::from(local_id),
-                        capability: peer.config.local_cap.to_owned(),
-                    }),
-                };
-                if lines.send(&m).await.is_err() {
-                    tables.unsubscribe(subscription.id).await;
-                    return;
-                }
-            }
-        }
-
-        // Send RouteMonitoring for buffered snapshot routes (per established peer).
-        for (addr, peer_header) in &established_peers {
-            let mut families_seen: FnvHashSet<Family> = FnvHashSet::default();
-            if let Some(peer_routes) = snapshot.remove(addr) {
-                for ((family, _), change) in &peer_routes {
-                    families_seen.insert(*family);
-                    let attrs = change.attrs.as_ref().unwrap();
-                    let update = bgp::Message::Update(bgp::Update {
-                        reach: Some(packet::bgp::NlriSet {
-                            family: *family,
-                            entries: change.nlris.clone(),
-                        }),
-                        mp_reach: None,
-                        attr: attrs.clone(),
-                        unreach: None,
-                        mp_unreach: None,
-                        nexthop: change.nexthop,
-                    });
-                    if lines
-                        .send(&bmp::Message::RouteMonitoring {
-                            header: bmp::PerPeerHeader::new(
-                                change.source.remote_asn,
-                                Ipv4Addr::from(change.source.router_id),
-                                0,
-                                change.source.remote_addr,
-                                change.source.uptime as u32,
-                            ),
-                            update,
-                            addpath: change.addpath,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        tables.unsubscribe(subscription.id).await;
-                        return;
-                    }
-                }
-            }
-            // Send EoR per family observed in the snapshot for this peer.
-            for family in families_seen {
-                if lines
-                    .send(&bmp::Message::RouteMonitoring {
-                        header: peer_header.clone(),
-                        update: bgp::Message::eor(family),
-                        addpath: false,
-                    })
-                    .await
-                    .is_err()
-                {
-                    tables.unsubscribe(subscription.id).await;
-                    return;
-                }
-            }
-        }
-
-        // Live event loop.
-        let mut rx = UnboundedReceiverStream::new(rx);
-        loop {
-            tokio::select! {
-                msg = lines.next() => {
-                    match msg {
-                        Some(Ok(_)) => {}
-                        _ => break,
-                    }
-                }
-                event = rx.next() => {
-                    match event {
-                        Some(BgpEvent::AdjRibIn(change)) => {
-                            let update = if let Some(ref attrs) = change.attrs {
-                                bgp::Message::Update(bgp::Update {
-                                    reach: Some(packet::bgp::NlriSet {
-                                        family: change.family,
-                                        entries: change.nlris.clone(),
-                                    }),
-                                    mp_reach: None,
-                                    attr: attrs.clone(),
-                                    unreach: None,
-                                    mp_unreach: None,
-                                    nexthop: change.nexthop,
-                                })
-                            } else {
-                                bgp::Message::Update(bgp::Update {
-                                    reach: None,
-                                    mp_reach: None,
-                                    attr: Arc::new(Vec::new()),
-                                    unreach: None,
-                                    mp_unreach: Some(packet::bgp::NlriSet {
-                                        family: change.family,
-                                        entries: change.nlris.clone(),
-                                    }),
-                                    nexthop: None,
-                                })
-                            };
-                            if lines
-                                .send(&bmp::Message::RouteMonitoring {
-                                    header: bmp::PerPeerHeader::new(
-                                        change.source.remote_asn,
-                                        Ipv4Addr::from(change.source.router_id),
-                                        0,
-                                        change.source.remote_addr,
-                                        change.source.uptime as u32,
-                                    ),
-                                    update,
-                                    addpath: change.addpath,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Some(BgpEvent::PeerUp(data)) => {
-                            let remote_id = Ipv4Addr::from(data.peer_id);
-                            let m = bmp::Message::PeerUp {
-                                header: bmp::PerPeerHeader::new(
-                                    data.peer_asn,
-                                    remote_id,
-                                    0,
-                                    data.peer_addr,
-                                    data.uptime as u32,
-                                ),
-                                local_addr: data.local_addr,
-                                local_port: data.local_port,
-                                remote_port: data.remote_port,
-                                remote_open: data.received_open,
-                                local_open: data.sent_open,
-                            };
-                            if lines.send(&m).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(BgpEvent::PeerDown(data)) => {
-                            let m = bmp::Message::PeerDown {
-                                header: bmp::PerPeerHeader::new(
-                                    data.peer_asn,
-                                    Ipv4Addr::from(data.peer_id),
-                                    0,
-                                    data.peer_addr,
-                                    data.uptime as u32,
-                                ),
-                                reason: data.reason,
-                            };
-                            if lines.send(&m).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(BgpEvent::EndOfInitDump) => {}
-                        None => break,
-                    }
-                }
-            }
-        }
-        tables.unsubscribe(subscription.id).await;
-    }
-
-    fn try_connect(
-        sockaddr: SocketAddr,
-        configured_time: u64,
-        global: GlobalHandle,
-        tables: TableHandle,
-    ) {
-        tokio::spawn(async move {
-            loop {
-                if let Ok(Ok(stream)) = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
-                    TcpStream::connect(sockaddr),
-                )
-                .await
-                {
-                    if let Some(client) = global.write().await.bmp_clients.get_mut(&sockaddr) {
-                        client.uptime = SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-                    } else {
-                        break;
-                    }
-                    BmpClient::serve(stream, sockaddr, global.clone(), tables.clone()).await;
-                    if let Some(client) = global.write().await.bmp_clients.get_mut(&sockaddr) {
-                        client.downtime = SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-                    } else {
-                        break;
-                    }
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                if let Some(client) = global.write().await.bmp_clients.get_mut(&sockaddr) {
-                    if client.configured_time != configured_time {
-                        break;
-                    }
-                } else {
-                    // de-configured
-                    break;
-                }
-            }
-        });
-    }
-}
-
-#[derive(Default)]
 struct RpkiState {
     uptime: AtomicU64,
     downtime: AtomicU64,
@@ -2944,20 +2654,20 @@ fn create_listen_socket(addr: String, port: u16) -> std::io::Result<std::net::Tc
     Ok(sock.into())
 }
 
-type GlobalHandle = Arc<tokio::sync::RwLock<Global>>;
+pub(crate) type GlobalHandle = Arc<tokio::sync::RwLock<Global>>;
 
-struct Global {
+pub(crate) struct Global {
     asn: u32,
-    router_id: Ipv4Addr,
+    pub(crate) router_id: Ipv4Addr,
     listen_port: u16,
     listen_sockets: Vec<RawFd>,
-    peers: FnvHashMap<IpAddr, Peer>,
+    pub(crate) peers: FnvHashMap<IpAddr, Peer>,
     peer_group: FnvHashMap<String, PeerGroup>,
 
     ptable: table::PolicyTable,
 
     rpki_clients: FnvHashMap<SocketAddr, RpkiClient>,
-    bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
+    pub(crate) bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
     mrt_filenames: FnvHashSet<String>,
 
     /// Selection Deferral state machine for the Restarting Speaker (RFC 4724 §4.1).
@@ -3645,42 +3355,42 @@ enum TableEvent {
 
 /// Opaque subscription handle returned by [`TableManager::subscribe`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct SubscriptionId(u64);
+pub(crate) struct SubscriptionId(u64);
 
 /// A pre-import-policy Adj-RIB-In update from one peer.
 /// `attrs` is `None` for withdrawals.
-struct AdjRibInChange {
-    source: Arc<table::Source>,
-    family: Family,
-    addpath: bool,
-    nlris: Vec<packet::PathNlri>,
-    attrs: Option<Arc<Vec<packet::Attribute>>>,
-    nexthop: Option<bgp::Nexthop>,
+pub(crate) struct AdjRibInChange {
+    pub(crate) source: Arc<table::Source>,
+    pub(crate) family: Family,
+    pub(crate) addpath: bool,
+    pub(crate) nlris: Vec<packet::PathNlri>,
+    pub(crate) attrs: Option<Arc<Vec<packet::Attribute>>>,
+    pub(crate) nexthop: Option<bgp::Nexthop>,
 }
 
 #[derive(Clone)]
-struct PeerUpData {
-    peer_addr: IpAddr,
-    peer_asn: u32,
-    peer_id: u32,
-    uptime: u64,
-    local_addr: IpAddr,
-    local_port: u16,
-    remote_port: u16,
-    sent_open: bgp::Message,
-    received_open: bgp::Message,
+pub(crate) struct PeerUpData {
+    pub(crate) peer_addr: IpAddr,
+    pub(crate) peer_asn: u32,
+    pub(crate) peer_id: u32,
+    pub(crate) uptime: u64,
+    pub(crate) local_addr: IpAddr,
+    pub(crate) local_port: u16,
+    pub(crate) remote_port: u16,
+    pub(crate) sent_open: bgp::Message,
+    pub(crate) received_open: bgp::Message,
 }
 
 #[derive(Clone)]
-struct PeerDownData {
-    peer_addr: IpAddr,
-    peer_asn: u32,
-    peer_id: u32,
-    uptime: u64,
-    reason: bmp::PeerDownReason,
+pub(crate) struct PeerDownData {
+    pub(crate) peer_addr: IpAddr,
+    pub(crate) peer_asn: u32,
+    pub(crate) peer_id: u32,
+    pub(crate) uptime: u64,
+    pub(crate) reason: bmp::PeerDownReason,
 }
 
-enum BgpEvent {
+pub(crate) enum BgpEvent {
     AdjRibIn(AdjRibInChange),
     PeerUp(PeerUpData),
     PeerDown(PeerDownData),
@@ -3688,14 +3398,14 @@ enum BgpEvent {
     EndOfInitDump,
 }
 
-struct Subscription {
-    rx: mpsc::UnboundedReceiver<BgpEvent>,
-    id: SubscriptionId,
+pub(crate) struct Subscription {
+    pub(crate) rx: mpsc::UnboundedReceiver<BgpEvent>,
+    pub(crate) id: SubscriptionId,
 }
 
-type TableHandle = Arc<TableManager>;
+pub(crate) type TableHandle = Arc<TableManager>;
 
-struct TableManager {
+pub(crate) struct TableManager {
     shards: Vec<Mutex<TableShard>>,
     kernel_tx: ArcSwapOption<mpsc::UnboundedSender<KernelRouteEvent>>,
     import_policy: ArcSwapOption<table::PolicyAssignment>,
@@ -3818,7 +3528,7 @@ impl TableManager {
 
     /// Subscribe with full snapshot: sends all current routes as AdjRibIn events per shard,
     /// then two EndOfRib signals. Registers for live events atomically per shard.
-    async fn subscribe(&self) -> Subscription {
+    pub(crate) async fn subscribe(&self) -> Subscription {
         let id = SubscriptionId(
             self.next_sub_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -3870,7 +3580,7 @@ impl TableManager {
         Subscription { rx, id }
     }
 
-    async fn unsubscribe(&self, id: SubscriptionId) {
+    pub(crate) async fn unsubscribe(&self, id: SubscriptionId) {
         {
             let mut subs = self.subscribers.lock().await;
             subs.remove(&id);
@@ -4268,23 +3978,6 @@ fn gr_on_disconnect(
         _ => false,
     };
     if applies { Some(gr) } else { None }
-}
-
-/// Convert a `SessionDownReason` to the BMP `PeerDownReason` encoding.
-fn session_down_to_bmp(reason: Option<crate::fsm::SessionDownReason>) -> bmp::PeerDownReason {
-    match reason {
-        None => bmp::PeerDownReason::RemoteUnexpected,
-        Some(crate::fsm::SessionDownReason::HoldTimerExpired) => bmp::PeerDownReason::LocalFsm(0),
-        Some(crate::fsm::SessionDownReason::RemoteNotification(msg)) => {
-            bmp::PeerDownReason::RemoteNotification(msg)
-        }
-        Some(crate::fsm::SessionDownReason::LocalNotification(msg)) => {
-            bmp::PeerDownReason::LocalNotification(msg)
-        }
-        Some(crate::fsm::SessionDownReason::FsmError) => bmp::PeerDownReason::LocalFsm(0),
-        Some(crate::fsm::SessionDownReason::AdminShutdown) => bmp::PeerDownReason::LocalFsm(0),
-        Some(crate::fsm::SessionDownReason::IoError) => bmp::PeerDownReason::RemoteUnexpected,
-    }
 }
 
 async fn gr_drop_families(tables: &TableHandle, addr: IpAddr, families: &[Family]) {
@@ -5528,7 +5221,7 @@ impl PeerSession {
             let kernel_tx = self.tables.kernel_tx.load_full();
             // All per-family Sources share the same peer-level fields; use any for BMP.
             let any_source = self.source.values().next().unwrap().clone();
-            let bmp_reason = session_down_to_bmp(self.shutdown.take());
+            let bmp_reason = crate::bmp::session_down_to_bmp(self.shutdown.take());
             for i in 0..self.tables.shards.len() {
                 let mut t = self.tables.shards[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
@@ -6748,66 +6441,6 @@ mod tests {
         // Unknown peer: timer must NOT be started, deferral still in AwaitingStart.
         assert!(g.selection_deferral_timer.is_none());
         assert!(g.selection_deferral.is_some());
-    }
-
-    // ---- RFC 8538 N-bit: session_down_to_bmp conversion ----
-
-    #[test]
-    fn session_down_to_bmp_none_is_remote_unexpected() {
-        assert!(matches!(
-            session_down_to_bmp(None),
-            bmp::PeerDownReason::RemoteUnexpected
-        ));
-    }
-
-    #[test]
-    fn session_down_to_bmp_io_error_is_remote_unexpected() {
-        assert!(matches!(
-            session_down_to_bmp(Some(crate::fsm::SessionDownReason::IoError)),
-            bmp::PeerDownReason::RemoteUnexpected
-        ));
-    }
-
-    #[test]
-    fn session_down_to_bmp_hold_timer_is_local_fsm() {
-        assert!(matches!(
-            session_down_to_bmp(Some(crate::fsm::SessionDownReason::HoldTimerExpired)),
-            bmp::PeerDownReason::LocalFsm(0)
-        ));
-    }
-
-    #[test]
-    fn session_down_to_bmp_admin_shutdown_is_local_fsm() {
-        assert!(matches!(
-            session_down_to_bmp(Some(crate::fsm::SessionDownReason::AdminShutdown)),
-            bmp::PeerDownReason::LocalFsm(0)
-        ));
-    }
-
-    #[test]
-    fn session_down_to_bmp_remote_notification_preserved() {
-        let msg = bgp::Message::Notification(rustybgp_packet::error::BgpError::Other {
-            code: 6,
-            subcode: 0,
-            data: vec![],
-        });
-        assert!(matches!(
-            session_down_to_bmp(Some(crate::fsm::SessionDownReason::RemoteNotification(msg))),
-            bmp::PeerDownReason::RemoteNotification(_)
-        ));
-    }
-
-    #[test]
-    fn session_down_to_bmp_local_notification_preserved() {
-        let msg = bgp::Message::Notification(rustybgp_packet::error::BgpError::Other {
-            code: 6,
-            subcode: 0,
-            data: vec![],
-        });
-        assert!(matches!(
-            session_down_to_bmp(Some(crate::fsm::SessionDownReason::LocalNotification(msg))),
-            bmp::PeerDownReason::LocalNotification(_)
-        ));
     }
 
     // ---- RFC 8538 N-bit: negotiate_gr N-bit extraction ----
