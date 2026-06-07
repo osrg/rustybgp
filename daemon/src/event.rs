@@ -2031,18 +2031,15 @@ impl GoBgpService for GrpcService {
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
 
         let sockaddr = SocketAddr::new(addr, request.port as u16);
-        match self.global.write().await.rpki_clients.entry(sockaddr) {
-            Occupied(_) => {
+        match self.global.write().await.add_rpki_client(sockaddr) {
+            Err(()) => {
                 return Err(tonic::Status::new(
                     tonic::Code::AlreadyExists,
                     format!("rpki client {} already exists", sockaddr),
                 ));
             }
-            Vacant(v) => {
-                let client = RpkiClient::new();
-                let t = client.configured_time;
-                v.insert(client);
-                RpkiClient::try_connect(sockaddr, t, self.global.clone(), self.tables.clone());
+            Ok((cancel, state)) => {
+                RpkiClient::try_connect(sockaddr, cancel, state, self.tables.clone());
             }
         }
         Ok(tonic::Response::new(api::AddRpkiResponse {}))
@@ -2055,17 +2052,14 @@ impl GoBgpService for GrpcService {
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
         let sockaddr = SocketAddr::new(addr, request.port as u16);
-
-        let tx = if let Some(mut client) = self.global.write().await.rpki_clients.remove(&sockaddr)
-        {
-            client.mgmt_tx.take()
+        if self.global.write().await.remove_rpki_client(sockaddr) {
+            Ok(tonic::Response::new(api::DeleteRpkiResponse {}))
         } else {
-            None
-        };
-        if let Some(tx) = tx {
-            let _ = tx.send(RpkiMgmtMsg::Deconfigured);
+            Err(tonic::Status::new(
+                tonic::Code::NotFound,
+                format!("rpki client {} not found", sockaddr),
+            ))
         }
-        Ok(tonic::Response::new(api::DeleteRpkiResponse {}))
     }
     type ListRpkiStream = Pin<
         Box<
@@ -2078,7 +2072,7 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<Self::ListRpkiStream>, tonic::Status> {
         let mut v = FnvHashMap::default();
 
-        for (sockaddr, client) in &self.global.read().await.rpki_clients {
+        for (sockaddr, client) in self.global.read().await.iter_rpki_clients() {
             let r = api::Rpki {
                 conf: Some(api::RpkiConf {
                     address: sockaddr.ip().to_string(),
@@ -2468,31 +2462,22 @@ impl From<&RpkiState> for api::RpkiState {
     }
 }
 
-enum RpkiMgmtMsg {
-    Deconfigured,
-}
-
 struct RpkiClient {
-    configured_time: u64,
+    cancel: CancellationToken,
     state: Arc<RpkiState>,
-    mgmt_tx: Option<mpsc::UnboundedSender<RpkiMgmtMsg>>,
 }
 
 impl RpkiClient {
     fn new() -> Self {
         RpkiClient {
-            configured_time: SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            cancel: CancellationToken::new(),
             state: Arc::new(RpkiState::default()),
-            mgmt_tx: None,
         }
     }
 
     async fn serve(
         stream: TcpStream,
-        rx: mpsc::UnboundedReceiver<RpkiMgmtMsg>,
+        cancel: CancellationToken,
         state: Arc<RpkiState>,
         tables: TableHandle,
     ) -> Result<(), Error> {
@@ -2508,16 +2493,11 @@ impl RpkiClient {
             Ordering::Relaxed,
         );
         state.up.store(true, Ordering::Relaxed);
-        let mut rx = UnboundedReceiverStream::new(rx);
         let mut v = Vec::new();
         let mut end_of_data = false;
         loop {
             tokio::select! {
-                msg = rx.next() => {
-                    if let Some(RpkiMgmtMsg::Deconfigured) = msg {
-                            break;
-                    }
-                }
+                _ = cancel.cancelled() => break,
                 msg = lines.next() => {
                     let msg = match msg {
                         Some(msg) => match msg {
@@ -2563,40 +2543,37 @@ impl RpkiClient {
 
     fn try_connect(
         sockaddr: SocketAddr,
-        configured_time: u64,
-        global: GlobalHandle,
+        cancel: CancellationToken,
+        state: Arc<RpkiState>,
         tables: TableHandle,
     ) {
         tokio::spawn(async move {
             loop {
-                if let Ok(Ok(stream)) = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
-                    TcpStream::connect(sockaddr),
-                )
-                .await
-                {
-                    let (tx, rx) = mpsc::unbounded_channel();
-                    let state = if let Some(client) =
-                        global.write().await.rpki_clients.get_mut(&sockaddr)
-                    {
-                        client.mgmt_tx = Some(tx);
-                        client.state.clone()
-                    } else {
-                        break;
-                    };
-                    let _ = RpkiClient::serve(stream, rx, state, tables.clone()).await;
-                } else {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                let stream = tokio::select! {
+                    r = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        TcpStream::connect(sockaddr),
+                    ) => match r {
+                        Ok(Ok(s)) => s,
+                        _ => {
+                            tokio::select! {
+                                _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {}
+                                _ = cancel.cancelled() => return,
+                            }
+                            continue;
+                        }
+                    },
+                    _ = cancel.cancelled() => return,
+                };
+
+                tokio::select! {
+                    _ = RpkiClient::serve(stream, cancel.clone(), state.clone(), tables.clone()) => {}
+                    _ = cancel.cancelled() => return,
                 }
-                if let Some(client) = global.write().await.rpki_clients.get_mut(&sockaddr) {
-                    if client.configured_time != configured_time {
-                        break;
-                    }
-                    if client.mgmt_tx.is_some() {
-                        client.mgmt_tx = None;
-                    }
-                } else {
-                    break;
+
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {}
+                    _ = cancel.cancelled() => return,
                 }
             }
         });
@@ -2720,6 +2697,36 @@ impl Global {
 
     fn iter_bmp_clients(&self) -> impl Iterator<Item = (&SocketAddr, &BmpClient)> {
         self.bmp_clients.iter()
+    }
+
+    fn add_rpki_client(
+        &mut self,
+        sockaddr: SocketAddr,
+    ) -> Result<(CancellationToken, Arc<RpkiState>), ()> {
+        use std::collections::hash_map::Entry;
+        match self.rpki_clients.entry(sockaddr) {
+            Entry::Occupied(_) => Err(()),
+            Entry::Vacant(v) => {
+                let client = RpkiClient::new();
+                let cancel = client.cancel.clone();
+                let state = Arc::clone(&client.state);
+                v.insert(client);
+                Ok((cancel, state))
+            }
+        }
+    }
+
+    fn remove_rpki_client(&mut self, sockaddr: SocketAddr) -> bool {
+        if let Some(client) = self.rpki_clients.remove(&sockaddr) {
+            client.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn iter_rpki_clients(&self) -> impl Iterator<Item = (&SocketAddr, &RpkiClient)> {
+        self.rpki_clients.iter()
     }
 
     fn add_peer(
