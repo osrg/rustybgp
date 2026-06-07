@@ -2069,7 +2069,9 @@ impl RpkiTable {
     }
 
     fn key_to_addr(mut key: Vec<u8>) -> packet::IpNet {
-        let mask = key.pop().unwrap();
+        let mask = key
+            .pop()
+            .expect("RPKI trie key must end with a prefix-length byte");
         let prefix = match key.len() {
             4 => {
                 let mut octets = [0_u8; 4];
@@ -2081,7 +2083,9 @@ impl RpkiTable {
                 octets.clone_from_slice(&key[..]);
                 IpAddr::from(octets)
             }
-            _ => panic!(""),
+            n => {
+                unreachable!("RPKI trie key address length must be 4 (IPv4) or 16 (IPv6), got {n}")
+            }
         };
         packet::IpNet::new(prefix, mask)
     }
