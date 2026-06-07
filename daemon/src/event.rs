@@ -2043,15 +2043,12 @@ impl GoBgpService for GrpcService {
             v.insert(sockaddr.ip(), r);
         }
 
-        {
-            let t = self.tables.shards[0].lock().await;
-            for (addr, r) in v.iter_mut() {
-                let s = t.rtable.rpki_state(addr);
-                r.state.as_mut().unwrap().record_ipv4 = s.num_records_v4;
-                r.state.as_mut().unwrap().record_ipv6 = s.num_records_v6;
-                r.state.as_mut().unwrap().prefix_ipv4 = s.num_prefixes_v4;
-                r.state.as_mut().unwrap().prefix_ipv6 = s.num_prefixes_v6;
-            }
+        for (addr, r) in v.iter_mut() {
+            let s = self.tables.rpki_state(addr).await;
+            r.state.as_mut().unwrap().record_ipv4 = s.num_records_v4;
+            r.state.as_mut().unwrap().record_ipv6 = s.num_records_v6;
+            r.state.as_mut().unwrap().prefix_ipv4 = s.num_prefixes_v4;
+            r.state.as_mut().unwrap().prefix_ipv6 = s.num_prefixes_v6;
         }
 
         let (tx, rx) = mpsc::channel(1024);
@@ -2099,13 +2096,13 @@ impl GoBgpService for GrpcService {
             None => Family::IPV4,
         };
 
-        let v: Vec<api::ListRpkiTableResponse> = self.tables.shards[0]
-            .lock()
+        let v: Vec<api::ListRpkiTableResponse> = self
+            .tables
+            .collect_roa(family)
             .await
-            .rtable
-            .iter_roa(family)
+            .into_iter()
             .map(|(net, roa)| api::ListRpkiTableResponse {
-                roa: Some(convert::roa_to_api(&net, roa)),
+                roa: Some(convert::roa_to_api(&net, &roa)),
             })
             .collect();
         let (tx, rx) = mpsc::channel(1024);
@@ -3481,6 +3478,20 @@ impl TableManager {
             state += shard.lock().await.rtable.state(family);
         }
         state
+    }
+
+    pub(crate) async fn collect_roa(&self, family: Family) -> Vec<(packet::IpNet, table::Roa)> {
+        self.shards[0]
+            .lock()
+            .await
+            .rtable
+            .iter_roa(family)
+            .map(|(net, roa)| (net, roa.clone()))
+            .collect()
+    }
+
+    pub(crate) async fn rpki_state(&self, addr: &IpAddr) -> table::RpkiTableState {
+        self.shards[0].lock().await.rtable.rpki_state(addr)
     }
 
     pub(crate) async fn collect_paths(
