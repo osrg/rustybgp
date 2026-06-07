@@ -6250,4 +6250,86 @@ mod tests {
             assert!(reach_pids.contains(&3));
         }
     } // mod process_nlri_change
+
+    fn make_grpc_service() -> GrpcService {
+        let (active_conn_tx, _) = mpsc::unbounded_channel();
+        GrpcService::new(
+            Arc::new(tokio::sync::Notify::new()),
+            active_conn_tx,
+            make_global(),
+            make_tables(),
+        )
+    }
+
+    fn ipv4_path(prefix: &str, prefix_len: u32, nexthop: &str) -> api::Path {
+        api::Path {
+            nlri: Some(api::Nlri {
+                nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
+                    prefix_len,
+                    prefix: prefix.to_string(),
+                })),
+            }),
+            pattrs: vec![
+                api::Attribute {
+                    attr: Some(api::attribute::Attr::Origin(api::OriginAttribute {
+                        origin: 0,
+                    })),
+                },
+                api::Attribute {
+                    attr: Some(api::attribute::Attr::NextHop(api::NextHopAttribute {
+                        next_hop: nexthop.to_string(),
+                    })),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn ipv4_withdraw(prefix: &str, prefix_len: u32) -> api::Path {
+        api::Path {
+            nlri: Some(api::Nlri {
+                nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
+                    prefix_len,
+                    prefix: prefix.to_string(),
+                })),
+            }),
+            pattrs: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn add_path_inserts_route() {
+        let svc = make_grpc_service();
+        let req = tonic::Request::new(api::AddPathRequest {
+            path: Some(ipv4_path("10.1.0.0", 24, "10.0.0.1")),
+            ..Default::default()
+        });
+        svc.add_path(req).await.unwrap();
+        let t = svc.tables.shards[0].lock().await;
+        assert_eq!(t.rtable.best_paths(&Family::IPV4).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_path_removes_route() {
+        let svc = make_grpc_service();
+
+        let add_req = tonic::Request::new(api::AddPathRequest {
+            path: Some(ipv4_path("10.2.0.0", 24, "10.0.0.1")),
+            ..Default::default()
+        });
+        svc.add_path(add_req).await.unwrap();
+        {
+            let t = svc.tables.shards[0].lock().await;
+            assert_eq!(t.rtable.best_paths(&Family::IPV4).len(), 1);
+        }
+
+        let del_req = tonic::Request::new(api::DeletePathRequest {
+            path: Some(ipv4_withdraw("10.2.0.0", 24)),
+            ..Default::default()
+        });
+        svc.delete_path(del_req).await.unwrap();
+        let t = svc.tables.shards[0].lock().await;
+        assert!(t.rtable.best_paths(&Family::IPV4).is_empty());
+    }
 }
