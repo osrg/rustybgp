@@ -3126,12 +3126,7 @@ impl Global {
             if !deferral.is_completed() {
                 for output in &init_outputs {
                     if let crate::gr::RestartingOutput::DeferFamilies(families) = output {
-                        for i in 0..tables.shards.len() {
-                            let mut t = tables.shards[i].lock().await;
-                            for &family in families {
-                                t.rtable.start_deferral(family);
-                            }
-                        }
+                        tables.start_deferral_families(families).await;
                     }
                 }
                 global.write().await.selection_deferral = Some(deferral);
@@ -3448,6 +3443,15 @@ impl TableManager {
             let mut t = shard.lock().await;
             for &family in families {
                 t.end_deferral(family, kernel_tx.as_deref(), export_policy.as_deref());
+            }
+        }
+    }
+
+    async fn start_deferral_families(&self, families: &[Family]) {
+        for shard in &self.shards {
+            let mut t = shard.lock().await;
+            for &family in families {
+                t.rtable.start_deferral(family);
             }
         }
     }
