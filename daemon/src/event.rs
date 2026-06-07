@@ -4607,84 +4607,11 @@ impl PeerSession {
     async fn run(mut self, global: GlobalHandle, active_conn_tx: mpsc::UnboundedSender<TcpStream>) {
         let tables = self.tables.clone();
         let info = self.session_loop(&global).await;
+        let remote_addr = info.remote_addr;
 
         // Operate on PeerContext directly via self.context — no global lock needed
         // for the ctx-only operations.
-        let no_sessions = {
-            let mut ctx = self.context.lock().unwrap();
-
-            {
-                let mut arb = ctx.conn_arbiter.lock().unwrap();
-                match info.role {
-                    crate::fsm::Role::Active => arb.active_close_tx = None,
-                    crate::fsm::Role::Passive => arb.passive_close_tx = None,
-                }
-                // Ensure the FSM slot is cleared regardless of how the session
-                // ended.  When shutdown was set directly (I/O error, EOF, cease)
-                // the FSM never received a SessionDown output and its Connection
-                // slot may still be occupied; a stuck slot causes the next
-                // reconnect's Input::Connected to return CloseConnection.
-                // If the slot is already None (e.g. HoldTimerExpired went through
-                // the FSM) process() is a no-op.
-                let _ = arb.process(info.role, crate::fsm::Input::Disconnected);
-            }
-
-            if let Some(gr) = &info.negotiated_gr {
-                // GR active (we are the helper; the peer is the restarting speaker):
-                // advance the GR state machine to arm the restart timer, then wait
-                // for the peer to reconnect and re-send its routes.
-                //
-                // The peer crashed and its RIB is now empty.  When it reconnects it
-                // must learn all routes from us again, so the next session must send
-                // a full update -- exactly the same as a brand-new session.  Keeping
-                // the old export_map would cause the new session to treat those routes
-                // as "already sent" and skip re-advertising them to the peer, leaving
-                // the peer with an incomplete RIB after recovery.  Drop it so that
-                // the next session starts with a clean slate.
-                //
-                // The stale-route side (routes received FROM the peer) is handled
-                // separately: MarkStale table events were already sent in
-                // session_loop() under the same shard locks as peer_event_tx.remove(),
-                // so no second pass over the table is needed here.
-                if let Some(h) = ctx.gr_restart_timer.take() {
-                    h.abort();
-                }
-
-                let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
-                    families: gr.families.clone(),
-                    restart_time: gr.restart_time,
-                });
-                for output in &outputs {
-                    if let crate::gr::GrOutput::StartTimer(duration) = output {
-                        let dur = *duration;
-                        let addr = self.remote_addr;
-                        let context_c = Arc::clone(&self.context);
-                        let tables_c = tables.clone();
-                        let handle = tokio::spawn(async move {
-                            tokio::time::sleep(dur).await;
-                            gr_restart_timer_expired(context_c, tables_c, addr).await;
-                        })
-                        .abort_handle();
-                        ctx.gr_restart_timer = Some(handle);
-                    }
-                }
-                drop(info.export_map);
-            } else {
-                // Normal disconnect (no GR): the peer's routes were already removed
-                // from the RIB in session_loop().  The next session must also send a
-                // full update, so the export_map is discarded here and the next
-                // session starts with an empty one.  Clean up any leftover GR state
-                // from a previous cycle that never recovered.
-                if let Some(h) = ctx.gr_restart_timer.take() {
-                    h.abort();
-                }
-                drop(info.export_map);
-            }
-
-            // Only reset and reconnect when no PeerSession remains for this peer.
-            let arb = ctx.conn_arbiter.lock().unwrap();
-            arb.active_close_tx.is_none() && arb.passive_close_tx.is_none()
-        };
+        let no_sessions = apply_disconnect(&self.context, self.remote_addr, &tables, info).await;
 
         // Notify RestartingDeferral that this peer has disconnected, if active.
         let rd_outputs = {
@@ -4700,17 +4627,103 @@ impl PeerSession {
 
         // Peer-level operations still require the global write lock.
         let mut server = global.write().await;
-        if let Some(peer) = server.peers.get_mut(&info.remote_addr)
+        if let Some(peer) = server.peers.get_mut(&remote_addr)
             && no_sessions
         {
             if peer.config.delete_on_disconnected {
-                server.peers.remove(&info.remote_addr);
+                server.peers.remove(&remote_addr);
             } else {
                 peer.reset();
                 enable_active_connect(peer, active_conn_tx);
             }
         }
     }
+}
+
+/// Cleans up after a BGP session ends: updates the FSM slot, handles the GR
+/// state machine, discards the session's export_map, and returns whether this
+/// was the last active session for the peer.
+///
+/// Extracted from `PeerSession::run()` so that both GR and non-GR paths can
+/// be tested without a live TCP connection.
+async fn apply_disconnect(
+    context: &Arc<std::sync::Mutex<PeerContext>>,
+    remote_addr: IpAddr,
+    tables: &TableHandle,
+    info: DisconnectInfo,
+) -> bool {
+    let mut ctx = context.lock().unwrap();
+
+    {
+        let mut arb = ctx.conn_arbiter.lock().unwrap();
+        match info.role {
+            crate::fsm::Role::Active => arb.active_close_tx = None,
+            crate::fsm::Role::Passive => arb.passive_close_tx = None,
+        }
+        // Ensure the FSM slot is cleared regardless of how the session
+        // ended.  When shutdown was set directly (I/O error, EOF, cease)
+        // the FSM never received a SessionDown output and its Connection
+        // slot may still be occupied; a stuck slot causes the next
+        // reconnect's Input::Connected to return CloseConnection.
+        // If the slot is already None (e.g. HoldTimerExpired went through
+        // the FSM) process() is a no-op.
+        let _ = arb.process(info.role, crate::fsm::Input::Disconnected);
+    }
+
+    if let Some(gr) = &info.negotiated_gr {
+        // GR active (we are the helper; the peer is the restarting speaker):
+        // advance the GR state machine to arm the restart timer, then wait
+        // for the peer to reconnect and re-send its routes.
+        //
+        // The peer crashed and its RIB is now empty.  When it reconnects it
+        // must learn all routes from us again, so the next session must send
+        // a full update -- exactly the same as a brand-new session.  Keeping
+        // the old export_map would cause the new session to treat those routes
+        // as "already sent" and skip re-advertising them to the peer, leaving
+        // the peer with an incomplete RIB after recovery.  Drop it so that
+        // the next session starts with a clean slate.
+        //
+        // The stale-route side (routes received FROM the peer) is handled
+        // separately: MarkStale table events were already sent in
+        // session_loop() under the same shard locks as peer_event_tx.remove(),
+        // so no second pass over the table is needed here.
+        if let Some(h) = ctx.gr_restart_timer.take() {
+            h.abort();
+        }
+
+        let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
+            families: gr.families.clone(),
+            restart_time: gr.restart_time,
+        });
+        for output in &outputs {
+            if let crate::gr::GrOutput::StartTimer(duration) = output {
+                let dur = *duration;
+                let context_c = Arc::clone(context);
+                let tables_c = tables.clone();
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(dur).await;
+                    gr_restart_timer_expired(context_c, tables_c, remote_addr).await;
+                })
+                .abort_handle();
+                ctx.gr_restart_timer = Some(handle);
+            }
+        }
+        drop(info.export_map);
+    } else {
+        // Normal disconnect (no GR): the peer's routes were already removed
+        // from the RIB in session_loop().  The next session must also send a
+        // full update, so the export_map is discarded here and the next
+        // session starts with an empty one.  Clean up any leftover GR state
+        // from a previous cycle that never recovered.
+        if let Some(h) = ctx.gr_restart_timer.take() {
+            h.abort();
+        }
+        drop(info.export_map);
+    }
+
+    // Only reset and reconnect when no PeerSession remains for this peer.
+    let arb = ctx.conn_arbiter.lock().unwrap();
+    arb.active_close_tx.is_none() && arb.passive_close_tx.is_none()
 }
 
 /// Core routing-update logic shared by handle_prefix_update() and unit tests.
@@ -6512,5 +6525,69 @@ mod tests {
         .unwrap();
         let t = svc.tables.shards[0].lock().await;
         assert!(t.rtable.best_paths(&Family::IPV4).is_empty());
+    }
+
+    // ---- apply_disconnect: export_map lifetime ----
+
+    fn make_disconnect_info(negotiated_gr: Option<NegotiatedGr>) -> DisconnectInfo {
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        let mut em = ExportMap::new();
+        em.mark_sent(Family::IPV4, nlri, 0);
+        DisconnectInfo {
+            role: crate::fsm::Role::Active,
+            remote_addr: "10.0.0.1".parse().unwrap(),
+            export_map: em,
+            negotiated_gr,
+        }
+    }
+
+    #[tokio::test]
+    async fn gr_disconnect_clears_export_map() {
+        // When GR is negotiated, apply_disconnect must NOT carry the session's
+        // export_map into the persistent PeerContext.  The next session must
+        // send a full update so the restarting peer can rebuild its RIB.
+        let tables = make_tables();
+        let context = make_context();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let info = make_disconnect_info(Some(NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: std::time::Duration::from_secs(90),
+            notification_enabled: false,
+        }));
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+
+        apply_disconnect(&context, remote_addr, &tables, info).await;
+
+        // The persistent export_map on PeerContext must remain empty.
+        assert!(
+            !context
+                .lock()
+                .unwrap()
+                .export_map
+                .was_sent(Family::IPV4, &nlri)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_gr_disconnect_clears_export_map() {
+        // On a normal disconnect (no GR), apply_disconnect must also discard
+        // the session's export_map rather than copying it to PeerContext.
+        let tables = make_tables();
+        let context = make_context();
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let info = make_disconnect_info(None);
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+
+        apply_disconnect(&context, remote_addr, &tables, info).await;
+
+        assert!(
+            !context
+                .lock()
+                .unwrap()
+                .export_map
+                .was_sent(Family::IPV4, &nlri)
+        );
     }
 }
