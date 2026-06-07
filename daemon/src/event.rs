@@ -1055,7 +1055,6 @@ impl GrpcService {
         path: api::Path,
     ) -> Result<
         (
-            usize,
             Arc<table::Source>,
             Family,
             Vec<packet::PathNlri>,
@@ -1104,7 +1103,6 @@ impl GrpcService {
             Some(Arc::new(attr))
         };
         Ok((
-            self.tables.dealer(net),
             self.local_source.clone(),
             family,
             vec![packet::PathNlri {
@@ -1592,11 +1590,11 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::AddPathRequest>,
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
-        let (idx, source, family, nets, attrs, nexthop) =
+        let (source, family, nets, attrs, nexthop) =
             self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
         let map_nets = nets.clone();
         self.tables
-            .pass_update(idx, source, family, nets, attrs, nexthop)
+            .pass_update(source, family, nets, attrs, nexthop)
             .await;
         let id = uuid::Uuid::new_v4();
         self.path_uuid_map
@@ -1626,9 +1624,8 @@ impl GoBgpService for GrpcService {
             .await
             .remove(&id)
             .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "uuid not found"))?;
-        let idx = self.tables.dealer(nets[0].nlri);
         self.tables
-            .pass_update(idx, self.local_source.clone(), family, nets, None, None)
+            .pass_update(self.local_source.clone(), family, nets, None, None)
             .await;
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
@@ -1714,9 +1711,9 @@ impl GoBgpService for GrpcService {
         let mut stream = request.into_inner();
         while let Some(Ok(request)) = stream.next().await {
             for path in request.paths {
-                if let Ok((idx, source, family, nets, attrs, nexthop)) = self.local_path(path) {
+                if let Ok((source, family, nets, attrs, nexthop)) = self.local_path(path) {
                     self.tables
-                        .pass_update(idx, source, family, nets, attrs, nexthop)
+                        .pass_update(source, family, nets, attrs, nexthop)
                         .await;
                 }
             }

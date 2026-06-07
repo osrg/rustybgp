@@ -106,7 +106,7 @@ impl TableManager {
         }
     }
 
-    pub(crate) fn dealer<T: Hash>(&self, a: T) -> usize {
+    fn dealer<T: Hash>(&self, a: T) -> usize {
         let mut hasher = FnvHasher::default();
         a.hash(&mut hasher);
         hasher.finish() as usize % self.shards.len()
@@ -183,13 +183,14 @@ impl TableManager {
 
     pub(crate) async fn pass_update(
         &self,
-        idx: usize,
         source: Arc<table::Source>,
         family: Family,
         nets: Vec<packet::PathNlri>,
         attrs: Option<Arc<Vec<packet::Attribute>>>,
         nexthop: Option<bgp::Nexthop>,
     ) {
+        let Some(first) = nets.first() else { return };
+        let idx = self.dealer(first.nlri);
         let import_policy = self.import_policy.load_full();
         let export_policy = self.export_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
