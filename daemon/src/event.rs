@@ -3288,6 +3288,7 @@ pub(crate) type TableHandle = Arc<TableManager>;
 
 pub(crate) struct TableManager {
     shards: Vec<Mutex<TableShard>>,
+    rpki: std::sync::RwLock<table::RpkiTable>,
     kernel_tx: ArcSwapOption<mpsc::UnboundedSender<KernelRouteEvent>>,
     import_policy: ArcSwapOption<table::PolicyAssignment>,
     export_policy: ArcSwapOption<table::PolicyAssignment>,
@@ -3308,6 +3309,7 @@ impl TableManager {
                     })
                 })
                 .collect(),
+            rpki: std::sync::RwLock::new(table::RpkiTable::new()),
             kernel_tx: ArcSwapOption::const_empty(),
             import_policy: ArcSwapOption::const_empty(),
             export_policy: ArcSwapOption::const_empty(),
@@ -3344,7 +3346,6 @@ impl TableManager {
         let mut nh = nexthop;
         let filtered = crate::policy::apply_import(
             import_policy.as_deref(),
-            &t.rtable,
             &source,
             &net.nlri,
             &attr,
@@ -3457,23 +3458,22 @@ impl TableManager {
     }
 
     async fn rpki_insert(&self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
-        for shard in &self.shards {
-            shard.lock().await.insert_roa(roas.clone());
+        let mut rpki = self.rpki.write().unwrap();
+        for (net, roa) in roas {
+            rpki.insert(net, roa);
         }
     }
 
     async fn rpki_reset(&self, addr: Arc<IpAddr>, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
-        for shard in &self.shards {
-            let mut t = shard.lock().await;
-            t.rpki_drop(addr.clone());
-            t.insert_roa(roas.clone());
+        let mut rpki = self.rpki.write().unwrap();
+        rpki.drop_source(addr);
+        for (net, roa) in roas {
+            rpki.insert(net, roa);
         }
     }
 
     async fn rpki_drop_all(&self, addr: Arc<IpAddr>) {
-        for shard in &self.shards {
-            shard.lock().await.rpki_drop(addr.clone());
-        }
+        self.rpki.write().unwrap().drop_source(addr);
     }
 
     pub(crate) async fn table_state(&self, family: Family) -> table::TableState {
@@ -3485,17 +3485,16 @@ impl TableManager {
     }
 
     pub(crate) async fn collect_roa(&self, family: Family) -> Vec<(packet::IpNet, table::Roa)> {
-        self.shards[0]
-            .lock()
-            .await
-            .rtable
-            .iter_roa(family)
+        self.rpki
+            .read()
+            .unwrap()
+            .iter(family)
             .map(|(net, roa)| (net, roa.clone()))
             .collect()
     }
 
     pub(crate) async fn rpki_state(&self, addr: &IpAddr) -> table::RpkiTableState {
-        self.shards[0].lock().await.rtable.rpki_state(addr)
+        self.rpki.read().unwrap().state(addr)
     }
 
     pub(crate) async fn collect_paths(
@@ -3510,6 +3509,7 @@ impl TableManager {
         } else {
             None
         };
+        // Phase 1: collect from each shard (validation: None); shard lock released after each.
         let mut out = Vec::new();
         for shard in &self.shards {
             let t = shard.lock().await;
@@ -3520,6 +3520,13 @@ impl TableManager {
                 prefixes.clone(),
                 export_policy.clone(),
             ));
+        }
+        // Phase 2: apply RPKI validation without holding any shard lock.
+        let rpki = self.rpki.read().unwrap();
+        for dest in &mut out {
+            for path in &mut dest.paths {
+                path.validation = rpki.validate(family, &path.source, &dest.net, &path.attr);
+            }
         }
         out
     }
@@ -3718,7 +3725,7 @@ impl TableShard {
         let filtered_new_best: Option<table::Path> = if let Some(best) = update.new_best() {
             let mut nexthop = best.nexthop;
             if export_policy.is_some_and(|policy| {
-                self.rtable.apply_policy(
+                table::Table::apply_policy(
                     policy,
                     &best.source,
                     &update.net,
@@ -3749,7 +3756,7 @@ impl TableShard {
                     .filter_map(|p| {
                         let mut nexthop = p.nexthop;
                         if export_policy.is_some_and(|policy| {
-                            self.rtable.apply_policy(
+                            table::Table::apply_policy(
                                 policy,
                                 &p.source,
                                 &update.net,
@@ -3845,7 +3852,6 @@ impl TableShard {
                     let mut nh = nexthop.unwrap();
                     let filtered = crate::policy::apply_import(
                         import_policy,
-                        &self.rtable,
                         &source,
                         &net.nlri,
                         &attrs,
@@ -3898,16 +3904,6 @@ impl TableShard {
         for change in self.rtable.end_deferral(family) {
             self.distribute_update(change, kernel_tx, export_policy);
         }
-    }
-
-    fn insert_roa(&mut self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
-        for (net, roa) in roas {
-            self.rtable.roa_insert(net, roa);
-        }
-    }
-
-    fn rpki_drop(&mut self, addr: Arc<IpAddr>) {
-        self.rtable.rpki_drop(addr);
     }
 }
 
@@ -4536,7 +4532,7 @@ impl PeerSession {
             for path in paths.iter().take(effective_max) {
                 let mut nexthop = path.nexthop;
                 if export_policy.as_ref().is_some_and(|a| {
-                    rtable.apply_policy(
+                    table::Table::apply_policy(
                         a,
                         &path.source,
                         &net,

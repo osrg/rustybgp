@@ -18,21 +18,20 @@
 //! Pure logic — no async, no I/O.
 
 use rustybgp_packet::bgp::Nexthop;
-use rustybgp_table::{Disposition, PolicyAssignment, Table};
+use rustybgp_table::{Disposition, PolicyAssignment};
 use std::sync::Arc;
 
 /// Apply import policy to a route and return whether it should be filtered
 /// (rejected). Also applies any nexthop rewriting action.
 pub(crate) fn apply_import(
     import_policy: Option<&PolicyAssignment>,
-    rtable: &Table,
     source: &Arc<rustybgp_table::Source>,
     nlri: &rustybgp_packet::Nlri,
     attrs: &Arc<Vec<rustybgp_packet::Attribute>>,
     nexthop: &mut Nexthop,
 ) -> bool {
     import_policy.is_some_and(|a| {
-        rtable.apply_policy(a, source, nlri, attrs, nexthop, source.local_addr)
+        rustybgp_table::Table::apply_policy(a, source, nlri, attrs, nexthop, source.local_addr)
             == Disposition::Reject
     })
 }
@@ -100,14 +99,12 @@ mod tests {
 
     #[test]
     fn import_no_policy_accepts() {
-        let rtable = Table::new();
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]);
         let mut nh = Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
         let filtered = apply_import(
             None,
-            &rtable,
             &source(1),
             &packet::Nlri::from_str("10.0.0.0/24").unwrap(),
             &attrs,
@@ -118,7 +115,6 @@ mod tests {
 
     #[test]
     fn import_rejected_by_policy() {
-        let rtable = Table::new();
         let policy = reject_policy();
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
@@ -126,7 +122,6 @@ mod tests {
         let mut nh = Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
         let filtered = apply_import(
             Some(&policy),
-            &rtable,
             &source(1),
             &packet::Nlri::from_str("10.0.0.0/24").unwrap(),
             &attrs,

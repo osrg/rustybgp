@@ -66,6 +66,7 @@ pub struct DestinationEntry {
 }
 
 pub struct PathEntry {
+    pub source: Arc<Source>,
     pub id: u32,
     pub timestamp: SystemTime,
     pub attr: Arc<Vec<packet::Attribute>>,
@@ -451,7 +452,6 @@ pub struct Rib {
 pub struct Table {
     ribs: FnvHashMap<Family, Rib>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, PrefixStats>>,
-    rpki: RpkiTable,
 }
 
 impl Default for Table {
@@ -461,14 +461,6 @@ impl Default for Table {
 }
 
 impl Table {
-    pub fn new() -> Self {
-        Table {
-            ribs: vec![(Family::EMPTY, Rib::default())].into_iter().collect(),
-            route_stats: FnvHashMap::default(),
-            rpki: RpkiTable::new(),
-        }
-    }
-
     /// Returns all current unfiltered paths grouped by destination.
     /// Each tuple is (nlri, paths_sorted_by_preference).
     pub fn best_paths(&self, family: &Family) -> Vec<(packet::Nlri, Vec<Path>)> {
@@ -607,7 +599,7 @@ impl Table {
                                 );
                                 if let Some(pa) = &export_policy {
                                     let mut nh = p.path.nexthop;
-                                    if self.apply_policy(
+                                    if Self::apply_policy(
                                         pa,
                                         &p.path.source,
                                         net,
@@ -627,19 +619,17 @@ impl Table {
                                 Some((p, p.path.attr.clone()))
                             }
                         })
-                        .map(|(p, attr)| {
-                            let validation = self.rpki.validate(family, &p.path.source, net, &attr);
-                            PathEntry {
-                                id: if table_type == TableType::AdjOut {
-                                    0
-                                } else {
-                                    p.id
-                                },
-                                timestamp: p.timestamp,
-                                attr,
-                                validation,
-                                stale: p.path.source.is_stale(),
-                            }
+                        .map(|(p, attr)| PathEntry {
+                            source: p.path.source.clone(),
+                            id: if table_type == TableType::AdjOut {
+                                0
+                            } else {
+                                p.id
+                            },
+                            timestamp: p.timestamp,
+                            attr,
+                            validation: None,
+                            stale: p.path.source.is_stale(),
                         })
                         .collect()
                 },
@@ -1078,99 +1068,14 @@ impl Table {
         changes
     }
 
-    pub fn iter_roa(&self, family: Family) -> impl Iterator<Item = (packet::IpNet, &Roa)> + '_ {
-        self.rpki
-            .roas
-            .get(&family)
-            .unwrap()
-            .iter()
-            .flat_map(|(n, e)| {
-                let net = RpkiTable::key_to_addr(n);
-                e.iter().map(move |r| (net.clone(), r.as_ref()))
-            })
-    }
-
-    pub fn rpki_state(&self, addr: &IpAddr) -> RpkiTableState {
-        let mut state = RpkiTableState::default();
-        for (family, roas) in self.rpki.roas.iter() {
-            let mut records = 0;
-            let mut prefixes = 0;
-            for (_, e) in roas.iter() {
-                for r in e {
-                    if &*r.source == addr {
-                        prefixes += 1;
-                    }
-                }
-                if prefixes != 0 {
-                    records += 1;
-                }
-            }
-            match *family {
-                Family::IPV4 => {
-                    state.num_records_v4 += records;
-                    state.num_prefixes_v4 += prefixes;
-                }
-                Family::IPV6 => {
-                    state.num_records_v6 += records;
-                    state.num_prefixes_v6 += prefixes;
-                }
-                _ => {}
-            }
-        }
-        state
-    }
-    pub fn rpki_drop(&mut self, source: Arc<IpAddr>) {
-        for (_, roa) in self.rpki.roas.iter_mut() {
-            let mut empty = Vec::new();
-            for (n, e) in roa.iter_mut() {
-                let mut i = 0;
-                while i != e.len() {
-                    if Arc::ptr_eq(&e[i].source, &source) {
-                        e.remove(i);
-                    } else {
-                        i += 1;
-                    }
-                }
-                if e.is_empty() {
-                    empty.push(n);
-                }
-            }
-            for n in empty {
-                roa.remove(n);
-            }
-        }
-    }
-
-    pub fn roa_insert(&mut self, net: packet::IpNet, roa: Arc<Roa>) {
-        let (family, mut key, mask) = match net {
-            packet::IpNet::V4(net) => (Family::IPV4, net.addr.octets().to_vec(), net.mask),
-            packet::IpNet::V6(net) => (Family::IPV6, net.addr.octets().to_vec(), net.mask),
-        };
-        key.push(mask);
-        match self.rpki.roas.get_mut(&family).unwrap().get_mut(&key) {
-            Some(entry) => {
-                for e in entry.iter() {
-                    if Arc::ptr_eq(&e.source, &roa.source)
-                        && e.max_length == roa.max_length
-                        && e.as_number == roa.as_number
-                    {
-                        return;
-                    }
-                }
-                entry.push(roa);
-            }
-            None => {
-                self.rpki
-                    .roas
-                    .get_mut(&family)
-                    .unwrap()
-                    .insert(key, vec![roa]);
-            }
+    pub fn new() -> Self {
+        Table {
+            ribs: vec![(Family::EMPTY, Rib::default())].into_iter().collect(),
+            route_stats: FnvHashMap::default(),
         }
     }
 
     pub fn apply_policy(
-        &self,
         assignment: &PolicyAssignment,
         source: &Arc<Source>,
         net: &packet::Nlri,
@@ -1178,7 +1083,7 @@ impl Table {
         nexthop: &mut bgp::Nexthop,
         local_addr: IpAddr,
     ) -> Disposition {
-        assignment.apply(&self.rpki, source, net, attr, nexthop, local_addr)
+        assignment.apply(source, net, attr, nexthop, local_addr)
     }
 }
 
@@ -1735,7 +1640,6 @@ pub struct PolicyAssignment {
 impl PolicyAssignment {
     fn apply(
         &self,
-        _rpki: &RpkiTable,
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
@@ -2154,7 +2058,7 @@ pub struct RpkiTable {
 }
 
 impl RpkiTable {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let roas: FnvHashMap<Family, PatriciaMap<_>> = vec![
             (Family::IPV4, PatriciaMap::default()),
             (Family::IPV6, PatriciaMap::default()),
@@ -2182,7 +2086,7 @@ impl RpkiTable {
         packet::IpNet::new(prefix, mask)
     }
 
-    fn validate(
+    pub fn validate(
         &self,
         family: Family,
         source: &Arc<Source>,
@@ -2248,6 +2152,89 @@ impl RpkiTable {
                 Some(result)
             }
         }
+    }
+
+    pub fn insert(&mut self, net: packet::IpNet, roa: Arc<Roa>) {
+        let (family, mut key, mask) = match net {
+            packet::IpNet::V4(net) => (Family::IPV4, net.addr.octets().to_vec(), net.mask),
+            packet::IpNet::V6(net) => (Family::IPV6, net.addr.octets().to_vec(), net.mask),
+        };
+        key.push(mask);
+        match self.roas.get_mut(&family).unwrap().get_mut(&key) {
+            Some(entry) => {
+                for e in entry.iter() {
+                    if Arc::ptr_eq(&e.source, &roa.source)
+                        && e.max_length == roa.max_length
+                        && e.as_number == roa.as_number
+                    {
+                        return;
+                    }
+                }
+                entry.push(roa);
+            }
+            None => {
+                self.roas.get_mut(&family).unwrap().insert(key, vec![roa]);
+            }
+        }
+    }
+
+    pub fn drop_source(&mut self, source: Arc<IpAddr>) {
+        for (_, roa) in self.roas.iter_mut() {
+            let mut empty = Vec::new();
+            for (n, e) in roa.iter_mut() {
+                let mut i = 0;
+                while i != e.len() {
+                    if Arc::ptr_eq(&e[i].source, &source) {
+                        e.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+                if e.is_empty() {
+                    empty.push(n);
+                }
+            }
+            for n in empty {
+                roa.remove(n);
+            }
+        }
+    }
+
+    pub fn state(&self, addr: &IpAddr) -> RpkiTableState {
+        let mut state = RpkiTableState::default();
+        for (family, roas) in self.roas.iter() {
+            let mut records = 0;
+            let mut prefixes = 0;
+            for (_, e) in roas.iter() {
+                for r in e {
+                    if &*r.source == addr {
+                        prefixes += 1;
+                    }
+                }
+                if prefixes != 0 {
+                    records += 1;
+                }
+            }
+            match *family {
+                Family::IPV4 => {
+                    state.num_records_v4 += records;
+                    state.num_prefixes_v4 += prefixes;
+                }
+                Family::IPV6 => {
+                    state.num_records_v6 += records;
+                    state.num_prefixes_v6 += prefixes;
+                }
+                _ => {}
+            }
+        }
+        state
+    }
+
+    pub fn iter(&self, family: Family) -> impl Iterator<Item = (packet::IpNet, &Roa)> + '_ {
+        self.roas.get(&family).unwrap().iter().flat_map(|(n, e)| {
+            let net = RpkiTable::key_to_addr(n);
+            e.iter().map(move |r| (net.clone(), r.as_ref()))
+        })
     }
 }
 
@@ -3186,7 +3173,7 @@ mod tests {
 
         let s = source(1, 65001, 65000, 1);
         let net = nlri(10, 0, 0, 0, 24);
-        let result = rt.apply_policy(
+        let result = Table::apply_policy(
             &assignment,
             &s,
             &net,
@@ -3236,7 +3223,7 @@ mod tests {
         let s = source(1, 65001, 65000, 1);
         // Different prefix → no match → default disposition (Accept)
         let net = nlri(192, 168, 0, 0, 24);
-        let result = rt.apply_policy(
+        let result = Table::apply_policy(
             &assignment,
             &s,
             &net,
@@ -3290,7 +3277,7 @@ mod tests {
         let s = source(1, 65001, 65000, 1);
         let net = nlri(10, 0, 0, 0, 24);
         let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let result = rt.apply_policy(
+        let result = Table::apply_policy(
             &assignment,
             &s,
             &net,
@@ -3344,7 +3331,7 @@ mod tests {
         let net = nlri(10, 0, 0, 0, 24);
         let local_addr = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
         let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let result = rt.apply_policy(
+        let result = Table::apply_policy(
             &assignment,
             &s,
             &net,
@@ -3401,7 +3388,7 @@ mod tests {
         let net = nlri(192, 168, 0, 0, 24);
         let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
         let mut nexthop = original;
-        let _result = rt.apply_policy(
+        let _result = Table::apply_policy(
             &assignment,
             &s,
             &net,
