@@ -4630,11 +4630,22 @@ impl PeerSession {
             }
 
             if let Some(gr) = &info.negotiated_gr {
-                // GR active: advance the state machine to start the restart timer
-                // and preserve export_map for the reconnecting session.
-                // MarkStale table events were already sent in session_loop() under
-                // the same shard locks as peer_event_tx.remove(), so no second pass
-                // over the table is needed here.
+                // GR active (we are the helper; the peer is the restarting speaker):
+                // advance the GR state machine to arm the restart timer, then wait
+                // for the peer to reconnect and re-send its routes.
+                //
+                // The peer crashed and its RIB is now empty.  When it reconnects it
+                // must learn all routes from us again, so the next session must send
+                // a full update -- exactly the same as a brand-new session.  Keeping
+                // the old export_map would cause the new session to treat those routes
+                // as "already sent" and skip re-advertising them to the peer, leaving
+                // the peer with an incomplete RIB after recovery.  Drop it so that
+                // the next session starts with a clean slate.
+                //
+                // The stale-route side (routes received FROM the peer) is handled
+                // separately: MarkStale table events were already sent in
+                // session_loop() under the same shard locks as peer_event_tx.remove(),
+                // so no second pass over the table is needed here.
                 if let Some(h) = ctx.gr_restart_timer.take() {
                     h.abort();
                 }
@@ -4657,10 +4668,13 @@ impl PeerSession {
                         ctx.gr_restart_timer = Some(handle);
                     }
                 }
-                ctx.export_map = info.export_map;
+                drop(info.export_map);
             } else {
-                // Normal disconnect: routes were already dropped in session_loop().
-                // Clean up any leftover GR state from a previous cycle that never recovered.
+                // Normal disconnect (no GR): the peer's routes were already removed
+                // from the RIB in session_loop().  The next session must also send a
+                // full update, so the export_map is discarded here and the next
+                // session starts with an empty one.  Clean up any leftover GR state
+                // from a previous cycle that never recovered.
                 if let Some(h) = ctx.gr_restart_timer.take() {
                     h.abort();
                 }
