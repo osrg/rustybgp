@@ -6339,4 +6339,127 @@ mod tests {
         let t = svc.tables.shards[0].lock().await;
         assert!(t.rtable.best_paths(&Family::IPV4).is_empty());
     }
+
+    #[tokio::test]
+    async fn add_path_returns_valid_uuid() {
+        let svc = make_grpc_service();
+        let req = tonic::Request::new(api::AddPathRequest {
+            path: Some(ipv4_path("10.3.0.0", 24, "10.0.0.1")),
+            ..Default::default()
+        });
+        let uuid = svc.add_path(req).await.unwrap().into_inner().uuid;
+        assert_eq!(uuid.len(), 16);
+        assert!(uuid::Uuid::from_slice(&uuid).is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_path_returns_unique_uuids() {
+        let svc = make_grpc_service();
+        let req1 = tonic::Request::new(api::AddPathRequest {
+            path: Some(ipv4_path("10.4.0.0", 24, "10.0.0.1")),
+            ..Default::default()
+        });
+        let req2 = tonic::Request::new(api::AddPathRequest {
+            path: Some(ipv4_path("10.5.0.0", 24, "10.0.0.1")),
+            ..Default::default()
+        });
+        let uuid1 = svc.add_path(req1).await.unwrap().into_inner().uuid;
+        let uuid2 = svc.add_path(req2).await.unwrap().into_inner().uuid;
+        assert_ne!(uuid1, uuid2);
+    }
+
+    #[tokio::test]
+    async fn delete_path_without_uuid_is_rejected() {
+        let svc = make_grpc_service();
+        let req = tonic::Request::new(api::DeletePathRequest {
+            uuid: vec![],
+            ..Default::default()
+        });
+        let err = svc.delete_path(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn delete_path_with_unknown_uuid_returns_not_found() {
+        let svc = make_grpc_service();
+        let unknown_uuid = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let req = tonic::Request::new(api::DeletePathRequest {
+            uuid: unknown_uuid,
+            ..Default::default()
+        });
+        let err = svc.delete_path(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    fn ipv4_path_with_id(prefix: &str, prefix_len: u32, nexthop: &str, path_id: u32) -> api::Path {
+        api::Path {
+            identifier: path_id,
+            ..ipv4_path(prefix, prefix_len, nexthop)
+        }
+    }
+
+    #[tokio::test]
+    async fn add_path_with_path_id_inserts_route() {
+        let svc = make_grpc_service();
+        let req = tonic::Request::new(api::AddPathRequest {
+            path: Some(ipv4_path_with_id("10.6.0.0", 24, "10.0.0.1", 1)),
+            ..Default::default()
+        });
+        svc.add_path(req).await.unwrap();
+        let t = svc.tables.shards[0].lock().await;
+        assert_eq!(t.rtable.best_paths(&Family::IPV4).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_path_with_different_path_ids_coexist() {
+        let svc = make_grpc_service();
+        let prefix = "10.7.0.0";
+
+        let req1 = tonic::Request::new(api::AddPathRequest {
+            path: Some(ipv4_path_with_id(prefix, 24, "10.0.0.1", 1)),
+            ..Default::default()
+        });
+        let req2 = tonic::Request::new(api::AddPathRequest {
+            path: Some(ipv4_path_with_id(prefix, 24, "10.0.0.2", 2)),
+            ..Default::default()
+        });
+        let uuid1 = svc.add_path(req1).await.unwrap().into_inner().uuid;
+        let uuid2 = svc.add_path(req2).await.unwrap().into_inner().uuid;
+
+        {
+            let t = svc.tables.shards[0].lock().await;
+            let entries = t.rtable.best_paths(&Family::IPV4);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                entries[0].1.len(),
+                2,
+                "both path_id=1 and path_id=2 should coexist"
+            );
+        }
+
+        svc.delete_path(tonic::Request::new(api::DeletePathRequest {
+            uuid: uuid1,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        {
+            let t = svc.tables.shards[0].lock().await;
+            let entries = t.rtable.best_paths(&Family::IPV4);
+            assert_eq!(
+                entries[0].1.len(),
+                1,
+                "one path should remain after first delete"
+            );
+        }
+
+        svc.delete_path(tonic::Request::new(api::DeletePathRequest {
+            uuid: uuid2,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let t = svc.tables.shards[0].lock().await;
+        assert!(t.rtable.best_paths(&Family::IPV4).is_empty());
+    }
 }
