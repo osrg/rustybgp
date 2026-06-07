@@ -1009,6 +1009,7 @@ struct GrpcService {
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
     global: GlobalHandle,
     tables: TableHandle,
+    path_uuid_map: tokio::sync::Mutex<FnvHashMap<uuid::Uuid, (Family, Vec<packet::PathNlri>)>>,
 }
 
 impl GrpcService {
@@ -1036,6 +1037,7 @@ impl GrpcService {
             active_conn_tx,
             global,
             tables,
+            path_uuid_map: tokio::sync::Mutex::new(FnvHashMap::default()),
         }
     }
 
@@ -1592,23 +1594,41 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
         let (idx, source, family, nets, attrs, nexthop) =
             self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
+        let map_nets = nets.clone();
         self.tables
             .pass_update(idx, source, family, nets, attrs, nexthop)
             .await;
-
-        // FIXME: support uuid
+        let id = uuid::Uuid::new_v4();
+        self.path_uuid_map
+            .lock()
+            .await
+            .insert(id, (family, map_nets));
         Ok(tonic::Response::new(api::AddPathResponse {
-            uuid: Vec::new(),
+            uuid: id.as_bytes().to_vec(),
         }))
     }
     async fn delete_path(
         &self,
         request: tonic::Request<api::DeletePathRequest>,
     ) -> Result<tonic::Response<api::DeletePathResponse>, tonic::Status> {
-        let (idx, source, family, nets, attrs, nexthop) =
-            self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
+        let inner = request.into_inner();
+        if inner.uuid.is_empty() {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "uuid is required",
+            ));
+        }
+        let id = uuid::Uuid::from_slice(&inner.uuid)
+            .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid uuid"))?;
+        let (family, nets) = self
+            .path_uuid_map
+            .lock()
+            .await
+            .remove(&id)
+            .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "uuid not found"))?;
+        let idx = self.tables.dealer(nets[0].nlri);
         self.tables
-            .pass_update(idx, source, family, nets, attrs, nexthop)
+            .pass_update(idx, self.local_source.clone(), family, nets, None, None)
             .await;
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
@@ -6285,19 +6305,6 @@ mod tests {
         }
     }
 
-    fn ipv4_withdraw(prefix: &str, prefix_len: u32) -> api::Path {
-        api::Path {
-            nlri: Some(api::Nlri {
-                nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
-                    prefix_len,
-                    prefix: prefix.to_string(),
-                })),
-            }),
-            pattrs: vec![],
-            ..Default::default()
-        }
-    }
-
     #[tokio::test]
     async fn add_path_inserts_route() {
         let svc = make_grpc_service();
@@ -6318,14 +6325,14 @@ mod tests {
             path: Some(ipv4_path("10.2.0.0", 24, "10.0.0.1")),
             ..Default::default()
         });
-        svc.add_path(add_req).await.unwrap();
+        let uuid = svc.add_path(add_req).await.unwrap().into_inner().uuid;
         {
             let t = svc.tables.shards[0].lock().await;
             assert_eq!(t.rtable.best_paths(&Family::IPV4).len(), 1);
         }
 
         let del_req = tonic::Request::new(api::DeletePathRequest {
-            path: Some(ipv4_withdraw("10.2.0.0", 24)),
+            uuid,
             ..Default::default()
         });
         svc.delete_path(del_req).await.unwrap();
