@@ -1709,11 +1709,7 @@ impl GoBgpService for GrpcService {
             Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
-        let mut info = table::TableState::default();
-        for i in 0..self.tables.shards.len() {
-            let t = self.tables.shards[i].lock().await;
-            info += t.rtable.state(family);
-        }
+        let info = self.tables.table_state(family).await;
         Ok(tonic::Response::new(convert::routing_table_state_to_api(
             info,
         )))
@@ -3477,6 +3473,14 @@ impl TableManager {
         for shard in &self.shards {
             shard.lock().await.rpki_drop(addr.clone());
         }
+    }
+
+    pub(crate) async fn table_state(&self, family: Family) -> table::TableState {
+        let mut state = table::TableState::default();
+        for shard in &self.shards {
+            state += shard.lock().await.rtable.state(family);
+        }
+        state
     }
 
     pub(crate) async fn collect_paths(
