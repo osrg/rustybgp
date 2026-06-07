@@ -1148,7 +1148,12 @@ impl GoBgpService for GrpcService {
         } else {
             Global::BGP_PORT
         };
-        global.router_id = Ipv4Addr::from_str(&g.router_id).unwrap();
+        global.router_id = Ipv4Addr::from_str(&g.router_id).map_err(|_| {
+            tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                format!("invalid router-id: {}", g.router_id),
+            )
+        })?;
         self.init.notify_one();
 
         Ok(tonic::Response::new(api::StartBgpResponse {}))
