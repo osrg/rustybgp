@@ -135,6 +135,11 @@ fn session_state_to_api(v: SessionState) -> api::peer_state::SessionState {
 /// `PeerSession` via `Arc`.  All fields are atomics so they can be updated by
 /// the session task without taking the global lock.  Reset at the start of each
 /// new BGP session; the `Arc` itself lives as long as either side holds a clone.
+struct SessionAddrs {
+    local: SocketAddr,
+    remote_port: u16,
+}
+
 struct PeerState {
     fsm: AtomicU8,
     uptime: AtomicU64,
@@ -143,6 +148,7 @@ struct PeerState {
     remote_id: AtomicU32,
     remote_holdtime: AtomicU16,
     remote_cap: ArcSwapOption<Vec<packet::Capability>>,
+    session_addrs: ArcSwapOption<SessionAddrs>,
 }
 
 /// Per-peer FSM coordinator.  Created once when `local_router_id` is known
@@ -298,9 +304,6 @@ pub(crate) struct Peer {
     config: PeerConfig,
     admin_down: bool,
 
-    remote_sockaddr: SocketAddr,
-    local_sockaddr: SocketAddr,
-
     /// Shared with the active `PeerSession`; updated atomically during a session.
     state: Arc<PeerState>,
 
@@ -318,7 +321,6 @@ pub(crate) struct Peer {
 struct PeerView {
     config: PeerConfig,
     admin_down: bool,
-    local_sockaddr: SocketAddr,
     state: Arc<PeerState>,
     counter_tx: Arc<MessageCounter>,
     counter_rx: Arc<MessageCounter>,
@@ -350,6 +352,8 @@ impl Peer {
         if self.state.fsm.load(Ordering::Relaxed) != SessionState::Established as u8 {
             return None;
         }
+        let addrs_guard = self.state.session_addrs.load();
+        let addrs = (*addrs_guard).as_ref()?;
         let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
         let remote_id = Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed));
         let peer_header = bmp::PerPeerHeader::new(
@@ -361,9 +365,9 @@ impl Peer {
         );
         let msg = bmp::Message::PeerUp {
             header: peer_header.clone(),
-            local_addr: self.local_sockaddr.ip(),
-            local_port: self.local_sockaddr.port(),
-            remote_port: self.remote_sockaddr.port(),
+            local_addr: addrs.local.ip(),
+            local_port: addrs.local.port(),
+            remote_port: addrs.remote_port,
             remote_open: bgp::Message::Open(bgp::Open {
                 as_number: remote_asn,
                 holdtime: HoldTime::new(self.state.remote_holdtime.load(Ordering::Relaxed))
@@ -392,7 +396,6 @@ impl Peer {
         PeerView {
             config: self.config.clone(),
             admin_down: self.admin_down,
-            local_sockaddr: self.local_sockaddr,
             state: Arc::clone(&self.state),
             counter_tx: Arc::clone(&self.counter_tx),
             counter_rx: Arc::clone(&self.counter_rx),
@@ -418,6 +421,7 @@ impl Peer {
         self.state
             .fsm
             .store(SessionState::Idle as u8, Ordering::Relaxed);
+        self.state.session_addrs.store(None);
         let mut ctx = self.context.lock().unwrap();
         ctx.active_connect_cancel_tx = ActiveConnectCancel::default();
         {
@@ -437,8 +441,6 @@ struct PeerParams {
     remote_addr: IpAddr,
     remote_port: u16,
     remote_asn: u32,
-    remote_sockaddr: SocketAddr,
-    local_sockaddr: SocketAddr,
     local_asn: u32,
     passive: bool,
     rs_client: bool,
@@ -556,8 +558,6 @@ impl PeerParams {
                 graceful_restart: self.graceful_restart,
             },
             admin_down: self.admin_down,
-            local_sockaddr: self.local_sockaddr,
-            remote_sockaddr: self.remote_sockaddr,
             state: Arc::new(PeerState {
                 fsm: AtomicU8::new(self.state as u8),
                 uptime: AtomicU64::new(0),
@@ -566,6 +566,7 @@ impl PeerParams {
                 remote_id: AtomicU32::new(0),
                 remote_holdtime: AtomicU16::new(0),
                 remote_cap: ArcSwapOption::empty(),
+                session_addrs: ArcSwapOption::empty(),
             }),
             counter_tx: Default::default(),
             counter_rx: Default::default(),
@@ -677,7 +678,13 @@ impl From<&PeerView> for api::Peer {
             conf: Some(Default::default()),
             timers: Some(tm),
             transport: Some(api::Transport {
-                local_address: p.local_sockaddr.ip().to_string(),
+                local_address: p
+                    .state
+                    .session_addrs
+                    .load()
+                    .as_ref()
+                    .map(|a| a.local.ip().to_string())
+                    .unwrap_or_default(),
                 ..Default::default()
             }),
             route_reflector: Some(Default::default()),
@@ -784,8 +791,6 @@ impl TryFrom<&api::Peer> for PeerParams {
                 }
             }),
             remote_asn: conf.peer_asn,
-            remote_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            local_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             local_asn: conf.local_asn,
             passive: p.transport.as_ref().is_some_and(|x| x.passive_mode),
             rs_client: p
@@ -952,8 +957,6 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                 .and_then(|t| t.remote_port)
                 .unwrap_or(Global::BGP_PORT),
             remote_asn: peer_as,
-            remote_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            local_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             local_asn: c.local_as.unwrap_or(0),
             passive: transport_config
                 .and_then(|t| t.passive_mode)
@@ -2586,7 +2589,6 @@ async fn accept_connection(
     stream: TcpStream,
     role: crate::fsm::Role,
 ) -> Option<PeerSession> {
-    let local_sockaddr = stream.local_addr().ok()?;
     let remote_sockaddr = stream.peer_addr().ok()?;
     let remote_addr = remote_sockaddr.ip();
     let mut g = global.write().await;
@@ -2612,8 +2614,6 @@ async fn accept_connection(
                 println!("already has {:?} connection {}", role, remote_addr);
                 return None;
             }
-            peer.remote_sockaddr = remote_sockaddr;
-            peer.local_sockaddr = local_sockaddr;
             peer.state
                 .fsm
                 .store(SessionState::Active as u8, Ordering::Relaxed);
@@ -2647,8 +2647,6 @@ async fn accept_connection(
                     remote_addr,
                     remote_port: Global::BGP_PORT,
                     remote_asn,
-                    remote_sockaddr,
-                    local_sockaddr,
                     local_asn: 0,
                     passive: false,
                     rs_client,
@@ -3609,6 +3607,7 @@ impl PeerSession {
                 remote_id: AtomicU32::new(0),
                 remote_holdtime: AtomicU16::new(0),
                 remote_cap: ArcSwapOption::empty(),
+                session_addrs: ArcSwapOption::empty(),
             }),
             counter_tx: Default::default(),
             counter_rx: Default::default(),
@@ -3936,6 +3935,12 @@ impl PeerSession {
                     self.state
                         .remote_cap
                         .store(Some(Arc::new(remote_capabilities)));
+                    // Store session_addrs before StateChanged(Established) sets FSM=Established,
+                    // so readers that observe Established always also see a populated session_addrs.
+                    self.state.session_addrs.store(Some(Arc::new(SessionAddrs {
+                        local: local_sockaddr,
+                        remote_port: remote_sockaddr.port(),
+                    })));
                     self.on_established(local_sockaddr, remote_sockaddr).await;
                 }
                 crate::fsm::PeerFsmOutput::Connection(
@@ -3946,6 +3951,11 @@ impl PeerSession {
                 }
                 crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::StateChanged(s)) => {
                     self.state.fsm.store(u8::from(s), Ordering::Relaxed);
+                    // Clear session_addrs after FSM=Idle so readers that observe
+                    // None never simultaneously observe FSM=Established.
+                    if s == SessionState::Idle {
+                        self.state.session_addrs.store(None);
+                    }
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -4698,8 +4708,6 @@ mod tests {
             remote_addr,
             remote_port: Global::BGP_PORT,
             remote_asn: 0,
-            remote_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            local_sockaddr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             local_asn: 0,
             passive: false,
             rs_client: false,
