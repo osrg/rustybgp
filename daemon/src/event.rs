@@ -3932,27 +3932,24 @@ impl PeerSession {
                     self.state
                         .remote_cap
                         .store(Some(Arc::new(remote_capabilities)));
-                    // Store session_addrs before StateChanged(Established) sets FSM=Established,
-                    // so readers that observe Established always also see a populated session_addrs.
                     self.state.session_addrs.store(Some(Arc::new(SessionAddrs {
                         local: local_sockaddr,
                         remote_port: remote_sockaddr.port(),
                     })));
+                    self.state
+                        .fsm
+                        .store(SessionState::Established as u8, Ordering::Relaxed);
                     self.on_established(local_sockaddr, remote_sockaddr).await;
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
                     crate::fsm::Output::SessionDown(reason),
                 ) => {
+                    self.state.session_addrs.store(None);
                     self.shutdown = Some(reason);
                 }
                 crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::StateChanged(s)) => {
                     self.state.fsm.store(u8::from(s), Ordering::Relaxed);
-                    // Clear session_addrs after FSM=Idle so readers that observe
-                    // None never simultaneously observe FSM=Established.
-                    if s == SessionState::Idle {
-                        self.state.session_addrs.store(None);
-                    }
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,

@@ -302,7 +302,6 @@ impl Connection {
                 self.state = State::Established;
                 vec![
                     Output::SetHoldTimer(self.negotiated_holdtime),
-                    Output::StateChanged(State::Established),
                     Output::SessionEstablished {
                         remote_asn: self.remote_asn,
                         remote_id: self.remote_id,
@@ -727,7 +726,7 @@ mod tests {
         // Receive KEEPALIVE -> Established
         let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
         assert_eq!(s.state(), State::Established);
-        assert!(has_output(&out, |o| matches!(
+        assert!(!has_output(&out, |o| matches!(
             o,
             Output::StateChanged(State::Established)
         )));
@@ -735,6 +734,96 @@ mod tests {
             o,
             Output::SessionEstablished { .. }
         )));
+    }
+
+    #[test]
+    fn session_established_carries_remote_peer_info() {
+        let mut s = basic_connection();
+        let _ = s.process(Input::Connected(false));
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        let established = out.iter().find_map(|o| {
+            if let Output::SessionEstablished {
+                remote_asn,
+                remote_id,
+                remote_holdtime,
+                ..
+            } = o
+            {
+                Some((*remote_asn, *remote_id, *remote_holdtime))
+            } else {
+                None
+            }
+        });
+        assert_eq!(established, Some((65002, remote_router_id(), 60)));
+    }
+
+    #[test]
+    fn session_down_does_not_include_state_changed() {
+        let mut s = basic_connection();
+        let _ = s.process(Input::Connected(false));
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
+
+        let out = s.process(Input::HoldTimerExpired);
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SessionDown(SessionDownReason::HoldTimerExpired)
+        )));
+        assert!(!has_output(&out, |o| matches!(o, Output::StateChanged(_))));
+    }
+
+    #[test]
+    fn admin_shutdown_sends_notification_and_session_down() {
+        let mut s = basic_connection();
+        let _ = s.process(Input::Connected(false));
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
+
+        let out = s.process(Input::AdminShutdown);
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SendMessage(bgp::Message::Notification(_))
+        )));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SessionDown(SessionDownReason::AdminShutdown)
+        )));
+        assert!(!has_output(&out, |o| matches!(o, Output::StateChanged(_))));
+    }
+
+    #[test]
+    fn disconnected_produces_session_down_io_error() {
+        let mut s = basic_connection();
+        let _ = s.process(Input::Connected(false));
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
+
+        let out = s.process(Input::Disconnected);
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SessionDown(SessionDownReason::IoError)
+        )));
+        assert!(!has_output(&out, |o| matches!(o, Output::StateChanged(_))));
     }
 
     #[test]
