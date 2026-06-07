@@ -1048,7 +1048,21 @@ impl GrpcService {
         Ok(())
     }
 
-    fn local_path(&self, path: api::Path) -> Result<(usize, TableEvent), tonic::Status> {
+    #[allow(clippy::type_complexity)]
+    fn local_path(
+        &self,
+        path: api::Path,
+    ) -> Result<
+        (
+            usize,
+            Arc<table::Source>,
+            Family,
+            Vec<packet::PathNlri>,
+            Option<Arc<Vec<packet::Attribute>>>,
+            Option<bgp::Nexthop>,
+        ),
+        tonic::Status,
+    > {
         let family = match path.family {
             Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
@@ -1083,24 +1097,21 @@ impl GrpcService {
                 attr.push(a);
             }
         }
+        let attrs = if attr.is_empty() {
+            None
+        } else {
+            Some(Arc::new(attr))
+        };
         Ok((
             self.tables.dealer(net),
-            TableEvent::PassUpdate(
-                self.local_source.clone(),
-                family,
-                vec![packet::PathNlri {
-                    path_id: path.identifier,
-                    nlri: net,
-                }],
-                {
-                    if attr.is_empty() {
-                        None
-                    } else {
-                        Some(Arc::new(attr))
-                    }
-                },
-                nexthop,
-            ),
+            self.local_source.clone(),
+            family,
+            vec![packet::PathNlri {
+                path_id: path.identifier,
+                nlri: net,
+            }],
+            attrs,
+            nexthop,
         ))
     }
 }
@@ -1577,8 +1588,11 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::AddPathRequest>,
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
-        let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        self.tables.event(u.0, u.1).await;
+        let (idx, source, family, nets, attrs, nexthop) =
+            self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
+        self.tables
+            .pass_update(idx, source, family, nets, attrs, nexthop)
+            .await;
 
         // FIXME: support uuid
         Ok(tonic::Response::new(api::AddPathResponse {
@@ -1589,8 +1603,11 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::DeletePathRequest>,
     ) -> Result<tonic::Response<api::DeletePathResponse>, tonic::Status> {
-        let u = self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        self.tables.event(u.0, u.1).await;
+        let (idx, source, family, nets, attrs, nexthop) =
+            self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
+        self.tables
+            .pass_update(idx, source, family, nets, attrs, nexthop)
+            .await;
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
     type ListPathStream = Pin<
@@ -1686,8 +1703,10 @@ impl GoBgpService for GrpcService {
         let mut stream = request.into_inner();
         while let Some(Ok(request)) = stream.next().await {
             for path in request.paths {
-                if let Ok(u) = self.local_path(path) {
-                    self.tables.event(u.0, u.1).await;
+                if let Ok((idx, source, family, nets, attrs, nexthop)) = self.local_path(path) {
+                    self.tables
+                        .pass_update(idx, source, family, nets, attrs, nexthop)
+                        .await;
                 }
             }
         }
@@ -2552,23 +2571,17 @@ impl RpkiClient {
                         {
                             let roa = Arc::new(table::Roa::new(prefix.max_length, prefix.as_number, remote_addr.clone()));
                             if end_of_data {
-                                for i in 0..tables.shards.len() {
-                                    tables.event(i, TableEvent::InsertRoa(vec![(prefix.net.clone(), roa.clone())])).await;
-                                }
+                                tables
+                                    .rpki_insert(vec![(prefix.net.clone(), roa.clone())])
+                                    .await;
                             } else {
-                                v.push((
-                                    prefix.net,
-                                    roa,
-                                ));
+                                v.push((prefix.net, roa));
                             }
                         }
                         rpki::Message::EndOfData { serial_number } => {
                             end_of_data = true;
                             state.serial.store(serial_number, Ordering::Relaxed);
-                            for i in 0..tables.shards.len() {
-                                tables.event(i, TableEvent::Drop(remote_addr.clone())).await;
-                                tables.event(i, TableEvent::InsertRoa(v.to_owned())).await;
-                            }
+                            tables.rpki_reset(remote_addr.clone(), v.to_owned()).await;
                         }
                         _ => {}
                     }
@@ -2582,9 +2595,7 @@ impl RpkiClient {
                 .as_secs(),
             Ordering::Relaxed,
         );
-        for i in 0..tables.shards.len() {
-            tables.event(i, TableEvent::Drop(remote_addr.clone())).await;
-        }
+        tables.rpki_drop_all(remote_addr.clone()).await;
         Ok(())
     }
 
@@ -3329,28 +3340,6 @@ enum KernelRouteEvent {
     },
 }
 
-enum TableEvent {
-    // BGP events
-    PassUpdate(
-        Arc<table::Source>,
-        Family,
-        Vec<packet::PathNlri>,
-        Option<Arc<Vec<packet::Attribute>>>,
-        Option<bgp::Nexthop>,
-    ),
-    Disconnected(IpAddr, Family),
-    /// Remove only stale paths from this peer+family (GR EOR / deferral timer).
-    /// Unlike Disconnected, fresh routes from a reconnected session are preserved.
-    DropStale(IpAddr, Family),
-    /// Clear the deferral flag for `family` and distribute all accumulated best
-    /// paths to peers.  Used by the Restarting Speaker when deferral ends for a
-    /// family (FamilyDeferralComplete or EndDeferral from RestartingDeferral).
-    EndDeferral(Family),
-    // RPKI events
-    InsertRoa(Vec<(packet::IpNet, Arc<table::Roa>)>),
-    Drop(Arc<IpAddr>),
-}
-
 /// Opaque subscription handle returned by [`TableManager::subscribe`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SubscriptionId(u64);
@@ -3512,16 +3501,79 @@ impl TableManager {
         }
     }
 
-    async fn event(&self, idx: usize, msg: TableEvent) {
+    async fn pass_update(
+        &self,
+        idx: usize,
+        source: Arc<table::Source>,
+        family: Family,
+        nets: Vec<packet::PathNlri>,
+        attrs: Option<Arc<Vec<packet::Attribute>>>,
+        nexthop: Option<bgp::Nexthop>,
+    ) {
         let import_policy = self.import_policy.load_full();
         let export_policy = self.export_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
-        self.shards[idx].lock().await.event(
-            msg,
-            kernel_tx.as_deref(),
+        self.shards[idx].lock().await.pass_update(
+            source,
+            family,
+            nets,
+            attrs,
+            nexthop,
             import_policy.as_deref(),
+            kernel_tx.as_deref(),
             export_policy.as_deref(),
         );
+    }
+
+    async fn drop_families(&self, addr: IpAddr, families: &[Family]) {
+        let kernel_tx = self.kernel_tx.load_full();
+        for shard in &self.shards {
+            let mut t = shard.lock().await;
+            for &family in families {
+                t.disconnected(addr, family, kernel_tx.as_deref());
+            }
+        }
+    }
+
+    async fn drop_stale_families(&self, addr: IpAddr, families: &[Family]) {
+        let kernel_tx = self.kernel_tx.load_full();
+        for shard in &self.shards {
+            let mut t = shard.lock().await;
+            for &family in families {
+                t.drop_stale(addr, family, kernel_tx.as_deref());
+            }
+        }
+    }
+
+    async fn end_deferral_families(&self, families: &[Family]) {
+        let kernel_tx = self.kernel_tx.load_full();
+        let export_policy = self.export_policy.load_full();
+        for shard in &self.shards {
+            let mut t = shard.lock().await;
+            for &family in families {
+                t.end_deferral(family, kernel_tx.as_deref(), export_policy.as_deref());
+            }
+        }
+    }
+
+    async fn rpki_insert(&self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
+        for shard in &self.shards {
+            shard.lock().await.insert_roa(roas.clone());
+        }
+    }
+
+    async fn rpki_reset(&self, addr: Arc<IpAddr>, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
+        for shard in &self.shards {
+            let mut t = shard.lock().await;
+            t.rpki_drop(addr.clone());
+            t.insert_roa(roas.clone());
+        }
+    }
+
+    async fn rpki_drop_all(&self, addr: Arc<IpAddr>) {
+        for shard in &self.shards {
+            shard.lock().await.rpki_drop(addr.clone());
+        }
     }
 
     /// Subscribe with full snapshot: sends all current routes as AdjRibIn events per shard,
@@ -3879,83 +3931,90 @@ impl TableShard {
         }
     }
 
-    fn event(
+    #[allow(clippy::too_many_arguments)]
+    fn pass_update(
         &mut self,
-        msg: TableEvent,
-        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        source: Arc<table::Source>,
+        family: Family,
+        nets: Vec<packet::PathNlri>,
+        attrs: Option<Arc<Vec<packet::Attribute>>>,
+        nexthop: Option<bgp::Nexthop>,
         import_policy: Option<&table::PolicyAssignment>,
+        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
         export_policy: Option<&table::PolicyAssignment>,
     ) {
-        match msg {
-            TableEvent::PassUpdate(source, family, nets, attrs, nexthop) => {
-                self.notify_adj_rib_in(source.clone(), family, &nets, attrs.as_ref(), nexthop);
-                self.send_mrt_update(&source, family, &nets, attrs.as_ref(), nexthop);
+        self.notify_adj_rib_in(source.clone(), family, &nets, attrs.as_ref(), nexthop);
+        self.send_mrt_update(&source, family, &nets, attrs.as_ref(), nexthop);
 
-                match attrs {
-                    Some(attrs) => {
-                        for net in nets {
-                            let mut nh = nexthop.unwrap();
-                            let filtered = crate::policy::apply_import(
-                                import_policy,
-                                &self.rtable,
-                                &source,
-                                &net.nlri,
-                                &attrs,
-                                &mut nh,
-                            );
-                            if let table::InsertResult::Changed(update) = self.rtable.insert(
-                                source.clone(),
-                                family,
-                                net.nlri,
-                                net.path_id,
-                                nh,
-                                attrs.clone(),
-                                filtered,
-                                None,
-                            ) {
-                                self.distribute_update(update, kernel_tx, export_policy);
-                            }
-                        }
-                    }
-                    None => {
-                        for net in nets {
-                            if let Some(update) = self.rtable.remove(
-                                source.clone(),
-                                family,
-                                net.nlri,
-                                net.path_id,
-                                None,
-                            ) {
-                                self.distribute_update(update, kernel_tx, export_policy);
-                            }
-                        }
+        match attrs {
+            Some(attrs) => {
+                for net in nets {
+                    let mut nh = nexthop.unwrap();
+                    let filtered = crate::policy::apply_import(
+                        import_policy,
+                        &self.rtable,
+                        &source,
+                        &net.nlri,
+                        &attrs,
+                        &mut nh,
+                    );
+                    if let table::InsertResult::Changed(update) = self.rtable.insert(
+                        source.clone(),
+                        family,
+                        net.nlri,
+                        net.path_id,
+                        nh,
+                        attrs.clone(),
+                        filtered,
+                        None,
+                    ) {
+                        self.distribute_update(update, kernel_tx, export_policy);
                     }
                 }
             }
-            TableEvent::Disconnected(addr, family) => {
-                for change in self.rtable.drop(addr, family) {
-                    self.distribute_update(change, kernel_tx, None);
+            None => {
+                for net in nets {
+                    if let Some(update) =
+                        self.rtable
+                            .remove(source.clone(), family, net.nlri, net.path_id, None)
+                    {
+                        self.distribute_update(update, kernel_tx, export_policy);
+                    }
                 }
-            }
-            TableEvent::DropStale(addr, family) => {
-                for change in self.rtable.drop_stale(addr, family, None) {
-                    self.distribute_update(change, kernel_tx, None);
-                }
-            }
-            TableEvent::EndDeferral(family) => {
-                for change in self.rtable.end_deferral(family) {
-                    self.distribute_update(change, kernel_tx, export_policy);
-                }
-            }
-            TableEvent::InsertRoa(v) => {
-                for (net, roa) in v {
-                    self.rtable.roa_insert(net, roa);
-                }
-            }
-            TableEvent::Drop(addr) => {
-                self.rtable.rpki_drop(addr);
             }
         }
+    }
+
+    fn drop_stale(
+        &mut self,
+        addr: IpAddr,
+        family: Family,
+        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+    ) {
+        for change in self.rtable.drop_stale(addr, family, None) {
+            self.distribute_update(change, kernel_tx, None);
+        }
+    }
+
+    fn end_deferral(
+        &mut self,
+        family: Family,
+        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        export_policy: Option<&table::PolicyAssignment>,
+    ) {
+        for change in self.rtable.end_deferral(family) {
+            self.distribute_update(change, kernel_tx, export_policy);
+        }
+    }
+
+    fn insert_roa(&mut self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
+        for (net, roa) in roas {
+            self.rtable.roa_insert(net, roa);
+        }
+    }
+
+    fn rpki_drop(&mut self, addr: Arc<IpAddr>) {
+        self.rtable.rpki_drop(addr);
     }
 }
 
@@ -4043,16 +4102,6 @@ fn gr_on_disconnect(
     if applies { Some(gr) } else { None }
 }
 
-async fn gr_drop_families(tables: &TableHandle, addr: IpAddr, families: &[Family]) {
-    for i in 0..tables.shards.len() {
-        for &family in families {
-            tables
-                .event(i, TableEvent::Disconnected(addr, family))
-                .await;
-        }
-    }
-}
-
 /// Apply outputs from [`crate::gr::RestartingDeferral::process`].
 ///
 /// Handles FamilyDeferralComplete and EndDeferral immediately.
@@ -4085,12 +4134,12 @@ async fn process_restarting_outputs(
     }
 
     if !complete_families.is_empty() {
-        gr_end_deferral_families(tables, &complete_families).await;
+        tables.end_deferral_families(&complete_families).await;
     }
 
     if let Some(remaining) = end_remaining {
         if !remaining.is_empty() {
-            gr_end_deferral_families(tables, &remaining).await;
+            tables.end_deferral_families(&remaining).await;
         }
         let mut server = global.write().await;
         if let Some(h) = server.selection_deferral_timer.take() {
@@ -4126,25 +4175,6 @@ async fn gr_selection_deferral_timer_expired(global: GlobalHandle, tables: Table
     let _ = process_restarting_outputs(outputs, &global, &tables).await;
 }
 
-/// Clear the deferral flag for each family across all shards and distribute
-/// the accumulated best paths to all connected peers.  Called when
-/// RestartingDeferral emits FamilyDeferralComplete or EndDeferral.
-async fn gr_end_deferral_families(tables: &TableHandle, families: &[Family]) {
-    for i in 0..tables.shards.len() {
-        for &family in families {
-            tables.event(i, TableEvent::EndDeferral(family)).await;
-        }
-    }
-}
-
-async fn gr_drop_stale_families(tables: &TableHandle, addr: IpAddr, families: &[Family]) {
-    for i in 0..tables.shards.len() {
-        for &family in families {
-            tables.event(i, TableEvent::DropStale(addr, family)).await;
-        }
-    }
-}
-
 fn collect_delete_families(outputs: &[crate::gr::GrOutput]) -> Vec<Family> {
     outputs
         .iter()
@@ -4171,7 +4201,7 @@ async fn gr_restart_timer_expired(
         collect_delete_families(&outputs)
     };
     if !families.is_empty() {
-        gr_drop_families(&tables, addr, &families).await;
+        tables.drop_families(addr, &families).await;
     }
 }
 
@@ -4853,12 +4883,9 @@ impl PeerSession {
                             collect_delete_families(&outputs)
                         };
                         if !delete_families.is_empty() {
-                            gr_drop_stale_families(
-                                &self.tables,
-                                self.remote_addr,
-                                &delete_families,
-                            )
-                            .await;
+                            self.tables
+                                .drop_stale_families(self.remote_addr, &delete_families)
+                                .await;
                         }
                     }
                 }
@@ -4887,7 +4914,8 @@ impl PeerSession {
                         collect_delete_families(&outputs)
                     };
                     if !delete_families.is_empty() {
-                        gr_drop_stale_families(&self.tables, self.remote_addr, &delete_families)
+                        self.tables
+                            .drop_stale_families(self.remote_addr, &delete_families)
                             .await;
                     }
                 }
@@ -6230,11 +6258,7 @@ mod tests {
         let session_families = vec![Family::IPV4, Family::IPV6];
         let drop_families =
             families_to_drop_on_disconnect(session_families.iter(), Some(&negotiated_gr));
-        for &family in &drop_families {
-            tables
-                .event(0, TableEvent::Disconnected(remote_addr, family))
-                .await;
-        }
+        tables.drop_families(remote_addr, &drop_families).await;
 
         let t = tables.shards[0].lock().await;
         // IPv4 route (GR family) must still be in the table.
@@ -6281,11 +6305,7 @@ mod tests {
         // No GR: all families dropped.
         let session_families = vec![Family::IPV4];
         let drop_families = families_to_drop_on_disconnect(session_families.iter(), None);
-        for &family in &drop_families {
-            tables
-                .event(0, TableEvent::Disconnected(remote_addr, family))
-                .await;
-        }
+        tables.drop_families(remote_addr, &drop_families).await;
 
         assert!(
             tables.shards[0]
