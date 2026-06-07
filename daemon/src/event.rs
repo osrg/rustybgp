@@ -3484,6 +3484,14 @@ impl TableManager {
         state
     }
 
+    async fn collect_best_paths(&self, family: Family) -> Vec<(packet::Nlri, Vec<table::Path>)> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(shard.lock().await.rtable.best_paths(&family));
+        }
+        out
+    }
+
     pub(crate) async fn collect_roa(&self, family: Family) -> Vec<(packet::IpNet, table::Roa)> {
         self.rpki
             .read()
@@ -4479,8 +4487,8 @@ impl PeerSession {
                         .and_then(|s| s.send_max().get(f))
                         .copied()
                         .unwrap_or(1);
-                    Self::populate_from_shard(
-                        rtable,
+                    Self::populate_from_paths(
+                        rtable.best_paths(f),
                         *f,
                         effective_max,
                         &export_policy,
@@ -4520,15 +4528,15 @@ impl PeerSession {
             .await;
     }
 
-    fn populate_from_shard(
-        rtable: &table::Table,
+    fn populate_from_paths(
+        paths: Vec<(packet::Nlri, Vec<table::Path>)>,
         family: Family,
         effective_max: usize,
         export_policy: &Option<Arc<table::PolicyAssignment>>,
         pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
         export_map: &mut ExportMap,
     ) {
-        for (net, paths) in rtable.best_paths(&family) {
+        for (net, paths) in paths {
             for path in paths.iter().take(effective_max) {
                 let mut nexthop = path.nexthop;
                 if export_policy.as_ref().is_some_and(|a| {
@@ -4570,17 +4578,15 @@ impl PeerSession {
             .and_then(|s| s.send_max().get(&family))
             .copied()
             .unwrap_or(1);
-        for i in 0..self.tables.shards.len() {
-            let t = self.tables.shards[i].lock().await;
-            Self::populate_from_shard(
-                &t.rtable,
-                family,
-                effective_max,
-                &export_policy,
-                &mut self.pending,
-                &mut self.export_map,
-            );
-        }
+        let paths = self.tables.collect_best_paths(family).await;
+        Self::populate_from_paths(
+            paths,
+            family,
+            effective_max,
+            &export_policy,
+            &mut self.pending,
+            &mut self.export_map,
+        );
         self.pending.get_mut(&family).unwrap().schedule_eor();
     }
 
