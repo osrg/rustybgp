@@ -36,13 +36,13 @@ use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::{Duration, Instant};
+use tokio::time::Duration;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_util::codec::{Encoder, Framed};
+use tokio_util::codec::Framed;
 
 use crate::api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
-use rustybgp_packet::{self as packet, BgpFramer, Family, HoldTime, bgp, bmp, mrt, rpki};
+use rustybgp_packet::{self as packet, BgpFramer, Family, HoldTime, bgp, bmp, rpki};
 
 use crate::api;
 use crate::auth;
@@ -2154,7 +2154,7 @@ impl GoBgpService for GrpcService {
         }
         let interval = request.rotation_interval;
         let filename = request.filename;
-        let mut d = MrtDumper::new(&filename, interval);
+        let mut d = crate::mrt::MrtDumper::new(&filename, interval);
         {
             let mut g = self.global.write().await;
             if !g.mrt_filenames.insert(filename.clone()) {
@@ -2338,120 +2338,6 @@ fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) 
             }
         }
     });
-}
-
-fn adj_rib_in_to_mrt(change: &AdjRibInChange) -> mrt::Message {
-    let header = mrt::MpHeader::new(
-        change.source.remote_asn,
-        change.source.local_asn,
-        0,
-        change.source.remote_addr,
-        change.source.local_addr,
-        true,
-    );
-    let body = if let Some(attrs) = &change.attrs {
-        bgp::Message::Update(bgp::Update {
-            reach: Some(packet::bgp::NlriSet {
-                family: change.family,
-                entries: change.nlris.clone(),
-            }),
-            mp_reach: None,
-            attr: attrs.clone(),
-            unreach: None,
-            mp_unreach: None,
-            nexthop: change.nexthop,
-        })
-    } else {
-        bgp::Message::Update(bgp::Update {
-            reach: None,
-            mp_reach: None,
-            attr: Arc::new(Vec::new()),
-            unreach: None,
-            mp_unreach: Some(packet::bgp::NlriSet {
-                family: change.family,
-                entries: change.nlris.clone(),
-            }),
-            nexthop: None,
-        })
-    };
-    mrt::Message::Mp {
-        header,
-        body,
-        addpath: change.addpath,
-    }
-}
-
-struct MrtDumper {
-    filename: String,
-    interval: u64,
-}
-
-impl MrtDumper {
-    fn new(filename: &str, interval: u64) -> Self {
-        MrtDumper {
-            filename: filename.to_string(),
-            interval,
-        }
-    }
-
-    fn pathname(&self) -> String {
-        if self.interval != 0 {
-            chrono::Local::now().format(&self.filename).to_string()
-        } else {
-            self.filename.clone()
-        }
-    }
-
-    async fn serve(
-        &mut self,
-        mut file: tokio::fs::File,
-        global: GlobalHandle,
-        tables: TableHandle,
-    ) -> Result<(), Error> {
-        let subscription = tables.subscribe_live().await;
-        let result = self.run_loop(&mut file, subscription.rx).await;
-        tables.unsubscribe(subscription.id).await;
-        global.write().await.mrt_filenames.remove(&self.filename);
-        result
-    }
-
-    async fn run_loop(
-        &self,
-        file: &mut tokio::fs::File,
-        rx: mpsc::UnboundedReceiver<BgpEvent>,
-    ) -> Result<(), Error> {
-        let mut codec = mrt::MrtCodec::new();
-        let mut rx = UnboundedReceiverStream::new(rx);
-        let interval = if self.interval == 0 {
-            60 * 24 * 60 * 365 * 100
-        } else {
-            self.interval
-        };
-        let start = Instant::now() + Duration::from_secs(interval);
-        let mut timer = tokio::time::interval_at(start, Duration::from_secs(interval));
-        loop {
-            tokio::select! {
-                event = rx.next() => {
-                    match event {
-                        Some(BgpEvent::AdjRibIn(change)) => {
-                            let msg = adj_rib_in_to_mrt(&change);
-                            let mut buf = bytes::BytesMut::with_capacity(8192);
-                            codec.encode(&msg, &mut buf)?;
-                            file.write_all(&buf).await?;
-                        }
-                        Some(BgpEvent::PeerUp(_)) | Some(BgpEvent::PeerDown(_)) => {}
-                        None => return Ok(()),
-                    }
-                }
-                _ = timer.tick().fuse() => {
-                    if self.interval != 0 {
-                        *file = tokio::fs::File::create(std::path::Path::new(&self.pathname()))
-                            .await?;
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[derive(Default)]
@@ -2712,7 +2598,7 @@ pub(crate) struct Global {
 
     rpki_clients: FnvHashMap<SocketAddr, RpkiClient>,
     pub(crate) bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
-    mrt_filenames: FnvHashSet<String>,
+    pub(crate) mrt_filenames: FnvHashSet<String>,
 
     /// Selection Deferral state machine for the Restarting Speaker (RFC 4724 §4.1).
     /// Present only when the daemon started with --graceful-restart.
@@ -2982,7 +2868,7 @@ impl Global {
                         }
                         let interval = config.rotation_interval.as_ref().map_or(0, |x| *x);
                         let filename = filename.clone();
-                        let mut d = MrtDumper::new(&filename, interval);
+                        let mut d = crate::mrt::MrtDumper::new(&filename, interval);
                         match tokio::fs::File::create(std::path::Path::new(&d.pathname())).await {
                             Ok(file) => {
                                 let global2 = global.clone();
@@ -3641,8 +3527,8 @@ impl TableManager {
         Subscription { rx, id }
     }
 
-    /// Subscribe for live events only (no snapshot). Used by watch_event gRPC.
-    async fn subscribe_live(&self) -> Subscription {
+    /// Subscribe for live events only (no snapshot). Used by watch_event gRPC and MRT.
+    pub(crate) async fn subscribe_live(&self) -> Subscription {
         let id = SubscriptionId(
             self.next_sub_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
