@@ -2813,36 +2813,21 @@ async fn accept_connection(
             crate::fsm::Role::Passive => arb.passive_close_tx = Some(close_tx),
         }
     }
-    let mut session = PeerSession::new(
-        stream,
-        remote_addr,
-        peer.config.local_asn,
-        peer.config.local_cap.to_owned(),
+    let res = PeerResources {
+        local_asn: peer.config.local_asn,
+        local_cap: peer.config.local_cap.to_owned(),
         is_restarting,
-        peer.config.route_server_client,
-        role,
-        conn_arbiter,
-        Some(close_rx),
-        peer.state.clone(),
-        peer.counter_tx.clone(),
-        peer.counter_rx.clone(),
-        tables.clone(),
+        rs_client: peer.config.route_server_client,
+        prefix_limits: peer.config.prefix_limits.clone(),
+        state: peer.state.clone(),
+        counter_tx: peer.counter_tx.clone(),
+        counter_rx: peer.counter_rx.clone(),
+        tables: tables.clone(),
         export_map,
         context,
-    )?;
-    // Initialize per-family prefix counters from config.
-    session.prefix_counters = peer
-        .config
-        .prefix_limits
-        .iter()
-        .map(|(family, max)| {
-            (
-                *family,
-                (*max, Arc::new(std::sync::atomic::AtomicU64::new(0))),
-            )
-        })
-        .collect();
-    Some(session)
+        conn_arbiter,
+    };
+    PeerSession::new(stream, remote_addr, role, Some(close_rx), res)
 }
 
 impl Global {
@@ -3559,6 +3544,29 @@ impl ExportMap {
     }
 }
 
+/// Shared resources passed to `PeerSession::new()`.
+///
+/// Bundles the peer-level objects that come from `Peer` and `Global` so that
+/// the session constructor does not need a long argument list.  Constructed as
+/// a struct literal in `accept_connection` where all fields are already at hand.
+struct PeerResources {
+    local_asn: u32,
+    local_cap: Vec<packet::Capability>,
+    /// See `PeerSession::is_restarting`.
+    is_restarting: bool,
+    rs_client: bool,
+    /// Per-family prefix limits from `PeerConfig`; used to initialise
+    /// `PeerSession::prefix_counters` inside `new()`.
+    prefix_limits: FnvHashMap<Family, u32>,
+    state: Arc<PeerState>,
+    counter_tx: Arc<MessageCounter>,
+    counter_rx: Arc<MessageCounter>,
+    tables: TableHandle,
+    export_map: ExportMap,
+    context: Arc<std::sync::Mutex<PeerContext>>,
+    conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
+}
+
 /// I/O driver for one TCP connection (one BGP session).
 ///
 /// Lifetime: a single BGP session — from `accept_connection` until the TCP
@@ -3618,23 +3626,12 @@ struct PeerSession {
 }
 
 impl PeerSession {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         stream: TcpStream,
         remote_addr: IpAddr,
-        local_asn: u32,
-        local_cap: Vec<packet::Capability>,
-        is_restarting: bool,
-        rs_client: bool,
         role: crate::fsm::Role,
-        conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
         close_rx: Option<tokio::sync::oneshot::Receiver<CloseReason>>,
-        state: Arc<PeerState>,
-        counter_tx: Arc<MessageCounter>,
-        counter_rx: Arc<MessageCounter>,
-        tables: TableHandle,
-        export_map: ExportMap,
-        context: Arc<std::sync::Mutex<PeerContext>>,
+        res: PeerResources,
     ) -> Option<Self> {
         let local_sockaddr = stream.local_addr().ok()?;
         let local_addr = local_sockaddr.ip();
@@ -3648,37 +3645,48 @@ impl PeerSession {
         }
 
         let mut builder = bgp::PeerCodecBuilder::new();
-        builder.local_asn(local_asn).local_addr(local_addr);
+        builder.local_asn(res.local_asn).local_addr(local_addr);
         if let Some(ll) = link_addr {
             builder.link_addr(ll);
         }
-        if rs_client {
+        if res.rs_client {
             builder.keep_aspath(true).keep_nexthop(true);
         }
         let framer = BgpFramer::new(builder.build());
 
+        let prefix_counters = res
+            .prefix_limits
+            .iter()
+            .map(|(family, max)| {
+                (
+                    *family,
+                    (*max, Arc::new(std::sync::atomic::AtomicU64::new(0))),
+                )
+            })
+            .collect();
+
         Some(PeerSession {
             remote_addr,
             local_addr,
-            local_asn,
-            state,
-            counter_tx,
-            counter_rx,
-            local_cap,
-            is_restarting,
-            rs_client,
-            conn_arbiter,
+            local_asn: res.local_asn,
+            state: res.state,
+            counter_tx: res.counter_tx,
+            counter_rx: res.counter_rx,
+            local_cap: res.local_cap,
+            is_restarting: res.is_restarting,
+            rs_client: res.rs_client,
+            conn_arbiter: res.conn_arbiter,
             role,
             close_rx,
             stream: Some(stream),
             source: FnvHashMap::default(),
             peer_event_rx: None,
             shutdown: None,
-            tables,
-            export_map,
-            prefix_counters: FnvHashMap::default(),
+            tables: res.tables,
+            export_map: res.export_map,
+            prefix_counters,
             negotiated_gr: None,
-            context,
+            context: res.context,
             urgent: Vec::new(),
             framer,
             keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
