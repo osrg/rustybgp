@@ -1662,26 +1662,15 @@ impl GoBgpService for GrpcService {
             .filter_map(|x| x.ok())
             .collect();
 
-        let mut v = Vec::new();
-        let pa = if table_type == table::TableType::AdjOut {
-            self.tables.export_policy.load_full()
-        } else {
-            None
-        };
-        for i in 0..self.tables.shards.len() {
-            let t = self.tables.shards[i].lock().await;
-            for d in t.rtable.iter_destinations(
-                table_type,
-                family,
-                peer_addr,
-                prefixes.clone(),
-                pa.clone(),
-            ) {
-                v.push(api::ListPathResponse {
-                    destination: Some(convert::destination_to_api(d, family)),
-                });
-            }
-        }
+        let v: Vec<_> = self
+            .tables
+            .collect_paths(table_type, family, peer_addr, prefixes)
+            .await
+            .into_iter()
+            .map(|d| api::ListPathResponse {
+                destination: Some(convert::destination_to_api(d, family)),
+            })
+            .collect();
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(async move {
             for r in v {
@@ -3488,6 +3477,32 @@ impl TableManager {
         for shard in &self.shards {
             shard.lock().await.rpki_drop(addr.clone());
         }
+    }
+
+    pub(crate) async fn collect_paths(
+        &self,
+        table_type: table::TableType,
+        family: Family,
+        peer_addr: Option<IpAddr>,
+        prefixes: Vec<packet::Nlri>,
+    ) -> Vec<table::DestinationEntry> {
+        let export_policy = if table_type == table::TableType::AdjOut {
+            self.export_policy.load_full()
+        } else {
+            None
+        };
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let t = shard.lock().await;
+            out.extend(t.rtable.iter_destinations(
+                table_type,
+                family,
+                peer_addr,
+                prefixes.clone(),
+                export_policy.clone(),
+            ));
+        }
+        out
     }
 
     /// Subscribe with snapshot: calls `on_change` for each current route (per shard, under lock),
