@@ -134,6 +134,46 @@ fn adj_rib_in_to_bmp_update(change: &AdjRibInChange) -> bgp::Message {
     }
 }
 
+/// Records that a PeerUp was sent for `addr`.
+fn track_peer_up(sent: &mut FnvHashSet<IpAddr>, addr: IpAddr) {
+    sent.insert(addr);
+}
+
+/// Returns true if a PeerDown should be forwarded (a PeerUp was sent for `addr`).
+/// Removes `addr` from the tracking set so a second PeerDown is suppressed.
+fn track_peer_down(sent: &mut FnvHashSet<IpAddr>, addr: IpAddr) -> bool {
+    sent.remove(&addr)
+}
+
+/// Sends a PeerUp message and records the peer in `sent`.
+/// Returns false if the connection is broken.
+async fn send_peer_up(
+    sent: &mut FnvHashSet<IpAddr>,
+    lines: &mut Framed<TcpStream, bmp::BmpCodec>,
+    addr: IpAddr,
+    msg: &bmp::Message,
+) -> bool {
+    if lines.send(msg).await.is_err() {
+        return false;
+    }
+    track_peer_up(sent, addr);
+    true
+}
+
+/// Sends a PeerDown message only if a PeerUp was previously sent for `addr`.
+/// Returns false if the connection is broken.
+async fn send_peer_down(
+    sent: &mut FnvHashSet<IpAddr>,
+    lines: &mut Framed<TcpStream, bmp::BmpCodec>,
+    addr: IpAddr,
+    msg: &bmp::Message,
+) -> bool {
+    if !track_peer_down(sent, addr) {
+        return true;
+    }
+    lines.send(msg).await.is_ok()
+}
+
 /// Convert a `SessionDownReason` to the BMP `PeerDownReason` encoding.
 pub(crate) fn session_down_to_bmp(
     reason: Option<crate::fsm::SessionDownReason>,
@@ -221,14 +261,15 @@ impl BmpClient {
 
         // Send PeerUp for all established peers.
         let local_id = global.read().await.router_id;
+        let mut sent_peer_up: FnvHashSet<IpAddr> = FnvHashSet::default();
         let mut established_peers: Vec<(IpAddr, bmp::PerPeerHeader)> = Vec::new();
         for peer in global.read().await.peers.values() {
             if let Some((addr, peer_header, msg)) = peer.bmp_peer_up(local_id) {
-                established_peers.push((addr, peer_header));
-                if lines.send(&msg).await.is_err() {
+                if !send_peer_up(&mut sent_peer_up, &mut lines, addr, &msg).await {
                     tables.unsubscribe(subscription.id).await;
                     return;
                 }
+                established_peers.push((addr, peer_header));
             }
         }
 
@@ -290,7 +331,9 @@ impl BmpClient {
                                 remote_open: data.received_open,
                                 local_open: data.sent_open,
                             };
-                            if lines.send(&m).await.is_err() {
+                            if !send_peer_up(&mut sent_peer_up, &mut lines, data.peer_addr, &m)
+                                .await
+                            {
                                 break;
                             }
                         }
@@ -305,7 +348,9 @@ impl BmpClient {
                                 ),
                                 reason: data.reason,
                             };
-                            if lines.send(&m).await.is_err() {
+                            if !send_peer_down(&mut sent_peer_up, &mut lines, data.peer_addr, &m)
+                                .await
+                            {
                                 break;
                             }
                         }
@@ -551,6 +596,54 @@ mod tests {
 
         // 2 RouteMonitoring + 2 EoR (one per family)
         assert_eq!(msgs.len(), 4);
+    }
+
+    // ---- track_peer_up / track_peer_down (Race 2 guard) ----
+
+    #[test]
+    fn peer_down_without_prior_peer_up_is_suppressed() {
+        let mut sent: FnvHashSet<IpAddr> = FnvHashSet::default();
+        let addr: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(!track_peer_down(&mut sent, addr));
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn peer_up_enables_peer_down() {
+        let mut sent: FnvHashSet<IpAddr> = FnvHashSet::default();
+        let addr: IpAddr = "10.0.0.1".parse().unwrap();
+        track_peer_up(&mut sent, addr);
+        assert!(track_peer_down(&mut sent, addr));
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn second_peer_down_after_first_is_suppressed() {
+        let mut sent: FnvHashSet<IpAddr> = FnvHashSet::default();
+        let addr: IpAddr = "10.0.0.1".parse().unwrap();
+        track_peer_up(&mut sent, addr);
+        assert!(track_peer_down(&mut sent, addr));
+        assert!(!track_peer_down(&mut sent, addr));
+    }
+
+    #[test]
+    fn peer_reconnect_restores_peer_down_forwarding() {
+        let mut sent: FnvHashSet<IpAddr> = FnvHashSet::default();
+        let addr: IpAddr = "10.0.0.1".parse().unwrap();
+        track_peer_up(&mut sent, addr);
+        assert!(track_peer_down(&mut sent, addr));
+        track_peer_up(&mut sent, addr);
+        assert!(track_peer_down(&mut sent, addr));
+    }
+
+    #[test]
+    fn peer_down_tracking_is_per_peer() {
+        let mut sent: FnvHashSet<IpAddr> = FnvHashSet::default();
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        track_peer_up(&mut sent, a);
+        assert!(!track_peer_down(&mut sent, b));
+        assert!(track_peer_down(&mut sent, a));
     }
 
     // ---- session_down_to_bmp ----
