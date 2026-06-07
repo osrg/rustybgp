@@ -2797,13 +2797,10 @@ async fn accept_connection(
         let _ = stream.set_ttl(1);
     }
     let context = Arc::clone(&peer.context);
-    let conn_arbiter = {
-        let ctx = peer.context.lock().unwrap();
-        Arc::clone(&ctx.conn_arbiter)
-    };
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<CloseReason>();
     {
-        let mut arb = conn_arbiter.lock().unwrap();
+        let ctx = context.lock().unwrap();
+        let mut arb = ctx.conn_arbiter.lock().unwrap();
         match role {
             crate::fsm::Role::Active => arb.active_close_tx = Some(close_tx),
             crate::fsm::Role::Passive => arb.passive_close_tx = Some(close_tx),
@@ -2820,7 +2817,6 @@ async fn accept_connection(
         counter_rx: peer.counter_rx.clone(),
         tables: tables.clone(),
         context,
-        conn_arbiter,
     };
     PeerSession::new(stream, remote_addr, role, Some(close_rx), res)
 }
@@ -3558,7 +3554,6 @@ struct PeerResources {
     counter_rx: Arc<MessageCounter>,
     tables: TableHandle,
     context: Arc<std::sync::Mutex<PeerContext>>,
-    conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
 }
 
 /// I/O driver for one TCP connection (one BGP session).
@@ -3659,6 +3654,8 @@ impl PeerSession {
             })
             .collect();
 
+        let conn_arbiter = Arc::clone(&res.context.lock().unwrap().conn_arbiter);
+
         Some(PeerSession {
             remote_addr,
             local_addr,
@@ -3669,7 +3666,7 @@ impl PeerSession {
             local_cap: res.local_cap,
             is_restarting: res.is_restarting,
             rs_client: res.rs_client,
-            conn_arbiter: res.conn_arbiter,
+            conn_arbiter,
             role,
             close_rx,
             stream: Some(stream),
