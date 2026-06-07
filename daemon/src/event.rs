@@ -467,7 +467,7 @@ impl PeerParams {
     /// `local_router_id` is needed to construct `PeerFsm` for collision
     /// detection; it is only known once `Global::router_id` is set, so callers
     /// always go through `Global::add_peer` rather than calling this directly.
-    fn build(mut self, local_router_id: u32, global_asn: u32, is_restarting: bool) -> Peer {
+    fn build(mut self, local_router_id: u32, global_asn: u32) -> Peer {
         if self.local_asn == 0 {
             self.local_asn = global_asn;
         }
@@ -504,10 +504,10 @@ impl PeerParams {
             }
         }
         if let Some(gr) = &self.graceful_restart {
-            // R-bit (0x8): local speaker is currently restarting (RFC 4724).
             // N-bit (0x4): supports GR for NOTIFICATION and Hold Timer (RFC 8538).
-            let flags =
-                if is_restarting { 0x8 } else { 0 } | if gr.notification_enabled { 0x4 } else { 0 };
+            // R-bit (0x8) is NOT set here; it is applied at connection time in
+            // PeerFsm::on_connected() based on the current global restarting state.
+            let flags = if gr.notification_enabled { 0x4 } else { 0 };
             local_cap.push(packet::Capability::GracefulRestart {
                 flags,
                 restart_time: gr.restart_time,
@@ -1187,10 +1187,6 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddPeerRequest>,
     ) -> Result<tonic::Response<api::AddPeerResponse>, tonic::Status> {
         let api_peer = request.into_inner().peer.ok_or(Error::EmptyArgument)?;
-        let is_restarting = api_peer
-            .graceful_restart
-            .as_ref()
-            .is_some_and(|gr| gr.local_restarting);
         let params = PeerParams::try_from(&api_peer)?;
         let mut global = self.global.write().await;
         if let Some(password) = params.password.as_ref() {
@@ -1198,7 +1194,7 @@ impl GoBgpService for GrpcService {
                 auth::set_md5sig(*fd, &params.remote_addr, password);
             }
         }
-        global.add_peer(params, Some(self.active_conn_tx.clone()), is_restarting)?;
+        global.add_peer(params, Some(self.active_conn_tx.clone()))?;
         Ok(tonic::Response::new(api::AddPeerResponse {}))
     }
     async fn delete_peer(
@@ -2686,14 +2682,13 @@ impl Global {
         &mut self,
         params: PeerParams,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
-        is_restarting: bool,
     ) -> std::result::Result<(), Error> {
         if self.peers.contains_key(&params.remote_addr) {
             return Err(Error::AlreadyExists(
                 "peer address already exists".to_string(),
             ));
         }
-        let mut peer = params.build(u32::from(self.router_id), self.asn, is_restarting);
+        let mut peer = params.build(u32::from(self.router_id), self.asn);
         if peer.admin_down {
             peer.state
                 .fsm
@@ -2717,6 +2712,7 @@ async fn accept_connection(
     let remote_sockaddr = stream.peer_addr().ok()?;
     let remote_addr = remote_sockaddr.ip();
     let mut g = global.write().await;
+    let is_restarting = g.selection_deferral.is_some();
     let peer = match g.peers.get_mut(&remote_addr) {
         Some(peer) => {
             if peer.admin_down {
@@ -2791,7 +2787,6 @@ async fn accept_connection(
                     graceful_restart: None,
                 },
                 None,
-                false,
             );
             g.peers.get_mut(&remote_addr).unwrap()
         }
@@ -2823,6 +2818,7 @@ async fn accept_connection(
         remote_addr,
         peer.config.local_asn,
         peer.config.local_cap.to_owned(),
+        is_restarting,
         peer.config.route_server_client,
         role,
         conn_arbiter,
@@ -3129,9 +3125,7 @@ impl Global {
             for p in peers {
                 match PeerParams::try_from(p) {
                     Ok(params) => {
-                        if let Err(e) =
-                            server.add_peer(params, Some(active_tx.clone()), is_restarting)
-                        {
+                        if let Err(e) = server.add_peer(params, Some(active_tx.clone())) {
                             eprintln!("failed to add peer from config: {}", e);
                         }
                     }
@@ -3419,15 +3413,9 @@ async fn process_restarting_outputs(
             h.abort();
         }
         server.selection_deferral = None;
-        // Clear the Restart State (R) bit so future OPENs no longer
-        // advertise the restarting-speaker state.
-        for peer in server.peers.values_mut() {
-            for cap in &mut peer.config.local_cap {
-                if let packet::Capability::GracefulRestart { flags, .. } = cap {
-                    *flags &= !0x8;
-                }
-            }
-        }
+        // R-bit is no longer stored in peer config; it is derived from
+        // selection_deferral.is_some() at connection time (PeerFsm::on_connected).
+        // Setting selection_deferral = None is sufficient.
         println!("graceful-restart: all peers sent EOR; cleared restarting state");
     }
 
@@ -3591,6 +3579,10 @@ struct PeerSession {
     counter_rx: Arc<MessageCounter>,
 
     local_cap: Vec<packet::Capability>,
+    /// True if the local router is the restarting speaker at session creation
+    /// time (i.e., Global::selection_deferral was Some when the session was
+    /// constructed).  Used to set the R-bit in the GR capability of the OPEN.
+    is_restarting: bool,
 
     rs_client: bool,
 
@@ -3632,6 +3624,7 @@ impl PeerSession {
         remote_addr: IpAddr,
         local_asn: u32,
         local_cap: Vec<packet::Capability>,
+        is_restarting: bool,
         rs_client: bool,
         role: crate::fsm::Role,
         conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
@@ -3672,6 +3665,7 @@ impl PeerSession {
             counter_tx,
             counter_rx,
             local_cap,
+            is_restarting,
             rs_client,
             conn_arbiter,
             role,
@@ -3739,6 +3733,7 @@ impl PeerSession {
             counter_tx: Default::default(),
             counter_rx: Default::default(),
             local_cap: vec![],
+            is_restarting: false,
             rs_client: false,
             conn_arbiter,
             role: crate::fsm::Role::Passive,
@@ -4450,7 +4445,7 @@ impl PeerSession {
             .conn_arbiter
             .lock()
             .unwrap()
-            .process(self.role, crate::fsm::Input::Connected);
+            .process(self.role, crate::fsm::Input::Connected(self.is_restarting));
         let effects = self
             .apply_outputs(outputs, local_sockaddr, remote_sockaddr)
             .await;
@@ -4862,8 +4857,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr), None, false)
-                .unwrap();
+            g.add_peer(default_peer_params(remote_addr), None).unwrap();
         }
 
         let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
@@ -4896,8 +4890,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr), None, false)
-                .unwrap();
+            g.add_peer(default_peer_params(remote_addr), None).unwrap();
         }
 
         let h = accept_connection(&global, &tables, server, crate::fsm::Role::Active).await;
@@ -4932,7 +4925,6 @@ mod tests {
                     ..default_peer_params(remote_addr)
                 },
                 None,
-                false,
             )
             .unwrap();
         }
@@ -4950,8 +4942,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr), None, false)
-                .unwrap();
+            g.add_peer(default_peer_params(remote_addr), None).unwrap();
             let (tx, _rx) = tokio::sync::oneshot::channel::<CloseReason>();
             g.peers
                 .get_mut(&remote_addr)
@@ -5027,8 +5018,7 @@ mod tests {
     ) -> PeerSession {
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr), None, false)
-                .unwrap();
+            g.add_peer(default_peer_params(remote_addr), None).unwrap();
         }
         accept_connection(global, tables, server, crate::fsm::Role::Passive)
             .await
@@ -5051,7 +5041,10 @@ mod tests {
                 capability: vec![],
             });
             let mut arb = conn.conn_arbiter.lock().unwrap();
-            arb.process(crate::fsm::Role::Passive, crate::fsm::Input::Connected);
+            arb.process(
+                crate::fsm::Role::Passive,
+                crate::fsm::Input::Connected(false),
+            );
             arb.process(
                 crate::fsm::Role::Passive,
                 crate::fsm::Input::MessageReceived(open),
@@ -5293,13 +5286,19 @@ mod tests {
         {
             let mut arb = conn_arbiter.lock().unwrap();
             // Active → OpenConfirm
-            arb.process(crate::fsm::Role::Active, crate::fsm::Input::Connected);
+            arb.process(
+                crate::fsm::Role::Active,
+                crate::fsm::Input::Connected(false),
+            );
             arb.process(
                 crate::fsm::Role::Active,
                 crate::fsm::Input::MessageReceived(open_msg.clone()),
             );
             // Passive → OpenConfirm → collision detected → CEASE sent directly to active_close_tx
-            arb.process(crate::fsm::Role::Passive, crate::fsm::Input::Connected);
+            arb.process(
+                crate::fsm::Role::Passive,
+                crate::fsm::Input::Connected(false),
+            );
             arb.process(
                 crate::fsm::Role::Passive,
                 crate::fsm::Input::MessageReceived(open_msg),
@@ -5636,8 +5635,7 @@ mod tests {
 
         {
             let mut g = global.write().await;
-            g.add_peer(default_peer_params(remote_addr), None, false)
-                .unwrap();
+            g.add_peer(default_peer_params(remote_addr), None).unwrap();
         }
 
         let session = accept_connection(&global, &tables, server, crate::fsm::Role::Passive)

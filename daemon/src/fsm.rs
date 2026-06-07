@@ -67,7 +67,9 @@ impl TryFrom<u8> for State {
 /// Events fed into the session FSM.
 pub(crate) enum Input {
     /// TCP connection established; start the OPEN exchange.
-    Connected,
+    /// The bool indicates whether the local speaker is currently the restarting
+    /// speaker (R-bit in the GR capability of the OPEN).
+    Connected(bool),
     /// A complete BGP message was received from the peer.
     MessageReceived(bgp::Message),
     /// The keepalive timer fired (send direction: we may need to send KEEPALIVE).
@@ -194,7 +196,7 @@ impl Connection {
     /// Process an input event and return actions for the I/O driver.
     pub(crate) fn process(&mut self, input: Input) -> Vec<Output> {
         match input {
-            Input::Connected => self.on_connected(),
+            Input::Connected(_) => self.on_connected(),
             Input::MessageReceived(msg) => self.on_message(msg),
             Input::KeepaliveTimerExpired => self.on_keepalive_timer_expired(),
             Input::HoldTimerExpired => self.on_hold_timer_expired(),
@@ -503,8 +505,8 @@ impl PeerFsm {
     /// Includes collision detection: if both Connections reach OpenConfirm,
     /// the loser is sent a CEASE notification and closed.
     pub(crate) fn process(&mut self, role: Role, input: Input) -> Vec<PeerFsmOutput> {
-        if matches!(input, Input::Connected) {
-            return self.on_connected(role);
+        if let Input::Connected(is_restarting) = input {
+            return self.on_connected(role, is_restarting);
         }
         let Some(session) = self.connection_mut(role) else {
             return Vec::new();
@@ -541,7 +543,7 @@ impl PeerFsm {
     /// Handle a new TCP connection for the given role.
     /// Creates a Connection and starts the OPEN exchange, or returns CloseConnection
     /// if a Connection for this role already exists.
-    fn on_connected(&mut self, role: Role) -> Vec<PeerFsmOutput> {
+    fn on_connected(&mut self, role: Role, is_restarting: bool) -> Vec<PeerFsmOutput> {
         let slot = match role {
             Role::Active => &mut self.active,
             Role::Passive => &mut self.passive,
@@ -549,15 +551,41 @@ impl PeerFsm {
         if slot.is_some() {
             return vec![PeerFsmOutput::CloseConnection];
         }
+        // Apply R-bit (0x8) to the GR capability when the local speaker is
+        // the restarting speaker.  local_cap stores caps without R-bit so that
+        // no mutation is needed when recovery completes.
+        let effective_cap = if is_restarting {
+            self.local_cap
+                .iter()
+                .map(|c| {
+                    if let Capability::GracefulRestart {
+                        flags,
+                        restart_time,
+                        families,
+                    } = c
+                    {
+                        Capability::GracefulRestart {
+                            flags: flags | 0x8,
+                            restart_time: *restart_time,
+                            families: families.clone(),
+                        }
+                    } else {
+                        c.clone()
+                    }
+                })
+                .collect()
+        } else {
+            self.local_cap.clone()
+        };
         *slot = Some(Connection::new(
             self.local_asn,
             self.local_router_id,
-            self.local_cap.clone(),
+            effective_cap,
             self.local_holdtime,
             self.expected_remote_asn,
             self.send_max.clone(),
         ));
-        let outputs = slot.as_mut().unwrap().process(Input::Connected);
+        let outputs = slot.as_mut().unwrap().process(Input::Connected(false));
         outputs
             .into_iter()
             .map(|o| PeerFsmOutput::Connection(role, o))
@@ -653,7 +681,7 @@ mod tests {
         let mut s = basic_connection();
         assert_eq!(s.state(), State::Idle);
 
-        let out = s.process(Input::Connected);
+        let out = s.process(Input::Connected(false));
         assert_eq!(s.state(), State::OpenSent);
         assert!(has_output(&out, |o| matches!(
             o,
@@ -668,7 +696,7 @@ mod tests {
     #[test]
     fn open_exchange_reaches_established() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         assert_eq!(s.state(), State::OpenSent);
 
         // Receive remote OPEN
@@ -712,7 +740,7 @@ mod tests {
     #[test]
     fn asn_mismatch_sends_notification() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
 
         let out = s.process(Input::MessageReceived(remote_open(
             65099,
@@ -729,7 +757,7 @@ mod tests {
     #[test]
     fn open_in_unexpected_state_sends_fsm_error() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         let _ = s.process(Input::MessageReceived(remote_open(
             65002,
             remote_router_id(),
@@ -764,7 +792,7 @@ mod tests {
             0, // accept any
             FnvHashMap::default(),
         );
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
 
         let out = s.process(Input::MessageReceived(remote_open(
             65099,
@@ -778,7 +806,7 @@ mod tests {
     #[test]
     fn holdtime_negotiation_uses_minimum() {
         let mut s = basic_connection(); // local_holdtime = 90
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
 
         let _ = s.process(Input::MessageReceived(remote_open(
             65002,
@@ -791,7 +819,7 @@ mod tests {
     #[test]
     fn holdtimer_expiry_shuts_down() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         let _ = s.process(Input::MessageReceived(remote_open(
             65002,
             remote_router_id(),
@@ -810,7 +838,7 @@ mod tests {
     #[test]
     fn connected_starts_initial_hold_timer() {
         let mut s = basic_connection();
-        let out = s.process(Input::Connected);
+        let out = s.process(Input::Connected(false));
         assert!(has_output(&out, |o| matches!(
             o,
             Output::SetHoldTimer(INITIAL_HOLD_SECS)
@@ -820,7 +848,7 @@ mod tests {
     #[test]
     fn hold_timer_expired_in_open_sent_shuts_down() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         let out = s.process(Input::HoldTimerExpired);
         assert!(has_output(&out, |o| matches!(
             o,
@@ -831,7 +859,7 @@ mod tests {
     #[test]
     fn keepalive_timer_expired_sends_keepalive_and_rearms() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         let _ = s.process(Input::MessageReceived(remote_open(
             65002,
             remote_router_id(),
@@ -854,7 +882,7 @@ mod tests {
     #[test]
     fn keepalive_timer_expired_in_established_sends_keepalive_and_rearms() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         let _ = s.process(Input::MessageReceived(remote_open(
             65002,
             remote_router_id(),
@@ -889,7 +917,7 @@ mod tests {
     #[test]
     fn keepalive_in_established_resets_hold_timer() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         let _ = s.process(Input::MessageReceived(remote_open(
             65002,
             remote_router_id(),
@@ -907,7 +935,7 @@ mod tests {
     #[test]
     fn update_in_established_resets_hold_timer() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         let _ = s.process(Input::MessageReceived(remote_open(
             65002,
             remote_router_id(),
@@ -943,7 +971,7 @@ mod tests {
     #[test]
     fn keepalive_in_unexpected_state_sends_fsm_error() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         // State is now OpenSent — KEEPALIVE before OPEN is an FSM error
         let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
         assert!(has_output(&out, |o| matches!(
@@ -959,7 +987,7 @@ mod tests {
     #[test]
     fn route_refresh_in_established_triggers_readvertise() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         let _ = s.process(Input::MessageReceived(remote_open(
             65002,
             remote_router_id(),
@@ -981,7 +1009,7 @@ mod tests {
     #[test]
     fn route_refresh_in_non_established_sends_fsm_error() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         // State is OpenSent
         let out = s.process(Input::MessageReceived(bgp::Message::RouteRefresh {
             family: Family::IPV4,
@@ -999,7 +1027,7 @@ mod tests {
     #[test]
     fn notification_received_shuts_down() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
 
         let notif = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
             code: 6,
@@ -1016,7 +1044,7 @@ mod tests {
     #[test]
     fn update_in_non_established_shuts_down() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         assert_eq!(s.state(), State::OpenSent);
 
         let update = bgp::Message::Update(bgp::Update {
@@ -1034,7 +1062,7 @@ mod tests {
     #[test]
     fn update_sent_in_established_resets_keepalive_timer() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         let _ = s.process(Input::MessageReceived(remote_open(
             65002,
             remote_router_id(),
@@ -1053,7 +1081,7 @@ mod tests {
     #[test]
     fn update_sent_in_non_established_is_noop() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
         assert_eq!(s.state(), State::OpenSent);
 
         let out = s.process(Input::UpdateSent);
@@ -1063,7 +1091,7 @@ mod tests {
     #[test]
     fn admin_shutdown_sends_cease() {
         let mut s = basic_connection();
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
 
         let out = s.process(Input::AdminShutdown);
         assert!(has_output(&out, |o| matches!(
@@ -1086,7 +1114,7 @@ mod tests {
             65002,
             FnvHashMap::default(),
         );
-        let _ = s.process(Input::Connected);
+        let _ = s.process(Input::Connected(false));
 
         let out = s.process(Input::MessageReceived(remote_open(
             65002,
@@ -1115,7 +1143,7 @@ mod tests {
     }
 
     fn connect(peer: &mut PeerFsm, role: Role) -> Vec<PeerFsmOutput> {
-        peer.process(role, Input::Connected)
+        peer.process(role, Input::Connected(false))
     }
 
     fn remote_open_msg(asn: u32, router_id: u32) -> bgp::Message {
@@ -1486,7 +1514,7 @@ mod tests {
         assert!(peer.connection(Role::Active).is_none());
 
         // Reconnect succeeds: OPEN is sent, no CloseConnection.
-        let out = peer.process(Role::Active, Input::Connected);
+        let out = peer.process(Role::Active, Input::Connected(false));
         assert!(!has_peer_output(&out, |o| matches!(
             o,
             PeerFsmOutput::CloseConnection
