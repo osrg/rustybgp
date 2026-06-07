@@ -2340,6 +2340,47 @@ fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) 
     });
 }
 
+fn adj_rib_in_to_mrt(change: &AdjRibInChange) -> mrt::Message {
+    let header = mrt::MpHeader::new(
+        change.source.remote_asn,
+        change.source.local_asn,
+        0,
+        change.source.remote_addr,
+        change.source.local_addr,
+        true,
+    );
+    let body = if let Some(attrs) = &change.attrs {
+        bgp::Message::Update(bgp::Update {
+            reach: Some(packet::bgp::NlriSet {
+                family: change.family,
+                entries: change.nlris.clone(),
+            }),
+            mp_reach: None,
+            attr: attrs.clone(),
+            unreach: None,
+            mp_unreach: None,
+            nexthop: change.nexthop,
+        })
+    } else {
+        bgp::Message::Update(bgp::Update {
+            reach: None,
+            mp_reach: None,
+            attr: Arc::new(Vec::new()),
+            unreach: None,
+            mp_unreach: Some(packet::bgp::NlriSet {
+                family: change.family,
+                entries: change.nlris.clone(),
+            }),
+            nexthop: None,
+        })
+    };
+    mrt::Message::Mp {
+        header,
+        body,
+        addpath: change.addpath,
+    }
+}
+
 struct MrtDumper {
     filename: String,
     interval: u64,
@@ -2367,18 +2408,9 @@ impl MrtDumper {
         global: GlobalHandle,
         tables: TableHandle,
     ) -> Result<(), Error> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        for i in 0..tables.shards.len() {
-            let mut t = tables.shards[i].lock().await;
-            t.mrt_event_tx.insert(self.filename.clone(), tx.clone());
-        }
-
-        let result = self.run_loop(&mut file, rx).await;
-
-        for i in 0..tables.shards.len() {
-            let mut t = tables.shards[i].lock().await;
-            t.mrt_event_tx.remove(&self.filename);
-        }
+        let subscription = tables.subscribe_live().await;
+        let result = self.run_loop(&mut file, subscription.rx).await;
+        tables.unsubscribe(subscription.id).await;
         global.write().await.mrt_filenames.remove(&self.filename);
         result
     }
@@ -2386,7 +2418,7 @@ impl MrtDumper {
     async fn run_loop(
         &self,
         file: &mut tokio::fs::File,
-        rx: mpsc::UnboundedReceiver<mrt::Message>,
+        rx: mpsc::UnboundedReceiver<BgpEvent>,
     ) -> Result<(), Error> {
         let mut codec = mrt::MrtCodec::new();
         let mut rx = UnboundedReceiverStream::new(rx);
@@ -2399,13 +2431,15 @@ impl MrtDumper {
         let mut timer = tokio::time::interval_at(start, Duration::from_secs(interval));
         loop {
             tokio::select! {
-                msg = rx.next() => {
-                    match msg {
-                        Some(msg) => {
+                event = rx.next() => {
+                    match event {
+                        Some(BgpEvent::AdjRibIn(change)) => {
+                            let msg = adj_rib_in_to_mrt(&change);
                             let mut buf = bytes::BytesMut::with_capacity(8192);
                             codec.encode(&msg, &mut buf)?;
                             file.write_all(&buf).await?;
                         }
+                        Some(BgpEvent::PeerUp(_)) | Some(BgpEvent::PeerDown(_)) => {}
                         None => return Ok(()),
                     }
                 }
@@ -3407,7 +3441,6 @@ impl TableManager {
                         rtable: table::Table::new(),
                         peer_event_tx: FnvHashMap::default(),
                         subscribers: FnvHashMap::default(),
-                        mrt_event_tx: FnvHashMap::default(),
                         addpath: FnvHashMap::default(),
                     })
                 })
@@ -3445,7 +3478,6 @@ impl TableManager {
         let idx = self.dealer(net.nlri);
         let mut t = self.shards[idx].lock().await;
         t.notify_adj_rib_in(source.clone(), family, &[net], Some(&attr), Some(nexthop));
-        t.send_mrt_update(&source, family, &[net], Some(&attr), Some(nexthop));
         let mut nh = nexthop;
         let filtered = crate::policy::apply_import(
             import_policy.as_deref(),
@@ -3488,7 +3520,6 @@ impl TableManager {
         let idx = self.dealer(net.nlri);
         let mut t = self.shards[idx].lock().await;
         t.notify_adj_rib_in(source.clone(), family, &[net], None, None);
-        t.send_mrt_update(&source, family, &[net], None, None);
         let counter_ref = prefix_counter.as_ref();
         if let Some(update) = t
             .rtable
@@ -3705,7 +3736,6 @@ struct TableShard {
     rtable: table::Table,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
     subscribers: FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>,
-    mrt_event_tx: FnvHashMap<String, mpsc::UnboundedSender<mrt::Message>>,
     addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
 }
 
@@ -3755,60 +3785,6 @@ impl TableShard {
                 attrs: attrs.cloned(),
                 nexthop,
             }));
-        }
-    }
-
-    fn send_mrt_update(
-        &self,
-        source: &table::Source,
-        family: Family,
-        nets: &[packet::PathNlri],
-        attrs: Option<&Arc<Vec<packet::Attribute>>>,
-        nexthop: Option<bgp::Nexthop>,
-    ) {
-        if self.mrt_event_tx.is_empty() {
-            return;
-        }
-        let addpath = self.has_addpath(&source.remote_addr, &family);
-        let header = mrt::MpHeader::new(
-            source.remote_asn,
-            source.local_asn,
-            0,
-            source.remote_addr,
-            source.local_addr,
-            true,
-        );
-        let body = if let Some(attrs) = attrs {
-            bgp::Message::Update(bgp::Update {
-                reach: Some(packet::bgp::NlriSet {
-                    family,
-                    entries: nets.to_owned(),
-                }),
-                mp_reach: None,
-                attr: attrs.clone(),
-                unreach: None,
-                mp_unreach: None,
-                nexthop,
-            })
-        } else {
-            bgp::Message::Update(bgp::Update {
-                reach: None,
-                mp_reach: None,
-                attr: Arc::new(Vec::new()),
-                unreach: None,
-                mp_unreach: Some(packet::bgp::NlriSet {
-                    family,
-                    entries: nets.to_owned(),
-                }),
-                nexthop: None,
-            })
-        };
-        for mrt_tx in self.mrt_event_tx.values() {
-            let _ = mrt_tx.send(mrt::Message::Mp {
-                header: header.clone(),
-                body: body.clone(),
-                addpath,
-            });
         }
     }
 
@@ -3942,7 +3918,6 @@ impl TableShard {
         export_policy: Option<&table::PolicyAssignment>,
     ) {
         self.notify_adj_rib_in(source.clone(), family, &nets, attrs.as_ref(), nexthop);
-        self.send_mrt_update(&source, family, &nets, attrs.as_ref(), nexthop);
 
         match attrs {
             Some(attrs) => {
