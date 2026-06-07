@@ -673,8 +673,11 @@ impl TableShard {
 
         match attrs {
             Some(attrs) => {
+                // nexthop must be present for reach updates; a missing nexthop
+                // is a protocol violation, so silently drop the update.
+                let Some(nexthop) = nexthop else { return };
                 for net in nets {
-                    let mut nh = nexthop.unwrap();
+                    let mut nh = nexthop;
                     let filtered = crate::policy::apply_import(
                         import_policy,
                         &source,
