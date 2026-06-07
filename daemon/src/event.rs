@@ -38,6 +38,7 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
@@ -2232,27 +2233,41 @@ impl GoBgpService for GrpcService {
         }
 
         let sockaddr = SocketAddr::new(addr, request.port as u16);
-        match self.global.write().await.bmp_clients.entry(sockaddr) {
-            Occupied(_) => {
+        match self.global.write().await.add_bmp_client(sockaddr) {
+            Err(()) => {
                 return Err(tonic::Status::new(
                     tonic::Code::AlreadyExists,
                     format!("bmp client {} already exists", sockaddr),
                 ));
             }
-            Vacant(v) => {
-                let client = BmpClient::new();
-                let t = client.configured_time;
-                v.insert(client);
-                BmpClient::try_connect(sockaddr, t, self.global.clone(), self.tables.clone());
+            Ok((cancel, state)) => {
+                BmpClient::try_connect(
+                    sockaddr,
+                    cancel,
+                    state,
+                    self.global.clone(),
+                    self.tables.clone(),
+                );
             }
         }
         Ok(tonic::Response::new(api::AddBmpResponse {}))
     }
     async fn delete_bmp(
         &self,
-        _request: tonic::Request<api::DeleteBmpRequest>,
+        request: tonic::Request<api::DeleteBmpRequest>,
     ) -> Result<tonic::Response<api::DeleteBmpResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let request = request.into_inner();
+        let addr = IpAddr::from_str(&request.address)
+            .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
+        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        if self.global.write().await.remove_bmp_client(sockaddr) {
+            Ok(tonic::Response::new(api::DeleteBmpResponse {}))
+        } else {
+            Err(tonic::Status::new(
+                tonic::Code::NotFound,
+                format!("bmp client {} not found", sockaddr),
+            ))
+        }
     }
     type ListBmpStream = Pin<
         Box<dyn Stream<Item = Result<api::ListBmpResponse, tonic::Status>> + Send + Sync + 'static>,
@@ -2265,8 +2280,7 @@ impl GoBgpService for GrpcService {
             .global
             .read()
             .await
-            .bmp_clients
-            .iter()
+            .iter_bmp_clients()
             .map(|(k, v)| api::ListBmpResponse {
                 station: Some(api::list_bmp_response::BmpStation {
                     conf: Some(api::list_bmp_response::bmp_station::Conf {
@@ -2275,11 +2289,13 @@ impl GoBgpService for GrpcService {
                     }),
                     state: Some(api::list_bmp_response::bmp_station::State {
                         uptime: Some(prost_types::Timestamp {
-                            seconds: v.uptime as i64,
+                            seconds: v.state.uptime.load(std::sync::atomic::Ordering::Relaxed)
+                                as i64,
                             nanos: 0,
                         }),
                         downtime: Some(prost_types::Timestamp {
-                            seconds: v.downtime as i64,
+                            seconds: v.state.downtime.load(std::sync::atomic::Ordering::Relaxed)
+                                as i64,
                             nanos: 0,
                         }),
                     }),
@@ -2624,7 +2640,7 @@ pub(crate) struct Global {
     ptable: table::PolicyTable,
 
     rpki_clients: FnvHashMap<SocketAddr, RpkiClient>,
-    pub(crate) bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
+    bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
     pub(crate) mrt_filenames: FnvHashSet<String>,
 
     /// Selection Deferral state machine for the Restarting Speaker (RFC 4724 §4.1).
@@ -2674,6 +2690,36 @@ impl Global {
             selection_deferral: None,
             selection_deferral_timer: None,
         }
+    }
+
+    fn add_bmp_client(
+        &mut self,
+        sockaddr: SocketAddr,
+    ) -> Result<(CancellationToken, Arc<crate::bmp::BmpClientState>), ()> {
+        use std::collections::hash_map::Entry;
+        match self.bmp_clients.entry(sockaddr) {
+            Entry::Occupied(_) => Err(()),
+            Entry::Vacant(v) => {
+                let client = BmpClient::new();
+                let cancel = client.cancel.clone();
+                let state = Arc::clone(&client.state);
+                v.insert(client);
+                Ok((cancel, state))
+            }
+        }
+    }
+
+    fn remove_bmp_client(&mut self, sockaddr: SocketAddr) -> bool {
+        if let Some(client) = self.bmp_clients.remove(&sockaddr) {
+            client.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn iter_bmp_clients(&self) -> impl Iterator<Item = (&SocketAddr, &BmpClient)> {
+        self.bmp_clients.iter()
     }
 
     fn add_peer(
@@ -2984,15 +3030,16 @@ impl Global {
                 let config = s.config.as_ref().unwrap();
                 let sockaddr =
                     SocketAddr::new(config.address.unwrap(), config.port.unwrap() as u16);
-                match server.bmp_clients.entry(sockaddr) {
-                    Occupied(_) => {
-                        panic!("duplicated bmp server {}", sockaddr);
-                    }
-                    Vacant(v) => {
-                        let client = BmpClient::new();
-                        let t = client.configured_time;
-                        v.insert(client);
-                        BmpClient::try_connect(sockaddr, t, global.clone(), tables.clone());
+                match server.add_bmp_client(sockaddr) {
+                    Err(()) => panic!("duplicated bmp server {}", sockaddr),
+                    Ok((cancel, state)) => {
+                        BmpClient::try_connect(
+                            sockaddr,
+                            cancel,
+                            state,
+                            global.clone(),
+                            tables.clone(),
+                        );
                     }
                 }
             }

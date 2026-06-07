@@ -16,10 +16,12 @@ use fnv::{FnvHashMap, FnvHashSet};
 use futures::{SinkExt, StreamExt};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::net::TcpStream;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 
 use rustybgp_packet::{self as packet, Family, bgp, bmp};
 
@@ -193,27 +195,36 @@ pub(crate) fn session_down_to_bmp(
     }
 }
 
-#[derive(Default)]
+pub(crate) struct BmpClientState {
+    pub(crate) uptime: AtomicU64,
+    pub(crate) downtime: AtomicU64,
+}
+
+impl BmpClientState {
+    fn new() -> Arc<Self> {
+        Arc::new(BmpClientState {
+            uptime: AtomicU64::new(0),
+            downtime: AtomicU64::new(0),
+        })
+    }
+}
+
 pub(crate) struct BmpClient {
-    pub(crate) configured_time: u64,
-    pub(crate) uptime: u64,
-    pub(crate) downtime: u64,
+    pub(crate) cancel: CancellationToken,
+    pub(crate) state: Arc<BmpClientState>,
 }
 
 impl BmpClient {
     pub(crate) fn new() -> Self {
         BmpClient {
-            configured_time: SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            ..Default::default()
+            cancel: CancellationToken::new(),
+            state: BmpClientState::new(),
         }
     }
 
-    pub(crate) async fn serve(
+    async fn serve(
         stream: TcpStream,
-        _sockaddr: SocketAddr,
+        cancel: CancellationToken,
         global: GlobalHandle,
         tables: TableHandle,
     ) {
@@ -349,6 +360,7 @@ impl BmpClient {
                         None => break,
                     }
                 }
+                _ = cancel.cancelled() => break,
             }
         }
         tables.unsubscribe(subscription.id).await;
@@ -356,44 +368,54 @@ impl BmpClient {
 
     pub(crate) fn try_connect(
         sockaddr: SocketAddr,
-        configured_time: u64,
+        cancel: CancellationToken,
+        state: Arc<BmpClientState>,
         global: GlobalHandle,
         tables: TableHandle,
     ) {
         tokio::spawn(async move {
             loop {
-                if let Ok(Ok(stream)) = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
-                    TcpStream::connect(sockaddr),
-                )
-                .await
-                {
-                    if let Some(client) = global.write().await.bmp_clients.get_mut(&sockaddr) {
-                        client.uptime = SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-                    } else {
-                        break;
-                    }
-                    BmpClient::serve(stream, sockaddr, global.clone(), tables.clone()).await;
-                    if let Some(client) = global.write().await.bmp_clients.get_mut(&sockaddr) {
-                        client.downtime = SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-                    } else {
-                        break;
-                    }
+                let stream = tokio::select! {
+                    r = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        TcpStream::connect(sockaddr),
+                    ) => match r {
+                        Ok(Ok(s)) => s,
+                        _ => {
+                            tokio::select! {
+                                _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {}
+                                _ = cancel.cancelled() => return,
+                            }
+                            continue;
+                        }
+                    },
+                    _ = cancel.cancelled() => return,
+                };
+
+                state.uptime.store(
+                    SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    Ordering::Relaxed,
+                );
+
+                tokio::select! {
+                    _ = BmpClient::serve(stream, cancel.clone(), global.clone(), tables.clone()) => {}
+                    _ = cancel.cancelled() => return,
                 }
-                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                if let Some(client) = global.write().await.bmp_clients.get_mut(&sockaddr) {
-                    if client.configured_time != configured_time {
-                        break;
-                    }
-                } else {
-                    // de-configured
-                    break;
+
+                state.downtime.store(
+                    SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    Ordering::Relaxed,
+                );
+
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {}
+                    _ = cancel.cancelled() => return,
                 }
             }
         });
