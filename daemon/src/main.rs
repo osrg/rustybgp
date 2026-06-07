@@ -27,6 +27,7 @@ mod mrt;
 mod peer_tx;
 mod policy;
 mod proto;
+mod table_manager;
 
 use clap::{Arg, Command};
 use std::net::Ipv4Addr;
