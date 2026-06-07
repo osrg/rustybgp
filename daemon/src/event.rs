@@ -4069,7 +4069,9 @@ impl PeerSession {
         }
     }
 
-    async fn flush_tx(&mut self, stream: &mut TcpStream) {
+    // Returns false if a write error occurred; the caller must route
+    // Input::Disconnected through the FSM in that case.
+    async fn flush_tx(&mut self, stream: &mut TcpStream) -> bool {
         // 1. Flush urgent (open, keepalive, notification) messages.
         let mut txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
         for _ in 0..self.urgent.len() {
@@ -4081,14 +4083,12 @@ impl PeerSession {
                 let buf = txbuf.freeze();
                 txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
                 if stream.write_all(&buf).await.is_err() {
-                    self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
-                    return;
+                    return false;
                 }
             }
         }
         if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
-            self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
-            return;
+            return false;
         }
 
         // 2. Drain pending updates (withdrawals, reach, EOR) via peer_tx.
@@ -4114,14 +4114,13 @@ impl PeerSession {
                     let buf = txbuf.freeze();
                     txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
                     if stream.write_all(&buf).await.is_err() {
-                        self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
-                        return;
+                        return false;
                     }
                 }
             }
         }
         if !txbuf.is_empty() && stream.write_all(&txbuf.freeze()).await.is_err() {
-            self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
+            return false;
         }
         if any_update_pending {
             let outputs = self
@@ -4141,6 +4140,7 @@ impl PeerSession {
                 }
             }
         }
+        true
     }
 
     /// Returns `true` if the per-peer prefix limit was exceeded (RFC 4486 §2).
@@ -4402,7 +4402,12 @@ impl PeerSession {
                         rxbuf.reserve(rxbuf_size);
                         match stream.try_read_buf(&mut rxbuf) {
                             Ok(0) => {
-                                self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
+                                let outputs = self.conn_arbiter.lock().unwrap().process(
+                                    self.role,
+                                    crate::fsm::Input::Disconnected,
+                                );
+                                let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
+                                self.process_effects(effects, global).await;
                             }
                             Ok(_) => loop {
                                     match self.framer.try_parse(&mut rxbuf) {
@@ -4429,13 +4434,25 @@ impl PeerSession {
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
                             Err(_e) => {
-                                self.shutdown = Some(crate::fsm::SessionDownReason::IoError);
+                                let outputs = self.conn_arbiter.lock().unwrap().process(
+                                    self.role,
+                                    crate::fsm::Input::Disconnected,
+                                );
+                                let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
+                                self.process_effects(effects, global).await;
                             }
                         }
                     }
 
-                    if ready.is_writable() {
-                        self.flush_tx(&mut stream).await;
+                    if ready.is_writable()
+                        && !self.flush_tx(&mut stream).await
+                    {
+                        let outputs = self.conn_arbiter.lock().unwrap().process(
+                            self.role,
+                            crate::fsm::Input::Disconnected,
+                        );
+                        let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
+                        self.process_effects(effects, global).await;
                     }
                 }
             }
@@ -4537,12 +4554,11 @@ async fn apply_disconnect(
             crate::fsm::Role::Passive => arb.passive_close_tx = None,
         }
         // Ensure the FSM slot is cleared regardless of how the session
-        // ended.  When shutdown was set directly (I/O error, EOF, cease)
-        // the FSM never received a SessionDown output and its Connection
-        // slot may still be occupied; a stuck slot causes the next
-        // reconnect's Input::Connected to return CloseConnection.
-        // If the slot is already None (e.g. HoldTimerExpired went through
-        // the FSM) process() is a no-op.
+        // ended.  Most paths (I/O errors, hold-timer, admin-shutdown) route
+        // through the FSM and clear the slot via close_connection(); this
+        // call is a fallback for paths that set self.shutdown directly
+        // (LocalNotification, FsmError from parse, SendMessage cease).
+        // If the slot is already None process() is a no-op.
         let _ = arb.process(info.role, crate::fsm::Input::Disconnected);
     }
 
@@ -5501,9 +5517,8 @@ mod tests {
         );
     }
 
-    // Regression test: after a session ends via EOF/I/O error (shutdown set
-    // directly, bypassing the FSM), run() must clear the FSM Connection slot via
-    // Input::Disconnected so that the next connection is not rejected.
+    // After a session ends via EOF the FSM Connection slot must be cleared
+    // so that the next connection is not rejected.
     #[tokio::test]
     async fn fsm_slot_cleared_after_eof() {
         let global = make_global();
@@ -5525,13 +5540,12 @@ mod tests {
         let global_clone = Arc::clone(&global);
         let h = tokio::spawn(async move { session.run(global_clone, active_tx).await });
 
-        // Drop the client-side socket → the server sees EOF → shutdown is set
-        // directly without going through the FSM.
+        // Drop the client-side socket → the server sees EOF → Input::Disconnected
+        // is routed through the FSM, which clears the Connection slot.
         drop(client);
         h.await.unwrap();
 
         // After run() completes the passive FSM slot must be None.
-        // Without the Input::Disconnected fix this assertion fails.
         let g = global.read().await;
         let ctx = g.peers[&remote_addr].context.lock().unwrap();
         let arb = ctx.conn_arbiter.lock().unwrap();
