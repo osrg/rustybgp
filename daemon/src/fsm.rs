@@ -532,9 +532,15 @@ impl PeerFsm {
             }
         }
 
-        // Auto-clear the session slot when the session goes down.
+        // Auto-clear the session slot and emit StateChanged(Idle) when the
+        // session goes down, so the driver always sees a paired SessionDown +
+        // StateChanged(Idle) without needing special-case knowledge here.
         if session_down {
             self.close_connection(role);
+            result.push(PeerFsmOutput::Connection(
+                role,
+                Output::StateChanged(State::Idle),
+            ));
         }
 
         result
@@ -1612,6 +1618,64 @@ mod tests {
         assert!(has_peer_output(&out, |o| matches!(
             o,
             PeerFsmOutput::Connection(Role::Active, Output::SendMessage(bgp::Message::Open(_)))
+        )));
+    }
+
+    // PeerFsm::process() appends StateChanged(Idle) whenever session_down is true,
+    // so the driver always sees a paired SessionDown + StateChanged(Idle).
+    #[test]
+    fn peer_fsm_session_down_emits_state_changed_idle() {
+        let mut peer = make_peer_fsm(local_router_id(), 65002);
+        reach_established(&mut peer, Role::Active);
+
+        let out = peer.process(Role::Active, Input::Disconnected);
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::Connection(
+                Role::Active,
+                Output::SessionDown(SessionDownReason::IoError)
+            )
+        )));
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::Connection(Role::Active, Output::StateChanged(State::Idle))
+        )));
+
+        // StateChanged(Idle) must come after SessionDown in the output vec.
+        let session_down_pos = out.iter().position(|o| {
+            matches!(
+                o,
+                PeerFsmOutput::Connection(
+                    Role::Active,
+                    Output::SessionDown(SessionDownReason::IoError)
+                )
+            )
+        });
+        let state_changed_pos = out.iter().position(|o| {
+            matches!(
+                o,
+                PeerFsmOutput::Connection(Role::Active, Output::StateChanged(State::Idle))
+            )
+        });
+        assert!(session_down_pos < state_changed_pos);
+    }
+
+    #[test]
+    fn peer_fsm_admin_shutdown_emits_state_changed_idle() {
+        let mut peer = make_peer_fsm(local_router_id(), 65002);
+        reach_established(&mut peer, Role::Active);
+
+        let out = peer.process(Role::Active, Input::AdminShutdown);
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::Connection(
+                Role::Active,
+                Output::SessionDown(SessionDownReason::AdminShutdown)
+            )
+        )));
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::Connection(Role::Active, Output::StateChanged(State::Idle))
         )));
     }
 }
