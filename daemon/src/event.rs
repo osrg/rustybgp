@@ -154,8 +154,16 @@ struct PeerState {
 /// the losing connection are atomic without touching the global `RwLock`.
 struct ConnArbiter {
     fsm: crate::fsm::PeerFsm,
-    active_close_tx: Option<tokio::sync::oneshot::Sender<bgp::Message>>,
-    passive_close_tx: Option<tokio::sync::oneshot::Sender<bgp::Message>>,
+    active_close_tx: Option<tokio::sync::oneshot::Sender<CloseReason>>,
+    passive_close_tx: Option<tokio::sync::oneshot::Sender<CloseReason>>,
+}
+
+/// Signal sent to a running connection to request shutdown.
+enum CloseReason {
+    /// Admin shutdown (disable_peer / shutdown_peer): the FSM handles CEASE generation.
+    AdminShutdown,
+    /// Direct CEASE delivery (collision resolution / delete_peer): send the given message.
+    SendMessage(bgp::Message),
 }
 
 impl ConnArbiter {
@@ -191,7 +199,7 @@ impl ConnArbiter {
                         crate::fsm::Role::Passive => self.passive_close_tx.take(),
                     };
                     if let Some(tx) = tx {
-                        let _ = tx.send(msg);
+                        let _ = tx.send(CloseReason::SendMessage(msg));
                     }
                 }
                 other => result.push(other),
@@ -1220,7 +1228,7 @@ impl GoBgpService for GrpcService {
                             .into_iter()
                             .flatten()
                         {
-                            let _ = tx.send(cease.clone());
+                            let _ = tx.send(CloseReason::SendMessage(cease.clone()));
                         }
                     }
                 }
@@ -1304,9 +1312,37 @@ impl GoBgpService for GrpcService {
     }
     async fn shutdown_peer(
         &self,
-        _request: tonic::Request<api::ShutdownPeerRequest>,
+        request: tonic::Request<api::ShutdownPeerRequest>,
     ) -> Result<tonic::Response<api::ShutdownPeerResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
+            for (addr, p) in &mut self.global.write().await.peers {
+                if addr == &peer_addr {
+                    if p.admin_down {
+                        return Err(tonic::Status::new(
+                            tonic::Code::InvalidArgument,
+                            "peer is admin-down",
+                        ));
+                    }
+                    let ctx = p.context.lock().unwrap();
+                    let mut arb = ctx.conn_arbiter.lock().unwrap();
+                    for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let _ = tx.send(CloseReason::AdminShutdown);
+                    }
+                    return Ok(tonic::Response::new(api::ShutdownPeerResponse {}));
+                }
+            }
+            return Err(tonic::Status::new(
+                tonic::Code::NotFound,
+                "peer address not found",
+            ));
+        }
+        Err(tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            "invalid peer address",
+        ))
     }
     async fn enable_peer(
         &self,
@@ -1351,11 +1387,6 @@ impl GoBgpService for GrpcService {
                         ));
                     } else {
                         p.admin_down = true;
-                        let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
-                            code: 6,
-                            subcode: 2,
-                            data: vec![],
-                        });
                         {
                             let mut ctx = p.context.lock().unwrap();
                             ctx.active_connect_cancel_tx.0.take();
@@ -1364,7 +1395,7 @@ impl GoBgpService for GrpcService {
                                 .into_iter()
                                 .flatten()
                             {
-                                let _ = tx.send(cease.clone());
+                                let _ = tx.send(CloseReason::AdminShutdown);
                             }
                         }
                         return Ok(tonic::Response::new(api::DisablePeerResponse {}));
@@ -2779,7 +2810,7 @@ async fn accept_connection(
         let export_map = ctx.export_map.clone();
         (conn_arbiter, export_map)
     };
-    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<bgp::Message>();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<CloseReason>();
     {
         let mut arb = conn_arbiter.lock().unwrap();
         match role {
@@ -3565,9 +3596,8 @@ struct PeerSession {
 
     conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
     role: crate::fsm::Role,
-    /// Receives a CEASE Notification from an external signal (collision winner
-    /// or admin operation); on receipt this Connection sends the message and closes.
-    close_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
+    /// Receives a shutdown signal from an external source (collision winner or admin operation).
+    close_rx: Option<tokio::sync::oneshot::Receiver<CloseReason>>,
 
     stream: Option<TcpStream>,
     source: FnvHashMap<Family, Arc<table::Source>>,
@@ -3605,7 +3635,7 @@ impl PeerSession {
         rs_client: bool,
         role: crate::fsm::Role,
         conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
-        close_rx: Option<tokio::sync::oneshot::Receiver<bgp::Message>>,
+        close_rx: Option<tokio::sync::oneshot::Receiver<CloseReason>>,
         state: Arc<PeerState>,
         counter_tx: Arc<MessageCounter>,
         counter_rx: Arc<MessageCounter>,
@@ -4451,9 +4481,17 @@ impl PeerSession {
 
             futures::select_biased! {
                 cease = &mut close_rx => {
-                    if let Some(Ok(msg)) = cease {
-                        self.urgent.insert(0, msg);
-                        self.shutdown = Some(crate::fsm::SessionDownReason::AdminShutdown);
+                    match cease {
+                        Some(Ok(CloseReason::AdminShutdown)) => {
+                            let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::AdminShutdown);
+                            let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
+                            self.process_effects(effects, global).await;
+                        }
+                        Some(Ok(CloseReason::SendMessage(msg))) => {
+                            self.urgent.insert(0, msg);
+                            self.shutdown = Some(crate::fsm::SessionDownReason::AdminShutdown);
+                        }
+                        _ => {}
                     }
                 }
                 _ = self.holdtime_futures.next() => {
@@ -4887,7 +4925,7 @@ mod tests {
             let mut g = global.write().await;
             g.add_peer(default_peer_params(remote_addr), None, false)
                 .unwrap();
-            let (tx, _rx) = tokio::sync::oneshot::channel::<bgp::Message>();
+            let (tx, _rx) = tokio::sync::oneshot::channel::<CloseReason>();
             g.peers
                 .get_mut(&remote_addr)
                 .unwrap()
@@ -5210,8 +5248,7 @@ mod tests {
         passive_connection(&global, &tables, remote_addr, server).await;
 
         // Pre-install active_close_tx inside the arbiter.
-        let (active_close_tx, mut active_close_rx) =
-            tokio::sync::oneshot::channel::<bgp::Message>();
+        let (active_close_tx, mut active_close_rx) = tokio::sync::oneshot::channel::<CloseReason>();
         let conn_arbiter = {
             let g = global.read().await;
             Arc::clone(&g.peers[&remote_addr].context.lock().unwrap().conn_arbiter)
@@ -5245,7 +5282,10 @@ mod tests {
         let received = active_close_rx
             .try_recv()
             .expect("CEASE not delivered to active (loser)");
-        assert!(matches!(received, bgp::Message::Notification(_)));
+        assert!(matches!(
+            received,
+            CloseReason::SendMessage(bgp::Message::Notification(_))
+        ));
         let _ = tables; // suppress unused warning
     }
 

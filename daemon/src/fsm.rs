@@ -76,8 +76,7 @@ pub(crate) enum Input {
     HoldTimerExpired,
     /// TCP stream closed or I/O error detected by the driver.
     Disconnected,
-    /// Administrative shutdown (e.g., peer deconfigured).
-    #[allow(dead_code)]
+    /// Administrative shutdown (disable_peer / shutdown_peer).
     AdminShutdown,
     /// An UPDATE message was sent to the peer; reset the keepalive timer.
     UpdateSent,
