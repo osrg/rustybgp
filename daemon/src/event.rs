@@ -3936,9 +3936,6 @@ impl PeerSession {
                         local: local_sockaddr,
                         remote_port: remote_sockaddr.port(),
                     })));
-                    self.state
-                        .fsm
-                        .store(SessionState::Established as u8, Ordering::Relaxed);
                     self.on_established(local_sockaddr, remote_sockaddr).await;
                 }
                 crate::fsm::PeerFsmOutput::Connection(

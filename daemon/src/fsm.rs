@@ -308,6 +308,7 @@ impl Connection {
                         remote_holdtime: self.remote_holdtime,
                         remote_capabilities: std::mem::take(&mut self.remote_cap),
                     },
+                    Output::StateChanged(State::Established),
                 ]
             }
             State::Established => {
@@ -726,13 +727,13 @@ mod tests {
         // Receive KEEPALIVE -> Established
         let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
         assert_eq!(s.state(), State::Established);
-        assert!(!has_output(&out, |o| matches!(
-            o,
-            Output::StateChanged(State::Established)
-        )));
         assert!(has_output(&out, |o| matches!(
             o,
             Output::SessionEstablished { .. }
+        )));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::StateChanged(State::Established)
         )));
     }
 
