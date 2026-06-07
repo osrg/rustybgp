@@ -16,7 +16,7 @@
 use arc_swap::ArcSwapOption;
 use fnv::{FnvHashMap, FnvHashSet};
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, SinkExt, Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use std::boxed::Box;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
@@ -28,21 +28,18 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
-};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
-use rustybgp_packet::{self as packet, BgpFramer, Family, HoldTime, bgp, bmp, rpki};
+use rustybgp_packet::{self as packet, BgpFramer, Family, HoldTime, bgp, bmp};
 
 use crate::api;
 use crate::auth;
@@ -50,6 +47,7 @@ use crate::bmp::BmpClient;
 use crate::config;
 use crate::convert;
 use crate::error::Error;
+use crate::rpki::{RpkiClient, RpkiState};
 use rustybgp_kernel as kernel;
 use rustybgp_table as table;
 
@@ -2377,61 +2375,8 @@ fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) 
     });
 }
 
-#[derive(Default)]
-struct RpkiState {
-    uptime: AtomicU64,
-    downtime: AtomicU64,
-    up: AtomicBool,
-    serial: AtomicU32,
-    received_ipv4: AtomicI64,
-    received_ipv6: AtomicI64,
-    serial_notify: AtomicI64,
-    cache_reset: AtomicI64,
-    cache_response: AtomicI64,
-    end_of_data: AtomicI64,
-    error: AtomicI64,
-    serial_query: AtomicI64,
-    reset_query: AtomicI64,
-}
-
-impl RpkiState {
-    fn update(&self, msg: &rpki::Message) {
-        match msg {
-            rpki::Message::SerialNotify { .. } => {
-                self.serial_notify.fetch_add(1, Ordering::Relaxed);
-            }
-            rpki::Message::SerialQuery { .. } => {
-                let _ = self.serial_query.fetch_add(1, Ordering::Relaxed);
-            }
-            rpki::Message::ResetQuery => {
-                let _ = self.reset_query.fetch_add(1, Ordering::Relaxed);
-            }
-            rpki::Message::CacheResponse => {
-                let _ = self.cache_response.fetch_add(1, Ordering::Relaxed);
-            }
-            rpki::Message::IpPrefix(prefix) => match prefix.net {
-                packet::IpNet::V4(_) => {
-                    let _ = self.received_ipv4.fetch_add(1, Ordering::Relaxed);
-                }
-                packet::IpNet::V6(_) => {
-                    let _ = self.received_ipv6.fetch_add(1, Ordering::Relaxed);
-                }
-            },
-            rpki::Message::EndOfData { .. } => {
-                let _ = self.end_of_data.fetch_add(1, Ordering::Relaxed);
-            }
-            rpki::Message::CacheReset => {
-                let _ = self.cache_reset.fetch_add(1, Ordering::Relaxed);
-            }
-            rpki::Message::ErrorReport => {
-                let _ = self.error.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-impl From<&RpkiState> for api::RpkiState {
-    fn from(s: &RpkiState) -> Self {
+impl From<&crate::rpki::RpkiState> for api::RpkiState {
+    fn from(s: &crate::rpki::RpkiState) -> Self {
         let uptime = s.uptime.load(Ordering::Relaxed);
         let downtime = s.downtime.load(Ordering::Relaxed);
         api::RpkiState {
@@ -2459,124 +2404,6 @@ impl From<&RpkiState> for api::RpkiState {
             serial_query: s.serial_query.load(Ordering::Relaxed),
             reset_query: s.reset_query.load(Ordering::Relaxed),
         }
-    }
-}
-
-struct RpkiClient {
-    cancel: CancellationToken,
-    state: Arc<RpkiState>,
-}
-
-impl RpkiClient {
-    fn new() -> Self {
-        RpkiClient {
-            cancel: CancellationToken::new(),
-            state: Arc::new(RpkiState::default()),
-        }
-    }
-
-    async fn serve(
-        stream: TcpStream,
-        cancel: CancellationToken,
-        state: Arc<RpkiState>,
-        tables: TableHandle,
-    ) -> Result<(), Error> {
-        let remote_addr = stream.peer_addr()?.ip();
-        let remote_addr = Arc::new(remote_addr);
-        let mut lines = Framed::new(stream, rpki::RtrCodec::new());
-        let _ = lines.send(&rpki::Message::ResetQuery).await;
-        state.uptime.store(
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            Ordering::Relaxed,
-        );
-        state.up.store(true, Ordering::Relaxed);
-        let mut v = Vec::new();
-        let mut end_of_data = false;
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                msg = lines.next() => {
-                    let msg = match msg {
-                        Some(msg) => match msg {
-                            Ok(msg) => msg,
-                            Err(_) => break,
-                        },
-                        None => break,
-                    };
-                    state.update(&msg);
-                    match msg {
-                        rpki::Message::IpPrefix(prefix)
-                            if prefix.flags & 1 > 0 =>
-                        {
-                            let roa = Arc::new(table::Roa::new(prefix.max_length, prefix.as_number, remote_addr.clone()));
-                            if end_of_data {
-                                tables
-                                    .rpki_insert(vec![(prefix.net.clone(), roa.clone())])
-                                    .await;
-                            } else {
-                                v.push((prefix.net, roa));
-                            }
-                        }
-                        rpki::Message::EndOfData { serial_number } => {
-                            end_of_data = true;
-                            state.serial.store(serial_number, Ordering::Relaxed);
-                            tables.rpki_reset(remote_addr.clone(), v.to_owned()).await;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        state.downtime.store(
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            Ordering::Relaxed,
-        );
-        tables.rpki_drop_all(remote_addr.clone()).await;
-        Ok(())
-    }
-
-    fn try_connect(
-        sockaddr: SocketAddr,
-        cancel: CancellationToken,
-        state: Arc<RpkiState>,
-        tables: TableHandle,
-    ) {
-        tokio::spawn(async move {
-            loop {
-                let stream = tokio::select! {
-                    r = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(5),
-                        TcpStream::connect(sockaddr),
-                    ) => match r {
-                        Ok(Ok(s)) => s,
-                        _ => {
-                            tokio::select! {
-                                _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {}
-                                _ = cancel.cancelled() => return,
-                            }
-                            continue;
-                        }
-                    },
-                    _ = cancel.cancelled() => return,
-                };
-
-                tokio::select! {
-                    _ = RpkiClient::serve(stream, cancel.clone(), state.clone(), tables.clone()) => {}
-                    _ = cancel.cancelled() => return,
-                }
-
-                tokio::select! {
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {}
-                    _ = cancel.cancelled() => return,
-                }
-            }
-        });
     }
 }
 
