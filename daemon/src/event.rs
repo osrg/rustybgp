@@ -1258,12 +1258,11 @@ impl GoBgpService for GrpcService {
                 .collect()
         };
 
-        for i in 0..self.tables.shards.len() {
-            let t = self.tables.shards[i].lock().await;
-            for (peer_addr, peer) in &mut peers {
-                if let Some(m) = t.rtable.peer_stats(peer_addr) {
-                    peer.update_stats(m.map(|(f, s)| (f, s.clone())).collect());
-                }
+        let addrs: Vec<IpAddr> = peers.keys().copied().collect();
+        let all_stats = self.tables.collect_peer_stats(&addrs).await;
+        for (addr, peer) in &mut peers {
+            if let Some(stats) = all_stats.get(addr) {
+                peer.update_stats(stats.clone());
             }
         }
 
@@ -3503,6 +3502,28 @@ impl TableManager {
 
     pub(crate) async fn rpki_state(&self, addr: &IpAddr) -> table::RpkiTableState {
         self.rpki.read().unwrap().state(addr)
+    }
+
+    async fn collect_peer_stats(
+        &self,
+        addrs: &[IpAddr],
+    ) -> FnvHashMap<IpAddr, FnvHashMap<Family, table::PrefixStats>> {
+        let mut map: FnvHashMap<IpAddr, FnvHashMap<Family, table::PrefixStats>> =
+            FnvHashMap::default();
+        for shard in &self.shards {
+            let t = shard.lock().await;
+            for addr in addrs {
+                if let Some(iter) = t.rtable.peer_stats(addr) {
+                    let entry = map.entry(*addr).or_default();
+                    for (f, s) in iter {
+                        let stats = entry.entry(f).or_default();
+                        stats.received += s.received;
+                        stats.accepted += s.accepted;
+                    }
+                }
+            }
+        }
+        map
     }
 
     pub(crate) async fn collect_paths(
