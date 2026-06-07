@@ -278,7 +278,6 @@ struct PeerContext {
     conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
     /// Cancels the active-connect retry loop spawned by `enable_active_connect`.
     active_connect_cancel_tx: ActiveConnectCancel,
-    export_map: ExportMap,
     /// GR helper state machine; persists across sessions.
     gr_state: crate::gr::GrState,
     /// Abort handle for the GR restart timer task.
@@ -574,7 +573,6 @@ impl PeerParams {
             context: Arc::new(std::sync::Mutex::new(PeerContext {
                 conn_arbiter,
                 active_connect_cancel_tx: ActiveConnectCancel::default(),
-                export_map: ExportMap::new(),
                 gr_state: crate::gr::GrState::new(),
                 gr_restart_timer: None,
             })),
@@ -2799,11 +2797,9 @@ async fn accept_connection(
         let _ = stream.set_ttl(1);
     }
     let context = Arc::clone(&peer.context);
-    let (conn_arbiter, export_map) = {
+    let conn_arbiter = {
         let ctx = peer.context.lock().unwrap();
-        let conn_arbiter = Arc::clone(&ctx.conn_arbiter);
-        let export_map = ctx.export_map.clone();
-        (conn_arbiter, export_map)
+        Arc::clone(&ctx.conn_arbiter)
     };
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<CloseReason>();
     {
@@ -2823,7 +2819,6 @@ async fn accept_connection(
         counter_tx: peer.counter_tx.clone(),
         counter_rx: peer.counter_rx.clone(),
         tables: tables.clone(),
-        export_map,
         context,
         conn_arbiter,
     };
@@ -3562,7 +3557,6 @@ struct PeerResources {
     counter_tx: Arc<MessageCounter>,
     counter_rx: Arc<MessageCounter>,
     tables: TableHandle,
-    export_map: ExportMap,
     context: Arc<std::sync::Mutex<PeerContext>>,
     conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
 }
@@ -3683,7 +3677,7 @@ impl PeerSession {
             peer_event_rx: None,
             shutdown: None,
             tables: res.tables,
-            export_map: res.export_map,
+            export_map: ExportMap::new(),
             prefix_counters,
             negotiated_gr: None,
             context: res.context,
@@ -5376,7 +5370,6 @@ mod tests {
         Arc::new(std::sync::Mutex::new(PeerContext {
             conn_arbiter,
             active_connect_cancel_tx: ActiveConnectCancel::default(),
-            export_map: ExportMap::new(),
             gr_state: crate::gr::GrState::new(),
             gr_restart_timer: None,
         }))
@@ -6548,52 +6541,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gr_disconnect_clears_export_map() {
-        // When GR is negotiated, apply_disconnect must NOT carry the session's
-        // export_map into the persistent PeerContext.  The next session must
-        // send a full update so the restarting peer can rebuild its RIB.
+    async fn gr_disconnect_runs_without_panic() {
         let tables = make_tables();
         let context = make_context();
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
-
         let info = make_disconnect_info(Some(NegotiatedGr {
             families: vec![Family::IPV4],
             restart_time: std::time::Duration::from_secs(90),
             notification_enabled: false,
         }));
-        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
-
         apply_disconnect(&context, remote_addr, &tables, info).await;
-
-        // The persistent export_map on PeerContext must remain empty.
-        assert!(
-            !context
-                .lock()
-                .unwrap()
-                .export_map
-                .was_sent(Family::IPV4, &nlri)
-        );
     }
 
     #[tokio::test]
-    async fn non_gr_disconnect_clears_export_map() {
-        // On a normal disconnect (no GR), apply_disconnect must also discard
-        // the session's export_map rather than copying it to PeerContext.
+    async fn non_gr_disconnect_runs_without_panic() {
         let tables = make_tables();
         let context = make_context();
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
-
         let info = make_disconnect_info(None);
-        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
-
         apply_disconnect(&context, remote_addr, &tables, info).await;
-
-        assert!(
-            !context
-                .lock()
-                .unwrap()
-                .export_map
-                .was_sent(Family::IPV4, &nlri)
-        );
     }
 }
