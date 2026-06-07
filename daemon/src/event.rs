@@ -2279,7 +2279,7 @@ async fn add_policy_assignment(
     Ok(())
 }
 
-enum ToPeerEvent {
+pub(crate) enum ToPeerEvent {
     NlriChange(table::NlriChange),
 }
 
@@ -3604,6 +3604,32 @@ impl TableManager {
             let _ = tx.send(BgpEvent::PeerDown(data.clone()));
         }
     }
+
+    /// Register a peer's event channel with every shard atomically.
+    ///
+    /// For each shard, while the lock is held, `on_shard` is called with the
+    /// shard's routing table so the caller can populate its initial routes.
+    /// The returned receiver delivers `ToPeerEvent` messages from all shards.
+    pub(crate) async fn register_peer<F>(
+        &self,
+        addr: IpAddr,
+        addpath: FnvHashSet<Family>,
+        mut on_shard: F,
+    ) -> mpsc::UnboundedReceiver<ToPeerEvent>
+    where
+        F: FnMut(&table::Table),
+    {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for shard in &self.shards {
+            let mut t = shard.lock().await;
+            on_shard(&t.rtable);
+            t.peer_event_tx.insert(addr, tx.clone());
+            if !addpath.is_empty() {
+                t.addpath.insert(addr, addpath.clone());
+            }
+        }
+        rx
+    }
 }
 
 struct TableShard {
@@ -4236,7 +4262,7 @@ struct PeerSession {
 
     stream: Option<TcpStream>,
     source: FnvHashMap<Family, Arc<table::Source>>,
-    peer_event_tx: Vec<mpsc::UnboundedSender<ToPeerEvent>>,
+    peer_event_rx: Option<UnboundedReceiverStream<ToPeerEvent>>,
     shutdown: Option<crate::fsm::SessionDownReason>,
     tables: TableHandle,
     export_map: ExportMap,
@@ -4313,7 +4339,7 @@ impl PeerSession {
             close_rx,
             stream: Some(stream),
             source: FnvHashMap::default(),
-            peer_event_tx: Vec::new(),
+            peer_event_rx: None,
             shutdown: None,
             tables,
             export_map,
@@ -4380,7 +4406,7 @@ impl PeerSession {
             close_rx: None,
             stream: None,
             source: FnvHashMap::default(),
-            peer_event_tx: vec![],
+            peer_event_rx: None,
             shutdown: None,
             tables,
             export_map: ExportMap::new(),
@@ -4485,35 +4511,30 @@ impl PeerSession {
         }
 
         let export_policy = self.tables.export_policy.load_full();
-        for i in 0..self.tables.shards.len() {
-            let mut t = self.tables.shards[i].lock().await;
-
-            // Populate initial routes for each negotiated family.
-            for (f, _, _) in &channel_info {
-                let effective_max = self
-                    .conn_arbiter
-                    .lock()
-                    .unwrap()
-                    .connection(self.role)
-                    .and_then(|s| s.send_max().get(f))
-                    .copied()
-                    .unwrap_or(1);
-                Self::populate_from_shard(
-                    &t,
-                    *f,
-                    effective_max,
-                    &export_policy,
-                    &mut self.pending,
-                    &mut self.export_map,
-                );
-            }
-
-            t.peer_event_tx
-                .insert(self.remote_addr, self.peer_event_tx.remove(0));
-            if !addpath.is_empty() {
-                t.addpath.insert(self.remote_addr, addpath.clone());
-            }
-        }
+        let peer_event_rx = self
+            .tables
+            .register_peer(self.remote_addr, addpath, |rtable| {
+                for (f, _, _) in &channel_info {
+                    let effective_max = self
+                        .conn_arbiter
+                        .lock()
+                        .unwrap()
+                        .connection(self.role)
+                        .and_then(|s| s.send_max().get(f))
+                        .copied()
+                        .unwrap_or(1);
+                    Self::populate_from_shard(
+                        rtable,
+                        *f,
+                        effective_max,
+                        &export_policy,
+                        &mut self.pending,
+                        &mut self.export_map,
+                    );
+                }
+            })
+            .await;
+        self.peer_event_rx = Some(UnboundedReceiverStream::new(peer_event_rx));
         let remote_holdtime = HoldTime::new(self.state.remote_holdtime.load(Ordering::Relaxed))
             .unwrap_or(HoldTime::DISABLED);
         self.tables
@@ -4544,18 +4565,18 @@ impl PeerSession {
     }
 
     fn populate_from_shard(
-        t: &TableShard,
+        rtable: &table::Table,
         family: Family,
         effective_max: usize,
         export_policy: &Option<Arc<table::PolicyAssignment>>,
         pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
         export_map: &mut ExportMap,
     ) {
-        for (net, paths) in t.rtable.best_paths(&family) {
+        for (net, paths) in rtable.best_paths(&family) {
             for path in paths.iter().take(effective_max) {
                 let mut nexthop = path.nexthop;
                 if export_policy.as_ref().is_some_and(|a| {
-                    t.rtable.apply_policy(
+                    rtable.apply_policy(
                         a,
                         &path.source,
                         &net,
@@ -4596,7 +4617,7 @@ impl PeerSession {
         for i in 0..self.tables.shards.len() {
             let t = self.tables.shards[i].lock().await;
             Self::populate_from_shard(
-                &t,
+                &t.rtable,
                 family,
                 effective_max,
                 &export_policy,
@@ -5089,13 +5110,6 @@ impl PeerSession {
         };
         let rxbuf_size = 1 << 16;
 
-        let mut peer_event_rx = Vec::new();
-        for _ in 0..self.tables.shards.len() {
-            let (tx, rx) = mpsc::unbounded_channel();
-            self.peer_event_tx.push(tx);
-            peer_event_rx.push(UnboundedReceiverStream::new(rx));
-        }
-
         // Kick off the OPEN exchange via the FSM.
         let outputs = self
             .conn_arbiter
@@ -5111,8 +5125,11 @@ impl PeerSession {
             self.close_rx.take().map(|rx| rx.fuse()).into();
         let mut rxbuf = bytes::BytesMut::with_capacity(rxbuf_size);
         while self.shutdown.is_none() {
-            let mut peer_event_futures: FuturesUnordered<_> =
-                peer_event_rx.iter_mut().map(|rx| rx.next()).collect();
+            let mut peer_event_next: futures::future::OptionFuture<_> = self
+                .peer_event_rx
+                .as_mut()
+                .map(|rx| rx.next().fuse())
+                .into();
 
             let interest = if self.urgent.is_empty() {
                 let mut interest = tokio::io::Interest::READABLE;
@@ -5145,13 +5162,15 @@ impl PeerSession {
                     let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
                     self.process_effects(effects, global).await;
                 }
-                msg = peer_event_futures.next().fuse() => {
-                    if let Some(Some(msg)) = msg {
-                        match msg {
-                            ToPeerEvent::NlriChange(update) => {
-                                self.handle_prefix_update(update);
-                            }
+                msg = peer_event_next => {
+                    match msg {
+                        Some(Some(ToPeerEvent::NlriChange(update))) => {
+                            self.handle_prefix_update(update);
                         }
+                        Some(None) => {
+                            self.peer_event_rx = None;
+                        }
+                        _ => {}
                     }
                 }
                 ready = stream.ready(interest).fuse() => {
@@ -5222,6 +5241,7 @@ impl PeerSession {
             // All per-family Sources share the same peer-level fields; use any for BMP.
             let any_source = self.source.values().next().unwrap().clone();
             let bmp_reason = crate::bmp::session_down_to_bmp(self.shutdown.take());
+            self.peer_event_rx = None;
             for i in 0..self.tables.shards.len() {
                 let mut t = self.tables.shards[i].lock().await;
                 t.peer_event_tx.remove(&self.remote_addr);
