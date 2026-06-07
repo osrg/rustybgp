@@ -3342,8 +3342,6 @@ enum TableEvent {
     /// Remove only stale paths from this peer+family (GR EOR / deferral timer).
     /// Unlike Disconnected, fresh routes from a reconnected session are preserved.
     DropStale(IpAddr, Family),
-    /// Re-run best-path selection after marking routes from this peer stale (GR helper).
-    MarkStale(IpAddr, Family),
     /// Clear the deferral flag for `family` and distribute all accumulated best
     /// paths to peers.  Used by the Restarting Speaker when deferral ends for a
     /// family (FamilyDeferralComplete or EndDeferral from RestartingDeferral).
@@ -3630,6 +3628,27 @@ impl TableManager {
         }
         rx
     }
+
+    pub(crate) async fn unregister_peer(
+        &self,
+        addr: IpAddr,
+        drop_families: &[Family],
+        stale_families: &[Family],
+    ) {
+        let kernel_tx = self.kernel_tx.load_full();
+        let export_policy = self.export_policy.load_full();
+        for shard in &self.shards {
+            let mut t = shard.lock().await;
+            t.peer_event_tx.remove(&addr);
+            t.addpath.remove(&addr);
+            for &family in drop_families {
+                t.disconnected(addr, family, kernel_tx.as_deref());
+            }
+            for &family in stale_families {
+                t.mark_stale(addr, family, kernel_tx.as_deref(), export_policy.as_deref());
+            }
+        }
+    }
 }
 
 struct TableShard {
@@ -3643,6 +3662,29 @@ struct TableShard {
 impl TableShard {
     fn has_addpath(&self, addr: &IpAddr, family: &Family) -> bool {
         self.addpath.get(addr).is_some_and(|e| e.contains(family))
+    }
+
+    fn disconnected(
+        &mut self,
+        addr: IpAddr,
+        family: Family,
+        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+    ) {
+        for change in self.rtable.drop(addr, family) {
+            self.distribute_update(change, kernel_tx, None);
+        }
+    }
+
+    fn mark_stale(
+        &mut self,
+        addr: IpAddr,
+        family: Family,
+        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        export_policy: Option<&table::PolicyAssignment>,
+    ) {
+        for change in self.rtable.restale(addr, family) {
+            self.distribute_update(change, kernel_tx, export_policy);
+        }
     }
 
     fn notify_adj_rib_in(
@@ -3898,11 +3940,6 @@ impl TableShard {
             TableEvent::DropStale(addr, family) => {
                 for change in self.rtable.drop_stale(addr, family, None) {
                     self.distribute_update(change, kernel_tx, None);
-                }
-            }
-            TableEvent::MarkStale(addr, family) => {
-                for change in self.rtable.restale(addr, family) {
-                    self.distribute_update(change, kernel_tx, export_policy);
                 }
             }
             TableEvent::EndDeferral(family) => {
@@ -5235,34 +5272,13 @@ impl PeerSession {
                 .as_ref()
                 .map(|g| g.families.clone())
                 .unwrap_or_default();
-            let import_policy = self.tables.import_policy.load_full();
-            let export_policy = self.tables.export_policy.load_full();
-            let kernel_tx = self.tables.kernel_tx.load_full();
             // All per-family Sources share the same peer-level fields; use any for BMP.
             let any_source = self.source.values().next().unwrap().clone();
             let bmp_reason = crate::bmp::session_down_to_bmp(self.shutdown.take());
             self.peer_event_rx = None;
-            for i in 0..self.tables.shards.len() {
-                let mut t = self.tables.shards[i].lock().await;
-                t.peer_event_tx.remove(&self.remote_addr);
-                t.addpath.remove(&self.remote_addr);
-                for &family in &drop_families {
-                    t.event(
-                        TableEvent::Disconnected(self.remote_addr, family),
-                        kernel_tx.as_deref(),
-                        import_policy.as_deref(),
-                        export_policy.as_deref(),
-                    );
-                }
-                for &family in &stale_families {
-                    t.event(
-                        TableEvent::MarkStale(self.remote_addr, family),
-                        kernel_tx.as_deref(),
-                        import_policy.as_deref(),
-                        export_policy.as_deref(),
-                    );
-                }
-            }
+            self.tables
+                .unregister_peer(self.remote_addr, &drop_families, &stale_families)
+                .await;
             self.tables
                 .peer_down(PeerDownData {
                     peer_addr: any_source.remote_addr,
