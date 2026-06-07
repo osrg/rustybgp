@@ -1465,7 +1465,6 @@ impl GoBgpService for GrpcService {
                                 )),
                             }
                         }
-                        BgpEvent::EndOfInitDump => continue,
                     };
                     if tx.send(Ok(r)).await.is_err() {
                         break;
@@ -3381,8 +3380,6 @@ pub(crate) enum BgpEvent {
     AdjRibIn(AdjRibInChange),
     PeerUp(PeerUpData),
     PeerDown(PeerDownData),
-    /// Signals that the initial snapshot from `subscribe()` is fully delivered.
-    EndOfInitDump,
 }
 
 pub(crate) struct Subscription {
@@ -3576,9 +3573,12 @@ impl TableManager {
         }
     }
 
-    /// Subscribe with full snapshot: sends all current routes as AdjRibIn events per shard,
-    /// then two EndOfRib signals. Registers for live events atomically per shard.
-    pub(crate) async fn subscribe(&self) -> Subscription {
+    /// Subscribe with snapshot: calls `on_change` for each current route (per shard, under lock),
+    /// then registers for live AdjRibIn/PeerUp/PeerDown events.
+    pub(crate) async fn subscribe_with<F>(&self, mut on_change: F) -> Subscription
+    where
+        F: FnMut(AdjRibInChange),
+    {
         let id = SubscriptionId(
             self.next_sub_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -3589,26 +3589,24 @@ impl TableManager {
             let mut subs = self.subscribers.lock().await;
             subs.insert(id, tx.clone());
         }
-        // Snapshot each shard atomically and register for AdjRibIn events.
-        for i in 0..self.shards.len() {
-            let mut shard = self.shards[i].lock().await;
-            for f in shard.rtable.families().collect::<Vec<_>>() {
-                for reach in shard.rtable.iter_reach(f) {
-                    let addpath = shard.has_addpath(&reach.source.remote_addr, &f);
-                    let _ = tx.send(BgpEvent::AdjRibIn(AdjRibInChange {
+        // Snapshot each shard atomically while registering for live AdjRibIn events.
+        for shard in &self.shards {
+            let mut t = shard.lock().await;
+            for f in t.rtable.families().collect::<Vec<_>>() {
+                for reach in t.rtable.iter_reach(f) {
+                    let addpath = t.has_addpath(&reach.source.remote_addr, &f);
+                    on_change(AdjRibInChange {
                         source: reach.source,
                         family: f,
                         addpath,
                         nlris: vec![reach.net],
                         attrs: Some(reach.attr),
                         nexthop: Some(reach.nexthop),
-                    }));
+                    });
                 }
             }
-            shard.subscribers.insert(id, tx.clone());
+            t.subscribers.insert(id, tx.clone());
         }
-        // Signal end of initial snapshot.
-        let _ = tx.send(BgpEvent::EndOfInitDump);
         Subscription { rx, id }
     }
 

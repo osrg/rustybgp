@@ -245,19 +245,11 @@ impl BmpClient {
             ]))
             .await;
 
-        let subscription = tables.subscribe().await;
-        let mut rx = subscription.rx;
-
-        // Buffer all snapshot events until EndOfInitDump.
         let mut snapshot: SnapshotMap = FnvHashMap::default();
-        loop {
-            match rx.recv().await {
-                Some(BgpEvent::AdjRibIn(change)) => apply_snapshot(&mut snapshot, change),
-                Some(BgpEvent::PeerUp(_)) | Some(BgpEvent::PeerDown(_)) => {}
-                Some(BgpEvent::EndOfInitDump) => break,
-                None => return,
-            }
-        }
+        let subscription = tables
+            .subscribe_with(|change| apply_snapshot(&mut snapshot, change))
+            .await;
+        let rx = subscription.rx;
 
         // Send PeerUp for all established peers.
         let local_id = global.read().await.router_id;
@@ -354,7 +346,6 @@ impl BmpClient {
                                 break;
                             }
                         }
-                        Some(BgpEvent::EndOfInitDump) => {}
                         None => break,
                     }
                 }
