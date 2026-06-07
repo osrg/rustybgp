@@ -349,9 +349,6 @@ impl Peer {
         &self,
         local_router_id: Ipv4Addr,
     ) -> Option<(IpAddr, bmp::PerPeerHeader, bmp::Message)> {
-        if self.state.fsm.load(Ordering::Relaxed) != SessionState::Established as u8 {
-            return None;
-        }
         let addrs_guard = self.state.session_addrs.load();
         let addrs = (*addrs_guard).as_ref()?;
         let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
