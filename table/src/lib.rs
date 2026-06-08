@@ -566,10 +566,14 @@ impl Table {
                         .enumerate()
                         .filter(|(_, p)| {
                             if table_type == TableType::AdjIn {
-                                return p.path.source.remote_addr == peer_addr.unwrap();
+                                return p.path.source.remote_addr
+                                    == peer_addr
+                                        .expect("peer_addr is required for AdjIn table type");
                             } else if table_type == TableType::AdjOut {
                                 return best == Some(*p as *const RibEntry)
-                                    && p.path.source.remote_addr != peer_addr.unwrap();
+                                    && p.path.source.remote_addr
+                                        != peer_addr
+                                            .expect("peer_addr is required for AdjOut table type");
                             }
                             true
                         })
