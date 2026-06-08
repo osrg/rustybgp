@@ -328,6 +328,7 @@ impl TableManager {
         query: table::TableQuery,
         family: Family,
         prefixes: Vec<table::PrefixFilter>,
+        enable_filtered: bool,
     ) -> Vec<table::DestinationEntry> {
         let export_policy = if matches!(query, table::TableQuery::AdjOut(_)) {
             self.export_policy.load_full()
@@ -343,6 +344,7 @@ impl TableManager {
                 family,
                 prefixes.clone(),
                 export_policy.clone(),
+                enable_filtered,
             ));
         }
         // Phase 2: apply RPKI validation without holding any shard lock.

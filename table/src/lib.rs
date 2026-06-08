@@ -127,6 +127,9 @@ pub struct PathEntry {
     pub validation: Option<RpkiValidation>,
     /// True when this path is marked stale during Graceful Restart (RFC 4724).
     pub stale: bool,
+    /// True when this path was suppressed by import/export policy.
+    /// Only present when the caller requested filtered paths.
+    pub filtered: bool,
 }
 
 pub struct RpkiValidation {
@@ -586,10 +589,15 @@ impl Table {
         self.ribs.keys().filter(|f| **f != Family::EMPTY).copied()
     }
 
-    /// Returns all paths in the global RIB for the given destination.
-    fn global_paths(dst: &Destination) -> Vec<PathEntry> {
+    /// Returns paths in the global RIB for the given destination.
+    ///
+    /// When `enable_filtered` is false only unfiltered (policy-accepted) paths
+    /// are returned.  When true all paths are returned and those suppressed by
+    /// import policy have `filtered` set to true.
+    fn global_paths(dst: &Destination, enable_filtered: bool) -> Vec<PathEntry> {
         dst.entry
             .iter()
+            .filter(|p| enable_filtered || !p.is_filtered())
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
                 id: p.id,
@@ -597,15 +605,21 @@ impl Table {
                 attr: p.path.attr.clone(),
                 validation: None,
                 stale: p.path.source.is_stale(),
+                filtered: p.is_filtered(),
             })
             .collect()
     }
 
     /// Returns paths received from `peer` (Adj-RIB-In view).
-    fn adj_in_paths(dst: &Destination, peer: IpAddr) -> Vec<PathEntry> {
+    ///
+    /// When `enable_filtered` is false only unfiltered paths are returned.
+    /// When true all paths from that peer are returned and those suppressed by
+    /// import policy have `filtered` set to true.
+    fn adj_in_paths(dst: &Destination, peer: IpAddr, enable_filtered: bool) -> Vec<PathEntry> {
         dst.entry
             .iter()
             .filter(|p| p.path.source.remote_addr == peer)
+            .filter(|p| enable_filtered || !p.is_filtered())
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
                 id: p.id,
@@ -613,6 +627,7 @@ impl Table {
                 attr: p.path.attr.clone(),
                 validation: None,
                 stale: p.path.source.is_stale(),
+                filtered: p.is_filtered(),
             })
             .collect()
     }
@@ -671,6 +686,7 @@ impl Table {
                     attr,
                     validation: None,
                     stale: p.path.source.is_stale(),
+                    filtered: false,
                 })
             })
             .collect()
@@ -689,6 +705,7 @@ impl Table {
         family: Family,
         prefixes: Vec<PrefixFilter>,
         export_policy: Option<Arc<PolicyAssignment>>,
+        enable_filtered: bool,
     ) -> impl Iterator<Item = DestinationEntry> + '_ {
         self.ribs
             .get(&family)
@@ -705,8 +722,8 @@ impl Table {
             })
             .map(move |(net, dst)| {
                 let paths = match query {
-                    TableQuery::Global => Self::global_paths(dst),
-                    TableQuery::AdjIn(peer) => Self::adj_in_paths(dst, peer),
+                    TableQuery::Global => Self::global_paths(dst, enable_filtered),
+                    TableQuery::AdjIn(peer) => Self::adj_in_paths(dst, peer, enable_filtered),
                     TableQuery::AdjOut(peer) => {
                         Self::adj_out_paths(dst, peer, *net, family, export_policy.as_deref())
                     }
@@ -3830,7 +3847,13 @@ mod tests {
         // peer_addr=10.0.0.99 (different from both sources)
         let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
         let dsts: Vec<_> = rt
-            .destinations(TableQuery::AdjOut(peer_addr), Family::IPV4, vec![], None)
+            .destinations(
+                TableQuery::AdjOut(peer_addr),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
             .collect();
         assert_eq!(dsts.len(), 1);
         assert_eq!(dsts[0].paths.len(), 1);
@@ -3856,7 +3879,13 @@ mod tests {
 
         let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
         let dsts: Vec<_> = rt
-            .destinations(TableQuery::AdjOut(peer_addr), Family::IPV4, vec![], None)
+            .destinations(
+                TableQuery::AdjOut(peer_addr),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
             .collect();
         // no unfiltered best → destination should be filtered out
         assert!(dsts.is_empty());
@@ -4788,7 +4817,7 @@ mod tests {
         insert_path(&mut rt, &s2, n2);
 
         let dests: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![], None)
+            .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
             .collect();
         assert_eq!(dests.len(), 2);
         assert!(dests.iter().all(|d| !d.paths.is_empty()));
@@ -4806,7 +4835,7 @@ mod tests {
 
         let peer1 = s1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(TableQuery::AdjIn(peer1), Family::IPV4, vec![], None)
+            .destinations(TableQuery::AdjIn(peer1), Family::IPV4, vec![], None, false)
             .collect();
 
         assert_eq!(dests.len(), 1);
@@ -4847,7 +4876,7 @@ mod tests {
         // Ask for what would be sent to s1; the best path (from s2) should be returned.
         let peer1 = s1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(TableQuery::AdjOut(peer1), Family::IPV4, vec![], None)
+            .destinations(TableQuery::AdjOut(peer1), Family::IPV4, vec![], None, false)
             .collect();
 
         assert_eq!(dests.len(), 1);
@@ -4865,7 +4894,7 @@ mod tests {
 
         let peer1 = s1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(TableQuery::AdjOut(peer1), Family::IPV4, vec![], None)
+            .destinations(TableQuery::AdjOut(peer1), Family::IPV4, vec![], None, false)
             .collect();
 
         // The only path came from peer1, so nothing would be sent back to it.
@@ -4906,7 +4935,13 @@ mod tests {
         insert_path(&mut rt, &s1, n3);
 
         let dests: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![exact(n2)], None)
+            .destinations(
+                TableQuery::Global,
+                Family::IPV4,
+                vec![exact(n2)],
+                None,
+                false,
+            )
             .collect();
 
         assert_eq!(dests.len(), 1);
@@ -4924,7 +4959,7 @@ mod tests {
         insert_path(&mut rt, &s1, n2);
 
         let dests: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![], None)
+            .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
             .collect();
         assert_eq!(dests.len(), 2);
     }
@@ -4953,6 +4988,7 @@ mod tests {
                 Family::IPV4,
                 vec![longer(super16)],
                 None,
+                false,
             )
             .map(|d| d.net)
             .collect();
@@ -4979,7 +5015,13 @@ mod tests {
 
         // Shorter query against 10.0.1.0/24: should return /24 itself and /16 (less specific).
         let mut nets: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![shorter(sub24)], None)
+            .destinations(
+                TableQuery::Global,
+                Family::IPV4,
+                vec![shorter(sub24)],
+                None,
+                false,
+            )
             .map(|d| d.net)
             .collect();
         nets.sort_by_key(|n| n.to_string());
@@ -4988,5 +5030,54 @@ mod tests {
         assert!(nets.contains(&super16));
         assert!(nets.contains(&sub24));
         assert!(!nets.contains(&other));
+    }
+
+    fn insert_filtered_path(rt: &mut Table, src: &Arc<Source>, net: packet::Nlri) {
+        rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            true, // filtered = true
+            None,
+        );
+    }
+
+    #[test]
+    fn destinations_enable_filtered_false_excludes_filtered_paths() {
+        let s1 = source(1, 65001, 65000, 1);
+        let n1 = nlri(10, 0, 0, 0, 24);
+
+        let mut rt = Table::new();
+        insert_filtered_path(&mut rt, &s1, n1);
+
+        // Without enable_filtered the destination has no unfiltered paths and is omitted.
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
+            .collect();
+        assert!(dests.is_empty());
+    }
+
+    #[test]
+    fn destinations_enable_filtered_true_includes_filtered_paths() {
+        let s1 = source(1, 65001, 65000, 1);
+        let n1 = nlri(10, 0, 0, 0, 24);
+        let n2 = nlri(10, 0, 1, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &s1, n1); // unfiltered
+        insert_filtered_path(&mut rt, &s1, n2); // filtered
+
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::IPV4, vec![], None, true)
+            .collect();
+
+        assert_eq!(dests.len(), 2);
+        let d1 = dests.iter().find(|d| d.net == n1).unwrap();
+        let d2 = dests.iter().find(|d| d.net == n2).unwrap();
+        assert!(!d1.paths[0].filtered);
+        assert!(d2.paths[0].filtered);
     }
 }

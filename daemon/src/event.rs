@@ -1740,6 +1740,7 @@ impl GoBgpService for GrpcService {
             .collect();
 
         let batch_size = request.batch_size;
+        let enable_filtered = request.enable_filtered;
         let binary = convert::PathBinaryFlags {
             nlri_binary: request.enable_nlri_binary || request.enable_only_binary,
             attr_binary: request.enable_attribute_binary || request.enable_only_binary,
@@ -1748,7 +1749,7 @@ impl GoBgpService for GrpcService {
         let mut path_count = 0u64;
         let v: Vec<_> = self
             .tables
-            .collect_paths(query, family, prefixes)
+            .collect_paths(query, family, prefixes, enable_filtered)
             .await
             .into_iter()
             .take_while(|d| {

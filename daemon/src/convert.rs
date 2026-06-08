@@ -1447,6 +1447,7 @@ pub(crate) fn destination_to_api(
                 },
                 validation: p.validation.map(rpki_validation_to_api),
                 stale: p.stale,
+                filtered: p.filtered,
                 nlri_binary: if binary.nlri_binary {
                     d.net.encode_to_bytes()
                 } else {
