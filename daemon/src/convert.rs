@@ -1322,6 +1322,68 @@ fn parse_community_value(s: &str) -> Option<u32> {
     None
 }
 
+fn parse_ext_community_value(s: &str) -> Option<[u8; 8]> {
+    let (sub_type, rest) = if let Some(r) = s.strip_prefix("rt:") {
+        (0x02u8, r)
+    } else if let Some(r) = s.strip_prefix("soo:") {
+        (0x03u8, r)
+    } else {
+        return None;
+    };
+    // Try "ASN:local-admin" with 2-octet ASN
+    let parts: Vec<&str> = rest.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    if let Ok(asn) = parts[0].parse::<u16>() {
+        let local: u32 = parts[1].parse().ok()?;
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0x00; // Transitive Two-Octet AS Specific
+        bytes[1] = sub_type;
+        bytes[2] = (asn >> 8) as u8;
+        bytes[3] = asn as u8;
+        bytes[4] = (local >> 24) as u8;
+        bytes[5] = (local >> 16) as u8;
+        bytes[6] = (local >> 8) as u8;
+        bytes[7] = local as u8;
+        return Some(bytes);
+    }
+    // Try "IPv4:local-admin"
+    if let Ok(addr) = parts[0].parse::<Ipv4Addr>() {
+        let local: u16 = parts[1].parse().ok()?;
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0x01; // Transitive IPv4 Address Specific
+        bytes[1] = sub_type;
+        let octets = addr.octets();
+        bytes[2..6].copy_from_slice(&octets);
+        bytes[6] = (local >> 8) as u8;
+        bytes[7] = local as u8;
+        return Some(bytes);
+    }
+    None
+}
+
+fn ext_community_action_from_api(
+    ca: api::CommunityAction,
+) -> Option<rustybgp_table::ExtCommunityAction> {
+    use rustybgp_table::CommunityActionType;
+    let action_type = match api::community_action::Type::try_from(ca.r#type) {
+        Ok(api::community_action::Type::Add) => CommunityActionType::Add,
+        Ok(api::community_action::Type::Remove) => CommunityActionType::Remove,
+        Ok(api::community_action::Type::Replace) => CommunityActionType::Replace,
+        _ => return None,
+    };
+    let communities: Vec<[u8; 8]> = ca
+        .communities
+        .iter()
+        .filter_map(|s| parse_ext_community_value(s))
+        .collect();
+    Some(rustybgp_table::ExtCommunityAction {
+        action_type,
+        communities,
+    })
+}
+
 fn community_action_from_api(ca: api::CommunityAction) -> Option<rustybgp_table::CommunityAction> {
     use rustybgp_table::CommunityActionType;
     let action_type = match api::community_action::Type::try_from(ca.r#type) {
@@ -1403,6 +1465,10 @@ pub(crate) fn disposition_from_api(
             use_left_most: ap.use_left_most,
         });
 
+    let ext_community = actions
+        .ext_community
+        .and_then(ext_community_action_from_api);
+
     Ok((
         disposition,
         rustybgp_table::Actions {
@@ -1411,6 +1477,7 @@ pub(crate) fn disposition_from_api(
             local_pref,
             med,
             as_prepend,
+            ext_community,
         },
     ))
 }

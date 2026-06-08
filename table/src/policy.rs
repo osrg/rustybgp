@@ -477,6 +477,26 @@ fn communities_to_attr(communities: Vec<u32>) -> Option<packet::Attribute> {
     packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, bin)
 }
 
+fn ext_communities_from_attr(attrs: &[packet::Attribute]) -> Vec<[u8; 8]> {
+    attrs
+        .iter()
+        .find(|a| a.code() == packet::Attribute::EXTENDED_COMMUNITY)
+        .and_then(|a| a.binary())
+        .map(|bin| bin.chunks(8).filter_map(|c| c.try_into().ok()).collect())
+        .unwrap_or_default()
+}
+
+fn ext_communities_to_attr(communities: Vec<[u8; 8]>) -> Option<packet::Attribute> {
+    if communities.is_empty() {
+        return None;
+    }
+    let mut bin = Vec::with_capacity(communities.len() * 8);
+    for c in communities {
+        bin.extend_from_slice(&c);
+    }
+    packet::Attribute::new_with_bin(packet::Attribute::EXTENDED_COMMUNITY, bin)
+}
+
 /// Action to set the LOCAL_PREF attribute to a fixed value.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalPrefAction {
@@ -510,6 +530,14 @@ pub struct AsPrependAction {
     pub use_left_most: bool,
 }
 
+/// Action to add, remove, or replace BGP extended communities (RFC 4360).
+/// Each community is stored as its 8-byte wire-format representation.
+#[derive(Clone, Debug)]
+pub struct ExtCommunityAction {
+    pub action_type: CommunityActionType,
+    pub communities: Vec<[u8; 8]>,
+}
+
 /// Actions applied to a route when a policy statement matches.
 #[derive(Clone, Default)]
 pub struct Actions {
@@ -518,6 +546,7 @@ pub struct Actions {
     pub local_pref: Option<LocalPrefAction>,
     pub med: Option<MedAction>,
     pub as_prepend: Option<AsPrependAction>,
+    pub ext_community: Option<ExtCommunityAction>,
 }
 
 #[derive(Clone)]
@@ -632,6 +661,27 @@ impl Statement {
             }
             attrs.retain(|a| a.code() != packet::Attribute::AS_PATH);
             attrs.push(new_as_path);
+        }
+
+        if let Some(action) = &self.actions.ext_community {
+            let attrs = Arc::make_mut(attr);
+            let existing = ext_communities_from_attr(attrs);
+            let new_communities = match action.action_type {
+                CommunityActionType::Add => {
+                    let mut result = existing;
+                    result.extend_from_slice(&action.communities);
+                    result
+                }
+                CommunityActionType::Remove => existing
+                    .into_iter()
+                    .filter(|c| !action.communities.contains(c))
+                    .collect(),
+                CommunityActionType::Replace => action.communities.clone(),
+            };
+            attrs.retain(|a| a.code() != packet::Attribute::EXTENDED_COMMUNITY);
+            if let Some(new_attr) = ext_communities_to_attr(new_communities) {
+                attrs.push(new_attr);
+            }
         }
 
         self.disposition.unwrap_or(Disposition::Pass)
@@ -1538,5 +1588,98 @@ mod tests {
         let mut nexthop = nh();
         Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(get_as_path(&attr), vec![65100, 65100]);
+    }
+
+    fn make_ext_community_assignment(action: ExtCommunityAction) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![],
+                Some(Disposition::Accept),
+                Actions {
+                    ext_community: Some(action),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "ribs",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+        assignment
+    }
+
+    fn get_ext_communities(attrs: &[packet::Attribute]) -> Vec<[u8; 8]> {
+        ext_communities_from_attr(attrs)
+    }
+
+    // rt:65001:100 in two-octet-AS wire format: type=0x00, sub=0x02, ASN=65001, val=100
+    const RT_65001_100: [u8; 8] = [0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0x64];
+    // rt:65001:200
+    const RT_65001_200: [u8; 8] = [0x00, 0x02, 0xFD, 0xE9, 0x00, 0x00, 0x00, 0xC8];
+    // soo:65002:100: type=0x00, sub=0x03, ASN=65002, val=100
+    const SOO_65002_100: [u8; 8] = [0x00, 0x03, 0xFD, 0xEA, 0x00, 0x00, 0x00, 0x64];
+
+    fn attrs_with_ext_community(communities: &[[u8; 8]]) -> Arc<Vec<packet::Attribute>> {
+        let mut bin = Vec::with_capacity(communities.len() * 8);
+        for c in communities {
+            bin.extend_from_slice(c);
+        }
+        Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::EXTENDED_COMMUNITY, bin).unwrap(),
+        ])
+    }
+
+    #[test]
+    fn ext_community_add() {
+        let assignment = make_ext_community_assignment(ExtCommunityAction {
+            action_type: CommunityActionType::Add,
+            communities: vec![RT_65001_100],
+        });
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_ext_community(&[SOO_65002_100]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let result = get_ext_communities(&attr);
+        assert!(result.contains(&SOO_65002_100), "original preserved");
+        assert!(result.contains(&RT_65001_100), "new added");
+    }
+
+    #[test]
+    fn ext_community_remove() {
+        let assignment = make_ext_community_assignment(ExtCommunityAction {
+            action_type: CommunityActionType::Remove,
+            communities: vec![RT_65001_100],
+        });
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_ext_community(&[RT_65001_100, RT_65001_200]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let result = get_ext_communities(&attr);
+        assert!(!result.contains(&RT_65001_100), "removed");
+        assert!(result.contains(&RT_65001_200), "other preserved");
+    }
+
+    #[test]
+    fn ext_community_replace() {
+        let assignment = make_ext_community_assignment(ExtCommunityAction {
+            action_type: CommunityActionType::Replace,
+            communities: vec![RT_65001_100],
+        });
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_ext_community(&[SOO_65002_100, RT_65001_200]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let result = get_ext_communities(&attr);
+        assert_eq!(result, vec![RT_65001_100]);
     }
 }
