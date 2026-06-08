@@ -1791,9 +1791,25 @@ impl GoBgpService for GrpcService {
     }
     async fn delete_dynamic_neighbor(
         &self,
-        _request: tonic::Request<api::DeleteDynamicNeighborRequest>,
+        request: tonic::Request<api::DeleteDynamicNeighborRequest>,
     ) -> Result<tonic::Response<api::DeleteDynamicNeighborResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let req = request.into_inner();
+        let prefix = packet::IpNet::from_str(&req.prefix)
+            .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
+        let mut global = self.global.write().await;
+        let pg = global
+            .peer_group
+            .get_mut(&req.peer_group)
+            .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "peer group not found"))?;
+        let before = pg.dynamic_peers.len();
+        pg.dynamic_peers.retain(|dp| dp.prefix != prefix);
+        if pg.dynamic_peers.len() == before {
+            return Err(tonic::Status::new(
+                tonic::Code::NotFound,
+                "prefix not found in peer group",
+            ));
+        }
+        Ok(tonic::Response::new(api::DeleteDynamicNeighborResponse {}))
     }
     type ListDynamicNeighborStream = Pin<
         Box<
