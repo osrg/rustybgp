@@ -499,6 +499,17 @@ pub struct MedAction {
     pub value: i64,
 }
 
+/// Action to prepend an ASN to the AS_PATH attribute N times.
+#[derive(Clone, Debug)]
+pub struct AsPrependAction {
+    /// ASN to prepend. Ignored when use_left_most is true.
+    pub asn: u32,
+    /// Number of times to prepend.
+    pub repeat: u32,
+    /// If true, prepend the leftmost existing ASN in the path instead of asn.
+    pub use_left_most: bool,
+}
+
 /// Actions applied to a route when a policy statement matches.
 #[derive(Clone, Default)]
 pub struct Actions {
@@ -506,6 +517,7 @@ pub struct Actions {
     pub community: Option<CommunityAction>,
     pub local_pref: Option<LocalPrefAction>,
     pub med: Option<MedAction>,
+    pub as_prepend: Option<AsPrependAction>,
 }
 
 #[derive(Clone)]
@@ -595,6 +607,31 @@ impl Statement {
             {
                 attrs.push(new_attr);
             }
+        }
+
+        if let Some(action) = &self.actions.as_prepend
+            && action.repeat > 0
+        {
+            let attrs = Arc::make_mut(attr);
+            let existing = attrs
+                .iter()
+                .find(|a| a.code() == packet::Attribute::AS_PATH)
+                .cloned()
+                .unwrap_or_else(packet::Attribute::empty_as_path);
+            let asn = if action.use_left_most {
+                bgp::AsPathIter::new(&existing)
+                    .next()
+                    .and_then(|seg| seg.first().copied())
+                    .unwrap_or(action.asn)
+            } else {
+                action.asn
+            };
+            let mut new_as_path = existing;
+            for _ in 0..action.repeat {
+                new_as_path = new_as_path.as_path_prepend(asn);
+            }
+            attrs.retain(|a| a.code() != packet::Attribute::AS_PATH);
+            attrs.push(new_as_path);
         }
 
         self.disposition.unwrap_or(Disposition::Pass)
@@ -1408,5 +1445,98 @@ mod tests {
         let mut nexthop = nh();
         Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(get_med(&attr), Some(0));
+    }
+
+    fn make_as_prepend_assignment(
+        asn: u32,
+        repeat: u32,
+        use_left_most: bool,
+    ) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![],
+                Some(Disposition::Accept),
+                Actions {
+                    as_prepend: Some(AsPrependAction {
+                        asn,
+                        repeat,
+                        use_left_most,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "ribs",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+        assignment
+    }
+
+    fn as_path_attr(asns: &[u32]) -> packet::Attribute {
+        let mut attr = packet::Attribute::empty_as_path();
+        for &asn in asns.iter().rev() {
+            attr = attr.as_path_prepend(asn);
+        }
+        attr
+    }
+
+    fn get_as_path(attrs: &[packet::Attribute]) -> Vec<u32> {
+        attrs
+            .iter()
+            .find(|a| a.code() == packet::Attribute::AS_PATH)
+            .map(|a| bgp::AsPathIter::new(a).flatten().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn as_prepend_once() {
+        let assignment = make_as_prepend_assignment(65100, 1, false);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![as_path_attr(&[65001, 65002])]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_as_path(&attr), vec![65100, 65001, 65002]);
+    }
+
+    #[test]
+    fn as_prepend_multiple() {
+        let assignment = make_as_prepend_assignment(65100, 3, false);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![as_path_attr(&[65001])]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_as_path(&attr), vec![65100, 65100, 65100, 65001]);
+    }
+
+    #[test]
+    fn as_prepend_use_left_most() {
+        let assignment = make_as_prepend_assignment(0, 1, true);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![as_path_attr(&[65001, 65002])]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_as_path(&attr), vec![65001, 65001, 65002]);
+    }
+
+    #[test]
+    fn as_prepend_to_empty_path() {
+        let assignment = make_as_prepend_assignment(65100, 2, false);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_as_path(&attr), vec![65100, 65100]);
     }
 }

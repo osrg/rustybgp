@@ -1395,6 +1395,14 @@ pub(crate) fn disposition_from_api(
         })
     });
 
+    let as_prepend = actions
+        .as_prepend
+        .map(|ap| rustybgp_table::AsPrependAction {
+            asn: ap.asn,
+            repeat: ap.repeat,
+            use_left_most: ap.use_left_most,
+        });
+
     Ok((
         disposition,
         rustybgp_table::Actions {
@@ -1402,6 +1410,7 @@ pub(crate) fn disposition_from_api(
             community,
             local_pref,
             med,
+            as_prepend,
         },
     ))
 }
