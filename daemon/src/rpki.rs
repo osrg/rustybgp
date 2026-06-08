@@ -13,7 +13,7 @@
 // permissions and limitations under the License.
 
 use futures::{SinkExt, StreamExt};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -106,9 +106,22 @@ impl RpkiClient {
         state: Arc<RpkiState>,
         tables: TableHandle,
     ) -> Result<(), Error> {
-        let remote_addr = stream.peer_addr()?.ip();
-        let remote_addr = Arc::new(remote_addr);
-        let mut lines = Framed::new(stream, rpki::RtrCodec::new());
+        let remote_addr = Arc::new(stream.peer_addr()?.ip());
+        let lines = Framed::new(stream, rpki::RtrCodec::new());
+        Self::serve_inner(lines, remote_addr, cancel, soft_reset, state, tables).await
+    }
+
+    async fn serve_inner<IO>(
+        mut lines: Framed<IO, rpki::RtrCodec>,
+        remote_addr: Arc<IpAddr>,
+        cancel: CancellationToken,
+        soft_reset: Arc<Notify>,
+        state: Arc<RpkiState>,
+        tables: TableHandle,
+    ) -> Result<(), Error>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let _ = lines.send(&rpki::Message::ResetQuery).await;
         state.uptime.store(
             SystemTime::now()
@@ -215,5 +228,210 @@ impl RpkiClient {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{SinkExt, StreamExt};
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio_util::codec::Framed;
+
+    use crate::table_manager::TableManager;
+
+    fn make_tables() -> TableHandle {
+        Arc::new(TableManager::new(1))
+    }
+
+    fn spawn_serve_inner(
+        client_io: tokio::io::DuplexStream,
+        state: Arc<RpkiState>,
+        cancel: CancellationToken,
+        soft_reset: Arc<Notify>,
+    ) -> tokio::task::JoinHandle<Result<(), Error>> {
+        let remote_addr = Arc::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)));
+        let framed = Framed::new(client_io, rpki::RtrCodec::new());
+        let tables = make_tables();
+        tokio::spawn(async move {
+            RpkiClient::serve_inner(framed, remote_addr, cancel, soft_reset, state, tables).await
+        })
+    }
+
+    fn end_of_data(session_id: u16, serial_number: u32) -> rpki::Message {
+        rpki::Message::EndOfData {
+            session_id,
+            serial_number,
+            refresh_interval: 0,
+            retry_interval: 0,
+            expire_interval: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_reset_query_on_connect() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let state = Arc::new(RpkiState::default());
+        let cancel = CancellationToken::new();
+        let soft_reset = Arc::new(Notify::new());
+
+        let handle = spawn_serve_inner(client_io, state, cancel.clone(), soft_reset);
+
+        let mut server = Framed::new(server_io, rpki::RtrCodec::new());
+        let msg = server.next().await.unwrap().unwrap();
+        assert!(matches!(msg, rpki::Message::ResetQuery));
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn cache_response_stores_session_id() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let state = Arc::new(RpkiState::default());
+        let cancel = CancellationToken::new();
+        let soft_reset = Arc::new(Notify::new());
+
+        let handle = spawn_serve_inner(client_io, state.clone(), cancel.clone(), soft_reset);
+
+        let mut server = Framed::new(server_io, rpki::RtrCodec::new());
+        let _ = server.next().await.unwrap().unwrap(); // ResetQuery
+        server
+            .send(&rpki::Message::CacheResponse { session_id: 42 })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        assert_eq!(state.session_id.load(Ordering::Relaxed), 42);
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn end_of_data_stores_serial() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let state = Arc::new(RpkiState::default());
+        let cancel = CancellationToken::new();
+        let soft_reset = Arc::new(Notify::new());
+
+        let handle = spawn_serve_inner(client_io, state.clone(), cancel.clone(), soft_reset);
+
+        let mut server = Framed::new(server_io, rpki::RtrCodec::new());
+        let _ = server.next().await.unwrap().unwrap(); // ResetQuery
+        server
+            .send(&rpki::Message::CacheResponse { session_id: 1 })
+            .await
+            .unwrap();
+        server.send(&end_of_data(1, 999)).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        assert_eq!(state.serial.load(Ordering::Relaxed), 999);
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn soft_reset_sends_serial_query_after_end_of_data() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let state = Arc::new(RpkiState::default());
+        let cancel = CancellationToken::new();
+        let soft_reset = Arc::new(Notify::new());
+
+        let handle =
+            spawn_serve_inner(client_io, state.clone(), cancel.clone(), soft_reset.clone());
+
+        let mut server = Framed::new(server_io, rpki::RtrCodec::new());
+        let _ = server.next().await.unwrap().unwrap(); // ResetQuery
+        server
+            .send(&rpki::Message::CacheResponse { session_id: 7 })
+            .await
+            .unwrap();
+        server.send(&end_of_data(7, 100)).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        soft_reset.notify_one();
+
+        let msg = server.next().await.unwrap().unwrap();
+        match msg {
+            rpki::Message::SerialQuery {
+                session_id,
+                serial_number,
+            } => {
+                assert_eq!(session_id, 7);
+                assert_eq!(serial_number, 100);
+            }
+            _ => panic!(
+                "expected SerialQuery, got {:?}",
+                std::mem::discriminant(&msg)
+            ),
+        }
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn soft_reset_before_sync_fires_after_end_of_data() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let state = Arc::new(RpkiState::default());
+        let cancel = CancellationToken::new();
+        let soft_reset = Arc::new(Notify::new());
+
+        let handle =
+            spawn_serve_inner(client_io, state.clone(), cancel.clone(), soft_reset.clone());
+
+        let mut server = Framed::new(server_io, rpki::RtrCodec::new());
+        let _ = server.next().await.unwrap().unwrap(); // ResetQuery
+
+        // Notify before the initial sync is complete; the guard (if end_of_data)
+        // suppresses the arm until EndOfData is processed.
+        soft_reset.notify_one();
+
+        server
+            .send(&rpki::Message::CacheResponse { session_id: 3 })
+            .await
+            .unwrap();
+        server.send(&end_of_data(3, 50)).await.unwrap();
+
+        // The stored notification fires once end_of_data becomes true.
+        let msg = server.next().await.unwrap().unwrap();
+        match msg {
+            rpki::Message::SerialQuery {
+                session_id,
+                serial_number,
+            } => {
+                assert_eq!(session_id, 3);
+                assert_eq!(serial_number, 50);
+            }
+            _ => panic!(
+                "expected SerialQuery, got {:?}",
+                std::mem::discriminant(&msg)
+            ),
+        }
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn state_up_false_after_serve_exits() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let state = Arc::new(RpkiState::default());
+        let cancel = CancellationToken::new();
+        let soft_reset = Arc::new(Notify::new());
+
+        let handle = spawn_serve_inner(client_io, state.clone(), cancel, soft_reset);
+
+        let mut server = Framed::new(server_io, rpki::RtrCodec::new());
+        let _ = server.next().await.unwrap().unwrap(); // ResetQuery
+
+        // Dropping the server side signals EOF to serve_inner, which exits the loop.
+        drop(server);
+        handle.await.unwrap().unwrap();
+
+        assert!(!state.up.load(Ordering::Relaxed));
     }
 }
