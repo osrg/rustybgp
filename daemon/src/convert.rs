@@ -1064,7 +1064,7 @@ fn srv6_service_sub_sub_tlvs_from_api(
 }
 
 pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement {
-    use rustybgp_table::{Comparison, Condition, RpkiValidationState};
+    use rustybgp_table::{Comparison, Condition, RouteType, RpkiValidationState};
     let mut s = api::Statement {
         name: my.name.to_string(),
         conditions: None,
@@ -1131,6 +1131,14 @@ pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement
                 // BGP ORIGIN: 0=IGP, 1=EGP, 2=Incomplete
                 // API OriginType: Igp=1, Egp=2, Incomplete=3
                 conditions.origin = (*val as i32) + 1;
+            }
+            Condition::RouteType(rt) => {
+                use api::conditions::RouteType as ApiRouteType;
+                conditions.route_type = match rt {
+                    RouteType::Internal => ApiRouteType::Internal as i32,
+                    RouteType::External => ApiRouteType::External as i32,
+                    RouteType::Local => ApiRouteType::Local as i32,
+                };
             }
         }
     }
@@ -1240,7 +1248,7 @@ pub(crate) fn conditions_from_api(
     conditions: Option<api::Conditions>,
 ) -> Result<Vec<rustybgp_table::ConditionConfig>, rustybgp_table::TableError> {
     use rustybgp_table::{
-        Comparison, ConditionConfig, MatchOption, RpkiValidationState, TableError,
+        Comparison, ConditionConfig, MatchOption, RouteType, RpkiValidationState, TableError,
     };
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -1323,6 +1331,13 @@ pub(crate) fn conditions_from_api(
                 ));
             }
         }
+    }
+    use api::conditions::RouteType as ApiRouteType;
+    match ApiRouteType::try_from(conditions.route_type) {
+        Ok(ApiRouteType::Internal) => v.push(ConditionConfig::RouteType(RouteType::Internal)),
+        Ok(ApiRouteType::External) => v.push(ConditionConfig::RouteType(RouteType::External)),
+        Ok(ApiRouteType::Local) => v.push(ConditionConfig::RouteType(RouteType::Local)),
+        _ => {}
     }
     Ok(v)
 }

@@ -327,13 +327,20 @@ pub enum Condition {
     // ExtendedCommunity,
     AsPathLength(Comparison, u32),
     Rpki(RpkiValidationState),
-    // RouteType(u32),
     // LargeCommunity,
     // AfiSafiIn(Vec<bgp::Family>),
     LocalPrefEq(u32),
     MedEq(u32),
     /// BGP ORIGIN value: 0=IGP, 1=EGP, 2=Incomplete
     Origin(u8),
+    RouteType(RouteType),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum RouteType {
+    Internal,
+    External,
+    Local,
 }
 
 impl Condition {
@@ -428,6 +435,17 @@ impl Condition {
                     .find(|a| a.code() == packet::Attribute::ORIGIN)
                     .and_then(|a| a.value())
                     == Some(*v as u32);
+            }
+            Condition::RouteType(rt) => {
+                return match rt {
+                    RouteType::Local => source.is_local(),
+                    RouteType::Internal => {
+                        !source.is_local() && source.remote_asn == source.local_asn
+                    }
+                    RouteType::External => {
+                        !source.is_local() && source.remote_asn != source.local_asn
+                    }
+                };
             }
             _ => {}
         }
@@ -833,6 +851,7 @@ pub enum ConditionConfig {
     MedEq(u32),
     /// BGP ORIGIN value: 0=IGP, 1=EGP, 2=Incomplete
     Origin(u8),
+    RouteType(RouteType),
 }
 
 pub enum DefinedSetRef<'a> {
@@ -1262,6 +1281,9 @@ impl PolicyTable {
                 }
                 ConditionConfig::Origin(val) => {
                     v.push(Condition::Origin(val));
+                }
+                ConditionConfig::RouteType(rt) => {
+                    v.push(Condition::RouteType(rt));
                 }
             }
         }
@@ -2057,5 +2079,63 @@ mod tests {
         let mut nexthop = nh();
         let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(d, Disposition::Accept);
+    }
+
+    #[test]
+    fn route_type_local_matches() {
+        let assignment =
+            make_condition_assignment(vec![ConditionConfig::RouteType(RouteType::Local)]);
+        let s = Source::local();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn route_type_local_no_match_for_peer() {
+        let assignment =
+            make_condition_assignment(vec![ConditionConfig::RouteType(RouteType::Local)]);
+        let s = source(); // remote peer, not local
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Accept);
+    }
+
+    #[test]
+    fn route_type_external_matches() {
+        let assignment =
+            make_condition_assignment(vec![ConditionConfig::RouteType(RouteType::External)]);
+        // source() has remote_asn=65001, local_asn=65000 => external
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn route_type_internal_matches() {
+        let assignment =
+            make_condition_assignment(vec![ConditionConfig::RouteType(RouteType::Internal)]);
+        // same ASN => internal
+        let s = Arc::new(Source::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
+            65000,
+            65000,
+            Ipv4Addr::new(0, 0, 0, 1),
+            0,
+            false,
+        ));
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
     }
 }
