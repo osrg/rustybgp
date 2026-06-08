@@ -2365,9 +2365,39 @@ impl GoBgpService for GrpcService {
     }
     async fn enable_rpki(
         &self,
-        _request: tonic::Request<api::EnableRpkiRequest>,
+        request: tonic::Request<api::EnableRpkiRequest>,
     ) -> Result<tonic::Response<api::EnableRpkiResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let request = request.into_inner();
+        let addr = IpAddr::from_str(&request.address)
+            .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
+        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        let (cancel, soft_reset, state) = {
+            let mut global = self.global.write().await;
+            match global.rpki_clients.get_mut(&sockaddr) {
+                None => {
+                    return Err(tonic::Status::new(
+                        tonic::Code::NotFound,
+                        format!("rpki client {} not found", sockaddr),
+                    ));
+                }
+                Some(client) if !client.disabled => {
+                    return Err(tonic::Status::new(
+                        tonic::Code::FailedPrecondition,
+                        format!("rpki client {} is not disabled", sockaddr),
+                    ));
+                }
+                Some(client) => {
+                    client.disabled = false;
+                    (
+                        client.cancel.clone(),
+                        Arc::clone(&client.soft_reset),
+                        Arc::clone(&client.state),
+                    )
+                }
+            }
+        };
+        RpkiClient::try_connect(sockaddr, cancel, soft_reset, state, self.tables.clone());
+        Ok(tonic::Response::new(api::EnableRpkiResponse {}))
     }
     async fn disable_rpki(
         &self,
