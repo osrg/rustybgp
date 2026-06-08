@@ -189,6 +189,14 @@ impl Nlri {
         }
     }
 
+    /// Encode this NLRI into its BGP wire format (prefix-length byte followed
+    /// by the significant address bytes).
+    pub fn encode_to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let _ = self.encode(&mut buf);
+        buf
+    }
+
     // Add a new match arm here when introducing a new SAFI.
     fn decode<T: io::Read>(family: Family, c: &mut T, len: usize) -> Result<Nlri, Error> {
         match family {
@@ -1067,6 +1075,13 @@ impl Attribute {
                 (l, None)
             }
         }
+    }
+
+    /// Encode this attribute into its BGP wire format.
+    pub fn encode_to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let _ = self.encode(&mut buf);
+        buf
     }
 
     fn encode<B: BufMut + AsMut<[u8]>>(&self, dst: &mut B) -> Result<u16, ()> {

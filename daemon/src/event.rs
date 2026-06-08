@@ -1740,6 +1740,11 @@ impl GoBgpService for GrpcService {
             .collect();
 
         let batch_size = request.batch_size;
+        let binary = convert::PathBinaryFlags {
+            nlri_binary: request.enable_nlri_binary || request.enable_only_binary,
+            attr_binary: request.enable_attribute_binary || request.enable_only_binary,
+            only_binary: request.enable_only_binary,
+        };
         let mut path_count = 0u64;
         let v: Vec<_> = self
             .tables
@@ -1754,7 +1759,7 @@ impl GoBgpService for GrpcService {
                 path_count <= batch_size
             })
             .map(|d| api::ListPathResponse {
-                destination: Some(convert::destination_to_api(d, family)),
+                destination: Some(convert::destination_to_api(d, family, &binary)),
             })
             .collect();
         let (tx, rx) = mpsc::channel(1024);

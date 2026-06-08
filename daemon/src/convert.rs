@@ -1410,9 +1410,20 @@ pub(crate) fn routing_table_state_to_api(s: rustybgp_table::TableState) -> api::
     }
 }
 
+/// Controls which binary-encoded fields are populated in each `api::Path`.
+pub(crate) struct PathBinaryFlags {
+    /// Populate `nlri_binary` with the BGP wire encoding of the NLRI.
+    pub nlri_binary: bool,
+    /// Populate `pattrs_binary` with the BGP wire encoding of each attribute.
+    pub attr_binary: bool,
+    /// When true, clear `nlri` and `pattrs` so only the binary fields are present.
+    pub only_binary: bool,
+}
+
 pub(crate) fn destination_to_api(
     d: rustybgp_table::DestinationEntry,
     family: Family,
+    binary: &PathBinaryFlags,
 ) -> api::Destination {
     use crate::proto::ToApi;
     api::Destination {
@@ -1421,13 +1432,31 @@ pub(crate) fn destination_to_api(
             .paths
             .into_iter()
             .map(|p| api::Path {
-                nlri: Some(nlri_to_api(&d.net)),
+                nlri: if binary.only_binary {
+                    None
+                } else {
+                    Some(nlri_to_api(&d.net))
+                },
                 family: Some(family_to_api(family)),
                 identifier: p.id,
                 age: Some(p.timestamp.to_api()),
-                pattrs: p.attr.iter().map(attr_to_api).collect(),
+                pattrs: if binary.only_binary {
+                    vec![]
+                } else {
+                    p.attr.iter().map(attr_to_api).collect()
+                },
                 validation: p.validation.map(rpki_validation_to_api),
                 stale: p.stale,
+                nlri_binary: if binary.nlri_binary {
+                    d.net.encode_to_bytes()
+                } else {
+                    vec![]
+                },
+                pattrs_binary: if binary.attr_binary {
+                    p.attr.iter().map(|a| a.encode_to_bytes()).collect()
+                } else {
+                    vec![]
+                },
                 ..Default::default()
             })
             .collect(),
