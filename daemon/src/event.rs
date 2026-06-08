@@ -1677,9 +1677,24 @@ impl GoBgpService for GrpcService {
     }
     async fn delete_peer_group(
         &self,
-        _request: tonic::Request<api::DeletePeerGroupRequest>,
+        request: tonic::Request<api::DeletePeerGroupRequest>,
     ) -> Result<tonic::Response<api::DeletePeerGroupResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let name = request.into_inner().name;
+        let mut global = self.global.write().await;
+        match global.peer_group.get(&name) {
+            None => Err(tonic::Status::new(
+                tonic::Code::NotFound,
+                "peer group not found",
+            )),
+            Some(pg) if !pg.dynamic_peers.is_empty() => Err(tonic::Status::new(
+                tonic::Code::FailedPrecondition,
+                "peer group has dynamic neighbors; delete them first",
+            )),
+            Some(_) => {
+                global.peer_group.remove(&name);
+                Ok(tonic::Response::new(api::DeletePeerGroupResponse {}))
+            }
+        }
     }
     async fn update_peer_group(
         &self,
