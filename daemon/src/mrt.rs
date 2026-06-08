@@ -19,11 +19,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::Encoder;
+use tokio_util::sync::CancellationToken;
 
 use rustybgp_packet::{self as packet, bgp, mrt};
 
 use crate::error::Error;
-use crate::event::{AdjRibInChange, BgpEvent, GlobalHandle, TableHandle};
+use crate::event::{AdjRibInChange, BgpEvent, TableHandle};
 
 fn adj_rib_in_to_mrt(change: &AdjRibInChange) -> mrt::Message {
     let header = mrt::MpHeader::new(
@@ -90,13 +91,12 @@ impl MrtDumper {
     pub(crate) async fn serve(
         &mut self,
         mut file: tokio::fs::File,
-        global: GlobalHandle,
+        cancel: CancellationToken,
         tables: TableHandle,
     ) -> Result<(), Error> {
         let subscription = tables.subscribe_live().await;
-        let result = self.run_loop(&mut file, subscription.rx).await;
+        let result = self.run_loop(&mut file, subscription.rx, cancel).await;
         tables.unsubscribe(subscription.id).await;
-        global.write().await.mrt_filenames.remove(&self.filename);
         result
     }
 
@@ -104,6 +104,7 @@ impl MrtDumper {
         &self,
         file: &mut tokio::fs::File,
         rx: tokio::sync::mpsc::UnboundedReceiver<BgpEvent>,
+        cancel: CancellationToken,
     ) -> Result<(), Error> {
         let mut codec = mrt::MrtCodec::new();
         let mut rx = UnboundedReceiverStream::new(rx);
@@ -134,6 +135,7 @@ impl MrtDumper {
                             .await?;
                     }
                 }
+                _ = cancel.cancelled() => return Ok(()),
             }
         }
     }

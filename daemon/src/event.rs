@@ -1252,6 +1252,18 @@ impl GoBgpService for GrpcService {
             }
         }
         global.peers.clear();
+        for client in global.bmp_clients.values() {
+            client.cancel.cancel();
+        }
+        global.bmp_clients.clear();
+        for client in global.rpki_clients.values() {
+            client.cancel.cancel();
+        }
+        global.rpki_clients.clear();
+        for cancel in global.mrt_dumpers.values() {
+            cancel.cancel();
+        }
+        global.mrt_dumpers.clear();
         global.asn = 0;
         global.router_id = Ipv4Addr::new(0, 0, 0, 0);
         global.listen_port = Global::BGP_PORT;
@@ -2298,29 +2310,30 @@ impl GoBgpService for GrpcService {
         let interval = request.rotation_interval;
         let filename = request.filename;
         let mut d = crate::mrt::MrtDumper::new(&filename, interval);
+        let cancel = CancellationToken::new();
         {
             let mut g = self.global.write().await;
-            if !g.mrt_filenames.insert(filename.clone()) {
+            if g.mrt_dumpers.contains_key(&filename) {
                 return Err(tonic::Status::new(
                     tonic::Code::AlreadyExists,
                     "mrt dumper already enabled for this file",
                 ));
             }
+            g.mrt_dumpers.insert(filename.clone(), cancel.clone());
         }
         let file = match tokio::fs::File::create(std::path::Path::new(&d.pathname())).await {
             Ok(file) => file,
             Err(e) => {
-                self.global.write().await.mrt_filenames.remove(&filename);
+                self.global.write().await.mrt_dumpers.remove(&filename);
                 return Err(tonic::Status::new(
                     tonic::Code::Internal,
                     format!("failed to create mrt dump file: {e}"),
                 ));
             }
         };
-        let global = self.global.clone();
         let tables = self.tables.clone();
         tokio::spawn(async move {
-            if let Err(e) = d.serve(file, global, tables).await {
+            if let Err(e) = d.serve(file, cancel, tables).await {
                 println!("mrt dumper failed: {:?}", e);
             }
         });
@@ -2328,9 +2341,18 @@ impl GoBgpService for GrpcService {
     }
     async fn disable_mrt(
         &self,
-        _request: tonic::Request<api::DisableMrtRequest>,
+        request: tonic::Request<api::DisableMrtRequest>,
     ) -> Result<tonic::Response<api::DisableMrtResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let filename = request.into_inner().filename;
+        if let Some(cancel) = self.global.write().await.mrt_dumpers.remove(&filename) {
+            cancel.cancel();
+            Ok(tonic::Response::new(api::DisableMrtResponse {}))
+        } else {
+            Err(tonic::Status::new(
+                tonic::Code::NotFound,
+                format!("mrt dumper not found for file: {filename}"),
+            ))
+        }
     }
     async fn add_bmp(
         &self,
@@ -2570,7 +2592,7 @@ pub(crate) struct Global {
 
     rpki_clients: FnvHashMap<SocketAddr, RpkiClient>,
     bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
-    pub(crate) mrt_filenames: FnvHashSet<String>,
+    mrt_dumpers: FnvHashMap<String, CancellationToken>,
 
     /// Selection Deferral state machine for the Restarting Speaker (RFC 4724 §4.1).
     /// Present only when the daemon started with --graceful-restart.
@@ -2618,7 +2640,7 @@ impl Global {
 
             rpki_clients: FnvHashMap::default(),
             bmp_clients: FnvHashMap::default(),
-            mrt_filenames: FnvHashSet::default(),
+            mrt_dumpers: FnvHashMap::default(),
 
             selection_deferral: None,
             selection_deferral_timer: None,
@@ -2870,28 +2892,29 @@ impl Global {
                         continue;
                     }
                     if let Some(filename) = config.file_name.as_ref() {
+                        let cancel = CancellationToken::new();
                         {
                             let mut g = global.write().await;
-                            if !g.mrt_filenames.insert(filename.clone()) {
+                            if g.mrt_dumpers.contains_key(filename) {
                                 println!("mrt dumper already enabled for {filename}, skipping");
                                 continue;
                             }
+                            g.mrt_dumpers.insert(filename.clone(), cancel.clone());
                         }
                         let interval = config.rotation_interval.as_ref().map_or(0, |x| *x);
                         let filename = filename.clone();
                         let mut d = crate::mrt::MrtDumper::new(&filename, interval);
                         match tokio::fs::File::create(std::path::Path::new(&d.pathname())).await {
                             Ok(file) => {
-                                let global2 = global.clone();
                                 let tables2 = tables.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = d.serve(file, global2, tables2).await {
+                                    if let Err(e) = d.serve(file, cancel, tables2).await {
                                         println!("mrt dumper failed: {:?}", e);
                                     }
                                 });
                             }
                             Err(e) => {
-                                global.write().await.mrt_filenames.remove(&filename);
+                                global.write().await.mrt_dumpers.remove(&filename);
                                 println!("failed to create mrt dump file: {:?}", e);
                             }
                         }
