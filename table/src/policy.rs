@@ -438,10 +438,50 @@ pub enum NexthopAction {
     Unchanged,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommunityActionType {
+    Add,
+    Remove,
+    Replace,
+}
+
+/// Action to add, remove, or replace standard BGP communities (RFC 1997).
+#[derive(Clone, Debug)]
+pub struct CommunityAction {
+    pub action_type: CommunityActionType,
+    /// Community values in numeric form (high-16 << 16 | low-16).
+    pub communities: Vec<u32>,
+}
+
+fn communities_from_attr(attrs: &[packet::Attribute]) -> Vec<u32> {
+    attrs
+        .iter()
+        .find(|a| a.code() == packet::Attribute::COMMUNITY)
+        .and_then(|a| a.binary())
+        .map(|bin| {
+            bin.chunks(4)
+                .filter_map(|c| c.try_into().ok().map(|b: [u8; 4]| u32::from_be_bytes(b)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn communities_to_attr(communities: Vec<u32>) -> Option<packet::Attribute> {
+    if communities.is_empty() {
+        return None;
+    }
+    let mut bin = Vec::with_capacity(communities.len() * 4);
+    for c in communities {
+        bin.extend_from_slice(&c.to_be_bytes());
+    }
+    packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, bin)
+}
+
 /// Actions applied to a route when a policy statement matches.
 #[derive(Clone, Default)]
 pub struct Actions {
     pub nexthop: Option<NexthopAction>,
+    pub community: Option<CommunityAction>,
 }
 
 #[derive(Clone)]
@@ -458,7 +498,7 @@ impl Statement {
         &self,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut bgp::Nexthop,
         local_addr: IpAddr,
     ) -> Disposition {
@@ -479,6 +519,27 @@ impl Statement {
                 },
                 NexthopAction::Unchanged => *nexthop,
             };
+        }
+
+        if let Some(action) = &self.actions.community {
+            let attrs = Arc::make_mut(attr);
+            let existing = communities_from_attr(attrs);
+            let new_communities = match action.action_type {
+                CommunityActionType::Add => {
+                    let mut result = existing;
+                    result.extend_from_slice(&action.communities);
+                    result
+                }
+                CommunityActionType::Remove => existing
+                    .into_iter()
+                    .filter(|c| !action.communities.contains(c))
+                    .collect(),
+                CommunityActionType::Replace => action.communities.clone(),
+            };
+            attrs.retain(|a| a.code() != packet::Attribute::COMMUNITY);
+            if let Some(new_attr) = communities_to_attr(new_communities) {
+                attrs.push(new_attr);
+            }
         }
 
         self.disposition.unwrap_or(Disposition::Pass)
@@ -556,7 +617,7 @@ impl Policy {
         &self,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut bgp::Nexthop,
         local_addr: IpAddr,
     ) -> Disposition {
@@ -581,7 +642,7 @@ impl PolicyAssignment {
         &self,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut bgp::Nexthop,
         local_addr: IpAddr,
     ) -> Disposition {
@@ -963,5 +1024,174 @@ impl PolicyTable {
             .iter()
             .filter(move |(pname, _)| name.is_empty() || name.as_str() == pname.as_ref())
             .map(|(_, p)| p.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Source, Table};
+    use rustybgp_packet::bgp;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn source() -> Arc<Source> {
+        Arc::new(Source::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
+            65001,
+            65000,
+            Ipv4Addr::new(0, 0, 0, 1),
+            0,
+            false,
+        ))
+    }
+
+    fn nlri() -> packet::Nlri {
+        packet::Nlri::V4(bgp::Ipv4Net {
+            addr: Ipv4Addr::new(10, 0, 0, 0),
+            mask: 24,
+        })
+    }
+
+    fn nh() -> bgp::Nexthop {
+        bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1))
+    }
+
+    fn local_addr() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254))
+    }
+
+    fn attrs_with_community(communities: &[u32]) -> Arc<Vec<packet::Attribute>> {
+        let mut bin = Vec::with_capacity(communities.len() * 4);
+        for c in communities {
+            bin.extend_from_slice(&c.to_be_bytes());
+        }
+        Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, bin).unwrap(),
+        ])
+    }
+
+    fn get_communities(attrs: &[packet::Attribute]) -> Vec<u32> {
+        communities_from_attr(attrs)
+    }
+
+    fn make_assignment(action: CommunityAction) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![],
+                Some(Disposition::Accept),
+                Actions {
+                    community: Some(action),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "ribs",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+        assignment
+    }
+
+    #[test]
+    fn community_add_to_existing() {
+        let assignment = make_assignment(CommunityAction {
+            action_type: CommunityActionType::Add,
+            communities: vec![0xFDE8_0064], // 65000:100
+        });
+
+        let s = source();
+        let net = nlri();
+        // Route already carries 65000:200
+        let mut attr = attrs_with_community(&[0xFDE8_00C8]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+
+        let result = get_communities(&attr);
+        assert!(
+            result.contains(&0xFDE8_00C8),
+            "original community preserved"
+        );
+        assert!(result.contains(&0xFDE8_0064), "new community added");
+    }
+
+    #[test]
+    fn community_add_to_empty() {
+        let assignment = make_assignment(CommunityAction {
+            action_type: CommunityActionType::Add,
+            communities: vec![0xFDE8_0064],
+        });
+
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+
+        let result = get_communities(&attr);
+        assert_eq!(result, vec![0xFDE8_0064]);
+    }
+
+    #[test]
+    fn community_remove() {
+        let assignment = make_assignment(CommunityAction {
+            action_type: CommunityActionType::Remove,
+            communities: vec![0xFDE8_0064], // remove 65000:100
+        });
+
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_community(&[0xFDE8_0064, 0xFDE8_00C8]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+
+        let result = get_communities(&attr);
+        assert!(!result.contains(&0xFDE8_0064), "65000:100 removed");
+        assert!(result.contains(&0xFDE8_00C8), "65000:200 preserved");
+    }
+
+    #[test]
+    fn community_remove_all_produces_no_attr() {
+        let assignment = make_assignment(CommunityAction {
+            action_type: CommunityActionType::Remove,
+            communities: vec![0xFDE8_0064],
+        });
+
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_community(&[0xFDE8_0064]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+
+        assert!(
+            !attr
+                .iter()
+                .any(|a| a.code() == packet::Attribute::COMMUNITY),
+            "COMMUNITY attribute absent when all removed"
+        );
+    }
+
+    #[test]
+    fn community_replace() {
+        let assignment = make_assignment(CommunityAction {
+            action_type: CommunityActionType::Replace,
+            communities: vec![0xFDE8_0064], // replace with 65000:100
+        });
+
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_community(&[0xFDE8_00C8, 0xFDE8_012C]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+
+        let result = get_communities(&attr);
+        assert_eq!(result, vec![0xFDE8_0064], "communities replaced");
     }
 }

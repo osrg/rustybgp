@@ -557,12 +557,13 @@ impl TableShard {
         // Apply export policy to new_best.
         let filtered_new_best: Option<table::Path> = if let Some(best) = update.new_best() {
             let mut nexthop = best.nexthop;
+            let mut attr = Arc::clone(&best.attr);
             if export_policy.is_some_and(|policy| {
                 table::Table::apply_policy(
                     policy,
                     &best.source,
                     &update.net,
-                    &best.attr,
+                    &mut attr,
                     &mut nexthop,
                     best.source.local_addr,
                 ) == table::Disposition::Reject
@@ -571,6 +572,7 @@ impl TableShard {
             } else {
                 Some(table::Path {
                     nexthop,
+                    attr,
                     ..best.clone()
                 })
             }
@@ -588,12 +590,13 @@ impl TableShard {
                     .iter()
                     .filter_map(|p| {
                         let mut nexthop = p.nexthop;
+                        let mut attr = Arc::clone(&p.attr);
                         if export_policy.is_some_and(|policy| {
                             table::Table::apply_policy(
                                 policy,
                                 &p.source,
                                 &update.net,
-                                &p.attr,
+                                &mut attr,
                                 &mut nexthop,
                                 p.source.local_addr,
                             ) == table::Disposition::Reject
@@ -602,6 +605,7 @@ impl TableShard {
                         } else {
                             Some(table::Path {
                                 nexthop,
+                                attr,
                                 ..p.clone()
                             })
                         }

@@ -1297,6 +1297,50 @@ pub(crate) fn conditions_from_api(
     Ok(v)
 }
 
+fn parse_community_value(s: &str) -> Option<u32> {
+    if let Ok(v) = s.parse::<u32>() {
+        return Some(v);
+    }
+    match s.to_lowercase().as_str() {
+        "graceful-shutdown" => return Some(0xffff_0000),
+        "accept-own" => return Some(0xffff_0001),
+        "llgr-stale" => return Some(0xffff_0006),
+        "no-llgr" => return Some(0xffff_0007),
+        "blackhole" => return Some(0xffff_029a),
+        "no-export" => return Some(0xffff_ff01),
+        "no-advertise" => return Some(0xffff_ff02),
+        "no-export-subconfed" => return Some(0xffff_ff03),
+        "no-peer" => return Some(0xffff_ff04),
+        _ => {}
+    }
+    let parts: Vec<&str> = s.splitn(2, ':').collect();
+    if parts.len() == 2 {
+        let high: u16 = parts[0].parse().ok()?;
+        let low: u16 = parts[1].parse().ok()?;
+        return Some(((high as u32) << 16) | low as u32);
+    }
+    None
+}
+
+fn community_action_from_api(ca: api::CommunityAction) -> Option<rustybgp_table::CommunityAction> {
+    use rustybgp_table::CommunityActionType;
+    let action_type = match api::community_action::Type::try_from(ca.r#type) {
+        Ok(api::community_action::Type::Add) => CommunityActionType::Add,
+        Ok(api::community_action::Type::Remove) => CommunityActionType::Remove,
+        Ok(api::community_action::Type::Replace) => CommunityActionType::Replace,
+        _ => return None,
+    };
+    let communities: Vec<u32> = ca
+        .communities
+        .iter()
+        .filter_map(|s| parse_community_value(s))
+        .collect();
+    Some(rustybgp_table::CommunityAction {
+        action_type,
+        communities,
+    })
+}
+
 pub(crate) fn disposition_from_api(
     actions: Option<api::Actions>,
 ) -> Result<
@@ -1333,7 +1377,9 @@ pub(crate) fn disposition_from_api(
         }
     });
 
-    Ok((disposition, rustybgp_table::Actions { nexthop }))
+    let community = actions.community.and_then(community_action_from_api);
+
+    Ok((disposition, rustybgp_table::Actions { nexthop, community }))
 }
 
 pub(crate) fn defined_set_from_api(

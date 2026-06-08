@@ -648,7 +648,7 @@ impl Table {
                     .keep_aspath(p.path.source.rs_client)
                     .keep_nexthop(p.path.source.rs_client)
                     .build();
-                let attr = Arc::new(
+                let mut attr = Arc::new(
                     p.path
                         .attr
                         .iter()
@@ -665,7 +665,7 @@ impl Table {
                         pa,
                         &p.path.source,
                         &net,
-                        &attr,
+                        &mut attr,
                         &mut nh,
                         p.path.source.local_addr,
                     ) == Disposition::Reject
@@ -1169,7 +1169,7 @@ impl Table {
         assignment: &PolicyAssignment,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut bgp::Nexthop,
         local_addr: IpAddr,
     ) -> Disposition {
@@ -2356,7 +2356,7 @@ mod tests {
             &assignment,
             &s,
             &net,
-            &empty_attrs(),
+            &mut empty_attrs(),
             &mut nh(),
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         );
@@ -2406,7 +2406,7 @@ mod tests {
             &assignment,
             &s,
             &net,
-            &empty_attrs(),
+            &mut empty_attrs(),
             &mut nh(),
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         );
@@ -2440,6 +2440,7 @@ mod tests {
                     nexthop: Some(NexthopAction::Address(IpAddr::V4(Ipv4Addr::new(
                         192, 168, 1, 1,
                     )))),
+                    ..Actions::default()
                 },
             )
             .unwrap();
@@ -2460,7 +2461,7 @@ mod tests {
             &assignment,
             &s,
             &net,
-            &empty_attrs(),
+            &mut empty_attrs(),
             &mut nexthop,
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         );
@@ -2493,6 +2494,7 @@ mod tests {
                 Some(Disposition::Accept),
                 Actions {
                     nexthop: Some(NexthopAction::PeerSelf),
+                    ..Actions::default()
                 },
             )
             .unwrap();
@@ -2514,7 +2516,7 @@ mod tests {
             &assignment,
             &s,
             &net,
-            &empty_attrs(),
+            &mut empty_attrs(),
             &mut nexthop,
             local_addr,
         );
@@ -2549,6 +2551,7 @@ mod tests {
                     nexthop: Some(NexthopAction::Address(IpAddr::V4(Ipv4Addr::new(
                         192, 168, 1, 1,
                     )))),
+                    ..Actions::default()
                 },
             )
             .unwrap();
@@ -2571,7 +2574,7 @@ mod tests {
             &assignment,
             &s,
             &net,
-            &empty_attrs(),
+            &mut empty_attrs(),
             &mut nexthop,
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         );

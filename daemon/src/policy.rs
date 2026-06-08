@@ -31,7 +31,8 @@ pub(crate) fn apply_import(
     nexthop: &mut Nexthop,
 ) -> bool {
     import_policy.is_some_and(|a| {
-        rustybgp_table::Table::apply_policy(a, source, nlri, attrs, nexthop, source.local_addr)
+        let mut attr = Arc::clone(attrs);
+        rustybgp_table::Table::apply_policy(a, source, nlri, &mut attr, nexthop, source.local_addr)
             == Disposition::Reject
     })
 }

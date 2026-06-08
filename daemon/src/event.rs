@@ -4182,12 +4182,13 @@ impl PeerSession {
         for (net, paths) in paths {
             for path in paths.iter().take(effective_max) {
                 let mut nexthop = path.nexthop;
+                let mut attr = Arc::clone(&path.attr);
                 if export_policy.as_ref().is_some_and(|a| {
                     table::Table::apply_policy(
                         a,
                         &path.source,
                         &net,
-                        &path.attr,
+                        &mut attr,
                         &mut nexthop,
                         path.source.local_addr,
                     ) == table::Disposition::Reject
