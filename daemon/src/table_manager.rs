@@ -325,12 +325,11 @@ impl TableManager {
 
     pub(crate) async fn collect_paths(
         &self,
-        table_type: table::TableType,
+        query: table::TableQuery,
         family: Family,
-        peer_addr: Option<IpAddr>,
         prefixes: Vec<packet::Nlri>,
     ) -> Vec<table::DestinationEntry> {
-        let export_policy = if table_type == table::TableType::AdjOut {
+        let export_policy = if matches!(query, table::TableQuery::AdjOut(_)) {
             self.export_policy.load_full()
         } else {
             None
@@ -339,10 +338,9 @@ impl TableManager {
         let mut out = Vec::new();
         for shard in &self.shards {
             let t = shard.lock().await;
-            out.extend(t.rtable.iter_destinations(
-                table_type,
+            out.extend(t.rtable.destinations(
+                query,
                 family,
-                peer_addr,
                 prefixes.clone(),
                 export_policy.clone(),
             ));

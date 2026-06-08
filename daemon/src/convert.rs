@@ -1410,14 +1410,6 @@ pub(crate) fn routing_table_state_to_api(s: rustybgp_table::TableState) -> api::
     }
 }
 
-pub(crate) fn table_type_from_api(t: api::TableType) -> rustybgp_table::TableType {
-    match t {
-        api::TableType::AdjIn => rustybgp_table::TableType::AdjIn,
-        api::TableType::AdjOut => rustybgp_table::TableType::AdjOut,
-        _ => rustybgp_table::TableType::Global,
-    }
-}
-
 pub(crate) fn destination_to_api(
     d: rustybgp_table::DestinationEntry,
     family: Family,

@@ -1691,30 +1691,29 @@ impl GoBgpService for GrpcService {
             Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
-        let (table_type, peer_addr) = if let Ok(t) = api::TableType::try_from(request.table_type) {
-            let s = match t {
+        let query = if let Ok(t) = api::TableType::try_from(request.table_type) {
+            match t {
                 api::TableType::Unspecified => {
                     return Err(tonic::Status::new(
                         tonic::Code::InvalidArgument,
                         "table type unspecified",
                     ));
                 }
-                api::TableType::Global => None,
+                api::TableType::Global => table::TableQuery::Global,
                 api::TableType::Local | api::TableType::Vrf => {
                     return Err(tonic::Status::unimplemented("Not yet implemented"));
                 }
-                api::TableType::AdjIn | api::TableType::AdjOut => {
-                    if let Ok(addr) = IpAddr::from_str(&request.name) {
-                        Some(addr)
-                    } else {
-                        return Err(tonic::Status::new(
-                            tonic::Code::InvalidArgument,
-                            "invalid neighbor name",
-                        ));
-                    }
-                }
-            };
-            (convert::table_type_from_api(t), s)
+                api::TableType::AdjIn => IpAddr::from_str(&request.name)
+                    .map(table::TableQuery::AdjIn)
+                    .map_err(|_| {
+                        tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
+                    })?,
+                api::TableType::AdjOut => IpAddr::from_str(&request.name)
+                    .map(table::TableQuery::AdjOut)
+                    .map_err(|_| {
+                        tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
+                    })?,
+            }
         } else {
             return Err(tonic::Status::new(
                 tonic::Code::InvalidArgument,
@@ -1731,7 +1730,7 @@ impl GoBgpService for GrpcService {
 
         let v: Vec<_> = self
             .tables
-            .collect_paths(table_type, family, peer_addr, prefixes)
+            .collect_paths(query, family, prefixes)
             .await
             .into_iter()
             .map(|d| api::ListPathResponse {

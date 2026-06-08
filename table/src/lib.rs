@@ -53,11 +53,17 @@ pub enum RpkiValidationReason {
     Length,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum TableType {
+/// Identifies which routing table to query and, for per-peer tables,
+/// which peer to scope the query to.
+#[derive(Clone, Copy)]
+pub enum TableQuery {
+    /// The global RIB: best paths selected from all peers.
     Global,
-    AdjIn,
-    AdjOut,
+    /// Adj-RIB-In for the given peer: all paths received from that peer.
+    AdjIn(IpAddr),
+    /// Adj-RIB-Out for the given peer: best paths that would be sent to that peer,
+    /// with export attribute transformations applied.
+    AdjOut(IpAddr),
 }
 
 pub struct DestinationEntry {
@@ -532,11 +538,104 @@ impl Table {
         self.ribs.keys().filter(|f| **f != Family::EMPTY).copied()
     }
 
-    pub fn iter_destinations(
-        &self,
-        table_type: TableType,
+    /// Returns all paths in the global RIB for the given destination.
+    fn global_paths(dst: &Destination) -> Vec<PathEntry> {
+        dst.entry
+            .iter()
+            .map(|p| PathEntry {
+                source: p.path.source.clone(),
+                id: p.id,
+                timestamp: p.timestamp,
+                attr: p.path.attr.clone(),
+                validation: None,
+                stale: p.path.source.is_stale(),
+            })
+            .collect()
+    }
+
+    /// Returns paths received from `peer` (Adj-RIB-In view).
+    fn adj_in_paths(dst: &Destination, peer: IpAddr) -> Vec<PathEntry> {
+        dst.entry
+            .iter()
+            .filter(|p| p.path.source.remote_addr == peer)
+            .map(|p| PathEntry {
+                source: p.path.source.clone(),
+                id: p.id,
+                timestamp: p.timestamp,
+                attr: p.path.attr.clone(),
+                validation: None,
+                stale: p.path.source.is_stale(),
+            })
+            .collect()
+    }
+
+    /// Returns the best path(s) that would be sent to `peer` (Adj-RIB-Out view).
+    ///
+    /// Excludes paths learned from `peer` itself to prevent readvertisement.
+    /// Applies per-peer attribute export transformations and outbound policy.
+    fn adj_out_paths(
+        dst: &Destination,
+        peer: IpAddr,
+        net: packet::Nlri,
         family: Family,
-        peer_addr: Option<IpAddr>,
+        export_policy: Option<&PolicyAssignment>,
+    ) -> Vec<PathEntry> {
+        let best = dst.unfiltered_best().map(|p| p as *const RibEntry);
+        dst.entry
+            .iter()
+            .filter(|p| Some(*p as *const RibEntry) == best && p.path.source.remote_addr != peer)
+            .filter_map(|p| {
+                let codec = bgp::PeerCodecBuilder::new()
+                    .local_asn(p.path.source.local_asn)
+                    .local_addr(p.path.source.local_addr)
+                    .keep_aspath(p.path.source.rs_client)
+                    .keep_nexthop(p.path.source.rs_client)
+                    .build();
+                let attr = Arc::new(
+                    p.path
+                        .attr
+                        .iter()
+                        .cloned()
+                        .map(|a| {
+                            let (_, m) = a.export(a.code(), None::<&mut BytesMut>, family, &codec);
+                            m.unwrap_or(a)
+                        })
+                        .collect::<Vec<packet::Attribute>>(),
+                );
+                if let Some(pa) = export_policy {
+                    let mut nh = p.path.nexthop;
+                    if Self::apply_policy(
+                        pa,
+                        &p.path.source,
+                        &net,
+                        &attr,
+                        &mut nh,
+                        p.path.source.local_addr,
+                    ) == Disposition::Reject
+                    {
+                        return None;
+                    }
+                }
+                Some(PathEntry {
+                    source: p.path.source.clone(),
+                    id: 0,
+                    timestamp: p.timestamp,
+                    attr,
+                    validation: None,
+                    stale: p.path.source.is_stale(),
+                })
+            })
+            .collect()
+    }
+
+    /// Iterates destinations matching `query` and `prefixes` for the given `family`.
+    ///
+    /// When `prefixes` is empty all destinations are returned; otherwise only
+    /// destinations whose NLRI exactly matches one of the given prefixes are included.
+    pub fn destinations(
+        &self,
+        query: TableQuery,
+        family: Family,
         prefixes: Vec<packet::Nlri>,
         export_policy: Option<Arc<PolicyAssignment>>,
     ) -> impl Iterator<Item = DestinationEntry> + '_ {
@@ -545,98 +644,16 @@ impl Table {
             .unwrap_or_else(|| self.ribs.get(&Family::EMPTY).unwrap())
             .destinations
             .iter()
-            .filter(move |(net, _dst)| {
-                prefixes.is_empty() || {
-                    let mut found = false;
-                    for prefix in &prefixes {
-                        if *net == prefix {
-                            found = true;
-                            break;
-                        }
+            .filter(move |(net, _)| prefixes.is_empty() || prefixes.iter().any(|p| *net == p))
+            .map(move |(net, dst)| {
+                let paths = match query {
+                    TableQuery::Global => Self::global_paths(dst),
+                    TableQuery::AdjIn(peer) => Self::adj_in_paths(dst, peer),
+                    TableQuery::AdjOut(peer) => {
+                        Self::adj_out_paths(dst, peer, *net, family, export_policy.as_deref())
                     }
-                    found
-                }
-            })
-            .map(move |(net, dst)| DestinationEntry {
-                net: *net,
-                paths: {
-                    let best = dst.unfiltered_best().map(|p| p as *const RibEntry);
-                    dst.entry
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, p)| {
-                            if table_type == TableType::AdjIn {
-                                return p.path.source.remote_addr
-                                    == peer_addr
-                                        .expect("peer_addr is required for AdjIn table type");
-                            } else if table_type == TableType::AdjOut {
-                                return best == Some(*p as *const RibEntry)
-                                    && p.path.source.remote_addr
-                                        != peer_addr
-                                            .expect("peer_addr is required for AdjOut table type");
-                            }
-                            true
-                        })
-                        .filter_map(|(_, p)| {
-                            if table_type == TableType::AdjOut {
-                                let codec = bgp::PeerCodecBuilder::new()
-                                    .local_asn(p.path.source.local_asn)
-                                    .local_addr(p.path.source.local_addr)
-                                    .keep_aspath(p.path.source.rs_client)
-                                    .keep_nexthop(p.path.source.rs_client)
-                                    .build();
-                                let attr = Arc::new(
-                                    p.path
-                                        .attr
-                                        .iter()
-                                        .cloned()
-                                        .map(|a| {
-                                            let (_, m) = a.export(
-                                                a.code(),
-                                                None::<&mut BytesMut>,
-                                                family,
-                                                &codec,
-                                            );
-                                            if let Some(m) = m { m } else { a }
-                                        })
-                                        .collect::<Vec<packet::Attribute>>(),
-                                );
-                                if let Some(pa) = &export_policy {
-                                    let mut nh = p.path.nexthop;
-                                    if Self::apply_policy(
-                                        pa,
-                                        &p.path.source,
-                                        net,
-                                        &attr,
-                                        &mut nh,
-                                        p.path.source.local_addr,
-                                    ) == Disposition::Reject
-                                    {
-                                        None
-                                    } else {
-                                        Some((p, attr))
-                                    }
-                                } else {
-                                    Some((p, attr))
-                                }
-                            } else {
-                                Some((p, p.path.attr.clone()))
-                            }
-                        })
-                        .map(|(p, attr)| PathEntry {
-                            source: p.path.source.clone(),
-                            id: if table_type == TableType::AdjOut {
-                                0
-                            } else {
-                                p.id
-                            },
-                            timestamp: p.timestamp,
-                            attr,
-                            validation: None,
-                            stale: p.path.source.is_stale(),
-                        })
-                        .collect()
-                },
+                };
+                DestinationEntry { net: *net, paths }
             })
             .filter(|d| !d.paths.is_empty())
     }
@@ -3753,9 +3770,9 @@ mod tests {
         );
 
         // peer_addr=10.0.0.99 (different from both sources)
-        let peer_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)));
+        let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
         let dsts: Vec<_> = rt
-            .iter_destinations(TableType::AdjOut, Family::IPV4, peer_addr, vec![], None)
+            .destinations(TableQuery::AdjOut(peer_addr), Family::IPV4, vec![], None)
             .collect();
         assert_eq!(dsts.len(), 1);
         assert_eq!(dsts[0].paths.len(), 1);
@@ -3779,9 +3796,9 @@ mod tests {
             None,
         );
 
-        let peer_addr = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)));
+        let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
         let dsts: Vec<_> = rt
-            .iter_destinations(TableType::AdjOut, Family::IPV4, peer_addr, vec![], None)
+            .destinations(TableQuery::AdjOut(peer_addr), Family::IPV4, vec![], None)
             .collect();
         // no unfiltered best → destination should be filtered out
         assert!(dsts.is_empty());
@@ -4683,5 +4700,153 @@ mod tests {
         );
         assert!(matches!(result, InsertResult::PrefixLimitExceeded));
         assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    // --- destinations() / TableQuery tests ---
+
+    /// Insert a path from `src` for `net` into `rt` with no filtering.
+    fn insert_path(rt: &mut Table, src: &Arc<Source>, net: packet::Nlri) {
+        rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    fn destinations_global_returns_all_paths() {
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        let n1 = nlri(10, 0, 0, 0, 24);
+        let n2 = nlri(10, 0, 1, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &s1, n1);
+        insert_path(&mut rt, &s2, n2);
+
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::IPV4, vec![], None)
+            .collect();
+        assert_eq!(dests.len(), 2);
+        assert!(dests.iter().all(|d| !d.paths.is_empty()));
+    }
+
+    #[test]
+    fn destinations_adj_in_filters_by_peer() {
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        let n1 = nlri(10, 0, 0, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &s1, n1);
+        insert_path(&mut rt, &s2, n1);
+
+        let peer1 = s1.remote_addr;
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::AdjIn(peer1), Family::IPV4, vec![], None)
+            .collect();
+
+        assert_eq!(dests.len(), 1);
+        assert_eq!(dests[0].paths.len(), 1);
+        assert_eq!(dests[0].paths[0].source.remote_addr, peer1);
+    }
+
+    #[test]
+    fn destinations_adj_out_excludes_source_peer() {
+        // s2 wins best-path selection via higher local_pref.
+        // AdjOut(peer1) must return s2's path, not s1's.
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        let n1 = nlri(10, 0, 0, 0, 24);
+
+        let mut rt = Table::new();
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            n1,
+            0,
+            nh(),
+            attrs_with_local_pref(100),
+            false,
+            None,
+        );
+        rt.insert(
+            s2.clone(),
+            Family::IPV4,
+            n1,
+            0,
+            nh(),
+            attrs_with_local_pref(200),
+            false,
+            None,
+        );
+
+        // Ask for what would be sent to s1; the best path (from s2) should be returned.
+        let peer1 = s1.remote_addr;
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::AdjOut(peer1), Family::IPV4, vec![], None)
+            .collect();
+
+        assert_eq!(dests.len(), 1);
+        assert_eq!(dests[0].paths.len(), 1);
+        assert_ne!(dests[0].paths[0].source.remote_addr, peer1);
+    }
+
+    #[test]
+    fn destinations_adj_out_empty_when_only_path_is_from_peer() {
+        let s1 = source(1, 65001, 65000, 1);
+        let n1 = nlri(10, 0, 0, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &s1, n1);
+
+        let peer1 = s1.remote_addr;
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::AdjOut(peer1), Family::IPV4, vec![], None)
+            .collect();
+
+        // The only path came from peer1, so nothing would be sent back to it.
+        assert!(dests.is_empty());
+    }
+
+    #[test]
+    fn destinations_prefix_filter_returns_only_matching() {
+        let s1 = source(1, 65001, 65000, 1);
+        let n1 = nlri(10, 0, 0, 0, 24);
+        let n2 = nlri(10, 0, 1, 0, 24);
+        let n3 = nlri(10, 0, 2, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &s1, n1);
+        insert_path(&mut rt, &s1, n2);
+        insert_path(&mut rt, &s1, n3);
+
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::IPV4, vec![n2], None)
+            .collect();
+
+        assert_eq!(dests.len(), 1);
+        assert_eq!(dests[0].net, n2);
+    }
+
+    #[test]
+    fn destinations_prefix_filter_empty_returns_all() {
+        let s1 = source(1, 65001, 65000, 1);
+        let n1 = nlri(10, 0, 0, 0, 24);
+        let n2 = nlri(10, 0, 1, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &s1, n1);
+        insert_path(&mut rt, &s1, n2);
+
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::IPV4, vec![], None)
+            .collect();
+        assert_eq!(dests.len(), 2);
     }
 }
