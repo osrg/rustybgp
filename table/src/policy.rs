@@ -477,11 +477,18 @@ fn communities_to_attr(communities: Vec<u32>) -> Option<packet::Attribute> {
     packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, bin)
 }
 
+/// Action to set the LOCAL_PREF attribute to a fixed value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalPrefAction {
+    pub value: u32,
+}
+
 /// Actions applied to a route when a policy statement matches.
 #[derive(Clone, Default)]
 pub struct Actions {
     pub nexthop: Option<NexthopAction>,
     pub community: Option<CommunityAction>,
+    pub local_pref: Option<LocalPrefAction>,
 }
 
 #[derive(Clone)]
@@ -538,6 +545,16 @@ impl Statement {
             };
             attrs.retain(|a| a.code() != packet::Attribute::COMMUNITY);
             if let Some(new_attr) = communities_to_attr(new_communities) {
+                attrs.push(new_attr);
+            }
+        }
+
+        if let Some(action) = &self.actions.local_pref {
+            let attrs = Arc::make_mut(attr);
+            attrs.retain(|a| a.code() != packet::Attribute::LOCAL_PREF);
+            if let Some(new_attr) =
+                packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, action.value)
+            {
                 attrs.push(new_attr);
             }
         }
@@ -1193,5 +1210,72 @@ mod tests {
 
         let result = get_communities(&attr);
         assert_eq!(result, vec![0xFDE8_0064], "communities replaced");
+    }
+
+    fn make_local_pref_assignment(value: u32) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![],
+                Some(Disposition::Accept),
+                Actions {
+                    local_pref: Some(LocalPrefAction { value }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "ribs",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+        assignment
+    }
+
+    fn get_local_pref(attrs: &[packet::Attribute]) -> Option<u32> {
+        attrs
+            .iter()
+            .find(|a| a.code() == packet::Attribute::LOCAL_PREF)
+            .and_then(|a| a.value())
+    }
+
+    #[test]
+    fn local_pref_set_replaces_existing() {
+        let assignment = make_local_pref_assignment(200);
+
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 100).unwrap(),
+        ]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+
+        assert_eq!(get_local_pref(&attr), Some(200));
+        assert_eq!(
+            attr.iter()
+                .filter(|a| a.code() == packet::Attribute::LOCAL_PREF)
+                .count(),
+            1,
+            "only one LOCAL_PREF attribute"
+        );
+    }
+
+    #[test]
+    fn local_pref_set_adds_when_absent() {
+        let assignment = make_local_pref_assignment(150);
+
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+
+        assert_eq!(get_local_pref(&attr), Some(150));
     }
 }

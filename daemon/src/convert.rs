@@ -1379,7 +1379,18 @@ pub(crate) fn disposition_from_api(
 
     let community = actions.community.and_then(community_action_from_api);
 
-    Ok((disposition, rustybgp_table::Actions { nexthop, community }))
+    let local_pref = actions
+        .local_pref
+        .map(|lp| rustybgp_table::LocalPrefAction { value: lp.value });
+
+    Ok((
+        disposition,
+        rustybgp_table::Actions {
+            nexthop,
+            community,
+            local_pref,
+        },
+    ))
 }
 
 pub(crate) fn defined_set_from_api(
