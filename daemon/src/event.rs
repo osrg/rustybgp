@@ -1698,9 +1698,34 @@ impl GoBgpService for GrpcService {
     }
     async fn update_peer_group(
         &self,
-        _request: tonic::Request<api::UpdatePeerGroupRequest>,
+        request: tonic::Request<api::UpdatePeerGroupRequest>,
     ) -> Result<tonic::Response<api::UpdatePeerGroupResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let pg = request
+            .into_inner()
+            .peer_group
+            .ok_or(Error::EmptyArgument)?;
+        let name = pg
+            .conf
+            .as_ref()
+            .ok_or(Error::EmptyArgument)?
+            .peer_group_name
+            .clone();
+        let updated = PeerGroup::from(pg);
+        let mut global = self.global.write().await;
+        match global.peer_group.get_mut(&name) {
+            None => Err(tonic::Status::new(
+                tonic::Code::NotFound,
+                "peer group not found",
+            )),
+            Some(entry) => {
+                entry.as_number = updated.as_number;
+                entry.route_server_client = updated.route_server_client;
+                entry.holdtime = updated.holdtime;
+                Ok(tonic::Response::new(api::UpdatePeerGroupResponse {
+                    needs_soft_reset_in: false,
+                }))
+            }
+        }
     }
     type ListPeerGroupStream = Pin<
         Box<
