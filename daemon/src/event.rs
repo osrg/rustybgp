@@ -1721,11 +1721,22 @@ impl GoBgpService for GrpcService {
             ));
         };
 
-        let prefixes: Vec<packet::Nlri> = request
+        let prefixes: Vec<table::PrefixFilter> = request
             .prefixes
             .iter()
-            .map(|x| packet::Nlri::from_str(&x.prefix))
-            .filter_map(|x| x.ok())
+            .filter_map(|x| {
+                let prefix = packet::Nlri::from_str(&x.prefix).ok()?;
+                let lookup_type = match api::table_lookup_prefix::Type::try_from(x.r#type).ok()? {
+                    api::table_lookup_prefix::Type::Unspecified
+                    | api::table_lookup_prefix::Type::Exact => table::LookupType::Exact,
+                    api::table_lookup_prefix::Type::Longer => table::LookupType::Longer,
+                    api::table_lookup_prefix::Type::Shorter => table::LookupType::Shorter,
+                };
+                Some(table::PrefixFilter {
+                    prefix,
+                    lookup_type,
+                })
+            })
             .collect();
 
         let v: Vec<_> = self

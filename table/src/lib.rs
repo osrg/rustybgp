@@ -66,6 +66,54 @@ pub enum TableQuery {
     AdjOut(IpAddr),
 }
 
+/// Controls how a prefix in a query is matched against RIB entries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LookupType {
+    /// Exact prefix match only.
+    Exact,
+    /// The RIB entry is equally or more specific than the query prefix
+    /// (i.e. the RIB prefix is contained within the query prefix).
+    Longer,
+    /// The RIB entry is equally or less specific than the query prefix
+    /// (i.e. the RIB prefix contains the query prefix).
+    Shorter,
+}
+
+/// A prefix together with the match semantics to apply when filtering RIB entries.
+#[derive(Clone, Copy)]
+pub struct PrefixFilter {
+    pub prefix: packet::Nlri,
+    pub lookup_type: LookupType,
+}
+
+/// Returns true when `supernet` contains `subnet` (i.e. `subnet` is equally or
+/// more specific than `supernet`).  Mixed address families always return false.
+fn nlri_contains(supernet: &packet::Nlri, subnet: &packet::Nlri) -> bool {
+    match (supernet, subnet) {
+        (packet::Nlri::V4(sup), packet::Nlri::V4(sub)) => {
+            if sup.mask > sub.mask {
+                return false;
+            }
+            if sup.mask == 0 {
+                return true;
+            }
+            let shift = 32 - u32::from(sup.mask);
+            u32::from(sup.addr) >> shift == u32::from(sub.addr) >> shift
+        }
+        (packet::Nlri::V6(sup), packet::Nlri::V6(sub)) => {
+            if sup.mask > sub.mask {
+                return false;
+            }
+            if sup.mask == 0 {
+                return true;
+            }
+            let shift = 128 - u32::from(sup.mask);
+            u128::from(sup.addr) >> shift == u128::from(sub.addr) >> shift
+        }
+        _ => false,
+    }
+}
+
 pub struct DestinationEntry {
     pub net: packet::Nlri,
     pub paths: Vec<PathEntry>,
@@ -631,12 +679,15 @@ impl Table {
     /// Iterates destinations matching `query` and `prefixes` for the given `family`.
     ///
     /// When `prefixes` is empty all destinations are returned; otherwise only
-    /// destinations whose NLRI exactly matches one of the given prefixes are included.
+    /// destinations matching at least one `PrefixFilter` are included.
+    /// `LookupType::Exact` requires an identical prefix; `Longer` returns
+    /// entries that are equally or more specific; `Shorter` returns entries
+    /// that are equally or less specific.
     pub fn destinations(
         &self,
         query: TableQuery,
         family: Family,
-        prefixes: Vec<packet::Nlri>,
+        prefixes: Vec<PrefixFilter>,
         export_policy: Option<Arc<PolicyAssignment>>,
     ) -> impl Iterator<Item = DestinationEntry> + '_ {
         self.ribs
@@ -644,7 +695,14 @@ impl Table {
             .unwrap_or_else(|| self.ribs.get(&Family::EMPTY).unwrap())
             .destinations
             .iter()
-            .filter(move |(net, _)| prefixes.is_empty() || prefixes.iter().any(|p| *net == p))
+            .filter(move |(net, _)| {
+                prefixes.is_empty()
+                    || prefixes.iter().any(|f| match f.lookup_type {
+                        LookupType::Exact => **net == f.prefix,
+                        LookupType::Longer => nlri_contains(&f.prefix, net),
+                        LookupType::Shorter => nlri_contains(net, &f.prefix),
+                    })
+            })
             .map(move |(net, dst)| {
                 let paths = match query {
                     TableQuery::Global => Self::global_paths(dst),
@@ -4814,8 +4872,29 @@ mod tests {
         assert!(dests.is_empty());
     }
 
+    fn exact(net: packet::Nlri) -> PrefixFilter {
+        PrefixFilter {
+            prefix: net,
+            lookup_type: LookupType::Exact,
+        }
+    }
+
+    fn longer(net: packet::Nlri) -> PrefixFilter {
+        PrefixFilter {
+            prefix: net,
+            lookup_type: LookupType::Longer,
+        }
+    }
+
+    fn shorter(net: packet::Nlri) -> PrefixFilter {
+        PrefixFilter {
+            prefix: net,
+            lookup_type: LookupType::Shorter,
+        }
+    }
+
     #[test]
-    fn destinations_prefix_filter_returns_only_matching() {
+    fn destinations_prefix_filter_exact_returns_only_matching() {
         let s1 = source(1, 65001, 65000, 1);
         let n1 = nlri(10, 0, 0, 0, 24);
         let n2 = nlri(10, 0, 1, 0, 24);
@@ -4827,7 +4906,7 @@ mod tests {
         insert_path(&mut rt, &s1, n3);
 
         let dests: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![n2], None)
+            .destinations(TableQuery::Global, Family::IPV4, vec![exact(n2)], None)
             .collect();
 
         assert_eq!(dests.len(), 1);
@@ -4848,5 +4927,66 @@ mod tests {
             .destinations(TableQuery::Global, Family::IPV4, vec![], None)
             .collect();
         assert_eq!(dests.len(), 2);
+    }
+
+    #[test]
+    fn destinations_prefix_filter_longer_returns_more_specific() {
+        let s1 = source(1, 65001, 65000, 1);
+        // supernet: 10.0.0.0/16
+        let super16 = nlri(10, 0, 0, 0, 16);
+        // contained: 10.0.1.0/24 and 10.0.2.0/24
+        let sub24a = nlri(10, 0, 1, 0, 24);
+        let sub24b = nlri(10, 0, 2, 0, 24);
+        // outside: 10.1.0.0/24
+        let other = nlri(10, 1, 0, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &s1, super16);
+        insert_path(&mut rt, &s1, sub24a);
+        insert_path(&mut rt, &s1, sub24b);
+        insert_path(&mut rt, &s1, other);
+
+        // Longer query against 10.0.0.0/16: should return /16, /24, /24 inside it.
+        let mut nets: Vec<_> = rt
+            .destinations(
+                TableQuery::Global,
+                Family::IPV4,
+                vec![longer(super16)],
+                None,
+            )
+            .map(|d| d.net)
+            .collect();
+        nets.sort_by_key(|n| n.to_string());
+
+        assert_eq!(nets.len(), 3);
+        assert!(nets.contains(&super16));
+        assert!(nets.contains(&sub24a));
+        assert!(nets.contains(&sub24b));
+        assert!(!nets.contains(&other));
+    }
+
+    #[test]
+    fn destinations_prefix_filter_shorter_returns_less_specific() {
+        let s1 = source(1, 65001, 65000, 1);
+        let super16 = nlri(10, 0, 0, 0, 16);
+        let sub24 = nlri(10, 0, 1, 0, 24);
+        let other = nlri(10, 1, 0, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &s1, super16);
+        insert_path(&mut rt, &s1, sub24);
+        insert_path(&mut rt, &s1, other);
+
+        // Shorter query against 10.0.1.0/24: should return /24 itself and /16 (less specific).
+        let mut nets: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::IPV4, vec![shorter(sub24)], None)
+            .map(|d| d.net)
+            .collect();
+        nets.sort_by_key(|n| n.to_string());
+
+        assert_eq!(nets.len(), 2);
+        assert!(nets.contains(&super16));
+        assert!(nets.contains(&sub24));
+        assert!(!nets.contains(&other));
     }
 }

@@ -327,7 +327,7 @@ impl TableManager {
         &self,
         query: table::TableQuery,
         family: Family,
-        prefixes: Vec<packet::Nlri>,
+        prefixes: Vec<table::PrefixFilter>,
     ) -> Vec<table::DestinationEntry> {
         let export_policy = if matches!(query, table::TableQuery::AdjOut(_)) {
             self.export_policy.load_full()
