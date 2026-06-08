@@ -82,6 +82,7 @@ pub(crate) struct TableManager {
     pub(crate) export_policy: ArcSwapOption<table::PolicyAssignment>,
     next_sub_id: std::sync::atomic::AtomicU64,
     subscribers: Mutex<FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>>,
+    local: Arc<table::Source>,
 }
 
 impl TableManager {
@@ -103,6 +104,7 @@ impl TableManager {
             export_policy: ArcSwapOption::const_empty(),
             next_sub_id: std::sync::atomic::AtomicU64::new(0),
             subscribers: Mutex::new(FnvHashMap::default()),
+            local: table::Source::local(),
         }
     }
 
@@ -183,7 +185,6 @@ impl TableManager {
 
     pub(crate) async fn pass_update(
         &self,
-        source: Arc<table::Source>,
         family: Family,
         nets: Vec<packet::PathNlri>,
         attrs: Option<Arc<Vec<packet::Attribute>>>,
@@ -195,7 +196,7 @@ impl TableManager {
         let export_policy = self.export_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
         self.shards[idx].lock().await.pass_update(
-            source,
+            self.local.clone(),
             family,
             nets,
             attrs,

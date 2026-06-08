@@ -1077,7 +1077,6 @@ impl From<api::PeerGroup> for PeerGroup {
 struct GrpcService {
     init: Arc<tokio::sync::Notify>,
     policy_assignment_sem: tokio::sync::Semaphore,
-    local_source: Arc<table::Source>,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
     global: GlobalHandle,
     tables: TableHandle,
@@ -1094,18 +1093,6 @@ impl GrpcService {
         GrpcService {
             init,
             policy_assignment_sem: tokio::sync::Semaphore::new(1),
-            local_source: Arc::new(table::Source::new(
-                IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-                IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-                0,
-                0,
-                Ipv4Addr::new(0, 0, 0, 0),
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                false,
-            )),
             active_conn_tx,
             global,
             tables,
@@ -1127,7 +1114,6 @@ impl GrpcService {
         path: api::Path,
     ) -> Result<
         (
-            Arc<table::Source>,
             Family,
             Vec<packet::PathNlri>,
             Option<Arc<Vec<packet::Attribute>>>,
@@ -1175,7 +1161,6 @@ impl GrpcService {
             Some(Arc::new(attr))
         };
         Ok((
-            self.local_source.clone(),
             family,
             vec![packet::PathNlri {
                 path_id: path.identifier,
@@ -1853,12 +1838,10 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::AddPathRequest>,
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
-        let (source, family, nets, attrs, nexthop) =
+        let (family, nets, attrs, nexthop) =
             self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
         let map_nets = nets.clone();
-        self.tables
-            .pass_update(source, family, nets, attrs, nexthop)
-            .await;
+        self.tables.pass_update(family, nets, attrs, nexthop).await;
         let id = uuid::Uuid::new_v4();
         self.path_uuid_map
             .lock()
@@ -1887,9 +1870,7 @@ impl GoBgpService for GrpcService {
             .await
             .remove(&id)
             .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "uuid not found"))?;
-        self.tables
-            .pass_update(self.local_source.clone(), family, nets, None, None)
-            .await;
+        self.tables.pass_update(family, nets, None, None).await;
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
     type ListPathStream = Pin<
@@ -1999,10 +1980,8 @@ impl GoBgpService for GrpcService {
         let mut stream = request.into_inner();
         while let Some(Ok(request)) = stream.next().await {
             for path in request.paths {
-                if let Ok((source, family, nets, attrs, nexthop)) = self.local_path(path) {
-                    self.tables
-                        .pass_update(source, family, nets, attrs, nexthop)
-                        .await;
+                if let Ok((family, nets, attrs, nexthop)) = self.local_path(path) {
+                    self.tables.pass_update(family, nets, attrs, nexthop).await;
                 }
             }
         }

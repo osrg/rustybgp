@@ -19,8 +19,8 @@ use std::convert::Into;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr};
 use std::ops::AddAssign;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 
 use bytes::BytesMut;
@@ -450,7 +450,31 @@ impl Hash for Source {
     }
 }
 
+/// Canonical source for locally-injected routes (add_path gRPC API).
+/// All clones share the same allocation, enabling O(1) pointer-based
+/// identity checks via Source::is_local().
+static LOCAL_SOURCE: LazyLock<Arc<Source>> = LazyLock::new(|| {
+    Arc::new(Source {
+        remote_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        remote_asn: 0,
+        local_asn: 0,
+        router_id: 0,
+        uptime: 0,
+        rs_client: false,
+        stale: AtomicBool::new(false),
+    })
+});
+
 impl Source {
+    pub fn local() -> Arc<Self> {
+        Arc::clone(&LOCAL_SOURCE)
+    }
+
+    pub fn is_local(&self) -> bool {
+        std::ptr::eq(self as *const Source, Arc::as_ptr(&LOCAL_SOURCE))
+    }
+
     pub fn new(
         remote_addr: IpAddr,
         local_addr: IpAddr,
