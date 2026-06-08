@@ -1383,12 +1383,25 @@ pub(crate) fn disposition_from_api(
         .local_pref
         .map(|lp| rustybgp_table::LocalPrefAction { value: lp.value });
 
+    let med = actions.med.and_then(|m| {
+        let action_type = match api::med_action::Type::try_from(m.r#type) {
+            Ok(api::med_action::Type::Mod) => rustybgp_table::MedActionType::Mod,
+            Ok(api::med_action::Type::Replace) => rustybgp_table::MedActionType::Replace,
+            _ => return None,
+        };
+        Some(rustybgp_table::MedAction {
+            action_type,
+            value: m.value,
+        })
+    });
+
     Ok((
         disposition,
         rustybgp_table::Actions {
             nexthop,
             community,
             local_pref,
+            med,
         },
     ))
 }

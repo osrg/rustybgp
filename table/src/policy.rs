@@ -483,12 +483,29 @@ pub struct LocalPrefAction {
     pub value: u32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum MedActionType {
+    /// Add the signed value to the existing MED (clamped to [0, u32::MAX]).
+    Mod,
+    /// Set the MED to the given value regardless of any existing MED.
+    Replace,
+}
+
+/// Action to modify or replace the MULTI_EXIT_DISC (MED) attribute.
+#[derive(Clone, Debug)]
+pub struct MedAction {
+    pub action_type: MedActionType,
+    /// For Mod: signed delta. For Replace: the new MED value (must be >= 0).
+    pub value: i64,
+}
+
 /// Actions applied to a route when a policy statement matches.
 #[derive(Clone, Default)]
 pub struct Actions {
     pub nexthop: Option<NexthopAction>,
     pub community: Option<CommunityAction>,
     pub local_pref: Option<LocalPrefAction>,
+    pub med: Option<MedAction>,
 }
 
 #[derive(Clone)]
@@ -554,6 +571,27 @@ impl Statement {
             attrs.retain(|a| a.code() != packet::Attribute::LOCAL_PREF);
             if let Some(new_attr) =
                 packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, action.value)
+            {
+                attrs.push(new_attr);
+            }
+        }
+
+        if let Some(action) = &self.actions.med {
+            let attrs = Arc::make_mut(attr);
+            let current = attrs
+                .iter()
+                .find(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
+                .and_then(|a| a.value())
+                .unwrap_or(0);
+            let new_med = match action.action_type {
+                MedActionType::Mod => {
+                    (current as i64 + action.value).clamp(0, u32::MAX as i64) as u32
+                }
+                MedActionType::Replace => action.value.clamp(0, u32::MAX as i64) as u32,
+            };
+            attrs.retain(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC);
+            if let Some(new_attr) =
+                packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, new_med)
             {
                 attrs.push(new_attr);
             }
@@ -1277,5 +1315,98 @@ mod tests {
         Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
 
         assert_eq!(get_local_pref(&attr), Some(150));
+    }
+
+    fn make_med_assignment(action_type: MedActionType, value: i64) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![],
+                Some(Disposition::Accept),
+                Actions {
+                    med: Some(MedAction { action_type, value }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "ribs",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+        assignment
+    }
+
+    fn get_med(attrs: &[packet::Attribute]) -> Option<u32> {
+        attrs
+            .iter()
+            .find(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
+            .and_then(|a| a.value())
+    }
+
+    fn attrs_with_med(med: u32) -> Arc<Vec<packet::Attribute>> {
+        Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, med).unwrap(),
+        ])
+    }
+
+    #[test]
+    fn med_replace_existing() {
+        let assignment = make_med_assignment(MedActionType::Replace, 300);
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_med(100);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_med(&attr), Some(300));
+    }
+
+    #[test]
+    fn med_replace_absent() {
+        let assignment = make_med_assignment(MedActionType::Replace, 100);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_med(&attr), Some(100));
+    }
+
+    #[test]
+    fn med_mod_add() {
+        let assignment = make_med_assignment(MedActionType::Mod, 50);
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_med(200);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_med(&attr), Some(250));
+    }
+
+    #[test]
+    fn med_mod_subtract() {
+        let assignment = make_med_assignment(MedActionType::Mod, -50);
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_med(200);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_med(&attr), Some(150));
+    }
+
+    #[test]
+    fn med_mod_clamp_to_zero() {
+        let assignment = make_med_assignment(MedActionType::Mod, -200);
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_med(100);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_med(&attr), Some(0));
     }
 }
