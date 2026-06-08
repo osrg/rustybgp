@@ -152,6 +152,23 @@ impl RpkiClient {
                     };
                     state.update(&msg);
                     match msg {
+                        rpki::Message::SerialNotify { serial_number, .. }
+                            if end_of_data
+                                && serial_number != state.serial.load(Ordering::Relaxed) =>
+                        {
+                            let session_id = state.session_id.load(Ordering::Relaxed);
+                            let current_serial = state.serial.load(Ordering::Relaxed);
+                            state.update(&rpki::Message::SerialQuery {
+                                session_id,
+                                serial_number: current_serial,
+                            });
+                            let _ = lines
+                                .send(&rpki::Message::SerialQuery {
+                                    session_id,
+                                    serial_number: current_serial,
+                                })
+                                .await;
+                        }
                         rpki::Message::CacheResponse { session_id } => {
                             state.session_id.store(session_id, Ordering::Relaxed);
                         }
