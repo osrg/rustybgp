@@ -328,13 +328,13 @@ pub enum Condition {
     AsPathLength(Comparison, u32),
     Rpki(RpkiValidationState),
     // LargeCommunity,
-    // AfiSafiIn(Vec<bgp::Family>),
     LocalPrefEq(u32),
     MedEq(u32),
     /// BGP ORIGIN value: 0=IGP, 1=EGP, 2=Incomplete
     Origin(u8),
     RouteType(RouteType),
     CommunityCount(Comparison, u32),
+    AfiSafiIn(Vec<bgp::Family>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -456,9 +456,33 @@ impl Condition {
                     Comparison::Le => count <= *v,
                 };
             }
+            Condition::AfiSafiIn(families) => {
+                return families.contains(&nlri_family(net));
+            }
             _ => {}
         }
         false
+    }
+}
+
+fn nlri_family(net: &packet::Nlri) -> bgp::Family {
+    use packet::mup::MupNlri;
+    match net {
+        packet::Nlri::V4(_) => bgp::Family::IPV4,
+        packet::Nlri::V6(_) => bgp::Family::IPV6,
+        packet::Nlri::Mup(m) => {
+            let is_ipv4 = match m {
+                MupNlri::InterworkSegmentDiscovery(r) => r.prefix_addr.is_ipv4(),
+                MupNlri::DirectSegmentDiscovery(r) => r.address.is_ipv4(),
+                MupNlri::Type1SessionTransformed(r) => r.prefix_addr.is_ipv4(),
+                MupNlri::Type2SessionTransformed(r) => r.endpoint_address.is_ipv4(),
+            };
+            if is_ipv4 {
+                bgp::Family::IPV4_MUP
+            } else {
+                bgp::Family::IPV6_MUP
+            }
+        }
     }
 }
 
@@ -862,6 +886,7 @@ pub enum ConditionConfig {
     Origin(u8),
     RouteType(RouteType),
     CommunityCount(Comparison, u32),
+    AfiSafiIn(Vec<bgp::Family>),
 }
 
 pub enum DefinedSetRef<'a> {
@@ -1297,6 +1322,9 @@ impl PolicyTable {
                 }
                 ConditionConfig::CommunityCount(cmp, count) => {
                     v.push(Condition::CommunityCount(cmp, count));
+                }
+                ConditionConfig::AfiSafiIn(families) => {
+                    v.push(Condition::AfiSafiIn(families));
                 }
             }
         }
@@ -2165,6 +2193,30 @@ mod tests {
         let mut nexthop = nh();
         let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn afi_safi_in_ipv4_match() {
+        let assignment =
+            make_condition_assignment(vec![ConditionConfig::AfiSafiIn(vec![bgp::Family::IPV4])]);
+        let s = source();
+        let net = nlri(); // V4
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn afi_safi_in_ipv4_no_match_for_ipv6() {
+        let assignment =
+            make_condition_assignment(vec![ConditionConfig::AfiSafiIn(vec![bgp::Family::IPV6])]);
+        let s = source();
+        let net = nlri(); // V4
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Accept);
     }
 
     #[test]

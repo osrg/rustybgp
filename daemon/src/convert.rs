@@ -1150,6 +1150,9 @@ pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement
                     count: *count,
                 });
             }
+            Condition::AfiSafiIn(families) => {
+                conditions.afi_safi_in = families.iter().map(|f| family_to_api(*f)).collect();
+            }
         }
     }
     s.conditions = Some(conditions);
@@ -1354,6 +1357,14 @@ pub(crate) fn conditions_from_api(
             Comparison::from(m.r#type),
             m.count,
         ));
+    }
+    if !conditions.afi_safi_in.is_empty() {
+        let families: Vec<rustybgp_packet::Family> = conditions
+            .afi_safi_in
+            .iter()
+            .map(|f| rustybgp_packet::Family::new((f.afi as u32) << 16 | f.safi as u32))
+            .collect();
+        v.push(ConditionConfig::AfiSafiIn(families));
     }
     Ok(v)
 }
