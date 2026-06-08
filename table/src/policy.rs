@@ -332,6 +332,8 @@ pub enum Condition {
     // AfiSafiIn(Vec<bgp::Family>),
     LocalPrefEq(u32),
     MedEq(u32),
+    /// BGP ORIGIN value: 0=IGP, 1=EGP, 2=Incomplete
+    Origin(u8),
 }
 
 impl Condition {
@@ -419,6 +421,13 @@ impl Condition {
                     .find(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
                     .and_then(|a| a.value())
                     == Some(*v);
+            }
+            Condition::Origin(v) => {
+                return attr
+                    .iter()
+                    .find(|a| a.code() == packet::Attribute::ORIGIN)
+                    .and_then(|a| a.value())
+                    == Some(*v as u32);
             }
             _ => {}
         }
@@ -822,6 +831,8 @@ pub enum ConditionConfig {
     Rpki(RpkiValidationState),
     LocalPrefEq(u32),
     MedEq(u32),
+    /// BGP ORIGIN value: 0=IGP, 1=EGP, 2=Incomplete
+    Origin(u8),
 }
 
 pub enum DefinedSetRef<'a> {
@@ -1248,6 +1259,9 @@ impl PolicyTable {
                 }
                 ConditionConfig::MedEq(val) => {
                     v.push(Condition::MedEq(val));
+                }
+                ConditionConfig::Origin(val) => {
+                    v.push(Condition::Origin(val));
                 }
             }
         }
@@ -2011,6 +2025,34 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, 99).unwrap(),
+        ]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Accept);
+    }
+
+    #[test]
+    fn origin_condition_match() {
+        // BGP ORIGIN 1 = EGP
+        let assignment = make_condition_assignment(vec![ConditionConfig::Origin(1)]);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap(),
+        ]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn origin_condition_no_match() {
+        // condition is EGP, route has IGP
+        let assignment = make_condition_assignment(vec![ConditionConfig::Origin(1)]);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]);
         let mut nexthop = nh();
         let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());

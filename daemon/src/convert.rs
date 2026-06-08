@@ -1127,6 +1127,11 @@ pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement
             Condition::MedEq(val) => {
                 conditions.med_eq = Some(api::MedEq { value: *val });
             }
+            Condition::Origin(val) => {
+                // BGP ORIGIN: 0=IGP, 1=EGP, 2=Incomplete
+                // API OriginType: Igp=1, Egp=2, Incomplete=3
+                conditions.origin = (*val as i32) + 1;
+            }
         }
     }
     s.conditions = Some(conditions);
@@ -1305,6 +1310,19 @@ pub(crate) fn conditions_from_api(
     }
     if let Some(m) = conditions.med_eq {
         v.push(ConditionConfig::MedEq(m.value));
+    }
+    // API OriginType: Igp=1, Egp=2, Incomplete=3; BGP ORIGIN: 0=IGP, 1=EGP, 2=Incomplete
+    if conditions.origin != api::OriginType::Unspecified as i32 {
+        match api::OriginType::try_from(conditions.origin) {
+            Ok(api::OriginType::Igp) => v.push(ConditionConfig::Origin(0)),
+            Ok(api::OriginType::Egp) => v.push(ConditionConfig::Origin(1)),
+            Ok(api::OriginType::Incomplete) => v.push(ConditionConfig::Origin(2)),
+            _ => {
+                return Err(TableError::InvalidArgument(
+                    "invalid origin condition".to_string(),
+                ));
+            }
+        }
     }
     Ok(v)
 }
