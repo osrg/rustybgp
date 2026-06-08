@@ -1191,12 +1191,108 @@ pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement
             },
         }
     });
+    let actions = &my.actions;
+    use rustybgp_table::MedActionType;
+
+    let community = actions.community.as_ref().map(|a| api::CommunityAction {
+        r#type: community_action_type_to_i32(&a.action_type),
+        communities: a
+            .communities
+            .iter()
+            .map(|&c| format!("{}:{}", c >> 16, c & 0xffff))
+            .collect(),
+    });
+
+    let local_pref = actions
+        .local_pref
+        .as_ref()
+        .map(|a| api::LocalPrefAction { value: a.value });
+
+    let med = actions.med.as_ref().map(|a| api::MedAction {
+        r#type: match a.action_type {
+            MedActionType::Mod => api::med_action::Type::Mod as i32,
+            MedActionType::Replace => api::med_action::Type::Replace as i32,
+        },
+        value: a.value,
+    });
+
+    let as_prepend = actions.as_prepend.as_ref().map(|a| api::AsPrependAction {
+        asn: a.asn,
+        repeat: a.repeat,
+        use_left_most: a.use_left_most,
+    });
+
+    let ext_community = actions
+        .ext_community
+        .as_ref()
+        .map(|a| api::CommunityAction {
+            r#type: community_action_type_to_i32(&a.action_type),
+            communities: a
+                .communities
+                .iter()
+                .filter_map(ext_community_bytes_to_string)
+                .collect(),
+        });
+
+    let large_community = actions
+        .large_community
+        .as_ref()
+        .map(|a| api::CommunityAction {
+            r#type: community_action_type_to_i32(&a.action_type),
+            communities: a
+                .communities
+                .iter()
+                .map(|(ga, ld1, ld2)| format!("{}:{}:{}", ga, ld1, ld2))
+                .collect(),
+        });
+
+    let origin_action = actions.origin.as_ref().map(|a| api::OriginAction {
+        // BGP ORIGIN: 0=IGP, 1=EGP, 2=Incomplete → API OriginType: Igp=1, Egp=2, Incomplete=3
+        origin: (a.origin as i32) + 1,
+    });
+
     s.actions = Some(api::Actions {
         route_action: my.disposition.map_or(0, |a| a as i32),
         nexthop,
-        ..Default::default()
+        community,
+        local_pref,
+        med,
+        as_prepend,
+        ext_community,
+        large_community,
+        origin_action,
     });
     s
+}
+
+fn community_action_type_to_i32(t: &rustybgp_table::CommunityActionType) -> i32 {
+    use rustybgp_table::CommunityActionType;
+    match t {
+        CommunityActionType::Add => api::community_action::Type::Add as i32,
+        CommunityActionType::Remove => api::community_action::Type::Remove as i32,
+        CommunityActionType::Replace => api::community_action::Type::Replace as i32,
+    }
+}
+
+fn ext_community_bytes_to_string(c: &[u8; 8]) -> Option<String> {
+    let prefix = match c[1] {
+        0x02 => "rt",
+        0x03 => "soo",
+        _ => return None,
+    };
+    match c[0] {
+        0x00 => {
+            let asn = u16::from_be_bytes([c[2], c[3]]);
+            let local = u32::from_be_bytes([c[4], c[5], c[6], c[7]]);
+            Some(format!("{}:{}:{}", prefix, asn, local))
+        }
+        0x01 => {
+            let addr = Ipv4Addr::new(c[2], c[3], c[4], c[5]);
+            let local = u16::from_be_bytes([c[6], c[7]]);
+            Some(format!("{}:{}:{}", prefix, addr, local))
+        }
+        _ => None,
+    }
 }
 
 fn match_option_to_i32(opt: &rustybgp_table::MatchOption) -> i32 {
@@ -2277,5 +2373,303 @@ mod tests {
         };
         let mut c = Cursor::new(Vec::new());
         assert!(write_extcom(&mut c, bad).is_err());
+    }
+
+    // ─── Statement Actions roundtrip ─────────────────────────────────────────
+
+    fn actions_roundtrip(api_actions: api::Actions) -> api::Actions {
+        let (disposition, actions) =
+            disposition_from_api(Some(api_actions)).expect("disposition_from_api failed");
+        let stmt = rustybgp_table::Statement {
+            name: std::sync::Arc::from("s"),
+            conditions: vec![],
+            disposition,
+            actions,
+        };
+        statement_to_api(&stmt)
+            .actions
+            .expect("no actions in output")
+    }
+
+    #[test]
+    fn actions_roundtrip_community_add() {
+        let out = actions_roundtrip(api::Actions {
+            community: Some(api::CommunityAction {
+                r#type: api::community_action::Type::Add as i32,
+                communities: vec!["100:200".to_string()],
+            }),
+            ..Default::default()
+        });
+        let c = out.community.expect("community missing");
+        assert_eq!(c.r#type, api::community_action::Type::Add as i32);
+        assert_eq!(c.communities, vec!["100:200"]);
+    }
+
+    #[test]
+    fn actions_roundtrip_local_pref() {
+        let out = actions_roundtrip(api::Actions {
+            local_pref: Some(api::LocalPrefAction { value: 150 }),
+            ..Default::default()
+        });
+        assert_eq!(out.local_pref.expect("local_pref missing").value, 150);
+    }
+
+    #[test]
+    fn actions_roundtrip_med_mod() {
+        let out = actions_roundtrip(api::Actions {
+            med: Some(api::MedAction {
+                r#type: api::med_action::Type::Mod as i32,
+                value: 10,
+            }),
+            ..Default::default()
+        });
+        let med = out.med.expect("med missing");
+        assert_eq!(med.r#type, api::med_action::Type::Mod as i32);
+        assert_eq!(med.value, 10);
+    }
+
+    #[test]
+    fn actions_roundtrip_med_replace() {
+        let out = actions_roundtrip(api::Actions {
+            med: Some(api::MedAction {
+                r#type: api::med_action::Type::Replace as i32,
+                value: 500,
+            }),
+            ..Default::default()
+        });
+        let med = out.med.expect("med missing");
+        assert_eq!(med.r#type, api::med_action::Type::Replace as i32);
+        assert_eq!(med.value, 500);
+    }
+
+    #[test]
+    fn actions_roundtrip_as_prepend() {
+        let out = actions_roundtrip(api::Actions {
+            as_prepend: Some(api::AsPrependAction {
+                asn: 65001,
+                repeat: 3,
+                use_left_most: false,
+            }),
+            ..Default::default()
+        });
+        let ap = out.as_prepend.expect("as_prepend missing");
+        assert_eq!(ap.asn, 65001);
+        assert_eq!(ap.repeat, 3);
+    }
+
+    #[test]
+    fn actions_roundtrip_ext_community_rt() {
+        // rt:65001:100  → type 0x00, sub_type 0x02, AS=65001, local=100
+        let out = actions_roundtrip(api::Actions {
+            ext_community: Some(api::CommunityAction {
+                r#type: api::community_action::Type::Add as i32,
+                communities: vec!["rt:65001:100".to_string()],
+            }),
+            ..Default::default()
+        });
+        let ec = out.ext_community.expect("ext_community missing");
+        assert_eq!(ec.r#type, api::community_action::Type::Add as i32);
+        assert_eq!(ec.communities, vec!["rt:65001:100"]);
+    }
+
+    #[test]
+    fn actions_roundtrip_large_community() {
+        let out = actions_roundtrip(api::Actions {
+            large_community: Some(api::CommunityAction {
+                r#type: api::community_action::Type::Replace as i32,
+                communities: vec!["65001:1:2".to_string()],
+            }),
+            ..Default::default()
+        });
+        let lc = out.large_community.expect("large_community missing");
+        assert_eq!(lc.r#type, api::community_action::Type::Replace as i32);
+        assert_eq!(lc.communities, vec!["65001:1:2"]);
+    }
+
+    #[test]
+    fn actions_roundtrip_origin_igp() {
+        let out = actions_roundtrip(api::Actions {
+            origin_action: Some(api::OriginAction {
+                origin: api::OriginType::Igp as i32,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            out.origin_action.expect("origin_action missing").origin,
+            api::OriginType::Igp as i32
+        );
+    }
+
+    // ─── Statement Conditions roundtrip ──────────────────────────────────────
+
+    // conditions_from_api treats rpki_result==ValidationState::None (=1) as "no RPKI condition".
+    // Use this sentinel in every test Conditions to avoid spurious RPKI errors.
+    const NO_RPKI: i32 = 1; // api::ValidationState::None
+
+    fn conditions_roundtrip(api_conds: api::Conditions) -> api::Conditions {
+        let configs = conditions_from_api(Some(api_conds)).expect("conditions_from_api failed");
+        let mut table = rustybgp_table::PolicyTable::new();
+        table
+            .add_statement("s", configs, None, rustybgp_table::Actions::default())
+            .expect("add_statement failed");
+        let stmt = table
+            .iter_statements("s".to_string())
+            .next()
+            .expect("statement not found");
+        statement_to_api(stmt)
+            .conditions
+            .expect("no conditions in output")
+    }
+
+    #[test]
+    fn conditions_roundtrip_local_pref_eq() {
+        let out = conditions_roundtrip(api::Conditions {
+            local_pref_eq: Some(api::LocalPrefEq { value: 100 }),
+            rpki_result: NO_RPKI,
+            ..Default::default()
+        });
+        assert_eq!(out.local_pref_eq.expect("local_pref_eq missing").value, 100);
+    }
+
+    #[test]
+    fn conditions_roundtrip_med_eq() {
+        let out = conditions_roundtrip(api::Conditions {
+            med_eq: Some(api::MedEq { value: 200 }),
+            rpki_result: NO_RPKI,
+            ..Default::default()
+        });
+        assert_eq!(out.med_eq.expect("med_eq missing").value, 200);
+    }
+
+    #[test]
+    fn conditions_roundtrip_origin_igp() {
+        let out = conditions_roundtrip(api::Conditions {
+            origin: api::OriginType::Igp as i32,
+            rpki_result: NO_RPKI,
+            ..Default::default()
+        });
+        assert_eq!(out.origin, api::OriginType::Igp as i32);
+    }
+
+    #[test]
+    fn conditions_roundtrip_route_type_external() {
+        use api::conditions::RouteType as ApiRouteType;
+        let out = conditions_roundtrip(api::Conditions {
+            route_type: ApiRouteType::External as i32,
+            rpki_result: NO_RPKI,
+            ..Default::default()
+        });
+        assert_eq!(out.route_type, ApiRouteType::External as i32);
+    }
+
+    #[test]
+    fn conditions_roundtrip_community_count_ge() {
+        let out = conditions_roundtrip(api::Conditions {
+            community_count: Some(api::CommunityCount {
+                r#type: 1,
+                count: 3,
+            }), // 1=Ge
+            rpki_result: NO_RPKI,
+            ..Default::default()
+        });
+        let cc = out.community_count.expect("community_count missing");
+        assert_eq!(cc.r#type, 1);
+        assert_eq!(cc.count, 3);
+    }
+
+    #[test]
+    fn conditions_roundtrip_afi_safi_in() {
+        let out = conditions_roundtrip(api::Conditions {
+            afi_safi_in: vec![api::Family { afi: 1, safi: 1 }], // IPv4 unicast
+            rpki_result: NO_RPKI,
+            ..Default::default()
+        });
+        assert_eq!(out.afi_safi_in.len(), 1);
+        assert_eq!(out.afi_safi_in[0].afi, 1);
+        assert_eq!(out.afi_safi_in[0].safi, 1);
+    }
+
+    fn conditions_roundtrip_with_set(
+        set: rustybgp_table::DefinedSetConfig,
+        api_conds: api::Conditions,
+    ) -> api::Conditions {
+        let configs = conditions_from_api(Some(api_conds)).expect("conditions_from_api failed");
+        let mut table = rustybgp_table::PolicyTable::new();
+        table.add_defined_set(set).expect("add_defined_set failed");
+        table
+            .add_statement("s", configs, None, rustybgp_table::Actions::default())
+            .expect("add_statement failed");
+        let stmt = table
+            .iter_statements("s".to_string())
+            .next()
+            .expect("statement not found");
+        statement_to_api(stmt)
+            .conditions
+            .expect("no conditions in output")
+    }
+
+    #[test]
+    fn conditions_roundtrip_community_set() {
+        let out = conditions_roundtrip_with_set(
+            rustybgp_table::DefinedSetConfig::Community {
+                name: "cs1".to_string(),
+                patterns: vec!["100:.*".to_string()],
+            },
+            api::Conditions {
+                community_set: Some(api::MatchSet {
+                    name: "cs1".to_string(),
+                    r#type: 0, // Any
+                }),
+                rpki_result: NO_RPKI,
+                ..Default::default()
+            },
+        );
+        let ms = out.community_set.expect("community_set missing");
+        assert_eq!(ms.name, "cs1");
+        assert_eq!(ms.r#type, 0);
+    }
+
+    #[test]
+    fn conditions_roundtrip_ext_community_set() {
+        let out = conditions_roundtrip_with_set(
+            rustybgp_table::DefinedSetConfig::ExtCommunity {
+                name: "ecs1".to_string(),
+                patterns: vec!["rt:65001:.*".to_string()],
+            },
+            api::Conditions {
+                ext_community_set: Some(api::MatchSet {
+                    name: "ecs1".to_string(),
+                    r#type: 2, // Invert
+                }),
+                rpki_result: NO_RPKI,
+                ..Default::default()
+            },
+        );
+        let ms = out.ext_community_set.expect("ext_community_set missing");
+        assert_eq!(ms.name, "ecs1");
+        assert_eq!(ms.r#type, 2);
+    }
+
+    #[test]
+    fn conditions_roundtrip_large_community_set() {
+        let out = conditions_roundtrip_with_set(
+            rustybgp_table::DefinedSetConfig::LargeCommunity {
+                name: "lcs1".to_string(),
+                patterns: vec!["65001:1:.*".to_string()],
+            },
+            api::Conditions {
+                large_community_set: Some(api::MatchSet {
+                    name: "lcs1".to_string(),
+                    r#type: 1, // All
+                }),
+                rpki_result: NO_RPKI,
+                ..Default::default()
+            },
+        );
+        let ms = out
+            .large_community_set
+            .expect("large_community_set missing");
+        assert_eq!(ms.name, "lcs1");
+        assert_eq!(ms.r#type, 1);
     }
 }
