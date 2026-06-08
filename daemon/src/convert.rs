@@ -2014,6 +2014,66 @@ fn bgp_defined_sets_to_api(sets: &config::BgpDefinedSets) -> Result<Vec<api::Def
             })
         }
     }
+    if let Some(sets) = sets.community_sets.as_ref() {
+        for set in sets {
+            let name = set
+                .community_set_name
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration("empty name".to_string()))?
+                .to_string();
+            let list = set
+                .community_list
+                .as_ref()
+                .map(|l| l.to_vec())
+                .unwrap_or_default();
+            v.push(api::DefinedSet {
+                defined_type: api::DefinedType::Community as i32,
+                name,
+                list,
+                prefixes: Vec::new(),
+            })
+        }
+    }
+    if let Some(sets) = sets.ext_community_sets.as_ref() {
+        for set in sets {
+            let name = set
+                .ext_community_set_name
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration("empty name".to_string()))?
+                .to_string();
+            let list = set
+                .ext_community_list
+                .as_ref()
+                .map(|l| l.to_vec())
+                .unwrap_or_default();
+            v.push(api::DefinedSet {
+                defined_type: api::DefinedType::ExtCommunity as i32,
+                name,
+                list,
+                prefixes: Vec::new(),
+            })
+        }
+    }
+    if let Some(sets) = sets.large_community_sets.as_ref() {
+        for set in sets {
+            let name = set
+                .large_community_set_name
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration("empty name".to_string()))?
+                .to_string();
+            let list = set
+                .large_community_list
+                .as_ref()
+                .map(|l| l.to_vec())
+                .unwrap_or_default();
+            v.push(api::DefinedSet {
+                defined_type: api::DefinedType::LargeCommunity as i32,
+                name,
+                list,
+                prefixes: Vec::new(),
+            })
+        }
+    }
     Ok(v)
 }
 
@@ -2024,6 +2084,26 @@ pub(crate) fn defined_sets_to_api(
     if let Some(sets) = &sets.prefix_sets {
         for s in sets {
             v.push(prefix_set_to_api(s)?);
+        }
+    }
+    if let Some(sets) = &sets.neighbor_sets {
+        for set in sets {
+            let name = set
+                .neighbor_set_name
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration("empty name".to_string()))?
+                .to_string();
+            let list = set
+                .neighbor_info_list
+                .as_ref()
+                .map(|l| l.to_vec())
+                .unwrap_or_default();
+            v.push(api::DefinedSet {
+                defined_type: api::DefinedType::Neighbor as i32,
+                name,
+                list,
+                prefixes: Vec::new(),
+            });
         }
     }
     if let Some(sets) = &sets.bgp_defined_sets {
@@ -2060,6 +2140,9 @@ fn attribute_comparison_to_i32(c: &config::AttributeComparison) -> i32 {
 
 fn conditions_to_api(c: &config::Conditions) -> Result<api::Conditions, Error> {
     let mut conditions = api::Conditions {
+        // rpki_result uses ValidationState::None (= 1) as the "no condition" sentinel.
+        // Default::default() gives 0 (Unspecified) which conditions_from_api treats as an error.
+        rpki_result: api::ValidationState::None as i32,
         ..Default::default()
     };
     if let Some(set) = c.match_prefix_set.as_ref() {
@@ -2077,9 +2160,23 @@ fn conditions_to_api(c: &config::Conditions) -> Result<api::Conditions, Error> {
             name,
         });
     }
-
-    if let Some(set) = c.bgp_conditions.as_ref() {
-        if let Some(set) = set.match_as_path_set.as_ref() {
+    if let Some(set) = c.match_neighbor_set.as_ref() {
+        let name = set
+            .neighbor_set
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfiguration("empty name".to_string()))?
+            .to_string();
+        let set_option = set
+            .match_set_options
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfiguration("empty match option".to_string()))?;
+        conditions.neighbor_set = Some(api::MatchSet {
+            r#type: match_set_options_restricted_to_i32(set_option),
+            name,
+        });
+    }
+    if let Some(bgp) = c.bgp_conditions.as_ref() {
+        if let Some(set) = bgp.match_as_path_set.as_ref() {
             let match_type = match &set.match_set_options {
                 Some(v) => match_set_options_to_i32(v),
                 None => 0,
@@ -2091,7 +2188,7 @@ fn conditions_to_api(c: &config::Conditions) -> Result<api::Conditions, Error> {
                 });
             }
         }
-        if let Some(l) = set.as_path_length.as_ref() {
+        if let Some(l) = bgp.as_path_length.as_ref() {
             let op = l.operator.as_ref().ok_or_else(|| {
                 Error::InvalidConfiguration("empty as path length operator".to_string())
             })?;
@@ -2102,6 +2199,62 @@ fn conditions_to_api(c: &config::Conditions) -> Result<api::Conditions, Error> {
                 r#type: attribute_comparison_to_i32(op),
                 length,
             });
+        }
+        if let Some(set) = bgp.match_community_set.as_ref()
+            && let Some(name) = &set.community_set
+        {
+            let match_type = match &set.match_set_options {
+                Some(v) => match_set_options_to_i32(v),
+                None => 0,
+            };
+            conditions.community_set = Some(api::MatchSet {
+                r#type: match_type,
+                name: name.clone(),
+            });
+        }
+        if let Some(set) = bgp.match_ext_community_set.as_ref()
+            && let Some(name) = &set.ext_community_set
+        {
+            let match_type = match &set.match_set_options {
+                Some(v) => match_set_options_to_i32(v),
+                None => 0,
+            };
+            conditions.ext_community_set = Some(api::MatchSet {
+                r#type: match_type,
+                name: name.clone(),
+            });
+        }
+        if let Some(set) = bgp.match_large_community_set.as_ref()
+            && let Some(name) = &set.large_community_set
+        {
+            let match_type = match &set.match_set_options {
+                Some(v) => match_set_options_to_i32(v),
+                None => 0,
+            };
+            conditions.large_community_set = Some(api::MatchSet {
+                r#type: match_type,
+                name: name.clone(),
+            });
+        }
+        if let Some(nexthops) = bgp.next_hop_in_list.as_ref() {
+            conditions.next_hop_in_list = nexthops.iter().map(|a| a.to_string()).collect();
+        }
+        if let Some(rpki) = bgp.rpki_validation_result.as_ref() {
+            conditions.rpki_result = match rpki {
+                config::RpkiValidationResultType::None => 0,
+                config::RpkiValidationResultType::NotFound => api::ValidationState::NotFound as i32,
+                config::RpkiValidationResultType::Valid => api::ValidationState::Valid as i32,
+                config::RpkiValidationResultType::Invalid => api::ValidationState::Invalid as i32,
+            };
+        }
+        if let Some(rt) = bgp.route_type.as_ref() {
+            use api::conditions::RouteType as ApiRouteType;
+            conditions.route_type = match rt {
+                config::RouteType::None => ApiRouteType::Unspecified as i32,
+                config::RouteType::Internal => ApiRouteType::Internal as i32,
+                config::RouteType::External => ApiRouteType::External as i32,
+                config::RouteType::Local => ApiRouteType::Local as i32,
+            };
         }
     }
     Ok(conditions)
@@ -2115,53 +2268,171 @@ fn route_disposition_to_i32(r: &config::RouteDisposition) -> i32 {
     }
 }
 
+fn community_option_str_to_i32(opt: Option<&str>) -> Result<i32, Error> {
+    match opt {
+        Some("add") => Ok(1),
+        Some("remove") => Ok(2),
+        Some("replace") => Ok(3),
+        _ => Err(Error::InvalidConfiguration(
+            "missing or invalid community option".to_string(),
+        )),
+    }
+}
+
+fn actions_from_config(a: &config::Actions) -> Result<api::Actions, Error> {
+    let route_action = match a.route_disposition.as_ref() {
+        Some(r) => route_disposition_to_i32(r),
+        None => 0,
+    };
+    let nexthop = a
+        .bgp_actions
+        .as_ref()
+        .and_then(|ba| ba.set_next_hop.as_ref())
+        .map(|nh| {
+            let s = nh.as_str();
+            api::NexthopAction {
+                self_: s == "self",
+                unchanged: s == "unchanged",
+                address: if s != "self" && s != "unchanged" {
+                    s.to_string()
+                } else {
+                    String::new()
+                },
+                peer_address: false,
+            }
+        });
+
+    let mut community = None;
+    let mut ext_community = None;
+    let mut large_community = None;
+    let mut local_pref = None;
+    let mut med = None;
+    let mut as_prepend = None;
+    let mut origin_action = None;
+
+    if let Some(ba) = a.bgp_actions.as_ref() {
+        if let Some(sc) = ba.set_community.as_ref() {
+            let action_type = community_option_str_to_i32(sc.options.as_deref())?;
+            let communities = sc
+                .set_community_method
+                .as_ref()
+                .and_then(|m| m.communities_list.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            community = Some(api::CommunityAction {
+                r#type: action_type,
+                communities,
+            });
+        }
+        if let Some(sec) = ba.set_ext_community.as_ref() {
+            let action_type = community_option_str_to_i32(sec.options.as_deref())?;
+            let communities = sec
+                .set_ext_community_method
+                .as_ref()
+                .and_then(|m| m.communities_list.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            ext_community = Some(api::CommunityAction {
+                r#type: action_type,
+                communities,
+            });
+        }
+        if let Some(slc) = ba.set_large_community.as_ref() {
+            let action_type = match slc.options.as_ref() {
+                Some(config::BgpSetCommunityOptionType::Add) => 1,
+                Some(config::BgpSetCommunityOptionType::Remove) => 2,
+                Some(config::BgpSetCommunityOptionType::Replace) => 3,
+                None => {
+                    return Err(Error::InvalidConfiguration(
+                        "missing large community option".to_string(),
+                    ));
+                }
+            };
+            let communities = slc
+                .set_large_community_method
+                .as_ref()
+                .and_then(|m| m.communities_list.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            large_community = Some(api::CommunityAction {
+                r#type: action_type,
+                communities,
+            });
+        }
+        if let Some(lp) = ba.set_local_pref {
+            local_pref = Some(api::LocalPrefAction { value: lp });
+        }
+        if let Some(med_str) = ba.set_med.as_ref() {
+            let (med_type, value) = if let Some(s) = med_str.strip_prefix('+') {
+                let v: i64 = s
+                    .parse()
+                    .map_err(|_| Error::InvalidConfiguration("invalid MED value".to_string()))?;
+                (1, v)
+            } else if med_str.starts_with('-') {
+                let v: i64 = med_str
+                    .parse()
+                    .map_err(|_| Error::InvalidConfiguration("invalid MED value".to_string()))?;
+                (1, v)
+            } else {
+                let v: i64 = med_str
+                    .parse()
+                    .map_err(|_| Error::InvalidConfiguration("invalid MED value".to_string()))?;
+                (2, v)
+            };
+            med = Some(api::MedAction {
+                r#type: med_type,
+                value,
+            });
+        }
+        if let Some(ap) = ba.set_as_path_prepend.as_ref() {
+            let repeat = ap.repeat_n.unwrap_or(0) as u32;
+            let (asn, use_left_most) = match ap.r#as.as_deref() {
+                Some("last-as") => (0u32, true),
+                Some(s) => (
+                    s.parse::<u32>().map_err(|_| {
+                        Error::InvalidConfiguration("invalid ASN in as-prepend".to_string())
+                    })?,
+                    false,
+                ),
+                None => (0, false),
+            };
+            as_prepend = Some(api::AsPrependAction {
+                asn,
+                repeat,
+                use_left_most,
+            });
+        }
+        if let Some(origin) = ba.set_route_origin.as_ref() {
+            let origin_val = match origin {
+                config::BgpOriginAttrType::Igp => api::OriginType::Igp as i32,
+                config::BgpOriginAttrType::Egp => api::OriginType::Egp as i32,
+                config::BgpOriginAttrType::Incomplete => api::OriginType::Incomplete as i32,
+            };
+            origin_action = Some(api::OriginAction { origin: origin_val });
+        }
+    }
+
+    Ok(api::Actions {
+        route_action,
+        community,
+        med,
+        as_prepend,
+        ext_community,
+        nexthop,
+        local_pref,
+        large_community,
+        origin_action,
+    })
+}
+
 pub(crate) fn statement_from_config(s: &config::Statement) -> Result<api::Statement, Error> {
     let u = Uuid::new_v4().to_string();
     let name = match s.name.as_ref() {
         Some(n) => n.to_string(),
         None => u,
     };
-
-    let conditions = if let Some(c) = &s.conditions {
-        Some(conditions_to_api(c)?)
-    } else {
-        None
-    };
-
-    let actions = s.actions.as_ref().map(|a| {
-        let nexthop = a
-            .bgp_actions
-            .as_ref()
-            .and_then(|ba| ba.set_next_hop.as_ref())
-            .map(|nh| {
-                let s = nh.as_str();
-                api::NexthopAction {
-                    self_: s == "self",
-                    unchanged: s == "unchanged",
-                    address: if s != "self" && s != "unchanged" {
-                        s.to_string()
-                    } else {
-                        String::new()
-                    },
-                    peer_address: false,
-                }
-            });
-        api::Actions {
-            route_action: match a.route_disposition.as_ref() {
-                Some(a) => route_disposition_to_i32(a),
-                None => 0,
-            },
-            community: None,
-            med: None,
-            as_prepend: None,
-            ext_community: None,
-            nexthop,
-            local_pref: None,
-            large_community: None,
-            origin_action: None,
-        }
-    });
-
+    let conditions = s.conditions.as_ref().map(conditions_to_api).transpose()?;
+    let actions = s.actions.as_ref().map(actions_from_config).transpose()?;
     Ok(api::Statement {
         name,
         conditions,
@@ -2174,6 +2445,43 @@ pub(crate) fn default_policy_type_to_i32(t: &config::DefaultPolicyType) -> i32 {
         config::DefaultPolicyType::AcceptRoute => 1,
         config::DefaultPolicyType::RejectRoute => 2,
     }
+}
+
+pub(crate) fn load_policy_from_config(
+    ptable: &mut rustybgp_table::PolicyTable,
+    config: &config::BgpConfig,
+) -> Result<(), Error> {
+    if let Some(defined_sets) = &config.defined_sets {
+        for set in defined_sets_to_api(defined_sets)? {
+            ptable.add_defined_set(defined_set_from_api(set)?)?;
+        }
+    }
+    if let Some(policies) = &config.policy_definitions {
+        let mut seen = std::collections::HashSet::new();
+        for policy in policies {
+            if let Some(name) = &policy.name {
+                let mut s_names = Vec::new();
+                if let Some(statements) = &policy.statements {
+                    for s in statements {
+                        if let Some(n) = s.name.as_ref()
+                            && seen.contains(n)
+                        {
+                            s_names.push(n.clone());
+                            continue;
+                        }
+                        let stmt = statement_from_config(s)?;
+                        let conditions = conditions_from_api(stmt.conditions)?;
+                        let (disposition, actions) = disposition_from_api(stmt.actions)?;
+                        ptable.add_statement(&stmt.name, conditions, disposition, actions)?;
+                        s_names.push(stmt.name.clone());
+                        seen.insert(stmt.name);
+                    }
+                }
+                ptable.add_policy(name, s_names)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2688,5 +2996,647 @@ mod tests {
             .expect("large_community_set missing");
         assert_eq!(ms.name, "lcs1");
         assert_eq!(ms.r#type, 1);
+    }
+
+    // ─── config loading tests (TOML) ─────────────────────────────────────────
+
+    fn make_ptable(toml: &str) -> rustybgp_table::PolicyTable {
+        let conf: config::BgpConfig = toml::from_str(toml).expect("invalid TOML");
+        let mut ptable = rustybgp_table::PolicyTable::new();
+        load_policy_from_config(&mut ptable, &conf).expect("load_policy_from_config failed");
+        ptable
+    }
+
+    fn first_stmt(ptable: &rustybgp_table::PolicyTable) -> &rustybgp_table::Statement {
+        ptable
+            .iter_statements("".to_string())
+            .next()
+            .expect("no statement")
+    }
+
+    // ── condition tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn config_prefix_condition() {
+        let ptable = make_ptable(
+            r#"
+[[defined-sets.prefix-sets]]
+prefix-set-name = "ps1"
+
+[[defined-sets.prefix-sets.prefix-list]]
+ip-prefix = "10.0.0.0/8"
+masklength-range = "8..24"
+
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.conditions.match-prefix-set]
+prefix-set = "ps1"
+match-set-options = "any"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        );
+        assert_eq!(ptable.iter_defined_sets().count(), 1);
+        let stmt = first_stmt(&ptable);
+        assert!(
+            stmt.conditions
+                .iter()
+                .any(|c| matches!(c, rustybgp_table::Condition::Prefix(n, ..) if n == "ps1"))
+        );
+    }
+
+    #[test]
+    fn config_neighbor_condition() {
+        let ptable = make_ptable(
+            r#"
+[[defined-sets.neighbor-sets]]
+neighbor-set-name = "ns1"
+neighbor-info-list = ["10.0.0.1/32"]
+
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.conditions.match-neighbor-set]
+neighbor-set = "ns1"
+match-set-options = "any"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        );
+        assert_eq!(ptable.iter_defined_sets().count(), 1);
+        let stmt = first_stmt(&ptable);
+        assert!(
+            stmt.conditions
+                .iter()
+                .any(|c| matches!(c, rustybgp_table::Condition::Neighbor(n, ..) if n == "ns1"))
+        );
+    }
+
+    #[test]
+    fn config_as_path_condition() {
+        let ptable = make_ptable(
+            r#"
+[[defined-sets.bgp-defined-sets.as-path-sets]]
+as-path-set-name = "aps1"
+as-path-list = ["^65100_"]
+
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.conditions.bgp-conditions.match-as-path-set]
+as-path-set = "aps1"
+match-set-options = "any"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        );
+        assert_eq!(ptable.iter_defined_sets().count(), 1);
+        let stmt = first_stmt(&ptable);
+        assert!(
+            stmt.conditions
+                .iter()
+                .any(|c| matches!(c, rustybgp_table::Condition::AsPath(n, ..) if n == "aps1"))
+        );
+    }
+
+    #[test]
+    fn config_community_condition() {
+        let ptable = make_ptable(
+            r#"
+[[defined-sets.bgp-defined-sets.community-sets]]
+community-set-name = "cs1"
+community-list = ["100:200"]
+
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.conditions.bgp-conditions.match-community-set]
+community-set = "cs1"
+match-set-options = "any"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        );
+        assert_eq!(ptable.iter_defined_sets().count(), 1);
+        let stmt = first_stmt(&ptable);
+        assert!(
+            stmt.conditions
+                .iter()
+                .any(|c| matches!(c, rustybgp_table::Condition::Community(n, ..) if n == "cs1"))
+        );
+    }
+
+    #[test]
+    fn config_ext_community_condition() {
+        let ptable = make_ptable(
+            r#"
+[[defined-sets.bgp-defined-sets.ext-community-sets]]
+ext-community-set-name = "ecs1"
+ext-community-list = ["rt:65000:100"]
+
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.conditions.bgp-conditions.match-ext-community-set]
+ext-community-set = "ecs1"
+match-set-options = "any"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        );
+        assert_eq!(ptable.iter_defined_sets().count(), 1);
+        let stmt = first_stmt(&ptable);
+        assert!(
+            stmt.conditions.iter().any(
+                |c| matches!(c, rustybgp_table::Condition::ExtCommunity(n, ..) if n == "ecs1")
+            )
+        );
+    }
+
+    #[test]
+    fn config_large_community_condition() {
+        let ptable = make_ptable(
+            r#"
+[[defined-sets.bgp-defined-sets.large-community-sets]]
+large-community-set-name = "lcs1"
+large-community-list = ["65000:1:2"]
+
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.conditions.bgp-conditions.match-large-community-set]
+large-community-set = "lcs1"
+match-set-options = "any"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        );
+        assert_eq!(ptable.iter_defined_sets().count(), 1);
+        let stmt = first_stmt(&ptable);
+        assert!(
+            stmt.conditions.iter().any(
+                |c| matches!(c, rustybgp_table::Condition::LargeCommunity(n, ..) if n == "lcs1")
+            )
+        );
+    }
+
+    #[test]
+    fn config_as_path_length_condition() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.conditions.bgp-conditions.as-path-length]
+operator = "le"
+value = 10
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        assert!(stmt.conditions.iter().any(
+            |c| matches!(c, rustybgp_table::Condition::AsPathLength(cmp, len)
+                if matches!(cmp, rustybgp_table::Comparison::Le) && *len == 10)
+        ));
+    }
+
+    #[test]
+    fn config_nexthop_condition() {
+        use std::net::IpAddr;
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.conditions.bgp-conditions]
+next-hop-in-list = ["10.0.0.1"]
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        let expected: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(
+            stmt.conditions.iter().any(
+                |c| matches!(c, rustybgp_table::Condition::Nexthop(v) if v.contains(&expected))
+            )
+        );
+    }
+
+    #[test]
+    fn config_rpki_condition() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.conditions.bgp-conditions]
+rpki-validation-result = "valid"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        assert!(
+            stmt.conditions
+                .iter()
+                .any(|c| matches!(c, rustybgp_table::Condition::Rpki(s)
+                if *s == rustybgp_table::RpkiValidationState::Valid))
+        );
+    }
+
+    #[test]
+    fn config_route_type_condition() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.conditions.bgp-conditions]
+route-type = "external"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        assert!(
+            stmt.conditions
+                .iter()
+                .any(|c| matches!(c, rustybgp_table::Condition::RouteType(t)
+                if matches!(t, rustybgp_table::RouteType::External)))
+        );
+    }
+
+    // ── action tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn config_community_action_add() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-community.options = "add"
+bgp-actions.set-community.set-community-method.communities-list = ["100:200"]
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        let action = stmt
+            .actions
+            .community
+            .as_ref()
+            .expect("community action missing");
+        assert!(matches!(
+            action.action_type,
+            rustybgp_table::CommunityActionType::Add
+        ));
+        assert_eq!(action.communities, vec![(100u32 << 16) | 200]);
+    }
+
+    #[test]
+    fn config_community_action_remove() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-community.options = "remove"
+bgp-actions.set-community.set-community-method.communities-list = ["300:400"]
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        let action = stmt
+            .actions
+            .community
+            .as_ref()
+            .expect("community action missing");
+        assert!(matches!(
+            action.action_type,
+            rustybgp_table::CommunityActionType::Remove
+        ));
+        assert_eq!(action.communities, vec![(300u32 << 16) | 400]);
+    }
+
+    #[test]
+    fn config_ext_community_action_add() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-ext-community.options = "add"
+bgp-actions.set-ext-community.set-ext-community-method.communities-list = ["rt:65000:100"]
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        let action = stmt
+            .actions
+            .ext_community
+            .as_ref()
+            .expect("ext_community action missing");
+        assert!(matches!(
+            action.action_type,
+            rustybgp_table::CommunityActionType::Add
+        ));
+        // rt:65000:100 -> type=0x00 sub=0x02 asn=65000(0xFDE8) local=100(0x64)
+        let expected: [u8; 8] = [0x00, 0x02, 0xFD, 0xE8, 0x00, 0x00, 0x00, 0x64];
+        assert_eq!(action.communities, vec![expected]);
+    }
+
+    #[test]
+    fn config_large_community_action_add() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-large-community.options = "add"
+bgp-actions.set-large-community.set-large-community-method.communities-list = ["65000:1:2"]
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        let action = stmt
+            .actions
+            .large_community
+            .as_ref()
+            .expect("large_community action missing");
+        assert!(matches!(
+            action.action_type,
+            rustybgp_table::CommunityActionType::Add
+        ));
+        assert_eq!(action.communities, vec![(65000u32, 1u32, 2u32)]);
+    }
+
+    #[test]
+    fn config_local_pref_action() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-local-pref = 200
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        assert_eq!(
+            stmt.actions.local_pref,
+            Some(rustybgp_table::LocalPrefAction { value: 200 })
+        );
+    }
+
+    #[test]
+    fn config_med_action_replace() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-med = "300"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        let med = stmt.actions.med.as_ref().expect("med action missing");
+        assert!(matches!(
+            med.action_type,
+            rustybgp_table::MedActionType::Replace
+        ));
+        assert_eq!(med.value, 300);
+    }
+
+    #[test]
+    fn config_med_action_mod_positive() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-med = "+50"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        let med = stmt.actions.med.as_ref().expect("med action missing");
+        assert!(matches!(
+            med.action_type,
+            rustybgp_table::MedActionType::Mod
+        ));
+        assert_eq!(med.value, 50);
+    }
+
+    #[test]
+    fn config_med_action_mod_negative() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-med = "-50"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        let med = stmt.actions.med.as_ref().expect("med action missing");
+        assert!(matches!(
+            med.action_type,
+            rustybgp_table::MedActionType::Mod
+        ));
+        assert_eq!(med.value, -50);
+    }
+
+    #[test]
+    fn config_as_prepend_action() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-as-path-prepend.repeat-n = 3
+bgp-actions.set-as-path-prepend.as = "65001"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        let ap = stmt
+            .actions
+            .as_prepend
+            .as_ref()
+            .expect("as_prepend action missing");
+        assert_eq!(ap.asn, 65001);
+        assert_eq!(ap.repeat, 3);
+        assert!(!ap.use_left_most);
+    }
+
+    #[test]
+    fn config_as_prepend_last_as() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-as-path-prepend.repeat-n = 2
+bgp-actions.set-as-path-prepend.as = "last-as"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        let ap = stmt
+            .actions
+            .as_prepend
+            .as_ref()
+            .expect("as_prepend action missing");
+        assert_eq!(ap.repeat, 2);
+        assert!(ap.use_left_most);
+    }
+
+    #[test]
+    fn config_origin_action_igp() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-route-origin = "igp"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        assert_eq!(
+            stmt.actions.origin,
+            Some(rustybgp_table::OriginAction { origin: 0 })
+        );
+    }
+
+    #[test]
+    fn config_origin_action_egp() {
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-route-origin = "egp"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        assert_eq!(
+            stmt.actions.origin,
+            Some(rustybgp_table::OriginAction { origin: 1 })
+        );
+    }
+
+    #[test]
+    fn config_nexthop_action_self() {
+        use rustybgp_table::NexthopAction;
+        let ptable = make_ptable(
+            r#"
+[[policy-definitions]]
+name = "p1"
+
+[[policy-definitions.statements]]
+name = "s1"
+
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+bgp-actions.set-next-hop = "self"
+"#,
+        );
+        let stmt = first_stmt(&ptable);
+        assert_eq!(stmt.actions.nexthop, Some(NexthopAction::PeerSelf));
     }
 }

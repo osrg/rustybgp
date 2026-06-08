@@ -18,7 +18,6 @@ use fnv::{FnvHashMap, FnvHashSet};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, Stream, StreamExt};
 use std::boxed::Box;
-use std::collections::HashSet;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::{From, TryFrom};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -3338,55 +3337,12 @@ impl Global {
                 }
             }
         }
-        if let Some(defined_sets) = bgp.as_ref().and_then(|x| x.defined_sets.as_ref()) {
-            match convert::defined_sets_to_api(defined_sets) {
-                Ok(sets) => {
-                    let mut server = global.write().await;
-                    for set in sets {
-                        let set = convert::defined_set_from_api(set).unwrap();
-                        if let Err(e) = server.ptable.add_defined_set(set) {
-                            panic!("{:?}", e);
-                        }
-                    }
-                }
-                Err(e) => panic!("{:?}", e),
-            }
-        }
-        if let Some(policies) = bgp.as_ref().and_then(|x| x.policy_definitions.as_ref()) {
-            let mut h = HashSet::new();
+        if let Some(bgp_conf) = bgp.as_ref()
+            && (bgp_conf.defined_sets.is_some() || bgp_conf.policy_definitions.is_some())
+        {
             let mut server = global.write().await;
-            for policy in policies {
-                if let Some(name) = &policy.name {
-                    let mut s_names = Vec::new();
-                    if let Some(statements) = &policy.statements {
-                        for s in statements {
-                            if let Some(n) = s.name.as_ref()
-                                && h.contains(n)
-                            {
-                                s_names.push(n.clone());
-                                continue;
-                            }
-                            match convert::statement_from_config(s) {
-                                Ok(s) => {
-                                    let conditions =
-                                        convert::conditions_from_api(s.conditions).unwrap();
-                                    let (disposition, actions) =
-                                        convert::disposition_from_api(s.actions).unwrap();
-                                    server
-                                        .ptable
-                                        .add_statement(&s.name, conditions, disposition, actions)
-                                        .unwrap();
-                                    s_names.push(s.name.clone());
-                                    h.insert(s.name);
-                                }
-                                Err(e) => panic!("{:?}", e),
-                            }
-                        }
-                    }
-                    if let Err(e) = server.ptable.add_policy(name, s_names) {
-                        panic!("{:?}", e);
-                    }
-                }
+            if let Err(e) = convert::load_policy_from_config(&mut server.ptable, bgp_conf) {
+                panic!("{:?}", e);
             }
         }
         if let Some(g) = bgp.as_ref().and_then(|x| x.global.as_ref()) {
