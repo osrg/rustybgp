@@ -402,7 +402,12 @@ impl Peer {
         }
     }
 
-    fn reset(&mut self) {
+    /// Clears session-negotiated state and connection handles so the peer is
+    /// ready for the next connection attempt.  Config fields and
+    /// `PeerContext::gr_state` are intentionally left untouched: config is
+    /// operator-owned, and gr_state must survive across session boundaries
+    /// while GR is active.
+    fn clear_session_state(&mut self) {
         self.state.downtime.store(
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -4539,7 +4544,7 @@ impl PeerSession {
             if peer.config.delete_on_disconnected {
                 server.peers.remove(&remote_addr);
             } else {
-                peer.reset();
+                peer.clear_session_state();
                 enable_active_connect(peer, active_conn_tx);
             }
         }
