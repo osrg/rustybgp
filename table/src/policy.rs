@@ -910,6 +910,15 @@ pub struct PrefixConfig {
     pub mask_length_max: u8,
 }
 
+pub enum DefinedSetKind {
+    Prefix,
+    Neighbor,
+    AsPath,
+    Community,
+    ExtCommunity,
+    LargeCommunity,
+}
+
 pub enum DefinedSetConfig {
     Prefix {
         name: String,
@@ -1509,6 +1518,265 @@ impl PolicyTable {
             .iter()
             .filter(move |(pname, _)| name.is_empty() || name.as_str() == pname.as_ref())
             .map(|(_, p)| p.as_ref())
+    }
+
+    pub fn delete_defined_set(
+        &mut self,
+        name: &str,
+        kind: DefinedSetKind,
+        all: bool,
+    ) -> Result<(), TableError> {
+        match kind {
+            DefinedSetKind::Prefix => {
+                if all {
+                    self.prefix_sets.clear();
+                } else {
+                    for stmt in self.statements.values() {
+                        if stmt
+                            .conditions
+                            .iter()
+                            .any(|c| matches!(c, Condition::Prefix(n, ..) if n == name))
+                        {
+                            return Err(TableError::StillInUse(name.to_string()));
+                        }
+                    }
+                    if self.prefix_sets.remove(name).is_none() {
+                        return Err(TableError::NotFound);
+                    }
+                }
+            }
+            DefinedSetKind::Neighbor => {
+                if all {
+                    self.neighbor_sets.clear();
+                } else {
+                    for stmt in self.statements.values() {
+                        if stmt
+                            .conditions
+                            .iter()
+                            .any(|c| matches!(c, Condition::Neighbor(n, ..) if n == name))
+                        {
+                            return Err(TableError::StillInUse(name.to_string()));
+                        }
+                    }
+                    if self.neighbor_sets.remove(name).is_none() {
+                        return Err(TableError::NotFound);
+                    }
+                }
+            }
+            DefinedSetKind::AsPath => {
+                if all {
+                    self.aspath_sets.clear();
+                } else {
+                    for stmt in self.statements.values() {
+                        if stmt
+                            .conditions
+                            .iter()
+                            .any(|c| matches!(c, Condition::AsPath(n, ..) if n == name))
+                        {
+                            return Err(TableError::StillInUse(name.to_string()));
+                        }
+                    }
+                    if self.aspath_sets.remove(name).is_none() {
+                        return Err(TableError::NotFound);
+                    }
+                }
+            }
+            DefinedSetKind::Community => {
+                if all {
+                    self.community_sets.clear();
+                } else {
+                    for stmt in self.statements.values() {
+                        if stmt
+                            .conditions
+                            .iter()
+                            .any(|c| matches!(c, Condition::Community(n, ..) if n == name))
+                        {
+                            return Err(TableError::StillInUse(name.to_string()));
+                        }
+                    }
+                    if self.community_sets.remove(name).is_none() {
+                        return Err(TableError::NotFound);
+                    }
+                }
+            }
+            DefinedSetKind::ExtCommunity => {
+                if all {
+                    self.ext_community_sets.clear();
+                } else {
+                    for stmt in self.statements.values() {
+                        if stmt
+                            .conditions
+                            .iter()
+                            .any(|c| matches!(c, Condition::ExtCommunity(n, ..) if n == name))
+                        {
+                            return Err(TableError::StillInUse(name.to_string()));
+                        }
+                    }
+                    if self.ext_community_sets.remove(name).is_none() {
+                        return Err(TableError::NotFound);
+                    }
+                }
+            }
+            DefinedSetKind::LargeCommunity => {
+                if all {
+                    self.large_community_sets.clear();
+                } else {
+                    for stmt in self.statements.values() {
+                        if stmt
+                            .conditions
+                            .iter()
+                            .any(|c| matches!(c, Condition::LargeCommunity(n, ..) if n == name))
+                        {
+                            return Err(TableError::StillInUse(name.to_string()));
+                        }
+                    }
+                    if self.large_community_sets.remove(name).is_none() {
+                        return Err(TableError::NotFound);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn delete_statement(&mut self, name: &str, all: bool) -> Result<(), TableError> {
+        if all {
+            self.statements.clear();
+            return Ok(());
+        }
+        for policy in self.policies.values() {
+            if policy.statements.iter().any(|s| s.name.as_ref() == name) {
+                return Err(TableError::StillInUse(name.to_string()));
+            }
+        }
+        if self.statements.remove(name).is_none() {
+            return Err(TableError::NotFound);
+        }
+        Ok(())
+    }
+
+    // Returns updated (import_assignment, export_assignment) after removing the policy.
+    #[allow(clippy::type_complexity)]
+    pub fn delete_policy(
+        &mut self,
+        name: &str,
+        preserve_statements: bool,
+        all: bool,
+    ) -> Result<(Option<Arc<PolicyAssignment>>, Option<Arc<PolicyAssignment>>), TableError> {
+        if all {
+            if !preserve_statements {
+                self.statements.clear();
+            }
+            self.policies.clear();
+            self.assignment_import = None;
+            self.assignment_export = None;
+            return Ok((None, None));
+        }
+
+        let policy = self.policies.remove(name).ok_or(TableError::NotFound)?;
+
+        self.assignment_import =
+            Self::filter_policy_from_assignment(self.assignment_import.take(), name);
+        self.assignment_export =
+            Self::filter_policy_from_assignment(self.assignment_export.take(), name);
+
+        if !preserve_statements {
+            for stmt in &policy.statements {
+                let still_used = self
+                    .policies
+                    .values()
+                    .any(|p| p.statements.iter().any(|s| s.name == stmt.name));
+                if !still_used {
+                    self.statements.remove(stmt.name.as_ref());
+                }
+            }
+        }
+
+        Ok((
+            self.assignment_import.clone(),
+            self.assignment_export.clone(),
+        ))
+    }
+
+    fn filter_policy_from_assignment(
+        assignment: Option<Arc<PolicyAssignment>>,
+        policy_name: &str,
+    ) -> Option<Arc<PolicyAssignment>> {
+        let old = assignment?;
+        let policies: Vec<Arc<Policy>> = old
+            .policies
+            .iter()
+            .filter(|p| p.name.as_ref() != policy_name)
+            .cloned()
+            .collect();
+        Some(Arc::new(PolicyAssignment {
+            name: old.name.clone(),
+            disposition: old.disposition,
+            policies,
+        }))
+    }
+
+    // Returns the updated assignment after removing policies (or None if all=true).
+    pub fn delete_policy_assignment(
+        &mut self,
+        direction: PolicyDirection,
+        policy_names: &[String],
+        all: bool,
+    ) -> Result<Option<Arc<PolicyAssignment>>, TableError> {
+        let field = match direction {
+            PolicyDirection::Import => &mut self.assignment_import,
+            PolicyDirection::Export => &mut self.assignment_export,
+        };
+        if all {
+            *field = None;
+            return Ok(None);
+        }
+        let old = field.take().ok_or(TableError::NotFound)?;
+        let policies: Vec<Arc<Policy>> = old
+            .policies
+            .iter()
+            .filter(|p| !policy_names.iter().any(|n| n == p.name.as_ref()))
+            .cloned()
+            .collect();
+        let updated = Arc::new(PolicyAssignment {
+            name: old.name.clone(),
+            disposition: old.disposition,
+            policies,
+        });
+        *field = Some(updated.clone());
+        Ok(Some(updated))
+    }
+
+    // Replaces the assignment for direction entirely.
+    pub fn set_policy_assignment(
+        &mut self,
+        name: &str,
+        direction: PolicyDirection,
+        default_action: Disposition,
+        policy_names: Vec<String>,
+    ) -> Result<Arc<PolicyAssignment>, TableError> {
+        let mut policies = Vec::new();
+        for pname in &policy_names {
+            match self.policies.get(pname.as_str()) {
+                Some(p) => policies.push(p.clone()),
+                None => {
+                    return Err(TableError::InvalidArgument(format!(
+                        "{} policy not found",
+                        pname
+                    )));
+                }
+            }
+        }
+        let assignment = Arc::new(PolicyAssignment {
+            name: Arc::from(name),
+            disposition: default_action,
+            policies,
+        });
+        match direction {
+            PolicyDirection::Import => self.assignment_import = Some(assignment.clone()),
+            PolicyDirection::Export => self.assignment_export = Some(assignment.clone()),
+        }
+        Ok(assignment)
     }
 }
 

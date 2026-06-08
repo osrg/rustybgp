@@ -53,6 +53,12 @@ impl From<Error> for tonic::Status {
                 rustybgp_table::TableError::AlreadyExists(s) => {
                     tonic::Status::new(tonic::Code::AlreadyExists, s)
                 }
+                rustybgp_table::TableError::NotFound => {
+                    tonic::Status::new(tonic::Code::NotFound, "not found")
+                }
+                rustybgp_table::TableError::StillInUse(s) => {
+                    tonic::Status::new(tonic::Code::FailedPrecondition, s)
+                }
             },
             _ => panic!("unsupported error code"),
         }

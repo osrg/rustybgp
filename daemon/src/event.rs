@@ -2040,9 +2040,20 @@ impl GoBgpService for GrpcService {
     }
     async fn delete_policy(
         &self,
-        _request: tonic::Request<api::DeletePolicyRequest>,
+        request: tonic::Request<api::DeletePolicyRequest>,
     ) -> Result<tonic::Response<api::DeletePolicyResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let req = request.into_inner();
+        let name = req.policy.map(|p| p.name).unwrap_or_default();
+        let (import, export) = self
+            .global
+            .write()
+            .await
+            .ptable
+            .delete_policy(&name, req.preserve_statements, req.all)
+            .map_err(Error::from)?;
+        self.tables.import_policy.store(import);
+        self.tables.export_policy.store(export);
+        Ok(tonic::Response::new(api::DeletePolicyResponse {}))
     }
     type ListPolicyStream = Pin<
         Box<
@@ -2082,9 +2093,50 @@ impl GoBgpService for GrpcService {
     }
     async fn set_policies(
         &self,
-        _request: tonic::Request<api::SetPoliciesRequest>,
+        request: tonic::Request<api::SetPoliciesRequest>,
     ) -> Result<tonic::Response<api::SetPoliciesResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let req = request.into_inner();
+        let mut new_ptable = table::PolicyTable::new();
+
+        for ds in req.defined_sets {
+            let set = convert::defined_set_from_api(ds).map_err(Error::from)?;
+            new_ptable.add_defined_set(set).map_err(Error::from)?;
+        }
+
+        for policy in &req.policies {
+            for stmt in &policy.statements {
+                let conditions =
+                    convert::conditions_from_api(stmt.conditions.clone()).map_err(Error::from)?;
+                let (disposition, actions) =
+                    convert::disposition_from_api(stmt.actions.clone()).map_err(Error::from)?;
+                // Ignore AlreadyExists: the same statement may appear in multiple policies.
+                let _ = new_ptable.add_statement(&stmt.name, conditions, disposition, actions);
+            }
+            let stmt_names = policy.statements.iter().map(|s| s.name.clone()).collect();
+            new_ptable
+                .add_policy(&policy.name, stmt_names)
+                .map_err(Error::from)?;
+        }
+
+        let mut new_import = None;
+        let mut new_export = None;
+        for assign in req.assignments {
+            let (name, direction, default_action, policy_names) =
+                convert::policy_assignment_from_api(assign).map_err(Error::from)?;
+            let (dir, assignment) = new_ptable
+                .add_assignment(&name, direction, default_action, policy_names)
+                .map_err(Error::from)?;
+            if dir == table::PolicyDirection::Import {
+                new_import = Some(assignment);
+            } else {
+                new_export = Some(assignment);
+            }
+        }
+
+        self.global.write().await.ptable = new_ptable;
+        self.tables.import_policy.store(new_import);
+        self.tables.export_policy.store(new_export);
+        Ok(tonic::Response::new(api::SetPoliciesResponse {}))
     }
     async fn add_defined_set(
         &self,
@@ -2105,9 +2157,18 @@ impl GoBgpService for GrpcService {
     }
     async fn delete_defined_set(
         &self,
-        _request: tonic::Request<api::DeleteDefinedSetRequest>,
+        request: tonic::Request<api::DeleteDefinedSetRequest>,
     ) -> Result<tonic::Response<api::DeleteDefinedSetResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let req = request.into_inner();
+        let set = req.defined_set.ok_or(Error::EmptyArgument)?;
+        let kind = convert::defined_set_kind_from_api(set.defined_type).map_err(Error::from)?;
+        self.global
+            .write()
+            .await
+            .ptable
+            .delete_defined_set(&set.name, kind, req.all)
+            .map_err(Error::from)?;
+        Ok(tonic::Response::new(api::DeleteDefinedSetResponse {}))
     }
     type ListDefinedSetStream = Pin<
         Box<
@@ -2164,9 +2225,17 @@ impl GoBgpService for GrpcService {
     }
     async fn delete_statement(
         &self,
-        _request: tonic::Request<api::DeleteStatementRequest>,
+        request: tonic::Request<api::DeleteStatementRequest>,
     ) -> Result<tonic::Response<api::DeleteStatementResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let req = request.into_inner();
+        let name = req.statement.map(|s| s.name).unwrap_or_default();
+        self.global
+            .write()
+            .await
+            .ptable
+            .delete_statement(&name, req.all)
+            .map_err(Error::from)?;
+        Ok(tonic::Response::new(api::DeleteStatementResponse {}))
     }
     type ListStatementStream = Pin<
         Box<
@@ -2217,9 +2286,26 @@ impl GoBgpService for GrpcService {
     }
     async fn delete_policy_assignment(
         &self,
-        _request: tonic::Request<api::DeletePolicyAssignmentRequest>,
+        request: tonic::Request<api::DeletePolicyAssignmentRequest>,
     ) -> Result<tonic::Response<api::DeletePolicyAssignmentResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let _ = self.policy_assignment_sem.acquire().await;
+        let req = request.into_inner();
+        let assignment = req.assignment.ok_or(Error::EmptyArgument)?;
+        let (_, direction, _, policy_names) =
+            convert::policy_assignment_from_api(assignment).map_err(Error::from)?;
+        let updated = self
+            .global
+            .write()
+            .await
+            .ptable
+            .delete_policy_assignment(direction, &policy_names, req.all)
+            .map_err(Error::from)?;
+        if direction == table::PolicyDirection::Import {
+            self.tables.import_policy.store(updated);
+        } else {
+            self.tables.export_policy.store(updated);
+        }
+        Ok(tonic::Response::new(api::DeletePolicyAssignmentResponse {}))
     }
     type ListPolicyAssignmentStream = Pin<
         Box<
@@ -2259,9 +2345,28 @@ impl GoBgpService for GrpcService {
     }
     async fn set_policy_assignment(
         &self,
-        _request: tonic::Request<api::SetPolicyAssignmentRequest>,
+        request: tonic::Request<api::SetPolicyAssignmentRequest>,
     ) -> Result<tonic::Response<api::SetPolicyAssignmentResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let _ = self.policy_assignment_sem.acquire().await;
+        let assignment = request
+            .into_inner()
+            .assignment
+            .ok_or(Error::EmptyArgument)?;
+        let (name, direction, default_action, policy_names) =
+            convert::policy_assignment_from_api(assignment).map_err(Error::from)?;
+        let updated = self
+            .global
+            .write()
+            .await
+            .ptable
+            .set_policy_assignment(&name, direction, default_action, policy_names)
+            .map_err(Error::from)?;
+        if direction == table::PolicyDirection::Import {
+            self.tables.import_policy.store(Some(updated));
+        } else {
+            self.tables.export_policy.store(Some(updated));
+        }
+        Ok(tonic::Response::new(api::SetPolicyAssignmentResponse {}))
     }
     async fn add_rpki(
         &self,

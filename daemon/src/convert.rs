@@ -1778,6 +1778,23 @@ pub(crate) fn defined_set_from_api(
     }
 }
 
+pub(crate) fn defined_set_kind_from_api(
+    defined_type: i32,
+) -> Result<rustybgp_table::DefinedSetKind, rustybgp_table::TableError> {
+    use rustybgp_table::{DefinedSetKind, TableError};
+    match api::DefinedType::try_from(defined_type) {
+        Ok(api::DefinedType::Prefix) => Ok(DefinedSetKind::Prefix),
+        Ok(api::DefinedType::Neighbor) => Ok(DefinedSetKind::Neighbor),
+        Ok(api::DefinedType::AsPath) => Ok(DefinedSetKind::AsPath),
+        Ok(api::DefinedType::Community) => Ok(DefinedSetKind::Community),
+        Ok(api::DefinedType::ExtCommunity) => Ok(DefinedSetKind::ExtCommunity),
+        Ok(api::DefinedType::LargeCommunity) => Ok(DefinedSetKind::LargeCommunity),
+        _ => Err(TableError::InvalidArgument(
+            "unsupported defined set type".to_string(),
+        )),
+    }
+}
+
 pub(crate) fn policy_assignment_from_api(
     req: api::PolicyAssignment,
 ) -> Result<

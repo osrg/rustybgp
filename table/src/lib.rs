@@ -32,6 +32,10 @@ pub enum TableError {
     InvalidArgument(String),
     #[error("entity already exists")]
     AlreadyExists(String),
+    #[error("entity not found")]
+    NotFound,
+    #[error("entity still in use")]
+    StillInUse(String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
