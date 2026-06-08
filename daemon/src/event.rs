@@ -222,14 +222,6 @@ impl ConnArbiter {
     }
 }
 
-/// Cancellation handle for the active-connect retry task.
-///
-/// Lifetime: one active-connect attempt.  Replaced with a fresh instance on
-/// each reconnect; dropping the inner `Sender` signals the task to exit.
-/// `Clone` produces `None` (intentional: only one owner cancels the task).
-#[derive(Default)]
-struct ActiveConnectCancel(Option<tokio::sync::oneshot::Sender<()>>);
-
 /// Static GR configuration for a single peer, set at peer creation.
 /// `None` in `PeerConfig::graceful_restart` means GR is disabled for this peer.
 /// Cloned into capability negotiation at each session open.
@@ -282,7 +274,8 @@ struct PeerContext {
     /// Shared arbiter for this peer: holds PeerFsm and collision close-channels.
     conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
     /// Cancels the active-connect retry loop spawned by `enable_active_connect`.
-    active_connect_cancel_tx: ActiveConnectCancel,
+    /// Dropping the sender signals the task to exit; replaced on each reconnect.
+    active_connect_cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// GR helper state machine; persists across sessions.
     gr_state: crate::gr::GrState,
     /// Abort handle for the GR restart timer task.
@@ -425,7 +418,7 @@ impl Peer {
             .store(SessionState::Idle as u8, Ordering::Relaxed);
         self.state.session_addrs.store(None);
         let mut ctx = self.context.lock().unwrap();
-        ctx.active_connect_cancel_tx = ActiveConnectCancel::default();
+        ctx.active_connect_cancel_tx = None;
         {
             let mut arb = ctx.conn_arbiter.lock().unwrap();
             arb.active_close_tx = None;
@@ -574,7 +567,7 @@ impl PeerParams {
             counter_rx: Default::default(),
             context: Arc::new(std::sync::Mutex::new(PeerContext {
                 conn_arbiter,
-                active_connect_cancel_tx: ActiveConnectCancel::default(),
+                active_connect_cancel_tx: None,
                 gr_state: crate::gr::GrState::new(),
                 gr_restart_timer: None,
             })),
@@ -1226,7 +1219,7 @@ impl GoBgpService for GrpcService {
                         h.abort();
                     }
                     // Cancel the active-connect retry loop.
-                    ctx.active_connect_cancel_tx.0.take();
+                    ctx.active_connect_cancel_tx.take();
                     {
                         let mut arb = ctx.conn_arbiter.lock().unwrap();
                         for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
@@ -1394,7 +1387,7 @@ impl GoBgpService for GrpcService {
                         p.admin_down = true;
                         {
                             let mut ctx = p.context.lock().unwrap();
-                            ctx.active_connect_cancel_tx.0.take();
+                            ctx.active_connect_cancel_tx.take();
                             let mut arb = ctx.conn_arbiter.lock().unwrap();
                             for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
                                 .into_iter()
@@ -2357,7 +2350,7 @@ fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) 
     let retry_time = peer.config.connect_retry_time;
     let password = peer.config.password.as_ref().map(|x| x.to_string());
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    peer.context.lock().unwrap().active_connect_cancel_tx = ActiveConnectCancel(Some(cancel_tx));
+    peer.context.lock().unwrap().active_connect_cancel_tx = Some(cancel_tx);
     tokio::spawn(async move {
         loop {
             let socket = match peer_addr {
@@ -3981,12 +3974,7 @@ impl PeerSession {
         for effect in effects {
             match effect {
                 GlobalEffect::StopActiveConnect => {
-                    self.context
-                        .lock()
-                        .unwrap()
-                        .active_connect_cancel_tx
-                        .0
-                        .take();
+                    self.context.lock().unwrap().active_connect_cancel_tx.take();
                 }
                 GlobalEffect::GrSessionEstablished { negotiated_gr } => {
                     let gr_families = negotiated_gr
@@ -5280,7 +5268,7 @@ mod tests {
         let conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(fsm)));
         Arc::new(std::sync::Mutex::new(PeerContext {
             conn_arbiter,
-            active_connect_cancel_tx: ActiveConnectCancel::default(),
+            active_connect_cancel_tx: None,
             gr_state: crate::gr::GrState::new(),
             gr_restart_timer: None,
         }))
@@ -5296,7 +5284,7 @@ mod tests {
         let context = make_context();
 
         let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-        context.lock().unwrap().active_connect_cancel_tx = ActiveConnectCancel(Some(tx));
+        context.lock().unwrap().active_connect_cancel_tx = Some(tx);
 
         let mut session = PeerSession::new_for_test(remote_addr, context.clone(), tables);
         session
