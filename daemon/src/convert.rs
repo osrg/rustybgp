@@ -1505,6 +1505,16 @@ pub(crate) fn disposition_from_api(
         .large_community
         .and_then(large_community_action_from_api);
 
+    let origin = actions.origin_action.and_then(|oa| {
+        let origin = match api::OriginType::try_from(oa.origin) {
+            Ok(api::OriginType::Igp) => 0u8,
+            Ok(api::OriginType::Egp) => 1u8,
+            Ok(api::OriginType::Incomplete) => 2u8,
+            _ => return None,
+        };
+        Some(rustybgp_table::OriginAction { origin })
+    });
+
     Ok((
         disposition,
         rustybgp_table::Actions {
@@ -1515,6 +1525,7 @@ pub(crate) fn disposition_from_api(
             as_prepend,
             ext_community,
             large_community,
+            origin,
         },
     ))
 }

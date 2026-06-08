@@ -581,6 +581,13 @@ pub struct LargeCommunityAction {
     pub communities: Vec<(u32, u32, u32)>,
 }
 
+/// Action to overwrite the ORIGIN attribute (RFC 4271 section 5.1.1).
+/// origin: 0=IGP, 1=EGP, 2=Incomplete
+#[derive(Clone, Debug, PartialEq)]
+pub struct OriginAction {
+    pub origin: u8,
+}
+
 /// Actions applied to a route when a policy statement matches.
 #[derive(Clone, Default)]
 pub struct Actions {
@@ -591,6 +598,7 @@ pub struct Actions {
     pub as_prepend: Option<AsPrependAction>,
     pub ext_community: Option<ExtCommunityAction>,
     pub large_community: Option<LargeCommunityAction>,
+    pub origin: Option<OriginAction>,
 }
 
 #[derive(Clone)]
@@ -745,6 +753,16 @@ impl Statement {
             };
             attrs.retain(|a| a.code() != packet::Attribute::LARGE_COMMUNITY);
             if let Some(new_attr) = large_communities_to_attr(new_communities) {
+                attrs.push(new_attr);
+            }
+        }
+
+        if let Some(action) = &self.actions.origin {
+            let attrs = Arc::make_mut(attr);
+            attrs.retain(|a| a.code() != packet::Attribute::ORIGIN);
+            if let Some(new_attr) =
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, action.origin as u32)
+            {
                 attrs.push(new_attr);
             }
         }
@@ -1833,5 +1851,71 @@ mod tests {
         let mut nexthop = nh();
         Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(get_large_communities(&attr), vec![(65001, 2, 50)]);
+    }
+
+    fn make_origin_assignment(origin: u8) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![],
+                Some(Disposition::Accept),
+                Actions {
+                    origin: Some(OriginAction { origin }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "ribs",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+        assignment
+    }
+
+    fn get_origin(attrs: &[packet::Attribute]) -> Option<u8> {
+        attrs
+            .iter()
+            .find(|a| a.code() == packet::Attribute::ORIGIN)
+            .and_then(|a| a.value())
+            .map(|v| v as u8)
+    }
+
+    #[test]
+    fn origin_set_igp() {
+        let assignment = make_origin_assignment(0); // IGP
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 2).unwrap(), // Incomplete
+        ]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_origin(&attr), Some(0));
+    }
+
+    #[test]
+    fn origin_set_incomplete() {
+        let assignment = make_origin_assignment(2); // Incomplete
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(), // IGP
+        ]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_origin(&attr), Some(2));
+        assert_eq!(
+            attr.iter()
+                .filter(|a| a.code() == packet::Attribute::ORIGIN)
+                .count(),
+            1,
+            "only one ORIGIN attribute"
+        );
     }
 }
