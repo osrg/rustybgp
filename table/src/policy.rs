@@ -334,6 +334,7 @@ pub enum Condition {
     /// BGP ORIGIN value: 0=IGP, 1=EGP, 2=Incomplete
     Origin(u8),
     RouteType(RouteType),
+    CommunityCount(Comparison, u32),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -445,6 +446,14 @@ impl Condition {
                     RouteType::External => {
                         !source.is_local() && source.remote_asn != source.local_asn
                     }
+                };
+            }
+            Condition::CommunityCount(cmp, v) => {
+                let count = communities_from_attr(attr).len() as u32;
+                return match cmp {
+                    Comparison::Eq => count == *v,
+                    Comparison::Ge => count >= *v,
+                    Comparison::Le => count <= *v,
                 };
             }
             _ => {}
@@ -852,6 +861,7 @@ pub enum ConditionConfig {
     /// BGP ORIGIN value: 0=IGP, 1=EGP, 2=Incomplete
     Origin(u8),
     RouteType(RouteType),
+    CommunityCount(Comparison, u32),
 }
 
 pub enum DefinedSetRef<'a> {
@@ -1284,6 +1294,9 @@ impl PolicyTable {
                 }
                 ConditionConfig::RouteType(rt) => {
                     v.push(Condition::RouteType(rt));
+                }
+                ConditionConfig::CommunityCount(cmp, count) => {
+                    v.push(Condition::CommunityCount(cmp, count));
                 }
             }
         }
@@ -2113,6 +2126,42 @@ mod tests {
         let s = source();
         let net = nlri();
         let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn community_count_eq_match() {
+        let assignment =
+            make_condition_assignment(vec![ConditionConfig::CommunityCount(Comparison::Eq, 2)]);
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_community(&[0x00010001, 0x00010002]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn community_count_eq_no_match() {
+        let assignment =
+            make_condition_assignment(vec![ConditionConfig::CommunityCount(Comparison::Eq, 2)]);
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_community(&[0x00010001]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Accept);
+    }
+
+    #[test]
+    fn community_count_ge_match() {
+        let assignment =
+            make_condition_assignment(vec![ConditionConfig::CommunityCount(Comparison::Ge, 2)]);
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_community(&[0x00010001, 0x00010002, 0x00010003]);
         let mut nexthop = nh();
         let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(d, Disposition::Reject);

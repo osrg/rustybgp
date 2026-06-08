@@ -1140,6 +1140,16 @@ pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement
                     RouteType::Local => ApiRouteType::Local as i32,
                 };
             }
+            Condition::CommunityCount(cmp, count) => {
+                conditions.community_count = Some(api::CommunityCount {
+                    r#type: match cmp {
+                        Comparison::Eq => 0,
+                        Comparison::Ge => 1,
+                        Comparison::Le => 2,
+                    },
+                    count: *count,
+                });
+            }
         }
     }
     s.conditions = Some(conditions);
@@ -1338,6 +1348,12 @@ pub(crate) fn conditions_from_api(
         Ok(ApiRouteType::External) => v.push(ConditionConfig::RouteType(RouteType::External)),
         Ok(ApiRouteType::Local) => v.push(ConditionConfig::RouteType(RouteType::Local)),
         _ => {}
+    }
+    if let Some(m) = conditions.community_count {
+        v.push(ConditionConfig::CommunityCount(
+            Comparison::from(m.r#type),
+            m.count,
+        ));
     }
     Ok(v)
 }
