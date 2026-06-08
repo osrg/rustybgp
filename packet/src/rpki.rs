@@ -76,6 +76,16 @@ impl Message {
         let buf: Vec<u8> = Vec::new();
         let mut c = Cursor::new(buf);
         match self {
+            Message::SerialNotify {
+                session_id,
+                serial_number,
+            } => {
+                c.write_u8(version)?;
+                c.write_u8(Message::SERIAL_NOTIFY)?;
+                c.write_u16::<NetworkEndian>(*session_id)?;
+                c.write_u32::<NetworkEndian>(12)?;
+                c.write_u32::<NetworkEndian>(*serial_number)?;
+            }
             Message::ResetQuery => {
                 c.write_u8(version)?;
                 c.write_u8(Message::RESET_QUERY)?;
@@ -92,7 +102,75 @@ impl Message {
                 c.write_u32::<NetworkEndian>(12)?;
                 c.write_u32::<NetworkEndian>(*serial_number)?;
             }
-            _ => {}
+            Message::CacheResponse { session_id } => {
+                c.write_u8(version)?;
+                c.write_u8(Message::CACHE_RESPONSE)?;
+                c.write_u16::<NetworkEndian>(*session_id)?;
+                c.write_u32::<NetworkEndian>(8)?;
+            }
+            Message::IpPrefix(prefix) => match &prefix.net {
+                crate::IpNet::V4(net) => {
+                    c.write_u8(version)?;
+                    c.write_u8(Message::IPV4_PREFIX)?;
+                    c.write_u16::<NetworkEndian>(0)?;
+                    c.write_u32::<NetworkEndian>(20)?;
+                    c.write_u8(prefix.flags)?;
+                    c.write_u8(net.mask)?;
+                    c.write_u8(prefix.max_length)?;
+                    c.write_u8(0)?;
+                    for octet in net.addr.octets() {
+                        c.write_u8(octet)?;
+                    }
+                    c.write_u32::<NetworkEndian>(prefix.as_number)?;
+                }
+                crate::IpNet::V6(net) => {
+                    c.write_u8(version)?;
+                    c.write_u8(Message::IPV6_PREFIX)?;
+                    c.write_u16::<NetworkEndian>(0)?;
+                    c.write_u32::<NetworkEndian>(32)?;
+                    c.write_u8(prefix.flags)?;
+                    c.write_u8(net.mask)?;
+                    c.write_u8(prefix.max_length)?;
+                    c.write_u8(0)?;
+                    for octet in net.addr.octets() {
+                        c.write_u8(octet)?;
+                    }
+                    c.write_u32::<NetworkEndian>(prefix.as_number)?;
+                }
+            },
+            Message::EndOfData {
+                session_id,
+                serial_number,
+                refresh_interval,
+                retry_interval,
+                expire_interval,
+            } => {
+                c.write_u8(version)?;
+                c.write_u8(Message::END_OF_DATA)?;
+                c.write_u16::<NetworkEndian>(*session_id)?;
+                if version >= 1 {
+                    c.write_u32::<NetworkEndian>(24)?;
+                    c.write_u32::<NetworkEndian>(*serial_number)?;
+                    c.write_u32::<NetworkEndian>(*refresh_interval)?;
+                    c.write_u32::<NetworkEndian>(*retry_interval)?;
+                    c.write_u32::<NetworkEndian>(*expire_interval)?;
+                } else {
+                    c.write_u32::<NetworkEndian>(12)?;
+                    c.write_u32::<NetworkEndian>(*serial_number)?;
+                }
+            }
+            Message::CacheReset => {
+                c.write_u8(version)?;
+                c.write_u8(Message::CACHE_RESET)?;
+                c.write_u16::<NetworkEndian>(0)?;
+                c.write_u32::<NetworkEndian>(8)?;
+            }
+            Message::ErrorReport { error_code } => {
+                c.write_u8(version)?;
+                c.write_u8(Message::ERROR_REPORT)?;
+                c.write_u16::<NetworkEndian>(*error_code)?;
+                c.write_u32::<NetworkEndian>(8)?;
+            }
         }
         Ok(c.into_inner())
     }
