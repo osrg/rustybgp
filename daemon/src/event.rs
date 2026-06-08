@@ -161,14 +161,21 @@ struct ConnArbiter {
     fsm: crate::fsm::PeerFsm,
     active_close_tx: Option<tokio::sync::oneshot::Sender<CloseReason>>,
     passive_close_tx: Option<tokio::sync::oneshot::Sender<CloseReason>>,
+    active_join_handle: Option<tokio::task::JoinHandle<()>>,
+    passive_join_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Signal sent to a running connection to request shutdown.
+#[derive(Clone)]
 enum CloseReason {
     /// Admin shutdown (disable_peer / shutdown_peer): the FSM handles CEASE generation.
     AdminShutdown,
     /// Direct CEASE delivery (collision resolution / delete_peer): send the given message.
     SendMessage(bgp::Message),
+    /// Close the TCP connection without sending any BGP message (used for
+    /// Graceful Restart: the remote peer detects the silent close and enters
+    /// helper mode).
+    Silent,
 }
 
 impl ConnArbiter {
@@ -177,6 +184,8 @@ impl ConnArbiter {
             fsm,
             active_close_tx: None,
             passive_close_tx: None,
+            active_join_handle: None,
+            passive_join_handle: None,
         }
     }
 
@@ -276,6 +285,9 @@ struct PeerContext {
     /// Cancels the active-connect retry loop spawned by `enable_active_connect`.
     /// Dropping the sender signals the task to exit; replaced on each reconnect.
     active_connect_cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// JoinHandle for the active-connect retry task.  Stored alongside
+    /// active_connect_cancel_tx so stop_bgp can await task completion.
+    active_connect_join_handle: Option<tokio::task::JoinHandle<()>>,
     /// GR helper state machine; persists across sessions.
     gr_state: crate::gr::GrState,
     /// Abort handle for the GR restart timer task.
@@ -419,6 +431,7 @@ impl Peer {
         self.state.session_addrs.store(None);
         let mut ctx = self.context.lock().unwrap();
         ctx.active_connect_cancel_tx = None;
+        ctx.active_connect_join_handle = None;
         {
             let mut arb = ctx.conn_arbiter.lock().unwrap();
             arb.active_close_tx = None;
@@ -586,6 +599,7 @@ impl PeerParams {
             context: Arc::new(std::sync::Mutex::new(PeerContext {
                 conn_arbiter,
                 active_connect_cancel_tx: None,
+                active_connect_join_handle: None,
                 gr_state: crate::gr::GrState::new(),
                 gr_restart_timer: None,
             })),
@@ -1188,9 +1202,68 @@ impl GoBgpService for GrpcService {
     }
     async fn stop_bgp(
         &self,
-        _request: tonic::Request<api::StopBgpRequest>,
+        request: tonic::Request<api::StopBgpRequest>,
     ) -> Result<tonic::Response<api::StopBgpResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let allow_gr = request.into_inner().allow_graceful_restart;
+        let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
+            code: 6,
+            subcode: 3,
+            data: vec![],
+        });
+
+        let mut global = self.global.write().await;
+        if global.asn == 0 {
+            return Err(tonic::Status::new(
+                tonic::Code::FailedPrecondition,
+                "BGP is not running",
+            ));
+        }
+
+        // Collect all peer task handles and send close signals while holding
+        // the lock.  The handles are awaited after the lock is released.
+        let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        for peer in global.peers.values_mut() {
+            let has_gr = peer.config.graceful_restart.is_some();
+            let reason = if !allow_gr || !has_gr {
+                CloseReason::SendMessage(cease.clone())
+            } else {
+                CloseReason::Silent
+            };
+
+            let mut ctx = peer.context.lock().unwrap();
+            ctx.active_connect_cancel_tx.take();
+            if let Some(h) = ctx.active_connect_join_handle.take() {
+                join_handles.push(h);
+            }
+            if let Some(h) = ctx.gr_restart_timer.take() {
+                h.abort();
+            }
+            let mut arb = ctx.conn_arbiter.lock().unwrap();
+            for (close_tx, join_handle) in [
+                (arb.active_close_tx.take(), arb.active_join_handle.take()),
+                (arb.passive_close_tx.take(), arb.passive_join_handle.take()),
+            ] {
+                if let Some(tx) = close_tx {
+                    let _ = tx.send(reason.clone());
+                }
+                if let Some(h) = join_handle {
+                    join_handles.push(h);
+                }
+            }
+        }
+        global.peers.clear();
+        global.asn = 0;
+        global.router_id = Ipv4Addr::new(0, 0, 0, 0);
+        global.listen_port = Global::BGP_PORT;
+        if let Some(tx) = global.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        drop(global);
+
+        for h in join_handles {
+            let _ = h.await;
+        }
+        Ok(tonic::Response::new(api::StopBgpResponse {}))
     }
     async fn get_bgp(
         &self,
@@ -1238,6 +1311,7 @@ impl GoBgpService for GrpcService {
                     }
                     // Cancel the active-connect retry loop.
                     ctx.active_connect_cancel_tx.take();
+                    ctx.active_connect_join_handle.take();
                     {
                         let mut arb = ctx.conn_arbiter.lock().unwrap();
                         for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
@@ -1406,6 +1480,7 @@ impl GoBgpService for GrpcService {
                         {
                             let mut ctx = p.context.lock().unwrap();
                             ctx.active_connect_cancel_tx.take();
+                            ctx.active_connect_join_handle.take();
                             let mut arb = ctx.conn_arbiter.lock().unwrap();
                             for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
                                 .into_iter()
@@ -2393,8 +2468,7 @@ fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) 
     let retry_time = peer.config.connect_retry_time;
     let password = peer.config.password.as_ref().map(|x| x.to_string());
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    peer.context.lock().unwrap().active_connect_cancel_tx = Some(cancel_tx);
-    tokio::spawn(async move {
+    let join_handle = tokio::spawn(async move {
         loop {
             let socket = match peer_addr {
                 IpAddr::V4(_) => tokio::net::TcpSocket::new_v4().unwrap(),
@@ -2421,6 +2495,9 @@ fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) 
             }
         }
     });
+    let mut ctx = peer.context.lock().unwrap();
+    ctx.active_connect_cancel_tx = Some(cancel_tx);
+    ctx.active_connect_join_handle = Some(join_handle);
 }
 
 impl From<&crate::rpki::RpkiState> for api::RpkiState {
@@ -2500,6 +2577,10 @@ pub(crate) struct Global {
     selection_deferral: Option<crate::gr::RestartingDeferral>,
     /// Abort handle for the global Selection_Deferral_Timer (RFC 4724 §4.1).
     selection_deferral_timer: Option<tokio::task::AbortHandle>,
+
+    /// Sending on this channel causes the BGP listener loop to stop, enabling
+    /// a subsequent start_bgp call to restart it.  None when BGP is not running.
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl From<&Global> for api::Global {
@@ -2541,6 +2622,8 @@ impl Global {
 
             selection_deferral: None,
             selection_deferral_timer: None,
+
+            stop_tx: None,
         }
     }
 
@@ -3114,57 +3197,73 @@ impl Global {
                 panic!("failed to listen on grpc {}", e);
             }
         });
-        notify.notified().await;
-        let listen_port = global.read().await.listen_port;
-        let listen_sockets: Vec<std::net::TcpListener> = vec![
-            create_listen_socket("0.0.0.0".to_string(), listen_port),
-            create_listen_socket("[::]".to_string(), listen_port),
-        ]
-        .into_iter()
-        .filter_map(|x| x.ok())
-        .collect();
-        global
-            .write()
-            .await
-            .listen_sockets
-            .append(&mut listen_sockets.iter().map(|x| x.as_raw_fd()).collect());
-
-        for (addr, peer) in &global.read().await.peers {
-            if let Some(password) = &peer.config.password {
-                for l in &listen_sockets {
-                    auth::set_md5sig(l.as_raw_fd(), addr, password);
-                }
-            }
-        }
-
-        let mut incomings = listen_sockets
-            .into_iter()
-            .map(|x| {
-                tokio_stream::wrappers::TcpListenerStream::new(TcpListener::from_std(x).unwrap())
-            })
-            .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
-        assert_ne!(incomings.len(), 0);
         loop {
-            let mut bgp_listen_futures = FuturesUnordered::new();
-            for incoming in &mut incomings {
-                bgp_listen_futures.push(incoming.next());
-            }
-            futures::select_biased! {
-                stream = bgp_listen_futures.next() => {
-                    if let Some(Some(Ok(stream))) = stream
-                        && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Passive).await
-                    {
-                        tokio::spawn(h.run(global.clone(), active_tx.clone()));
+            notify.notified().await;
+            let listen_port = global.read().await.listen_port;
+            let listen_sockets: Vec<std::net::TcpListener> = vec![
+                create_listen_socket("0.0.0.0".to_string(), listen_port),
+                create_listen_socket("[::]".to_string(), listen_port),
+            ]
+            .into_iter()
+            .filter_map(|x| x.ok())
+            .collect();
+            global
+                .write()
+                .await
+                .listen_sockets
+                .append(&mut listen_sockets.iter().map(|x| x.as_raw_fd()).collect());
+
+            for (addr, peer) in &global.read().await.peers {
+                if let Some(password) = &peer.config.password {
+                    for l in &listen_sockets {
+                        auth::set_md5sig(l.as_raw_fd(), addr, password);
                     }
                 }
-                stream = active_rx.recv().fuse() => {
-                    if let Some(stream) = stream
-                        && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Active).await
-                    {
-                        tokio::spawn(h.run(global.clone(), active_tx.clone()));
+            }
+
+            let mut incomings = listen_sockets
+                .into_iter()
+                .map(|x| {
+                    tokio_stream::wrappers::TcpListenerStream::new(
+                        TcpListener::from_std(x).unwrap(),
+                    )
+                })
+                .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
+            assert_ne!(incomings.len(), 0);
+
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            global.write().await.stop_tx = Some(stop_tx);
+
+            loop {
+                let mut bgp_listen_futures = FuturesUnordered::new();
+                for incoming in &mut incomings {
+                    bgp_listen_futures.push(incoming.next());
+                }
+                futures::select_biased! {
+                    stream = bgp_listen_futures.next() => {
+                        if let Some(Some(Ok(stream))) = stream
+                            && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Passive).await
+                        {
+                            let arb = h.conn_arbiter.clone();
+                            let join_handle = tokio::spawn(h.run(global.clone(), active_tx.clone()));
+                            arb.lock().unwrap().passive_join_handle = Some(join_handle);
+                        }
                     }
+                    stream = active_rx.recv().fuse() => {
+                        if let Some(stream) = stream
+                            && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Active).await
+                        {
+                            let arb = h.conn_arbiter.clone();
+                            let join_handle = tokio::spawn(h.run(global.clone(), active_tx.clone()));
+                            arb.lock().unwrap().active_join_handle = Some(join_handle);
+                        }
+                    }
+                    _ = (&mut stop_rx).fuse() => { break }
                 }
             }
+            // Close listeners by dropping incomings; clear stored FDs.
+            drop(incomings);
+            global.write().await.listen_sockets.clear();
         }
     }
 }
@@ -4017,7 +4116,9 @@ impl PeerSession {
         for effect in effects {
             match effect {
                 GlobalEffect::StopActiveConnect => {
-                    self.context.lock().unwrap().active_connect_cancel_tx.take();
+                    let mut ctx = self.context.lock().unwrap();
+                    ctx.active_connect_cancel_tx.take();
+                    ctx.active_connect_join_handle.take();
                 }
                 GlobalEffect::GrSessionEstablished { negotiated_gr } => {
                     let gr_families = negotiated_gr
@@ -4413,6 +4514,11 @@ impl PeerSession {
                             self.urgent.insert(0, msg);
                             self.shutdown = Some(crate::fsm::SessionDownReason::AdminShutdown);
                         }
+                        Some(Ok(CloseReason::Silent)) => {
+                            // Close TCP without sending a NOTIFICATION so the remote
+                            // peer treats this as a GR restart event.
+                            self.shutdown = Some(crate::fsm::SessionDownReason::AdminShutdown);
+                        }
                         _ => {}
                     }
                 }
@@ -4599,8 +4705,14 @@ async fn apply_disconnect(
     {
         let mut arb = ctx.conn_arbiter.lock().unwrap();
         match info.role {
-            crate::fsm::Role::Active => arb.active_close_tx = None,
-            crate::fsm::Role::Passive => arb.passive_close_tx = None,
+            crate::fsm::Role::Active => {
+                arb.active_close_tx = None;
+                arb.active_join_handle = None;
+            }
+            crate::fsm::Role::Passive => {
+                arb.passive_close_tx = None;
+                arb.passive_join_handle = None;
+            }
         }
         // Ensure the FSM slot is cleared regardless of how the session
         // ended.  Most paths (I/O errors, hold-timer, admin-shutdown) route
@@ -5312,6 +5424,7 @@ mod tests {
         Arc::new(std::sync::Mutex::new(PeerContext {
             conn_arbiter,
             active_connect_cancel_tx: None,
+            active_connect_join_handle: None,
             gr_state: crate::gr::GrState::new(),
             gr_restart_timer: None,
         }))
