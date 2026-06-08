@@ -350,6 +350,7 @@ impl Condition {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
+        nexthop: &bgp::Nexthop,
     ) -> bool {
         match self {
             Condition::Prefix(_name, opt, set) => {
@@ -468,9 +469,7 @@ impl Condition {
                 return match_string_set(&strs, &set.sets, opt);
             }
             Condition::Nexthop(nexthops) => {
-                // Nexthop matching is done at the routing level, not on attributes
-                let _ = nexthops;
-                return false;
+                return nexthops.contains(&nexthop.addr());
             }
             Condition::ExtCommunity(_name, opt, set) => {
                 let communities = ext_communities_from_attr(attr);
@@ -752,7 +751,10 @@ impl Statement {
         nexthop: &mut bgp::Nexthop,
         local_addr: IpAddr,
     ) -> Disposition {
-        let matched = self.conditions.iter().all(|c| c.evalute(source, net, attr));
+        let matched = self
+            .conditions
+            .iter()
+            .all(|c| c.evalute(source, net, attr, nexthop));
         if !matched {
             return Disposition::Pass;
         }
@@ -2827,6 +2829,66 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_large_community_tuples(&[(65001, 1, 100)]);
         let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Accept);
+    }
+
+    fn make_nexthop_condition_assignment(nexthops: Vec<IpAddr>) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "s1",
+                vec![ConditionConfig::Nexthop(nexthops)],
+                Some(Disposition::Accept),
+                Actions::default(),
+            )
+            .unwrap();
+        ptable.add_policy("p1", vec!["s1".to_string()]).unwrap();
+        ptable
+            .add_assignment(
+                "a1",
+                PolicyDirection::Import,
+                Disposition::Reject,
+                vec!["p1".to_string()],
+            )
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn nexthop_condition_match() {
+        let assignment =
+            make_nexthop_condition_assignment(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Accept);
+    }
+
+    #[test]
+    fn nexthop_condition_no_match() {
+        let assignment =
+            make_nexthop_condition_assignment(vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))]);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn nexthop_condition_multiple_match() {
+        let assignment = make_nexthop_condition_assignment(vec![
+            IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        ]);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
         let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(d, Disposition::Accept);
     }
