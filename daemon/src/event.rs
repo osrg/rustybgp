@@ -4364,6 +4364,9 @@ impl PeerSession {
                             self.process_effects(effects, global).await;
                         }
                         Some(Ok(CloseReason::SendMessage(msg))) => {
+                            // Bypass FSM: NOTIFICATION content is pre-determined by
+                            // the caller (collision subcode 7, peer delete subcode 3);
+                            // Input::AdminShutdown would overwrite it with subcode 2.
                             self.urgent.insert(0, msg);
                             self.shutdown = Some(crate::fsm::SessionDownReason::AdminShutdown);
                         }
@@ -4422,6 +4425,9 @@ impl PeerSession {
                                         },
                                     }
                                     Err(e) => {
+                                        // Bypass FSM: BgpError already encodes the
+                                        // correct NOTIFICATION; the FSM has no
+                                        // decision to make here.
                                         if let rustybgp_packet::Error::Bgp(ref bgp_err) = e {
                                             self.urgent.insert(0, bgp::Message::Notification(bgp_err.clone()));
                                             self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(bgp_err.clone())));
