@@ -253,6 +253,13 @@ impl TableManager {
         }
     }
 
+    pub(crate) async fn rpki_withdraw(&self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
+        let mut rpki = self.rpki.write().unwrap();
+        for (net, roa) in roas {
+            rpki.remove(net, &roa);
+        }
+    }
+
     pub(crate) async fn rpki_reset(
         &self,
         addr: Arc<IpAddr>,

@@ -2278,6 +2278,28 @@ impl RpkiTable {
         }
     }
 
+    pub fn remove(&mut self, net: packet::IpNet, roa: &Roa) {
+        let (family, mut key, mask) = match net {
+            packet::IpNet::V4(n) => (Family::IPV4, n.addr.octets().to_vec(), n.mask),
+            packet::IpNet::V6(n) => (Family::IPV6, n.addr.octets().to_vec(), n.mask),
+        };
+        key.push(mask);
+        let trie = self.roas.get_mut(&family).unwrap();
+        let is_empty = if let Some(entry) = trie.get_mut(&key) {
+            entry.retain(|e| {
+                !(Arc::ptr_eq(&e.source, &roa.source)
+                    && e.max_length == roa.max_length
+                    && e.as_number == roa.as_number)
+            });
+            entry.is_empty()
+        } else {
+            false
+        };
+        if is_empty {
+            trie.remove(key);
+        }
+    }
+
     pub fn drop_source(&mut self, source: Arc<IpAddr>) {
         for (_, roa) in self.roas.iter_mut() {
             let mut empty = Vec::new();

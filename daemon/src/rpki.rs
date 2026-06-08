@@ -155,18 +155,24 @@ impl RpkiClient {
                         rpki::Message::CacheResponse { session_id } => {
                             state.session_id.store(session_id, Ordering::Relaxed);
                         }
-                        rpki::Message::IpPrefix(prefix) if prefix.flags & 1 > 0 => {
+                        rpki::Message::IpPrefix(prefix) => {
                             let roa = Arc::new(table::Roa::new(
                                 prefix.max_length,
                                 prefix.as_number,
                                 remote_addr.clone(),
                             ));
-                            if end_of_data {
+                            if prefix.flags & 1 > 0 {
+                                if end_of_data {
+                                    tables
+                                        .rpki_insert(vec![(prefix.net.clone(), roa)])
+                                        .await;
+                                } else {
+                                    v.push((prefix.net, roa));
+                                }
+                            } else if end_of_data {
                                 tables
-                                    .rpki_insert(vec![(prefix.net.clone(), roa.clone())])
+                                    .rpki_withdraw(vec![(prefix.net.clone(), roa)])
                                     .await;
-                            } else {
-                                v.push((prefix.net, roa));
                             }
                         }
                         rpki::Message::EndOfData { serial_number, .. } => {
