@@ -1032,6 +1032,33 @@ struct PeerGroup {
     holdtime: Option<u64>,
 }
 
+fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
+    api::PeerGroup {
+        conf: Some(api::PeerGroupConf {
+            peer_group_name: name.to_string(),
+            peer_asn: pg.as_number,
+            ..Default::default()
+        }),
+        timers: pg.holdtime.map(|h| api::Timers {
+            config: Some(api::TimersConfig {
+                hold_time: h,
+                keepalive_interval: h / 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        route_server: if pg.route_server_client {
+            Some(api::RouteServer {
+                route_server_client: true,
+                ..Default::default()
+            })
+        } else {
+            None
+        },
+        ..Default::default()
+    }
+}
+
 impl From<api::PeerGroup> for PeerGroup {
     fn from(p: api::PeerGroup) -> PeerGroup {
         PeerGroup {
@@ -1670,9 +1697,28 @@ impl GoBgpService for GrpcService {
     >;
     async fn list_peer_group(
         &self,
-        _request: tonic::Request<api::ListPeerGroupRequest>,
+        request: tonic::Request<api::ListPeerGroupRequest>,
     ) -> Result<tonic::Response<Self::ListPeerGroupStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let name_filter = request.into_inner().peer_group_name;
+        let global = self.global.read().await;
+        let v: Vec<api::PeerGroup> = global
+            .peer_group
+            .iter()
+            .filter(|(name, _)| name_filter.is_empty() || name_filter == **name)
+            .map(|(name, pg)| peer_group_to_api(name, pg))
+            .collect();
+        drop(global);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for pg in v {
+                let _ = tx.send(Ok(api::ListPeerGroupResponse {
+                    peer_group: Some(pg),
+                }));
+            }
+        });
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        )))
     }
     async fn add_dynamic_neighbor(
         &self,
