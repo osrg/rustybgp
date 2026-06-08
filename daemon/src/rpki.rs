@@ -15,7 +15,7 @@
 use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
@@ -32,6 +32,7 @@ pub(crate) struct RpkiState {
     pub(crate) uptime: AtomicU64,
     pub(crate) downtime: AtomicU64,
     pub(crate) up: AtomicBool,
+    pub(crate) session_id: AtomicU16,
     pub(crate) serial: AtomicU32,
     pub(crate) received_ipv4: AtomicI64,
     pub(crate) received_ipv6: AtomicI64,
@@ -56,7 +57,7 @@ impl RpkiState {
             rpki::Message::ResetQuery => {
                 let _ = self.reset_query.fetch_add(1, Ordering::Relaxed);
             }
-            rpki::Message::CacheResponse => {
+            rpki::Message::CacheResponse { .. } => {
                 let _ = self.cache_response.fetch_add(1, Ordering::Relaxed);
             }
             rpki::Message::IpPrefix(prefix) => match prefix.net {
@@ -73,7 +74,7 @@ impl RpkiState {
             rpki::Message::CacheReset => {
                 let _ = self.cache_reset.fetch_add(1, Ordering::Relaxed);
             }
-            rpki::Message::ErrorReport => {
+            rpki::Message::ErrorReport { .. } => {
                 let _ = self.error.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -126,9 +127,10 @@ impl RpkiClient {
                     };
                     state.update(&msg);
                     match msg {
-                        rpki::Message::IpPrefix(prefix)
-                            if prefix.flags & 1 > 0 =>
-                        {
+                        rpki::Message::CacheResponse { session_id } => {
+                            state.session_id.store(session_id, Ordering::Relaxed);
+                        }
+                        rpki::Message::IpPrefix(prefix) if prefix.flags & 1 > 0 => {
                             let roa = Arc::new(table::Roa::new(
                                 prefix.max_length,
                                 prefix.as_number,
@@ -142,7 +144,7 @@ impl RpkiClient {
                                 v.push((prefix.net, roa));
                             }
                         }
-                        rpki::Message::EndOfData { serial_number } => {
+                        rpki::Message::EndOfData { serial_number, .. } => {
                             end_of_data = true;
                             state.serial.store(serial_number, Ordering::Relaxed);
                             tables.rpki_reset(remote_addr.clone(), v.to_owned()).await;
