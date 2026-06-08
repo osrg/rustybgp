@@ -1121,6 +1121,12 @@ pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement
                     length: *length,
                 })
             }
+            Condition::LocalPrefEq(val) => {
+                conditions.local_pref_eq = Some(api::LocalPrefEq { value: *val });
+            }
+            Condition::MedEq(val) => {
+                conditions.med_eq = Some(api::MedEq { value: *val });
+            }
         }
     }
     s.conditions = Some(conditions);
@@ -1293,6 +1299,12 @@ pub(crate) fn conditions_from_api(
             }
         };
         v.push(ConditionConfig::Rpki(s));
+    }
+    if let Some(m) = conditions.local_pref_eq {
+        v.push(ConditionConfig::LocalPrefEq(m.value));
+    }
+    if let Some(m) = conditions.med_eq {
+        v.push(ConditionConfig::MedEq(m.value));
     }
     Ok(v)
 }

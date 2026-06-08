@@ -330,6 +330,8 @@ pub enum Condition {
     // RouteType(u32),
     // LargeCommunity,
     // AfiSafiIn(Vec<bgp::Family>),
+    LocalPrefEq(u32),
+    MedEq(u32),
 }
 
 impl Condition {
@@ -403,6 +405,20 @@ impl Condition {
             }
             Condition::Rpki(_) => {
                 return false;
+            }
+            Condition::LocalPrefEq(v) => {
+                return attr
+                    .iter()
+                    .find(|a| a.code() == packet::Attribute::LOCAL_PREF)
+                    .and_then(|a| a.value())
+                    == Some(*v);
+            }
+            Condition::MedEq(v) => {
+                return attr
+                    .iter()
+                    .find(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
+                    .and_then(|a| a.value())
+                    == Some(*v);
             }
             _ => {}
         }
@@ -804,6 +820,8 @@ pub enum ConditionConfig {
     AsPathLength(Comparison, u32),
     Nexthop(Vec<IpAddr>),
     Rpki(RpkiValidationState),
+    LocalPrefEq(u32),
+    MedEq(u32),
 }
 
 pub enum DefinedSetRef<'a> {
@@ -1224,6 +1242,12 @@ impl PolicyTable {
                 }
                 ConditionConfig::Rpki(state) => {
                     v.push(Condition::Rpki(state));
+                }
+                ConditionConfig::LocalPrefEq(val) => {
+                    v.push(Condition::LocalPrefEq(val));
+                }
+                ConditionConfig::MedEq(val) => {
+                    v.push(Condition::MedEq(val));
                 }
             }
         }
@@ -1917,5 +1941,79 @@ mod tests {
             1,
             "only one ORIGIN attribute"
         );
+    }
+
+    fn make_condition_assignment(conditions: Vec<ConditionConfig>) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                conditions,
+                Some(Disposition::Reject),
+                Actions::default(),
+            )
+            .unwrap();
+        ptable.add_policy("p1", vec!["st1".to_string()]).unwrap();
+        ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Import,
+                Disposition::Accept,
+                vec!["p1".to_string()],
+            )
+            .unwrap();
+        ptable.assignment_import.unwrap()
+    }
+
+    #[test]
+    fn local_pref_eq_match() {
+        let assignment = make_condition_assignment(vec![ConditionConfig::LocalPrefEq(200)]);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
+        ]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn local_pref_eq_no_match() {
+        let assignment = make_condition_assignment(vec![ConditionConfig::LocalPrefEq(200)]);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 100).unwrap(),
+        ]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Accept);
+    }
+
+    #[test]
+    fn med_eq_match() {
+        let assignment = make_condition_assignment(vec![ConditionConfig::MedEq(50)]);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, 50).unwrap(),
+        ]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn med_eq_no_match() {
+        let assignment = make_condition_assignment(vec![ConditionConfig::MedEq(50)]);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, 99).unwrap(),
+        ]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Accept);
     }
 }
