@@ -324,10 +324,10 @@ pub enum Condition {
     AsPath(String, MatchOption, Arc<AsPathSet>),
     Community(String, MatchOption, Arc<CommunitySet>),
     Nexthop(Vec<IpAddr>),
-    // ExtendedCommunity,
+    ExtCommunity(String, MatchOption, Arc<ExtCommunitySet>),
     AsPathLength(Comparison, u32),
     Rpki(RpkiValidationState),
-    // LargeCommunity,
+    LargeCommunity(String, MatchOption, Arc<LargeCommunitySet>),
     LocalPrefEq(u32),
     MedEq(u32),
     /// BGP ORIGIN value: 0=IGP, 1=EGP, 2=Incomplete
@@ -459,9 +459,66 @@ impl Condition {
             Condition::AfiSafiIn(families) => {
                 return families.contains(&nlri_family(net));
             }
-            _ => {}
+            Condition::Community(_name, opt, set) => {
+                let communities = communities_from_attr(attr);
+                let strs: Vec<String> = communities
+                    .iter()
+                    .map(|c| format!("{}:{}", c >> 16, c & 0xffff))
+                    .collect();
+                return match_string_set(&strs, &set.sets, opt);
+            }
+            Condition::Nexthop(nexthops) => {
+                // Nexthop matching is done at the routing level, not on attributes
+                let _ = nexthops;
+                return false;
+            }
+            Condition::ExtCommunity(_name, opt, set) => {
+                let communities = ext_communities_from_attr(attr);
+                let strs: Vec<String> = communities
+                    .iter()
+                    .filter_map(ext_community_to_string)
+                    .collect();
+                return match_string_set(&strs, &set.sets, opt);
+            }
+            Condition::LargeCommunity(_name, opt, set) => {
+                let communities = large_communities_from_attr(attr);
+                let strs: Vec<String> = communities
+                    .iter()
+                    .map(|(ga, ld1, ld2)| format!("{}:{}:{}", ga, ld1, ld2))
+                    .collect();
+                return match_string_set(&strs, &set.sets, opt);
+            }
         }
         false
+    }
+}
+
+fn match_string_set(strs: &[String], patterns: &[Regex], opt: &MatchOption) -> bool {
+    match opt {
+        MatchOption::Any => strs.iter().any(|s| patterns.iter().any(|r| r.is_match(s))),
+        MatchOption::All => patterns.iter().all(|r| strs.iter().any(|s| r.is_match(s))),
+        MatchOption::Invert => !strs.iter().any(|s| patterns.iter().any(|r| r.is_match(s))),
+    }
+}
+
+fn ext_community_to_string(c: &[u8; 8]) -> Option<String> {
+    let prefix = match c[1] {
+        0x02 => "rt",
+        0x03 => "soo",
+        _ => return None,
+    };
+    match c[0] {
+        0x00 => {
+            let asn = u16::from_be_bytes([c[2], c[3]]);
+            let local = u32::from_be_bytes([c[4], c[5], c[6], c[7]]);
+            Some(format!("{}:{}:{}", prefix, asn, local))
+        }
+        0x01 => {
+            let addr = Ipv4Addr::new(c[2], c[3], c[4], c[5]);
+            let local = u16::from_be_bytes([c[6], c[7]]);
+            Some(format!("{}:{}:{}", prefix, addr, local))
+        }
+        _ => None,
     }
 }
 
@@ -870,6 +927,14 @@ pub enum DefinedSetConfig {
         name: String,
         patterns: Vec<String>,
     },
+    ExtCommunity {
+        name: String,
+        patterns: Vec<String>,
+    },
+    LargeCommunity {
+        name: String,
+        patterns: Vec<String>,
+    },
 }
 
 pub enum ConditionConfig {
@@ -877,6 +942,8 @@ pub enum ConditionConfig {
     NeighborSet(String, MatchOption),
     AsPathSet(String, MatchOption),
     CommunitySet(String, MatchOption),
+    ExtCommunitySet(String, MatchOption),
+    LargeCommunitySet(String, MatchOption),
     AsPathLength(Comparison, u32),
     Nexthop(Vec<IpAddr>),
     Rpki(RpkiValidationState),
@@ -894,6 +961,8 @@ pub enum DefinedSetRef<'a> {
     Neighbor(&'a str, &'a NeighborSet),
     AsPath(&'a str, &'a AsPathSet),
     Community(&'a str, &'a CommunitySet),
+    ExtCommunity(&'a str, &'a ExtCommunitySet),
+    LargeCommunity(&'a str, &'a LargeCommunitySet),
 }
 
 pub struct PrefixSet {
@@ -911,6 +980,14 @@ pub struct AsPathSet {
 }
 
 pub struct CommunitySet {
+    pub sets: Vec<Regex>,
+}
+
+pub struct ExtCommunitySet {
+    pub sets: Vec<Regex>,
+}
+
+pub struct LargeCommunitySet {
     pub sets: Vec<Regex>,
 }
 
@@ -976,6 +1053,8 @@ pub struct PolicyTable {
     neighbor_sets: FnvHashMap<Arc<str>, Arc<NeighborSet>>,
     aspath_sets: FnvHashMap<Arc<str>, Arc<AsPathSet>>,
     community_sets: FnvHashMap<Arc<str>, Arc<CommunitySet>>,
+    ext_community_sets: FnvHashMap<Arc<str>, Arc<ExtCommunitySet>>,
+    large_community_sets: FnvHashMap<Arc<str>, Arc<LargeCommunitySet>>,
 
     statements: FnvHashMap<Arc<str>, Arc<Statement>>,
     policies: FnvHashMap<Arc<str>, Arc<Policy>>,
@@ -1208,6 +1287,54 @@ impl PolicyTable {
                 }
                 Err(TableError::AlreadyExists(name))
             }
+            DefinedSetConfig::ExtCommunity { name, patterns } => {
+                let arc_name: Arc<str> = Arc::from(name.as_str());
+                let mut v = Vec::with_capacity(patterns.len());
+                for n in &patterns {
+                    match Regex::new(n) {
+                        Ok(r) => v.push(r),
+                        Err(_) => {
+                            return Err(TableError::InvalidArgument(format!(
+                                "invalid ext-community regex {:?}",
+                                n
+                            )));
+                        }
+                    }
+                }
+                if v.is_empty() {
+                    return Err(TableError::InvalidArgument(
+                        "empty ext-community defined-type".to_string(),
+                    ));
+                } else if let Vacant(e) = self.ext_community_sets.entry(arc_name) {
+                    e.insert(Arc::new(ExtCommunitySet { sets: v }));
+                    return Ok(());
+                }
+                Err(TableError::AlreadyExists(name))
+            }
+            DefinedSetConfig::LargeCommunity { name, patterns } => {
+                let arc_name: Arc<str> = Arc::from(name.as_str());
+                let mut v = Vec::with_capacity(patterns.len());
+                for n in &patterns {
+                    match Regex::new(n) {
+                        Ok(r) => v.push(r),
+                        Err(_) => {
+                            return Err(TableError::InvalidArgument(format!(
+                                "invalid large-community regex {:?}",
+                                n
+                            )));
+                        }
+                    }
+                }
+                if v.is_empty() {
+                    return Err(TableError::InvalidArgument(
+                        "empty large-community defined-type".to_string(),
+                    ));
+                } else if let Vacant(e) = self.large_community_sets.entry(arc_name) {
+                    e.insert(Arc::new(LargeCommunitySet { sets: v }));
+                    return Ok(());
+                }
+                Err(TableError::AlreadyExists(name))
+            }
         }
     }
 
@@ -1229,6 +1356,16 @@ impl PolicyTable {
                 self.community_sets
                     .iter()
                     .map(|(name, s)| DefinedSetRef::Community(name, s)),
+            )
+            .chain(
+                self.ext_community_sets
+                    .iter()
+                    .map(|(name, s)| DefinedSetRef::ExtCommunity(name, s)),
+            )
+            .chain(
+                self.large_community_sets
+                    .iter()
+                    .map(|(name, s)| DefinedSetRef::LargeCommunity(name, s)),
             )
     }
 
@@ -1294,6 +1431,28 @@ impl PolicyTable {
                         None => {
                             return Err(TableError::InvalidArgument(format!(
                                 "{} community-set isn't found",
+                                set_name
+                            )));
+                        }
+                    }
+                }
+                ConditionConfig::ExtCommunitySet(set_name, opt) => {
+                    match self.ext_community_sets.get(set_name.as_str()) {
+                        Some(set) => v.push(Condition::ExtCommunity(set_name, opt, set.clone())),
+                        None => {
+                            return Err(TableError::InvalidArgument(format!(
+                                "{} ext-community-set isn't found",
+                                set_name
+                            )));
+                        }
+                    }
+                }
+                ConditionConfig::LargeCommunitySet(set_name, opt) => {
+                    match self.large_community_sets.get(set_name.as_str()) {
+                        Some(set) => v.push(Condition::LargeCommunity(set_name, opt, set.clone())),
+                        None => {
+                            return Err(TableError::InvalidArgument(format!(
+                                "{} large-community-set isn't found",
                                 set_name
                             )));
                         }
@@ -2238,5 +2397,169 @@ mod tests {
         let mut nexthop = nh();
         let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(d, Disposition::Reject);
+    }
+
+    fn make_ext_community_condition_assignment(
+        set_name: &str,
+        patterns: Vec<String>,
+        opt: MatchOption,
+    ) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(DefinedSetConfig::ExtCommunity {
+                name: set_name.to_string(),
+                patterns,
+            })
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::ExtCommunitySet(set_name.to_string(), opt)],
+                Some(Disposition::Reject),
+                Actions::default(),
+            )
+            .unwrap();
+        ptable.add_policy("p1", vec!["st1".to_string()]).unwrap();
+        ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Import,
+                Disposition::Accept,
+                vec!["p1".to_string()],
+            )
+            .unwrap();
+        ptable.assignment_import.unwrap()
+    }
+
+    fn attrs_with_ext_community_bytes(bytes: &[[u8; 8]]) -> Arc<Vec<packet::Attribute>> {
+        let mut bin = Vec::with_capacity(bytes.len() * 8);
+        for b in bytes {
+            bin.extend_from_slice(b);
+        }
+        Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::EXTENDED_COMMUNITY, bin).unwrap(),
+        ])
+    }
+
+    fn rt_bytes(asn: u16, local: u32) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        b[0] = 0x00;
+        b[1] = 0x02;
+        b[2] = (asn >> 8) as u8;
+        b[3] = asn as u8;
+        b[4] = (local >> 24) as u8;
+        b[5] = (local >> 16) as u8;
+        b[6] = (local >> 8) as u8;
+        b[7] = local as u8;
+        b
+    }
+
+    #[test]
+    fn ext_community_set_any_match() {
+        let assignment = make_ext_community_condition_assignment(
+            "ec1",
+            vec!["^rt:65000:100$".to_string()],
+            MatchOption::Any,
+        );
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_ext_community_bytes(&[rt_bytes(65000, 100)]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn ext_community_set_any_no_match() {
+        let assignment = make_ext_community_condition_assignment(
+            "ec1",
+            vec!["^rt:65000:100$".to_string()],
+            MatchOption::Any,
+        );
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_ext_community_bytes(&[rt_bytes(65001, 100)]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Accept);
+    }
+
+    fn make_large_community_condition_assignment(
+        set_name: &str,
+        patterns: Vec<String>,
+        opt: MatchOption,
+    ) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(DefinedSetConfig::LargeCommunity {
+                name: set_name.to_string(),
+                patterns,
+            })
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::LargeCommunitySet(
+                    set_name.to_string(),
+                    opt,
+                )],
+                Some(Disposition::Reject),
+                Actions::default(),
+            )
+            .unwrap();
+        ptable.add_policy("p1", vec!["st1".to_string()]).unwrap();
+        ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Import,
+                Disposition::Accept,
+                vec!["p1".to_string()],
+            )
+            .unwrap();
+        ptable.assignment_import.unwrap()
+    }
+
+    fn attrs_with_large_community_tuples(
+        communities: &[(u32, u32, u32)],
+    ) -> Arc<Vec<packet::Attribute>> {
+        let mut bin = Vec::with_capacity(communities.len() * 12);
+        for (ga, ld1, ld2) in communities {
+            bin.extend_from_slice(&ga.to_be_bytes());
+            bin.extend_from_slice(&ld1.to_be_bytes());
+            bin.extend_from_slice(&ld2.to_be_bytes());
+        }
+        Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::LARGE_COMMUNITY, bin).unwrap(),
+        ])
+    }
+
+    #[test]
+    fn large_community_set_any_match() {
+        let assignment = make_large_community_condition_assignment(
+            "lc1",
+            vec!["^65000:1:100$".to_string()],
+            MatchOption::Any,
+        );
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_large_community_tuples(&[(65000, 1, 100)]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Reject);
+    }
+
+    #[test]
+    fn large_community_set_any_no_match() {
+        let assignment = make_large_community_condition_assignment(
+            "lc1",
+            vec!["^65000:1:100$".to_string()],
+            MatchOption::Any,
+        );
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_large_community_tuples(&[(65001, 1, 100)]);
+        let mut nexthop = nh();
+        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(d, Disposition::Accept);
     }
 }

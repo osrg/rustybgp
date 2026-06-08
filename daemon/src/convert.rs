@@ -1095,15 +1095,6 @@ pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement
                     r#type: match_option_to_i32(opt),
                 });
             }
-            Condition::Community(name, opt, _set) => {
-                conditions.community_set = Some(api::MatchSet {
-                    name: name.clone(),
-                    r#type: match_option_to_i32(opt),
-                });
-            }
-            Condition::Nexthop(v) => {
-                conditions.next_hop_in_list = v.iter().map(|x| x.to_string()).collect();
-            }
             Condition::Rpki(v) => {
                 conditions.rpki_result = match v {
                     RpkiValidationState::NotFound => api::ValidationState::NotFound as i32,
@@ -1152,6 +1143,27 @@ pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement
             }
             Condition::AfiSafiIn(families) => {
                 conditions.afi_safi_in = families.iter().map(|f| family_to_api(*f)).collect();
+            }
+            Condition::ExtCommunity(name, opt, _set) => {
+                conditions.ext_community_set = Some(api::MatchSet {
+                    name: name.clone(),
+                    r#type: match_option_to_i32(opt),
+                });
+            }
+            Condition::LargeCommunity(name, opt, _set) => {
+                conditions.large_community_set = Some(api::MatchSet {
+                    name: name.clone(),
+                    r#type: match_option_to_i32(opt),
+                });
+            }
+            Condition::Community(name, opt, _set) => {
+                conditions.community_set = Some(api::MatchSet {
+                    name: name.clone(),
+                    r#type: match_option_to_i32(opt),
+                });
+            }
+            Condition::Nexthop(v) => {
+                conditions.next_hop_in_list = v.iter().map(|x| x.to_string()).collect();
             }
         }
     }
@@ -1254,6 +1266,18 @@ pub(crate) fn defined_set_to_api(d: rustybgp_table::DefinedSetRef<'_>) -> api::D
             list: set.sets.iter().map(|x| x.to_string()).collect(),
             prefixes: Vec::new(),
         },
+        DefinedSetRef::ExtCommunity(name, set) => api::DefinedSet {
+            defined_type: api::DefinedType::ExtCommunity as i32,
+            name: name.to_string(),
+            list: set.sets.iter().map(|x| x.to_string()).collect(),
+            prefixes: Vec::new(),
+        },
+        DefinedSetRef::LargeCommunity(name, set) => api::DefinedSet {
+            defined_type: api::DefinedType::LargeCommunity as i32,
+            name: name.to_string(),
+            list: set.sets.iter().map(|x| x.to_string()).collect(),
+            prefixes: Vec::new(),
+        },
     }
 }
 
@@ -1296,6 +1320,18 @@ pub(crate) fn conditions_from_api(
     }
     if let Some(m) = conditions.community_set {
         v.push(ConditionConfig::CommunitySet(
+            m.name,
+            MatchOption::try_from(m.r#type)?,
+        ));
+    }
+    if let Some(m) = conditions.ext_community_set {
+        v.push(ConditionConfig::ExtCommunitySet(
+            m.name,
+            MatchOption::try_from(m.r#type)?,
+        ));
+    }
+    if let Some(m) = conditions.large_community_set {
+        v.push(ConditionConfig::LargeCommunitySet(
             m.name,
             MatchOption::try_from(m.r#type)?,
         ));
@@ -1629,6 +1665,14 @@ pub(crate) fn defined_set_from_api(
             patterns: set.list,
         }),
         Ok(api::DefinedType::Community) => Ok(DefinedSetConfig::Community {
+            name: set.name,
+            patterns: set.list,
+        }),
+        Ok(api::DefinedType::ExtCommunity) => Ok(DefinedSetConfig::ExtCommunity {
+            name: set.name,
+            patterns: set.list,
+        }),
+        Ok(api::DefinedType::LargeCommunity) => Ok(DefinedSetConfig::LargeCommunity {
             name: set.name,
             patterns: set.list,
         }),
