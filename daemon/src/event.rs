@@ -457,25 +457,25 @@ impl PeerParams {
     const DEFAULT_HOLD_TIME: u64 = 180;
     const DEFAULT_CONNECT_RETRY_TIME: u64 = 3;
 
-    /// Build a `Peer` from these params.
+    /// Derive the local capability list from peer configuration.
     ///
-    /// `local_router_id` is needed to construct `PeerFsm` for collision
-    /// detection; it is only known once `Global::router_id` is set, so callers
-    /// always go through `Global::add_peer` rather than calling this directly.
-    fn build(mut self, local_router_id: u32, global_asn: u32) -> Peer {
-        if self.local_asn == 0 {
-            self.local_asn = global_asn;
-        }
-
+    /// Separated from `build()` so the capability logic can be tested
+    /// independently of struct construction.
+    fn build_local_cap(
+        remote_addr: IpAddr,
+        local_asn: u32,
+        families: &FnvHashMap<Family, u8>,
+        graceful_restart: Option<&GrPeerConfig>,
+    ) -> Vec<packet::Capability> {
         let mut local_cap: Vec<packet::Capability> = Vec::new();
-        if self.families.is_empty() {
-            local_cap.push(match self.remote_addr {
+        if families.is_empty() {
+            local_cap.push(match remote_addr {
                 IpAddr::V4(_) => packet::Capability::MultiProtocol(Family::IPV4),
                 IpAddr::V6(_) => packet::Capability::MultiProtocol(Family::IPV6),
             });
         } else {
             let mut addpath = Vec::new();
-            for (f, mode) in &self.families {
+            for (f, mode) in families {
                 if *mode > 0 {
                     addpath.push((*f, *mode));
                 }
@@ -486,9 +486,8 @@ impl PeerParams {
             }
             // RFC 8950: advertise ExtendedNexthop when peering over IPv6
             // with IPv4 address family configured
-            if matches!(self.remote_addr, IpAddr::V6(_)) {
-                let enh_families: Vec<(Family, u16)> = self
-                    .families
+            if matches!(remote_addr, IpAddr::V6(_)) {
+                let enh_families: Vec<(Family, u16)> = families
                     .keys()
                     .filter(|f| f.afi() == Family::AFI_IP)
                     .map(|f| (*f, Family::AFI_IP6))
@@ -498,7 +497,7 @@ impl PeerParams {
                 }
             }
         }
-        if let Some(gr) = &self.graceful_restart {
+        if let Some(gr) = graceful_restart {
             // N-bit (0x4): supports GR for NOTIFICATION and Hold Timer (RFC 8538).
             // R-bit (0x8) is NOT set here; it is applied at connection time in
             // PeerFsm::on_connected() based on the current global restarting state.
@@ -511,7 +510,7 @@ impl PeerParams {
         }
 
         // Always advertise 4-byte ASN support.
-        let four_octet = packet::Capability::FourOctetAsNumber(self.local_asn);
+        let four_octet = packet::Capability::FourOctetAsNumber(local_asn);
         let four_octet_code: u8 = (&four_octet).into();
         if !local_cap
             .iter()
@@ -519,6 +518,25 @@ impl PeerParams {
         {
             local_cap.push(four_octet);
         }
+        local_cap
+    }
+
+    /// Build a `Peer` from these params.
+    ///
+    /// `local_router_id` is needed to construct `PeerFsm` for collision
+    /// detection; it is only known once `Global::router_id` is set, so callers
+    /// always go through `Global::add_peer` rather than calling this directly.
+    fn build(mut self, local_router_id: u32, global_asn: u32) -> Peer {
+        if self.local_asn == 0 {
+            self.local_asn = global_asn;
+        }
+
+        let local_cap = Self::build_local_cap(
+            self.remote_addr,
+            self.local_asn,
+            &self.families,
+            self.graceful_restart.as_ref(),
+        );
 
         let conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(
             crate::fsm::PeerFsm::new(
@@ -5291,7 +5309,7 @@ mod tests {
             .process_effects(vec![GlobalEffect::StopActiveConnect], &global)
             .await;
 
-        assert!(context.lock().unwrap().active_connect_cancel_tx.0.is_none());
+        assert!(context.lock().unwrap().active_connect_cancel_tx.is_none());
     }
 
     // ---- process_effects: GrSessionEstablished (helper side) ----
@@ -6457,5 +6475,149 @@ mod tests {
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
         let info = make_disconnect_info(None);
         apply_disconnect(&context, remote_addr, &tables, info).await;
+    }
+
+    // --- build_local_cap tests ---
+
+    fn cap_code(c: &packet::Capability) -> u8 {
+        c.into()
+    }
+
+    fn has_cap(caps: &[packet::Capability], code: u8) -> bool {
+        caps.iter().any(|c| cap_code(c) == code)
+    }
+
+    const CAP_FOUR_OCTET_ASN: u8 = 65;
+    const CAP_ADDPATH: u8 = 69;
+    const CAP_EXTENDED_NEXTHOP: u8 = 5;
+    const CAP_GRACEFUL_RESTART: u8 = 64;
+
+    #[test]
+    fn build_local_cap_ipv4_peer_no_families_defaults_to_ipv4() {
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &FnvHashMap::default(), None);
+        assert!(caps.iter().any(|c| matches!(
+            c,
+            packet::Capability::MultiProtocol(f) if *f == Family::IPV4
+        )));
+        assert!(has_cap(&caps, CAP_FOUR_OCTET_ASN));
+        assert!(!has_cap(&caps, CAP_ADDPATH));
+        assert!(!has_cap(&caps, CAP_EXTENDED_NEXTHOP));
+    }
+
+    #[test]
+    fn build_local_cap_ipv6_peer_no_families_defaults_to_ipv6() {
+        let remote_addr: IpAddr = "2001:db8::1".parse().unwrap();
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &FnvHashMap::default(), None);
+        assert!(caps.iter().any(|c| matches!(
+            c,
+            packet::Capability::MultiProtocol(f) if *f == Family::IPV6
+        )));
+        assert!(!has_cap(&caps, CAP_EXTENDED_NEXTHOP));
+    }
+
+    #[test]
+    fn build_local_cap_ipv6_peer_with_ipv4_family_includes_extended_nexthop() {
+        let remote_addr: IpAddr = "2001:db8::1".parse().unwrap();
+        let mut families = FnvHashMap::default();
+        families.insert(Family::IPV4, 0u8);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        assert!(has_cap(&caps, CAP_EXTENDED_NEXTHOP));
+        assert!(caps.iter().any(|c| matches!(
+            c,
+            packet::Capability::ExtendedNexthop(fams)
+                if fams.iter().any(|(f, nh)| *f == Family::IPV4 && *nh == Family::AFI_IP6)
+        )));
+    }
+
+    #[test]
+    fn build_local_cap_ipv6_peer_ipv6_only_family_no_extended_nexthop() {
+        let remote_addr: IpAddr = "2001:db8::1".parse().unwrap();
+        let mut families = FnvHashMap::default();
+        families.insert(Family::IPV6, 0u8);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        assert!(!has_cap(&caps, CAP_EXTENDED_NEXTHOP));
+    }
+
+    #[test]
+    fn build_local_cap_ipv4_peer_with_ipv4_family_no_extended_nexthop() {
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut families = FnvHashMap::default();
+        families.insert(Family::IPV4, 0u8);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        assert!(!has_cap(&caps, CAP_EXTENDED_NEXTHOP));
+    }
+
+    #[test]
+    fn build_local_cap_addpath_only_for_nonzero_modes() {
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut families = FnvHashMap::default();
+        families.insert(Family::IPV4, 3u8); // mode > 0: include in AddPath
+        families.insert(Family::IPV6, 0u8); // mode == 0: exclude from AddPath
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        assert!(has_cap(&caps, CAP_ADDPATH));
+        let addpath_families: Vec<Family> = caps
+            .iter()
+            .find_map(|c| {
+                if let packet::Capability::AddPath(fams) = c {
+                    Some(fams.iter().map(|(f, _)| *f).collect())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        assert!(addpath_families.contains(&Family::IPV4));
+        assert!(!addpath_families.contains(&Family::IPV6));
+    }
+
+    #[test]
+    fn build_local_cap_no_addpath_when_all_modes_zero() {
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut families = FnvHashMap::default();
+        families.insert(Family::IPV4, 0u8);
+        families.insert(Family::IPV6, 0u8);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        assert!(!has_cap(&caps, CAP_ADDPATH));
+    }
+
+    #[test]
+    fn build_local_cap_gr_notification_enabled_sets_n_bit() {
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let gr = GrPeerConfig {
+            restart_time: 120,
+            notification_enabled: true,
+            families: vec![Family::IPV4],
+        };
+        let caps =
+            PeerParams::build_local_cap(remote_addr, 65001, &FnvHashMap::default(), Some(&gr));
+        let gr_cap = caps.iter().find_map(|c| {
+            if let packet::Capability::GracefulRestart { flags, .. } = c {
+                Some(*flags)
+            } else {
+                None
+            }
+        });
+        assert!(has_cap(&caps, CAP_GRACEFUL_RESTART));
+        assert_eq!(gr_cap.unwrap() & 0x4, 0x4, "N-bit must be set");
+    }
+
+    #[test]
+    fn build_local_cap_gr_notification_disabled_clears_n_bit() {
+        let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let gr = GrPeerConfig {
+            restart_time: 120,
+            notification_enabled: false,
+            families: vec![Family::IPV4],
+        };
+        let caps =
+            PeerParams::build_local_cap(remote_addr, 65001, &FnvHashMap::default(), Some(&gr));
+        let gr_cap = caps.iter().find_map(|c| {
+            if let packet::Capability::GracefulRestart { flags, .. } = c {
+                Some(*flags)
+            } else {
+                None
+            }
+        });
+        assert_eq!(gr_cap.unwrap() & 0x4, 0, "N-bit must not be set");
     }
 }
