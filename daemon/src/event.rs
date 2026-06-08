@@ -252,7 +252,7 @@ struct PeerConfig {
     remote_port: u16,
     /// Expected AS number from configuration; 0 means "accept any".
     /// The actual negotiated ASN lives in PeerState.remote_asn (session-scoped).
-    remote_asn: u32,
+    expected_remote_asn: u32,
     local_asn: u32,
     passive: bool,
     delete_on_disconnected: bool,
@@ -437,7 +437,7 @@ impl Peer {
 struct PeerParams {
     remote_addr: IpAddr,
     remote_port: u16,
-    remote_asn: u32,
+    expected_remote_asn: u32,
     local_asn: u32,
     passive: bool,
     rs_client: bool,
@@ -528,7 +528,7 @@ impl PeerParams {
                 self.local_asn,
                 local_cap.clone(),
                 self.holdtime,
-                self.remote_asn,
+                self.expected_remote_asn,
                 self.send_max.clone(),
             ),
         )));
@@ -541,7 +541,7 @@ impl PeerParams {
                 } else {
                     Global::BGP_PORT
                 },
-                remote_asn: self.remote_asn,
+                expected_remote_asn: self.expected_remote_asn,
                 local_asn: self.local_asn,
                 passive: self.passive,
                 delete_on_disconnected: self.delete_on_disconnected,
@@ -590,7 +590,7 @@ impl From<&PeerView> for api::Peer {
             .unwrap_or_default();
         let mut ps = api::PeerState {
             neighbor_address: p.config.remote_addr.to_string(),
-            peer_asn: p.config.remote_asn,
+            peer_asn: p.config.expected_remote_asn,
             local_asn: p.config.local_asn,
             router_id: Ipv4Addr::from(p.state.remote_id.load(Ordering::Relaxed)).to_string(),
             messages: Some(api::Messages {
@@ -787,7 +787,7 @@ impl TryFrom<&api::Peer> for PeerParams {
                     Global::BGP_PORT
                 }
             }),
-            remote_asn: conf.peer_asn,
+            expected_remote_asn: conf.peer_asn,
             local_asn: conf.local_asn,
             passive: p.transport.as_ref().is_some_and(|x| x.passive_mode),
             rs_client: p
@@ -953,7 +953,7 @@ impl TryFrom<&config::Neighbor> for PeerParams {
             remote_port: transport_config
                 .and_then(|t| t.remote_port)
                 .unwrap_or(Global::BGP_PORT),
-            remote_asn: peer_as,
+            expected_remote_asn: peer_as,
             local_asn: c.local_as.unwrap_or(0),
             passive: transport_config
                 .and_then(|t| t.passive_mode)
@@ -2643,7 +2643,7 @@ async fn accept_connection(
                 PeerParams {
                     remote_addr,
                     remote_port: Global::BGP_PORT,
-                    remote_asn,
+                    expected_remote_asn: remote_asn,
                     local_asn: 0,
                     passive: false,
                     rs_client,
@@ -2665,7 +2665,7 @@ async fn accept_connection(
         }
     };
     if let Some(ttl) = peer.config.multihop_ttl {
-        if peer.config.remote_asn != peer.config.local_asn {
+        if peer.config.expected_remote_asn != peer.config.local_asn {
             let _ = stream.set_ttl(ttl.into());
         }
     } else {
@@ -4720,7 +4720,7 @@ mod tests {
         PeerParams {
             remote_addr,
             remote_port: Global::BGP_PORT,
-            remote_asn: 0,
+            expected_remote_asn: 0,
             local_asn: 0,
             passive: false,
             rs_client: false,
