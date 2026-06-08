@@ -1739,11 +1739,20 @@ impl GoBgpService for GrpcService {
             })
             .collect();
 
+        let batch_size = request.batch_size;
+        let mut path_count = 0u64;
         let v: Vec<_> = self
             .tables
             .collect_paths(query, family, prefixes)
             .await
             .into_iter()
+            .take_while(|d| {
+                if batch_size == 0 {
+                    return true;
+                }
+                path_count += d.paths.len() as u64;
+                path_count <= batch_size
+            })
             .map(|d| api::ListPathResponse {
                 destination: Some(convert::destination_to_api(d, family)),
             })
