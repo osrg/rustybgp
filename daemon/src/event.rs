@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::Duration;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -2300,8 +2300,8 @@ impl GoBgpService for GrpcService {
                     format!("rpki client {} already exists", sockaddr),
                 ));
             }
-            Ok((cancel, state)) => {
-                RpkiClient::try_connect(sockaddr, cancel, state, self.tables.clone());
+            Ok((cancel, soft_reset, state)) => {
+                RpkiClient::try_connect(sockaddr, cancel, soft_reset, state, self.tables.clone());
             }
         }
         Ok(tonic::Response::new(api::AddRpkiResponse {}))
@@ -2371,9 +2371,29 @@ impl GoBgpService for GrpcService {
     }
     async fn disable_rpki(
         &self,
-        _request: tonic::Request<api::DisableRpkiRequest>,
+        request: tonic::Request<api::DisableRpkiRequest>,
     ) -> Result<tonic::Response<api::DisableRpkiResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let request = request.into_inner();
+        let addr = IpAddr::from_str(&request.address)
+            .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
+        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        let mut global = self.global.write().await;
+        match global.rpki_clients.get_mut(&sockaddr) {
+            None => Err(tonic::Status::new(
+                tonic::Code::NotFound,
+                format!("rpki client {} not found", sockaddr),
+            )),
+            Some(client) if client.disabled => Err(tonic::Status::new(
+                tonic::Code::FailedPrecondition,
+                format!("rpki client {} is already disabled", sockaddr),
+            )),
+            Some(client) => {
+                client.cancel.cancel();
+                client.cancel = CancellationToken::new();
+                client.disabled = true;
+                Ok(tonic::Response::new(api::DisableRpkiResponse {}))
+            }
+        }
     }
     async fn reset_rpki(
         &self,
@@ -2811,16 +2831,17 @@ impl Global {
     fn add_rpki_client(
         &mut self,
         sockaddr: SocketAddr,
-    ) -> Result<(CancellationToken, Arc<RpkiState>), ()> {
+    ) -> Result<(CancellationToken, Arc<Notify>, Arc<RpkiState>), ()> {
         use std::collections::hash_map::Entry;
         match self.rpki_clients.entry(sockaddr) {
             Entry::Occupied(_) => Err(()),
             Entry::Vacant(v) => {
                 let client = RpkiClient::new();
                 let cancel = client.cancel.clone();
+                let soft_reset = Arc::clone(&client.soft_reset);
                 let state = Arc::clone(&client.state);
                 v.insert(client);
-                Ok((cancel, state))
+                Ok((cancel, soft_reset, state))
             }
         }
     }

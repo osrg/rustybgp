@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
@@ -84,6 +85,8 @@ impl RpkiState {
 pub(crate) struct RpkiClient {
     pub(crate) cancel: CancellationToken,
     pub(crate) state: Arc<RpkiState>,
+    pub(crate) disabled: bool,
+    pub(crate) soft_reset: Arc<Notify>,
 }
 
 impl RpkiClient {
@@ -91,12 +94,15 @@ impl RpkiClient {
         RpkiClient {
             cancel: CancellationToken::new(),
             state: Arc::new(RpkiState::default()),
+            disabled: false,
+            soft_reset: Arc::new(Notify::new()),
         }
     }
 
     async fn serve(
         stream: TcpStream,
         cancel: CancellationToken,
+        soft_reset: Arc<Notify>,
         state: Arc<RpkiState>,
         tables: TableHandle,
     ) -> Result<(), Error> {
@@ -117,6 +123,12 @@ impl RpkiClient {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
+                _ = soft_reset.notified(), if end_of_data => {
+                    let session_id = state.session_id.load(Ordering::Relaxed);
+                    let serial_number = state.serial.load(Ordering::Relaxed);
+                    state.update(&rpki::Message::SerialQuery { session_id, serial_number });
+                    let _ = lines.send(&rpki::Message::SerialQuery { session_id, serial_number }).await;
+                }
                 msg = lines.next() => {
                     let msg = match msg {
                         Some(msg) => match msg {
@@ -154,6 +166,7 @@ impl RpkiClient {
                 }
             }
         }
+        state.up.store(false, Ordering::Relaxed);
         state.downtime.store(
             SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -168,6 +181,7 @@ impl RpkiClient {
     pub(crate) fn try_connect(
         sockaddr: SocketAddr,
         cancel: CancellationToken,
+        soft_reset: Arc<Notify>,
         state: Arc<RpkiState>,
         tables: TableHandle,
     ) {
@@ -191,7 +205,7 @@ impl RpkiClient {
                 };
 
                 tokio::select! {
-                    _ = RpkiClient::serve(stream, cancel.clone(), state.clone(), tables.clone()) => {}
+                    _ = RpkiClient::serve(stream, cancel.clone(), soft_reset.clone(), state.clone(), tables.clone()) => {}
                     _ = cancel.cancelled() => return,
                 }
 
