@@ -2427,9 +2427,56 @@ impl GoBgpService for GrpcService {
     }
     async fn reset_rpki(
         &self,
-        _request: tonic::Request<api::ResetRpkiRequest>,
+        request: tonic::Request<api::ResetRpkiRequest>,
     ) -> Result<tonic::Response<api::ResetRpkiResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let request = request.into_inner();
+        let addr = IpAddr::from_str(&request.address)
+            .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
+        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        if request.soft {
+            let global = self.global.read().await;
+            return match global.rpki_clients.get(&sockaddr) {
+                None => Err(tonic::Status::new(
+                    tonic::Code::NotFound,
+                    format!("rpki client {} not found", sockaddr),
+                )),
+                Some(client) if client.disabled => Err(tonic::Status::new(
+                    tonic::Code::FailedPrecondition,
+                    format!("rpki client {} is disabled", sockaddr),
+                )),
+                Some(client) => {
+                    client.soft_reset.notify_one();
+                    Ok(tonic::Response::new(api::ResetRpkiResponse {}))
+                }
+            };
+        }
+        let (disabled, cancel, soft_reset, state) = {
+            let mut global = self.global.write().await;
+            match global.rpki_clients.get_mut(&sockaddr) {
+                None => {
+                    return Err(tonic::Status::new(
+                        tonic::Code::NotFound,
+                        format!("rpki client {} not found", sockaddr),
+                    ));
+                }
+                Some(client) => {
+                    let disabled = client.disabled;
+                    client.cancel.cancel();
+                    client.cancel = CancellationToken::new();
+                    (
+                        disabled,
+                        client.cancel.clone(),
+                        Arc::clone(&client.soft_reset),
+                        Arc::clone(&client.state),
+                    )
+                }
+            }
+        };
+        self.tables.rpki_drop_all(Arc::new(addr)).await;
+        if !disabled {
+            RpkiClient::try_connect(sockaddr, cancel, soft_reset, state, self.tables.clone());
+        }
+        Ok(tonic::Response::new(api::ResetRpkiResponse {}))
     }
     type ListRpkiTableStream = Pin<
         Box<
