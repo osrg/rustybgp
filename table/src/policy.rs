@@ -497,6 +497,41 @@ fn ext_communities_to_attr(communities: Vec<[u8; 8]>) -> Option<packet::Attribut
     packet::Attribute::new_with_bin(packet::Attribute::EXTENDED_COMMUNITY, bin)
 }
 
+fn large_communities_from_attr(attrs: &[packet::Attribute]) -> Vec<(u32, u32, u32)> {
+    attrs
+        .iter()
+        .find(|a| a.code() == packet::Attribute::LARGE_COMMUNITY)
+        .and_then(|a| a.binary())
+        .map(|bin| {
+            bin.chunks(12)
+                .filter_map(|c| {
+                    if c.len() == 12 {
+                        let ga = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+                        let ld1 = u32::from_be_bytes([c[4], c[5], c[6], c[7]]);
+                        let ld2 = u32::from_be_bytes([c[8], c[9], c[10], c[11]]);
+                        Some((ga, ld1, ld2))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn large_communities_to_attr(communities: Vec<(u32, u32, u32)>) -> Option<packet::Attribute> {
+    if communities.is_empty() {
+        return None;
+    }
+    let mut bin = Vec::with_capacity(communities.len() * 12);
+    for (ga, ld1, ld2) in communities {
+        bin.extend_from_slice(&ga.to_be_bytes());
+        bin.extend_from_slice(&ld1.to_be_bytes());
+        bin.extend_from_slice(&ld2.to_be_bytes());
+    }
+    packet::Attribute::new_with_bin(packet::Attribute::LARGE_COMMUNITY, bin)
+}
+
 /// Action to set the LOCAL_PREF attribute to a fixed value.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalPrefAction {
@@ -538,6 +573,14 @@ pub struct ExtCommunityAction {
     pub communities: Vec<[u8; 8]>,
 }
 
+/// Action to add, remove, or replace BGP large communities (RFC 8092).
+/// Each community is a (global_administrator, local_data_1, local_data_2) triple.
+#[derive(Clone, Debug)]
+pub struct LargeCommunityAction {
+    pub action_type: CommunityActionType,
+    pub communities: Vec<(u32, u32, u32)>,
+}
+
 /// Actions applied to a route when a policy statement matches.
 #[derive(Clone, Default)]
 pub struct Actions {
@@ -547,6 +590,7 @@ pub struct Actions {
     pub med: Option<MedAction>,
     pub as_prepend: Option<AsPrependAction>,
     pub ext_community: Option<ExtCommunityAction>,
+    pub large_community: Option<LargeCommunityAction>,
 }
 
 #[derive(Clone)]
@@ -680,6 +724,27 @@ impl Statement {
             };
             attrs.retain(|a| a.code() != packet::Attribute::EXTENDED_COMMUNITY);
             if let Some(new_attr) = ext_communities_to_attr(new_communities) {
+                attrs.push(new_attr);
+            }
+        }
+
+        if let Some(action) = &self.actions.large_community {
+            let attrs = Arc::make_mut(attr);
+            let existing = large_communities_from_attr(attrs);
+            let new_communities = match action.action_type {
+                CommunityActionType::Add => {
+                    let mut result = existing;
+                    result.extend_from_slice(&action.communities);
+                    result
+                }
+                CommunityActionType::Remove => existing
+                    .into_iter()
+                    .filter(|c| !action.communities.contains(c))
+                    .collect(),
+                CommunityActionType::Replace => action.communities.clone(),
+            };
+            attrs.retain(|a| a.code() != packet::Attribute::LARGE_COMMUNITY);
+            if let Some(new_attr) = large_communities_to_attr(new_communities) {
                 attrs.push(new_attr);
             }
         }
@@ -1681,5 +1746,92 @@ mod tests {
         Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         let result = get_ext_communities(&attr);
         assert_eq!(result, vec![RT_65001_100]);
+    }
+
+    fn make_large_community_assignment(action: LargeCommunityAction) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![],
+                Some(Disposition::Accept),
+                Actions {
+                    large_community: Some(action),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "ribs",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+        assignment
+    }
+
+    fn get_large_communities(attrs: &[packet::Attribute]) -> Vec<(u32, u32, u32)> {
+        large_communities_from_attr(attrs)
+    }
+
+    fn attrs_with_large_community(communities: &[(u32, u32, u32)]) -> Arc<Vec<packet::Attribute>> {
+        let mut bin = Vec::with_capacity(communities.len() * 12);
+        for (ga, ld1, ld2) in communities {
+            bin.extend_from_slice(&ga.to_be_bytes());
+            bin.extend_from_slice(&ld1.to_be_bytes());
+            bin.extend_from_slice(&ld2.to_be_bytes());
+        }
+        Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::LARGE_COMMUNITY, bin).unwrap(),
+        ])
+    }
+
+    #[test]
+    fn large_community_add() {
+        let assignment = make_large_community_assignment(LargeCommunityAction {
+            action_type: CommunityActionType::Add,
+            communities: vec![(65000, 1, 100)],
+        });
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_large_community(&[(65000, 1, 200)]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let result = get_large_communities(&attr);
+        assert!(result.contains(&(65000, 1, 200)), "original preserved");
+        assert!(result.contains(&(65000, 1, 100)), "new added");
+    }
+
+    #[test]
+    fn large_community_remove() {
+        let assignment = make_large_community_assignment(LargeCommunityAction {
+            action_type: CommunityActionType::Remove,
+            communities: vec![(65000, 1, 100)],
+        });
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_large_community(&[(65000, 1, 100), (65000, 1, 200)]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let result = get_large_communities(&attr);
+        assert!(!result.contains(&(65000, 1, 100)), "removed");
+        assert!(result.contains(&(65000, 1, 200)), "other preserved");
+    }
+
+    #[test]
+    fn large_community_replace() {
+        let assignment = make_large_community_assignment(LargeCommunityAction {
+            action_type: CommunityActionType::Replace,
+            communities: vec![(65001, 2, 50)],
+        });
+        let s = source();
+        let net = nlri();
+        let mut attr = attrs_with_large_community(&[(65000, 1, 100), (65000, 1, 200)]);
+        let mut nexthop = nh();
+        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        assert_eq!(get_large_communities(&attr), vec![(65001, 2, 50)]);
     }
 }

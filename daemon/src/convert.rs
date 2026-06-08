@@ -1384,6 +1384,38 @@ fn ext_community_action_from_api(
     })
 }
 
+fn parse_large_community_value(s: &str) -> Option<(u32, u32, u32)> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let ga: u32 = parts[0].parse().ok()?;
+    let ld1: u32 = parts[1].parse().ok()?;
+    let ld2: u32 = parts[2].parse().ok()?;
+    Some((ga, ld1, ld2))
+}
+
+fn large_community_action_from_api(
+    ca: api::CommunityAction,
+) -> Option<rustybgp_table::LargeCommunityAction> {
+    use rustybgp_table::CommunityActionType;
+    let action_type = match api::community_action::Type::try_from(ca.r#type) {
+        Ok(api::community_action::Type::Add) => CommunityActionType::Add,
+        Ok(api::community_action::Type::Remove) => CommunityActionType::Remove,
+        Ok(api::community_action::Type::Replace) => CommunityActionType::Replace,
+        _ => return None,
+    };
+    let communities: Vec<(u32, u32, u32)> = ca
+        .communities
+        .iter()
+        .filter_map(|s| parse_large_community_value(s))
+        .collect();
+    Some(rustybgp_table::LargeCommunityAction {
+        action_type,
+        communities,
+    })
+}
+
 fn community_action_from_api(ca: api::CommunityAction) -> Option<rustybgp_table::CommunityAction> {
     use rustybgp_table::CommunityActionType;
     let action_type = match api::community_action::Type::try_from(ca.r#type) {
@@ -1469,6 +1501,10 @@ pub(crate) fn disposition_from_api(
         .ext_community
         .and_then(ext_community_action_from_api);
 
+    let large_community = actions
+        .large_community
+        .and_then(large_community_action_from_api);
+
     Ok((
         disposition,
         rustybgp_table::Actions {
@@ -1478,6 +1514,7 @@ pub(crate) fn disposition_from_api(
             med,
             as_prepend,
             ext_community,
+            large_community,
         },
     ))
 }
