@@ -1805,9 +1805,33 @@ impl GoBgpService for GrpcService {
     >;
     async fn list_dynamic_neighbor(
         &self,
-        _request: tonic::Request<api::ListDynamicNeighborRequest>,
+        request: tonic::Request<api::ListDynamicNeighborRequest>,
     ) -> Result<tonic::Response<Self::ListDynamicNeighborStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let group_filter = request.into_inner().peer_group;
+        let global = self.global.read().await;
+        let v: Vec<api::DynamicNeighbor> = global
+            .peer_group
+            .iter()
+            .filter(|(name, _)| group_filter.is_empty() || group_filter == **name)
+            .flat_map(|(name, pg)| {
+                pg.dynamic_peers.iter().map(move |dp| api::DynamicNeighbor {
+                    prefix: dp.prefix.to_string(),
+                    peer_group: name.clone(),
+                })
+            })
+            .collect();
+        drop(global);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for dn in v {
+                let _ = tx.send(Ok(api::ListDynamicNeighborResponse {
+                    dynamic_neighbor: Some(dn),
+                }));
+            }
+        });
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        )))
     }
     async fn add_path(
         &self,
