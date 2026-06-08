@@ -1037,9 +1037,12 @@ impl From<api::PeerGroup> for PeerGroup {
         PeerGroup {
             as_number: p.conf.map_or(0, |c| c.peer_asn),
             dynamic_peers: Vec::new(),
-            // passive: p.transport.map_or(false, |c| c.passive_mode),
             route_server_client: p.route_server.is_some_and(|c| c.route_server_client),
-            holdtime: None,
+            holdtime: p
+                .timers
+                .and_then(|t| t.config)
+                .map(|c| c.hold_time)
+                .filter(|&h| h != 0),
         }
     }
 }
