@@ -561,8 +561,9 @@ fn write_extcom(c: &mut Cursor<Vec<u8>>, com: api::ExtendedCommunity) -> Result<
                 segment_id2: ensure_u16("segment_id2", m.segment_id2)?,
                 segment_id4: m.segment_id4,
             };
-            mup_ec.encode(c.get_mut());
-            c.set_position(c.position() + 8);
+            let mut buf = bytes::BytesMut::with_capacity(mup::MupExtended::LEN);
+            mup_ec.encode(&mut buf);
+            c.write_all(&buf).unwrap();
         }
         api::extended_community::Extcom::Unknown(u) => {
             if u.value.len() != 8 {
@@ -571,8 +572,7 @@ fn write_extcom(c: &mut Cursor<Vec<u8>>, com: api::ExtendedCommunity) -> Result<
                     u.value.len()
                 )));
             }
-            c.get_mut().extend_from_slice(&u.value);
-            c.set_position(c.position() + 8);
+            c.write_all(&u.value).unwrap();
         }
         _ => {
             return Err(Error::InvalidArgument(
