@@ -590,7 +590,14 @@ impl From<&PeerView> for api::Peer {
             .unwrap_or_default();
         let mut ps = api::PeerState {
             neighbor_address: p.config.remote_addr.to_string(),
-            peer_asn: p.config.expected_remote_asn,
+            peer_asn: {
+                let negotiated = p.state.remote_asn.load(Ordering::Relaxed);
+                if negotiated != 0 {
+                    negotiated
+                } else {
+                    p.config.expected_remote_asn
+                }
+            },
             local_asn: p.config.local_asn,
             router_id: Ipv4Addr::from(p.state.remote_id.load(Ordering::Relaxed)).to_string(),
             messages: Some(api::Messages {
