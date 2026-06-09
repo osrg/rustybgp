@@ -117,9 +117,17 @@ pub struct DestinationEntry {
     pub paths: Vec<PathEntry>,
 }
 
+/// A read-only snapshot of one BGP path, returned by [`Table::destinations`]
+/// for gRPC `ListPath` responses and similar inspection APIs.
+///
+/// Contains display fields (timestamp, RPKI validation, policy state) that are
+/// not needed for route distribution.  The nexthop is intentionally absent; it
+/// is embedded in the serialised UPDATE attributes for the API response.
 pub struct PathEntry {
     pub source: Arc<Source>,
-    pub id: u32,
+    /// AddPath path identifier received from the peer (0 when AddPath is not in use).
+    /// AddPath path identifier received from the peer (0 when AddPath is not in use).
+    pub remote_path_id: u32,
     pub timestamp: SystemTime,
     pub attr: Arc<Vec<packet::Attribute>>,
     pub validation: Option<RpkiValidation>,
@@ -203,6 +211,11 @@ impl PathAttribute {
 /// A path snapshot shared outside the table crate.
 /// All fields are Arc-backed so cloning is cheap.
 #[derive(Clone)]
+/// A BGP path distributed to peer TX queues via [`NlriChange`].
+///
+/// Contains the fields needed to encode a BGP UPDATE message for a neighbour.
+/// Display-only metadata (timestamp, RPKI validation, policy filter state) is
+/// kept in [`PathEntry`], which is built on demand for read-path APIs.
 pub struct Path {
     pub local_path_id: u32,
     pub source: Arc<Source>,
@@ -218,8 +231,7 @@ struct RibEntry {
     /// allocation as `path.attr`, so storing it costs only a reference-count
     /// increment.
     original_attr: Arc<Vec<packet::Attribute>>,
-    /// Remote peer's inbound path ID (from the sending peer's Add-Path).
-    id: u32,
+    remote_path_id: u32,
     timestamp: SystemTime,
     flags: u8,
 }
@@ -602,7 +614,7 @@ impl Table {
                     family,
                     net: packet::bgp::PathNlri {
                         nlri: *net,
-                        path_id: e.id,
+                        path_id: e.remote_path_id,
                     },
                     attr: e.original_attr.clone(),
                     nexthop: e.path.nexthop,
@@ -626,7 +638,7 @@ impl Table {
             .filter(|p| enable_filtered || !p.is_filtered())
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
-                id: p.id,
+                remote_path_id: p.remote_path_id,
                 timestamp: p.timestamp,
                 attr: p.path.attr.clone(),
                 validation: None,
@@ -648,7 +660,7 @@ impl Table {
             .filter(|p| enable_filtered || !p.is_filtered())
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
-                id: p.id,
+                remote_path_id: p.remote_path_id,
                 timestamp: p.timestamp,
                 attr: p.original_attr.clone(),
                 validation: None,
@@ -707,7 +719,7 @@ impl Table {
                 }
                 Some(PathEntry {
                     source: p.path.source.clone(),
-                    id: 0,
+                    remote_path_id: 0,
                     timestamp: p.timestamp,
                     attr,
                     validation: None,
@@ -799,7 +811,7 @@ impl Table {
             // same peer) when the peer reconnects after GR and re-sends the same route.
             // For non-GR sessions there is at most one Source per remote_addr in the
             // RIB, so the result is identical to an Arc::ptr_eq check.
-            if e.path.source.remote_addr == source.remote_addr && e.id == remote_id {
+            if e.path.source.remote_addr == source.remote_addr && e.remote_path_id == remote_id {
                 replaced_idx = Some(i);
             } else if e.path.source.remote_addr == source.remote_addr {
                 // Count peer paths that are NOT the one being replaced.
@@ -837,7 +849,7 @@ impl Table {
                 attr,
             },
             original_attr,
-            id: remote_id,
+            remote_path_id: remote_id,
             timestamp,
             flags,
         };
@@ -939,10 +951,9 @@ impl Table {
         // Match by remote_addr + path_id, not by Arc identity.  This correctly
         // removes a stale path from a previous GR session (different Source Arc
         // but same peer) when the peer reconnects and sends a WITHDRAW.
-        let i = dst
-            .entry
-            .iter()
-            .position(|e| e.path.source.remote_addr == source.remote_addr && e.id == remote_id)?;
+        let i = dst.entry.iter().position(|e| {
+            e.path.source.remote_addr == source.remote_addr && e.remote_path_id == remote_id
+        })?;
 
         // Capture (source, attr) Arc pointers before removal for best_changed detection.
         let old_best_key = dst

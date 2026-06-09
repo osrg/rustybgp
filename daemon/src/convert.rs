@@ -1861,7 +1861,7 @@ pub(crate) fn destination_to_api(
                     Some(nlri_to_api(&d.net))
                 },
                 family: Some(family_to_api(family)),
-                identifier: p.id,
+                identifier: p.remote_path_id,
                 age: Some(p.timestamp.to_api()),
                 pattrs: if binary.only_binary {
                     vec![]
