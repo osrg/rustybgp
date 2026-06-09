@@ -23,18 +23,34 @@ use std::sync::Arc;
 
 /// Apply import policy to a route and return whether it should be filtered
 /// (rejected). Also applies any nexthop rewriting action.
+/// Apply import policy and return `(filtered, post_policy_attr)`.
+///
+/// `post_policy_attr` is the Arc after policy attribute modifications.  When
+/// the policy does not modify attributes it is the same Arc as `attrs` (only
+/// the reference count increases), so callers can store the original Arc
+/// separately for Adj-RIB-In without extra allocation.
 pub(crate) fn apply_import(
     import_policy: Option<&PolicyAssignment>,
     source: &Arc<rustybgp_table::Source>,
     nlri: &rustybgp_packet::Nlri,
     attrs: &Arc<Vec<rustybgp_packet::Attribute>>,
     nexthop: &mut Nexthop,
-) -> bool {
-    import_policy.is_some_and(|a| {
-        let mut attr = Arc::clone(attrs);
-        rustybgp_table::Table::apply_policy(a, source, nlri, &mut attr, nexthop, source.local_addr)
-            == Disposition::Reject
-    })
+) -> (bool, Arc<Vec<rustybgp_packet::Attribute>>) {
+    match import_policy {
+        None => (false, Arc::clone(attrs)),
+        Some(a) => {
+            let mut attr = Arc::clone(attrs);
+            let filtered = rustybgp_table::Table::apply_policy(
+                a,
+                source,
+                nlri,
+                &mut attr,
+                nexthop,
+                source.local_addr,
+            ) == Disposition::Reject;
+            (filtered, attr)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -103,7 +119,7 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]);
         let mut nh = Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let filtered = apply_import(
+        let (filtered, _) = apply_import(
             None,
             &source(1),
             &packet::Nlri::from_str("10.0.0.0/24").unwrap(),
@@ -120,7 +136,7 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]);
         let mut nh = Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let filtered = apply_import(
+        let (filtered, _) = apply_import(
             Some(&policy),
             &source(1),
             &packet::Nlri::from_str("10.0.0.0/24").unwrap(),

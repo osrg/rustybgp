@@ -212,6 +212,12 @@ pub struct Path {
 
 struct RibEntry {
     path: Path,
+    /// Pre-import-policy attributes received from the peer (Adj-RIB-In view).
+    ///
+    /// When import policy does not modify attributes this Arc points to the same
+    /// allocation as `path.attr`, so storing it costs only a reference-count
+    /// increment.
+    original_attr: Arc<Vec<packet::Attribute>>,
     /// Remote peer's inbound path ID (from the sending peer's Add-Path).
     id: u32,
     timestamp: SystemTime,
@@ -598,7 +604,7 @@ impl Table {
                         nlri: *net,
                         path_id: e.id,
                     },
-                    attr: e.path.attr.clone(),
+                    attr: e.original_attr.clone(),
                     nexthop: e.path.nexthop,
                     timestamp: e.timestamp,
                 })
@@ -644,7 +650,7 @@ impl Table {
                 source: p.path.source.clone(),
                 id: p.id,
                 timestamp: p.timestamp,
-                attr: p.path.attr.clone(),
+                attr: p.original_attr.clone(),
                 validation: None,
                 stale: p.path.source.is_stale(),
                 filtered: p.is_filtered(),
@@ -762,6 +768,7 @@ impl Table {
         remote_id: u32,
         nexthop: bgp::Nexthop,
         attr: Arc<Vec<packet::Attribute>>,
+        original_attr: Option<Arc<Vec<packet::Attribute>>>,
         filtered: bool,
         prefix_limit: Option<(u32, &Arc<AtomicU64>)>,
         timestamp: SystemTime,
@@ -820,6 +827,8 @@ impl Table {
             .as_ref()
             .map_or_else(|| dst.alloc_path_id(), |old| old.path.local_path_id);
 
+        let original_attr = original_attr.unwrap_or_else(|| Arc::clone(&attr));
+
         let entry = RibEntry {
             path: Path {
                 local_path_id,
@@ -827,6 +836,7 @@ impl Table {
                 nexthop,
                 attr,
             },
+            original_attr,
             id: remote_id,
             timestamp,
             flags,
@@ -1547,6 +1557,7 @@ mod tests {
             0,
             nh(),
             attrs.clone(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1558,6 +1569,7 @@ mod tests {
             0,
             nh(),
             attrs.clone(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1569,6 +1581,7 @@ mod tests {
             0,
             nh(),
             attrs.clone(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1580,6 +1593,7 @@ mod tests {
             0,
             nh(),
             attrs.clone(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1624,6 +1638,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1644,6 +1659,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1656,6 +1672,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1679,6 +1696,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(100),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1690,6 +1708,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(200),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1714,6 +1733,7 @@ mod tests {
             0,
             nh(),
             attrs_with_as_path_len(3),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1725,6 +1745,7 @@ mod tests {
             0,
             nh(),
             attrs_with_as_path_len(1),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1750,6 +1771,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(2),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1762,6 +1784,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1787,6 +1810,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1799,6 +1823,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1824,6 +1849,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1836,6 +1862,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1863,6 +1890,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1874,6 +1902,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1901,6 +1930,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1912,6 +1942,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1939,6 +1970,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1963,6 +1995,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1981,6 +2014,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2003,6 +2037,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2016,6 +2051,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2031,6 +2067,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2054,6 +2091,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2066,6 +2104,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2078,6 +2117,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(200),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2102,6 +2142,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2114,6 +2155,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2127,6 +2169,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2139,6 +2182,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2164,6 +2208,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(200),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2175,6 +2220,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(100),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2188,6 +2234,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(50),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2217,6 +2264,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2230,6 +2278,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2243,6 +2292,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2255,6 +2305,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(50),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2278,6 +2329,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2306,6 +2358,7 @@ mod tests {
             1,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2319,6 +2372,7 @@ mod tests {
             2,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2351,6 +2405,7 @@ mod tests {
             1,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2362,6 +2417,7 @@ mod tests {
             2,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2401,6 +2457,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2412,6 +2469,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2423,6 +2481,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2716,6 +2775,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(200),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2729,6 +2789,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(50),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2754,6 +2815,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2767,6 +2829,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2789,6 +2852,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2802,6 +2866,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2814,6 +2879,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2836,6 +2902,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2849,6 +2916,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2869,6 +2937,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2891,6 +2960,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(100),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2904,6 +2974,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(100),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2917,6 +2988,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(100),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2940,6 +3012,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2953,6 +3026,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2978,6 +3052,7 @@ mod tests {
             0,
             nh(),
             attrs.clone(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2991,6 +3066,7 @@ mod tests {
             0,
             nh(),
             attrs.clone(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3004,6 +3080,7 @@ mod tests {
             0,
             nh(),
             attrs.clone(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3029,6 +3106,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3042,6 +3120,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3066,6 +3145,7 @@ mod tests {
             0,
             nh(),
             attrs.clone(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3079,6 +3159,7 @@ mod tests {
             0,
             nh(),
             attrs.clone(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3113,6 +3194,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(100),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3146,6 +3228,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3158,6 +3241,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3186,6 +3270,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3202,6 +3287,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3247,6 +3333,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3266,6 +3353,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(200),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3294,6 +3382,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3306,6 +3395,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3342,6 +3432,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3353,6 +3444,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3388,6 +3480,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3417,6 +3510,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3432,6 +3526,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3458,6 +3553,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3488,6 +3584,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3499,6 +3596,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3530,6 +3628,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3553,6 +3652,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3581,6 +3681,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3592,6 +3693,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3642,6 +3744,7 @@ mod tests {
             0, // remote_id / path_id
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3670,6 +3773,7 @@ mod tests {
             0, // same remote_id as session 1
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3716,6 +3820,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3759,6 +3864,7 @@ mod tests {
             1,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3770,6 +3876,7 @@ mod tests {
             2,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3786,6 +3893,7 @@ mod tests {
             1,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3815,6 +3923,7 @@ mod tests {
             0,
             nh(),
             attrs_with_origin(0),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3852,6 +3961,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3886,6 +3996,7 @@ mod tests {
             0,
             nh6,
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3915,6 +4026,7 @@ mod tests {
                 0,
                 nh(),
                 empty_attrs(),
+                None,
                 false,
                 None,
                 SystemTime::UNIX_EPOCH,
@@ -3929,6 +4041,7 @@ mod tests {
                 0,
                 nh(),
                 empty_attrs(),
+                None,
                 false,
                 None,
                 SystemTime::UNIX_EPOCH,
@@ -3973,6 +4086,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4002,6 +4116,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             pl,
             SystemTime::UNIX_EPOCH,
@@ -4034,6 +4149,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             Some((max, &counter)),
             SystemTime::UNIX_EPOCH,
@@ -4048,6 +4164,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             Some((max, &counter)),
             SystemTime::UNIX_EPOCH,
@@ -4083,6 +4200,7 @@ mod tests {
                 0,
                 nh(),
                 empty_attrs(),
+                None,
                 false,
                 Some((max, &counter)),
                 SystemTime::UNIX_EPOCH,
@@ -4104,6 +4222,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             Some((max, &counter)),
             SystemTime::UNIX_EPOCH,
@@ -4123,6 +4242,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4183,6 +4303,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(100),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4194,6 +4315,7 @@ mod tests {
             0,
             nh(),
             attrs_with_local_pref(200),
+            None,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4366,6 +4488,7 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
             true, // filtered = true
             None,
             SystemTime::UNIX_EPOCH,
@@ -4406,5 +4529,109 @@ mod tests {
         let d2 = dests.iter().find(|d| d.net == n2).unwrap();
         assert!(!d1.paths[0].filtered);
         assert!(d2.paths[0].filtered);
+    }
+
+    // --- Adj-RIB-In (original_attr) tests ---
+
+    #[test]
+    fn adj_in_returns_original_attr_not_post_policy() {
+        // Simulate import policy that modifies LOCAL_PREF:
+        //   original (pre-policy) = 100, post-policy = 200.
+        // destinations(AdjIn) must expose the original; Global exposes post-policy.
+        let s1 = source(1, 65001, 65000, 1);
+        let n1 = nlri(10, 0, 0, 0, 24);
+        let post_policy = attrs_with_local_pref(200);
+        let original = attrs_with_local_pref(100);
+
+        let mut rt = Table::new();
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            n1,
+            0,
+            nh(),
+            post_policy.clone(),
+            Some(original.clone()),
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+
+        let peer = s1.remote_addr;
+
+        let global: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
+            .collect();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].paths[0].attr, post_policy);
+
+        let adj_in: Vec<_> = rt
+            .destinations(TableQuery::AdjIn(peer), Family::IPV4, vec![], None, false)
+            .collect();
+        assert_eq!(adj_in.len(), 1);
+        assert_eq!(adj_in[0].paths[0].attr, original);
+    }
+
+    #[test]
+    fn adj_in_no_policy_attr_unchanged() {
+        // When no policy modifies attrs, original_attr == post-policy attr.
+        // Both Global and AdjIn views return the same content.
+        let s1 = source(1, 65001, 65000, 1);
+        let n1 = nlri(10, 0, 0, 0, 24);
+        let attr = attrs_with_local_pref(100);
+
+        let mut rt = Table::new();
+        // Pass None for original_attr: the insert() body falls back to Arc::clone(&attr).
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            n1,
+            0,
+            nh(),
+            attr.clone(),
+            None,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+
+        let peer = s1.remote_addr;
+
+        let global: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
+            .collect();
+        let adj_in: Vec<_> = rt
+            .destinations(TableQuery::AdjIn(peer), Family::IPV4, vec![], None, false)
+            .collect();
+
+        assert_eq!(global[0].paths[0].attr, attr);
+        assert_eq!(adj_in[0].paths[0].attr, attr);
+    }
+
+    #[test]
+    fn iter_reach_returns_original_attr() {
+        // iter_reach() is used by BMP RouteMonitoring and must carry pre-policy attrs.
+        let s1 = source(1, 65001, 65000, 1);
+        let n1 = nlri(10, 0, 0, 0, 24);
+        let post_policy = attrs_with_local_pref(200);
+        let original = attrs_with_local_pref(100);
+
+        let mut rt = Table::new();
+        rt.insert(
+            s1.clone(),
+            Family::IPV4,
+            n1,
+            0,
+            nh(),
+            post_policy,
+            Some(original.clone()),
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+
+        let reaches: Vec<_> = rt.iter_reach(Family::IPV4).collect();
+        assert_eq!(reaches.len(), 1);
+        assert_eq!(reaches[0].attr, original);
     }
 }

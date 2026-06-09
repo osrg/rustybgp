@@ -144,7 +144,8 @@ impl TableManager {
             timestamp,
         );
         let mut nh = nexthop;
-        let filtered = crate::policy::apply_import(
+        let original_attr = Arc::clone(&attr);
+        let (filtered, post_policy_attr) = crate::policy::apply_import(
             import_policy.as_deref(),
             &source,
             &net.nlri,
@@ -158,7 +159,8 @@ impl TableManager {
             net.nlri,
             net.path_id,
             nh,
-            attr,
+            post_policy_attr,
+            Some(original_attr),
             filtered,
             pl,
             timestamp,
@@ -714,7 +716,8 @@ impl TableShard {
                 let Some(nexthop) = nexthop else { return };
                 for net in nets {
                     let mut nh = nexthop;
-                    let filtered = crate::policy::apply_import(
+                    let original_attr = Arc::clone(&attrs);
+                    let (filtered, post_policy_attr) = crate::policy::apply_import(
                         import_policy,
                         &source,
                         &net.nlri,
@@ -727,7 +730,8 @@ impl TableShard {
                         net.nlri,
                         net.path_id,
                         nh,
-                        attrs.clone(),
+                        post_policy_attr,
+                        Some(original_attr),
                         filtered,
                         None,
                         timestamp,
