@@ -1422,9 +1422,87 @@ impl GoBgpService for GrpcService {
     }
     async fn reset_peer(
         &self,
-        _request: tonic::Request<api::ResetPeerRequest>,
+        request: tonic::Request<api::ResetPeerRequest>,
     ) -> Result<tonic::Response<api::ResetPeerResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let req = request.into_inner();
+        let peer_addr = IpAddr::from_str(&req.address)
+            .map_err(|_| tonic::Status::invalid_argument("invalid peer address"))?;
+
+        if !req.soft {
+            // Hard reset: send CEASE NOTIFICATION to drop the session.
+            // Unlike delete_peer the peer remains in the configuration
+            // and will attempt to reconnect.
+            //
+            // If GR helper mode is active (stale routes held for the peer),
+            // aborting gr_restart_timer here causes the subsequent session
+            // teardown to withdraw the stale routes, which matches the
+            // behaviour of a restart-timer expiry.
+            let global = self.global.read().await;
+            let peer = global
+                .peers
+                .get(&peer_addr)
+                .ok_or_else(|| tonic::Status::not_found("peer not found"))?;
+            let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
+                code: 6,
+                subcode: 3,
+                data: vec![],
+            });
+            let mut ctx = peer.context.lock().unwrap();
+            if let Some(h) = ctx.gr_restart_timer.take() {
+                h.abort();
+            }
+            let mut arb = ctx.conn_arbiter.lock().unwrap();
+            for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
+                .into_iter()
+                .flatten()
+            {
+                let _ = tx.send(CloseReason::SendMessage(cease.clone()));
+            }
+            return Ok(tonic::Response::new(api::ResetPeerResponse {}));
+        }
+
+        // Soft reset: re-apply policy / re-advertise without dropping the session.
+        //
+        // Soft reset IN re-applies the current import policy to all non-stale
+        // RIB entries from this peer.  Stale entries (held during GR helper
+        // mode) are intentionally skipped: they are transient, awaiting either
+        // the peer's reconnection or restart-timer expiry.  Re-applying policy
+        // to them would cause spurious churn for no practical benefit.  There
+        // is no RFC guidance on this interaction; skipping stale entries is a
+        // pragmatic implementation choice.
+        //
+        // Soft reset OUT re-advertises the current best paths to this peer via
+        // do_route_refresh().  If the session is not Established (e.g., the
+        // peer is in GR helper mode and the session is currently down),
+        // do_route_refresh() exits early, making this a safe no-op.
+        let direction = api::reset_peer_request::Direction::try_from(req.direction)
+            .unwrap_or(api::reset_peer_request::Direction::Unspecified);
+        let (do_in, do_out) = match direction {
+            api::reset_peer_request::Direction::Both => (true, true),
+            api::reset_peer_request::Direction::In => (true, false),
+            api::reset_peer_request::Direction::Out => (false, true),
+            api::reset_peer_request::Direction::Unspecified => {
+                return Err(tonic::Status::invalid_argument(
+                    "direction must be specified",
+                ));
+            }
+        };
+
+        // Verify the peer exists before touching the table.
+        {
+            let global = self.global.read().await;
+            if !global.peers.contains_key(&peer_addr) {
+                return Err(tonic::Status::not_found("peer not found"));
+            }
+        }
+
+        if do_in {
+            self.tables.soft_reset_in(peer_addr).await;
+        }
+        if do_out {
+            self.tables.soft_reset_out(peer_addr).await;
+        }
+        Ok(tonic::Response::new(api::ResetPeerResponse {}))
     }
     async fn shutdown_peer(
         &self,
@@ -2806,6 +2884,8 @@ async fn add_policy_assignment(
 
 pub(crate) enum ToPeerEvent {
     NlriChange(table::NlriChange),
+    /// Trigger a soft reset OUT: re-advertise all current best paths.
+    SoftResetOut,
 }
 
 fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) {
@@ -4857,6 +4937,15 @@ impl PeerSession {
                     match msg {
                         Some(Some(ToPeerEvent::NlriChange(update))) => {
                             self.handle_prefix_update(update);
+                        }
+                        Some(Some(ToPeerEvent::SoftResetOut)) => {
+                            // Re-advertise all current best paths to this peer.
+                            // do_route_refresh() checks SessionState::Established
+                            // internally, so if the session is down (e.g. GR
+                            // helper mode) this is a safe no-op.
+                            for family in self.pending.keys().cloned().collect::<Vec<_>>() {
+                                self.do_route_refresh(family).await;
+                            }
                         }
                         Some(None) => {
                             self.peer_event_rx = None;

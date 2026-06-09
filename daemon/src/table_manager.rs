@@ -221,6 +221,45 @@ impl TableManager {
         );
     }
 
+    /// Re-applies the current import policy to all non-stale paths from `peer`
+    /// across every shard and distributes any routing changes to peers.
+    pub(crate) async fn soft_reset_in(&self, peer: IpAddr) {
+        let import_policy = self.import_policy.load_full();
+        let export_policy = self.export_policy.load_full();
+        let kernel_tx = self.kernel_tx.load_full();
+        for shard in &self.shards {
+            let mut t = shard.lock().await;
+            t.soft_reset_in(
+                peer,
+                import_policy.as_deref(),
+                kernel_tx.as_deref(),
+                export_policy.as_deref(),
+            );
+        }
+    }
+
+    /// Triggers a soft reset OUT for `peer`: re-advertises all current best
+    /// paths to that peer.  Sends a [`ToPeerEvent::SoftResetOut`] on the
+    /// peer's event channel; the peer session handles it by calling
+    /// `do_route_refresh` for each negotiated family.
+    ///
+    /// If the peer's session is not Established (e.g., peer is in GR helper
+    /// mode and the session is down), the peer session's `do_route_refresh`
+    /// exits early, making this a safe no-op.
+    pub(crate) async fn soft_reset_out(&self, peer: IpAddr) {
+        // All shards register the same sender for each peer; shard 0 suffices
+        // for the lookup.
+        let tx = self.shards[0]
+            .lock()
+            .await
+            .peer_event_tx
+            .get(&peer)
+            .cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(ToPeerEvent::SoftResetOut);
+        }
+    }
+
     pub(crate) async fn drop_families(&self, addr: IpAddr, families: &[Family]) {
         let kernel_tx = self.kernel_tx.load_full();
         for shard in &self.shards {
@@ -684,6 +723,44 @@ impl TableShard {
         // Fan out to all peer channels.
         for tx in self.peer_event_tx.values() {
             let _ = tx.send(ToPeerEvent::NlriChange(filtered_update.clone()));
+        }
+    }
+
+    /// Re-applies the current import policy to all non-stale paths from `peer`.
+    ///
+    /// Each path is re-inserted via [`table::Table::insert`] using its stored
+    /// pre-policy attributes (`original_attr`), which replaces the existing RIB
+    /// entry and triggers best-path recalculation and peer notification if the
+    /// post-policy result changed.
+    ///
+    /// Stale paths (GR helper mode) are skipped; see
+    /// [`table::Table::collect_peer_paths_for_soft_reset`] for the rationale.
+    pub(crate) fn soft_reset_in(
+        &mut self,
+        peer: std::net::IpAddr,
+        import_policy: Option<&table::PolicyAssignment>,
+        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        export_policy: Option<&table::PolicyAssignment>,
+    ) {
+        let paths = self.rtable.collect_peer_paths_for_soft_reset(peer);
+        for (family, net, remote_path_id, nexthop, source, original_attr, timestamp) in paths {
+            let mut nh = nexthop;
+            let (filtered, post_policy_attr) =
+                crate::policy::apply_import(import_policy, &source, &net, &original_attr, &mut nh);
+            if let table::InsertResult::Changed(update) = self.rtable.insert(
+                source,
+                family,
+                net,
+                remote_path_id,
+                nh,
+                post_policy_attr,
+                Some(original_attr),
+                filtered,
+                None,
+                timestamp,
+            ) {
+                self.distribute_update(update, kernel_tx, export_policy);
+            }
         }
     }
 

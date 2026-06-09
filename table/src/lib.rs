@@ -419,6 +419,17 @@ impl InsertResult {
     }
 }
 
+/// One path entry returned by [`Table::collect_peer_paths_for_soft_reset`].
+pub type SoftResetPath = (
+    Family,
+    packet::Nlri,
+    u32,
+    bgp::Nexthop,
+    Arc<Source>,
+    Arc<Vec<packet::Attribute>>,
+    SystemTime,
+);
+
 /// Result of a single `Table::insert()` or `Table::remove()` operation.
 ///
 /// Non-Add-Path peers can skip processing when `best_changed` is false.
@@ -625,6 +636,47 @@ impl Table {
 
     pub fn families(&self) -> impl Iterator<Item = Family> + '_ {
         self.ribs.keys().filter(|f| **f != Family::EMPTY).copied()
+    }
+
+    /// Collects all non-stale paths from `peer` for use by soft reset IN.
+    ///
+    /// The returned tuples carry the pre-import-policy attributes
+    /// (`original_attr`) so the caller can re-apply the current import policy
+    /// and re-insert with [`Table::insert`].
+    ///
+    /// Stale paths (held during GR helper mode) are intentionally excluded.
+    /// They are transient entries awaiting either peer reconnection or restart
+    /// timer expiry; re-applying policy to them has no practical effect and
+    /// would cause spurious churn.  There is no RFC guidance on soft reset
+    /// interaction with GR stale routes -- this is a pragmatic implementation
+    /// choice.
+    pub fn collect_peer_paths_for_soft_reset(&self, peer: std::net::IpAddr) -> Vec<SoftResetPath> {
+        let mut out = Vec::new();
+        for (family, rib) in &self.ribs {
+            if *family == Family::EMPTY {
+                continue;
+            }
+            for (net, dst) in &rib.destinations {
+                for entry in &dst.entry {
+                    if entry.path.source.remote_addr != peer {
+                        continue;
+                    }
+                    if entry.path.source.is_stale() {
+                        continue;
+                    }
+                    out.push((
+                        *family,
+                        *net,
+                        entry.remote_path_id,
+                        entry.path.nexthop,
+                        Arc::clone(&entry.path.source),
+                        Arc::clone(&entry.original_attr),
+                        entry.timestamp,
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// Returns paths in the global RIB for the given destination.
