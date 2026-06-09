@@ -2758,6 +2758,38 @@ mod tests {
         assert_eq!(nexthop, original);
     }
 
+    #[test]
+    fn import_policy_with_nexthop_action_is_rejected() {
+        // Nexthop rewriting in import policy is not allowed: the pre-policy
+        // nexthop is stored in Path.nexthop rather than in the attribute list,
+        // so a nexthop-set action would bypass Adj-RIB-In recording.
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![],
+                Some(Disposition::Accept),
+                Actions {
+                    nexthop: Some(NexthopAction::Address(IpAddr::V4(Ipv4Addr::new(
+                        192, 168, 1, 1,
+                    )))),
+                    ..Actions::default()
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let result = ptable.add_assignment(
+            "ribs",
+            PolicyDirection::Import,
+            Disposition::Accept,
+            vec!["pol1".to_string()],
+        );
+        assert!(
+            result.is_err(),
+            "import policy with nexthop action must be rejected"
+        );
+    }
+
     // --- Ord regression: higher-priority attribute must win ---
 
     #[test]

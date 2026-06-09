@@ -1099,6 +1099,19 @@ impl PolicyTable {
             }
         }
 
+        if direction == PolicyDirection::Import {
+            for policy in &v {
+                for stmt in &policy.statements {
+                    if stmt.actions.nexthop.is_some() {
+                        return Err(TableError::InvalidArgument(format!(
+                            "statement '{}' sets nexthop, which is not allowed in import policy",
+                            stmt.name
+                        )));
+                    }
+                }
+            }
+        }
+
         let m = match direction {
             PolicyDirection::Import => &mut self.assignment_import,
             PolicyDirection::Export => &mut self.assignment_export,
