@@ -119,6 +119,7 @@ impl TableManager {
     /// Applies import policy and handles BMP/MRT notification internally.
     /// Returns `true` if the per-peer prefix limit (RFC 4486 §2) was exceeded.
     /// The caller must send a CEASE NOTIFICATION and close the session.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn insert_route(
         &self,
         source: Arc<table::Source>,
@@ -127,13 +128,21 @@ impl TableManager {
         nexthop: bgp::Nexthop,
         attr: Arc<Vec<packet::Attribute>>,
         prefix_limit: Option<(u32, Arc<std::sync::atomic::AtomicU64>)>,
+        timestamp: std::time::SystemTime,
     ) -> bool {
         let import_policy = self.import_policy.load_full();
         let export_policy = self.export_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
         let idx = self.dealer(net.nlri);
         let mut t = self.shards[idx].lock().await;
-        t.notify_adj_rib_in(source.clone(), family, &[net], Some(&attr), Some(nexthop));
+        t.notify_adj_rib_in(
+            source.clone(),
+            family,
+            &[net],
+            Some(&attr),
+            Some(nexthop),
+            timestamp,
+        );
         let mut nh = nexthop;
         let filtered = crate::policy::apply_import(
             import_policy.as_deref(),
@@ -152,6 +161,7 @@ impl TableManager {
             attr,
             filtered,
             pl,
+            timestamp,
         ) {
             table::InsertResult::PrefixLimitExceeded => return true,
             table::InsertResult::Changed(update) => {
@@ -169,12 +179,13 @@ impl TableManager {
         family: Family,
         net: packet::PathNlri,
         prefix_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+        timestamp: std::time::SystemTime,
     ) {
         let export_policy = self.export_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
         let idx = self.dealer(net.nlri);
         let mut t = self.shards[idx].lock().await;
-        t.notify_adj_rib_in(source.clone(), family, &[net], None, None);
+        t.notify_adj_rib_in(source.clone(), family, &[net], None, None, timestamp);
         let counter_ref = prefix_counter.as_ref();
         if let Some(update) = t
             .rtable
@@ -537,6 +548,7 @@ impl TableShard {
         nets: &[packet::PathNlri],
         attrs: Option<&Arc<Vec<packet::Attribute>>>,
         nexthop: Option<bgp::Nexthop>,
+        timestamp: std::time::SystemTime,
     ) {
         let addpath = self.has_addpath(&source.remote_addr, &family);
         for tx in self.subscribers.values() {
@@ -547,7 +559,7 @@ impl TableShard {
                 nlris: nets.to_owned(),
                 attrs: attrs.cloned(),
                 nexthop,
-                timestamp: std::time::SystemTime::now(),
+                timestamp,
             }));
         }
     }
@@ -685,7 +697,15 @@ impl TableShard {
         kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
         export_policy: Option<&table::PolicyAssignment>,
     ) {
-        self.notify_adj_rib_in(source.clone(), family, &nets, attrs.as_ref(), nexthop);
+        let timestamp = std::time::SystemTime::now();
+        self.notify_adj_rib_in(
+            source.clone(),
+            family,
+            &nets,
+            attrs.as_ref(),
+            nexthop,
+            timestamp,
+        );
 
         match attrs {
             Some(attrs) => {
@@ -710,6 +730,7 @@ impl TableShard {
                         attrs.clone(),
                         filtered,
                         None,
+                        timestamp,
                     ) {
                         self.distribute_update(update, kernel_tx, export_policy);
                     }

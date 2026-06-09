@@ -4585,6 +4585,7 @@ impl PeerSession {
         unreach: Option<packet::NlriSet>,
         attr: Arc<Vec<packet::Attribute>>,
         nexthop: Option<bgp::Nexthop>,
+        timestamp: std::time::SystemTime,
     ) -> bool {
         if let Some(s) = reach {
             let family = s.family;
@@ -4603,6 +4604,7 @@ impl PeerSession {
                         nexthop.unwrap(),
                         attr.clone(),
                         prefix_limit.clone(),
+                        timestamp,
                     )
                     .await
                 {
@@ -4619,7 +4621,13 @@ impl PeerSession {
                 .map(|(_, counter)| Arc::clone(counter));
             for net in s.entries {
                 self.tables
-                    .remove_route(source.clone(), family, net, prefix_counter.clone())
+                    .remove_route(
+                        source.clone(),
+                        family,
+                        net,
+                        prefix_counter.clone(),
+                        timestamp,
+                    )
                     .await;
             }
         }
@@ -4700,11 +4708,12 @@ impl PeerSession {
                     .into(),
                 ));
             }
+            let rx_timestamp = std::time::SystemTime::now();
             let prefix_limit_exceeded = self
-                .rx_update(reach.clone(), unreach, attr.clone(), nexthop)
+                .rx_update(reach.clone(), unreach, attr.clone(), nexthop, rx_timestamp)
                 .await
                 || self
-                    .rx_update(mp_reach, mp_unreach.clone(), attr, nexthop)
+                    .rx_update(mp_reach, mp_unreach.clone(), attr, nexthop, rx_timestamp)
                     .await;
             if prefix_limit_exceeded {
                 let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
@@ -5885,6 +5894,7 @@ mod tests {
                 attrs.clone(),
                 false,
                 None,
+                std::time::SystemTime::UNIX_EPOCH,
             );
             let _ = t.rtable.insert(
                 source.clone(),
@@ -5895,6 +5905,7 @@ mod tests {
                 attrs.clone(),
                 false,
                 None,
+                std::time::SystemTime::UNIX_EPOCH,
             );
         }
 
@@ -5937,8 +5948,17 @@ mod tests {
 
         {
             let mut t = tables.shards[0].lock().await;
-            t.rtable
-                .insert(source, Family::IPV4, ipv4_net, 0, nh4, attrs, false, None);
+            t.rtable.insert(
+                source,
+                Family::IPV4,
+                ipv4_net,
+                0,
+                nh4,
+                attrs,
+                false,
+                None,
+                std::time::SystemTime::UNIX_EPOCH,
+            );
         }
         assert_eq!(
             tables.shards[0]
