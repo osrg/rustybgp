@@ -1009,7 +1009,7 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                 .ebgp_multihop
                 .as_ref()
                 .and_then(|m| m.config.as_ref())
-                .and_then(|c| c.enabled.and(c.multihop_ttl)),
+                .and_then(|c| c.enabled.filter(|&en| en).and(c.multihop_ttl)),
             password: c.auth_password.clone(),
             families,
             send_max,
@@ -7048,5 +7048,412 @@ mod tests {
             }
         });
         assert_eq!(gr_cap.unwrap() & 0x4, 0, "N-bit must not be set");
+    }
+
+    fn make_peer_params(toml: &str) -> PeerParams {
+        let neighbor: rustybgp_config::generate::Neighbor =
+            toml::from_str(toml).expect("invalid TOML");
+        PeerParams::try_from(&neighbor).expect("PeerParams::try_from failed")
+    }
+
+    #[test]
+    fn peer_config_basic() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+"#,
+        );
+        assert_eq!(p.remote_addr, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(p.expected_remote_asn, 65002);
+    }
+
+    #[test]
+    fn peer_config_local_as() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+local-as = 65001
+"#,
+        );
+        assert_eq!(p.local_asn, 65001);
+    }
+
+    #[test]
+    fn peer_config_admin_down() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+admin-down = true
+"#,
+        );
+        assert!(p.admin_down);
+    }
+
+    #[test]
+    fn peer_config_auth_password() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+auth-password = "secret"
+"#,
+        );
+        assert_eq!(p.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn peer_config_hold_time() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[timers.config]
+hold-time = 90.0
+"#,
+        );
+        assert_eq!(p.holdtime, 90);
+    }
+
+    #[test]
+    fn peer_config_connect_retry() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[timers.config]
+connect-retry = 10.0
+"#,
+        );
+        assert_eq!(p.connect_retry_time, 10);
+    }
+
+    #[test]
+    fn peer_config_passive_mode() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[transport.config]
+passive-mode = true
+"#,
+        );
+        assert!(p.passive);
+    }
+
+    #[test]
+    fn peer_config_remote_port() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[transport.config]
+remote-port = 1179
+"#,
+        );
+        assert_eq!(p.remote_port, 1179);
+    }
+
+    #[test]
+    fn peer_config_multihop_ttl() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[ebgp-multihop.config]
+enabled = true
+multihop-ttl = 3
+"#,
+        );
+        assert_eq!(p.multihop_ttl, Some(3));
+    }
+
+    #[test]
+    fn peer_config_multihop_disabled() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[ebgp-multihop.config]
+enabled = false
+multihop-ttl = 3
+"#,
+        );
+        assert_eq!(p.multihop_ttl, None);
+    }
+
+    #[test]
+    fn peer_config_route_server_client() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[route-server.config]
+route-server-client = true
+"#,
+        );
+        assert!(p.rs_client);
+    }
+
+    #[test]
+    fn peer_config_afi_safis_ipv4_ipv6() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[[afi-safis]]
+[afi-safis.config]
+afi-safi-name = "ipv4-unicast"
+
+[[afi-safis]]
+[afi-safis.config]
+afi-safi-name = "ipv6-unicast"
+"#,
+        );
+        assert!(p.families.contains_key(&packet::Family::IPV4));
+        assert!(p.families.contains_key(&packet::Family::IPV6));
+        assert_eq!(p.families.len(), 2);
+    }
+
+    #[test]
+    fn peer_config_addpath_receive_only() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[[afi-safis]]
+[afi-safis.config]
+afi-safi-name = "ipv4-unicast"
+[afi-safis.add-paths.config]
+receive = true
+"#,
+        );
+        // mode bit 0 = receive
+        assert_eq!(p.families.get(&packet::Family::IPV4).copied(), Some(1));
+    }
+
+    #[test]
+    fn peer_config_addpath_send_only() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[[afi-safis]]
+[afi-safis.config]
+afi-safi-name = "ipv4-unicast"
+[afi-safis.add-paths.config]
+send-max = 2
+"#,
+        );
+        // mode bit 1 = send
+        assert_eq!(p.families.get(&packet::Family::IPV4).copied(), Some(2));
+        assert_eq!(p.send_max.get(&packet::Family::IPV4).copied(), Some(2));
+    }
+
+    #[test]
+    fn peer_config_addpath_both() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[[afi-safis]]
+[afi-safis.config]
+afi-safi-name = "ipv4-unicast"
+[afi-safis.add-paths.config]
+receive = true
+send-max = 3
+"#,
+        );
+        // mode bits 0+1 = 3
+        assert_eq!(p.families.get(&packet::Family::IPV4).copied(), Some(3));
+        assert_eq!(p.send_max.get(&packet::Family::IPV4).copied(), Some(3));
+    }
+
+    #[test]
+    fn peer_config_prefix_limit_ipv4() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[[afi-safis]]
+[afi-safis.config]
+afi-safi-name = "ipv4-unicast"
+[afi-safis.ipv4-unicast.prefix-limit.config]
+max-prefixes = 1000
+"#,
+        );
+        assert_eq!(
+            p.prefix_limits.get(&packet::Family::IPV4).copied(),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn peer_config_prefix_limit_ipv6() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "::1"
+peer-as = 65002
+
+[[afi-safis]]
+[afi-safis.config]
+afi-safi-name = "ipv6-unicast"
+[afi-safis.ipv6-unicast.prefix-limit.config]
+max-prefixes = 500
+"#,
+        );
+        assert_eq!(
+            p.prefix_limits.get(&packet::Family::IPV6).copied(),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn peer_config_graceful_restart() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[graceful-restart.config]
+enabled = true
+restart-time = 30
+
+[[afi-safis]]
+[afi-safis.config]
+afi-safi-name = "ipv4-unicast"
+[afi-safis.mp-graceful-restart.config]
+enabled = true
+"#,
+        );
+        let gr = p
+            .graceful_restart
+            .as_ref()
+            .expect("graceful_restart is None");
+        assert_eq!(gr.restart_time, 30);
+        assert!(gr.families.contains(&packet::Family::IPV4));
+    }
+
+    #[test]
+    fn peer_config_graceful_restart_notification_enabled() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[graceful-restart.config]
+enabled = true
+notification-enabled = true
+
+[[afi-safis]]
+[afi-safis.config]
+afi-safi-name = "ipv4-unicast"
+[afi-safis.mp-graceful-restart.config]
+enabled = true
+"#,
+        );
+        let gr = p
+            .graceful_restart
+            .as_ref()
+            .expect("graceful_restart is None");
+        assert!(gr.notification_enabled);
+    }
+
+    #[test]
+    fn peer_config_graceful_restart_no_families_yields_none() {
+        // GR enabled but no afi-safi has mp-graceful-restart enabled -> no GR config
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+
+[graceful-restart.config]
+enabled = true
+
+[[afi-safis]]
+[afi-safis.config]
+afi-safi-name = "ipv4-unicast"
+"#,
+        );
+        assert!(p.graceful_restart.is_none());
+    }
+
+    #[test]
+    fn peer_config_defaults() {
+        let p = make_peer_params(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+peer-as = 65002
+"#,
+        );
+        assert_eq!(p.holdtime, PeerParams::DEFAULT_HOLD_TIME);
+        assert_eq!(p.connect_retry_time, PeerParams::DEFAULT_CONNECT_RETRY_TIME);
+        assert_eq!(p.remote_port, Global::BGP_PORT);
+        assert!(!p.passive);
+        assert!(!p.rs_client);
+        assert!(!p.admin_down);
+        assert_eq!(p.local_asn, 0);
+        assert!(p.multihop_ttl.is_none());
+        assert!(p.password.is_none());
+        assert!(p.graceful_restart.is_none());
+    }
+
+    #[test]
+    fn peer_config_missing_neighbor_address() {
+        let neighbor: rustybgp_config::generate::Neighbor = toml::from_str(
+            r#"
+[config]
+peer-as = 65002
+"#,
+        )
+        .expect("invalid TOML");
+        assert!(PeerParams::try_from(&neighbor).is_err());
+    }
+
+    #[test]
+    fn peer_config_missing_peer_as() {
+        let neighbor: rustybgp_config::generate::Neighbor = toml::from_str(
+            r#"
+[config]
+neighbor-address = "10.0.0.1"
+"#,
+        )
+        .expect("invalid TOML");
+        assert!(PeerParams::try_from(&neighbor).is_err());
     }
 }
