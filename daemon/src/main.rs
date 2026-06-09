@@ -35,6 +35,7 @@ use std::net::Ipv4Addr;
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let version: &'static str = concat!("v", env!("CARGO_PKG_VERSION"), "-", env!("GIT_HASH"));
     let args = Command::new("rustybgpd")
         .version(version)
@@ -106,7 +107,7 @@ async fn main() -> Result<(), std::io::Error> {
         }
     };
 
-    println!("Hello, RustyBGPd ({} cpus)!", num_cpus::get());
+    log::info!("Hello, RustyBGPd ({} cpus)!", num_cpus::get());
 
     event::main(
         conf,

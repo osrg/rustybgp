@@ -2643,7 +2643,7 @@ impl GoBgpService for GrpcService {
         let tables = self.tables.clone();
         tokio::spawn(async move {
             if let Err(e) = d.serve(file, cancel, tables).await {
-                println!("mrt dumper failed: {:?}", e);
+                log::error!("mrt dumper failed: {:?}", e);
             }
         });
         Ok(tonic::Response::new(api::EnableMrtResponse {}))
@@ -2762,7 +2762,25 @@ impl GoBgpService for GrpcService {
         &self,
         _request: tonic::Request<api::SetLogLevelRequest>,
     ) -> Result<tonic::Response<api::SetLogLevelResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let level = match api::set_log_level_request::Level::try_from(_request.into_inner().level)
+            .unwrap_or(api::set_log_level_request::Level::Unspecified)
+        {
+            api::set_log_level_request::Level::Unspecified => {
+                return Err(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "log level unspecified",
+                ));
+            }
+            api::set_log_level_request::Level::Panic
+            | api::set_log_level_request::Level::Fatal
+            | api::set_log_level_request::Level::Error => log::LevelFilter::Error,
+            api::set_log_level_request::Level::Warn => log::LevelFilter::Warn,
+            api::set_log_level_request::Level::Info => log::LevelFilter::Info,
+            api::set_log_level_request::Level::Debug => log::LevelFilter::Debug,
+            api::set_log_level_request::Level::Trace => log::LevelFilter::Trace,
+        };
+        log::set_max_level(level);
+        Ok(tonic::Response::new(api::SetLogLevelResponse {}))
     }
 }
 
@@ -3056,7 +3074,7 @@ async fn accept_connection(
     let peer = match g.peers.get_mut(&remote_addr) {
         Some(peer) => {
             if peer.admin_down {
-                println!(
+                log::warn!(
                     "admin down; ignore a new passive connection from {}",
                     remote_addr
                 );
@@ -3071,7 +3089,7 @@ async fn accept_connection(
                 }
             };
             if already_connected {
-                println!("already has {:?} connection {}", role, remote_addr);
+                log::warn!("already has {:?} connection {}", role, remote_addr);
                 return None;
             }
             peer.state
@@ -3096,7 +3114,7 @@ async fn accept_connection(
                 }
             }
             if !is_dynamic {
-                println!(
+                log::warn!(
                     "can't find configuration a new passive connection {}",
                     remote_addr
                 );
@@ -3198,7 +3216,7 @@ impl Global {
                     && let Some(dump_type) = config.dump_type.as_ref()
                 {
                     if dump_type != &config::generate::MrtType::Updates {
-                        println!("only update dump is supported");
+                        log::warn!("only update dump is supported");
                         continue;
                     }
                     if let Some(filename) = config.file_name.as_ref() {
@@ -3206,7 +3224,7 @@ impl Global {
                         {
                             let mut g = global.write().await;
                             if g.mrt_dumpers.contains_key(filename) {
-                                println!("mrt dumper already enabled for {filename}, skipping");
+                                log::warn!("mrt dumper already enabled for {filename}, skipping");
                                 continue;
                             }
                             g.mrt_dumpers.insert(filename.clone(), cancel.clone());
@@ -3219,17 +3237,17 @@ impl Global {
                                 let tables2 = tables.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = d.serve(file, cancel, tables2).await {
-                                        println!("mrt dumper failed: {:?}", e);
+                                        log::error!("mrt dumper failed: {:?}", e);
                                     }
                                 });
                             }
                             Err(e) => {
                                 global.write().await.mrt_dumpers.remove(&filename);
-                                println!("failed to create mrt dump file: {:?}", e);
+                                log::error!("failed to create mrt dump file: {:?}", e);
                             }
                         }
                     } else {
-                        println!("mrt dump filename needs to be specified");
+                        log::warn!("mrt dump filename needs to be specified");
                     }
                 }
             }
@@ -3255,22 +3273,22 @@ impl Global {
                                     if let Err(e) =
                                         handle.install(dst, prefix_len, nexthop, 0).await
                                     {
-                                        eprintln!("kernel route install failed: {}", e);
+                                        log::error!("kernel route install failed: {}", e);
                                     }
                                 }
                                 KernelRouteEvent::Withdraw { dst, prefix_len } => {
                                     if let Err(e) = handle.withdraw(dst, prefix_len).await {
-                                        eprintln!("kernel route withdraw failed: {}", e);
+                                        log::error!("kernel route withdraw failed: {}", e);
                                     }
                                 }
                             }
                         }
                     });
                     tables.kernel_tx.store(Some(Arc::new(tx)));
-                    println!("kernel route integration enabled");
+                    log::info!("kernel route integration enabled");
                 }
                 Err(e) => {
-                    eprintln!("failed to enable kernel route integration: {:?}", e);
+                    log::error!("failed to enable kernel route integration: {:?}", e);
                 }
             }
         }
@@ -3399,11 +3417,11 @@ impl Global {
                 match PeerParams::try_from(p) {
                     Ok(params) => {
                         if let Err(e) = server.add_peer(params, Some(active_tx.clone())) {
-                            eprintln!("failed to add peer from config: {}", e);
+                            log::error!("failed to add peer from config: {}", e);
                         }
                     }
                     Err(e) => {
-                        eprintln!("skipping invalid peer config: {}", e);
+                        log::warn!("skipping invalid peer config: {}", e);
                     }
                 }
             }
@@ -3705,7 +3723,7 @@ async fn process_restarting_outputs(
         // R-bit is no longer stored in peer config; it is derived from
         // selection_deferral.is_some() at connection time (PeerFsm::on_connected).
         // Setting selection_deferral = None is sufficient.
-        println!("graceful-restart: all peers sent EOR; cleared restarting state");
+        log::info!("graceful-restart: all peers sent EOR; cleared restarting state");
     }
 
     // Flatten: None (no output) and Some(None) (disabled) both mean "don't start timer".
@@ -4322,22 +4340,25 @@ impl PeerSession {
                         match channels.get(family) {
                             Some(ch) => {
                                 if mode & 0x1 > 0 && !ch.addpath_rx() {
-                                    eprintln!(
+                                    log::warn!(
                                         "add-path receive configured for {:?} but not negotiated with peer {}",
-                                        family, self.remote_addr
+                                        family,
+                                        self.remote_addr
                                     );
                                 }
                                 if mode & 0x2 > 0 && !ch.addpath_tx() {
-                                    eprintln!(
+                                    log::warn!(
                                         "add-path send configured for {:?} but not negotiated with peer {}",
-                                        family, self.remote_addr
+                                        family,
+                                        self.remote_addr
                                     );
                                 }
                             }
                             None => {
-                                eprintln!(
+                                log::warn!(
                                     "add-path configured for {:?} but family not negotiated with peer {}",
-                                    family, self.remote_addr
+                                    family,
+                                    self.remote_addr
                                 );
                             }
                         }
@@ -4822,7 +4843,7 @@ impl PeerSession {
                     }
                 }
                 _ = self.holdtime_futures.next() => {
-                    println!("{}: holdtime expired", self.remote_addr);
+                    log::warn!("{}: holdtime expired", self.remote_addr);
                     let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
                     let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
                     self.process_effects(effects, global).await;
