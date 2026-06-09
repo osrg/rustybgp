@@ -360,6 +360,7 @@ pub struct Reach {
     pub net: packet::PathNlri,
     pub attr: Arc<Vec<packet::Attribute>>,
     pub nexthop: bgp::Nexthop,
+    pub timestamp: SystemTime,
 }
 
 impl From<Reach> for bgp::Message {
@@ -443,7 +444,6 @@ pub struct Source {
     pub remote_asn: u32,
     pub local_asn: u32,
     pub router_id: u32,
-    pub uptime: u64,
     rs_client: bool,
     stale: AtomicBool,
 }
@@ -464,7 +464,6 @@ static LOCAL_SOURCE: LazyLock<Arc<Source>> = LazyLock::new(|| {
         remote_asn: 0,
         local_asn: 0,
         router_id: 0,
-        uptime: 0,
         rs_client: false,
         stale: AtomicBool::new(false),
     })
@@ -485,7 +484,6 @@ impl Source {
         remote_asn: u32,
         local_asn: u32,
         router_id: Ipv4Addr,
-        uptime: u64,
         rs_client: bool,
     ) -> Self {
         Source {
@@ -494,7 +492,6 @@ impl Source {
             remote_asn,
             local_asn,
             router_id: router_id.into(),
-            uptime,
             rs_client,
             stale: AtomicBool::new(false),
         }
@@ -603,6 +600,7 @@ impl Table {
                     },
                     attr: e.path.attr.clone(),
                     nexthop: e.path.nexthop,
+                    timestamp: e.timestamp,
                 })
             })
     }
@@ -1456,7 +1454,6 @@ mod tests {
             remote_asn,
             local_asn,
             Ipv4Addr::new(0, 0, 0, router_id),
-            0,
             false,
         ))
     }
@@ -1523,7 +1520,6 @@ mod tests {
             1,
             2,
             Ipv4Addr::new(1, 1, 1, 1),
-            0,
             false,
         ));
         let s2 = Arc::new(Source::new(
@@ -1532,7 +1528,6 @@ mod tests {
             1,
             2,
             Ipv4Addr::new(1, 1, 1, 2),
-            0,
             false,
         ));
 

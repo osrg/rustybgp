@@ -37,6 +37,7 @@ pub(crate) struct AdjRibInChange {
     pub(crate) nlris: Vec<packet::PathNlri>,
     pub(crate) attrs: Option<Arc<Vec<packet::Attribute>>>,
     pub(crate) nexthop: Option<bgp::Nexthop>,
+    pub(crate) timestamp: std::time::SystemTime,
 }
 
 #[derive(Clone)]
@@ -394,6 +395,7 @@ impl TableManager {
                         nlris: vec![reach.net],
                         attrs: Some(reach.attr),
                         nexthop: Some(reach.nexthop),
+                        timestamp: reach.timestamp,
                     });
                 }
             }
@@ -545,6 +547,7 @@ impl TableShard {
                 nlris: nets.to_owned(),
                 attrs: attrs.cloned(),
                 nexthop,
+                timestamp: std::time::SystemTime::now(),
             }));
         }
     }

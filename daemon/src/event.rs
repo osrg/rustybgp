@@ -141,8 +141,8 @@ struct SessionAddrs {
 
 struct PeerState {
     fsm: AtomicU8,
-    uptime: AtomicU64,
-    downtime: AtomicU64,
+    peer_up_at: AtomicU64,
+    peer_down_at: AtomicU64,
     remote_asn: AtomicU32,
     remote_id: AtomicU32,
     remote_holdtime: AtomicU16,
@@ -362,7 +362,7 @@ impl Peer {
             remote_id,
             0,
             self.config.remote_addr,
-            self.state.uptime.load(Ordering::Relaxed) as u32,
+            self.state.peer_up_at.load(Ordering::Relaxed) as u32,
         );
         let msg = bmp::Message::PeerUp {
             header: peer_header.clone(),
@@ -412,7 +412,7 @@ impl Peer {
     /// operator-owned, and gr_state must survive across session boundaries
     /// while GR is active.
     fn clear_session_state(&mut self) {
-        self.state.downtime.store(
+        self.state.peer_down_at.store(
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
@@ -585,8 +585,8 @@ impl PeerParams {
             admin_down: self.admin_down,
             state: Arc::new(PeerState {
                 fsm: AtomicU8::new(self.state as u8),
-                uptime: AtomicU64::new(0),
-                downtime: AtomicU64::new(0),
+                peer_up_at: AtomicU64::new(0),
+                peer_down_at: AtomicU64::new(0),
                 remote_asn: AtomicU32::new(0),
                 remote_id: AtomicU32::new(0),
                 remote_holdtime: AtomicU16::new(0),
@@ -657,7 +657,7 @@ impl From<&PeerView> for api::Peer {
             }),
             state: Some(Default::default()),
         };
-        let uptime = p.state.uptime.load(Ordering::Relaxed);
+        let uptime = p.state.peer_up_at.load(Ordering::Relaxed);
         if uptime != 0 {
             let negotiated_holdtime = std::cmp::min(
                 p.config.holdtime,
@@ -672,7 +672,7 @@ impl From<&PeerView> for api::Peer {
                 keepalive_interval: negotiated_holdtime / 3,
                 ..Default::default()
             };
-            let downtime = p.state.downtime.load(Ordering::Relaxed);
+            let downtime = p.state.peer_down_at.load(Ordering::Relaxed);
             if downtime != 0 {
                 ts.downtime = Some(prost_types::Timestamp {
                     seconds: downtime as i64,
@@ -4035,8 +4035,8 @@ impl PeerSession {
             local_asn,
             state: Arc::new(PeerState {
                 fsm: AtomicU8::new(0),
-                uptime: AtomicU64::new(0),
-                downtime: AtomicU64::new(0),
+                peer_up_at: AtomicU64::new(0),
+                peer_down_at: AtomicU64::new(0),
                 remote_asn: AtomicU32::new(0),
                 remote_id: AtomicU32::new(0),
                 remote_holdtime: AtomicU16::new(0),
@@ -4119,7 +4119,7 @@ impl PeerSession {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        self.state.uptime.store(uptime, Ordering::Relaxed);
+        self.state.peer_up_at.store(uptime, Ordering::Relaxed);
         let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
         let router_id = Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed));
 
@@ -4142,7 +4142,6 @@ impl PeerSession {
                     remote_asn,
                     self.local_asn,
                     router_id,
-                    uptime,
                     self.rs_client,
                 )),
             );
@@ -4929,7 +4928,7 @@ impl PeerSession {
                     peer_addr: any_source.remote_addr,
                     peer_asn: any_source.remote_asn,
                     peer_id: any_source.router_id,
-                    uptime: any_source.uptime,
+                    uptime: self.state.peer_up_at.load(Ordering::Relaxed),
                     reason: bmp_reason,
                 })
                 .await;
@@ -5409,7 +5408,6 @@ mod tests {
                 65002,
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
-                0,
                 false,
             )),
         );
@@ -5434,7 +5432,6 @@ mod tests {
             65002,
             65001,
             Ipv4Addr::new(10, 0, 0, 2),
-            0,
             false,
         ))
     }
@@ -5867,7 +5864,6 @@ mod tests {
             65002,
             65001,
             Ipv4Addr::new(10, 0, 0, 2),
-            0,
             false,
         ));
         let ipv4_net: packet::Nlri = "10.1.0.0/24".parse().unwrap();
@@ -5933,7 +5929,6 @@ mod tests {
             65003,
             65001,
             Ipv4Addr::new(10, 0, 0, 3),
-            0,
             false,
         ));
         let ipv4_net: packet::Nlri = "10.2.0.0/24".parse().unwrap();
@@ -6296,7 +6291,6 @@ mod tests {
                 65002,
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
-                0,
                 false,
             ))
         }

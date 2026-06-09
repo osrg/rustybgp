@@ -54,7 +54,6 @@ mod tests {
             65001,
             65000,
             Ipv4Addr::new(10, 0, 0, addr),
-            0,
             false,
         ))
     }

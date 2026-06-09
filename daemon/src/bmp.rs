@@ -45,6 +45,7 @@ fn apply_snapshot(snapshot: &mut SnapshotMap, change: AdjRibInChange) {
                     nlris: vec![nlri],
                     attrs: change.attrs.clone(),
                     nexthop: change.nexthop,
+                    timestamp: change.timestamp,
                 },
             );
         }
@@ -88,7 +89,11 @@ fn flush_peer_snapshot(
                     Ipv4Addr::from(change.source.router_id),
                     0,
                     change.source.remote_addr,
-                    change.source.uptime as u32,
+                    change
+                        .timestamp
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as u32,
                 ),
                 update,
                 addpath: change.addpath,
@@ -307,7 +312,10 @@ impl BmpClient {
                                         Ipv4Addr::from(change.source.router_id),
                                         0,
                                         change.source.remote_addr,
-                                        change.source.uptime as u32,
+                                        change.timestamp
+                                            .duration_since(SystemTime::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs() as u32,
                                     ),
                                     update,
                                     addpath: change.addpath,
@@ -437,7 +445,6 @@ mod tests {
             65000,
             65001,
             "192.0.2.1".parse().unwrap(),
-            0,
             false,
         ))
     }
@@ -459,6 +466,7 @@ mod tests {
             nlris,
             attrs: Some(Arc::new(Vec::new())),
             nexthop: None,
+            timestamp: SystemTime::UNIX_EPOCH,
         }
     }
 
@@ -474,6 +482,7 @@ mod tests {
             nlris,
             attrs: None,
             nexthop: None,
+            timestamp: SystemTime::UNIX_EPOCH,
         }
     }
 
