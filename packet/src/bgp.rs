@@ -464,7 +464,7 @@ fn nlri_decode_unsupported_family() {
     assert!(Nlri::decode(mup_ipv4, &mut c, len).is_err());
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Capability {
     MultiProtocol(Family),
     RouteRefresh,

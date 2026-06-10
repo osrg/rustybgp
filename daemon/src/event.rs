@@ -1416,9 +1416,129 @@ impl GoBgpService for GrpcService {
     }
     async fn update_peer(
         &self,
-        _request: tonic::Request<api::UpdatePeerRequest>,
+        request: tonic::Request<api::UpdatePeerRequest>,
     ) -> Result<tonic::Response<api::UpdatePeerResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        let req = request.into_inner();
+        let api_peer = req.peer.ok_or(Error::EmptyArgument)?;
+        let new_params = PeerParams::try_from(&api_peer)?;
+
+        let mut global = self.global.write().await;
+
+        if !global.peers.contains_key(&new_params.remote_addr) {
+            return Err(tonic::Status::not_found("peer not found"));
+        }
+
+        let global_asn = global.asn;
+        let router_id = u32::from(global.router_id);
+        let listen_sockets = global.listen_sockets.clone();
+        let peer_addr = new_params.remote_addr;
+
+        let new_local_asn = if new_params.local_asn == 0 {
+            global_asn
+        } else {
+            new_params.local_asn
+        };
+        let new_local_cap = PeerParams::build_local_cap(
+            peer_addr,
+            new_local_asn,
+            &new_params.families,
+            new_params.graceful_restart.as_ref(),
+        );
+        let effective_remote_port = if new_params.remote_port != 0 {
+            new_params.remote_port
+        } else {
+            Global::BGP_PORT
+        };
+
+        let old_password;
+        {
+            let peer = global.peers.get_mut(&peer_addr).unwrap();
+
+            let needs_teardown = effective_remote_port != peer.config.remote_port
+                || new_params.expected_remote_asn != peer.config.expected_remote_asn
+                || new_local_asn != peer.config.local_asn
+                || new_params.passive != peer.config.passive
+                || new_params.holdtime != peer.config.holdtime
+                || new_local_cap != peer.config.local_cap
+                || new_params.multihop_ttl != peer.config.multihop_ttl
+                || new_params.password != peer.config.password;
+
+            old_password = peer.config.password.clone();
+
+            peer.config = PeerConfig {
+                remote_addr: peer_addr,
+                remote_port: effective_remote_port,
+                expected_remote_asn: new_params.expected_remote_asn,
+                local_asn: new_local_asn,
+                passive: new_params.passive,
+                delete_on_disconnected: new_params.delete_on_disconnected,
+                holdtime: new_params.holdtime,
+                connect_retry_time: new_params.connect_retry_time,
+                local_cap: new_local_cap.clone(),
+                route_server_client: new_params.rs_client,
+                multihop_ttl: new_params.multihop_ttl,
+                password: new_params.password.clone(),
+                prefix_limits: new_params.prefix_limits,
+                graceful_restart: new_params.graceful_restart.clone(),
+            };
+
+            if needs_teardown {
+                let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
+                    code: 6,
+                    subcode: 3,
+                    data: vec![],
+                });
+                // Build a fresh ConnArbiter carrying the updated PeerFsm so the
+                // next session uses the new capabilities, ASN, and hold time.
+                // The session task (if any) holds the old Arc and will exit after
+                // receiving CEASE; apply_disconnect then calls
+                // clear_session_state + enable_active_connect on the new arbiter.
+                let new_conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(
+                    crate::fsm::PeerFsm::new(
+                        router_id,
+                        new_local_asn,
+                        new_local_cap,
+                        new_params.holdtime,
+                        new_params.expected_remote_asn,
+                        new_params.send_max,
+                    ),
+                )));
+                let mut ctx = peer.context.lock().unwrap();
+                if let Some(h) = ctx.gr_restart_timer.take() {
+                    h.abort();
+                }
+                ctx.active_connect_cancel_tx.take();
+                ctx.active_connect_join_handle.take();
+                {
+                    let mut arb = ctx.conn_arbiter.lock().unwrap();
+                    for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let _ = tx.send(CloseReason::SendMessage(cease.clone()));
+                    }
+                }
+                ctx.conn_arbiter = new_conn_arbiter;
+            }
+        }
+
+        // Update TCP MD5 socket option after releasing the peer borrow.
+        if old_password != new_params.password {
+            if old_password.is_some() {
+                for fd in &listen_sockets {
+                    auth::set_md5sig(*fd, &peer_addr, "");
+                }
+            }
+            if let Some(pw) = &new_params.password {
+                for fd in &listen_sockets {
+                    auth::set_md5sig(*fd, &peer_addr, pw);
+                }
+            }
+        }
+
+        Ok(tonic::Response::new(api::UpdatePeerResponse {
+            needs_soft_reset_in: false,
+        }))
     }
     async fn reset_peer(
         &self,
