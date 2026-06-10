@@ -289,8 +289,42 @@ struct PeerContext {
     active_connect_join_handle: Option<tokio::task::JoinHandle<()>>,
     /// GR helper state machine; persists across sessions.
     gr_state: crate::gr::GrState,
-    /// Abort handle for the GR restart timer task.
-    gr_restart_timer: Option<tokio::task::AbortHandle>,
+    /// Command channel for the GR restart timer task.
+    /// Send `()` to fire the timer immediately (RunNow); drop the sender to cancel silently.
+    gr_restart_timer: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl PeerContext {
+    /// Cancel the GR restart timer without running the expired handler.
+    /// Used when a new session is established and GR recovery proceeds normally.
+    fn cancel_gr_timer(&mut self) {
+        self.gr_restart_timer.take(); // drop sender = cancel
+    }
+
+    /// Fire the GR restart timer immediately, triggering stale route purge.
+    /// Used when an API call forces the peer down while in GR helper mode.
+    fn fire_gr_timer(&mut self) {
+        if let Some(tx) = self.gr_restart_timer.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// Tear down the peer: fire GR timer, optionally stop the active-connect loop,
+    /// and send a close reason to any live session tasks.
+    fn force_down(&mut self, reason: CloseReason, cancel_active_connect: bool) {
+        self.fire_gr_timer();
+        if cancel_active_connect {
+            self.active_connect_cancel_tx.take();
+            self.active_connect_join_handle.take();
+        }
+        let mut arb = self.conn_arbiter.lock().unwrap();
+        for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = tx.send(reason.clone());
+        }
+    }
 }
 
 /// Administrative peer record stored in `Global::peers` under the global
@@ -1249,9 +1283,7 @@ impl GoBgpService for GrpcService {
             if let Some(h) = ctx.active_connect_join_handle.take() {
                 join_handles.push(h);
             }
-            if let Some(h) = ctx.gr_restart_timer.take() {
-                h.abort();
-            }
+            ctx.cancel_gr_timer();
             let mut arb = ctx.conn_arbiter.lock().unwrap();
             for (close_tx, join_handle) in [
                 (arb.active_close_tx.take(), arb.active_join_handle.take()),
@@ -1327,30 +1359,18 @@ impl GoBgpService for GrpcService {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
             let mut global = self.global.write().await;
             if let Some(p) = global.peers.remove(&peer_addr) {
-                let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
-                    code: 6,
-                    subcode: 3,
-                    data: vec![],
-                });
                 {
                     let mut ctx = p.context.lock().unwrap();
-                    // Abort the GR restart timer immediately so it does not fire after
-                    // the peer is gone and operate on stale state.
-                    if let Some(h) = ctx.gr_restart_timer.take() {
-                        h.abort();
-                    }
-                    // Cancel the active-connect retry loop.
-                    ctx.active_connect_cancel_tx.take();
-                    ctx.active_connect_join_handle.take();
-                    {
-                        let mut arb = ctx.conn_arbiter.lock().unwrap();
-                        for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
-                            .into_iter()
-                            .flatten()
-                        {
-                            let _ = tx.send(CloseReason::SendMessage(cease.clone()));
-                        }
-                    }
+                    ctx.force_down(
+                        CloseReason::SendMessage(bgp::Message::Notification(
+                            rustybgp_packet::BgpError::Other {
+                                code: 6,
+                                subcode: 3,
+                                data: vec![],
+                            },
+                        )),
+                        true,
+                    );
                 }
                 if p.config.password.is_some() {
                     for fd in &global.listen_sockets {
@@ -1494,11 +1514,6 @@ impl GoBgpService for GrpcService {
             };
 
             if needs_teardown {
-                let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
-                    code: 6,
-                    subcode: 3,
-                    data: vec![],
-                });
                 // Build a fresh ConnArbiter carrying the updated PeerFsm so the
                 // next session uses the new capabilities, ASN, and hold time.
                 // The session task (if any) holds the old Arc and will exit after
@@ -1515,20 +1530,16 @@ impl GoBgpService for GrpcService {
                     ),
                 )));
                 let mut ctx = peer.context.lock().unwrap();
-                if let Some(h) = ctx.gr_restart_timer.take() {
-                    h.abort();
-                }
-                ctx.active_connect_cancel_tx.take();
-                ctx.active_connect_join_handle.take();
-                {
-                    let mut arb = ctx.conn_arbiter.lock().unwrap();
-                    for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        let _ = tx.send(CloseReason::SendMessage(cease.clone()));
-                    }
-                }
+                ctx.force_down(
+                    CloseReason::SendMessage(bgp::Message::Notification(
+                        rustybgp_packet::BgpError::Other {
+                            code: 6,
+                            subcode: 3,
+                            data: vec![],
+                        },
+                    )),
+                    true,
+                );
                 ctx.conn_arbiter = new_conn_arbiter;
             }
         }
@@ -1564,31 +1575,25 @@ impl GoBgpService for GrpcService {
             // Unlike delete_peer the peer remains in the configuration
             // and will attempt to reconnect.
             //
-            // If GR helper mode is active (stale routes held for the peer),
-            // aborting gr_restart_timer here causes the subsequent session
-            // teardown to withdraw the stale routes, which matches the
-            // behaviour of a restart-timer expiry.
+            // If GR helper mode is active, fire the GR timer immediately to
+            // purge stale routes, matching the behaviour of a restart-timer expiry.
+            // The active-connect retry loop is kept running so the peer can reconnect.
             let global = self.global.read().await;
             let peer = global
                 .peers
                 .get(&peer_addr)
                 .ok_or_else(|| tonic::Status::not_found("peer not found"))?;
-            let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
-                code: 6,
-                subcode: 3,
-                data: vec![],
-            });
             let mut ctx = peer.context.lock().unwrap();
-            if let Some(h) = ctx.gr_restart_timer.take() {
-                h.abort();
-            }
-            let mut arb = ctx.conn_arbiter.lock().unwrap();
-            for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
-                .into_iter()
-                .flatten()
-            {
-                let _ = tx.send(CloseReason::SendMessage(cease.clone()));
-            }
+            ctx.force_down(
+                CloseReason::SendMessage(bgp::Message::Notification(
+                    rustybgp_packet::BgpError::Other {
+                        code: 6,
+                        subcode: 3,
+                        data: vec![],
+                    },
+                )),
+                false,
+            );
             return Ok(tonic::Response::new(api::ResetPeerResponse {}));
         }
 
@@ -1642,14 +1647,10 @@ impl GoBgpService for GrpcService {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
             for (addr, p) in &mut self.global.write().await.peers {
                 if addr == &peer_addr {
-                    let ctx = p.context.lock().unwrap();
-                    let mut arb = ctx.conn_arbiter.lock().unwrap();
-                    for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        let _ = tx.send(CloseReason::AdminShutdown);
-                    }
+                    p.context
+                        .lock()
+                        .unwrap()
+                        .force_down(CloseReason::AdminShutdown, false);
                     return Ok(tonic::Response::new(api::ShutdownPeerResponse {}));
                 }
             }
@@ -1673,13 +1674,8 @@ impl GoBgpService for GrpcService {
                     if p.admin_down {
                         p.admin_down = false;
                         enable_active_connect(p, self.active_conn_tx.clone());
-                        return Ok(tonic::Response::new(api::EnablePeerResponse {}));
-                    } else {
-                        return Err(tonic::Status::new(
-                            tonic::Code::InvalidArgument,
-                            "peer is already admin-up",
-                        ));
                     }
+                    return Ok(tonic::Response::new(api::EnablePeerResponse {}));
                 }
             }
             return Err(tonic::Status::new(
@@ -1699,27 +1695,14 @@ impl GoBgpService for GrpcService {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
             for (addr, p) in &mut self.global.write().await.peers {
                 if addr == &peer_addr {
-                    if p.admin_down {
-                        return Err(tonic::Status::new(
-                            tonic::Code::InvalidArgument,
-                            "peer is already admin-down",
-                        ));
-                    } else {
+                    if !p.admin_down {
                         p.admin_down = true;
-                        {
-                            let mut ctx = p.context.lock().unwrap();
-                            ctx.active_connect_cancel_tx.take();
-                            ctx.active_connect_join_handle.take();
-                            let mut arb = ctx.conn_arbiter.lock().unwrap();
-                            for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
-                                .into_iter()
-                                .flatten()
-                            {
-                                let _ = tx.send(CloseReason::AdminShutdown);
-                            }
-                        }
-                        return Ok(tonic::Response::new(api::DisablePeerResponse {}));
+                        p.context
+                            .lock()
+                            .unwrap()
+                            .force_down(CloseReason::AdminShutdown, true);
                     }
+                    return Ok(tonic::Response::new(api::DisablePeerResponse {}));
                 }
             }
             return Err(tonic::Status::new(
@@ -4689,9 +4672,7 @@ impl PeerSession {
                     // Cancel any previous restart timer (no ctx lock held across await).
                     {
                         let mut ctx = self.context.lock().unwrap();
-                        if let Some(h) = ctx.gr_restart_timer.take() {
-                            h.abort();
-                        }
+                        ctx.cancel_gr_timer();
                     }
 
                     // Check global state to decide role: Restarting Speaker or Helper.
@@ -5318,9 +5299,7 @@ async fn apply_disconnect(
         // separately: MarkStale table events were already sent in
         // session_loop() under the same shard locks as peer_event_tx.remove(),
         // so no second pass over the table is needed here.
-        if let Some(h) = ctx.gr_restart_timer.take() {
-            h.abort();
-        }
+        ctx.cancel_gr_timer();
 
         let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
             families: gr.families.clone(),
@@ -5331,12 +5310,17 @@ async fn apply_disconnect(
                 let dur = *duration;
                 let context_c = Arc::clone(context);
                 let tables_c = tables.clone();
-                let handle = tokio::spawn(async move {
-                    tokio::time::sleep(dur).await;
-                    gr_restart_timer_expired(context_c, tables_c, remote_addr).await;
-                })
-                .abort_handle();
-                ctx.gr_restart_timer = Some(handle);
+                let (timer_tx, timer_rx) = tokio::sync::oneshot::channel::<()>();
+                tokio::spawn(async move {
+                    let run = match tokio::time::timeout(dur, timer_rx).await {
+                        Err(_) | Ok(Ok(())) => true,
+                        Ok(Err(_)) => false,
+                    };
+                    if run {
+                        gr_restart_timer_expired(context_c, tables_c, remote_addr).await;
+                    }
+                });
+                ctx.gr_restart_timer = Some(timer_tx);
             }
         }
         drop(info.export_map);
@@ -5346,9 +5330,7 @@ async fn apply_disconnect(
         // full update, so the export_map is discarded here and the next
         // session starts with an empty one.  Clean up any leftover GR state
         // from a previous cycle that never recovered.
-        if let Some(h) = ctx.gr_restart_timer.take() {
-            h.abort();
-        }
+        ctx.cancel_gr_timer();
         drop(info.export_map);
     }
 
