@@ -1278,6 +1278,10 @@ impl GoBgpService for GrpcService {
             cancel.cancel();
         }
         global.mrt_dumpers.clear();
+        for cancel in global.watch_event_cancels.values() {
+            cancel.cancel();
+        }
+        global.watch_event_cancels.clear();
         global.asn = 0;
         global.router_id = Ipv4Addr::new(0, 0, 0, 0);
         global.listen_port = Global::BGP_PORT;
@@ -1741,11 +1745,23 @@ impl GoBgpService for GrpcService {
         _request: tonic::Request<api::WatchEventRequest>,
     ) -> Result<tonic::Response<Self::WatchEventStream>, tonic::Status> {
         let tables2 = self.tables.clone();
+        let global2 = self.global.clone();
         let subscription = self.tables.subscribe_live().await;
+        let sub_id = subscription.id;
         let (tx, rx) = mpsc::channel(1024);
+        let cancel = CancellationToken::new();
+        self.global
+            .write()
+            .await
+            .watch_event_cancels
+            .insert(sub_id, cancel.clone());
         tokio::spawn(async move {
             let mut rx = UnboundedReceiverStream::new(subscription.rx);
-            while let Some(event) = rx.next().await {
+            loop {
+                let event = tokio::select! {
+                    e = rx.next() => match e { Some(e) => e, None => break },
+                    _ = cancel.cancelled() => break,
+                };
                 let r = match event {
                     BgpEvent::PeerUp(data) => api::WatchEventResponse {
                         event: Some(api::watch_event_response::Event::Peer(
@@ -1817,7 +1833,8 @@ impl GoBgpService for GrpcService {
                     break;
                 }
             }
-            tables2.unsubscribe(subscription.id).await;
+            tables2.unsubscribe(sub_id).await;
+            global2.write().await.watch_event_cancels.remove(&sub_id);
         });
         Ok(tonic::Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(rx),
@@ -3150,6 +3167,7 @@ pub(crate) struct Global {
     rpki_clients: FnvHashMap<SocketAddr, RpkiClient>,
     bmp_clients: FnvHashMap<SocketAddr, BmpClient>,
     mrt_dumpers: FnvHashMap<String, CancellationToken>,
+    watch_event_cancels: FnvHashMap<SubscriptionId, CancellationToken>,
 
     /// Selection Deferral state machine for the Restarting Speaker (RFC 4724 §4.1).
     /// Present only when the daemon started with --graceful-restart.
@@ -3198,6 +3216,7 @@ impl Global {
             rpki_clients: FnvHashMap::default(),
             bmp_clients: FnvHashMap::default(),
             mrt_dumpers: FnvHashMap::default(),
+            watch_event_cancels: FnvHashMap::default(),
 
             selection_deferral: None,
             selection_deferral_timer: None,
@@ -3818,7 +3837,7 @@ pub(crate) enum KernelRouteEvent {
     },
 }
 
-use crate::table_manager::{PeerDownData, PeerUpData, TableManager};
+use crate::table_manager::{PeerDownData, PeerUpData, SubscriptionId, TableManager};
 // Re-export for mrt.rs and bmp.rs which import from crate::event.
 pub(crate) use crate::table_manager::{AdjRibInChange, BgpEvent, TableHandle};
 
