@@ -1511,12 +1511,6 @@ impl GoBgpService for GrpcService {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
             for (addr, p) in &mut self.global.write().await.peers {
                 if addr == &peer_addr {
-                    if p.admin_down {
-                        return Err(tonic::Status::new(
-                            tonic::Code::InvalidArgument,
-                            "peer is admin-down",
-                        ));
-                    }
                     let ctx = p.context.lock().unwrap();
                     let mut arb = ctx.conn_arbiter.lock().unwrap();
                     for tx in [arb.active_close_tx.take(), arb.passive_close_tx.take()]
