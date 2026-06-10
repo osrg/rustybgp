@@ -1738,96 +1738,90 @@ impl GoBgpService for GrpcService {
     >;
     async fn watch_event(
         &self,
-        request: tonic::Request<api::WatchEventRequest>,
+        _request: tonic::Request<api::WatchEventRequest>,
     ) -> Result<tonic::Response<Self::WatchEventStream>, tonic::Status> {
         let tables2 = self.tables.clone();
-        if let Some(_sockaddr) = request.remote_addr() {
-            let subscription = self.tables.subscribe_live().await;
-            let (tx, rx) = mpsc::channel(1024);
-            tokio::spawn(async move {
-                let mut rx = UnboundedReceiverStream::new(subscription.rx);
-                while let Some(event) = rx.next().await {
-                    let r = match event {
-                        BgpEvent::PeerUp(data) => api::WatchEventResponse {
-                            event: Some(api::watch_event_response::Event::Peer(
-                                api::watch_event_response::PeerEvent {
-                                    r#type: api::watch_event_response::peer_event::Type::State
-                                        .into(),
-                                    peer: Some(api::Peer {
-                                        conf: Some(api::PeerConf {
-                                            peer_asn: data.peer_asn,
-                                            neighbor_address: data.peer_addr.to_string(),
-                                            ..Default::default()
-                                        }),
-                                        state: Some(api::PeerState {
-                                            session_state: 6,
-                                            ..Default::default()
-                                        }),
+        let subscription = self.tables.subscribe_live().await;
+        let (tx, rx) = mpsc::channel(1024);
+        tokio::spawn(async move {
+            let mut rx = UnboundedReceiverStream::new(subscription.rx);
+            while let Some(event) = rx.next().await {
+                let r = match event {
+                    BgpEvent::PeerUp(data) => api::WatchEventResponse {
+                        event: Some(api::watch_event_response::Event::Peer(
+                            api::watch_event_response::PeerEvent {
+                                r#type: api::watch_event_response::peer_event::Type::State.into(),
+                                peer: Some(api::Peer {
+                                    conf: Some(api::PeerConf {
+                                        peer_asn: data.peer_asn,
+                                        neighbor_address: data.peer_addr.to_string(),
                                         ..Default::default()
                                     }),
-                                },
-                            )),
-                        },
-                        BgpEvent::PeerDown(data) => api::WatchEventResponse {
-                            event: Some(api::watch_event_response::Event::Peer(
-                                api::watch_event_response::PeerEvent {
-                                    r#type: api::watch_event_response::peer_event::Type::State
-                                        .into(),
-                                    peer: Some(api::Peer {
-                                        conf: Some(api::PeerConf {
-                                            peer_asn: data.peer_asn,
-                                            neighbor_address: data.peer_addr.to_string(),
-                                            ..Default::default()
-                                        }),
-                                        state: Some(api::PeerState {
-                                            session_state: 1,
-                                            ..Default::default()
-                                        }),
+                                    state: Some(api::PeerState {
+                                        session_state: 6,
                                         ..Default::default()
                                     }),
-                                },
-                            )),
-                        },
-                        BgpEvent::AdjRibIn(change) => {
-                            let mut paths = Vec::new();
-                            for net in &change.nlris {
-                                let path = if let Some(ref attrs) = change.attrs {
-                                    api::Path {
-                                        nlri: Some(convert::nlri_to_api(&net.nlri)),
-                                        family: Some(convert::family_to_api(change.family)),
-                                        identifier: net.path_id,
-                                        pattrs: attrs.iter().map(convert::attr_to_api).collect(),
+                                    ..Default::default()
+                                }),
+                            },
+                        )),
+                    },
+                    BgpEvent::PeerDown(data) => api::WatchEventResponse {
+                        event: Some(api::watch_event_response::Event::Peer(
+                            api::watch_event_response::PeerEvent {
+                                r#type: api::watch_event_response::peer_event::Type::State.into(),
+                                peer: Some(api::Peer {
+                                    conf: Some(api::PeerConf {
+                                        peer_asn: data.peer_asn,
+                                        neighbor_address: data.peer_addr.to_string(),
                                         ..Default::default()
-                                    }
-                                } else {
-                                    api::Path {
-                                        nlri: Some(convert::nlri_to_api(&net.nlri)),
-                                        family: Some(convert::family_to_api(change.family)),
-                                        identifier: net.path_id,
+                                    }),
+                                    state: Some(api::PeerState {
+                                        session_state: 1,
                                         ..Default::default()
-                                    }
-                                };
-                                paths.push(path);
-                            }
-                            api::WatchEventResponse {
-                                event: Some(api::watch_event_response::Event::Table(
-                                    api::watch_event_response::TableEvent { paths },
-                                )),
-                            }
+                                    }),
+                                    ..Default::default()
+                                }),
+                            },
+                        )),
+                    },
+                    BgpEvent::AdjRibIn(change) => {
+                        let mut paths = Vec::new();
+                        for net in &change.nlris {
+                            let path = if let Some(ref attrs) = change.attrs {
+                                api::Path {
+                                    nlri: Some(convert::nlri_to_api(&net.nlri)),
+                                    family: Some(convert::family_to_api(change.family)),
+                                    identifier: net.path_id,
+                                    pattrs: attrs.iter().map(convert::attr_to_api).collect(),
+                                    ..Default::default()
+                                }
+                            } else {
+                                api::Path {
+                                    nlri: Some(convert::nlri_to_api(&net.nlri)),
+                                    family: Some(convert::family_to_api(change.family)),
+                                    identifier: net.path_id,
+                                    ..Default::default()
+                                }
+                            };
+                            paths.push(path);
                         }
-                    };
-                    if tx.send(Ok(r)).await.is_err() {
-                        break;
+                        api::WatchEventResponse {
+                            event: Some(api::watch_event_response::Event::Table(
+                                api::watch_event_response::TableEvent { paths },
+                            )),
+                        }
                     }
+                };
+                if tx.send(Ok(r)).await.is_err() {
+                    break;
                 }
-                tables2.unsubscribe(subscription.id).await;
-            });
-            Ok(tonic::Response::new(Box::pin(
-                tokio_stream::wrappers::ReceiverStream::new(rx),
-            )))
-        } else {
-            Err(tonic::Status::unimplemented("Not yet implemented"))
-        }
+            }
+            tables2.unsubscribe(subscription.id).await;
+        });
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn add_peer_group(
         &self,
