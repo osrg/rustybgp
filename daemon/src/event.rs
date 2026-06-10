@@ -2795,7 +2795,42 @@ impl GoBgpService for GrpcService {
         &self,
         _request: tonic::Request<api::EnableZebraRequest>,
     ) -> Result<tonic::Response<api::EnableZebraResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        if self.tables.kernel_tx.load().is_some() {
+            return Ok(tonic::Response::new(api::EnableZebraResponse {}));
+        }
+        match kernel::Handle::new() {
+            Ok((handle, connection)) => {
+                tokio::spawn(connection);
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        match event {
+                            KernelRouteEvent::Install {
+                                dst,
+                                prefix_len,
+                                nexthop,
+                            } => {
+                                if let Err(e) = handle.install(dst, prefix_len, nexthop, 0).await {
+                                    log::error!("kernel route install failed: {}", e);
+                                }
+                            }
+                            KernelRouteEvent::Withdraw { dst, prefix_len } => {
+                                if let Err(e) = handle.withdraw(dst, prefix_len).await {
+                                    log::error!("kernel route withdraw failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                });
+                self.tables.kernel_tx.store(Some(Arc::new(tx)));
+                log::info!("kernel route integration enabled");
+                Ok(tonic::Response::new(api::EnableZebraResponse {}))
+            }
+            Err(e) => Err(tonic::Status::internal(format!(
+                "failed to enable kernel route integration: {:?}",
+                e
+            ))),
+        }
     }
     async fn enable_mrt(
         &self,
