@@ -1424,8 +1424,15 @@ impl GoBgpService for GrpcService {
 
         let mut global = self.global.write().await;
 
-        if !global.peers.contains_key(&new_params.remote_addr) {
-            return Err(tonic::Status::not_found("peer not found"));
+        let peer = global
+            .peers
+            .get(&new_params.remote_addr)
+            .ok_or_else(|| tonic::Status::not_found("peer not found"))?;
+
+        if new_params.rs_client != peer.config.route_server_client {
+            return Err(tonic::Status::invalid_argument(
+                "route_server_client cannot be changed via update_peer",
+            ));
         }
 
         let global_asn = global.asn;
