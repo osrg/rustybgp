@@ -3394,11 +3394,19 @@ async fn accept_connection(
             crate::fsm::Role::Passive => arb.passive_close_tx = Some(close_tx),
         }
     }
+    let peer_role = if peer.config.route_server_client {
+        PeerRole::RsClient
+    } else if peer.config.local_asn != 0 && peer.config.expected_remote_asn == peer.config.local_asn
+    {
+        PeerRole::Ibgp
+    } else {
+        PeerRole::Ebgp
+    };
     let res = PeerResources {
         local_asn: peer.config.local_asn,
         local_cap: peer.config.local_cap.to_owned(),
         is_restarting,
-        rs_client: peer.config.route_server_client,
+        role: peer_role,
         prefix_limits: peer.config.prefix_limits.clone(),
         state: peer.state.clone(),
         counter_tx: peer.counter_tx.clone(),
@@ -4098,6 +4106,49 @@ impl ExportMap {
     }
 }
 
+/// Per-session peer role, used to control attribute export and route filtering.
+///
+/// Determined once from peer configuration at session creation time and stored
+/// in `PeerExportContext`.  Extended to `IbgpRrClient` when Route Reflector
+/// support is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerRole {
+    Ibgp,
+    // Reserved for Route Reflector support; not yet used.
+    #[allow(dead_code)]
+    IbgpRrClient,
+    Ebgp,
+    RsClient,
+}
+
+/// Session-level peer export information.
+///
+/// Groups `PeerRole`, `local_asn`, and `local_addr` so that attribute
+/// transformation and route filtering decisions have a single source of truth.
+/// Built once in `PeerSession::new()` and stored as a field.
+struct PeerExportContext {
+    role: PeerRole,
+    local_asn: u32,
+    local_addr: IpAddr,
+}
+
+impl PeerExportContext {
+    /// Build a `PeerCodec` for wire encoding based on this session's role.
+    fn build_codec(&self, link_addr: Option<Ipv6Addr>) -> bgp::PeerCodec {
+        let mut builder = bgp::PeerCodecBuilder::new();
+        builder
+            .local_asn(self.local_asn)
+            .local_addr(self.local_addr);
+        if let Some(ll) = link_addr {
+            builder.link_addr(ll);
+        }
+        if self.role == PeerRole::RsClient {
+            builder.keep_aspath(true).keep_nexthop(true);
+        }
+        builder.build()
+    }
+}
+
 /// Shared resources passed to `PeerSession::new()`.
 ///
 /// Bundles the peer-level objects that come from `Peer` and `Global` so that
@@ -4108,7 +4159,7 @@ struct PeerResources {
     local_cap: Vec<packet::Capability>,
     /// See `PeerSession::is_restarting`.
     is_restarting: bool,
-    rs_client: bool,
+    role: PeerRole,
     /// Per-family prefix limits from `PeerConfig`; used to initialise
     /// `PeerSession::prefix_counters` inside `new()`.
     prefix_limits: FnvHashMap<Family, u32>,
@@ -4129,9 +4180,8 @@ struct PeerResources {
 /// `Arc<Mutex<ConnArbiter>>`.
 struct PeerSession {
     remote_addr: IpAddr,
-    local_addr: IpAddr,
 
-    local_asn: u32,
+    export_ctx: PeerExportContext,
 
     state: Arc<PeerState>,
 
@@ -4143,8 +4193,6 @@ struct PeerSession {
     /// time (i.e., Global::selection_deferral was Some when the session was
     /// constructed).  Used to set the R-bit in the GR capability of the OPEN.
     is_restarting: bool,
-
-    rs_client: bool,
 
     conn_arbiter: Arc<std::sync::Mutex<ConnArbiter>>,
     role: crate::fsm::Role,
@@ -4196,15 +4244,12 @@ impl PeerSession {
             txbuf_size = std::cmp::min(txbuf_size, r / 2);
         }
 
-        let mut builder = bgp::PeerCodecBuilder::new();
-        builder.local_asn(res.local_asn).local_addr(local_addr);
-        if let Some(ll) = link_addr {
-            builder.link_addr(ll);
-        }
-        if res.rs_client {
-            builder.keep_aspath(true).keep_nexthop(true);
-        }
-        let framer = BgpFramer::new(builder.build());
+        let export_ctx = PeerExportContext {
+            role: res.role,
+            local_asn: res.local_asn,
+            local_addr,
+        };
+        let framer = BgpFramer::new(export_ctx.build_codec(link_addr));
 
         let prefix_counters = res
             .prefix_limits
@@ -4221,14 +4266,12 @@ impl PeerSession {
 
         Some(PeerSession {
             remote_addr,
-            local_addr,
-            local_asn: res.local_asn,
+            export_ctx,
             state: res.state,
             counter_tx: res.counter_tx,
             counter_rx: res.counter_rx,
             local_cap: res.local_cap,
             is_restarting: res.is_restarting,
-            rs_client: res.rs_client,
             conn_arbiter,
             role,
             close_rx,
@@ -4281,8 +4324,11 @@ impl PeerSession {
 
         PeerSession {
             remote_addr,
-            local_addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            local_asn,
+            export_ctx: PeerExportContext {
+                role: PeerRole::Ebgp,
+                local_asn,
+                local_addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            },
             state: Arc::new(PeerState {
                 fsm: AtomicU8::new(0),
                 peer_up_at: AtomicU64::new(0),
@@ -4297,7 +4343,6 @@ impl PeerSession {
             counter_rx: Default::default(),
             local_cap: vec![],
             is_restarting: false,
-            rs_client: false,
             conn_arbiter,
             role: crate::fsm::Role::Passive,
             close_rx: None,
@@ -4388,11 +4433,11 @@ impl PeerSession {
                 *family,
                 Arc::new(table::Source::new(
                     self.remote_addr,
-                    self.local_addr,
+                    self.export_ctx.local_addr,
                     remote_asn,
-                    self.local_asn,
+                    self.export_ctx.local_asn,
                     router_id,
-                    self.rs_client,
+                    self.export_ctx.role == PeerRole::RsClient,
                 )),
             );
         }
@@ -4439,7 +4484,7 @@ impl PeerSession {
                 peer_asn: remote_asn,
                 peer_id: self.state.remote_id.load(Ordering::Relaxed),
                 uptime,
-                local_addr: self.local_addr,
+                local_addr: self.export_ctx.local_addr,
                 local_port: local_sockaddr.port(),
                 remote_port: remote_sockaddr.port(),
                 sent_open: bgp::Message::Open(bgp::Open {
