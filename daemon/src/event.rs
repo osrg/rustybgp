@@ -243,6 +243,14 @@ struct GrPeerConfig {
     families: Vec<Family>,
 }
 
+/// RFC 4456 Route Reflector configuration for a single peer.
+#[derive(Clone, Default)]
+struct RouteReflectorConfig {
+    route_reflector_client: bool,
+    /// Per-peer cluster ID; None means fall back to the local router-id.
+    route_reflector_cluster_id: Option<Ipv4Addr>,
+}
+
 /// Static per-peer configuration.  Set at peer creation (via `PeerParams::build`)
 /// and immutable for the lifetime of the peer.  Cloned into `PeerSession` at
 /// session start so the session task can access it without the global lock.
@@ -260,6 +268,11 @@ struct PeerConfig {
     connect_retry_time: u64,
     local_cap: Vec<packet::Capability>,
     route_server_client: bool,
+    route_reflector: RouteReflectorConfig,
+    /// Snapshot of the global router-id taken at peer creation.
+    /// Immutable for the lifetime of the peer; used for RR ORIGINATOR_ID loop
+    /// detection without holding the global lock.
+    local_router_id: Ipv4Addr,
     multihop_ttl: Option<u8>,
     password: Option<String>,
     /// Per-family prefix limits from config.
@@ -485,6 +498,7 @@ struct PeerParams {
     local_asn: u32,
     passive: bool,
     rs_client: bool,
+    route_reflector: RouteReflectorConfig,
     delete_on_disconnected: bool,
     admin_down: bool,
     state: SessionState,
@@ -611,6 +625,8 @@ impl PeerParams {
                 connect_retry_time: self.connect_retry_time,
                 local_cap,
                 route_server_client: self.rs_client,
+                route_reflector: self.route_reflector.clone(),
+                local_router_id: Ipv4Addr::from(local_router_id),
                 multihop_ttl: self.multihop_ttl,
                 password: self.password,
                 prefix_limits: self.prefix_limits,
@@ -754,7 +770,15 @@ impl From<&PeerView> for api::Peer {
                     .unwrap_or_default(),
                 ..Default::default()
             }),
-            route_reflector: Some(Default::default()),
+            route_reflector: Some(api::RouteReflector {
+                route_reflector_client: p.config.route_reflector.route_reflector_client,
+                route_reflector_cluster_id: p
+                    .config
+                    .route_reflector
+                    .route_reflector_cluster_id
+                    .map(|a| a.to_string())
+                    .unwrap_or_default(),
+            }),
             route_server: Some(api::RouteServer {
                 route_server_client: p.config.route_server_client,
                 secondary_route: false,
@@ -864,6 +888,16 @@ impl TryFrom<&api::Peer> for PeerParams {
                 .route_server
                 .as_ref()
                 .is_some_and(|x| x.route_server_client),
+            route_reflector: {
+                let rr = p.route_reflector.as_ref();
+                RouteReflectorConfig {
+                    route_reflector_client: rr.is_some_and(|x| x.route_reflector_client),
+                    route_reflector_cluster_id: rr
+                        .map(|x| x.route_reflector_cluster_id.as_str())
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| Ipv4Addr::from_str(s).ok()),
+                }
+            },
             delete_on_disconnected: false,
             admin_down: conf.admin_down,
             state: SessionState::Idle,
@@ -1034,6 +1068,18 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                 .and_then(|r| r.config.as_ref())
                 .and_then(|r| r.route_server_client)
                 .unwrap_or(false),
+            route_reflector: {
+                let rr_cfg = n.route_reflector.as_ref().and_then(|r| r.config.as_ref());
+                RouteReflectorConfig {
+                    route_reflector_client: rr_cfg
+                        .and_then(|r| r.route_reflector_client)
+                        .unwrap_or(false),
+                    route_reflector_cluster_id: rr_cfg
+                        .and_then(|r| r.route_reflector_cluster_id.as_deref())
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| Ipv4Addr::from_str(s).ok()),
+                }
+            },
             delete_on_disconnected: false,
             admin_down: c.admin_down.unwrap_or(false),
             state: SessionState::Idle,
@@ -1184,6 +1230,11 @@ impl GrpcService {
                 }
             } else if a.code() == bgp::Attribute::NEXTHOP {
                 nexthop = a.binary().and_then(|b| bgp::Nexthop::from_bytes(b));
+            } else if a.code() == bgp::Attribute::ORIGINATOR_ID
+                || a.code() == bgp::Attribute::CLUSTER_LIST
+            {
+                // Strip RR attributes from locally injected routes; they are
+                // added by the RR on reflection and must not be set by operators.
             } else {
                 attr.push(a);
             }
@@ -1458,6 +1509,13 @@ impl GoBgpService for GrpcService {
                 "route_server_client cannot be changed via update_peer",
             ));
         }
+        if new_params.route_reflector.route_reflector_client
+            != peer.config.route_reflector.route_reflector_client
+        {
+            return Err(tonic::Status::invalid_argument(
+                "route_reflector_client cannot be changed via update_peer",
+            ));
+        }
 
         let global_asn = global.asn;
         let router_id = u32::from(global.router_id);
@@ -1507,6 +1565,8 @@ impl GoBgpService for GrpcService {
                 connect_retry_time: new_params.connect_retry_time,
                 local_cap: new_local_cap.clone(),
                 route_server_client: new_params.rs_client,
+                route_reflector: new_params.route_reflector.clone(),
+                local_router_id: Ipv4Addr::from(router_id),
                 multihop_ttl: new_params.multihop_ttl,
                 password: new_params.password.clone(),
                 prefix_limits: new_params.prefix_limits,
@@ -3385,6 +3445,7 @@ async fn accept_connection(
                     local_asn: 0,
                     passive: false,
                     rs_client,
+                    route_reflector: RouteReflectorConfig::default(),
                     delete_on_disconnected: true,
                     admin_down: false,
                     state: SessionState::Active,
@@ -3423,9 +3484,22 @@ async fn accept_connection(
         PeerRole::RsClient
     } else if peer.config.local_asn != 0 && peer.config.expected_remote_asn == peer.config.local_asn
     {
-        PeerRole::Ibgp
+        if peer.config.route_reflector.route_reflector_client {
+            PeerRole::IbgpRrClient
+        } else {
+            PeerRole::Ibgp
+        }
     } else {
         PeerRole::Ebgp
+    };
+    let cluster_id = match peer_role {
+        PeerRole::Ibgp | PeerRole::IbgpRrClient => Some(
+            peer.config
+                .route_reflector
+                .route_reflector_cluster_id
+                .unwrap_or(peer.config.local_router_id),
+        ),
+        _ => None,
     };
     let res = PeerResources {
         local_asn: peer.config.local_asn,
@@ -3438,6 +3512,8 @@ async fn accept_connection(
         counter_rx: peer.counter_rx.clone(),
         tables: tables.clone(),
         context,
+        local_router_id: peer.config.local_router_id,
+        cluster_id,
     };
     PeerSession::new(stream, remote_addr, role, Some(close_rx), res)
 }
@@ -4116,8 +4192,6 @@ impl ExportMap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerRole {
     Ibgp,
-    // Reserved for Route Reflector support; not yet used.
-    #[allow(dead_code)]
     IbgpRrClient,
     Ebgp,
     RsClient,
@@ -4223,6 +4297,11 @@ struct PeerResources {
     counter_rx: Arc<MessageCounter>,
     tables: TableHandle,
     context: Arc<std::sync::Mutex<PeerContext>>,
+    /// Local router-id used for RR ORIGINATOR_ID loop detection.
+    local_router_id: Ipv4Addr,
+    /// RFC 4456 cluster-id for RR attribute manipulation and loop detection.
+    /// None for eBGP/RS-client sessions where RR logic does not apply.
+    cluster_id: Option<Ipv4Addr>,
 }
 
 /// I/O driver for one TCP connection (one BGP session).
@@ -4270,6 +4349,11 @@ struct PeerSession {
     /// so that `PeerSession::run` can operate on `PeerContext` without taking
     /// the global write lock.
     context: Arc<std::sync::Mutex<PeerContext>>,
+
+    /// Local router-id for RR ORIGINATOR_ID loop detection (RFC 4456 §8).
+    local_router_id: Ipv4Addr,
+    /// RFC 4456 cluster-id; Some only for iBGP sessions on an RR.
+    cluster_id: Option<Ipv4Addr>,
 
     // --- session I/O state ---
     urgent: Vec<bgp::Message>,
@@ -4340,6 +4424,8 @@ impl PeerSession {
             prefix_counters,
             negotiated_gr: None,
             context: res.context,
+            local_router_id: res.local_router_id,
+            cluster_id: res.cluster_id,
             urgent: Vec::new(),
             framer,
             keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
@@ -4412,6 +4498,8 @@ impl PeerSession {
             prefix_counters: FnvHashMap::default(),
             negotiated_gr: None,
             context,
+            local_router_id: Ipv4Addr::new(1, 0, 0, 1),
+            cluster_id: None,
             urgent: vec![],
             framer,
             keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
@@ -4495,6 +4583,7 @@ impl PeerSession {
                     self.export_ctx.local_asn,
                     router_id,
                     self.export_ctx.role == PeerRole::RsClient,
+                    self.export_ctx.role == PeerRole::IbgpRrClient,
                 )),
             );
         }
@@ -4533,6 +4622,7 @@ impl PeerSession {
                             pending,
                             &self.export_ctx,
                             export_policy.as_deref(),
+                            self.cluster_id,
                         );
                     }
                 }
@@ -4595,6 +4685,7 @@ impl PeerSession {
                 pending,
                 &self.export_ctx,
                 export_policy.as_deref(),
+                self.cluster_id,
             );
         }
         self.pending.get_mut(&family).unwrap().schedule_eor();
@@ -4915,6 +5006,27 @@ impl PeerSession {
         nexthop: Option<bgp::Nexthop>,
         timestamp: std::time::SystemTime,
     ) -> bool {
+        // RFC 4456 §8 loop detection: discard UPDATE if ORIGINATOR_ID equals
+        // local router-id, or if CLUSTER_LIST already contains local cluster-id.
+        if reach.is_some() {
+            let local_rid = u32::from(self.local_router_id);
+            let originator_loop = attr
+                .iter()
+                .find(|a| a.code() == packet::Attribute::ORIGINATOR_ID)
+                .is_some_and(|a| a.value().unwrap_or(0) == local_rid);
+            let cluster_loop = self.cluster_id.is_some_and(|cid| {
+                let cid_bytes = u32::from(cid).to_be_bytes();
+                attr.iter()
+                    .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
+                    .is_some_and(|a| {
+                        a.binary()
+                            .is_some_and(|b| b.chunks(4).any(|c| c == cid_bytes))
+                    })
+            });
+            if originator_loop || cluster_loop {
+                return false;
+            }
+        }
         if let Some(s) = reach {
             let family = s.family;
             let source = self.source[&family].clone();
@@ -4989,6 +5101,7 @@ impl PeerSession {
             pending,
             &self.export_ctx,
             export_policy.as_deref(),
+            self.cluster_id,
         );
     }
 
@@ -5431,6 +5544,81 @@ async fn apply_disconnect(
     arb.active_close_tx.is_none() && arb.passive_close_tx.is_none()
 }
 
+/// Build reflected attribute set for an RR (RFC 4456 §8).
+///
+/// Sets ORIGINATOR_ID to `source_router_id` if absent, and prepends
+/// `cluster_id` to CLUSTER_LIST (creating the attribute if absent).
+fn rr_reflect_attrs(
+    attrs: &Arc<Vec<packet::Attribute>>,
+    source_router_id: u32,
+    cluster_id: Ipv4Addr,
+) -> Arc<Vec<packet::Attribute>> {
+    let has_originator = attrs
+        .iter()
+        .any(|a| a.code() == packet::Attribute::ORIGINATOR_ID);
+
+    let cid_bytes = u32::from(cluster_id).to_be_bytes();
+    let new_cluster_list: Vec<u8> = {
+        let mut v = cid_bytes.to_vec();
+        if let Some(existing) = attrs
+            .iter()
+            .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
+            .and_then(|a| a.binary())
+        {
+            v.extend_from_slice(existing);
+        }
+        v
+    };
+
+    let mut new_attrs: Vec<packet::Attribute> = attrs
+        .iter()
+        .filter(|a| a.code() != packet::Attribute::CLUSTER_LIST)
+        .cloned()
+        .collect();
+
+    if !has_originator
+        && let Some(a) =
+            packet::Attribute::new_with_value(packet::Attribute::ORIGINATOR_ID, source_router_id)
+    {
+        new_attrs.push(a);
+    }
+    if let Some(a) =
+        packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, new_cluster_list)
+    {
+        new_attrs.push(a);
+    }
+    Arc::new(new_attrs)
+}
+
+/// Return `true` if `source` is an iBGP-learned path (not local, not eBGP).
+fn is_ibgp_learned(source: &table::Source) -> bool {
+    !source.is_local() && source.remote_asn == source.local_asn
+}
+
+/// iBGP split-horizon check for a single path.
+///
+/// Returns `true` when the path should be suppressed (not sent to `dest_role`).
+/// In plain iBGP mode (`cluster_id` is None) all iBGP-learned paths are
+/// suppressed.  In RR mode only non-client -> non-client is suppressed.
+fn ibgp_split_horizon_suppress(
+    source: &table::Source,
+    dest_role: PeerRole,
+    cluster_id: Option<Ipv4Addr>,
+) -> bool {
+    if !matches!(dest_role, PeerRole::Ibgp | PeerRole::IbgpRrClient) {
+        return false;
+    }
+    if !is_ibgp_learned(source) {
+        return false;
+    }
+    match cluster_id {
+        // Plain iBGP: suppress all iBGP -> iBGP.
+        None => true,
+        // RR mode: suppress only non-client -> non-client.
+        Some(_) => !source.is_rr_client() && dest_role == PeerRole::Ibgp,
+    }
+}
+
 /// Core routing-update logic shared by handle_prefix_update() and unit tests.
 ///
 /// Computes which BGP messages to send based on `update` and the peer's
@@ -5441,6 +5629,7 @@ async fn apply_disconnect(
 /// - Add-Path (effective_max > 1): diffs `current_paths[..effective_max]` against
 ///   `export_map` to produce per-path_id UPDATEs and WITHDRAWs, including
 ///   send_max boundary crossings in both directions.
+#[allow(clippy::too_many_arguments)]
 fn process_nlri_change(
     update: &table::NlriChange,
     effective_max: usize,
@@ -5449,8 +5638,8 @@ fn process_nlri_change(
     pending: &mut crate::peer_tx::PendingTx,
     export_ctx: &PeerExportContext,
     export_policy: Option<&table::PolicyAssignment>,
+    cluster_id: Option<Ipv4Addr>,
 ) {
-    let dest_is_ibgp = matches!(export_ctx.role, PeerRole::Ibgp | PeerRole::IbgpRrClient);
     if effective_max == 1 {
         // Non-Add-Path fast path: O(1) skip when best unchanged.
         if !update.best_changed {
@@ -5458,15 +5647,12 @@ fn process_nlri_change(
         }
         // Compute the best path visible to this peer: None if no best exists,
         // the best originated from this peer (echo prevention), or the best is
-        // iBGP-learned and the destination peer is also iBGP (split horizon).
+        // suppressed by split-horizon.
         let visible_best = update.new_best().and_then(|best| {
             if best.source.remote_addr == remote_addr {
                 return None;
             }
-            if dest_is_ibgp
-                && !best.source.is_local()
-                && best.source.remote_asn == best.source.local_asn
-            {
+            if ibgp_split_horizon_suppress(&best.source, export_ctx.role, cluster_id) {
                 return None;
             }
             Some(best)
@@ -5487,10 +5673,15 @@ fn process_nlri_change(
                     remote_addr,
                 ) == table::Disposition::Reject
             }) {
-                None
-            } else {
-                Some((attr, nexthop))
+                return None;
             }
+            // RR reflection: add ORIGINATOR_ID and prepend CLUSTER_LIST.
+            if let Some(cid) = cluster_id
+                && is_ibgp_learned(&best.source)
+            {
+                attr = rr_reflect_attrs(&attr, best.source.router_id, cid);
+            }
+            Some((attr, nexthop))
         });
         match policy_result {
             None => {
@@ -5518,15 +5709,7 @@ fn process_nlri_change(
             .current_paths
             .iter()
             .filter(|p| p.source.remote_addr != remote_addr)
-            .filter(|p| {
-                // iBGP split horizon: exclude iBGP-learned paths when sending to
-                // an iBGP peer.
-                if dest_is_ibgp {
-                    p.source.is_local() || p.source.remote_asn != p.source.local_asn
-                } else {
-                    true
-                }
-            })
+            .filter(|p| !ibgp_split_horizon_suppress(&p.source, export_ctx.role, cluster_id))
             .take(effective_max)
             .filter_map(|path| {
                 let mut nexthop = path.nexthop;
@@ -5542,10 +5725,15 @@ fn process_nlri_change(
                         remote_addr,
                     ) == table::Disposition::Reject
                 }) {
-                    None
-                } else {
-                    Some((path.local_path_id, attr, nexthop))
+                    return None;
                 }
+                // RR reflection: add ORIGINATOR_ID and prepend CLUSTER_LIST.
+                if let Some(cid) = cluster_id
+                    && is_ibgp_learned(&path.source)
+                {
+                    attr = rr_reflect_attrs(&attr, path.source.router_id, cid);
+                }
+                Some((path.local_path_id, attr, nexthop))
             })
             .collect();
 
@@ -5596,6 +5784,7 @@ mod tests {
             local_asn: 0,
             passive: false,
             rs_client: false,
+            route_reflector: RouteReflectorConfig::default(),
             delete_on_disconnected: false,
             admin_down: false,
             state: SessionState::Idle,
@@ -5836,6 +6025,7 @@ mod tests {
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
                 false,
+                false,
             )),
         );
         conn
@@ -5859,6 +6049,7 @@ mod tests {
             65002,
             65001,
             Ipv4Addr::new(10, 0, 0, 2),
+            false,
             false,
         ))
     }
@@ -6292,6 +6483,7 @@ mod tests {
             65001,
             Ipv4Addr::new(10, 0, 0, 2),
             false,
+            false,
         ));
         let ipv4_net: packet::Nlri = "10.1.0.0/24".parse().unwrap();
         let ipv6_net: packet::Nlri = "2001:db8::/32".parse().unwrap();
@@ -6360,6 +6552,7 @@ mod tests {
             65003,
             65001,
             Ipv4Addr::new(10, 0, 0, 3),
+            false,
             false,
         ));
         let ipv4_net: packet::Nlri = "10.2.0.0/24".parse().unwrap();
@@ -6733,6 +6926,7 @@ mod tests {
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
                 false,
+                false,
             ))
         }
 
@@ -6829,6 +7023,7 @@ mod tests {
                 &mut pending,
                 &ebgp_ctx(),
                 None,
+                None,
             );
 
             assert!(pending.is_empty());
@@ -6850,6 +7045,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
             );
 
@@ -6878,6 +7074,7 @@ mod tests {
                 &mut pending,
                 &ebgp_ctx(),
                 None,
+                None,
             );
 
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -6902,6 +7099,7 @@ mod tests {
                 &mut pending,
                 &ebgp_ctx(),
                 None,
+                None,
             );
 
             assert!(pending.is_empty());
@@ -6924,6 +7122,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
             );
 
@@ -6948,6 +7147,7 @@ mod tests {
                 &mut pending,
                 &ebgp_ctx(),
                 None,
+                None,
             );
             assert!(em.was_sent(Family::IPV4, &net));
             pending.drain_messages(Family::IPV4, false); // flush
@@ -6960,6 +7160,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
             );
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -6985,6 +7186,7 @@ mod tests {
                 &mut pending,
                 &ebgp_ctx(),
                 None,
+                None,
             );
 
             assert!(pending.is_empty());
@@ -7006,6 +7208,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
             );
 
@@ -7038,6 +7241,7 @@ mod tests {
                 &mut pending,
                 &ebgp_ctx(),
                 None,
+                None,
             );
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
@@ -7067,6 +7271,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
             );
 
@@ -7099,6 +7304,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
             );
 
@@ -7137,6 +7343,7 @@ mod tests {
                 &mut pending,
                 &ebgp_ctx(),
                 None,
+                None,
             );
 
             assert!(!em.contains_path(Family::IPV4, &net, 1)); // withdrawn
@@ -7167,6 +7374,7 @@ mod tests {
                 &mut pending,
                 &ebgp_ctx(),
                 None,
+                None,
             );
 
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -7194,6 +7402,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
             );
 
@@ -7225,6 +7434,7 @@ mod tests {
                 &mut pending,
                 &ebgp_ctx(),
                 None,
+                None,
             );
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
@@ -7247,6 +7457,7 @@ mod tests {
                 65001,
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
+                false,
                 false,
             ))
         }
@@ -7277,6 +7488,7 @@ mod tests {
                 &mut pending,
                 &ibgp_ctx(),
                 None,
+                None,
             );
 
             // Split horizon: iBGP-learned route must not be forwarded to iBGP peer
@@ -7303,6 +7515,7 @@ mod tests {
                 &mut pending,
                 &ibgp_ctx(),
                 None,
+                None,
             );
 
             // Must send a withdrawal for the previously-sent route
@@ -7327,6 +7540,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ibgp_ctx(),
+                None,
                 None,
             );
 
@@ -7354,6 +7568,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ibgp_ctx(),
+                None,
                 None,
             );
 
@@ -7448,6 +7663,347 @@ mod tests {
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
             let exported = ctx.export_nexthop(Some(original));
             assert_eq!(exported, original, "iBGP nexthop must be unchanged");
+        }
+
+        // ---- Route Reflector: split horizon relaxation ----
+
+        fn rr_client_source(addr: &str) -> Arc<table::Source> {
+            let ip: IpAddr = addr.parse().unwrap();
+            Arc::new(table::Source::new(
+                ip,
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                65001,
+                65001,
+                Ipv4Addr::new(10, 0, 0, 1),
+                false,
+                true, // rr_client = true
+            ))
+        }
+
+        fn ibgp_rr_client_ctx() -> PeerExportContext {
+            PeerExportContext {
+                role: PeerRole::IbgpRrClient,
+                local_asn: 65001,
+                local_addr: "127.0.0.1".parse().unwrap(),
+                link_addr: None,
+            }
+        }
+
+        const CLUSTER_ID: Ipv4Addr = Ipv4Addr::new(1, 0, 0, 1);
+
+        // non-client source -> non-client dest: still suppressed in RR mode
+        #[test]
+        fn rr_non_client_to_non_client_suppressed() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path(1, ibgp_source(PEER));
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_ctx(),
+                None,
+                Some(CLUSTER_ID),
+            );
+
+            assert!(pending.is_empty());
+            assert!(!em.was_sent(Family::IPV4, &net));
+        }
+
+        // rr-client source -> non-client dest: forwarded in RR mode
+        #[test]
+        fn rr_client_source_forwarded_to_non_client() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path(1, rr_client_source(PEER));
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_ctx(),
+                None,
+                Some(CLUSTER_ID),
+            );
+
+            assert!(em.was_sent(Family::IPV4, &net));
+            assert_eq!(
+                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                1
+            );
+        }
+
+        // non-client source -> rr-client dest: forwarded in RR mode
+        #[test]
+        fn rr_non_client_forwarded_to_rr_client() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path(1, ibgp_source(PEER));
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_rr_client_ctx(),
+                None,
+                Some(CLUSTER_ID),
+            );
+
+            assert!(em.was_sent(Family::IPV4, &net));
+            assert_eq!(
+                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                1
+            );
+        }
+
+        // ---- Route Reflector: rr_reflect_attrs via process_nlri_change ----
+
+        fn path_with_attrs(
+            pid: u32,
+            src: Arc<table::Source>,
+            attrs: Arc<Vec<packet::Attribute>>,
+        ) -> table::Path {
+            table::Path {
+                local_path_id: pid,
+                source: src,
+                nexthop: Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
+                attr: attrs,
+            }
+        }
+
+        fn drain_first_reach_attrs(
+            pending: &mut crate::peer_tx::PendingTx,
+        ) -> Arc<Vec<packet::Attribute>> {
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            for msg in msgs {
+                if let bgp::Message::Update(u) = msg {
+                    if u.reach.as_ref().is_some_and(|r| !r.entries.is_empty()) {
+                        return u.attr;
+                    }
+                }
+            }
+            panic!("no reach message found");
+        }
+
+        // ORIGINATOR_ID is set to source router_id when absent
+        #[test]
+        fn rr_reflect_sets_originator_id() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            // ibgp_source router_id = 10.0.0.1
+            let p = path(1, ibgp_source(PEER));
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_rr_client_ctx(),
+                None,
+                Some(CLUSTER_ID),
+            );
+
+            let attrs = drain_first_reach_attrs(&mut pending);
+            let orig = attrs
+                .iter()
+                .find(|a| a.code() == packet::Attribute::ORIGINATOR_ID)
+                .expect("ORIGINATOR_ID must be present after reflection");
+            assert_eq!(
+                orig.value().unwrap(),
+                u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+                "ORIGINATOR_ID must equal source router_id"
+            );
+        }
+
+        // Existing ORIGINATOR_ID is preserved (not overwritten)
+        #[test]
+        fn rr_reflect_preserves_existing_originator_id() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let orig_id = u32::from(Ipv4Addr::new(9, 9, 9, 9));
+            let attrs = Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                packet::Attribute::new_with_value(packet::Attribute::ORIGINATOR_ID, orig_id)
+                    .unwrap(),
+            ]);
+            let src = ibgp_source(PEER);
+            let p = path_with_attrs(1, src, attrs);
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_rr_client_ctx(),
+                None,
+                Some(CLUSTER_ID),
+            );
+
+            let attrs = drain_first_reach_attrs(&mut pending);
+            let origs: Vec<_> = attrs
+                .iter()
+                .filter(|a| a.code() == packet::Attribute::ORIGINATOR_ID)
+                .collect();
+            assert_eq!(origs.len(), 1, "must have exactly one ORIGINATOR_ID");
+            assert_eq!(
+                origs[0].value().unwrap(),
+                orig_id,
+                "existing ORIGINATOR_ID must not be overwritten"
+            );
+        }
+
+        // Local cluster_id is prepended to CLUSTER_LIST
+        #[test]
+        fn rr_reflect_prepends_cluster_id_to_cluster_list() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let existing_cid = Ipv4Addr::new(2, 0, 0, 2);
+            let cluster_bytes: Vec<u8> = u32::from(existing_cid).to_be_bytes().to_vec();
+            let attrs = Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cluster_bytes)
+                    .unwrap(),
+            ]);
+            let p = path_with_attrs(1, ibgp_source(PEER), attrs);
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_rr_client_ctx(),
+                None,
+                Some(CLUSTER_ID),
+            );
+
+            let attrs = drain_first_reach_attrs(&mut pending);
+            let cl = attrs
+                .iter()
+                .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
+                .expect("CLUSTER_LIST must be present");
+            let bytes = cl.binary().expect("CLUSTER_LIST must have binary value");
+            assert_eq!(bytes.len(), 8, "must contain two 4-byte cluster IDs");
+            let first = Ipv4Addr::from(u32::from_be_bytes(bytes[0..4].try_into().unwrap()));
+            let second = Ipv4Addr::from(u32::from_be_bytes(bytes[4..8].try_into().unwrap()));
+            assert_eq!(first, CLUSTER_ID, "local cluster_id must be prepended");
+            assert_eq!(second, existing_cid, "original cluster_id must follow");
+        }
+
+        // CLUSTER_LIST is created from scratch (not present in original attrs)
+        #[test]
+        fn rr_reflect_creates_cluster_list_when_absent() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            // path() uses plain attrs (ORIGIN only, no CLUSTER_LIST)
+            let p = path(1, ibgp_source(PEER));
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_rr_client_ctx(),
+                None,
+                Some(CLUSTER_ID),
+            );
+
+            let attrs = drain_first_reach_attrs(&mut pending);
+            let cl = attrs
+                .iter()
+                .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
+                .expect("CLUSTER_LIST must be created when absent");
+            let bytes = cl.binary().expect("CLUSTER_LIST must have binary value");
+            assert_eq!(bytes.len(), 4, "must contain exactly one cluster ID");
+            let cid = Ipv4Addr::from(u32::from_be_bytes(bytes[0..4].try_into().unwrap()));
+            assert_eq!(cid, CLUSTER_ID, "sole entry must be local cluster_id");
+        }
+
+        // eBGP-learned route forwarded to RR client: no RR attributes added
+        #[test]
+        fn rr_no_reflection_for_ebgp_route() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            // source() has remote_asn=65002, local_asn=65001 → eBGP learned
+            let p = path(1, source(PEER));
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_rr_client_ctx(),
+                None,
+                Some(CLUSTER_ID),
+            );
+
+            let attrs = drain_first_reach_attrs(&mut pending);
+            assert!(
+                attrs
+                    .iter()
+                    .all(|a| a.code() != packet::Attribute::ORIGINATOR_ID),
+                "eBGP-learned route must not get ORIGINATOR_ID"
+            );
+            assert!(
+                attrs
+                    .iter()
+                    .all(|a| a.code() != packet::Attribute::CLUSTER_LIST),
+                "eBGP-learned route must not get CLUSTER_LIST"
+            );
+        }
+
+        // RR client source -> RR client dest: forwarded (client-to-client)
+        #[test]
+        fn rr_client_to_client_forwarded() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path(1, rr_client_source(PEER));
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_rr_client_ctx(),
+                None,
+                Some(CLUSTER_ID),
+            );
+
+            assert!(em.was_sent(Family::IPV4, &net));
+            assert_eq!(
+                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                1
+            );
         }
     } // mod process_nlri_change
 
@@ -8228,5 +8784,109 @@ neighbor-address = "10.0.0.1"
         )
         .expect("invalid TOML");
         assert!(PeerParams::try_from(&neighbor).is_err());
+    }
+
+    // ---- rx_update: RFC 4456 loop detection ----
+    //
+    // new_for_test sets local_router_id = 1.0.0.1.  Loop detection fires before
+    // source lookup, so no source setup is required; the absence of an inserted
+    // route is verified via table_state().
+
+    fn reach_set(prefix: &str) -> Option<packet::NlriSet> {
+        Some(packet::NlriSet {
+            family: Family::IPV4,
+            entries: vec![packet::PathNlri::new(prefix.parse().unwrap())],
+        })
+    }
+
+    #[tokio::test]
+    async fn rx_update_originator_id_loop_drops_route() {
+        let tables = make_tables();
+        let context = make_context();
+        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
+        let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
+        // local_router_id is 1.0.0.1 in new_for_test
+        let attrs = Arc::new(vec![
+            packet::Attribute::new_with_value(
+                packet::Attribute::ORIGINATOR_ID,
+                u32::from(Ipv4Addr::new(1, 0, 0, 1)),
+            )
+            .unwrap(),
+        ]);
+
+        let exceeded = session
+            .rx_update(
+                reach_set("10.0.0.0/24"),
+                None,
+                attrs,
+                None,
+                std::time::SystemTime::now(),
+            )
+            .await;
+
+        assert!(!exceeded, "loop detection must not trigger CEASE");
+        let state = tables.table_state(Family::IPV4).await;
+        assert_eq!(state.num_destination, 0, "route must not be inserted");
+    }
+
+    #[tokio::test]
+    async fn rx_update_cluster_list_loop_drops_route() {
+        let tables = make_tables();
+        let context = make_context();
+        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
+        let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
+        let local_cid = Ipv4Addr::new(1, 2, 3, 4);
+        session.cluster_id = Some(local_cid);
+        let cid_bytes = u32::from(local_cid).to_be_bytes().to_vec();
+        let attrs = Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cid_bytes).unwrap(),
+        ]);
+
+        let exceeded = session
+            .rx_update(
+                reach_set("10.0.0.0/24"),
+                None,
+                attrs,
+                None,
+                std::time::SystemTime::now(),
+            )
+            .await;
+
+        assert!(!exceeded, "loop detection must not trigger CEASE");
+        let state = tables.table_state(Family::IPV4).await;
+        assert_eq!(state.num_destination, 0, "route must not be inserted");
+    }
+
+    // local cluster_id appears in the middle of a multi-entry CLUSTER_LIST
+    #[tokio::test]
+    async fn rx_update_cluster_list_loop_detects_middle_entry() {
+        let tables = make_tables();
+        let context = make_context();
+        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
+        let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
+        let local_cid = Ipv4Addr::new(1, 2, 3, 4);
+        session.cluster_id = Some(local_cid);
+        // CLUSTER_LIST: [2.0.0.2, 1.2.3.4 (local), 3.0.0.3]
+        let mut cid_bytes = Vec::new();
+        cid_bytes.extend_from_slice(&u32::from(Ipv4Addr::new(2, 0, 0, 2)).to_be_bytes());
+        cid_bytes.extend_from_slice(&u32::from(local_cid).to_be_bytes());
+        cid_bytes.extend_from_slice(&u32::from(Ipv4Addr::new(3, 0, 0, 3)).to_be_bytes());
+        let attrs = Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cid_bytes).unwrap(),
+        ]);
+
+        let exceeded = session
+            .rx_update(
+                reach_set("10.0.0.0/24"),
+                None,
+                attrs,
+                None,
+                std::time::SystemTime::now(),
+            )
+            .await;
+
+        assert!(!exceeded, "loop detection must not trigger CEASE");
+        let state = tables.table_state(Family::IPV4).await;
+        assert_eq!(state.num_destination, 0, "route must not be inserted");
     }
 }

@@ -1818,6 +1818,7 @@ mod tests {
             65000,
             Ipv4Addr::new(0, 0, 0, 1),
             false,
+            false,
         ))
     }
 
@@ -2983,6 +2984,7 @@ mod tests {
             65000,
             65000,
             Ipv4Addr::new(0, 0, 0, 1),
+            false,
             false,
         ));
         let net = nlri();

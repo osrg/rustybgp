@@ -473,6 +473,7 @@ pub struct Source {
     pub local_asn: u32,
     pub router_id: u32,
     rs_client: bool,
+    rr_client: bool,
     stale: AtomicBool,
 }
 
@@ -493,6 +494,7 @@ static LOCAL_SOURCE: LazyLock<Arc<Source>> = LazyLock::new(|| {
         local_asn: 0,
         router_id: 0,
         rs_client: false,
+        rr_client: false,
         stale: AtomicBool::new(false),
     })
 });
@@ -513,6 +515,7 @@ impl Source {
         local_asn: u32,
         router_id: Ipv4Addr,
         rs_client: bool,
+        rr_client: bool,
     ) -> Self {
         Source {
             remote_addr,
@@ -521,8 +524,13 @@ impl Source {
             local_asn,
             router_id: router_id.into(),
             rs_client,
+            rr_client,
             stale: AtomicBool::new(false),
         }
+    }
+
+    pub fn is_rr_client(&self) -> bool {
+        self.rr_client
     }
 
     pub fn mark_stale(&self) {
@@ -1531,6 +1539,7 @@ mod tests {
             local_asn,
             Ipv4Addr::new(0, 0, 0, router_id),
             false,
+            false,
         ))
     }
 
@@ -1597,6 +1606,7 @@ mod tests {
             2,
             Ipv4Addr::new(1, 1, 1, 1),
             false,
+            false,
         ));
         let s2 = Arc::new(Source::new(
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
@@ -1604,6 +1614,7 @@ mod tests {
             1,
             2,
             Ipv4Addr::new(1, 1, 1, 2),
+            false,
             false,
         ));
 

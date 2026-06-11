@@ -446,6 +446,7 @@ mod tests {
             65001,
             "192.0.2.1".parse().unwrap(),
             false,
+            false,
         ))
     }
 
