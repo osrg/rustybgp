@@ -4595,7 +4595,7 @@ impl PeerSession {
                     net,
                     pid,
                     export_ctx.export_nexthop(nexthop),
-                    path.attr.clone(),
+                    export_ctx.export_attrs(&attr),
                 );
                 export_map.mark_sent(family, net, pid);
             }
