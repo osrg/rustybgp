@@ -4123,29 +4123,82 @@ enum PeerRole {
 
 /// Session-level peer export information.
 ///
-/// Groups `PeerRole`, `local_asn`, and `local_addr` so that attribute
-/// transformation and route filtering decisions have a single source of truth.
-/// Built once in `PeerSession::new()` and stored as a field.
+/// Groups `PeerRole`, `local_asn`, `local_addr`, and `link_addr` so that
+/// attribute transformation and route filtering decisions have a single source
+/// of truth.  Built once in `PeerSession::new()` and stored as a field.
 struct PeerExportContext {
     role: PeerRole,
     local_asn: u32,
     local_addr: IpAddr,
+    link_addr: Option<Ipv6Addr>,
 }
 
 impl PeerExportContext {
-    /// Build a `PeerCodec` for wire encoding based on this session's role.
-    fn build_codec(&self, link_addr: Option<Ipv6Addr>) -> bgp::PeerCodec {
+    /// Build a `PeerCodec` for wire encoding.
+    ///
+    /// All attribute transformation is now handled by `export_attrs` /
+    /// `export_nexthop` before routes enter `PendingTx`, so the codec always
+    /// operates in pass-through mode (`keep_aspath=true`, `keep_nexthop=true`).
+    fn build_codec(&self) -> bgp::PeerCodec {
         let mut builder = bgp::PeerCodecBuilder::new();
         builder
             .local_asn(self.local_asn)
-            .local_addr(self.local_addr);
-        if let Some(ll) = link_addr {
+            .local_addr(self.local_addr)
+            .keep_aspath(true)
+            .keep_nexthop(true);
+        if let Some(ll) = self.link_addr {
             builder.link_addr(ll);
         }
-        if self.role == PeerRole::RsClient {
-            builder.keep_aspath(true).keep_nexthop(true);
-        }
         builder.build()
+    }
+
+    /// Apply per-peer attribute transformation to outgoing route attributes.
+    ///
+    /// For eBGP (and iBGP in the current stub): prepend `local_asn` to
+    /// AS_PATH; add a synthetic AS_PATH segment when the route carries none
+    /// (locally-originated routes).  For RS clients: pass through unchanged.
+    fn export_attrs(&self, attrs: &Arc<Vec<bgp::Attribute>>) -> Arc<Vec<bgp::Attribute>> {
+        match self.role {
+            PeerRole::RsClient => attrs.clone(),
+            PeerRole::Ebgp | PeerRole::Ibgp | PeerRole::IbgpRrClient => {
+                let has_as_path = attrs.iter().any(|a| a.code() == bgp::Attribute::AS_PATH);
+                let mut new_attrs: Vec<bgp::Attribute> = attrs
+                    .iter()
+                    .map(|a| {
+                        if a.code() == bgp::Attribute::AS_PATH {
+                            a.as_path_prepend(self.local_asn)
+                        } else {
+                            a.clone()
+                        }
+                    })
+                    .collect();
+                if !has_as_path {
+                    new_attrs.push(bgp::Attribute::empty_as_path().as_path_prepend(self.local_asn));
+                }
+                Arc::new(new_attrs)
+            }
+        }
+    }
+
+    /// Apply per-peer nexthop transformation to an outgoing route nexthop.
+    ///
+    /// For eBGP (and iBGP in the current stub): replace with the local
+    /// address, including the link-local address for IPv6 when available.
+    /// For RS clients: pass through unchanged.
+    fn export_nexthop(&self, nexthop: bgp::Nexthop) -> bgp::Nexthop {
+        match self.role {
+            PeerRole::RsClient => nexthop,
+            PeerRole::Ebgp | PeerRole::Ibgp | PeerRole::IbgpRrClient => match self.local_addr {
+                IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
+                IpAddr::V6(v6) => {
+                    if let Some(ll) = self.link_addr {
+                        bgp::Nexthop::V6LinkLocal(v6, ll)
+                    } else {
+                        bgp::Nexthop::V6(v6)
+                    }
+                }
+            },
+        }
     }
 }
 
@@ -4248,8 +4301,9 @@ impl PeerSession {
             role: res.role,
             local_asn: res.local_asn,
             local_addr,
+            link_addr,
         };
-        let framer = BgpFramer::new(export_ctx.build_codec(link_addr));
+        let framer = BgpFramer::new(export_ctx.build_codec());
 
         let prefix_counters = res
             .prefix_limits
@@ -4328,6 +4382,7 @@ impl PeerSession {
                 role: PeerRole::Ebgp,
                 local_asn,
                 local_addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                link_addr: None,
             },
             state: Arc::new(PeerState {
                 fsm: AtomicU8::new(0),
@@ -4954,6 +5009,7 @@ impl PeerSession {
             self.remote_addr,
             &mut self.export_map,
             pending,
+            &self.export_ctx,
         );
     }
 
@@ -5412,6 +5468,7 @@ fn process_nlri_change(
     remote_addr: IpAddr,
     export_map: &mut ExportMap,
     pending: &mut crate::peer_tx::PendingTx,
+    export_ctx: &PeerExportContext,
 ) {
     if effective_max == 1 {
         // Non-Add-Path fast path: O(1) skip when best unchanged.
@@ -5430,7 +5487,9 @@ fn process_nlri_change(
                     return;
                 }
                 export_map.mark_sent(update.family, update.net, 0);
-                pending.reach(update.net, 0, best.nexthop, best.attr.clone());
+                let attr = export_ctx.export_attrs(&best.attr);
+                let nexthop = export_ctx.export_nexthop(best.nexthop);
+                pending.reach(update.net, 0, nexthop, attr);
             }
         }
     } else {
@@ -5461,12 +5520,9 @@ fn process_nlri_change(
             let was_replaced = update.replaced_path_id == Some(path.local_path_id);
             if !already_sent || was_replaced {
                 export_map.mark_sent(update.family, update.net, path.local_path_id);
-                pending.reach(
-                    update.net,
-                    path.local_path_id,
-                    path.nexthop,
-                    path.attr.clone(),
-                );
+                let attr = export_ctx.export_attrs(&path.attr);
+                let nexthop = export_ctx.export_nexthop(path.nexthop);
+                pending.reach(update.net, path.local_path_id, nexthop, attr);
             }
         }
     }
@@ -6647,6 +6703,15 @@ mod tests {
             }
         }
 
+        fn ebgp_ctx() -> PeerExportContext {
+            PeerExportContext {
+                role: PeerRole::Ebgp,
+                local_asn: 65001,
+                local_addr: "127.0.0.1".parse().unwrap(),
+                link_addr: None,
+            }
+        }
+
         fn change(
             nlri: packet::Nlri,
             best_changed: bool,
@@ -6712,7 +6777,14 @@ mod tests {
             let net = nlri("10.0.0.0/24");
             let update = change(net, false, false, None, vec![]);
 
-            process_nlri_change(&update, 1, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(pending.is_empty());
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -6726,7 +6798,14 @@ mod tests {
             let path = path(1, source(PEER));
             let update = change(net, true, true, None, vec![path]);
 
-            process_nlri_change(&update, 1, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(em.was_sent(Family::IPV4, &net));
             assert!(em.contains_path(Family::IPV4, &net, 0)); // non-addpath uses path_id=0
@@ -6745,7 +6824,14 @@ mod tests {
             let net = nlri("10.0.0.0/24");
             let update = change(net, true, true, None, vec![]);
 
-            process_nlri_change(&update, 1, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(!em.was_sent(Family::IPV4, &net));
             let msgs = pending.drain_messages(Family::IPV4, false);
@@ -6761,7 +6847,14 @@ mod tests {
             let net = nlri("10.0.0.0/24");
             let update = change(net, true, true, None, vec![]);
 
-            process_nlri_change(&update, 1, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(pending.is_empty());
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -6776,7 +6869,14 @@ mod tests {
             let path = path(1, source(SELF));
             let update = change(net, true, true, None, vec![path]);
 
-            process_nlri_change(&update, 1, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(pending.is_empty());
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -6797,6 +6897,7 @@ mod tests {
                 remote,
                 &mut em,
                 &mut pending,
+                &ebgp_ctx(),
             );
             assert!(em.was_sent(Family::IPV4, &net));
             pending.drain_messages(Family::IPV4, false); // flush
@@ -6808,6 +6909,7 @@ mod tests {
                 remote,
                 &mut em,
                 &mut pending,
+                &ebgp_ctx(),
             );
             assert!(!em.was_sent(Family::IPV4, &net));
             let msgs = pending.drain_messages(Family::IPV4, false);
@@ -6824,7 +6926,14 @@ mod tests {
             let path = path(1, source(PEER));
             let update = change(net, false, false, None, vec![path]);
 
-            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(pending.is_empty());
         }
@@ -6838,7 +6947,14 @@ mod tests {
             let paths = vec![path(1, src.clone()), path(2, src.clone())];
             let update = change(net, true, true, None, paths);
 
-            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
             assert!(em.contains_path(Family::IPV4, &net, 2));
@@ -6861,7 +6977,14 @@ mod tests {
             // path_id=2 is removed; only path_id=1 remains
             let update = change(net, true, true, None, vec![path(1, src)]);
 
-            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
             assert!(!em.contains_path(Family::IPV4, &net, 2));
@@ -6883,7 +7006,14 @@ mod tests {
             let paths = vec![path(1, src.clone()), path(2, src)];
             let update = change(net, false, true, Some(1), paths);
 
-            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             let msgs = pending.drain_messages(Family::IPV4, false);
             let reach = reach_entries(&msgs);
@@ -6907,7 +7037,14 @@ mod tests {
             let paths = vec![path(3, src.clone()), path(1, src.clone()), path(2, src)];
             let update = change(net, true, true, None, paths);
 
-            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(em.contains_path(Family::IPV4, &net, 3));
             assert!(em.contains_path(Family::IPV4, &net, 1));
@@ -6936,7 +7073,14 @@ mod tests {
             let paths = vec![path(2, src.clone()), path(3, src)];
             let update = change(net, true, true, None, paths);
 
-            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(!em.contains_path(Family::IPV4, &net, 1)); // withdrawn
             assert!(em.contains_path(Family::IPV4, &net, 2)); // kept
@@ -6958,7 +7102,14 @@ mod tests {
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let update = change(net, true, true, None, vec![]);
 
-            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(!em.was_sent(Family::IPV4, &net));
             let msgs = pending.drain_messages(Family::IPV4, false);
@@ -6978,7 +7129,14 @@ mod tests {
             let paths = vec![path(1, self_src.clone()), path(2, self_src)];
             let update = change(net, true, true, None, paths);
 
-            process_nlri_change(&update, 2, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(pending.is_empty());
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -7000,7 +7158,14 @@ mod tests {
             let update = change(net, true, true, None, paths);
 
             // send_max=3 but only 2 peer paths after echo filter
-            process_nlri_change(&update, 3, SELF.parse().unwrap(), &mut em, &mut pending);
+            process_nlri_change(
+                &update,
+                3,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+            );
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
             assert!(!em.contains_path(Family::IPV4, &net, 2)); // self path not sent
