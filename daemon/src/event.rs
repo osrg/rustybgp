@@ -2842,22 +2842,9 @@ impl GoBgpService for GrpcService {
                 tokio::spawn(connection);
                 let (tx, mut rx) = mpsc::unbounded_channel();
                 tokio::spawn(async move {
-                    while let Some(event) = rx.recv().await {
-                        match event {
-                            KernelRouteEvent::Install {
-                                dst,
-                                prefix_len,
-                                nexthop,
-                            } => {
-                                if let Err(e) = handle.install(dst, prefix_len, nexthop, 0).await {
-                                    log::error!("kernel route install failed: {}", e);
-                                }
-                            }
-                            KernelRouteEvent::Withdraw { dst, prefix_len } => {
-                                if let Err(e) = handle.withdraw(dst, prefix_len).await {
-                                    log::error!("kernel route withdraw failed: {}", e);
-                                }
-                            }
+                    while let Some(change) = rx.recv().await {
+                        if let Err(e) = handle.apply(&change).await {
+                            log::error!("kernel route update failed: {}", e);
                         }
                     }
                 });
@@ -3541,24 +3528,9 @@ impl Global {
                     tokio::spawn(connection);
                     let (tx, mut rx) = mpsc::unbounded_channel();
                     tokio::spawn(async move {
-                        while let Some(event) = rx.recv().await {
-                            match event {
-                                KernelRouteEvent::Install {
-                                    dst,
-                                    prefix_len,
-                                    nexthop,
-                                } => {
-                                    if let Err(e) =
-                                        handle.install(dst, prefix_len, nexthop, 0).await
-                                    {
-                                        log::error!("kernel route install failed: {}", e);
-                                    }
-                                }
-                                KernelRouteEvent::Withdraw { dst, prefix_len } => {
-                                    if let Err(e) = handle.withdraw(dst, prefix_len).await {
-                                        log::error!("kernel route withdraw failed: {}", e);
-                                    }
-                                }
+                        while let Some(change) = rx.recv().await {
+                            if let Err(e) = handle.apply(&change).await {
+                                log::error!("kernel route update failed: {}", e);
                             }
                         }
                     });
@@ -3852,18 +3824,6 @@ impl Global {
             global.write().await.listen_sockets.clear();
         }
     }
-}
-
-pub(crate) enum KernelRouteEvent {
-    Install {
-        dst: IpAddr,
-        prefix_len: u8,
-        nexthop: IpAddr,
-    },
-    Withdraw {
-        dst: IpAddr,
-        prefix_len: u8,
-    },
 }
 
 use crate::table_manager::{PeerDownData, PeerUpData, SubscriptionId, TableManager};

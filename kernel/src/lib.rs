@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use rustybgp_packet as packet;
+
 use futures::StreamExt;
 use futures::stream::TryStreamExt;
 use rtnetlink::packet_core::NetlinkPayload;
@@ -92,6 +94,28 @@ impl Handle {
             (IpAddr::V4(dst), IpAddr::V4(gw)) => self.install_v4(dst, prefix_len, gw, metric).await,
             (IpAddr::V6(dst), IpAddr::V6(gw)) => self.install_v6(dst, prefix_len, gw, metric).await,
             _ => Err(Error::FamilyMismatch),
+        }
+    }
+
+    /// Apply a `KernelRouteChange` to the kernel FIB.
+    ///
+    /// Empty `nexthops` withdraws the route; non-empty installs it.
+    /// MUP NLRIs are silently ignored (not representable as kernel routes).
+    /// Family mismatches between dst and nexthop are also silently skipped.
+    pub async fn apply(&self, change: &packet::KernelRouteChange) -> Result<(), Error> {
+        let (dst, prefix_len) = match change.net {
+            packet::Nlri::V4(net) => (IpAddr::V4(net.addr), net.mask),
+            packet::Nlri::V6(net) => (IpAddr::V6(net.addr), net.mask),
+            packet::Nlri::Mup(_) => return Ok(()),
+        };
+        if change.nexthops.is_empty() {
+            return self.withdraw(dst, prefix_len).await;
+        }
+        // Use the first nexthop; multipath support to be added later.
+        let nexthop = change.nexthops[0].addr();
+        match self.install(dst, prefix_len, nexthop, 0).await {
+            Err(Error::FamilyMismatch) => Ok(()),
+            other => other,
         }
     }
 

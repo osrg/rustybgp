@@ -8,6 +8,7 @@ edition = "2024"
 rtnetlink = "0.21"
 futures = "0.3"
 thiserror = "2"
+rustybgp-packet = { path = "../packet" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

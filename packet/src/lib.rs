@@ -20,6 +20,14 @@ pub use self::bgp::{
 pub use self::error::{BgpError, Error};
 pub use self::frame::BgpFramer;
 
+/// A route change to be applied to the kernel FIB.
+///
+/// `nexthops` empty means withdraw; non-empty means install (multipath when >1).
+pub struct KernelRouteChange {
+    pub net: Nlri,
+    pub nexthops: Vec<bgp::Nexthop>,
+}
+
 pub mod bmp;
 pub mod error;
 pub mod frame;

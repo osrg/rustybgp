@@ -22,7 +22,7 @@ use tokio::sync::{Mutex, mpsc};
 use rustybgp_packet::{self as packet, Family, bgp};
 use rustybgp_table as table;
 
-use crate::event::{KernelRouteEvent, ToPeerEvent};
+use crate::event::ToPeerEvent;
 
 /// Opaque subscription handle returned by [`TableManager::subscribe`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -78,7 +78,7 @@ pub(crate) type TableHandle = Arc<TableManager>;
 pub(crate) struct TableManager {
     pub(crate) shards: Vec<Mutex<TableShard>>,
     rpki: std::sync::RwLock<table::RpkiTable>,
-    pub(crate) kernel_tx: ArcSwapOption<mpsc::UnboundedSender<KernelRouteEvent>>,
+    pub(crate) kernel_tx: ArcSwapOption<mpsc::UnboundedSender<packet::KernelRouteChange>>,
     pub(crate) import_policy: ArcSwapOption<table::PolicyAssignment>,
     pub(crate) export_policy: ArcSwapOption<table::PolicyAssignment>,
     next_sub_id: std::sync::atomic::AtomicU64,
@@ -524,7 +524,7 @@ impl TableShard {
         &mut self,
         addr: IpAddr,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
     ) {
         for change in self.rtable.drop(addr, family) {
             self.distribute_update(change, kernel_tx);
@@ -535,7 +535,7 @@ impl TableShard {
         &mut self,
         addr: IpAddr,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
     ) {
         for change in self.rtable.restale(addr, family) {
             self.distribute_update(change, kernel_tx);
@@ -565,47 +565,24 @@ impl TableShard {
         }
     }
 
-    pub(crate) fn distribute_update(
+    fn distribute_update(
         &self,
         update: table::NlriChange,
-        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
     ) {
         // Kernel route update for rank-1 best (raw, without export policy).
-        if update.best_changed
-            && let Some(tx) = kernel_tx
+        // kernel_tx is rarely set, so check it first.
+        if let Some(tx) = kernel_tx
+            && update.best_changed
         {
-            let (dst, prefix_len) = match update.net {
-                packet::Nlri::V4(net) => (IpAddr::from(net.addr), net.mask),
-                packet::Nlri::V6(net) => (IpAddr::from(net.addr), net.mask),
-                packet::Nlri::Mup(_) => {
-                    // Send to peers but skip kernel for MUP NLRIs.
-                    for tx in self.peer_event_tx.values() {
-                        let _ = tx.send(ToPeerEvent::NlriChange(update.clone()));
-                    }
-                    return;
-                }
+            let nexthops = match update.new_best() {
+                None => vec![],
+                Some(best) => best.nexthop.into_iter().collect(),
             };
-            match update.new_best() {
-                None => {
-                    let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
-                }
-                Some(best) => {
-                    if let Some(nexthop) = best.nexthop.map(|n| n.addr()) {
-                        if matches!(
-                            (dst, nexthop),
-                            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
-                        ) {
-                            let _ = tx.send(KernelRouteEvent::Install {
-                                dst,
-                                prefix_len,
-                                nexthop,
-                            });
-                        } else {
-                            let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
-                        }
-                    }
-                }
-            }
+            let _ = tx.send(packet::KernelRouteChange {
+                net: update.net,
+                nexthops,
+            });
         }
 
         // Fan out raw NlriChange to all peer channels.
@@ -628,7 +605,7 @@ impl TableShard {
         &mut self,
         peer: std::net::IpAddr,
         import_policy: Option<&table::PolicyAssignment>,
-        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
     ) {
         let paths = self.rtable.collect_adj_in_paths(peer);
         for (family, net, remote_path_id, mut nh, source, original_attr, timestamp) in paths {
@@ -655,7 +632,7 @@ impl TableShard {
         &mut self,
         addr: IpAddr,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
     ) {
         for change in self.rtable.drop_stale(addr, family, None) {
             self.distribute_update(change, kernel_tx);
@@ -665,7 +642,7 @@ impl TableShard {
     pub(crate) fn end_deferral(
         &mut self,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
     ) {
         for change in self.rtable.end_deferral(family) {
             self.distribute_update(change, kernel_tx);
