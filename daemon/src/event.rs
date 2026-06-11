@@ -4183,19 +4183,21 @@ impl PeerExportContext {
     /// eBGP: replace with local_addr (with link-local for IPv6 when available).
     /// iBGP / iBGP-RR-client / RS client: pass through unchanged (next-hop
     /// unchanged).
-    fn export_nexthop(&self, nexthop: bgp::Nexthop) -> bgp::Nexthop {
-        match self.role {
-            PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient => nexthop,
-            PeerRole::Ebgp => match self.local_addr {
-                IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
-                IpAddr::V6(v6) => {
-                    if let Some(ll) = self.link_addr {
-                        bgp::Nexthop::V6LinkLocal(v6, ll)
-                    } else {
-                        bgp::Nexthop::V6(v6)
-                    }
+    fn export_nexthop(&self, nexthop: Option<bgp::Nexthop>) -> bgp::Nexthop {
+        let local = || match self.local_addr {
+            IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
+            IpAddr::V6(v6) => {
+                if let Some(ll) = self.link_addr {
+                    bgp::Nexthop::V6LinkLocal(v6, ll)
+                } else {
+                    bgp::Nexthop::V6(v6)
                 }
-            },
+            }
+        };
+        match (self.role, nexthop) {
+            (_, None) => local(),
+            (PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient, Some(nh)) => nh,
+            (PeerRole::Ebgp, Some(_)) => local(),
         }
     }
 }
@@ -4522,6 +4524,7 @@ impl PeerSession {
                         *f,
                         effective_max,
                         &export_policy,
+                        &self.export_ctx,
                         &mut self.pending,
                         &mut self.export_map,
                     );
@@ -4563,6 +4566,7 @@ impl PeerSession {
         family: Family,
         effective_max: usize,
         export_policy: &Option<Arc<table::PolicyAssignment>>,
+        export_ctx: &PeerExportContext,
         pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
         export_map: &mut ExportMap,
     ) {
@@ -4587,10 +4591,12 @@ impl PeerSession {
                 } else {
                     0
                 };
-                pending
-                    .get_mut(&family)
-                    .unwrap()
-                    .reach(net, pid, nexthop, path.attr.clone());
+                pending.get_mut(&family).unwrap().reach(
+                    net,
+                    pid,
+                    export_ctx.export_nexthop(nexthop),
+                    path.attr.clone(),
+                );
                 export_map.mark_sent(family, net, pid);
             }
         }
@@ -4615,6 +4621,7 @@ impl PeerSession {
             family,
             effective_max,
             &export_policy,
+            &self.export_ctx,
             &mut self.pending,
             &mut self.export_map,
         );
@@ -5848,7 +5855,7 @@ mod tests {
         let best = table::Path {
             local_path_id: 1,
             source,
-            nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            nexthop: Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
             attr: Arc::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
             ]),
@@ -5881,7 +5888,7 @@ mod tests {
         let best = table::Path {
             local_path_id: 1,
             source,
-            nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            nexthop: Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
             attr: Arc::new(vec![]),
         };
         table::NlriChange {
@@ -6284,7 +6291,7 @@ mod tests {
                 Family::IPV4,
                 ipv4_net,
                 0,
-                nh4,
+                Some(nh4),
                 attrs.clone(),
                 None,
                 false,
@@ -6296,7 +6303,7 @@ mod tests {
                 Family::IPV6,
                 ipv6_net,
                 0,
-                nh6,
+                Some(nh6),
                 attrs.clone(),
                 None,
                 false,
@@ -6349,7 +6356,7 @@ mod tests {
                 Family::IPV4,
                 ipv4_net,
                 0,
-                nh4,
+                Some(nh4),
                 attrs,
                 None,
                 false,
@@ -6716,7 +6723,7 @@ mod tests {
             table::Path {
                 local_path_id,
                 source,
-                nexthop: bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                nexthop: Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
                 attr: Arc::new(vec![
                     packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 ]),
@@ -7390,7 +7397,7 @@ mod tests {
         fn ebgp_export_rewrites_nexthop() {
             let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-            let exported = ctx.export_nexthop(original);
+            let exported = ctx.export_nexthop(Some(original));
             assert_eq!(
                 exported,
                 bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)),
@@ -7402,7 +7409,7 @@ mod tests {
         fn ibgp_export_keeps_nexthop() {
             let ctx = ibgp_ctx();
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-            let exported = ctx.export_nexthop(original);
+            let exported = ctx.export_nexthop(Some(original));
             assert_eq!(exported, original, "iBGP nexthop must be unchanged");
         }
     } // mod process_nlri_change

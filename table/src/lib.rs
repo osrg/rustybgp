@@ -218,7 +218,7 @@ impl PathAttribute {
 pub struct Path {
     pub local_path_id: u32,
     pub source: Arc<Source>,
-    pub nexthop: bgp::Nexthop,
+    pub nexthop: Option<bgp::Nexthop>,
     pub attr: Arc<Vec<packet::Attribute>>,
 }
 
@@ -376,7 +376,7 @@ pub struct Reach {
     pub family: Family,
     pub net: packet::PathNlri,
     pub attr: Arc<Vec<packet::Attribute>>,
-    pub nexthop: bgp::Nexthop,
+    pub nexthop: Option<bgp::Nexthop>,
     pub timestamp: SystemTime,
 }
 
@@ -391,7 +391,7 @@ impl From<Reach> for bgp::Message {
             attr: c.attr,
             unreach: None,
             mp_unreach: None,
-            nexthop: Some(c.nexthop),
+            nexthop: c.nexthop,
         })
     }
 }
@@ -423,7 +423,7 @@ pub type SoftResetPath = (
     Family,
     packet::Nlri,
     u32,
-    bgp::Nexthop,
+    Option<bgp::Nexthop>,
     Arc<Source>,
     Arc<Vec<packet::Attribute>>,
     SystemTime,
@@ -827,7 +827,7 @@ impl Table {
         family: Family,
         net: packet::Nlri,
         remote_id: u32,
-        nexthop: bgp::Nexthop,
+        nexthop: Option<bgp::Nexthop>,
         attr: Arc<Vec<packet::Attribute>>,
         original_attr: Option<Arc<Vec<packet::Attribute>>>,
         filtered: bool,
@@ -1267,7 +1267,7 @@ impl Table {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &mut Arc<Vec<packet::Attribute>>,
-        nexthop: &mut bgp::Nexthop,
+        nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
     ) -> Disposition {
         assignment.apply(source, net, attr, nexthop, local_addr)
@@ -1536,8 +1536,8 @@ mod tests {
         })
     }
 
-    fn nh() -> bgp::Nexthop {
-        bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1))
+    fn nh() -> Option<bgp::Nexthop> {
+        Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)))
     }
 
     fn empty_attrs() -> Arc<Vec<packet::Attribute>> {
@@ -2693,7 +2693,7 @@ mod tests {
 
         let s = source(1, 65001, 65000, 1);
         let net = nlri(10, 0, 0, 0, 24);
-        let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let result = Table::apply_policy(
             &assignment,
             &s,
@@ -2703,7 +2703,10 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         );
         assert_eq!(result, Disposition::Accept);
-        assert_eq!(nexthop, bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(
+            nexthop,
+            Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1)))
+        );
     }
 
     #[test]
@@ -2748,7 +2751,7 @@ mod tests {
         let s = source(1, 65001, 65000, 1);
         let net = nlri(10, 0, 0, 0, 24);
         let local_addr = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
-        let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let result = Table::apply_policy(
             &assignment,
             &s,
@@ -2758,7 +2761,10 @@ mod tests {
             local_addr,
         );
         assert_eq!(result, Disposition::Accept);
-        assert_eq!(nexthop, bgp::Nexthop::V4(Ipv4Addr::new(172, 16, 0, 1)));
+        assert_eq!(
+            nexthop,
+            Some(bgp::Nexthop::V4(Ipv4Addr::new(172, 16, 0, 1)))
+        );
     }
 
     #[test]
@@ -2805,7 +2811,7 @@ mod tests {
         let s = source(1, 65001, 65000, 1);
         // Different prefix → no match → nexthop should not change
         let net = nlri(192, 168, 0, 0, 24);
-        let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let original = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mut nexthop = original;
         let _result = Table::apply_policy(
             &assignment,
@@ -4080,7 +4086,9 @@ mod tests {
 
         rt.start_deferral(Family::IPV4);
 
-        let nh6 = bgp::Nexthop::V6(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        let nh6 = Some(bgp::Nexthop::V6(std::net::Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        )));
         let update = rt.insert(
             src,
             Family::IPV6,

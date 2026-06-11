@@ -143,7 +143,7 @@ impl TableManager {
             Some(nexthop),
             timestamp,
         );
-        let mut nh = nexthop;
+        let mut nh = Some(nexthop);
         let original_attr = Arc::clone(&attr);
         let (filtered, post_policy_attr) = crate::policy::apply_import(
             import_policy.as_deref(),
@@ -446,7 +446,7 @@ impl TableManager {
                         addpath,
                         nlris: vec![reach.net],
                         attrs: Some(reach.attr),
-                        nexthop: Some(reach.nexthop),
+                        nexthop: reach.nexthop,
                         timestamp: reach.timestamp,
                     });
                 }
@@ -703,18 +703,19 @@ impl TableShard {
                     let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
                 }
                 Some(best) => {
-                    let nexthop = best.nexthop.addr();
-                    if matches!(
-                        (dst, nexthop),
-                        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
-                    ) {
-                        let _ = tx.send(KernelRouteEvent::Install {
-                            dst,
-                            prefix_len,
-                            nexthop,
-                        });
-                    } else {
-                        let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
+                    if let Some(nexthop) = best.nexthop.map(|n| n.addr()) {
+                        if matches!(
+                            (dst, nexthop),
+                            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+                        ) {
+                            let _ = tx.send(KernelRouteEvent::Install {
+                                dst,
+                                prefix_len,
+                                nexthop,
+                            });
+                        } else {
+                            let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
+                        }
                     }
                 }
             }
@@ -743,8 +744,7 @@ impl TableShard {
         export_policy: Option<&table::PolicyAssignment>,
     ) {
         let paths = self.rtable.collect_peer_paths_for_soft_reset(peer);
-        for (family, net, remote_path_id, nexthop, source, original_attr, timestamp) in paths {
-            let mut nh = nexthop;
+        for (family, net, remote_path_id, mut nh, source, original_attr, timestamp) in paths {
             let (filtered, post_policy_attr) =
                 crate::policy::apply_import(import_policy, &source, &net, &original_attr, &mut nh);
             if let table::InsertResult::Changed(update) = self.rtable.insert(
@@ -788,9 +788,6 @@ impl TableShard {
 
         match attrs {
             Some(attrs) => {
-                // nexthop must be present for reach updates; a missing nexthop
-                // is a protocol violation, so silently drop the update.
-                let Some(nexthop) = nexthop else { return };
                 for net in nets {
                     let mut nh = nexthop;
                     let original_attr = Arc::clone(&attrs);

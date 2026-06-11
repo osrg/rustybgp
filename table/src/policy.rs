@@ -350,7 +350,7 @@ impl Condition {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
-        nexthop: &bgp::Nexthop,
+        nexthop: Option<&bgp::Nexthop>,
     ) -> bool {
         match self {
             Condition::Prefix(_name, opt, set) => {
@@ -469,7 +469,7 @@ impl Condition {
                 return match_string_set(&strs, &set.sets, opt);
             }
             Condition::Nexthop(nexthops) => {
-                return nexthops.contains(&nexthop.addr());
+                return nexthop.is_some_and(|nh| nexthops.contains(&nh.addr()));
             }
             Condition::ExtCommunity(_name, opt, set) => {
                 let communities = ext_communities_from_attr(attr);
@@ -748,29 +748,33 @@ impl Statement {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &mut Arc<Vec<packet::Attribute>>,
-        nexthop: &mut bgp::Nexthop,
+        nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
     ) -> Disposition {
         let matched = self
             .conditions
             .iter()
-            .all(|c| c.evalute(source, net, attr, nexthop));
+            .all(|c| c.evalute(source, net, attr, nexthop.as_ref()));
         if !matched {
             return Disposition::Pass;
         }
 
         if let Some(action) = &self.actions.nexthop {
-            *nexthop = match action {
-                NexthopAction::Address(addr) => match addr {
-                    IpAddr::V4(v4) => bgp::Nexthop::V4(*v4),
-                    IpAddr::V6(v6) => bgp::Nexthop::V6(*v6),
-                },
-                NexthopAction::PeerSelf => match local_addr {
-                    IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
-                    IpAddr::V6(v6) => bgp::Nexthop::V6(v6),
-                },
-                NexthopAction::Unchanged => *nexthop,
-            };
+            match action {
+                NexthopAction::Address(addr) => {
+                    *nexthop = Some(match addr {
+                        IpAddr::V4(v4) => bgp::Nexthop::V4(*v4),
+                        IpAddr::V6(v6) => bgp::Nexthop::V6(*v6),
+                    });
+                }
+                NexthopAction::PeerSelf => {
+                    *nexthop = Some(match local_addr {
+                        IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
+                        IpAddr::V6(v6) => bgp::Nexthop::V6(v6),
+                    });
+                }
+                NexthopAction::Unchanged => {}
+            }
         }
 
         if let Some(action) = &self.actions.community {
@@ -1014,7 +1018,7 @@ impl Policy {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &mut Arc<Vec<packet::Attribute>>,
-        nexthop: &mut bgp::Nexthop,
+        nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
     ) -> Disposition {
         for statement in &self.statements {
@@ -1039,7 +1043,7 @@ impl PolicyAssignment {
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &mut Arc<Vec<packet::Attribute>>,
-        nexthop: &mut bgp::Nexthop,
+        nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
     ) -> Disposition {
         for policy in &self.policies {
@@ -1820,8 +1824,8 @@ mod tests {
         })
     }
 
-    fn nh() -> bgp::Nexthop {
-        bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1))
+    fn nh() -> Option<bgp::Nexthop> {
+        Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)))
     }
 
     fn local_addr() -> IpAddr {
@@ -2873,7 +2877,7 @@ mod tests {
         let s = source();
         let net = nlri();
         let mut attr = Arc::new(vec![]);
-        let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(d, Disposition::Accept);
     }
@@ -2885,7 +2889,7 @@ mod tests {
         let s = source();
         let net = nlri();
         let mut attr = Arc::new(vec![]);
-        let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(d, Disposition::Reject);
     }
@@ -2899,7 +2903,7 @@ mod tests {
         let s = source();
         let net = nlri();
         let mut attr = Arc::new(vec![]);
-        let mut nexthop = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
         assert_eq!(d, Disposition::Accept);
     }

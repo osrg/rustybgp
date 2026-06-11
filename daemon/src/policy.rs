@@ -34,7 +34,7 @@ pub(crate) fn apply_import(
     source: &Arc<rustybgp_table::Source>,
     nlri: &rustybgp_packet::Nlri,
     attrs: &Arc<Vec<rustybgp_packet::Attribute>>,
-    nexthop: &mut Nexthop,
+    nexthop: &mut Option<Nexthop>,
 ) -> (bool, Arc<Vec<rustybgp_packet::Attribute>>) {
     match import_policy {
         None => (false, Arc::clone(attrs)),
@@ -118,7 +118,7 @@ mod tests {
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]);
-        let mut nh = Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut nh = Some(Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (filtered, _) = apply_import(
             None,
             &source(1),
@@ -135,7 +135,7 @@ mod tests {
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]);
-        let mut nh = Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut nh = Some(Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (filtered, _) = apply_import(
             Some(&policy),
             &source(1),
