@@ -2033,7 +2033,23 @@ impl GoBgpService for GrpcService {
         let (family, nets, attrs, nexthop) =
             self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
         let map_nets = nets.clone();
-        self.tables.pass_update(family, nets, attrs, nexthop).await;
+        let timestamp = std::time::SystemTime::now();
+        let source = table::Source::local();
+        if let Some(attrs) = attrs {
+            for net in nets.clone() {
+                self.tables
+                    .insert_route(
+                        source.clone(),
+                        family,
+                        net,
+                        nexthop,
+                        attrs.clone(),
+                        None,
+                        timestamp,
+                    )
+                    .await;
+            }
+        }
         let id = uuid::Uuid::new_v4();
         self.path_uuid_map
             .lock()
@@ -2062,7 +2078,13 @@ impl GoBgpService for GrpcService {
             .await
             .remove(&id)
             .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "uuid not found"))?;
-        self.tables.pass_update(family, nets, None, None).await;
+        let timestamp = std::time::SystemTime::now();
+        let source = table::Source::local();
+        for net in nets {
+            self.tables
+                .remove_route(source.clone(), family, net, None, timestamp)
+                .await;
+        }
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
     type ListPathStream = Pin<
@@ -2170,10 +2192,26 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<tonic::Streaming<api::AddPathStreamRequest>>,
     ) -> Result<tonic::Response<api::AddPathStreamResponse>, tonic::Status> {
         let mut stream = request.into_inner();
+        let source = table::Source::local();
         while let Some(Ok(request)) = stream.next().await {
             for path in request.paths {
-                if let Ok((family, nets, attrs, nexthop)) = self.local_path(path) {
-                    self.tables.pass_update(family, nets, attrs, nexthop).await;
+                if let Ok((family, nets, attrs, nexthop)) = self.local_path(path)
+                    && let Some(attrs) = attrs
+                {
+                    let timestamp = std::time::SystemTime::now();
+                    for net in nets {
+                        self.tables
+                            .insert_route(
+                                source.clone(),
+                                family,
+                                net,
+                                nexthop,
+                                attrs.clone(),
+                                None,
+                                timestamp,
+                            )
+                            .await;
+                    }
                 }
             }
         }
@@ -4931,7 +4969,7 @@ impl PeerSession {
                         source.clone(),
                         family,
                         net,
-                        nexthop.unwrap(),
+                        nexthop,
                         attr.clone(),
                         prefix_limit.clone(),
                         timestamp,

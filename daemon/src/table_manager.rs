@@ -83,7 +83,6 @@ pub(crate) struct TableManager {
     pub(crate) export_policy: ArcSwapOption<table::PolicyAssignment>,
     next_sub_id: std::sync::atomic::AtomicU64,
     subscribers: Mutex<FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>>,
-    local: Arc<table::Source>,
 }
 
 impl TableManager {
@@ -105,7 +104,6 @@ impl TableManager {
             export_policy: ArcSwapOption::const_empty(),
             next_sub_id: std::sync::atomic::AtomicU64::new(0),
             subscribers: Mutex::new(FnvHashMap::default()),
-            local: table::Source::local(),
         }
     }
 
@@ -125,7 +123,7 @@ impl TableManager {
         source: Arc<table::Source>,
         family: Family,
         net: packet::PathNlri,
-        nexthop: bgp::Nexthop,
+        nexthop: Option<bgp::Nexthop>,
         attr: Arc<Vec<packet::Attribute>>,
         prefix_limit: Option<(u32, Arc<std::sync::atomic::AtomicU64>)>,
         timestamp: std::time::SystemTime,
@@ -139,10 +137,10 @@ impl TableManager {
             family,
             &[net],
             Some(&attr),
-            Some(nexthop),
+            nexthop,
             timestamp,
         );
-        let mut nh = Some(nexthop);
+        let mut nh = nexthop;
         let original_attr = Arc::clone(&attr);
         let (filtered, post_policy_attr) = crate::policy::apply_import(
             import_policy.as_deref(),
@@ -193,28 +191,6 @@ impl TableManager {
         {
             t.distribute_update(update, kernel_tx.as_deref());
         }
-    }
-
-    pub(crate) async fn pass_update(
-        &self,
-        family: Family,
-        nets: Vec<packet::PathNlri>,
-        attrs: Option<Arc<Vec<packet::Attribute>>>,
-        nexthop: Option<bgp::Nexthop>,
-    ) {
-        let Some(first) = nets.first() else { return };
-        let idx = self.dealer(first.nlri);
-        let import_policy = self.import_policy.load_full();
-        let kernel_tx = self.kernel_tx.load_full();
-        self.shards[idx].lock().await.pass_update(
-            self.local.clone(),
-            family,
-            nets,
-            attrs,
-            nexthop,
-            import_policy.as_deref(),
-            kernel_tx.as_deref(),
-        );
     }
 
     /// Re-applies the current import policy to all non-stale paths from `peer`
@@ -671,68 +647,6 @@ impl TableShard {
                 timestamp,
             ) {
                 self.distribute_update(update, kernel_tx);
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn pass_update(
-        &mut self,
-        source: Arc<table::Source>,
-        family: Family,
-        nets: Vec<packet::PathNlri>,
-        attrs: Option<Arc<Vec<packet::Attribute>>>,
-        nexthop: Option<bgp::Nexthop>,
-        import_policy: Option<&table::PolicyAssignment>,
-        kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
-    ) {
-        let timestamp = std::time::SystemTime::now();
-        self.notify_adj_rib_in(
-            source.clone(),
-            family,
-            &nets,
-            attrs.as_ref(),
-            nexthop,
-            timestamp,
-        );
-
-        match attrs {
-            Some(attrs) => {
-                for net in nets {
-                    let mut nh = nexthop;
-                    let original_attr = Arc::clone(&attrs);
-                    let (filtered, post_policy_attr) = crate::policy::apply_import(
-                        import_policy,
-                        &source,
-                        &net.nlri,
-                        &attrs,
-                        &mut nh,
-                    );
-                    if let table::InsertResult::Changed(update) = self.rtable.insert(
-                        source.clone(),
-                        family,
-                        net.nlri,
-                        net.path_id,
-                        nh,
-                        post_policy_attr,
-                        Some(original_attr),
-                        filtered,
-                        None,
-                        timestamp,
-                    ) {
-                        self.distribute_update(update, kernel_tx);
-                    }
-                }
-            }
-            None => {
-                for net in nets {
-                    if let Some(update) =
-                        self.rtable
-                            .remove(source.clone(), family, net.nlri, net.path_id, None)
-                    {
-                        self.distribute_update(update, kernel_tx);
-                    }
-                }
             }
         }
     }
