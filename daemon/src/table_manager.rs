@@ -131,7 +131,6 @@ impl TableManager {
         timestamp: std::time::SystemTime,
     ) -> bool {
         let import_policy = self.import_policy.load_full();
-        let export_policy = self.export_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
         let idx = self.dealer(net.nlri);
         let mut t = self.shards[idx].lock().await;
@@ -167,7 +166,7 @@ impl TableManager {
         ) {
             table::InsertResult::PrefixLimitExceeded => return true,
             table::InsertResult::Changed(update) => {
-                t.distribute_update(update, kernel_tx.as_deref(), export_policy.as_deref());
+                t.distribute_update(update, kernel_tx.as_deref());
             }
             table::InsertResult::NoChange => {}
         }
@@ -183,7 +182,6 @@ impl TableManager {
         prefix_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
         timestamp: std::time::SystemTime,
     ) {
-        let export_policy = self.export_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
         let idx = self.dealer(net.nlri);
         let mut t = self.shards[idx].lock().await;
@@ -193,7 +191,7 @@ impl TableManager {
             .rtable
             .remove(source, family, net.nlri, net.path_id, counter_ref)
         {
-            t.distribute_update(update, kernel_tx.as_deref(), export_policy.as_deref());
+            t.distribute_update(update, kernel_tx.as_deref());
         }
     }
 
@@ -207,7 +205,6 @@ impl TableManager {
         let Some(first) = nets.first() else { return };
         let idx = self.dealer(first.nlri);
         let import_policy = self.import_policy.load_full();
-        let export_policy = self.export_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
         self.shards[idx].lock().await.pass_update(
             self.local.clone(),
@@ -217,7 +214,6 @@ impl TableManager {
             nexthop,
             import_policy.as_deref(),
             kernel_tx.as_deref(),
-            export_policy.as_deref(),
         );
     }
 
@@ -225,16 +221,10 @@ impl TableManager {
     /// across every shard and distributes any routing changes to peers.
     pub(crate) async fn soft_reset_in(&self, peer: IpAddr) {
         let import_policy = self.import_policy.load_full();
-        let export_policy = self.export_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
         for shard in &self.shards {
             let mut t = shard.lock().await;
-            t.soft_reset_in(
-                peer,
-                import_policy.as_deref(),
-                kernel_tx.as_deref(),
-                export_policy.as_deref(),
-            );
+            t.soft_reset_in(peer, import_policy.as_deref(), kernel_tx.as_deref());
         }
     }
 
@@ -282,11 +272,10 @@ impl TableManager {
 
     pub(crate) async fn end_deferral_families(&self, families: &[Family]) {
         let kernel_tx = self.kernel_tx.load_full();
-        let export_policy = self.export_policy.load_full();
         for shard in &self.shards {
             let mut t = shard.lock().await;
             for &family in families {
-                t.end_deferral(family, kernel_tx.as_deref(), export_policy.as_deref());
+                t.end_deferral(family, kernel_tx.as_deref());
             }
         }
     }
@@ -529,7 +518,6 @@ impl TableManager {
         stale_families: &[Family],
     ) {
         let kernel_tx = self.kernel_tx.load_full();
-        let export_policy = self.export_policy.load_full();
         for shard in &self.shards {
             let mut t = shard.lock().await;
             t.peer_event_tx.remove(&addr);
@@ -538,7 +526,7 @@ impl TableManager {
                 t.disconnected(addr, family, kernel_tx.as_deref());
             }
             for &family in stale_families {
-                t.mark_stale(addr, family, kernel_tx.as_deref(), export_policy.as_deref());
+                t.mark_stale(addr, family, kernel_tx.as_deref());
             }
         }
     }
@@ -563,7 +551,7 @@ impl TableShard {
         kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
     ) {
         for change in self.rtable.drop(addr, family) {
-            self.distribute_update(change, kernel_tx, None);
+            self.distribute_update(change, kernel_tx);
         }
     }
 
@@ -572,10 +560,9 @@ impl TableShard {
         addr: IpAddr,
         family: Family,
         kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
-        export_policy: Option<&table::PolicyAssignment>,
     ) {
         for change in self.rtable.restale(addr, family) {
-            self.distribute_update(change, kernel_tx, export_policy);
+            self.distribute_update(change, kernel_tx);
         }
     }
 
@@ -606,98 +593,23 @@ impl TableShard {
         &self,
         update: table::NlriChange,
         kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
-        export_policy: Option<&table::PolicyAssignment>,
     ) {
-        // Apply export policy to new_best.
-        let filtered_new_best: Option<table::Path> = if let Some(best) = update.new_best() {
-            let mut nexthop = best.nexthop;
-            let mut attr = Arc::clone(&best.attr);
-            if export_policy.is_some_and(|policy| {
-                table::Table::apply_policy(
-                    policy,
-                    &best.source,
-                    &update.net,
-                    &mut attr,
-                    &mut nexthop,
-                    best.source.local_addr,
-                    best.source.remote_addr,
-                ) == table::Disposition::Reject
-            }) {
-                None
-            } else {
-                Some(table::Path {
-                    nexthop,
-                    attr,
-                    ..best.clone()
-                })
-            }
-        } else {
-            None
-        };
-
-        // Apply export policy to current_paths (for Add-Path peers).
-        let filtered_current_paths: Arc<Vec<table::Path>> = if export_policy.is_none() {
-            Arc::clone(&update.current_paths)
-        } else {
-            Arc::new(
-                update
-                    .current_paths
-                    .iter()
-                    .filter_map(|p| {
-                        let mut nexthop = p.nexthop;
-                        let mut attr = Arc::clone(&p.attr);
-                        if export_policy.is_some_and(|policy| {
-                            table::Table::apply_policy(
-                                policy,
-                                &p.source,
-                                &update.net,
-                                &mut attr,
-                                &mut nexthop,
-                                p.source.local_addr,
-                                p.source.remote_addr,
-                            ) == table::Disposition::Reject
-                        }) {
-                            None
-                        } else {
-                            Some(table::Path {
-                                nexthop,
-                                attr,
-                                ..p.clone()
-                            })
-                        }
-                    })
-                    .collect(),
-            )
-        };
-
-        let best_changed =
-            update.best_changed || update.new_best().is_some() != filtered_new_best.is_some();
-        let any_changed =
-            update.any_changed || update.current_paths.len() != filtered_current_paths.len();
-
-        let filtered_update = table::NlriChange {
-            best_changed,
-            any_changed,
-            current_paths: filtered_current_paths,
-            ..update
-        };
-
-        // Kernel route update for rank-1 best.
-        if filtered_update.best_changed
+        // Kernel route update for rank-1 best (raw, without export policy).
+        if update.best_changed
             && let Some(tx) = kernel_tx
         {
-            let (dst, prefix_len) = match filtered_update.net {
+            let (dst, prefix_len) = match update.net {
                 packet::Nlri::V4(net) => (IpAddr::from(net.addr), net.mask),
                 packet::Nlri::V6(net) => (IpAddr::from(net.addr), net.mask),
                 packet::Nlri::Mup(_) => {
                     // Send to peers but skip kernel for MUP NLRIs.
                     for tx in self.peer_event_tx.values() {
-                        let _ = tx.send(ToPeerEvent::NlriChange(filtered_update.clone()));
+                        let _ = tx.send(ToPeerEvent::NlriChange(update.clone()));
                     }
                     return;
                 }
             };
-            match &filtered_new_best {
+            match update.new_best() {
                 None => {
                     let _ = tx.send(KernelRouteEvent::Withdraw { dst, prefix_len });
                 }
@@ -720,9 +632,10 @@ impl TableShard {
             }
         }
 
-        // Fan out to all peer channels.
+        // Fan out raw NlriChange to all peer channels.
+        // Each peer applies export policy per-peer in process_nlri_change.
         for tx in self.peer_event_tx.values() {
-            let _ = tx.send(ToPeerEvent::NlriChange(filtered_update.clone()));
+            let _ = tx.send(ToPeerEvent::NlriChange(update.clone()));
         }
     }
 
@@ -740,7 +653,6 @@ impl TableShard {
         peer: std::net::IpAddr,
         import_policy: Option<&table::PolicyAssignment>,
         kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
-        export_policy: Option<&table::PolicyAssignment>,
     ) {
         let paths = self.rtable.collect_adj_in_paths(peer);
         for (family, net, remote_path_id, mut nh, source, original_attr, timestamp) in paths {
@@ -758,7 +670,7 @@ impl TableShard {
                 None,
                 timestamp,
             ) {
-                self.distribute_update(update, kernel_tx, export_policy);
+                self.distribute_update(update, kernel_tx);
             }
         }
     }
@@ -773,7 +685,6 @@ impl TableShard {
         nexthop: Option<bgp::Nexthop>,
         import_policy: Option<&table::PolicyAssignment>,
         kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
-        export_policy: Option<&table::PolicyAssignment>,
     ) {
         let timestamp = std::time::SystemTime::now();
         self.notify_adj_rib_in(
@@ -809,7 +720,7 @@ impl TableShard {
                         None,
                         timestamp,
                     ) {
-                        self.distribute_update(update, kernel_tx, export_policy);
+                        self.distribute_update(update, kernel_tx);
                     }
                 }
             }
@@ -819,7 +730,7 @@ impl TableShard {
                         self.rtable
                             .remove(source.clone(), family, net.nlri, net.path_id, None)
                     {
-                        self.distribute_update(update, kernel_tx, export_policy);
+                        self.distribute_update(update, kernel_tx);
                     }
                 }
             }
@@ -833,7 +744,7 @@ impl TableShard {
         kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
     ) {
         for change in self.rtable.drop_stale(addr, family, None) {
-            self.distribute_update(change, kernel_tx, None);
+            self.distribute_update(change, kernel_tx);
         }
     }
 
@@ -841,10 +752,9 @@ impl TableShard {
         &mut self,
         family: Family,
         kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
-        export_policy: Option<&table::PolicyAssignment>,
     ) {
         for change in self.rtable.end_deferral(family) {
-            self.distribute_update(change, kernel_tx, export_policy);
+            self.distribute_update(change, kernel_tx);
         }
     }
 }

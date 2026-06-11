@@ -4104,6 +4104,10 @@ impl ExportMap {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn clear_family(&mut self, family: Family) {
+        self.advertised.remove(&family);
+    }
 }
 
 /// Per-session peer role, used to control attribute export and route filtering.
@@ -4519,14 +4523,20 @@ impl PeerSession {
                         .and_then(|s| s.send_max().get(f))
                         .copied()
                         .unwrap_or(1);
-                    Self::populate_from_paths(
-                        rtable.collect_loc_rib_paths(f),
-                        effective_max,
-                        &export_policy,
-                        &self.export_ctx,
-                        &mut self.pending,
-                        &mut self.export_map,
-                    );
+                    for change in rtable.collect_loc_rib_paths(f) {
+                        let Some(pending) = self.pending.get_mut(&change.family) else {
+                            continue;
+                        };
+                        process_nlri_change(
+                            &change,
+                            effective_max,
+                            self.remote_addr,
+                            &mut self.export_map,
+                            pending,
+                            &self.export_ctx,
+                            export_policy.as_deref(),
+                        );
+                    }
                 }
             })
             .await;
@@ -4560,49 +4570,6 @@ impl PeerSession {
             .await;
     }
 
-    fn populate_from_paths(
-        changes: Vec<table::NlriChange>,
-        effective_max: usize,
-        export_policy: &Option<Arc<table::PolicyAssignment>>,
-        export_ctx: &PeerExportContext,
-        pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
-        export_map: &mut ExportMap,
-    ) {
-        for change in changes {
-            let net = change.net;
-            let family = change.family;
-            for path in change.current_paths.iter().take(effective_max) {
-                let mut nexthop = path.nexthop;
-                let mut attr = Arc::clone(&path.attr);
-                if export_policy.as_ref().is_some_and(|a| {
-                    table::Table::apply_policy(
-                        a,
-                        &path.source,
-                        &net,
-                        &mut attr,
-                        &mut nexthop,
-                        path.source.local_addr,
-                        path.source.remote_addr,
-                    ) == table::Disposition::Reject
-                }) {
-                    continue;
-                }
-                let pid = if effective_max > 1 {
-                    path.local_path_id
-                } else {
-                    0
-                };
-                pending.get_mut(&family).unwrap().reach(
-                    net,
-                    pid,
-                    export_ctx.export_nexthop(nexthop),
-                    export_ctx.export_attrs(&attr),
-                );
-                export_map.mark_sent(family, net, pid);
-            }
-        }
-    }
-
     async fn do_route_refresh(&mut self, family: Family) {
         if !self.pending.contains_key(&family) {
             return;
@@ -4616,15 +4583,22 @@ impl PeerSession {
             .and_then(|s| s.send_max().get(&family))
             .copied()
             .unwrap_or(1);
-        let paths = self.tables.collect_loc_rib_paths(family).await;
-        Self::populate_from_paths(
-            paths,
-            effective_max,
-            &export_policy,
-            &self.export_ctx,
-            &mut self.pending,
-            &mut self.export_map,
-        );
+        let changes = self.tables.collect_loc_rib_paths(family).await;
+        self.export_map.clear_family(family);
+        for change in changes {
+            let Some(pending) = self.pending.get_mut(&change.family) else {
+                continue;
+            };
+            process_nlri_change(
+                &change,
+                effective_max,
+                self.remote_addr,
+                &mut self.export_map,
+                pending,
+                &self.export_ctx,
+                export_policy.as_deref(),
+            );
+        }
         self.pending.get_mut(&family).unwrap().schedule_eor();
     }
 
@@ -5008,6 +4982,7 @@ impl PeerSession {
         let Some(pending) = self.pending.get_mut(&update.family) else {
             return;
         };
+        let export_policy = self.tables.export_policy.load_full();
         process_nlri_change(
             &update,
             effective_max,
@@ -5015,6 +4990,7 @@ impl PeerSession {
             &mut self.export_map,
             pending,
             &self.export_ctx,
+            export_policy.as_deref(),
         );
     }
 
@@ -5474,6 +5450,7 @@ fn process_nlri_change(
     export_map: &mut ExportMap,
     pending: &mut crate::peer_tx::PendingTx,
     export_ctx: &PeerExportContext,
+    export_policy: Option<&table::PolicyAssignment>,
 ) {
     let dest_is_ibgp = matches!(export_ctx.role, PeerRole::Ibgp | PeerRole::IbgpRrClient);
     if effective_max == 1 {
@@ -5496,17 +5473,38 @@ fn process_nlri_change(
             }
             Some(best)
         });
-        match visible_best.cloned() {
+        // Apply export policy to the visible best; a rejected best is treated
+        // as if no best exists (withdraw if previously advertised).
+        let policy_result = visible_best.and_then(|best| {
+            let mut nexthop = best.nexthop;
+            let mut attr = Arc::clone(&best.attr);
+            if export_policy.is_some_and(|policy| {
+                table::Table::apply_policy(
+                    policy,
+                    &best.source,
+                    &update.net,
+                    &mut attr,
+                    &mut nexthop,
+                    export_ctx.local_addr,
+                    remote_addr,
+                ) == table::Disposition::Reject
+            }) {
+                None
+            } else {
+                Some((attr, nexthop))
+            }
+        });
+        match policy_result {
             None => {
                 if export_map.was_sent(update.family, &update.net) {
                     export_map.mark_withdrawn(update.family, &update.net, 0);
                     pending.unreach(update.net, 0);
                 }
             }
-            Some(best) => {
+            Some((attr, nexthop)) => {
                 export_map.mark_sent(update.family, update.net, 0);
-                let attr = export_ctx.export_attrs(&best.attr);
-                let nexthop = export_ctx.export_nexthop(best.nexthop);
+                let attr = export_ctx.export_attrs(&attr);
+                let nexthop = export_ctx.export_nexthop(nexthop);
                 pending.reach(update.net, 0, nexthop, attr);
             }
         }
@@ -5515,7 +5513,10 @@ fn process_nlri_change(
         if !update.any_changed {
             return;
         }
-        let current_top_n: Vec<&table::Path> = update
+        // Build the effective top-N after echo prevention, split horizon, and
+        // export policy.  Store post-policy (attr, nexthop) so that
+        // export_attrs/export_nexthop can be applied in one step below.
+        let current_top_n: Vec<(u32, Arc<Vec<packet::Attribute>>, Option<bgp::Nexthop>)> = update
             .current_paths
             .iter()
             .filter(|p| p.source.remote_addr != remote_addr)
@@ -5529,27 +5530,45 @@ fn process_nlri_change(
                 }
             })
             .take(effective_max)
+            .filter_map(|path| {
+                let mut nexthop = path.nexthop;
+                let mut attr = Arc::clone(&path.attr);
+                if export_policy.is_some_and(|policy| {
+                    table::Table::apply_policy(
+                        policy,
+                        &path.source,
+                        &update.net,
+                        &mut attr,
+                        &mut nexthop,
+                        export_ctx.local_addr,
+                        remote_addr,
+                    ) == table::Disposition::Reject
+                }) {
+                    None
+                } else {
+                    Some((path.local_path_id, attr, nexthop))
+                }
+            })
             .collect();
 
         // Withdraw paths that were sent but are no longer in top-N
-        // (including paths pushed out by send_max boundary).
+        // (including paths pushed out by send_max boundary or policy).
         let sent_ids = export_map.sent_path_ids(update.family, &update.net);
-        let current_ids: FnvHashSet<u32> = current_top_n.iter().map(|p| p.local_path_id).collect();
+        let current_ids: FnvHashSet<u32> = current_top_n.iter().map(|(pid, _, _)| *pid).collect();
         for &pid in sent_ids.difference(&current_ids) {
             export_map.mark_withdrawn(update.family, &update.net, pid);
             pending.unreach(update.net, pid);
         }
 
         // Advertise paths that are new or whose attributes were replaced.
-        for path in &current_top_n {
-            let already_sent =
-                export_map.contains_path(update.family, &update.net, path.local_path_id);
-            let was_replaced = update.replaced_path_id == Some(path.local_path_id);
+        for (pid, attr, nexthop) in &current_top_n {
+            let already_sent = export_map.contains_path(update.family, &update.net, *pid);
+            let was_replaced = update.replaced_path_id == Some(*pid);
             if !already_sent || was_replaced {
-                export_map.mark_sent(update.family, update.net, path.local_path_id);
-                let attr = export_ctx.export_attrs(&path.attr);
-                let nexthop = export_ctx.export_nexthop(path.nexthop);
-                pending.reach(update.net, path.local_path_id, nexthop, attr);
+                export_map.mark_sent(update.family, update.net, *pid);
+                let attr = export_ctx.export_attrs(attr);
+                let nexthop = export_ctx.export_nexthop(*nexthop);
+                pending.reach(update.net, *pid, nexthop, attr);
             }
         }
     }
@@ -6327,7 +6346,7 @@ mod tests {
         // IPv4 route (GR family) must still be in the table.
         assert_eq!(t.rtable.collect_loc_rib_paths(&Family::IPV4).len(), 1);
         // IPv6 route (non-GR family) must have been removed.
-        assert!(t.rtable.best_paths(&Family::IPV6).is_empty());
+        assert!(t.rtable.collect_loc_rib_paths(&Family::IPV6).is_empty());
     }
 
     #[tokio::test]
@@ -6811,6 +6830,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(pending.is_empty());
@@ -6832,6 +6852,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(em.was_sent(Family::IPV4, &net));
@@ -6858,6 +6879,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -6881,6 +6903,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(pending.is_empty());
@@ -6903,6 +6926,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(pending.is_empty());
@@ -6925,6 +6949,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
             assert!(em.was_sent(Family::IPV4, &net));
             pending.drain_messages(Family::IPV4, false); // flush
@@ -6937,6 +6962,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
             assert!(!em.was_sent(Family::IPV4, &net));
             let msgs = pending.drain_messages(Family::IPV4, false);
@@ -6960,6 +6986,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(pending.is_empty());
@@ -6981,6 +7008,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
@@ -7011,6 +7039,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
@@ -7040,6 +7069,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             let msgs = pending.drain_messages(Family::IPV4, false);
@@ -7071,6 +7101,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(em.contains_path(Family::IPV4, &net, 3));
@@ -7107,6 +7138,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(!em.contains_path(Family::IPV4, &net, 1)); // withdrawn
@@ -7136,6 +7168,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -7163,6 +7196,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(pending.is_empty());
@@ -7192,6 +7226,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
             );
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
@@ -7243,6 +7278,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ibgp_ctx(),
+                None,
             );
 
             // Split horizon: iBGP-learned route must not be forwarded to iBGP peer
@@ -7268,6 +7304,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ibgp_ctx(),
+                None,
             );
 
             // Must send a withdrawal for the previously-sent route
@@ -7292,6 +7329,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ibgp_ctx(),
+                None,
             );
 
             // eBGP-learned route CAN be forwarded to iBGP peer
@@ -7318,6 +7356,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ibgp_ctx(),
+                None,
             );
 
             // Only the eBGP-learned path (pid=2) should be advertised
