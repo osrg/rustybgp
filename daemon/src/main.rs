@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #![recursion_limit = "1024"]
+#![warn(unreachable_pub)]
 pub(crate) use rustybgp_api as api;
 pub(crate) use rustybgp_config as config;
 mod auth;
