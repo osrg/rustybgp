@@ -1013,68 +1013,8 @@ impl Attribute {
         }
     }
 
-    pub fn nexthop_update(&self, addr: IpAddr) -> Attribute {
-        assert_eq!(self.code, Attribute::NEXTHOP);
-        match addr {
-            IpAddr::V4(addr) => Attribute {
-                code: self.code,
-                flags: self.flags,
-                data: AttributeData::Bin(addr.octets().to_vec()),
-            },
-            IpAddr::V6(addr) => Attribute {
-                code: self.code,
-                flags: self.flags,
-                data: AttributeData::Bin(addr.octets().to_vec()),
-            },
-        }
-    }
-
-    pub fn export<B: BufMut + AsMut<[u8]>>(
-        &self,
-        code: u8,
-        dst: Option<&mut B>,
-        family: Family,
-        codec: &PeerCodec,
-    ) -> (u16, Option<Attribute>) {
-        match code {
-            Attribute::AS_PATH => {
-                let n = if codec.keep_aspath {
-                    self.clone()
-                } else {
-                    self.as_path_prepend(codec.local_asn)
-                };
-                let l = if let Some(dst) = dst {
-                    n.encode(dst).unwrap()
-                } else {
-                    0
-                };
-                (l, Some(n))
-            }
-            Attribute::NEXTHOP => {
-                if family != Family::IPV4 {
-                    return (0, None);
-                }
-                let n = if codec.keep_nexthop {
-                    self.clone()
-                } else {
-                    self.nexthop_update(codec.local_addr)
-                };
-                let l = if let Some(dst) = dst {
-                    n.encode(dst).unwrap()
-                } else {
-                    0
-                };
-                (l, Some(n))
-            }
-            _ => {
-                let l = if let Some(dst) = dst {
-                    self.encode(dst).unwrap()
-                } else {
-                    0
-                };
-                (l, None)
-            }
-        }
+    pub(crate) fn encode_wire<B: BufMut + AsMut<[u8]>>(&self, dst: &mut B) -> u16 {
+        self.encode(dst).unwrap()
     }
 
     /// Encode this attribute into its BGP wire format.
@@ -1338,11 +1278,7 @@ pub fn create_channel(
 pub struct PeerCodecBuilder {
     local_asn: u32,
     remote_asn: u32,
-    local_addr: IpAddr,
-    link_addr: Option<Ipv6Addr>,
     extended_length: bool,
-    keep_aspath: bool,
-    keep_nexthop: bool,
     family: Vec<Family>,
 }
 
@@ -1357,11 +1293,7 @@ impl PeerCodecBuilder {
         PeerCodecBuilder {
             local_asn: 0,
             remote_asn: 0,
-            local_addr: IpAddr::V4(Ipv4Addr::from(0)),
-            link_addr: None,
             extended_length: false,
-            keep_aspath: false,
-            keep_nexthop: false,
             family: Vec::new(),
         }
     }
@@ -1375,37 +1307,13 @@ impl PeerCodecBuilder {
         PeerCodec {
             local_asn: self.local_asn,
             remote_asn: self.remote_asn,
-            local_addr: self.local_addr,
-            link_addr: self.link_addr,
             extended_length: self.extended_length,
-            keep_aspath: self.keep_aspath,
-            keep_nexthop: self.keep_nexthop,
             channel,
         }
     }
 
     pub fn local_asn(&mut self, asn: u32) -> &mut Self {
         self.local_asn = asn;
-        self
-    }
-
-    pub fn local_addr(&mut self, local_addr: IpAddr) -> &mut Self {
-        self.local_addr = local_addr;
-        self
-    }
-
-    pub fn link_addr(&mut self, addr: Ipv6Addr) -> &mut Self {
-        self.link_addr = Some(addr);
-        self
-    }
-
-    pub fn keep_aspath(&mut self, y: bool) -> &mut Self {
-        self.keep_aspath = y;
-        self
-    }
-
-    pub fn keep_nexthop(&mut self, y: bool) -> &mut Self {
-        self.keep_nexthop = y;
         self
     }
 
@@ -1419,10 +1327,6 @@ pub struct PeerCodec {
     extended_length: bool,
     local_asn: u32,
     remote_asn: u32,
-    local_addr: IpAddr,
-    link_addr: Option<Ipv6Addr>,
-    keep_aspath: bool,
-    keep_nexthop: bool,
     pub channel: FnvHashMap<Family, Channel>,
 }
 
@@ -1449,15 +1353,6 @@ impl PeerCodec {
     ) -> Result<u16, ()> {
         let family = &reach.family;
         let nets = &reach.entries;
-        let is_extended = self
-            .channel
-            .get(family)
-            .is_some_and(|c| c.extended_nexthop());
-        // RFC 8950: extended nexthop requires IPv6 local address
-        assert!(
-            !is_extended || matches!(self.local_addr, IpAddr::V6(_)) || self.keep_nexthop,
-            "extended nexthop requires IPv6 local address"
-        );
         let pos_head = dst.as_mut().len();
         // always use extended length
         dst.put_u8(
@@ -1468,37 +1363,19 @@ impl PeerCodec {
         dst.put_u16(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
-        if self.keep_nexthop {
-            let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
-            // Pad to at least 16 bytes for MP_REACH nexthop
-            let padded = if nh_bytes.len() < 16 {
-                let mut v = vec![0u8; 16];
-                v[..nh_bytes.len()].copy_from_slice(&nh_bytes);
-                v
-            } else {
-                nh_bytes
-            };
-            dst.put_u8(padded.len() as u8);
-            dst.put_slice(&padded);
+        // Attribute transformation (nexthop rewrite) is applied by PeerExportContext
+        // before routes enter PendingTx, so the nexthop here is already the export
+        // nexthop.  Pad IPv4/IPv6 to at least 16 bytes for MP_REACH.
+        let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
+        let padded = if nh_bytes.len() < 16 {
+            let mut v = vec![0u8; 16];
+            v[..nh_bytes.len()].copy_from_slice(&nh_bytes);
+            v
         } else {
-            match self.local_addr {
-                IpAddr::V6(global) => {
-                    if let Some(ll) = self.link_addr {
-                        // 32-byte nexthop: global + link-local (RFC 2545)
-                        dst.put_u8(32);
-                        dst.put_slice(&global.octets());
-                        dst.put_slice(&ll.octets());
-                    } else {
-                        dst.put_u8(16);
-                        dst.put_slice(&global.octets());
-                    }
-                }
-                IpAddr::V4(addr) => {
-                    dst.put_u8(4);
-                    dst.put_slice(&addr.octets());
-                }
-            };
-        }
+            nh_bytes
+        };
+        dst.put_u8(padded.len() as u8);
+        dst.put_slice(&padded);
         // padding
         dst.put_u8(0);
         let addpath = self.channel.get(family).is_some_and(|c| c.addpath_tx());
@@ -1663,47 +1540,37 @@ impl PeerCodec {
                 // BIRD encodes MP_REACH/MP_UNREACH first and then the rest.
                 // RustyBGP encode MP_REACH/MP_UNREACH last.
                 let mut attr_len = 0;
-                let attr_family = mp_reach
-                    .as_ref()
-                    .or(mp_unreach.as_ref())
-                    .map_or(family, |s| s.family);
                 let mut has_as_path = false;
+                // Attribute transformation (AS-path prepend, LOCAL_PREF strip) is applied
+                // by PeerExportContext before routes enter PendingTx; attrs here are already
+                // export-ready.  Encode every transitive attribute as-is.
                 for a in &*attrs {
                     if a.flags & Attribute::FLAG_TRANSITIVE > 0 {
-                        let code = a.code();
-                        if code == Attribute::AS_PATH {
+                        if a.code() == Attribute::AS_PATH {
                             has_as_path = true;
                         }
-                        let (n, _) = a.export(code, Some(dst), attr_family, self);
-                        attr_len += n;
+                        attr_len += a.encode_wire(dst);
                     }
                 }
-                // Encode NEXTHOP attribute for traditional IPv4 reach (not MP_REACH)
-                if reach.as_ref().is_some_and(|r| !r.entries.is_empty()) && mp_reach.is_none() {
-                    let nh_addr = if self.keep_nexthop {
-                        _nexthop.map(|nh| nh.addr()).unwrap_or(self.local_addr)
-                    } else {
-                        self.local_addr
-                    };
-                    if let IpAddr::V4(v4) = nh_addr {
-                        let nh_attr =
-                            Attribute::new_with_bin(Attribute::NEXTHOP, v4.octets().to_vec())
-                                .unwrap();
-                        let (n, _) =
-                            nh_attr.export(Attribute::NEXTHOP, Some(dst), attr_family, self);
-                        attr_len += n;
-                    }
+                // Encode NEXTHOP attribute for traditional IPv4 reach (not MP_REACH).
+                // The nexthop in the Update struct is the export nexthop, already set
+                // by PeerExportContext::export_nexthop().
+                if reach.as_ref().is_some_and(|r| !r.entries.is_empty())
+                    && mp_reach.is_none()
+                    && let Some(nh) = _nexthop
+                    && let IpAddr::V4(v4) = nh.addr()
+                {
+                    let nh_attr =
+                        Attribute::new_with_bin(Attribute::NEXTHOP, v4.octets().to_vec()).unwrap();
+                    attr_len += nh_attr.encode_wire(dst);
                 }
-                // Ensure AS_PATH is present (mandatory for eBGP UPDATEs).
-                // Locally-originated routes may lack AS_PATH; create one
-                // with the local ASN prepended. Skip for End-of-RIB markers
-                // (empty UPDATEs with no NLRI).
+                // Safety net: ensure AS_PATH is present for UPDATEs with NLRI.
+                // PeerExportContext::export_attrs() adds it for all non-RS sessions,
+                // so this branch fires only as a last resort.
                 let has_nlri =
                     reach.as_ref().is_some_and(|r| !r.entries.is_empty()) || mp_reach.is_some();
                 if !has_as_path && has_nlri {
-                    let empty = Attribute::empty_as_path();
-                    let (n, _) = empty.export(Attribute::AS_PATH, Some(dst), attr_family, self);
-                    attr_len += n;
+                    attr_len += Attribute::empty_as_path().encode_wire(dst);
                 }
                 // MP_REACH_NLRI attribute
                 if let Some(mp_reach) = mp_reach {

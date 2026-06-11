@@ -24,8 +24,6 @@ use std::sync::Arc;
 fn ipv4_codec() -> rustybgp_packet::bgp::PeerCodec {
     PeerCodecBuilder::new()
         .local_asn(65001)
-        .keep_aspath(true)
-        .keep_nexthop(true)
         .families(vec![Family::IPV4])
         .build()
 }

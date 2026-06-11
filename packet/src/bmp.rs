@@ -189,10 +189,7 @@ impl Default for BmpCodec {
 impl BmpCodec {
     pub fn new() -> Self {
         BmpCodec {
-            codec: bgp::PeerCodecBuilder::new()
-                .keep_aspath(true)
-                .keep_nexthop(true)
-                .build(),
+            codec: bgp::PeerCodecBuilder::new().build(),
         }
     }
 }

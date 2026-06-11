@@ -122,10 +122,7 @@ impl Default for MrtCodec {
 impl MrtCodec {
     pub fn new() -> Self {
         MrtCodec {
-            codec: bgp::PeerCodecBuilder::new()
-                .keep_aspath(true)
-                .keep_nexthop(true)
-                .build(),
+            codec: bgp::PeerCodecBuilder::new().build(),
         }
     }
 }

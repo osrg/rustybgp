@@ -30,8 +30,6 @@ fn ipv4_codec() -> rustybgp_packet::bgp::PeerCodec {
     // local_asn is set non-zero so is_ibgp() returns false (avoiding LOCAL_PREF injection).
     PeerCodecBuilder::new()
         .local_asn(65001)
-        .keep_aspath(true)
-        .keep_nexthop(true)
         .families(vec![Family::IPV4])
         .build()
 }
@@ -39,8 +37,6 @@ fn ipv4_codec() -> rustybgp_packet::bgp::PeerCodec {
 fn ipv6_codec() -> rustybgp_packet::bgp::PeerCodec {
     PeerCodecBuilder::new()
         .local_asn(65001)
-        .keep_aspath(true)
-        .keep_nexthop(true)
         .families(vec![Family::IPV6])
         .build()
 }
@@ -362,9 +358,6 @@ fn update_attr_med_dropped_on_encode() {
 fn ipv4_extended_nexthop_codec() -> PeerCodec {
     let mut codec = PeerCodecBuilder::new()
         .local_asn(65001)
-        .keep_aspath(true)
-        .keep_nexthop(true)
-        .local_addr(IpAddr::V6("2001:db8::1".parse().unwrap()))
         .families(vec![Family::IPV4])
         .build();
     // Enable extended nexthop on the IPv4 channel
@@ -613,8 +606,6 @@ fn update_passes_through_unknown_prefix_sid_tlv() {
 fn ipv4_mup_codec() -> PeerCodec {
     PeerCodecBuilder::new()
         .local_asn(65001)
-        .keep_aspath(true)
-        .keep_nexthop(true)
         .families(vec![Family::IPV4_MUP])
         .build()
 }
@@ -622,8 +613,6 @@ fn ipv4_mup_codec() -> PeerCodec {
 fn ipv6_mup_codec() -> PeerCodec {
     PeerCodecBuilder::new()
         .local_asn(65001)
-        .keep_aspath(true)
-        .keep_nexthop(true)
         .families(vec![Family::IPV6_MUP])
         .build()
 }

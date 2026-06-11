@@ -23,7 +23,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 
-use bytes::BytesMut;
 use rustybgp_packet::{self as packet, Attribute, Family, bgp};
 
 #[derive(Debug, thiserror::Error)]
@@ -730,7 +729,7 @@ impl Table {
         dst: &Destination,
         peer: IpAddr,
         net: packet::Nlri,
-        family: Family,
+        _family: Family,
         export_policy: Option<&PolicyAssignment>,
     ) -> Vec<PathEntry> {
         let best = dst.unfiltered_best().map(|p| p as *const RibEntry);
@@ -738,20 +737,18 @@ impl Table {
             .iter()
             .filter(|p| Some(*p as *const RibEntry) == best && p.path.source.remote_addr != peer)
             .filter_map(|p| {
-                let codec = bgp::PeerCodecBuilder::new()
-                    .local_asn(p.path.source.local_asn)
-                    .local_addr(p.path.source.local_addr)
-                    .keep_aspath(p.path.source.rs_client)
-                    .keep_nexthop(p.path.source.rs_client)
-                    .build();
+                // Apply per-peer AS_PATH transformation for the Adj-RIB-Out view.
+                // RS clients keep the original AS_PATH; other peers get local_asn prepended.
                 let mut attr = Arc::new(
                     p.path
                         .attr
                         .iter()
-                        .cloned()
                         .map(|a| {
-                            let (_, m) = a.export(a.code(), None::<&mut BytesMut>, family, &codec);
-                            m.unwrap_or(a)
+                            if !p.path.source.rs_client && a.code() == packet::Attribute::AS_PATH {
+                                a.as_path_prepend(p.path.source.local_asn)
+                            } else {
+                                a.clone()
+                            }
                         })
                         .collect::<Vec<packet::Attribute>>(),
                 );

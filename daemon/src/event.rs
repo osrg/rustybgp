@@ -4136,20 +4136,14 @@ struct PeerExportContext {
 impl PeerExportContext {
     /// Build a `PeerCodec` for wire encoding.
     ///
-    /// All attribute transformation is now handled by `export_attrs` /
-    /// `export_nexthop` before routes enter `PendingTx`, so the codec always
-    /// operates in pass-through mode (`keep_aspath=true`, `keep_nexthop=true`).
+    /// The codec carries only session-level parameters needed for decoding
+    /// (local_asn for iBGP loop detection) and message framing.  All attribute
+    /// transformation is handled by `export_attrs`/`export_nexthop` before
+    /// routes enter `PendingTx`.
     fn build_codec(&self) -> bgp::PeerCodec {
-        let mut builder = bgp::PeerCodecBuilder::new();
-        builder
+        bgp::PeerCodecBuilder::new()
             .local_asn(self.local_asn)
-            .local_addr(self.local_addr)
-            .keep_aspath(true)
-            .keep_nexthop(true);
-        if let Some(ll) = self.link_addr {
-            builder.link_addr(ll);
-        }
-        builder.build()
+            .build()
     }
 
     /// Apply per-peer attribute transformation to outgoing route attributes.

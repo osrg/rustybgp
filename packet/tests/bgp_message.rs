@@ -111,10 +111,7 @@ fn build_many_v4_route() {
         nexthop: None,
     });
 
-    let codec = PeerCodecBuilder::new()
-        .families(vec![Family::IPV4])
-        .keep_aspath(true)
-        .build();
+    let codec = PeerCodecBuilder::new().families(vec![Family::IPV4]).build();
     let mut txbuf = BytesMut::with_capacity(4096);
     let mut framer = BgpFramer::new(codec);
     framer.encode_to(&msg, &mut txbuf).unwrap();
