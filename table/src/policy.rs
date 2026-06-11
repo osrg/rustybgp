@@ -351,6 +351,7 @@ impl Condition {
         net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
         nexthop: Option<&bgp::Nexthop>,
+        peer_addr: IpAddr,
     ) -> bool {
         match self {
             Condition::Prefix(_name, opt, set) => {
@@ -387,7 +388,7 @@ impl Condition {
             Condition::Neighbor(_name, opt, set) => {
                 let mut found = false;
                 for n in &set.sets {
-                    if n.contains(&source.remote_addr) {
+                    if n.contains(&peer_addr) {
                         found = true;
                         break;
                     }
@@ -750,11 +751,12 @@ impl Statement {
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
+        peer_addr: IpAddr,
     ) -> Disposition {
         let matched = self
             .conditions
             .iter()
-            .all(|c| c.evalute(source, net, attr, nexthop.as_ref()));
+            .all(|c| c.evalute(source, net, attr, nexthop.as_ref(), peer_addr));
         if !matched {
             return Disposition::Pass;
         }
@@ -1020,9 +1022,10 @@ impl Policy {
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
+        peer_addr: IpAddr,
     ) -> Disposition {
         for statement in &self.statements {
-            let d = statement.apply(source, net, attr, nexthop, local_addr);
+            let d = statement.apply(source, net, attr, nexthop, local_addr, peer_addr);
             if d != Disposition::Pass {
                 return d;
             }
@@ -1045,9 +1048,10 @@ impl PolicyAssignment {
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
+        peer_addr: IpAddr,
     ) -> Disposition {
         for policy in &self.policies {
-            let d = policy.apply(source, net, attr, nexthop, local_addr);
+            let d = policy.apply(source, net, attr, nexthop, local_addr, peer_addr);
             if d != Disposition::Pass {
                 return d;
             }
@@ -1883,7 +1887,15 @@ mod tests {
         // Route already carries 65000:200
         let mut attr = attrs_with_community(&[0xFDE8_00C8]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
 
         let result = get_communities(&attr);
         assert!(
@@ -1904,7 +1916,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
 
         let result = get_communities(&attr);
         assert_eq!(result, vec![0xFDE8_0064]);
@@ -1921,7 +1941,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_community(&[0xFDE8_0064, 0xFDE8_00C8]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
 
         let result = get_communities(&attr);
         assert!(!result.contains(&0xFDE8_0064), "65000:100 removed");
@@ -1939,7 +1967,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_community(&[0xFDE8_0064]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
 
         assert!(
             !attr
@@ -1960,7 +1996,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_community(&[0xFDE8_00C8, 0xFDE8_012C]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
 
         let result = get_communities(&attr);
         assert_eq!(result, vec![0xFDE8_0064], "communities replaced");
@@ -2008,7 +2052,15 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 100).unwrap(),
         ]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
 
         assert_eq!(get_local_pref(&attr), Some(200));
         assert_eq!(
@@ -2028,7 +2080,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
 
         assert_eq!(get_local_pref(&attr), Some(150));
     }
@@ -2078,7 +2138,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_med(100);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_med(&attr), Some(300));
     }
 
@@ -2089,7 +2157,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_med(&attr), Some(100));
     }
 
@@ -2100,7 +2176,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_med(200);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_med(&attr), Some(250));
     }
 
@@ -2111,7 +2195,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_med(200);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_med(&attr), Some(150));
     }
 
@@ -2122,7 +2214,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_med(100);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_med(&attr), Some(0));
     }
 
@@ -2182,7 +2282,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![as_path_attr(&[65001, 65002])]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_as_path(&attr), vec![65100, 65001, 65002]);
     }
 
@@ -2193,7 +2301,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![as_path_attr(&[65001])]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_as_path(&attr), vec![65100, 65100, 65100, 65001]);
     }
 
@@ -2204,7 +2320,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![as_path_attr(&[65001, 65002])]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_as_path(&attr), vec![65001, 65001, 65002]);
     }
 
@@ -2215,7 +2339,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_as_path(&attr), vec![65100, 65100]);
     }
 
@@ -2275,7 +2407,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_ext_community(&[SOO_65002_100]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         let result = get_ext_communities(&attr);
         assert!(result.contains(&SOO_65002_100), "original preserved");
         assert!(result.contains(&RT_65001_100), "new added");
@@ -2291,7 +2431,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_ext_community(&[RT_65001_100, RT_65001_200]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         let result = get_ext_communities(&attr);
         assert!(!result.contains(&RT_65001_100), "removed");
         assert!(result.contains(&RT_65001_200), "other preserved");
@@ -2307,7 +2455,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_ext_community(&[SOO_65002_100, RT_65001_200]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         let result = get_ext_communities(&attr);
         assert_eq!(result, vec![RT_65001_100]);
     }
@@ -2363,7 +2519,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_large_community(&[(65000, 1, 200)]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         let result = get_large_communities(&attr);
         assert!(result.contains(&(65000, 1, 200)), "original preserved");
         assert!(result.contains(&(65000, 1, 100)), "new added");
@@ -2379,7 +2543,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_large_community(&[(65000, 1, 100), (65000, 1, 200)]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         let result = get_large_communities(&attr);
         assert!(!result.contains(&(65000, 1, 100)), "removed");
         assert!(result.contains(&(65000, 1, 200)), "other preserved");
@@ -2395,7 +2567,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_large_community(&[(65000, 1, 100), (65000, 1, 200)]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_large_communities(&attr), vec![(65001, 2, 50)]);
     }
 
@@ -2441,7 +2621,15 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 2).unwrap(), // Incomplete
         ]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_origin(&attr), Some(0));
     }
 
@@ -2454,7 +2642,15 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(), // IGP
         ]);
         let mut nexthop = nh();
-        Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(get_origin(&attr), Some(2));
         assert_eq!(
             attr.iter()
@@ -2496,7 +2692,15 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
         ]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2509,7 +2713,15 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 100).unwrap(),
         ]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Accept);
     }
 
@@ -2522,7 +2734,15 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, 50).unwrap(),
         ]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2535,7 +2755,15 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, 99).unwrap(),
         ]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Accept);
     }
 
@@ -2549,7 +2777,15 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap(),
         ]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2563,7 +2799,15 @@ mod tests {
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
         ]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Accept);
     }
 
@@ -2575,7 +2819,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2587,7 +2839,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Accept);
     }
 
@@ -2600,7 +2860,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2612,7 +2880,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_community(&[0x00010001, 0x00010002]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2624,7 +2900,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_community(&[0x00010001]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Accept);
     }
 
@@ -2636,7 +2920,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_community(&[0x00010001, 0x00010002, 0x00010003]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2648,7 +2940,15 @@ mod tests {
         let net = nlri(); // V4
         let mut attr = Arc::new(vec![]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2660,7 +2960,15 @@ mod tests {
         let net = nlri(); // V4
         let mut attr = Arc::new(vec![]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Accept);
     }
 
@@ -2680,7 +2988,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2750,7 +3066,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_ext_community_bytes(&[rt_bytes(65000, 100)]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2765,7 +3089,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_ext_community_bytes(&[rt_bytes(65001, 100)]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Accept);
     }
 
@@ -2829,7 +3161,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_large_community_tuples(&[(65000, 1, 100)]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2844,7 +3184,15 @@ mod tests {
         let net = nlri();
         let mut attr = attrs_with_large_community_tuples(&[(65001, 1, 100)]);
         let mut nexthop = nh();
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Accept);
     }
 
@@ -2878,7 +3226,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Accept);
     }
 
@@ -2890,7 +3246,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Reject);
     }
 
@@ -2904,7 +3268,15 @@ mod tests {
         let net = nlri();
         let mut attr = Arc::new(vec![]);
         let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let d = Table::apply_policy(&assignment, &s, &net, &mut attr, &mut nexthop, local_addr());
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+        );
         assert_eq!(d, Disposition::Accept);
     }
 }

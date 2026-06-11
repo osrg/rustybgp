@@ -418,7 +418,7 @@ impl InsertResult {
     }
 }
 
-/// One path entry returned by [`Table::collect_peer_paths_for_soft_reset`].
+/// One path entry returned by [`Table::collect_adj_in_paths`].
 pub type SoftResetPath = (
     Family,
     packet::Nlri,
@@ -565,9 +565,12 @@ impl Default for Table {
 }
 
 impl Table {
-    /// Returns all current unfiltered paths grouped by destination.
-    /// Each tuple is (nlri, paths_sorted_by_preference).
-    pub fn best_paths(&self, family: &Family) -> Vec<(packet::Nlri, Vec<Path>)> {
+    /// Returns one [`NlriChange`] per destination in the Loc-RIB for `family`.
+    ///
+    /// Each change has `best_changed` and `any_changed` set to `true` so that
+    /// callers treating it as a fresh event (initial dump, route refresh) will
+    /// unconditionally advertise every prefix.
+    pub fn collect_loc_rib_paths(&self, family: &Family) -> Vec<NlriChange> {
         let Some(t) = self.ribs.get(family) else {
             return Vec::new();
         };
@@ -575,7 +578,17 @@ impl Table {
             .iter()
             .filter_map(|(net, dst)| {
                 let paths: Vec<Path> = dst.unfiltered_iter().map(|e| e.path.clone()).collect();
-                (!paths.is_empty()).then_some((*net, paths))
+                if paths.is_empty() {
+                    return None;
+                }
+                Some(NlriChange {
+                    family: *family,
+                    net: *net,
+                    best_changed: true,
+                    any_changed: true,
+                    replaced_path_id: None,
+                    current_paths: Arc::new(paths),
+                })
             })
             .collect()
     }
@@ -649,7 +662,7 @@ impl Table {
     /// would cause spurious churn.  There is no RFC guidance on soft reset
     /// interaction with GR stale routes -- this is a pragmatic implementation
     /// choice.
-    pub fn collect_peer_paths_for_soft_reset(&self, peer: std::net::IpAddr) -> Vec<SoftResetPath> {
+    pub fn collect_adj_in_paths(&self, peer: std::net::IpAddr) -> Vec<SoftResetPath> {
         let mut out = Vec::new();
         for (family, rib) in &self.ribs {
             if *family == Family::EMPTY {
@@ -761,6 +774,7 @@ impl Table {
                         &mut attr,
                         &mut nh,
                         p.path.source.local_addr,
+                        peer,
                     ) == Disposition::Reject
                     {
                         return None;
@@ -974,17 +988,7 @@ impl Table {
         if let Some(ft) = self.ribs.get_mut(&family) {
             ft.deferring = false;
         }
-        self.best_paths(&family)
-            .into_iter()
-            .map(|(net, paths)| NlriChange {
-                family,
-                net,
-                best_changed: true,
-                any_changed: true,
-                replaced_path_id: None,
-                current_paths: Arc::new(paths),
-            })
-            .collect()
+        self.collect_loc_rib_paths(&family)
     }
 
     pub fn remove(
@@ -1269,8 +1273,9 @@ impl Table {
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
+        peer_addr: IpAddr,
     ) -> Disposition {
-        assignment.apply(source, net, attr, nexthop, local_addr)
+        assignment.apply(source, net, attr, nexthop, local_addr, peer_addr)
     }
 }
 
@@ -1569,13 +1574,13 @@ mod tests {
         ])
     }
 
-    /// Flat list of (nlri, path, rank) from best_paths(), sorted by nlri then rank.
+    /// Flat list of (nlri, path, rank) from collect_loc_rib_paths(), sorted by nlri then rank.
     /// Replaces old rt.best() which returned a flat Vec<Change>.
     fn flat_best(rt: &Table, family: &Family) -> Vec<(packet::Nlri, Path, usize)> {
         let mut result = Vec::new();
-        for (net, paths) in rt.best_paths(family) {
-            for (i, path) in paths.into_iter().enumerate() {
-                result.push((net, path, i + 1));
+        for change in rt.collect_loc_rib_paths(family) {
+            for (i, path) in change.current_paths.iter().cloned().enumerate() {
+                result.push((change.net, path, i + 1));
             }
         }
         result
@@ -2596,6 +2601,7 @@ mod tests {
             &mut empty_attrs(),
             &mut nh(),
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            s.remote_addr,
         );
         assert_eq!(result, Disposition::Reject);
     }
@@ -2646,6 +2652,7 @@ mod tests {
             &mut empty_attrs(),
             &mut nh(),
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            s.remote_addr,
         );
         assert_eq!(result, Disposition::Accept);
     }
@@ -2701,6 +2708,7 @@ mod tests {
             &mut empty_attrs(),
             &mut nexthop,
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            s.remote_addr,
         );
         assert_eq!(result, Disposition::Accept);
         assert_eq!(
@@ -2759,6 +2767,7 @@ mod tests {
             &mut empty_attrs(),
             &mut nexthop,
             local_addr,
+            s.remote_addr,
         );
         assert_eq!(result, Disposition::Accept);
         assert_eq!(
@@ -2820,6 +2829,7 @@ mod tests {
             &mut empty_attrs(),
             &mut nexthop,
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            s.remote_addr,
         );
         assert_eq!(nexthop, original);
     }
@@ -3040,7 +3050,7 @@ mod tests {
             None,
             SystemTime::UNIX_EPOCH,
         );
-        assert!(rt.best_paths(&Family::IPV4).is_empty());
+        assert!(rt.collect_loc_rib_paths(&Family::IPV4).is_empty());
     }
 
     // --- remove() with filtered head ---
@@ -3661,7 +3671,7 @@ mod tests {
         assert_eq!(flat_best(&rt, &Family::IPV4).len(), 1);
 
         rt.drop(s.remote_addr, Family::IPV4);
-        assert!(rt.best_paths(&Family::IPV4).is_empty());
+        assert!(rt.collect_loc_rib_paths(&Family::IPV4).is_empty());
     }
 
     // --- drop_stale ---
@@ -3734,7 +3744,7 @@ mod tests {
 
         s.mark_stale();
         rt.drop_stale(s.remote_addr, Family::IPV4, None);
-        assert!(rt.best_paths(&Family::IPV4).is_empty());
+        assert!(rt.collect_loc_rib_paths(&Family::IPV4).is_empty());
     }
 
     #[test]
@@ -3941,7 +3951,7 @@ mod tests {
             "WITHDRAW of stale path must produce NlriChange"
         );
         assert!(
-            rt.best_paths(&Family::IPV4).is_empty(),
+            rt.collect_loc_rib_paths(&Family::IPV4).is_empty(),
             "RIB must be empty after withdraw"
         );
     }
@@ -4226,7 +4236,7 @@ mod tests {
             "insert must return PrefixLimitExceeded when counter >= max"
         );
         // Route must not be stored.
-        assert!(rt.best_paths(&Family::IPV4).is_empty());
+        assert!(rt.collect_loc_rib_paths(&Family::IPV4).is_empty());
         // Counter must not be incremented further.
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }

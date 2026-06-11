@@ -338,13 +338,10 @@ impl TableManager {
         state
     }
 
-    pub(crate) async fn collect_best_paths(
-        &self,
-        family: Family,
-    ) -> Vec<(packet::Nlri, Vec<table::Path>)> {
+    pub(crate) async fn collect_loc_rib_paths(&self, family: Family) -> Vec<table::NlriChange> {
         let mut out = Vec::new();
         for shard in &self.shards {
-            out.extend(shard.lock().await.rtable.best_paths(&family));
+            out.extend(shard.lock().await.rtable.collect_loc_rib_paths(&family));
         }
         out
     }
@@ -623,6 +620,7 @@ impl TableShard {
                     &mut attr,
                     &mut nexthop,
                     best.source.local_addr,
+                    best.source.remote_addr,
                 ) == table::Disposition::Reject
             }) {
                 None
@@ -656,6 +654,7 @@ impl TableShard {
                                 &mut attr,
                                 &mut nexthop,
                                 p.source.local_addr,
+                                p.source.remote_addr,
                             ) == table::Disposition::Reject
                         }) {
                             None
@@ -735,7 +734,7 @@ impl TableShard {
     /// post-policy result changed.
     ///
     /// Stale paths (GR helper mode) are skipped; see
-    /// [`table::Table::collect_peer_paths_for_soft_reset`] for the rationale.
+    /// [`table::Table::collect_adj_in_paths`] for the rationale.
     pub(crate) fn soft_reset_in(
         &mut self,
         peer: std::net::IpAddr,
@@ -743,7 +742,7 @@ impl TableShard {
         kernel_tx: Option<&mpsc::UnboundedSender<KernelRouteEvent>>,
         export_policy: Option<&table::PolicyAssignment>,
     ) {
-        let paths = self.rtable.collect_peer_paths_for_soft_reset(peer);
+        let paths = self.rtable.collect_adj_in_paths(peer);
         for (family, net, remote_path_id, mut nh, source, original_attr, timestamp) in paths {
             let (filtered, post_policy_attr) =
                 crate::policy::apply_import(import_policy, &source, &net, &original_attr, &mut nh);

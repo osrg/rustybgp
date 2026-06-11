@@ -4520,8 +4520,7 @@ impl PeerSession {
                         .copied()
                         .unwrap_or(1);
                     Self::populate_from_paths(
-                        rtable.best_paths(f),
-                        *f,
+                        rtable.collect_loc_rib_paths(f),
                         effective_max,
                         &export_policy,
                         &self.export_ctx,
@@ -4562,16 +4561,17 @@ impl PeerSession {
     }
 
     fn populate_from_paths(
-        paths: Vec<(packet::Nlri, Vec<table::Path>)>,
-        family: Family,
+        changes: Vec<table::NlriChange>,
         effective_max: usize,
         export_policy: &Option<Arc<table::PolicyAssignment>>,
         export_ctx: &PeerExportContext,
         pending: &mut FnvHashMap<Family, crate::peer_tx::PendingTx>,
         export_map: &mut ExportMap,
     ) {
-        for (net, paths) in paths {
-            for path in paths.iter().take(effective_max) {
+        for change in changes {
+            let net = change.net;
+            let family = change.family;
+            for path in change.current_paths.iter().take(effective_max) {
                 let mut nexthop = path.nexthop;
                 let mut attr = Arc::clone(&path.attr);
                 if export_policy.as_ref().is_some_and(|a| {
@@ -4582,6 +4582,7 @@ impl PeerSession {
                         &mut attr,
                         &mut nexthop,
                         path.source.local_addr,
+                        path.source.remote_addr,
                     ) == table::Disposition::Reject
                 }) {
                     continue;
@@ -4615,10 +4616,9 @@ impl PeerSession {
             .and_then(|s| s.send_max().get(&family))
             .copied()
             .unwrap_or(1);
-        let paths = self.tables.collect_best_paths(family).await;
+        let paths = self.tables.collect_loc_rib_paths(family).await;
         Self::populate_from_paths(
             paths,
-            family,
             effective_max,
             &export_policy,
             &self.export_ctx,
@@ -6325,7 +6325,7 @@ mod tests {
 
         let t = tables.shards[0].lock().await;
         // IPv4 route (GR family) must still be in the table.
-        assert_eq!(t.rtable.best_paths(&Family::IPV4).len(), 1);
+        assert_eq!(t.rtable.collect_loc_rib_paths(&Family::IPV4).len(), 1);
         // IPv6 route (non-GR family) must have been removed.
         assert!(t.rtable.best_paths(&Family::IPV6).is_empty());
     }
@@ -6369,7 +6369,7 @@ mod tests {
                 .lock()
                 .await
                 .rtable
-                .best_paths(&Family::IPV4)
+                .collect_loc_rib_paths(&Family::IPV4)
                 .len(),
             1
         );
@@ -6384,7 +6384,7 @@ mod tests {
                 .lock()
                 .await
                 .rtable
-                .best_paths(&Family::IPV4)
+                .collect_loc_rib_paths(&Family::IPV4)
                 .is_empty()
         );
     }
@@ -7457,7 +7457,7 @@ mod tests {
         });
         svc.add_path(req).await.unwrap();
         let t = svc.tables.shards[0].lock().await;
-        assert_eq!(t.rtable.best_paths(&Family::IPV4).len(), 1);
+        assert_eq!(t.rtable.collect_loc_rib_paths(&Family::IPV4).len(), 1);
     }
 
     #[tokio::test]
@@ -7471,7 +7471,7 @@ mod tests {
         let uuid = svc.add_path(add_req).await.unwrap().into_inner().uuid;
         {
             let t = svc.tables.shards[0].lock().await;
-            assert_eq!(t.rtable.best_paths(&Family::IPV4).len(), 1);
+            assert_eq!(t.rtable.collect_loc_rib_paths(&Family::IPV4).len(), 1);
         }
 
         let del_req = tonic::Request::new(api::DeletePathRequest {
@@ -7480,7 +7480,7 @@ mod tests {
         });
         svc.delete_path(del_req).await.unwrap();
         let t = svc.tables.shards[0].lock().await;
-        assert!(t.rtable.best_paths(&Family::IPV4).is_empty());
+        assert!(t.rtable.collect_loc_rib_paths(&Family::IPV4).is_empty());
     }
 
     #[tokio::test]
@@ -7550,7 +7550,7 @@ mod tests {
         });
         svc.add_path(req).await.unwrap();
         let t = svc.tables.shards[0].lock().await;
-        assert_eq!(t.rtable.best_paths(&Family::IPV4).len(), 1);
+        assert_eq!(t.rtable.collect_loc_rib_paths(&Family::IPV4).len(), 1);
     }
 
     #[tokio::test]
@@ -7571,10 +7571,10 @@ mod tests {
 
         {
             let t = svc.tables.shards[0].lock().await;
-            let entries = t.rtable.best_paths(&Family::IPV4);
+            let entries = t.rtable.collect_loc_rib_paths(&Family::IPV4);
             assert_eq!(entries.len(), 1);
             assert_eq!(
-                entries[0].1.len(),
+                entries[0].current_paths.len(),
                 2,
                 "both path_id=1 and path_id=2 should coexist"
             );
@@ -7588,9 +7588,9 @@ mod tests {
         .unwrap();
         {
             let t = svc.tables.shards[0].lock().await;
-            let entries = t.rtable.best_paths(&Family::IPV4);
+            let entries = t.rtable.collect_loc_rib_paths(&Family::IPV4);
             assert_eq!(
-                entries[0].1.len(),
+                entries[0].current_paths.len(),
                 1,
                 "one path should remain after first delete"
             );
@@ -7603,7 +7603,7 @@ mod tests {
         .await
         .unwrap();
         let t = svc.tables.shards[0].lock().await;
-        assert!(t.rtable.best_paths(&Family::IPV4).is_empty());
+        assert!(t.rtable.collect_loc_rib_paths(&Family::IPV4).is_empty());
     }
 
     // ---- apply_disconnect: export_map lifetime ----

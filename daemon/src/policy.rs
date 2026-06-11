@@ -47,6 +47,7 @@ pub(crate) fn apply_import(
                 &mut attr,
                 nexthop,
                 source.local_addr,
+                source.remote_addr,
             ) == Disposition::Reject;
             (filtered, attr)
         }
