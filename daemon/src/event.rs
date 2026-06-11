@@ -5213,8 +5213,20 @@ impl PeerSession {
 
     async fn run(mut self, global: GlobalHandle, active_conn_tx: mpsc::UnboundedSender<TcpStream>) {
         let tables = self.tables.clone();
-        let info = self.session_loop(&global).await;
+        let mut info = self.session_loop(&global).await;
         let remote_addr = info.remote_addr;
+
+        // Suppress GR helper mode when the peer is admin-down: holding stale
+        // routes for a peer that is intentionally disabled serves no purpose.
+        if global
+            .read()
+            .await
+            .peers
+            .get(&remote_addr)
+            .is_some_and(|p| p.admin_down)
+        {
+            info.negotiated_gr = None;
+        }
 
         // Operate on PeerContext directly via self.context — no global lock needed
         // for the ctx-only operations.
