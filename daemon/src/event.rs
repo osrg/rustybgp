@@ -4154,16 +4154,20 @@ impl PeerExportContext {
 
     /// Apply per-peer attribute transformation to outgoing route attributes.
     ///
-    /// For eBGP (and iBGP in the current stub): prepend `local_asn` to
-    /// AS_PATH; add a synthetic AS_PATH segment when the route carries none
-    /// (locally-originated routes).  For RS clients: pass through unchanged.
+    /// eBGP: prepend `local_asn` to AS_PATH (adding a synthetic segment for
+    /// locally-originated routes), and strip LOCAL_PREF (not sent to eBGP
+    /// peers per RFC 4271).
+    /// iBGP / iBGP-RR-client: pass through unchanged — no AS_PATH prepend,
+    /// LOCAL_PREF retained.
+    /// RS client: pass through unchanged.
     fn export_attrs(&self, attrs: &Arc<Vec<bgp::Attribute>>) -> Arc<Vec<bgp::Attribute>> {
         match self.role {
-            PeerRole::RsClient => attrs.clone(),
-            PeerRole::Ebgp | PeerRole::Ibgp | PeerRole::IbgpRrClient => {
+            PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient => attrs.clone(),
+            PeerRole::Ebgp => {
                 let has_as_path = attrs.iter().any(|a| a.code() == bgp::Attribute::AS_PATH);
                 let mut new_attrs: Vec<bgp::Attribute> = attrs
                     .iter()
+                    .filter(|a| a.code() != bgp::Attribute::LOCAL_PREF)
                     .map(|a| {
                         if a.code() == bgp::Attribute::AS_PATH {
                             a.as_path_prepend(self.local_asn)
@@ -4182,13 +4186,13 @@ impl PeerExportContext {
 
     /// Apply per-peer nexthop transformation to an outgoing route nexthop.
     ///
-    /// For eBGP (and iBGP in the current stub): replace with the local
-    /// address, including the link-local address for IPv6 when available.
-    /// For RS clients: pass through unchanged.
+    /// eBGP: replace with local_addr (with link-local for IPv6 when available).
+    /// iBGP / iBGP-RR-client / RS client: pass through unchanged (next-hop
+    /// unchanged).
     fn export_nexthop(&self, nexthop: bgp::Nexthop) -> bgp::Nexthop {
         match self.role {
-            PeerRole::RsClient => nexthop,
-            PeerRole::Ebgp | PeerRole::Ibgp | PeerRole::IbgpRrClient => match self.local_addr {
+            PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient => nexthop,
+            PeerRole::Ebgp => match self.local_addr {
                 IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
                 IpAddr::V6(v6) => {
                     if let Some(ll) = self.link_addr {
@@ -5470,12 +5474,28 @@ fn process_nlri_change(
     pending: &mut crate::peer_tx::PendingTx,
     export_ctx: &PeerExportContext,
 ) {
+    let dest_is_ibgp = matches!(export_ctx.role, PeerRole::Ibgp | PeerRole::IbgpRrClient);
     if effective_max == 1 {
         // Non-Add-Path fast path: O(1) skip when best unchanged.
         if !update.best_changed {
             return;
         }
-        match update.new_best().cloned() {
+        // Compute the best path visible to this peer: None if no best exists,
+        // the best originated from this peer (echo prevention), or the best is
+        // iBGP-learned and the destination peer is also iBGP (split horizon).
+        let visible_best = update.new_best().and_then(|best| {
+            if best.source.remote_addr == remote_addr {
+                return None;
+            }
+            if dest_is_ibgp
+                && !best.source.is_local()
+                && best.source.remote_asn == best.source.local_asn
+            {
+                return None;
+            }
+            Some(best)
+        });
+        match visible_best.cloned() {
             None => {
                 if export_map.was_sent(update.family, &update.net) {
                     export_map.mark_withdrawn(update.family, &update.net, 0);
@@ -5483,9 +5503,6 @@ fn process_nlri_change(
                 }
             }
             Some(best) => {
-                if best.source.remote_addr == remote_addr {
-                    return;
-                }
                 export_map.mark_sent(update.family, update.net, 0);
                 let attr = export_ctx.export_attrs(&best.attr);
                 let nexthop = export_ctx.export_nexthop(best.nexthop);
@@ -5501,6 +5518,15 @@ fn process_nlri_change(
             .current_paths
             .iter()
             .filter(|p| p.source.remote_addr != remote_addr)
+            .filter(|p| {
+                // iBGP split horizon: exclude iBGP-learned paths when sending to
+                // an iBGP peer.
+                if dest_is_ibgp {
+                    p.source.is_local() || p.source.remote_asn != p.source.local_asn
+                } else {
+                    true
+                }
+            })
             .take(effective_max)
             .collect();
 
@@ -7175,6 +7201,215 @@ mod tests {
             assert_eq!(reach_pids.len(), 2);
             assert!(reach_pids.contains(&1));
             assert!(reach_pids.contains(&3));
+        }
+        // ---- iBGP split horizon ----
+
+        fn ibgp_source(addr: &str) -> Arc<table::Source> {
+            let ip: IpAddr = addr.parse().unwrap();
+            // remote_asn == local_asn → iBGP source
+            Arc::new(table::Source::new(
+                ip,
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                65001,
+                65001,
+                Ipv4Addr::new(10, 0, 0, 1),
+                false,
+            ))
+        }
+
+        fn ibgp_ctx() -> PeerExportContext {
+            PeerExportContext {
+                role: PeerRole::Ibgp,
+                local_asn: 65001,
+                local_addr: "127.0.0.1".parse().unwrap(),
+                link_addr: None,
+            }
+        }
+
+        #[test]
+        fn ibgp_split_horizon_suppresses_ibgp_learned_route() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            // Route learned from an iBGP peer (remote_asn == local_asn)
+            let path = path(1, ibgp_source(PEER));
+            let update = change(net, true, true, None, vec![path]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_ctx(),
+            );
+
+            // Split horizon: iBGP-learned route must not be forwarded to iBGP peer
+            assert!(pending.is_empty());
+            assert!(!em.was_sent(Family::IPV4, &net));
+        }
+
+        #[test]
+        fn ibgp_split_horizon_withdraws_when_best_becomes_ibgp() {
+            let mut em = ExportMap::new();
+            let net = nlri("10.0.0.0/24");
+            // Previously sent an eBGP-learned best
+            em.mark_sent(Family::IPV4, net, 0);
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            // New best is iBGP-learned
+            let path = path(1, ibgp_source(PEER));
+            let update = change(net, true, true, None, vec![path]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_ctx(),
+            );
+
+            // Must send a withdrawal for the previously-sent route
+            assert!(!em.was_sent(Family::IPV4, &net));
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            assert_eq!(unreach_entries(&msgs).len(), 1);
+        }
+
+        #[test]
+        fn ibgp_forwards_ebgp_learned_route() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            // Route learned from an eBGP peer (remote_asn != local_asn)
+            let path = path(1, source(PEER)); // source() uses remote_asn=65002
+            let update = change(net, true, true, None, vec![path]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_ctx(),
+            );
+
+            // eBGP-learned route CAN be forwarded to iBGP peer
+            assert!(em.was_sent(Family::IPV4, &net));
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            assert_eq!(reach_entries(&msgs).len(), 1);
+        }
+
+        #[test]
+        fn ibgp_split_horizon_addpath_filters_ibgp_paths() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let net = nlri("10.0.0.0/24");
+            let paths = vec![
+                path(1, ibgp_source(PEER)), // iBGP-learned — must be filtered
+                path(2, source(PEER)),      // eBGP-learned — may be forwarded
+            ];
+            let update = change(net, true, true, None, paths);
+
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ibgp_ctx(),
+            );
+
+            // Only the eBGP-learned path (pid=2) should be advertised
+            assert!(!em.contains_path(Family::IPV4, &net, 1));
+            assert!(em.contains_path(Family::IPV4, &net, 2));
+            let msgs = pending.drain_messages(Family::IPV4, false);
+            let reach = reach_entries(&msgs);
+            assert_eq!(reach.len(), 1);
+            assert_eq!(reach[0].1, 2);
+        }
+
+        // ---- export_attrs / export_nexthop per-role correctness ----
+
+        fn attr_with_local_pref() -> Arc<Vec<packet::Attribute>> {
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
+            ])
+        }
+
+        fn attr_with_aspath() -> Arc<Vec<packet::Attribute>> {
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                packet::Attribute::empty_as_path(),
+            ])
+        }
+
+        #[test]
+        fn ebgp_export_strips_local_pref() {
+            let ctx = ebgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_local_pref());
+            assert!(
+                exported
+                    .iter()
+                    .all(|a| a.code() != packet::Attribute::LOCAL_PREF),
+                "LOCAL_PREF must be stripped for eBGP"
+            );
+        }
+
+        #[test]
+        fn ibgp_export_keeps_local_pref() {
+            let ctx = ibgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_local_pref());
+            assert!(
+                exported
+                    .iter()
+                    .any(|a| a.code() == packet::Attribute::LOCAL_PREF),
+                "LOCAL_PREF must be preserved for iBGP"
+            );
+        }
+
+        #[test]
+        fn ebgp_export_prepends_aspath() {
+            let ctx = ebgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_aspath());
+            let aspath = exported
+                .iter()
+                .find(|a| a.code() == packet::Attribute::AS_PATH)
+                .expect("AS_PATH must be present");
+            // After prepend, AS_PATH origin should be local_asn (65001)
+            assert_eq!(aspath.as_path_origin(), Some(65001));
+        }
+
+        #[test]
+        fn ibgp_export_does_not_prepend_aspath() {
+            let ctx = ibgp_ctx();
+            let original = attr_with_aspath();
+            let exported = ctx.export_attrs(&original);
+            // iBGP should return the same Arc (no cloning/modification)
+            assert!(
+                Arc::ptr_eq(&exported, &original),
+                "iBGP export_attrs should return attrs unchanged"
+            );
+        }
+
+        #[test]
+        fn ebgp_export_rewrites_nexthop() {
+            let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
+            let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+            let exported = ctx.export_nexthop(original);
+            assert_eq!(
+                exported,
+                bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                "eBGP nexthop must be rewritten to local_addr"
+            );
+        }
+
+        #[test]
+        fn ibgp_export_keeps_nexthop() {
+            let ctx = ibgp_ctx();
+            let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+            let exported = ctx.export_nexthop(original);
+            assert_eq!(exported, original, "iBGP nexthop must be unchanged");
         }
     } // mod process_nlri_change
 
