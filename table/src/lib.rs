@@ -195,6 +195,15 @@ impl PathAttribute {
             .map(|attr| attr.value().unwrap())
     }
 
+    fn attr_cluster_list_length(&self) -> usize {
+        self.attr
+            .iter()
+            .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
+            .and_then(|a| a.binary())
+            .map(|b| b.len() / 4)
+            .unwrap_or(0)
+    }
+
     fn attr_as_path_length(&self) -> usize {
         match self
             .attr
@@ -280,7 +289,13 @@ impl Ord for RibEntry {
                     .is_stale()
                     .cmp(&other.path.source.is_stale())
             })
-            // Lower originator ID / router ID is better
+            // Shorter CLUSTER_LIST is better (RFC 4456 s9)
+            .then_with(|| {
+                self_pa
+                    .attr_cluster_list_length()
+                    .cmp(&other_pa.attr_cluster_list_length())
+            })
+            // Lower originator ID / router ID is better (RFC 4456 s9)
             .then_with(|| self.originator_id().cmp(&other.originator_id()))
     }
 }
@@ -1938,6 +1953,158 @@ mod tests {
             0,
             nh(),
             empty_attrs(),
+            None,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
+        assert_eq!(
+            best.source.remote_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    fn attrs_with_cluster_list(ids: &[u8]) -> Arc<Vec<packet::Attribute>> {
+        // Each id is used as the last octet of a 4-byte cluster ID (0.0.0.id).
+        let bytes: Vec<u8> = ids.iter().flat_map(|&id| [0u8, 0, 0, id]).collect();
+        Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, bytes).unwrap(),
+        ])
+    }
+
+    fn attrs_with_originator(id: u8) -> Arc<Vec<packet::Attribute>> {
+        Arc::new(vec![
+            packet::Attribute::new_with_value(
+                packet::Attribute::ORIGINATOR_ID,
+                u32::from(Ipv4Addr::new(0, 0, 0, id)),
+            )
+            .unwrap(),
+        ])
+    }
+
+    #[test]
+    fn best_path_shorter_cluster_list_wins() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // Two hops in CLUSTER_LIST — inserted first
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_cluster_list(&[1, 2]),
+            None,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+        // One hop in CLUSTER_LIST — shorter wins
+        let update = rt.insert(
+            source(2, 65001, 65000, 2),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_cluster_list(&[1]),
+            None,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
+        assert_eq!(
+            best.source.remote_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    #[test]
+    fn best_path_no_cluster_list_beats_one_hop() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // One hop in CLUSTER_LIST
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            attrs_with_cluster_list(&[1]),
+            None,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+        // No CLUSTER_LIST (length 0) — wins
+        let update = rt.insert(
+            source(2, 65001, 65000, 2),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            empty_attrs(),
+            None,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(update.as_changed().unwrap().best_changed);
+        let best = update.as_changed().unwrap().new_best().unwrap();
+        assert_eq!(
+            best.source.remote_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    #[test]
+    fn best_path_equal_cluster_list_falls_through_to_originator_id() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // Same CLUSTER_LIST length (1), higher ORIGINATOR_ID
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            {
+                let mut attrs = (*attrs_with_cluster_list(&[99])).clone();
+                attrs.push(
+                    packet::Attribute::new_with_value(
+                        packet::Attribute::ORIGINATOR_ID,
+                        u32::from(Ipv4Addr::new(0, 0, 0, 10)),
+                    )
+                    .unwrap(),
+                );
+                Arc::new(attrs)
+            },
+            None,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+        // Same CLUSTER_LIST length (1), lower ORIGINATOR_ID — wins
+        let update = rt.insert(
+            source(2, 65001, 65000, 2),
+            Family::IPV4,
+            net,
+            0,
+            nh(),
+            {
+                let mut attrs = (*attrs_with_cluster_list(&[99])).clone();
+                attrs.push(
+                    packet::Attribute::new_with_value(
+                        packet::Attribute::ORIGINATOR_ID,
+                        u32::from(Ipv4Addr::new(0, 0, 0, 5)),
+                    )
+                    .unwrap(),
+                );
+                Arc::new(attrs)
+            },
             None,
             false,
             None,
