@@ -124,6 +124,116 @@ fn mup_nlri_to_api(m: &mup::MupNlri) -> api::nlri::Nlri {
     }
 }
 
+/// Convert an `api::RouteTarget` to its 8-byte wire representation.
+///
+/// Rejects any RT whose sub_type is not 0x02 (Route Target) to prevent
+/// callers from silently injecting non-RT extended communities into VRFs.
+pub(crate) fn rt_from_api(rt: &api::RouteTarget) -> Result<[u8; 8], Error> {
+    use api::route_target::Rt;
+    let mut buf = [0u8; 8];
+    match rt
+        .rt
+        .as_ref()
+        .ok_or_else(|| Error::InvalidArgument("missing route target".to_string()))?
+    {
+        Rt::TwoOctetAsSpecific(r) => {
+            if r.sub_type != 2 {
+                return Err(Error::InvalidArgument(format!(
+                    "route target sub_type must be 2, got {}",
+                    r.sub_type
+                )));
+            }
+            if r.asn > u16::MAX as u32 {
+                return Err(Error::InvalidArgument(format!(
+                    "two-octet RT ASN out of range: {}",
+                    r.asn
+                )));
+            }
+            buf[0] = 0x00;
+            buf[1] = 0x02;
+            buf[2..4].copy_from_slice(&(r.asn as u16).to_be_bytes());
+            buf[4..8].copy_from_slice(&r.local_admin.to_be_bytes());
+        }
+        Rt::Ipv4AddressSpecific(r) => {
+            if r.sub_type != 2 {
+                return Err(Error::InvalidArgument(format!(
+                    "route target sub_type must be 2, got {}",
+                    r.sub_type
+                )));
+            }
+            if r.local_admin > u16::MAX as u32 {
+                return Err(Error::InvalidArgument(format!(
+                    "IPv4 RT local_admin out of range: {}",
+                    r.local_admin
+                )));
+            }
+            let addr: Ipv4Addr = r
+                .address
+                .parse()
+                .map_err(|e| Error::InvalidArgument(format!("invalid RT IPv4 address: {e}")))?;
+            buf[0] = 0x01;
+            buf[1] = 0x02;
+            buf[2..6].copy_from_slice(&addr.octets());
+            buf[6..8].copy_from_slice(&(r.local_admin as u16).to_be_bytes());
+        }
+        Rt::FourOctetAsSpecific(r) => {
+            if r.sub_type != 2 {
+                return Err(Error::InvalidArgument(format!(
+                    "route target sub_type must be 2, got {}",
+                    r.sub_type
+                )));
+            }
+            if r.local_admin > u16::MAX as u32 {
+                return Err(Error::InvalidArgument(format!(
+                    "four-octet RT local_admin out of range: {}",
+                    r.local_admin
+                )));
+            }
+            buf[0] = 0x02;
+            buf[1] = 0x02;
+            buf[2..6].copy_from_slice(&r.asn.to_be_bytes());
+            buf[6..8].copy_from_slice(&(r.local_admin as u16).to_be_bytes());
+        }
+    }
+    Ok(buf)
+}
+
+/// Convert an 8-byte RT wire value back to `api::RouteTarget`.
+pub(crate) fn rt_to_api(rt: &[u8; 8]) -> api::RouteTarget {
+    use api::route_target::Rt;
+    let rt_val = match rt[0] {
+        0x00 => Rt::TwoOctetAsSpecific(api::TwoOctetAsSpecificExtended {
+            is_transitive: true,
+            sub_type: rt[1] as u32,
+            asn: u16::from_be_bytes([rt[2], rt[3]]) as u32,
+            local_admin: u32::from_be_bytes([rt[4], rt[5], rt[6], rt[7]]),
+        }),
+        0x01 => Rt::Ipv4AddressSpecific(api::IPv4AddressSpecificExtended {
+            is_transitive: true,
+            sub_type: rt[1] as u32,
+            address: Ipv4Addr::new(rt[2], rt[3], rt[4], rt[5]).to_string(),
+            local_admin: u16::from_be_bytes([rt[6], rt[7]]) as u32,
+        }),
+        _ => Rt::FourOctetAsSpecific(api::FourOctetAsSpecificExtended {
+            is_transitive: true,
+            sub_type: rt[1] as u32,
+            asn: u32::from_be_bytes([rt[2], rt[3], rt[4], rt[5]]),
+            local_admin: u16::from_be_bytes([rt[6], rt[7]]) as u32,
+        }),
+    };
+    api::RouteTarget { rt: Some(rt_val) }
+}
+
+pub(crate) fn vrf_to_api(vrf: &rustybgp_table::Vrf) -> api::Vrf {
+    api::Vrf {
+        name: vrf.name.clone(),
+        rd: Some(rd_to_api(&vrf.rd)),
+        import_rt: vrf.import_rt.iter().map(rt_to_api).collect(),
+        export_rt: vrf.export_rt.iter().map(rt_to_api).collect(),
+        id: 0,
+    }
+}
+
 pub(crate) fn rd_to_api(rd: &RouteDistinguisher) -> api::RouteDistinguisher {
     let v = match *rd {
         RouteDistinguisher::TwoOctetAs { admin, assigned } => {
@@ -2508,6 +2618,125 @@ pub(crate) fn load_policy_from_config(
 mod tests {
     use super::*;
     use rustybgp_table::NexthopAction;
+
+    // --- RT conversion ---
+
+    fn two_octet_rt_api(asn: u32, local_admin: u32) -> api::RouteTarget {
+        api::RouteTarget {
+            rt: Some(api::route_target::Rt::TwoOctetAsSpecific(
+                api::TwoOctetAsSpecificExtended {
+                    is_transitive: true,
+                    sub_type: 2,
+                    asn,
+                    local_admin,
+                },
+            )),
+        }
+    }
+
+    fn ipv4_rt_api(addr: &str, local_admin: u32) -> api::RouteTarget {
+        api::RouteTarget {
+            rt: Some(api::route_target::Rt::Ipv4AddressSpecific(
+                api::IPv4AddressSpecificExtended {
+                    is_transitive: true,
+                    sub_type: 2,
+                    address: addr.to_string(),
+                    local_admin,
+                },
+            )),
+        }
+    }
+
+    fn four_octet_rt_api(asn: u32, local_admin: u32) -> api::RouteTarget {
+        api::RouteTarget {
+            rt: Some(api::route_target::Rt::FourOctetAsSpecific(
+                api::FourOctetAsSpecificExtended {
+                    is_transitive: true,
+                    sub_type: 2,
+                    asn,
+                    local_admin,
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn rt_from_api_two_octet_as() {
+        let rt = rt_from_api(&two_octet_rt_api(65000, 100)).unwrap();
+        assert_eq!(rt[0], 0x00);
+        assert_eq!(rt[1], 0x02);
+        assert_eq!(u16::from_be_bytes([rt[2], rt[3]]), 65000);
+        assert_eq!(u32::from_be_bytes([rt[4], rt[5], rt[6], rt[7]]), 100);
+    }
+
+    #[test]
+    fn rt_from_api_ipv4() {
+        let rt = rt_from_api(&ipv4_rt_api("192.0.2.1", 200)).unwrap();
+        assert_eq!(rt[0], 0x01);
+        assert_eq!(rt[1], 0x02);
+        assert_eq!(&rt[2..6], &[192, 0, 2, 1]);
+        assert_eq!(u16::from_be_bytes([rt[6], rt[7]]), 200);
+    }
+
+    #[test]
+    fn rt_from_api_four_octet_as() {
+        let rt = rt_from_api(&four_octet_rt_api(4_200_000_000, 7)).unwrap();
+        assert_eq!(rt[0], 0x02);
+        assert_eq!(rt[1], 0x02);
+        assert_eq!(
+            u32::from_be_bytes([rt[2], rt[3], rt[4], rt[5]]),
+            4_200_000_000
+        );
+        assert_eq!(u16::from_be_bytes([rt[6], rt[7]]), 7);
+    }
+
+    #[test]
+    fn rt_from_api_rejects_wrong_sub_type() {
+        let rt = api::RouteTarget {
+            rt: Some(api::route_target::Rt::TwoOctetAsSpecific(
+                api::TwoOctetAsSpecificExtended {
+                    is_transitive: true,
+                    sub_type: 3, // Route Origin, not Route Target
+                    asn: 65000,
+                    local_admin: 100,
+                },
+            )),
+        };
+        assert!(rt_from_api(&rt).is_err());
+    }
+
+    #[test]
+    fn rt_from_api_rejects_none() {
+        let rt = api::RouteTarget { rt: None };
+        assert!(rt_from_api(&rt).is_err());
+    }
+
+    #[test]
+    fn rt_roundtrip_two_octet() {
+        let original = two_octet_rt_api(65000, 100);
+        let bytes = rt_from_api(&original).unwrap();
+        let back = rt_to_api(&bytes);
+        let bytes2 = rt_from_api(&back).unwrap();
+        assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    fn rt_roundtrip_ipv4() {
+        let original = ipv4_rt_api("10.0.0.1", 42);
+        let bytes = rt_from_api(&original).unwrap();
+        let back = rt_to_api(&bytes);
+        let bytes2 = rt_from_api(&back).unwrap();
+        assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    fn rt_roundtrip_four_octet() {
+        let original = four_octet_rt_api(4_200_000_000, 7);
+        let bytes = rt_from_api(&original).unwrap();
+        let back = rt_to_api(&bytes);
+        let bytes2 = rt_from_api(&back).unwrap();
+        assert_eq!(bytes, bytes2);
+    }
 
     #[test]
     fn nexthop_action_self() {

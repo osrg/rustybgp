@@ -83,9 +83,14 @@ pub(crate) struct TableManager {
     pub(crate) export_policy: ArcSwapOption<table::PolicyAssignment>,
     next_sub_id: std::sync::atomic::AtomicU64,
     subscribers: Mutex<FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>>,
+    vrfs: Mutex<FnvHashMap<String, table::Vrf>>,
+    next_label: std::sync::atomic::AtomicU32,
 }
 
 impl TableManager {
+    /// First available MPLS label (0-15 are reserved per RFC 3032).
+    const LABEL_BASE: u32 = 16;
+
     pub(crate) fn new(num_shards: usize) -> Self {
         TableManager {
             shards: (0..num_shards)
@@ -104,7 +109,103 @@ impl TableManager {
             export_policy: ArcSwapOption::const_empty(),
             next_sub_id: std::sync::atomic::AtomicU64::new(0),
             subscribers: Mutex::new(FnvHashMap::default()),
+            vrfs: Mutex::new(FnvHashMap::default()),
+            next_label: std::sync::atomic::AtomicU32::new(Self::LABEL_BASE),
         }
+    }
+
+    fn allocate_label(&self) -> packet::mpls::MplsLabel {
+        packet::mpls::MplsLabel::new(
+            self.next_label
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) async fn add_vrf(
+        &self,
+        name: String,
+        rd: packet::rd::RouteDistinguisher,
+        import_rt: std::collections::HashSet<[u8; 8]>,
+        export_rt: Vec<[u8; 8]>,
+    ) -> Result<packet::mpls::MplsLabel, table::TableError> {
+        let mut vrfs = self.vrfs.lock().await;
+        if vrfs.contains_key(&name) {
+            return Err(table::TableError::AlreadyExists(name));
+        }
+        let label = self.allocate_label();
+        vrfs.insert(
+            name.clone(),
+            table::Vrf {
+                name,
+                rd,
+                import_rt,
+                export_rt,
+                label,
+            },
+        );
+        Ok(label)
+    }
+
+    pub(crate) async fn delete_vrf(&self, name: &str) -> Result<(), table::TableError> {
+        let mut vrfs = self.vrfs.lock().await;
+        vrfs.remove(name).ok_or(table::TableError::NotFound)?;
+        Ok(())
+    }
+
+    pub(crate) async fn list_vrfs(&self, name: Option<&str>) -> Vec<table::Vrf> {
+        let vrfs = self.vrfs.lock().await;
+        match name {
+            Some(n) => vrfs.get(n).cloned().into_iter().collect(),
+            None => vrfs.values().cloned().collect(),
+        }
+    }
+
+    /// Collect paths from the global VPN table that can be imported into `vrf`.
+    /// Returns destinations with the VPN wrapper stripped (plain V4/V6 NLRI).
+    pub(crate) async fn collect_vrf_paths(
+        &self,
+        vrf_name: &str,
+        family: Family,
+        prefixes: Vec<table::PrefixFilter>,
+        enable_filtered: bool,
+    ) -> Option<Vec<table::DestinationEntry>> {
+        let vpn_family = match family {
+            Family::IPV4 => Family::IPV4_VPN,
+            Family::IPV6 => Family::IPV6_VPN,
+            _ => return None,
+        };
+        let vrf = self.vrfs.lock().await.get(vrf_name)?.clone();
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let t = shard.lock().await;
+            for mut dest in t.rtable.destinations(
+                table::TableQuery::Global,
+                vpn_family,
+                prefixes.clone(),
+                None,
+                enable_filtered,
+            ) {
+                if dest.paths.iter().any(|p| vrf.can_import(&p.attr)) {
+                    // ToLocal() equivalent: strip VPN envelope from NLRI,
+                    // remove EXTENDED_COMMUNITY (export RTs) from each path.
+                    let Some(local_nlri) = table::vpn_to_local_nlri(&dest.net) else {
+                        continue;
+                    };
+                    dest.net = local_nlri;
+                    for path in &mut dest.paths {
+                        let stripped: Vec<_> = path
+                            .attr
+                            .iter()
+                            .filter(|a| a.code() != packet::Attribute::EXTENDED_COMMUNITY)
+                            .cloned()
+                            .collect();
+                        path.attr = std::sync::Arc::new(stripped);
+                    }
+                    out.push(dest);
+                }
+            }
+        }
+        Some(out)
     }
 
     fn dealer<T: Hash>(&self, a: T) -> usize {

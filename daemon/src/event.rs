@@ -2375,13 +2375,39 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::AddPathRequest>,
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
-        let (family, nets, attrs, nexthop) =
-            self.local_path(request.into_inner().path.ok_or(Error::EmptyArgument)?)?;
-        let map_nets = nets.clone();
+        let inner = request.into_inner();
+        let table_type =
+            api::TableType::try_from(inner.table_type).unwrap_or(api::TableType::Global);
+        let (mut family, nets, attrs, nexthop) =
+            self.local_path(inner.path.ok_or(Error::EmptyArgument)?)?;
+        let mut insert_nets = nets.clone();
+        let mut insert_attrs = attrs;
+        if table_type == api::TableType::Vrf {
+            let vrf_id = inner.vrf_id;
+            if vrf_id.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "vrf_id is required for VRF table type".to_string(),
+                )
+                .into());
+            }
+            let vrf = self
+                .tables
+                .list_vrfs(Some(&vrf_id))
+                .await
+                .into_iter()
+                .next()
+                .ok_or_else(|| tonic::Status::not_found(format!("VRF '{}' not found", vrf_id)))?;
+            let (vpn_family, vpn_nets, vpn_attrs) =
+                vrf_export_path(family, insert_nets, insert_attrs, &vrf)?;
+            family = vpn_family;
+            insert_nets = vpn_nets;
+            insert_attrs = vpn_attrs;
+        }
+        let map_nets = insert_nets.clone();
         let timestamp = std::time::SystemTime::now();
         let source = table::Source::local();
-        if let Some(attrs) = attrs {
-            for net in nets.clone() {
+        if let Some(attrs) = insert_attrs {
+            for net in insert_nets {
                 self.tables
                     .insert_route(
                         source.clone(),
@@ -2447,36 +2473,6 @@ impl GoBgpService for GrpcService {
             Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
-        let query = if let Ok(t) = api::TableType::try_from(request.table_type) {
-            match t {
-                api::TableType::Unspecified => {
-                    return Err(tonic::Status::new(
-                        tonic::Code::InvalidArgument,
-                        "table type unspecified",
-                    ));
-                }
-                api::TableType::Global => table::TableQuery::Global,
-                api::TableType::Local | api::TableType::Vrf => {
-                    return Err(tonic::Status::unimplemented("Not yet implemented"));
-                }
-                api::TableType::AdjIn => IpAddr::from_str(&request.name)
-                    .map(table::TableQuery::AdjIn)
-                    .map_err(|_| {
-                        tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
-                    })?,
-                api::TableType::AdjOut => IpAddr::from_str(&request.name)
-                    .map(table::TableQuery::AdjOut)
-                    .map_err(|_| {
-                        tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
-                    })?,
-            }
-        } else {
-            return Err(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "invalid table type",
-            ));
-        };
-
         let prefixes: Vec<table::PrefixFilter> = request
             .prefixes
             .iter()
@@ -2501,6 +2497,72 @@ impl GoBgpService for GrpcService {
             nlri_binary: request.enable_nlri_binary || request.enable_only_binary,
             attr_binary: request.enable_attribute_binary || request.enable_only_binary,
             only_binary: request.enable_only_binary,
+        };
+
+        let query = if let Ok(t) = api::TableType::try_from(request.table_type) {
+            match t {
+                api::TableType::Unspecified => {
+                    return Err(tonic::Status::new(
+                        tonic::Code::InvalidArgument,
+                        "table type unspecified",
+                    ));
+                }
+                api::TableType::Global => table::TableQuery::Global,
+                api::TableType::Local => {
+                    return Err(tonic::Status::unimplemented("Not yet implemented"));
+                }
+                api::TableType::Vrf => {
+                    let vrf_name = request.name.clone();
+                    if vrf_name.is_empty() {
+                        return Err(tonic::Status::new(
+                            tonic::Code::InvalidArgument,
+                            "name (vrf name) is required",
+                        ));
+                    }
+                    if !matches!(family, Family::IPV4 | Family::IPV6) {
+                        return Err(tonic::Status::new(
+                            tonic::Code::InvalidArgument,
+                            format!("unsupported VRF family: {:?}", family),
+                        ));
+                    }
+                    let entries = self
+                        .tables
+                        .collect_vrf_paths(&vrf_name, family, prefixes, enable_filtered)
+                        .await
+                        .ok_or_else(|| {
+                            tonic::Status::not_found(format!("VRF '{}' not found", vrf_name))
+                        })?;
+                    let (tx, rx) = mpsc::channel(1024);
+                    tokio::spawn(async move {
+                        for d in entries {
+                            let r = api::ListPathResponse {
+                                destination: Some(convert::destination_to_api(d, family, &binary)),
+                            };
+                            if tx.send(Ok(r)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    return Ok(tonic::Response::new(Box::pin(
+                        tokio_stream::wrappers::ReceiverStream::new(rx),
+                    )));
+                }
+                api::TableType::AdjIn => IpAddr::from_str(&request.name)
+                    .map(table::TableQuery::AdjIn)
+                    .map_err(|_| {
+                        tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
+                    })?,
+                api::TableType::AdjOut => IpAddr::from_str(&request.name)
+                    .map(table::TableQuery::AdjOut)
+                    .map_err(|_| {
+                        tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
+                    })?,
+            }
+        } else {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "invalid table type",
+            ));
         };
         let mut path_count = 0u64;
         let v: Vec<_> = self
@@ -2578,24 +2640,84 @@ impl GoBgpService for GrpcService {
     }
     async fn add_vrf(
         &self,
-        _request: tonic::Request<api::AddVrfRequest>,
+        request: tonic::Request<api::AddVrfRequest>,
     ) -> Result<tonic::Response<api::AddVrfResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        self.is_available(true).await?;
+        let vrf = request.into_inner().vrf.ok_or(Error::EmptyArgument)?;
+        let name = vrf.name.clone();
+        if name.is_empty() {
+            return Err(Error::InvalidArgument("vrf name is empty".to_string()).into());
+        }
+        let rd = convert::rd_from_api(
+            vrf.rd
+                .as_ref()
+                .ok_or_else(|| Error::InvalidArgument("missing rd".to_string()))?,
+        )?;
+        let import_rt = vrf
+            .import_rt
+            .iter()
+            .map(convert::rt_from_api)
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        let export_rt = vrf
+            .export_rt
+            .iter()
+            .map(convert::rt_from_api)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.tables
+            .add_vrf(name, rd, import_rt, export_rt)
+            .await
+            .map_err(Error::Table)?;
+        Ok(tonic::Response::new(api::AddVrfResponse {}))
     }
+
     async fn delete_vrf(
         &self,
-        _request: tonic::Request<api::DeleteVrfRequest>,
+        request: tonic::Request<api::DeleteVrfRequest>,
     ) -> Result<tonic::Response<api::DeleteVrfResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        self.is_available(true).await?;
+        let name = request.into_inner().name;
+        if name.is_empty() {
+            return Err(Error::InvalidArgument("vrf name is empty".to_string()).into());
+        }
+        self.tables.delete_vrf(&name).await.map_err(Error::Table)?;
+        Ok(tonic::Response::new(api::DeleteVrfResponse {}))
     }
+
     type ListVrfStream = Pin<
         Box<dyn Stream<Item = Result<api::ListVrfResponse, tonic::Status>> + Send + Sync + 'static>,
     >;
+
     async fn list_vrf(
         &self,
-        _request: tonic::Request<api::ListVrfRequest>,
+        request: tonic::Request<api::ListVrfRequest>,
     ) -> Result<tonic::Response<Self::ListVrfStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        self.is_available(false).await?;
+        let name_filter = request.into_inner().name;
+        let filter = if name_filter.is_empty() {
+            None
+        } else {
+            Some(name_filter.as_str())
+        };
+        let vrfs = self.tables.list_vrfs(filter).await;
+        let responses: Vec<_> = vrfs
+            .iter()
+            .map(|v| {
+                Ok(api::ListVrfResponse {
+                    vrf: Some(convert::vrf_to_api(v)),
+                })
+            })
+            .collect();
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            for r in responses {
+                if tx.send(r).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(tonic::Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
     async fn add_policy(
         &self,
@@ -4355,6 +4477,93 @@ async fn process_restarting_outputs(
 
     // Flatten: None (no output) and Some(None) (disabled) both mean "don't start timer".
     start_timer.flatten()
+}
+
+/// Convert plain IPv4/IPv6 NLRIs to VPNv4/VPNv6 for VRF export.
+///
+/// Attaches the VRF's RD, label, and export RTs (as EXTENDED_COMMUNITY) to
+/// each path, then returns the translated family and updated NLRI/attrs.
+type ExportedPath = (
+    Family,
+    Vec<packet::PathNlri>,
+    Option<Arc<Vec<packet::Attribute>>>,
+);
+
+fn vrf_export_path(
+    family: Family,
+    nets: Vec<packet::PathNlri>,
+    attrs: Option<Arc<Vec<packet::Attribute>>>,
+    vrf: &table::Vrf,
+) -> Result<ExportedPath, tonic::Status> {
+    let vpn_family = match family {
+        Family::IPV4 => Family::IPV4_VPN,
+        Family::IPV6 => Family::IPV6_VPN,
+        _ => {
+            return Err(tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "VRF add_path only supports IPv4/IPv6 families",
+            ));
+        }
+    };
+
+    let vpn_nets: Vec<packet::PathNlri> = nets
+        .into_iter()
+        .map(|pn| {
+            let vpn_nlri = match pn.nlri {
+                packet::Nlri::V4(prefix) => packet::Nlri::VpnV4(packet::vpn::VpnV4Nlri {
+                    labels: packet::mpls::MplsLabelStack::new(vec![vrf.label]),
+                    rd: vrf.rd,
+                    prefix,
+                }),
+                packet::Nlri::V6(prefix) => packet::Nlri::VpnV6(packet::vpn::VpnV6Nlri {
+                    labels: packet::mpls::MplsLabelStack::new(vec![vrf.label]),
+                    rd: vrf.rd,
+                    prefix,
+                }),
+                other => {
+                    return Err(tonic::Status::new(
+                        tonic::Code::InvalidArgument,
+                        format!("unsupported NLRI type for VRF export: {:?}", other),
+                    ));
+                }
+            };
+            Ok(packet::PathNlri {
+                path_id: pn.path_id,
+                nlri: vpn_nlri,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let vpn_attrs = if vrf.export_rt.is_empty() {
+        attrs
+    } else {
+        let rt_bytes: Vec<u8> = vrf
+            .export_rt
+            .iter()
+            .flat_map(|rt| rt.iter().copied())
+            .collect();
+        let mut new_attrs: Vec<packet::Attribute> =
+            attrs.as_deref().map_or_else(Vec::new, |v| v.to_vec());
+        if let Some(ec) = new_attrs
+            .iter_mut()
+            .find(|a| a.code() == packet::bgp::Attribute::EXTENDED_COMMUNITY)
+        {
+            let mut data = ec.binary().cloned().unwrap_or_default();
+            data.extend_from_slice(&rt_bytes);
+            *ec = packet::Attribute::new_with_bin(packet::bgp::Attribute::EXTENDED_COMMUNITY, data)
+                .unwrap();
+        } else {
+            if let Some(ec) = packet::Attribute::new_with_bin(
+                packet::bgp::Attribute::EXTENDED_COMMUNITY,
+                rt_bytes,
+            ) {
+                new_attrs.push(ec);
+            }
+        }
+        Some(Arc::new(new_attrs))
+    };
+
+    Ok((vpn_family, vpn_nets, vpn_attrs))
 }
 
 async fn gr_selection_deferral_timer_expired(global: GlobalHandle, tables: TableHandle) {
@@ -10516,5 +10725,401 @@ neighbor-address = "10.0.0.1"
         assert!(!exceeded, "loop detection must not trigger CEASE");
         let state = tables.table_state(Family::IPV4).await;
         assert_eq!(state.num_destination, 0, "route must not be inserted");
+    }
+
+    // --- VRF gRPC end-to-end ---
+
+    fn two_octet_rt(asn: u32, local_admin: u32) -> api::RouteTarget {
+        api::RouteTarget {
+            rt: Some(api::route_target::Rt::TwoOctetAsSpecific(
+                api::TwoOctetAsSpecificExtended {
+                    is_transitive: true,
+                    sub_type: 2,
+                    asn,
+                    local_admin,
+                },
+            )),
+        }
+    }
+
+    fn make_vrf_req(
+        name: &str,
+        rd_asn: u32,
+        rd_admin: u32,
+        rt_asn: u32,
+        rt_local: u32,
+    ) -> api::AddVrfRequest {
+        api::AddVrfRequest {
+            vrf: Some(api::Vrf {
+                name: name.to_string(),
+                rd: Some(api::RouteDistinguisher {
+                    rd: Some(api::route_distinguisher::Rd::TwoOctetAsn(
+                        api::RouteDistinguisherTwoOctetAsn {
+                            admin: rd_asn,
+                            assigned: rd_admin,
+                        },
+                    )),
+                }),
+                import_rt: vec![two_octet_rt(rt_asn, rt_local)],
+                export_rt: vec![two_octet_rt(rt_asn, rt_local)],
+                ..Default::default()
+            }),
+        }
+    }
+
+    async fn collect_list_vrf(svc: &GrpcService, name: &str) -> Vec<api::Vrf> {
+        let req = tonic::Request::new(api::ListVrfRequest {
+            name: name.to_string(),
+        });
+        let stream = svc.list_vrf(req).await.unwrap().into_inner();
+        stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok()?.vrf)
+            .collect()
+    }
+
+    async fn collect_list_path_vrf(
+        svc: &GrpcService,
+        vrf_name: &str,
+        afi: i32,
+        safi: i32,
+    ) -> Vec<api::Destination> {
+        let req = tonic::Request::new(api::ListPathRequest {
+            table_type: api::TableType::Vrf as i32,
+            name: vrf_name.to_string(),
+            family: Some(api::Family { afi, safi }),
+            ..Default::default()
+        });
+        let stream = svc.list_path(req).await.unwrap().into_inner();
+        stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok()?.destination)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn add_vrf_and_list_vrf() {
+        let svc = make_grpc_service();
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf1", 65000, 1, 65000, 1,
+        )))
+        .await
+        .unwrap();
+        let vrfs = collect_list_vrf(&svc, "vrf1").await;
+        assert_eq!(vrfs.len(), 1);
+        assert_eq!(vrfs[0].name, "vrf1");
+    }
+
+    #[tokio::test]
+    async fn add_vrf_duplicate_returns_error() {
+        let svc = make_grpc_service();
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf1", 65000, 1, 65000, 1,
+        )))
+        .await
+        .unwrap();
+        let err = svc
+            .add_vrf(tonic::Request::new(make_vrf_req(
+                "vrf1", 65000, 2, 65000, 2,
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn delete_vrf_removes_it() {
+        let svc = make_grpc_service();
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf1", 65000, 1, 65000, 1,
+        )))
+        .await
+        .unwrap();
+        svc.delete_vrf(tonic::Request::new(api::DeleteVrfRequest {
+            name: "vrf1".to_string(),
+        }))
+        .await
+        .unwrap();
+        let vrfs = collect_list_vrf(&svc, "vrf1").await;
+        assert!(vrfs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_vrf_not_found_returns_error() {
+        let svc = make_grpc_service();
+        let err = svc
+            .delete_vrf(tonic::Request::new(api::DeleteVrfRequest {
+                name: "noexist".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn consecutive_vrfs_get_different_labels() {
+        let svc = make_grpc_service();
+        // Both VRFs use the same RT so both import the other's routes; they differ only by RD.
+        // Injecting the same prefix into each VRF produces two distinct VPN NLRI (different labels),
+        // which means the global IPV4_VPN table has two destinations.
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf1", 65000, 1, 65000, 100,
+        )))
+        .await
+        .unwrap();
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf2", 65000, 2, 65000, 100,
+        )))
+        .await
+        .unwrap();
+
+        for vrf in ["vrf1", "vrf2"] {
+            let req = tonic::Request::new(api::AddPathRequest {
+                table_type: api::TableType::Vrf as i32,
+                vrf_id: vrf.to_string(),
+                path: Some(ipv4_path("10.1.0.0", 24, "10.0.0.1")),
+            });
+            svc.add_path(req).await.unwrap();
+        }
+
+        let req = tonic::Request::new(api::ListPathRequest {
+            table_type: api::TableType::Global as i32,
+            family: Some(api::Family { afi: 1, safi: 128 }),
+            ..Default::default()
+        });
+        let stream = svc.list_path(req).await.unwrap().into_inner();
+        let dests: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok()?.destination)
+            .collect();
+        // Each VRF gets a unique label so they produce distinct VPN NLRI (two separate destinations)
+        assert_eq!(
+            dests.len(),
+            2,
+            "each VRF label yields a distinct VPN destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_path_vrf_appears_in_global_vpn_table() {
+        let svc = make_grpc_service();
+        // Create VRF with RT 65000:100
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf1", 65000, 100, 65000, 100,
+        )))
+        .await
+        .unwrap();
+
+        // Inject a plain IPv4 route via the VRF table type
+        let req = tonic::Request::new(api::AddPathRequest {
+            table_type: api::TableType::Vrf as i32,
+            vrf_id: "vrf1".to_string(),
+            path: Some(ipv4_path("10.1.0.0", 24, "10.0.0.1")),
+        });
+        svc.add_path(req).await.unwrap();
+
+        // The route must appear in the global IPV4_VPN table (AFI=1, SAFI=128)
+        let req = tonic::Request::new(api::ListPathRequest {
+            table_type: api::TableType::Global as i32,
+            family: Some(api::Family { afi: 1, safi: 128 }),
+            ..Default::default()
+        });
+        let stream = svc.list_path(req).await.unwrap().into_inner();
+        let dests: Vec<_> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok()?.destination)
+            .collect();
+        assert_eq!(dests.len(), 1, "VPN route must be in global VPN table");
+    }
+
+    #[tokio::test]
+    async fn list_path_vrf_shows_plain_prefix() {
+        let svc = make_grpc_service();
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf1", 65000, 100, 65000, 100,
+        )))
+        .await
+        .unwrap();
+
+        let req = tonic::Request::new(api::AddPathRequest {
+            table_type: api::TableType::Vrf as i32,
+            vrf_id: "vrf1".to_string(),
+            path: Some(ipv4_path("192.0.2.0", 24, "10.0.0.1")),
+        });
+        svc.add_path(req).await.unwrap();
+
+        // list_path with TABLE_TYPE_VRF applies ToLocal(): the destination prefix
+        // and the path NLRI are plain unicast (IPv4/IPv6), matching GoBGP behavior.
+        let dests = collect_list_path_vrf(&svc, "vrf1", 1, 1).await;
+        assert_eq!(dests.len(), 1);
+        // destination.prefix is a plain CIDR string ("192.0.2.0/24"), not VPN format.
+        assert_eq!(
+            dests[0].prefix, "192.0.2.0/24",
+            "expected plain CIDR, got: {}",
+            dests[0].prefix
+        );
+        // path.nlri must be IpAddressPrefix (plain), not LabeledVpnIpPrefix.
+        let path_nlri = dests[0].paths[0].nlri.as_ref().unwrap();
+        assert!(
+            matches!(path_nlri.nlri, Some(api::nlri::Nlri::Prefix(_))),
+            "expected plain IpAddressPrefix NLRI"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_vrf_to_local_family_and_no_ext_community() {
+        // ToLocal() must:
+        //   1. return paths with unicast family (afi=1/safi=1 for IPv4), not VPN family
+        //   2. remove EXTENDED_COMMUNITY attribute (export RTs) from each path
+        let svc = make_grpc_service();
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf1", 65000, 100, 65000, 100,
+        )))
+        .await
+        .unwrap();
+
+        let req = tonic::Request::new(api::AddPathRequest {
+            table_type: api::TableType::Vrf as i32,
+            vrf_id: "vrf1".to_string(),
+            path: Some(ipv4_path("10.0.1.0", 24, "10.0.0.1")),
+        });
+        svc.add_path(req).await.unwrap();
+
+        let dests = collect_list_path_vrf(&svc, "vrf1", 1, 1).await;
+        assert_eq!(dests.len(), 1);
+
+        let path = &dests[0].paths[0];
+
+        // family must be IPv4 unicast (afi=1, safi=1), not IPv4 VPN (afi=1, safi=128)
+        let fam = path.family.as_ref().expect("family must be set");
+        assert_eq!(fam.afi, 1, "expected AFI_IP (1), got {}", fam.afi);
+        assert_eq!(fam.safi, 1, "expected SAFI_UNICAST (1), got {}", fam.safi);
+
+        // EXTENDED_COMMUNITY must not appear in the path attributes
+        let has_ext_comm = path
+            .pattrs
+            .iter()
+            .any(|a| matches!(a.attr, Some(api::attribute::Attr::ExtendedCommunities(_))));
+        assert!(
+            !has_ext_comm,
+            "EXTENDED_COMMUNITY must be stripped from VRF list_path response"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_vrf_ipv6_to_local() {
+        // Verify ToLocal() works correctly for IPv6 VRF paths:
+        //   destination.prefix must be plain IPv6 CIDR parseable by net.ParseCIDR,
+        //   path NLRI must be IpAddressPrefix (not LabeledVpnIpPrefix),
+        //   path family must be IPv6 unicast (afi=2, safi=1).
+        let svc = make_grpc_service();
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf1", 65000, 100, 65000, 100,
+        )))
+        .await
+        .unwrap();
+
+        let ipv6_path = api::Path {
+            family: Some(api::Family { afi: 2, safi: 1 }),
+            nlri: Some(api::Nlri {
+                nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
+                    prefix: "2001:db8::".to_string(),
+                    prefix_len: 32,
+                })),
+            }),
+            pattrs: vec![
+                api::Attribute {
+                    attr: Some(api::attribute::Attr::Origin(api::OriginAttribute {
+                        origin: 0,
+                    })),
+                },
+                api::Attribute {
+                    attr: Some(api::attribute::Attr::MpReach(api::MpReachNlriAttribute {
+                        family: Some(api::Family { afi: 2, safi: 1 }),
+                        next_hops: vec!["::1".to_string()],
+                        nlris: vec![],
+                    })),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let req = tonic::Request::new(api::AddPathRequest {
+            table_type: api::TableType::Vrf as i32,
+            vrf_id: "vrf1".to_string(),
+            path: Some(ipv6_path),
+        });
+        svc.add_path(req).await.unwrap();
+
+        // AFI=2 (IPv6), SAFI=1 (unicast) — VRF view
+        let dests = collect_list_path_vrf(&svc, "vrf1", 2, 1).await;
+        assert_eq!(dests.len(), 1, "IPv6 VRF path must appear");
+
+        // destination.prefix must be a plain IPv6 CIDR
+        assert_eq!(
+            dests[0].prefix, "2001:db8::/32",
+            "expected plain IPv6 CIDR, got: {}",
+            dests[0].prefix
+        );
+
+        let path = &dests[0].paths[0];
+
+        // path NLRI must be plain IpAddressPrefix
+        let nlri = path.nlri.as_ref().unwrap();
+        assert!(
+            matches!(nlri.nlri, Some(api::nlri::Nlri::Prefix(_))),
+            "expected IpAddressPrefix NLRI for IPv6 VRF path"
+        );
+
+        // family must be IPv6 unicast (afi=2, safi=1)
+        let fam = path.family.as_ref().unwrap();
+        assert_eq!(fam.afi, 2, "expected AFI_IP6 (2), got {}", fam.afi);
+        assert_eq!(fam.safi, 1, "expected SAFI_UNICAST (1), got {}", fam.safi);
+
+        // EXTENDED_COMMUNITY must be absent
+        assert!(
+            !path
+                .pattrs
+                .iter()
+                .any(|a| matches!(a.attr, Some(api::attribute::Attr::ExtendedCommunities(_)))),
+            "EXTENDED_COMMUNITY must be stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_vrf_rt_isolation() {
+        let svc = make_grpc_service();
+        // vrf1 uses RT 65000:1; vrf2 uses RT 65000:2 — routes must not leak
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf1", 65000, 1, 65000, 1,
+        )))
+        .await
+        .unwrap();
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf2", 65000, 2, 65000, 2,
+        )))
+        .await
+        .unwrap();
+
+        let req = tonic::Request::new(api::AddPathRequest {
+            table_type: api::TableType::Vrf as i32,
+            vrf_id: "vrf1".to_string(),
+            path: Some(ipv4_path("10.1.0.0", 24, "10.0.0.1")),
+        });
+        svc.add_path(req).await.unwrap();
+
+        let dests_vrf1 = collect_list_path_vrf(&svc, "vrf1", 1, 1).await;
+        let dests_vrf2 = collect_list_path_vrf(&svc, "vrf2", 1, 1).await;
+
+        assert_eq!(dests_vrf1.len(), 1, "vrf1 must see its own route");
+        assert_eq!(dests_vrf2.len(), 0, "vrf2 must not see vrf1's route");
     }
 }

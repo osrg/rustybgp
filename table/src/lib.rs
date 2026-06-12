@@ -15,6 +15,7 @@
 
 use fnv::FnvHashMap;
 use patricia_tree::PatriciaMap;
+use std::collections::HashSet;
 use std::convert::Into;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr};
@@ -35,6 +36,55 @@ pub enum TableError {
     NotFound,
     #[error("entity still in use")]
     StillInUse(String),
+}
+
+/// VRF (Virtual Routing and Forwarding) instance for BGP/MPLS IP VPN (RFC 4364).
+///
+/// Routes received from peers are imported when their extended communities
+/// contain at least one RT that matches `import_rt`.  Routes injected via
+/// the API are exported to the global VPN table with `rd`, `label`, and
+/// the `export_rt` set attached as extended communities.
+#[derive(Clone, Debug)]
+pub struct Vrf {
+    pub name: String,
+    pub rd: packet::rd::RouteDistinguisher,
+    /// Each entry is the 8-byte wire encoding of a Route Target extended
+    /// community (type/sub-type + value).  Stored as raw bytes for O(1)
+    /// lookup against the extended communities of incoming VPN routes.
+    pub import_rt: HashSet<[u8; 8]>,
+    pub export_rt: Vec<[u8; 8]>,
+    pub label: packet::mpls::MplsLabel,
+}
+
+impl Vrf {
+    /// Returns true when at least one RT in `attrs` extended communities
+    /// matches this VRF's import_rt set.
+    pub fn can_import(&self, attrs: &[Attribute]) -> bool {
+        for attr in attrs {
+            if attr.code() == Attribute::EXTENDED_COMMUNITY {
+                let Some(data) = attr.binary() else {
+                    continue;
+                };
+                for chunk in data.chunks_exact(8) {
+                    let bytes: [u8; 8] = chunk.try_into().unwrap();
+                    if self.import_rt.contains(&bytes) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Strip the VPN envelope from a VPNv4/VPNv6 NLRI, returning the plain
+/// IPv4/IPv6 prefix as seen inside the VRF.
+pub fn vpn_to_local_nlri(nlri: &packet::Nlri) -> Option<packet::Nlri> {
+    match nlri {
+        packet::Nlri::VpnV4(v) => Some(packet::Nlri::V4(v.prefix)),
+        packet::Nlri::VpnV6(v) => Some(packet::Nlri::V6(v.prefix)),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -4937,5 +4987,100 @@ mod tests {
         let reaches: Vec<_> = rt.iter_reach(Family::IPV4).collect();
         assert_eq!(reaches.len(), 1);
         assert_eq!(reaches[0].attr, original);
+    }
+
+    // --- Vrf::can_import ---
+
+    fn make_vrf(import_rts: Vec<[u8; 8]>) -> Vrf {
+        Vrf {
+            name: "test".to_string(),
+            rd: packet::rd::RouteDistinguisher::TwoOctetAs {
+                admin: 65000,
+                assigned: 1,
+            },
+            import_rt: import_rts.into_iter().collect(),
+            export_rt: Vec::new(),
+            label: packet::mpls::MplsLabel::new(16),
+        }
+    }
+
+    fn ext_community_attr(rts: &[[u8; 8]]) -> packet::Attribute {
+        let mut data = Vec::with_capacity(rts.len() * 8);
+        for rt in rts {
+            data.extend_from_slice(rt);
+        }
+        packet::Attribute::new_with_bin(packet::Attribute::EXTENDED_COMMUNITY, data).unwrap()
+    }
+
+    #[test]
+    fn can_import_matching_rt() {
+        let rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x64];
+        let vrf = make_vrf(vec![rt]);
+        let attrs = vec![ext_community_attr(&[rt])];
+        assert!(vrf.can_import(&attrs));
+    }
+
+    #[test]
+    fn can_import_no_match() {
+        let rt_import: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x64];
+        let rt_other: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x65];
+        let vrf = make_vrf(vec![rt_import]);
+        let attrs = vec![ext_community_attr(&[rt_other])];
+        assert!(!vrf.can_import(&attrs));
+    }
+
+    #[test]
+    fn can_import_multiple_rts_one_matches() {
+        let rt_a: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x01];
+        let rt_b: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x02];
+        let vrf = make_vrf(vec![rt_b]);
+        // path carries both RT A and RT B; RT B matches
+        let attrs = vec![ext_community_attr(&[rt_a, rt_b])];
+        assert!(vrf.can_import(&attrs));
+    }
+
+    #[test]
+    fn can_import_empty_import_rt() {
+        let rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x64];
+        let vrf = make_vrf(vec![]);
+        let attrs = vec![ext_community_attr(&[rt])];
+        assert!(!vrf.can_import(&attrs));
+    }
+
+    #[test]
+    fn can_import_no_ext_community_attr() {
+        let rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x64];
+        let vrf = make_vrf(vec![rt]);
+        let attrs: Vec<packet::Attribute> = vec![];
+        assert!(!vrf.can_import(&attrs));
+    }
+
+    // --- vpn_to_local_nlri ---
+
+    #[test]
+    fn vpn_to_local_nlri_v4() {
+        use std::net::Ipv4Addr;
+        let prefix = packet::bgp::Ipv4Net {
+            addr: Ipv4Addr::new(10, 0, 1, 0),
+            mask: 24,
+        };
+        let rd = packet::rd::RouteDistinguisher::TwoOctetAs {
+            admin: 65000,
+            assigned: 100,
+        };
+        let labels = packet::mpls::MplsLabelStack::new(vec![packet::mpls::MplsLabel::new(16)]);
+        let vpn = packet::Nlri::VpnV4(packet::vpn::VpnV4Nlri { prefix, rd, labels });
+        let local = vpn_to_local_nlri(&vpn).unwrap();
+        assert_eq!(local, packet::Nlri::V4(prefix));
+    }
+
+    #[test]
+    fn vpn_to_local_nlri_non_vpn_returns_none() {
+        use std::net::Ipv4Addr;
+        let plain = packet::Nlri::V4(packet::bgp::Ipv4Net {
+            addr: Ipv4Addr::new(10, 0, 0, 0),
+            mask: 8,
+        });
+        assert!(vpn_to_local_nlri(&plain).is_none());
     }
 }
