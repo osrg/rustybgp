@@ -142,7 +142,7 @@ fn build_many_v4_route() {
         nexthop: None,
     });
     for n in &net {
-        set.insert(PathNlri::new(*n));
+        set.insert(PathNlri::new(n.clone()));
     }
 
     framer.encode_to(&msg, &mut txbuf).unwrap();

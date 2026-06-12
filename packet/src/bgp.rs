@@ -34,12 +34,18 @@ impl Family {
 
     const SAFI_UNICAST: u8 = 1;
     const SAFI_MUP: u8 = 85;
+    const SAFI_MPLS_VPN: u8 = 128;
+    const SAFI_MPLS_VPN6: u8 = 129;
 
     pub const EMPTY: Family = Family(0);
     pub const IPV4: Family = Family((Family::AFI_IP as u32) << 16 | Family::SAFI_UNICAST as u32);
     pub const IPV6: Family = Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_UNICAST as u32);
     pub const IPV4_MUP: Family = Family((Family::AFI_IP as u32) << 16 | Family::SAFI_MUP as u32);
     pub const IPV6_MUP: Family = Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_MUP as u32);
+    pub const IPV4_VPN: Family =
+        Family((Family::AFI_IP as u32) << 16 | Family::SAFI_MPLS_VPN as u32);
+    pub const IPV6_VPN: Family =
+        Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_MPLS_VPN6 as u32);
 
     pub fn new(v: u32) -> Self {
         Family(v)
@@ -172,12 +178,13 @@ impl fmt::Display for IpNet {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub enum Nlri {
     V4(Ipv4Net),
     V6(Ipv6Net),
     Mup(crate::mup::MupNlri),
-    // add more Family here
+    VpnV4(crate::vpn::VpnV4Nlri),
+    VpnV6(crate::vpn::VpnV6Nlri),
 }
 
 impl Nlri {
@@ -186,6 +193,8 @@ impl Nlri {
             Nlri::V4(net) => net.encode(dst),
             Nlri::V6(net) => net.encode(dst),
             Nlri::Mup(m) => Ok(m.encode(dst)),
+            Nlri::VpnV4(n) => Ok(n.encode(dst)),
+            Nlri::VpnV6(n) => Ok(n.encode(dst)),
         }
     }
 
@@ -205,6 +214,8 @@ impl Nlri {
             Family::IPV4_MUP | Family::IPV6_MUP => {
                 crate::mup::MupNlri::decode(family, c, len).map(Nlri::Mup)
             }
+            Family::IPV4_VPN => crate::vpn::VpnV4Nlri::decode(c, len).map(Nlri::VpnV4),
+            Family::IPV6_VPN => crate::vpn::VpnV6Nlri::decode(c, len).map(Nlri::VpnV6),
             _ => Err(BgpError::UpdateMalformedAttributeList.into()),
         }
     }
@@ -230,13 +241,15 @@ impl fmt::Display for Nlri {
             Nlri::V4(net) => net.fmt(f),
             Nlri::V6(net) => net.fmt(f),
             Nlri::Mup(m) => m.fmt(f),
+            Nlri::VpnV4(n) => n.fmt(f),
+            Nlri::VpnV6(n) => n.fmt(f),
         }
     }
 }
 
 /// An NLRI entry with an optional AddPath path identifier (RFC 7911).
 /// `path_id` is 0 when AddPath is not negotiated for the address family.
-#[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct PathNlri {
     pub path_id: u32,
     pub nlri: Nlri,
@@ -1445,9 +1458,14 @@ impl PeerCodec {
         dst.put_u8(family.safi());
         // Attribute transformation (nexthop rewrite) is applied by PeerExportContext
         // before routes enter PendingTx, so the nexthop here is already the export
-        // nexthop.  Pad IPv4/IPv6 to at least 16 bytes for MP_REACH.
+        // nexthop.  VPN families prefix the nexthop with an 8-byte zero RD (RFC 4364
+        // §4.3.2); other families pad IPv4 to 16 bytes for MP_REACH.
         let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
-        let padded = if nh_bytes.len() < 16 {
+        let padded = if matches!(family, &Family::IPV4_VPN | &Family::IPV6_VPN) {
+            let mut v = vec![0u8; 8];
+            v.extend_from_slice(&nh_bytes);
+            v
+        } else if nh_bytes.len() < 16 {
             let mut v = vec![0u8; 16];
             v[..nh_bytes.len()].copy_from_slice(&nh_bytes);
             v
@@ -2060,6 +2078,16 @@ impl PeerCodec {
                     match nexthop_len {
                         4 | 16 | 32 => {
                             for _ in 0..nexthop_len {
+                                data.push(c.read_u8().unwrap());
+                            }
+                            mp_nexthop = Nexthop::from_bytes(&data);
+                        }
+                        // VPN nexthop (RFC 4364 §4.3.2): 8-byte RD (must be 0) + IP address.
+                        12 | 24 => {
+                            for _ in 0..8 {
+                                c.read_u8().unwrap();
+                            }
+                            for _ in 0..(nexthop_len - 8) {
                                 data.push(c.read_u8().unwrap());
                             }
                             mp_nexthop = Nexthop::from_bytes(&data);

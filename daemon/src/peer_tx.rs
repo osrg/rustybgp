@@ -67,7 +67,7 @@ impl PendingTx {
         let pid = if self.addpath_tx { path_id } else { 0 };
         let key: PendingKey = (nlri, pid);
         self.unreach.remove(&key);
-        if let Some((old_attr, _)) = self.reach.insert(key, (attr.clone(), nexthop)) {
+        if let Some((old_attr, _)) = self.reach.insert(key.clone(), (attr.clone(), nexthop)) {
             // b-1) same attr → no-op
             if old_attr == attr {
                 return;
@@ -143,7 +143,7 @@ impl PendingTx {
                 family,
                 entries: keys
                     .iter()
-                    .copied()
+                    .cloned()
                     .map(|(nlri, pid)| packet::PathNlri {
                         path_id: if self.addpath_tx { pid } else { 0 },
                         nlri,

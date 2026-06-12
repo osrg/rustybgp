@@ -106,7 +106,7 @@ impl Handle {
         let (dst, prefix_len) = match change.net {
             packet::Nlri::V4(net) => (IpAddr::V4(net.addr), net.mask),
             packet::Nlri::V6(net) => (IpAddr::V6(net.addr), net.mask),
-            packet::Nlri::Mup(_) => return Ok(()),
+            packet::Nlri::Mup(_) | packet::Nlri::VpnV4(_) | packet::Nlri::VpnV6(_) => return Ok(()),
         };
         if change.nexthops.is_empty() {
             return self.withdraw(dst, prefix_len).await;

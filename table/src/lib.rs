@@ -77,7 +77,7 @@ pub enum LookupType {
 }
 
 /// A prefix together with the match semantics to apply when filtering RIB entries.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PrefixFilter {
     pub prefix: packet::Nlri,
     pub lookup_type: LookupType,
@@ -610,7 +610,7 @@ impl Table {
                 }
                 Some(NlriChange {
                     family: *family,
-                    net: *net,
+                    net: net.clone(),
                     best_changed: true,
                     any_changed: true,
                     replaced_path_id: None,
@@ -663,7 +663,7 @@ impl Table {
                     source: e.path.source.clone(),
                     family,
                     net: packet::bgp::PathNlri {
-                        nlri: *net,
+                        nlri: net.clone(),
                         path_id: e.remote_path_id,
                     },
                     attr: e.original_attr.clone(),
@@ -705,7 +705,7 @@ impl Table {
                     }
                     out.push((
                         *family,
-                        *net,
+                        net.clone(),
                         entry.remote_path_id,
                         entry.path.nexthop,
                         Arc::clone(&entry.path.source),
@@ -852,11 +852,18 @@ impl Table {
                 let paths = match query {
                     TableQuery::Global => Self::global_paths(dst, enable_filtered),
                     TableQuery::AdjIn(peer) => Self::adj_in_paths(dst, peer, enable_filtered),
-                    TableQuery::AdjOut(peer) => {
-                        Self::adj_out_paths(dst, peer, *net, family, export_policy.as_deref())
-                    }
+                    TableQuery::AdjOut(peer) => Self::adj_out_paths(
+                        dst,
+                        peer,
+                        net.clone(),
+                        family,
+                        export_policy.as_deref(),
+                    ),
                 };
-                DestinationEntry { net: *net, paths }
+                DestinationEntry {
+                    net: net.clone(),
+                    paths,
+                }
             })
             .filter(|d| !d.paths.is_empty())
     }
@@ -879,7 +886,10 @@ impl Table {
 
         let rt = self.ribs.entry(family).or_default();
         let deferring = rt.deferring;
-        let dst = rt.destinations.entry(net).or_insert_with(Destination::new);
+        let dst = rt
+            .destinations
+            .entry(net.clone())
+            .or_insert_with(Destination::new);
 
         // Capture the current best's (source, attr) Arc pointers before any modification.
         // Comparing them with the post-insertion best detects all best-path changes:
@@ -1132,7 +1142,7 @@ impl Table {
                 if dst.entry.is_empty() {
                     changes.push(NlriChange {
                         family,
-                        net: *net,
+                        net: net.clone(),
                         best_changed: true,
                         any_changed: true,
                         replaced_path_id: None,
@@ -1151,7 +1161,7 @@ impl Table {
                 );
                 changes.push(NlriChange {
                     family,
-                    net: *net,
+                    net: net.clone(),
                     best_changed: old_best_id != new_best_id,
                     any_changed: true,
                     replaced_path_id: None,
@@ -1208,7 +1218,7 @@ impl Table {
                 if dst.entry.is_empty() {
                     changes.push(NlriChange {
                         family,
-                        net: *net,
+                        net: net.clone(),
                         best_changed: true,
                         any_changed: true,
                         replaced_path_id: None,
@@ -1227,7 +1237,7 @@ impl Table {
                 );
                 changes.push(NlriChange {
                     family,
-                    net: *net,
+                    net: net.clone(),
                     best_changed: old_best_id != new_best_id,
                     any_changed: true,
                     replaced_path_id: None,
@@ -1274,7 +1284,7 @@ impl Table {
                     );
                     changes.push(NlriChange {
                         family,
-                        net: *net,
+                        net: net.clone(),
                         best_changed,
                         any_changed: any_unfiltered_from_addr,
                         replaced_path_id: None,
@@ -1404,7 +1414,9 @@ impl RpkiTable {
                 let (mut addr, mask) = match net {
                     packet::Nlri::V4(net) => (net.addr.octets().to_vec(), net.mask),
                     packet::Nlri::V6(net) => (net.addr.octets().to_vec(), net.mask),
-                    packet::Nlri::Mup(_) => return None,
+                    packet::Nlri::Mup(_) | packet::Nlri::VpnV4(_) | packet::Nlri::VpnV6(_) => {
+                        return None;
+                    }
                 };
                 addr.drain((mask.div_ceil(8)) as usize..);
                 for (ipnet, entry) in m.iter_prefix(&addr) {
@@ -1608,7 +1620,7 @@ mod tests {
         let mut result = Vec::new();
         for change in rt.collect_loc_rib_paths(family) {
             for (i, path) in change.current_paths.iter().cloned().enumerate() {
-                result.push((change.net, path, i + 1));
+                result.push((change.net.clone(), path, i + 1));
             }
         }
         result
@@ -1648,7 +1660,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             family,
-            n1,
+            n1.clone(),
             0,
             nh(),
             attrs.clone(),
@@ -1660,7 +1672,7 @@ mod tests {
         rt.insert(
             s2,
             family,
-            n1,
+            n1.clone(),
             0,
             nh(),
             attrs.clone(),
@@ -1672,7 +1684,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             family,
-            n2,
+            n2.clone(),
             0,
             nh(),
             attrs.clone(),
@@ -1684,7 +1696,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             family,
-            n3,
+            n3.clone(),
             0,
             nh(),
             attrs.clone(),
@@ -1750,7 +1762,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -1763,7 +1775,7 @@ mod tests {
         let update = rt.insert(
             source(2, 65002, 65000, 2),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -1787,7 +1799,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(100),
@@ -1799,7 +1811,7 @@ mod tests {
         let update = rt.insert(
             source(2, 65002, 65000, 2),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(200),
@@ -1824,7 +1836,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_as_path_len(3),
@@ -1836,7 +1848,7 @@ mod tests {
         let update = rt.insert(
             source(2, 65002, 65000, 2),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_as_path_len(1),
@@ -1862,7 +1874,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(2),
@@ -1875,7 +1887,7 @@ mod tests {
         let update = rt.insert(
             source(2, 65002, 65000, 2),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -1901,7 +1913,7 @@ mod tests {
         rt.insert(
             source(1, 65000, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -1914,7 +1926,7 @@ mod tests {
         let update = rt.insert(
             source(2, 65001, 65000, 2),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -1940,7 +1952,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 10),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -1953,7 +1965,7 @@ mod tests {
         let update = rt.insert(
             source(2, 65002, 65000, 5),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -1996,7 +2008,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_cluster_list(&[1, 2]),
@@ -2009,7 +2021,7 @@ mod tests {
         let update = rt.insert(
             source(2, 65001, 65000, 2),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_cluster_list(&[1]),
@@ -2034,7 +2046,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_cluster_list(&[1]),
@@ -2047,7 +2059,7 @@ mod tests {
         let update = rt.insert(
             source(2, 65001, 65000, 2),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2072,7 +2084,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             {
@@ -2095,7 +2107,7 @@ mod tests {
         let update = rt.insert(
             source(2, 65001, 65000, 2),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             {
@@ -2133,7 +2145,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2145,7 +2157,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2173,7 +2185,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2185,7 +2197,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2213,7 +2225,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2238,7 +2250,7 @@ mod tests {
         let update = rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2257,7 +2269,7 @@ mod tests {
         let update = rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2280,7 +2292,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2294,7 +2306,7 @@ mod tests {
         let update = rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2310,7 +2322,7 @@ mod tests {
         let update = rt.insert(
             source(3, 65003, 65000, 3),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2334,7 +2346,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2347,7 +2359,7 @@ mod tests {
         rt.insert(
             source(2, 65002, 65000, 2),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2360,7 +2372,7 @@ mod tests {
         let update = rt.insert(
             s1,
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(200),
@@ -2385,7 +2397,7 @@ mod tests {
         rt.insert(
             source(3, 65003, 65000, 3),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2398,7 +2410,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2412,7 +2424,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2425,7 +2437,7 @@ mod tests {
         let update = rt.insert(
             s1,
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2451,7 +2463,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(200),
@@ -2463,7 +2475,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(100),
@@ -2477,7 +2489,7 @@ mod tests {
         let update = rt.insert(
             s1,
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(50),
@@ -2507,7 +2519,7 @@ mod tests {
         rt.insert(
             source(3, 65003, 65000, 3),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2521,7 +2533,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2535,7 +2547,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2548,7 +2560,7 @@ mod tests {
         let update = rt.insert(
             s2,
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(50),
@@ -2572,7 +2584,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -2601,7 +2613,7 @@ mod tests {
         rt.insert(
             src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             1,
             nh(),
             empty_attrs(),
@@ -2615,7 +2627,7 @@ mod tests {
         rt.insert(
             src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             2,
             nh(),
             empty_attrs(),
@@ -2648,7 +2660,7 @@ mod tests {
         rt.insert(
             src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             1,
             nh(),
             empty_attrs(),
@@ -2660,7 +2672,7 @@ mod tests {
         rt.insert(
             src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             2,
             nh(),
             empty_attrs(),
@@ -2671,7 +2683,7 @@ mod tests {
         );
 
         // Remove path_id=1: path_id=2 still exists -> received must stay 1
-        rt.remove(src.clone(), Family::IPV4, net, 1, None);
+        rt.remove(src.clone(), Family::IPV4, net.clone(), 1, None);
         let stats: Vec<_> = rt.peer_stats(&src.remote_addr).unwrap().collect();
         let (_, s) = stats[0];
         assert_eq!(
@@ -3061,7 +3073,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(200),
@@ -3075,7 +3087,7 @@ mod tests {
         let update = rt.insert(
             s2,
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(50),
@@ -3101,7 +3113,7 @@ mod tests {
         let update = rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3115,7 +3127,7 @@ mod tests {
         let update = rt.insert(
             s1,
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3138,7 +3150,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3152,7 +3164,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3165,7 +3177,7 @@ mod tests {
         let update = rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3188,7 +3200,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3202,7 +3214,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3223,7 +3235,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3246,7 +3258,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(100),
@@ -3260,7 +3272,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(100),
@@ -3274,7 +3286,7 @@ mod tests {
         rt.insert(
             s3.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(100),
@@ -3298,7 +3310,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3312,7 +3324,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3338,7 +3350,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs.clone(),
@@ -3352,7 +3364,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs.clone(),
@@ -3366,7 +3378,7 @@ mod tests {
         rt.insert(
             s3.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs.clone(),
@@ -3392,7 +3404,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3406,7 +3418,7 @@ mod tests {
         rt.insert(
             s2,
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3431,7 +3443,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs.clone(),
@@ -3445,7 +3457,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs.clone(),
@@ -3480,7 +3492,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(100),
@@ -3514,7 +3526,7 @@ mod tests {
         rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3527,7 +3539,7 @@ mod tests {
         rt.insert(
             source(2, 65002, 65000, 2),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3556,7 +3568,7 @@ mod tests {
         let update = rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3573,7 +3585,7 @@ mod tests {
         let update = rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3619,7 +3631,7 @@ mod tests {
         let update = rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3639,7 +3651,7 @@ mod tests {
         let update = rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_local_pref(200),
@@ -3668,7 +3680,7 @@ mod tests {
         let u1 = rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3681,7 +3693,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3718,7 +3730,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3730,7 +3742,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -3766,7 +3778,7 @@ mod tests {
         rt.insert(
             s.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -3796,7 +3808,7 @@ mod tests {
         rt.insert(
             stale_src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -3812,7 +3824,7 @@ mod tests {
         rt.insert(
             fresh_src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -3839,7 +3851,7 @@ mod tests {
         rt.insert(
             s.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -3870,7 +3882,7 @@ mod tests {
         rt.insert(
             stale_src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -3882,7 +3894,7 @@ mod tests {
         rt.insert(
             fresh_src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -3914,7 +3926,7 @@ mod tests {
         rt.insert(
             s.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -3938,7 +3950,7 @@ mod tests {
         rt.insert(
             s.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -3967,7 +3979,7 @@ mod tests {
         rt.insert(
             stale_src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -3979,7 +3991,7 @@ mod tests {
         rt.insert(
             fresh_src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -4030,7 +4042,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0, // remote_id / path_id
             nh(),
             attrs_with_origin(0),
@@ -4059,7 +4071,7 @@ mod tests {
         let update = rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0, // same remote_id as session 1
             nh(),
             attrs_with_origin(0),
@@ -4106,7 +4118,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -4150,7 +4162,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             1,
             nh(),
             attrs_with_origin(0),
@@ -4162,7 +4174,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             2,
             nh(),
             attrs_with_origin(0),
@@ -4179,7 +4191,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             1,
             nh(),
             attrs_with_origin(0),
@@ -4209,7 +4221,7 @@ mod tests {
         rt.insert(
             src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             attrs_with_origin(0),
@@ -4247,7 +4259,7 @@ mod tests {
         let update = rt.insert(
             src,
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -4374,7 +4386,7 @@ mod tests {
         let update = rt.insert(
             src,
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -4404,7 +4416,7 @@ mod tests {
         let result = rt.insert(
             src,
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -4437,7 +4449,7 @@ mod tests {
         rt.insert(
             src.clone(),
             Family::IPV4,
-            net1,
+            net1.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -4526,11 +4538,11 @@ mod tests {
     // --- destinations() / TableQuery tests ---
 
     /// Insert a path from `src` for `net` into `rt` with no filtering.
-    fn insert_path(rt: &mut Table, src: &Arc<Source>, net: packet::Nlri) {
+    fn insert_path(rt: &mut Table, src: &Arc<Source>, net: &packet::Nlri) {
         rt.insert(
             src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -4549,8 +4561,8 @@ mod tests {
         let n2 = nlri(10, 0, 1, 0, 24);
 
         let mut rt = Table::new();
-        insert_path(&mut rt, &s1, n1);
-        insert_path(&mut rt, &s2, n2);
+        insert_path(&mut rt, &s1, &n1);
+        insert_path(&mut rt, &s2, &n2);
 
         let dests: Vec<_> = rt
             .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
@@ -4566,8 +4578,8 @@ mod tests {
         let n1 = nlri(10, 0, 0, 0, 24);
 
         let mut rt = Table::new();
-        insert_path(&mut rt, &s1, n1);
-        insert_path(&mut rt, &s2, n1);
+        insert_path(&mut rt, &s1, &n1);
+        insert_path(&mut rt, &s2, &n1);
 
         let peer1 = s1.remote_addr;
         let dests: Vec<_> = rt
@@ -4591,7 +4603,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            n1,
+            n1.clone(),
             0,
             nh(),
             attrs_with_local_pref(100),
@@ -4603,7 +4615,7 @@ mod tests {
         rt.insert(
             s2.clone(),
             Family::IPV4,
-            n1,
+            n1.clone(),
             0,
             nh(),
             attrs_with_local_pref(200),
@@ -4630,7 +4642,7 @@ mod tests {
         let n1 = nlri(10, 0, 0, 0, 24);
 
         let mut rt = Table::new();
-        insert_path(&mut rt, &s1, n1);
+        insert_path(&mut rt, &s1, &n1);
 
         let peer1 = s1.remote_addr;
         let dests: Vec<_> = rt
@@ -4670,15 +4682,15 @@ mod tests {
         let n3 = nlri(10, 0, 2, 0, 24);
 
         let mut rt = Table::new();
-        insert_path(&mut rt, &s1, n1);
-        insert_path(&mut rt, &s1, n2);
-        insert_path(&mut rt, &s1, n3);
+        insert_path(&mut rt, &s1, &n1);
+        insert_path(&mut rt, &s1, &n2);
+        insert_path(&mut rt, &s1, &n3);
 
         let dests: Vec<_> = rt
             .destinations(
                 TableQuery::Global,
                 Family::IPV4,
-                vec![exact(n2)],
+                vec![exact(n2.clone())],
                 None,
                 false,
             )
@@ -4695,8 +4707,8 @@ mod tests {
         let n2 = nlri(10, 0, 1, 0, 24);
 
         let mut rt = Table::new();
-        insert_path(&mut rt, &s1, n1);
-        insert_path(&mut rt, &s1, n2);
+        insert_path(&mut rt, &s1, &n1);
+        insert_path(&mut rt, &s1, &n2);
 
         let dests: Vec<_> = rt
             .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
@@ -4716,17 +4728,17 @@ mod tests {
         let other = nlri(10, 1, 0, 0, 24);
 
         let mut rt = Table::new();
-        insert_path(&mut rt, &s1, super16);
-        insert_path(&mut rt, &s1, sub24a);
-        insert_path(&mut rt, &s1, sub24b);
-        insert_path(&mut rt, &s1, other);
+        insert_path(&mut rt, &s1, &super16);
+        insert_path(&mut rt, &s1, &sub24a);
+        insert_path(&mut rt, &s1, &sub24b);
+        insert_path(&mut rt, &s1, &other);
 
         // Longer query against 10.0.0.0/16: should return /16, /24, /24 inside it.
         let mut nets: Vec<_> = rt
             .destinations(
                 TableQuery::Global,
                 Family::IPV4,
-                vec![longer(super16)],
+                vec![longer(super16.clone())],
                 None,
                 false,
             )
@@ -4749,16 +4761,16 @@ mod tests {
         let other = nlri(10, 1, 0, 0, 24);
 
         let mut rt = Table::new();
-        insert_path(&mut rt, &s1, super16);
-        insert_path(&mut rt, &s1, sub24);
-        insert_path(&mut rt, &s1, other);
+        insert_path(&mut rt, &s1, &super16);
+        insert_path(&mut rt, &s1, &sub24);
+        insert_path(&mut rt, &s1, &other);
 
         // Shorter query against 10.0.1.0/24: should return /24 itself and /16 (less specific).
         let mut nets: Vec<_> = rt
             .destinations(
                 TableQuery::Global,
                 Family::IPV4,
-                vec![shorter(sub24)],
+                vec![shorter(sub24.clone())],
                 None,
                 false,
             )
@@ -4772,11 +4784,11 @@ mod tests {
         assert!(!nets.contains(&other));
     }
 
-    fn insert_filtered_path(rt: &mut Table, src: &Arc<Source>, net: packet::Nlri) {
+    fn insert_filtered_path(rt: &mut Table, src: &Arc<Source>, net: &packet::Nlri) {
         rt.insert(
             src.clone(),
             Family::IPV4,
-            net,
+            net.clone(),
             0,
             nh(),
             empty_attrs(),
@@ -4793,7 +4805,7 @@ mod tests {
         let n1 = nlri(10, 0, 0, 0, 24);
 
         let mut rt = Table::new();
-        insert_filtered_path(&mut rt, &s1, n1);
+        insert_filtered_path(&mut rt, &s1, &n1);
 
         // Without enable_filtered the destination has no unfiltered paths and is omitted.
         let dests: Vec<_> = rt
@@ -4809,8 +4821,8 @@ mod tests {
         let n2 = nlri(10, 0, 1, 0, 24);
 
         let mut rt = Table::new();
-        insert_path(&mut rt, &s1, n1); // unfiltered
-        insert_filtered_path(&mut rt, &s1, n2); // filtered
+        insert_path(&mut rt, &s1, &n1); // unfiltered
+        insert_filtered_path(&mut rt, &s1, &n2); // filtered
 
         let dests: Vec<_> = rt
             .destinations(TableQuery::Global, Family::IPV4, vec![], None, true)
@@ -4839,7 +4851,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            n1,
+            n1.clone(),
             0,
             nh(),
             post_policy.clone(),
@@ -4877,7 +4889,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            n1,
+            n1.clone(),
             0,
             nh(),
             attr.clone(),
@@ -4912,7 +4924,7 @@ mod tests {
         rt.insert(
             s1.clone(),
             Family::IPV4,
-            n1,
+            n1.clone(),
             0,
             nh(),
             post_policy,

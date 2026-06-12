@@ -6045,14 +6045,14 @@ fn process_nlri_change(
             None => {
                 if export_map.was_sent(update.family, &update.net) {
                     export_map.mark_withdrawn(update.family, &update.net, 0);
-                    pending.unreach(update.net, 0);
+                    pending.unreach(update.net.clone(), 0);
                 }
             }
             Some((attr, nexthop)) => {
-                export_map.mark_sent(update.family, update.net, 0);
+                export_map.mark_sent(update.family, update.net.clone(), 0);
                 let attr = export_ctx.export_attrs(&attr);
                 let nexthop = export_ctx.export_nexthop(nexthop);
-                pending.reach(update.net, 0, nexthop, attr);
+                pending.reach(update.net.clone(), 0, nexthop, attr);
             }
         }
     } else {
@@ -6102,7 +6102,7 @@ fn process_nlri_change(
         let current_ids: FnvHashSet<u32> = current_top_n.iter().map(|(pid, _, _)| *pid).collect();
         for &pid in sent_ids.difference(&current_ids) {
             export_map.mark_withdrawn(update.family, &update.net, pid);
-            pending.unreach(update.net, pid);
+            pending.unreach(update.net.clone(), pid);
         }
 
         // Advertise paths that are new or whose attributes were replaced.
@@ -6110,10 +6110,10 @@ fn process_nlri_change(
             let already_sent = export_map.contains_path(update.family, &update.net, *pid);
             let was_replaced = update.replaced_path_id == Some(*pid);
             if !already_sent || was_replaced {
-                export_map.mark_sent(update.family, update.net, *pid);
+                export_map.mark_sent(update.family, update.net.clone(), *pid);
                 let attr = export_ctx.export_attrs(attr);
                 let nexthop = export_ctx.export_nexthop(*nexthop);
-                pending.reach(update.net, *pid, nexthop, attr);
+                pending.reach(update.net.clone(), *pid, nexthop, attr);
             }
         }
     }
@@ -7458,7 +7458,7 @@ mod tests {
     // ---- handle_prefix_update tests ----
 
     fn make_prefix_update_reach(
-        nlri: packet::Nlri,
+        nlri: &packet::Nlri,
         source: Arc<table::Source>,
     ) -> table::NlriChange {
         let best = table::Path {
@@ -7471,7 +7471,7 @@ mod tests {
         };
         table::NlriChange {
             family: Family::IPV4,
-            net: nlri,
+            net: nlri.clone(),
             best_changed: true,
             any_changed: true,
             replaced_path_id: None,
@@ -7479,10 +7479,10 @@ mod tests {
         }
     }
 
-    fn make_prefix_update_withdraw(nlri: packet::Nlri) -> table::NlriChange {
+    fn make_prefix_update_withdraw(nlri: &packet::Nlri) -> table::NlriChange {
         table::NlriChange {
             family: Family::IPV4,
-            net: nlri,
+            net: nlri.clone(),
             best_changed: true,
             any_changed: true,
             replaced_path_id: None,
@@ -7491,7 +7491,7 @@ mod tests {
     }
 
     fn make_prefix_update_no_change(
-        nlri: packet::Nlri,
+        nlri: &packet::Nlri,
         source: Arc<table::Source>,
     ) -> table::NlriChange {
         let best = table::Path {
@@ -7502,7 +7502,7 @@ mod tests {
         };
         table::NlriChange {
             family: Family::IPV4,
-            net: nlri,
+            net: nlri.clone(),
             best_changed: false,
             any_changed: false,
             replaced_path_id: None,
@@ -7520,7 +7520,7 @@ mod tests {
         let mut conn = established_connection(&global, &tables, remote_addr, server).await;
         setup_ipv4_session(&mut conn);
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
-        let update = make_prefix_update_reach(nlri, other_source());
+        let update = make_prefix_update_reach(&nlri, other_source());
 
         conn.handle_prefix_update(update);
 
@@ -7540,7 +7540,7 @@ mod tests {
         let mut conn = established_connection(&global, &tables, remote_addr, server).await;
         setup_ipv4_session(&mut conn);
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
-        let update = make_prefix_update_no_change(nlri, other_source());
+        let update = make_prefix_update_no_change(&nlri, other_source());
 
         conn.handle_prefix_update(update);
 
@@ -7560,9 +7560,9 @@ mod tests {
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
 
         // Pre-mark as sent so the withdraw fires.
-        conn.export_map.mark_sent(Family::IPV4, nlri, 0);
+        conn.export_map.mark_sent(Family::IPV4, nlri.clone(), 0);
 
-        let update = make_prefix_update_withdraw(nlri);
+        let update = make_prefix_update_withdraw(&nlri);
         conn.handle_prefix_update(update);
 
         assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
@@ -7581,7 +7581,7 @@ mod tests {
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
 
         // Never advertised → spurious withdraw should be suppressed.
-        let update = make_prefix_update_withdraw(nlri);
+        let update = make_prefix_update_withdraw(&nlri);
         conn.handle_prefix_update(update);
 
         assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
@@ -7683,7 +7683,7 @@ mod tests {
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let mut m = ExportMap::new();
         assert!(!m.was_sent(Family::IPV4, &nlri));
-        m.mark_sent(Family::IPV4, nlri, 0);
+        m.mark_sent(Family::IPV4, nlri.clone(), 0);
         assert!(m.was_sent(Family::IPV4, &nlri));
     }
 
@@ -7698,7 +7698,7 @@ mod tests {
     fn export_map_mark_withdrawn_clears() {
         let nlri: packet::Nlri = "10.1.0.0/16".parse().unwrap();
         let mut m = ExportMap::new();
-        m.mark_sent(Family::IPV4, nlri, 0);
+        m.mark_sent(Family::IPV4, nlri.clone(), 0);
         assert!(m.was_sent(Family::IPV4, &nlri));
         m.mark_withdrawn(Family::IPV4, &nlri, 0);
         assert!(!m.was_sent(Family::IPV4, &nlri));
@@ -7709,10 +7709,10 @@ mod tests {
         let v4: packet::Nlri = "10.0.0.0/8".parse().unwrap();
         let v6: packet::Nlri = "2001:db8::/32".parse().unwrap();
         let mut m = ExportMap::new();
-        m.mark_sent(Family::IPV4, v4, 0);
+        m.mark_sent(Family::IPV4, v4.clone(), 0);
         assert!(m.was_sent(Family::IPV4, &v4));
         assert!(!m.was_sent(Family::IPV6, &v4));
-        m.mark_sent(Family::IPV6, v6, 0);
+        m.mark_sent(Family::IPV6, v6.clone(), 0);
         assert!(m.was_sent(Family::IPV6, &v6));
         assert!(!m.was_sent(Family::IPV4, &v6));
     }
@@ -8353,7 +8353,7 @@ mod tests {
         }
 
         fn change(
-            nlri: packet::Nlri,
+            nlri: &packet::Nlri,
             best_changed: bool,
             any_changed: bool,
             replaced_path_id: Option<u32>,
@@ -8361,7 +8361,7 @@ mod tests {
         ) -> table::NlriChange {
             table::NlriChange {
                 family: Family::IPV4,
-                net: nlri,
+                net: nlri.clone(),
                 best_changed,
                 any_changed,
                 replaced_path_id,
@@ -8380,7 +8380,7 @@ mod tests {
                         .chain(u.mp_reach.iter())
                         .flat_map(|s| &s.entries)
                     {
-                        out.push((e.nlri, e.path_id));
+                        out.push((e.nlri.clone(), e.path_id));
                     }
                 }
             }
@@ -8398,7 +8398,7 @@ mod tests {
                         .chain(u.mp_unreach.iter())
                         .flat_map(|s| &s.entries)
                     {
-                        out.push((e.nlri, e.path_id));
+                        out.push((e.nlri.clone(), e.path_id));
                     }
                 }
             }
@@ -8415,7 +8415,7 @@ mod tests {
             let mut em = ExportMap::new();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
-            let update = change(net, false, false, None, vec![]);
+            let update = change(&net, false, false, None, vec![]);
 
             process_nlri_change(
                 &update,
@@ -8438,7 +8438,7 @@ mod tests {
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let path = path(1, source(PEER));
-            let update = change(net, true, true, None, vec![path]);
+            let update = change(&net, true, true, None, vec![path]);
 
             process_nlri_change(
                 &update,
@@ -8466,7 +8466,7 @@ mod tests {
             em.mark_sent(Family::IPV4, nlri("10.0.0.0/24"), 0);
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
-            let update = change(net, true, true, None, vec![]);
+            let update = change(&net, true, true, None, vec![]);
 
             process_nlri_change(
                 &update,
@@ -8491,7 +8491,7 @@ mod tests {
             let mut em = ExportMap::new();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
-            let update = change(net, true, true, None, vec![]);
+            let update = change(&net, true, true, None, vec![]);
 
             process_nlri_change(
                 &update,
@@ -8515,7 +8515,7 @@ mod tests {
             let net = nlri("10.0.0.0/24");
             // Path from self — must not be echoed back
             let path = path(1, source(SELF));
-            let update = change(net, true, true, None, vec![path]);
+            let update = change(&net, true, true, None, vec![path]);
 
             process_nlri_change(
                 &update,
@@ -8542,7 +8542,7 @@ mod tests {
             // 1. Advertise
             let path = path(1, source(PEER));
             process_nlri_change(
-                &change(net, true, true, None, vec![path]),
+                &change(&net, true, true, None, vec![path]),
                 1,
                 remote,
                 &mut em,
@@ -8556,7 +8556,7 @@ mod tests {
 
             // 2. Withdraw
             process_nlri_change(
-                &change(net, true, true, None, vec![]),
+                &change(&net, true, true, None, vec![]),
                 1,
                 remote,
                 &mut em,
@@ -8578,7 +8578,7 @@ mod tests {
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let net = nlri("10.0.0.0/24");
             let path = path(1, source(PEER));
-            let update = change(net, false, false, None, vec![path]);
+            let update = change(&net, false, false, None, vec![path]);
 
             process_nlri_change(
                 &update,
@@ -8601,7 +8601,7 @@ mod tests {
             let net = nlri("10.0.0.0/24");
             let src = source(PEER);
             let paths = vec![path(1, src.clone()), path(2, src.clone())];
-            let update = change(net, true, true, None, paths);
+            let update = change(&net, true, true, None, paths);
 
             process_nlri_change(
                 &update,
@@ -8628,12 +8628,12 @@ mod tests {
         fn path_removed_sends_withdraw() {
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
-            em.mark_sent(Family::IPV4, net, 1);
-            em.mark_sent(Family::IPV4, net, 2);
+            em.mark_sent(Family::IPV4, net.clone(), 1);
+            em.mark_sent(Family::IPV4, net.clone(), 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let src = source(PEER);
             // path_id=2 is removed; only path_id=1 remains
-            let update = change(net, true, true, None, vec![path(1, src)]);
+            let update = change(&net, true, true, None, vec![path(1, src)]);
 
             process_nlri_change(
                 &update,
@@ -8658,13 +8658,13 @@ mod tests {
         fn replaced_path_readvertised() {
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
-            em.mark_sent(Family::IPV4, net, 1);
-            em.mark_sent(Family::IPV4, net, 2);
+            em.mark_sent(Family::IPV4, net.clone(), 1);
+            em.mark_sent(Family::IPV4, net.clone(), 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let src = source(PEER);
             // path_id=1 was replaced (new attributes); path_id=2 unchanged
             let paths = vec![path(1, src.clone()), path(2, src)];
-            let update = change(net, false, true, Some(1), paths);
+            let update = change(&net, false, true, Some(1), paths);
 
             process_nlri_change(
                 &update,
@@ -8692,12 +8692,12 @@ mod tests {
             // top-2 = [pid=3, pid=1]; pid=2 pushed out → WITHDRAW pid=2, UPDATE pid=3
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
-            em.mark_sent(Family::IPV4, net, 1);
-            em.mark_sent(Family::IPV4, net, 2);
+            em.mark_sent(Family::IPV4, net.clone(), 1);
+            em.mark_sent(Family::IPV4, net.clone(), 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let src = source(PEER);
             let paths = vec![path(3, src.clone()), path(1, src.clone()), path(2, src)];
-            let update = change(net, true, true, None, paths);
+            let update = change(&net, true, true, None, paths);
 
             process_nlri_change(
                 &update,
@@ -8729,13 +8729,13 @@ mod tests {
             // top-2 = [pid=2, pid=3]: WITHDRAW pid=1, UPDATE pid=3 (enters window)
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
-            em.mark_sent(Family::IPV4, net, 1);
-            em.mark_sent(Family::IPV4, net, 2);
+            em.mark_sent(Family::IPV4, net.clone(), 1);
+            em.mark_sent(Family::IPV4, net.clone(), 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let src = source(PEER);
             // pid=1 was removed; remaining: pid=2, pid=3
             let paths = vec![path(2, src.clone()), path(3, src)];
-            let update = change(net, true, true, None, paths);
+            let update = change(&net, true, true, None, paths);
 
             process_nlri_change(
                 &update,
@@ -8763,10 +8763,10 @@ mod tests {
         fn all_paths_removed_withdraws_all() {
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
-            em.mark_sent(Family::IPV4, net, 1);
-            em.mark_sent(Family::IPV4, net, 2);
+            em.mark_sent(Family::IPV4, net.clone(), 1);
+            em.mark_sent(Family::IPV4, net.clone(), 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
-            let update = change(net, true, true, None, vec![]);
+            let update = change(&net, true, true, None, vec![]);
 
             process_nlri_change(
                 &update,
@@ -8795,7 +8795,7 @@ mod tests {
             // Both paths from self — neither should be sent
             let self_src = source(SELF);
             let paths = vec![path(1, self_src.clone()), path(2, self_src)];
-            let update = change(net, true, true, None, paths);
+            let update = change(&net, true, true, None, paths);
 
             process_nlri_change(
                 &update,
@@ -8825,7 +8825,7 @@ mod tests {
                 path(2, self_src), // filtered
                 path(3, peer_src),
             ];
-            let update = change(net, true, true, None, paths);
+            let update = change(&net, true, true, None, paths);
 
             // send_max=3 but only 2 peer paths after echo filter
             process_nlri_change(
@@ -8881,7 +8881,7 @@ mod tests {
             let net = nlri("10.0.0.0/24");
             // Route learned from an iBGP peer (remote_asn == local_asn)
             let path = path(1, ibgp_source(PEER));
-            let update = change(net, true, true, None, vec![path]);
+            let update = change(&net, true, true, None, vec![path]);
 
             process_nlri_change(
                 &update,
@@ -8904,11 +8904,11 @@ mod tests {
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
             // Previously sent an eBGP-learned best
-            em.mark_sent(Family::IPV4, net, 0);
+            em.mark_sent(Family::IPV4, net.clone(), 0);
             let mut pending = crate::peer_tx::PendingTx::new(false);
             // New best is iBGP-learned
             let path = path(1, ibgp_source(PEER));
-            let update = change(net, true, true, None, vec![path]);
+            let update = change(&net, true, true, None, vec![path]);
 
             process_nlri_change(
                 &update,
@@ -8934,7 +8934,7 @@ mod tests {
             let net = nlri("10.0.0.0/24");
             // Route learned from an eBGP peer (remote_asn != local_asn)
             let path = path(1, source(PEER)); // source() uses remote_asn=65002
-            let update = change(net, true, true, None, vec![path]);
+            let update = change(&net, true, true, None, vec![path]);
 
             process_nlri_change(
                 &update,
@@ -8962,7 +8962,7 @@ mod tests {
                 path(1, ibgp_source(PEER)), // iBGP-learned — must be filtered
                 path(2, source(PEER)),      // eBGP-learned — may be forwarded
             ];
-            let update = change(net, true, true, None, paths);
+            let update = change(&net, true, true, None, paths);
 
             process_nlri_change(
                 &update,
@@ -9220,7 +9220,7 @@ mod tests {
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, ibgp_source(PEER));
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9244,7 +9244,7 @@ mod tests {
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, rr_client_source(PEER));
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9271,7 +9271,7 @@ mod tests {
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, ibgp_source(PEER));
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9328,7 +9328,7 @@ mod tests {
             let net = nlri("10.0.0.0/24");
             // ibgp_source router_id = 10.0.0.1
             let p = path(1, ibgp_source(PEER));
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9367,7 +9367,7 @@ mod tests {
             ]);
             let src = ibgp_source(PEER);
             let p = path_with_attrs(1, src, attrs);
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9407,7 +9407,7 @@ mod tests {
                     .unwrap(),
             ]);
             let p = path_with_attrs(1, ibgp_source(PEER), attrs);
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9441,7 +9441,7 @@ mod tests {
             let net = nlri("10.0.0.0/24");
             // path() uses plain attrs (ORIGIN only, no CLUSTER_LIST)
             let p = path(1, ibgp_source(PEER));
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9473,7 +9473,7 @@ mod tests {
             let net = nlri("10.0.0.0/24");
             // source() has remote_asn=65002, local_asn=65001 → eBGP learned
             let p = path(1, source(PEER));
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9508,7 +9508,7 @@ mod tests {
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, rr_client_source(PEER));
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9560,7 +9560,7 @@ mod tests {
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, rs_client_source(PEER));
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9587,7 +9587,7 @@ mod tests {
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, source(PEER));
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,
@@ -9614,7 +9614,7 @@ mod tests {
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, rs_client_source(PEER));
-            let update = change(net, true, true, None, vec![p]);
+            let update = change(&net, true, true, None, vec![p]);
 
             process_nlri_change(
                 &update,

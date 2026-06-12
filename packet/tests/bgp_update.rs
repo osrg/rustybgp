@@ -86,7 +86,7 @@ fn update_ipv4_announce() {
     let msg = Message::Update(Update {
         reach: Some(NlriSet {
             family: Family::IPV4,
-            entries: vec![prefix],
+            entries: vec![prefix.clone()],
         }),
         mp_reach: None,
         attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
@@ -151,7 +151,7 @@ fn update_ipv4_withdraw() {
         attr: Arc::new(Vec::new()),
         unreach: Some(NlriSet {
             family: Family::IPV4,
-            entries: vec![prefix],
+            entries: vec![prefix.clone()],
         }),
         mp_unreach: None,
         nexthop: None,
@@ -179,7 +179,7 @@ fn update_ipv6_announce() {
         reach: None,
         mp_reach: Some(NlriSet {
             family: Family::IPV6,
-            entries: vec![prefix],
+            entries: vec![prefix.clone()],
         }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
@@ -220,7 +220,7 @@ fn update_ipv6_withdraw() {
         unreach: None,
         mp_unreach: Some(NlriSet {
             family: Family::IPV6,
-            entries: vec![prefix],
+            entries: vec![prefix.clone()],
         }),
         nexthop: None,
     });
@@ -376,7 +376,7 @@ fn update_ipv4_with_ipv6_nexthop() {
         reach: None,
         mp_reach: Some(NlriSet {
             family: Family::IPV4,
-            entries: vec![prefix],
+            entries: vec![prefix.clone()],
         }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
@@ -420,7 +420,7 @@ fn update_ipv4_extended_nexthop_withdraw() {
         unreach: None,
         mp_unreach: Some(NlriSet {
             family: Family::IPV4,
-            entries: vec![prefix],
+            entries: vec![prefix.clone()],
         }),
         nexthop: None,
     });
@@ -513,7 +513,7 @@ fn update_ipv4_with_prefix_sid() {
     let msg = Message::Update(Update {
         reach: Some(NlriSet {
             family: Family::IPV4,
-            entries: vec![prefix],
+            entries: vec![prefix.clone()],
         }),
         mp_reach: None,
         attr: Arc::new(vec![
@@ -567,7 +567,7 @@ fn update_passes_through_unknown_prefix_sid_tlv() {
     let msg = Message::Update(Update {
         reach: Some(NlriSet {
             family: Family::IPV4,
-            entries: vec![prefix],
+            entries: vec![prefix.clone()],
         }),
         mp_reach: None,
         attr: Arc::new(vec![
@@ -638,7 +638,7 @@ fn update_ipv4_mup_announce() {
         reach: None,
         mp_reach: Some(NlriSet {
             family: Family::IPV4_MUP,
-            entries: vec![nlri],
+            entries: vec![nlri.clone()],
         }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
@@ -682,7 +682,7 @@ fn update_ipv6_mup_announce() {
         reach: None,
         mp_reach: Some(NlriSet {
             family: Family::IPV6_MUP,
-            entries: vec![nlri],
+            entries: vec![nlri.clone()],
         }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
@@ -730,7 +730,7 @@ fn update_mup_withdraw() {
         unreach: None,
         mp_unreach: Some(NlriSet {
             family: Family::IPV4_MUP,
-            entries: vec![nlri],
+            entries: vec![nlri.clone()],
         }),
         nexthop: None,
     });
@@ -771,7 +771,7 @@ fn update_mup_with_ext_community() {
         reach: None,
         mp_reach: Some(NlriSet {
             family: Family::IPV4_MUP,
-            entries: vec![nlri],
+            entries: vec![nlri.clone()],
         }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),

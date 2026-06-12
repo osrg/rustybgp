@@ -130,12 +130,12 @@ impl TableManager {
     ) -> bool {
         let import_policy = self.import_policy.load_full();
         let kernel_tx = self.kernel_tx.load_full();
-        let idx = self.dealer(net.nlri);
+        let idx = self.dealer(&net.nlri);
         let mut t = self.shards[idx].lock().await;
         t.notify_adj_rib_in(
             source.clone(),
             family,
-            &[net],
+            std::slice::from_ref(&net),
             Some(&attr),
             nexthop,
             timestamp,
@@ -181,9 +181,16 @@ impl TableManager {
         timestamp: std::time::SystemTime,
     ) {
         let kernel_tx = self.kernel_tx.load_full();
-        let idx = self.dealer(net.nlri);
+        let idx = self.dealer(&net.nlri);
         let mut t = self.shards[idx].lock().await;
-        t.notify_adj_rib_in(source.clone(), family, &[net], None, None, timestamp);
+        t.notify_adj_rib_in(
+            source.clone(),
+            family,
+            std::slice::from_ref(&net),
+            None,
+            None,
+            timestamp,
+        );
         let counter_ref = prefix_counter.as_ref();
         if let Some(update) = t
             .rtable
@@ -580,7 +587,7 @@ impl TableShard {
                 Some(best) => best.nexthop.into_iter().collect(),
             };
             let _ = tx.send(packet::KernelRouteChange {
-                net: update.net,
+                net: update.net.clone(),
                 nexthops,
             });
         }

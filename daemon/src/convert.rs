@@ -53,6 +53,26 @@ pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
         Nlri::Mup(m) => api::Nlri {
             nlri: Some(mup_nlri_to_api(m)),
         },
+        Nlri::VpnV4(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::LabeledVpnIpPrefix(
+                api::LabeledVpnipAddressPrefix {
+                    labels: n.labels.labels().iter().map(|l| l.value()).collect(),
+                    rd: Some(rd_to_api(&n.rd)),
+                    prefix_len: n.prefix.mask as u32,
+                    prefix: n.prefix.addr.to_string(),
+                },
+            )),
+        },
+        Nlri::VpnV6(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::LabeledVpnIpPrefix(
+                api::LabeledVpnipAddressPrefix {
+                    labels: n.labels.labels().iter().map(|l| l.value()).collect(),
+                    rd: Some(rd_to_api(&n.rd)),
+                    prefix_len: n.prefix.mask as u32,
+                    prefix: n.prefix.addr.to_string(),
+                },
+            )),
+        },
     }
 }
 

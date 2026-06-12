@@ -35,14 +35,14 @@ type SnapshotMap = FnvHashMap<IpAddr, FnvHashMap<(Family, packet::PathNlri), Adj
 fn apply_snapshot(snapshot: &mut SnapshotMap, change: AdjRibInChange) {
     if change.attrs.is_some() {
         let peer_map = snapshot.entry(change.source.remote_addr).or_default();
-        for &nlri in &change.nlris {
+        for nlri in &change.nlris {
             peer_map.insert(
-                (change.family, nlri),
+                (change.family, nlri.clone()),
                 AdjRibInChange {
                     source: change.source.clone(),
                     family: change.family,
                     addpath: change.addpath,
-                    nlris: vec![nlri],
+                    nlris: vec![nlri.clone()],
                     attrs: change.attrs.clone(),
                     nexthop: change.nexthop,
                     timestamp: change.timestamp,
@@ -50,8 +50,8 @@ fn apply_snapshot(snapshot: &mut SnapshotMap, change: AdjRibInChange) {
             );
         }
     } else if let Some(peer_map) = snapshot.get_mut(&change.source.remote_addr) {
-        for &nlri in &change.nlris {
-            peer_map.remove(&(change.family, nlri));
+        for nlri in &change.nlris {
+            peer_map.remove(&(change.family, nlri.clone()));
         }
     }
 }
@@ -507,7 +507,7 @@ mod tests {
 
         apply_snapshot(
             &mut snapshot,
-            reach_change(source.clone(), Family::IPV4, vec![nlri]),
+            reach_change(source.clone(), Family::IPV4, vec![nlri.clone()]),
         );
 
         let peer_map = snapshot.get(&source.remote_addr).unwrap();
@@ -523,7 +523,7 @@ mod tests {
 
         apply_snapshot(
             &mut snapshot,
-            reach_change(source.clone(), Family::IPV4, vec![nlri]),
+            reach_change(source.clone(), Family::IPV4, vec![nlri.clone()]),
         );
         apply_snapshot(
             &mut snapshot,
@@ -557,7 +557,7 @@ mod tests {
 
         apply_snapshot(
             &mut snapshot,
-            reach_change(source.clone(), Family::IPV4, vec![n1, n2]),
+            reach_change(source.clone(), Family::IPV4, vec![n1.clone(), n2.clone()]),
         );
         apply_snapshot(
             &mut snapshot,
