@@ -1646,6 +1646,10 @@ impl GoBgpService for GrpcService {
         global.asn = 0;
         global.router_id = Ipv4Addr::new(0, 0, 0, 0);
         global.listen_port = Global::BGP_PORT;
+        for handle in global.kernel_abort_handles.drain(..) {
+            handle.abort();
+        }
+        self.tables.kernel_tx.store(None);
         if let Some(tx) = global.stop_tx.take() {
             let _ = tx.send(());
         }
@@ -3332,9 +3336,9 @@ impl GoBgpService for GrpcService {
             .collect();
         match kernel::Handle::with_route_monitor() {
             Ok((handle, connection, route_events)) => {
-                tokio::spawn(connection);
+                let conn_handle = tokio::spawn(connection);
                 let (tx, mut rx) = mpsc::unbounded_channel();
-                tokio::spawn(async move {
+                let bgp_to_kernel = tokio::spawn(async move {
                     while let Some(change) = rx.recv().await {
                         if let Err(e) = handle.apply(&change).await {
                             log::error!("kernel route update failed: {}", e);
@@ -3343,11 +3347,16 @@ impl GoBgpService for GrpcService {
                 });
                 self.tables.kernel_tx.store(Some(Arc::new(tx)));
                 let tables = self.tables.clone();
-                tokio::spawn(table_manager::run_kernel_routes(
+                let kernel_to_bgp = tokio::spawn(table_manager::run_kernel_routes(
                     tables,
                     route_events,
                     redistribute,
                 ));
+                self.global.write().await.kernel_abort_handles.extend([
+                    conn_handle.abort_handle(),
+                    bgp_to_kernel.abort_handle(),
+                    kernel_to_bgp.abort_handle(),
+                ]);
                 log::info!("kernel route integration enabled");
                 Ok(tonic::Response::new(api::EnableZebraResponse {}))
             }
@@ -3695,6 +3704,10 @@ pub(crate) struct Global {
     /// Abort handle for the global Selection_Deferral_Timer (RFC 4724 §4.1).
     selection_deferral_timer: Option<tokio::task::AbortHandle>,
 
+    /// Abort handles for the kernel integration tasks spawned by enable_zebra.
+    /// Aborted and cleared by stop_bgp.
+    kernel_abort_handles: Vec<tokio::task::AbortHandle>,
+
     /// Sending on this channel causes the BGP listener loop to stop, enabling
     /// a subsequent start_bgp call to restart it.  None when BGP is not running.
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -3746,6 +3759,8 @@ impl Global {
 
             selection_deferral: None,
             selection_deferral_timer: None,
+
+            kernel_abort_handles: Vec::new(),
 
             stop_tx: None,
         }
@@ -4086,9 +4101,9 @@ impl Global {
                 .collect();
             match kernel::Handle::with_route_monitor() {
                 Ok((handle, connection, route_events)) => {
-                    tokio::spawn(connection);
+                    let conn_handle = tokio::spawn(connection);
                     let (tx, mut rx) = mpsc::unbounded_channel();
-                    tokio::spawn(async move {
+                    let bgp_to_kernel = tokio::spawn(async move {
                         while let Some(change) = rx.recv().await {
                             if let Err(e) = handle.apply(&change).await {
                                 log::error!("kernel route update failed: {}", e);
@@ -4097,11 +4112,16 @@ impl Global {
                     });
                     tables.kernel_tx.store(Some(Arc::new(tx)));
                     let tables_arc = tables.clone();
-                    tokio::spawn(table_manager::run_kernel_routes(
+                    let kernel_to_bgp = tokio::spawn(table_manager::run_kernel_routes(
                         tables_arc,
                         route_events,
                         redistribute,
                     ));
+                    global.write().await.kernel_abort_handles.extend([
+                        conn_handle.abort_handle(),
+                        bgp_to_kernel.abort_handle(),
+                        kernel_to_bgp.abort_handle(),
+                    ]);
                     log::info!("kernel route integration enabled");
                 }
                 Err(e) => {
