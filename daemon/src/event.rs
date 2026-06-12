@@ -810,42 +810,7 @@ impl TryFrom<&api::Peer> for PeerParams {
             })
             .collect();
 
-        let graceful_restart = {
-            const DEFAULT_RESTART_TIME: u16 = 120;
-
-            let gr = p.graceful_restart.as_ref();
-            if gr.is_some_and(|g| g.enabled) {
-                let gr_families: Vec<Family> = p
-                    .afi_safis
-                    .iter()
-                    .filter(|a| {
-                        a.mp_graceful_restart
-                            .as_ref()
-                            .is_some_and(|m| m.config.as_ref().is_some_and(|c| c.enabled))
-                    })
-                    .filter_map(|a| {
-                        let f = a.config.as_ref()?.family.as_ref()?;
-                        Some(convert::family_from_api(f))
-                    })
-                    .collect();
-
-                if !gr_families.is_empty() {
-                    let restart_time = gr
-                        .and_then(|g| u16::try_from(g.restart_time).ok())
-                        .unwrap_or(DEFAULT_RESTART_TIME);
-                    let notification_enabled = gr.is_some_and(|g| g.notification_enabled);
-                    Some(GrPeerConfig {
-                        restart_time,
-                        notification_enabled,
-                        families: gr_families,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let graceful_restart = { parse_gr_api(p.graceful_restart.as_ref(), &p.afi_safis) };
 
         let holdtime = {
             let t = p
@@ -968,6 +933,75 @@ fn parse_afi_safis_yaml(
     (families, send_max)
 }
 
+/// Build GrPeerConfig from gRPC GracefulRestart message + per-family mp_graceful_restart flags.
+fn parse_gr_api(
+    gr: Option<&api::GracefulRestart>,
+    afi_safis: &[api::AfiSafi],
+) -> Option<GrPeerConfig> {
+    const DEFAULT_RESTART_TIME: u16 = 120;
+    if !gr.is_some_and(|g| g.enabled) {
+        return None;
+    }
+    let gr_families: Vec<Family> = afi_safis
+        .iter()
+        .filter(|a| {
+            a.mp_graceful_restart
+                .as_ref()
+                .is_some_and(|m| m.config.as_ref().is_some_and(|c| c.enabled))
+        })
+        .filter_map(|a| {
+            let f = a.config.as_ref()?.family.as_ref()?;
+            Some(convert::family_from_api(f))
+        })
+        .collect();
+    if gr_families.is_empty() {
+        return None;
+    }
+    Some(GrPeerConfig {
+        restart_time: gr
+            .and_then(|g| u16::try_from(g.restart_time).ok())
+            .unwrap_or(DEFAULT_RESTART_TIME),
+        notification_enabled: gr.is_some_and(|g| g.notification_enabled),
+        families: gr_families,
+    })
+}
+
+/// Build GrPeerConfig from YAML GracefulRestartConfig + per-family mp-graceful-restart flags.
+fn parse_gr_yaml(
+    afi_safis: &[config::AfiSafi],
+    gr_config: Option<&config::GracefulRestartConfig>,
+) -> Option<GrPeerConfig> {
+    const DEFAULT_RESTART_TIME: u16 = 120;
+    if !gr_config.and_then(|c| c.enabled).unwrap_or(false) {
+        return None;
+    }
+    let gr_families: Vec<Family> = afi_safis
+        .iter()
+        .filter(|a| {
+            a.mp_graceful_restart
+                .as_ref()
+                .and_then(|gr| gr.config.as_ref())
+                .and_then(|c| c.enabled)
+                .unwrap_or(false)
+        })
+        .filter_map(|a| {
+            convert::family_from_config(a.config.as_ref()?.afi_safi_name.as_ref()?).ok()
+        })
+        .collect();
+    if gr_families.is_empty() {
+        return None;
+    }
+    Some(GrPeerConfig {
+        restart_time: gr_config
+            .and_then(|c| c.restart_time)
+            .unwrap_or(DEFAULT_RESTART_TIME),
+        notification_enabled: gr_config
+            .and_then(|c| c.notification_enabled)
+            .unwrap_or(false),
+        families: gr_families,
+    })
+}
+
 impl TryFrom<&config::Neighbor> for PeerParams {
     type Error = String;
 
@@ -985,51 +1019,12 @@ impl TryFrom<&config::Neighbor> for PeerParams {
         let timer_config = n.timers.as_ref().and_then(|t| t.config.as_ref());
 
         let (families, send_max) = parse_afi_safis_yaml(afi_safis);
-
-        // Build GR helper config from graceful-restart + per-family mp-graceful-restart.
-        let graceful_restart = {
-            const DEFAULT_RESTART_TIME: u16 = 120;
-
-            let gr_config = n
-                .graceful_restart
+        let graceful_restart = parse_gr_yaml(
+            afi_safis,
+            n.graceful_restart
                 .as_ref()
-                .and_then(|gr| gr.config.as_ref());
-            let gr_enabled = gr_config.and_then(|c| c.enabled).unwrap_or(false);
-
-            if gr_enabled {
-                let gr_families: Vec<Family> = afi_safis
-                    .iter()
-                    .filter(|a| {
-                        a.mp_graceful_restart
-                            .as_ref()
-                            .and_then(|gr| gr.config.as_ref())
-                            .and_then(|c| c.enabled)
-                            .unwrap_or(false)
-                    })
-                    .filter_map(|a| {
-                        convert::family_from_config(a.config.as_ref()?.afi_safi_name.as_ref()?).ok()
-                    })
-                    .collect();
-
-                if !gr_families.is_empty() {
-                    let restart_time = gr_config
-                        .and_then(|c| c.restart_time)
-                        .unwrap_or(DEFAULT_RESTART_TIME);
-                    let notification_enabled = gr_config
-                        .and_then(|c| c.notification_enabled)
-                        .unwrap_or(false);
-                    Some(GrPeerConfig {
-                        restart_time,
-                        notification_enabled,
-                        families: gr_families,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+                .and_then(|gr| gr.config.as_ref()),
+        );
 
         // Extract per-family prefix limits.
         let mut prefix_limits: FnvHashMap<Family, u32> = FnvHashMap::default();
@@ -1124,6 +1119,7 @@ struct PeerGroup {
     connect_retry_time: Option<u64>,
     families: FnvHashMap<Family, u8>,
     send_max: FnvHashMap<Family, usize>,
+    graceful_restart: Option<GrPeerConfig>,
 }
 
 fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
@@ -1189,25 +1185,45 @@ fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
         afi_safis: pg
             .families
             .iter()
-            .map(|(family, mode)| api::AfiSafi {
-                config: Some(api::AfiSafiConfig {
-                    family: Some(convert::family_to_api(*family)),
-                    ..Default::default()
-                }),
-                add_paths: if *mode != 0 {
-                    Some(api::AddPaths {
-                        config: Some(api::AddPathsConfig {
-                            receive: (*mode & 1) != 0,
-                            send_max: pg.send_max.get(family).copied().unwrap_or(0) as u32,
-                        }),
+            .map(|(family, mode)| {
+                let gr_enabled = pg
+                    .graceful_restart
+                    .as_ref()
+                    .is_some_and(|gr| gr.families.contains(family));
+                api::AfiSafi {
+                    config: Some(api::AfiSafiConfig {
+                        family: Some(convert::family_to_api(*family)),
                         ..Default::default()
-                    })
-                } else {
-                    None
-                },
-                ..Default::default()
+                    }),
+                    add_paths: if *mode != 0 {
+                        Some(api::AddPaths {
+                            config: Some(api::AddPathsConfig {
+                                receive: (*mode & 1) != 0,
+                                send_max: pg.send_max.get(family).copied().unwrap_or(0) as u32,
+                            }),
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    },
+                    mp_graceful_restart: if gr_enabled {
+                        Some(api::MpGracefulRestart {
+                            config: Some(api::MpGracefulRestartConfig { enabled: true }),
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    },
+                    ..Default::default()
+                }
             })
             .collect(),
+        graceful_restart: pg.graceful_restart.as_ref().map(|gr| api::GracefulRestart {
+            enabled: true,
+            restart_time: gr.restart_time as u32,
+            notification_enabled: gr.notification_enabled,
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -1265,6 +1281,7 @@ impl From<api::PeerGroup> for PeerGroup {
                 })
                 .collect(),
             send_max: FnvHashMap::default(),
+            graceful_restart: parse_gr_api(p.graceful_restart.as_ref(), &p.afi_safis),
         }
     }
 }
@@ -1329,6 +1346,12 @@ impl PeerGroup {
                 .filter(|&t| t != 0),
             families,
             send_max,
+            graceful_restart: parse_gr_yaml(
+                pg.afi_safis.as_deref().unwrap_or_default(),
+                pg.graceful_restart
+                    .as_ref()
+                    .and_then(|gr| gr.config.as_ref()),
+            ),
         }
     }
 }
@@ -3633,7 +3656,7 @@ async fn accept_connection(
                 families: group.families.clone(),
                 send_max: group.send_max.clone(),
                 prefix_limits: FnvHashMap::default(),
-                graceful_restart: None,
+                graceful_restart: group.graceful_restart.clone(),
             };
             let _ = g.add_peer(params, None);
             g.peers.get_mut(&remote_addr).unwrap()
@@ -3974,6 +3997,7 @@ impl Global {
                     connect_retry_time: None,
                     families: FnvHashMap::default(),
                     send_max: FnvHashMap::default(),
+                    graceful_restart: None,
                 },
             );
         }
@@ -6120,6 +6144,7 @@ mod tests {
                     connect_retry_time: None,
                     families: FnvHashMap::default(),
                     send_max: FnvHashMap::default(),
+                    graceful_restart: None,
                 },
             );
         }
@@ -6163,6 +6188,7 @@ mod tests {
                     connect_retry_time: Some(30),
                     families: FnvHashMap::default(),
                     send_max: FnvHashMap::default(),
+                    graceful_restart: None,
                 },
             );
         }
@@ -6581,6 +6607,219 @@ mod tests {
         assert_eq!(*pg.send_max.get(&Family::IPV4).unwrap(), 4);
     }
 
+    // --- PeerGroup graceful_restart tests ---
+
+    #[test]
+    fn peer_group_yaml_gr_parsed() {
+        let yaml_pg = config::PeerGroup {
+            config: Some(config::PeerGroupConfig {
+                peer_group_name: Some("g".to_string()),
+                ..Default::default()
+            }),
+            afi_safis: Some(vec![config::AfiSafi {
+                config: Some(config::AfiSafiConfig {
+                    afi_safi_name: Some(config::AfiSafiType::Ipv4Unicast),
+                    ..Default::default()
+                }),
+                mp_graceful_restart: Some(config::MpGracefulRestart {
+                    config: Some(config::MpGracefulRestartConfig {
+                        enabled: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            graceful_restart: Some(config::GracefulRestart {
+                config: Some(config::GracefulRestartConfig {
+                    enabled: Some(true),
+                    restart_time: Some(90),
+                    notification_enabled: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pg = PeerGroup::from_yaml(&yaml_pg);
+        let gr = pg.graceful_restart.as_ref().expect("GR should be Some");
+        assert_eq!(gr.restart_time, 90);
+        assert!(gr.notification_enabled);
+        assert_eq!(gr.families, vec![Family::IPV4]);
+    }
+
+    #[test]
+    fn peer_group_yaml_gr_disabled_yields_none() {
+        let yaml_pg = config::PeerGroup {
+            config: Some(config::PeerGroupConfig {
+                peer_group_name: Some("g".to_string()),
+                ..Default::default()
+            }),
+            graceful_restart: Some(config::GracefulRestart {
+                config: Some(config::GracefulRestartConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pg = PeerGroup::from_yaml(&yaml_pg);
+        assert!(pg.graceful_restart.is_none());
+    }
+
+    #[test]
+    fn peer_group_yaml_gr_no_families_yields_none() {
+        // GR enabled but no afi-safi has mp-graceful-restart -> None
+        let yaml_pg = config::PeerGroup {
+            config: Some(config::PeerGroupConfig {
+                peer_group_name: Some("g".to_string()),
+                ..Default::default()
+            }),
+            afi_safis: Some(vec![config::AfiSafi {
+                config: Some(config::AfiSafiConfig {
+                    afi_safi_name: Some(config::AfiSafiType::Ipv4Unicast),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            graceful_restart: Some(config::GracefulRestart {
+                config: Some(config::GracefulRestartConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pg = PeerGroup::from_yaml(&yaml_pg);
+        assert!(pg.graceful_restart.is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_group_grpc_gr_roundtrip() {
+        let svc = make_grpc_service();
+        svc.add_peer_group(tonic::Request::new(api::AddPeerGroupRequest {
+            peer_group: Some(api::PeerGroup {
+                conf: Some(api::PeerGroupConf {
+                    peer_group_name: "gr-grp".to_string(),
+                    ..Default::default()
+                }),
+                graceful_restart: Some(api::GracefulRestart {
+                    enabled: true,
+                    restart_time: 150,
+                    notification_enabled: true,
+                    ..Default::default()
+                }),
+                afi_safis: vec![api::AfiSafi {
+                    config: Some(api::AfiSafiConfig {
+                        family: Some(api::Family {
+                            afi: api::family::Afi::Ip as i32,
+                            safi: api::family::Safi::Unicast as i32,
+                        }),
+                        ..Default::default()
+                    }),
+                    mp_graceful_restart: Some(api::MpGracefulRestart {
+                        config: Some(api::MpGracefulRestartConfig { enabled: true }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        svc.list_peer_group(tonic::Request::new(api::ListPeerGroupRequest {
+            peer_group_name: "gr-grp".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .for_each(|r| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(r.unwrap().peer_group.unwrap()).await;
+            }
+        })
+        .await;
+
+        let got = rx.recv().await.unwrap();
+        let gr = got.graceful_restart.as_ref().expect("GR should be Some");
+        assert!(gr.enabled);
+        assert_eq!(gr.restart_time, 150);
+        assert!(gr.notification_enabled);
+        // mp_graceful_restart should be reflected in afi_safis
+        assert_eq!(got.afi_safis.len(), 1);
+        assert!(
+            got.afi_safis[0]
+                .mp_graceful_restart
+                .as_ref()
+                .and_then(|m| m.config.as_ref())
+                .is_some_and(|c| c.enabled)
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_peer_inherits_gr_from_group() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut families = FnvHashMap::default();
+        families.insert(Family::IPV4, 0u8);
+
+        {
+            let mut g = global.write().await;
+            g.peer_group.insert(
+                "gr-group".to_string(),
+                PeerGroup {
+                    as_number: 65002,
+                    dynamic_peers: vec![DynamicPeer {
+                        prefix: packet::IpNet::new(remote_addr, 32),
+                    }],
+                    route_server_client: false,
+                    holdtime: None,
+                    local_asn: 0,
+                    passive: false,
+                    route_reflector: RouteReflectorConfig::default(),
+                    multihop_ttl: None,
+                    auth_password: None,
+                    connect_retry_time: None,
+                    families,
+                    send_max: FnvHashMap::default(),
+                    graceful_restart: Some(GrPeerConfig {
+                        restart_time: 120,
+                        notification_enabled: false,
+                        families: vec![Family::IPV4],
+                    }),
+                },
+            );
+        }
+
+        let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(h.is_some());
+
+        let g = global.read().await;
+        let peer = g.peers.get(&remote_addr).unwrap();
+        let gr = peer
+            .config
+            .graceful_restart
+            .as_ref()
+            .expect("GR should be inherited");
+        assert_eq!(gr.restart_time, 120);
+        assert_eq!(gr.families, vec![Family::IPV4]);
+        // GR capability should appear in local_cap
+        let has_gr_cap = peer
+            .config
+            .local_cap
+            .iter()
+            .any(|c| matches!(c, packet::Capability::GracefulRestart { .. }));
+        assert!(has_gr_cap);
+    }
+
     #[tokio::test]
     async fn dynamic_peer_inherits_families_from_group() {
         let global = make_global();
@@ -6611,6 +6850,7 @@ mod tests {
                     connect_retry_time: None,
                     families,
                     send_max: FnvHashMap::default(),
+                    graceful_restart: None,
                 },
             );
         }
