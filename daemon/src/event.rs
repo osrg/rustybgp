@@ -3334,37 +3334,15 @@ impl GoBgpService for GrpcService {
             .iter()
             .filter_map(|s| kernel::route_type_to_protocol(s))
             .collect();
-        match kernel::Handle::with_route_monitor() {
-            Ok((handle, connection, route_events)) => {
-                let conn_handle = tokio::spawn(connection);
-                let (tx, mut rx) = mpsc::unbounded_channel();
-                let bgp_to_kernel = tokio::spawn(async move {
-                    while let Some(change) = rx.recv().await {
-                        if let Err(e) = handle.apply(&change).await {
-                            log::error!("kernel route update failed: {}", e);
-                        }
-                    }
-                });
-                self.tables.kernel_tx.store(Some(Arc::new(tx)));
-                let tables = self.tables.clone();
-                let kernel_to_bgp = tokio::spawn(table_manager::run_kernel_routes(
-                    tables,
-                    route_events,
-                    redistribute,
-                ));
-                self.global.write().await.kernel_abort_handles.extend([
-                    conn_handle.abort_handle(),
-                    bgp_to_kernel.abort_handle(),
-                    kernel_to_bgp.abort_handle(),
-                ]);
-                log::info!("kernel route integration enabled");
-                Ok(tonic::Response::new(api::EnableZebraResponse {}))
-            }
-            Err(e) => Err(tonic::Status::internal(format!(
-                "failed to enable kernel route integration: {:?}",
-                e
-            ))),
-        }
+        start_kernel_tasks(&self.tables, &self.global, redistribute)
+            .await
+            .map_err(|e| {
+                tonic::Status::internal(format!(
+                    "failed to enable kernel route integration: {:?}",
+                    e
+                ))
+            })?;
+        Ok(tonic::Response::new(api::EnableZebraResponse {}))
     }
     async fn enable_mrt(
         &self,
@@ -3993,6 +3971,37 @@ async fn accept_connection(
     PeerSession::new(stream, remote_addr, role, Some(close_rx), res)
 }
 
+async fn start_kernel_tasks(
+    tables: &TableHandle,
+    global: &GlobalHandle,
+    redistribute: Vec<kernel::Protocol>,
+) -> Result<(), kernel::Error> {
+    let (handle, connection, route_events) = kernel::Handle::with_route_monitor()?;
+    let conn_handle = tokio::spawn(connection);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let bgp_to_kernel = tokio::spawn(async move {
+        while let Some(change) = rx.recv().await {
+            if let Err(e) = handle.apply(&change).await {
+                log::error!("kernel route update failed: {}", e);
+            }
+        }
+    });
+    tables.kernel_tx.store(Some(Arc::new(tx)));
+    let tables_clone = tables.clone();
+    let kernel_to_bgp = tokio::spawn(table_manager::run_kernel_routes(
+        tables_clone,
+        route_events,
+        redistribute,
+    ));
+    global.write().await.kernel_abort_handles.extend([
+        conn_handle.abort_handle(),
+        bgp_to_kernel.abort_handle(),
+        kernel_to_bgp.abort_handle(),
+    ]);
+    log::info!("kernel route integration enabled");
+    Ok(())
+}
+
 impl Global {
     async fn serve(
         bgp: Option<config::BgpConfig>,
@@ -4099,34 +4108,8 @@ impl Global {
                 .flatten()
                 .filter_map(|s| kernel::route_type_to_protocol(s))
                 .collect();
-            match kernel::Handle::with_route_monitor() {
-                Ok((handle, connection, route_events)) => {
-                    let conn_handle = tokio::spawn(connection);
-                    let (tx, mut rx) = mpsc::unbounded_channel();
-                    let bgp_to_kernel = tokio::spawn(async move {
-                        while let Some(change) = rx.recv().await {
-                            if let Err(e) = handle.apply(&change).await {
-                                log::error!("kernel route update failed: {}", e);
-                            }
-                        }
-                    });
-                    tables.kernel_tx.store(Some(Arc::new(tx)));
-                    let tables_arc = tables.clone();
-                    let kernel_to_bgp = tokio::spawn(table_manager::run_kernel_routes(
-                        tables_arc,
-                        route_events,
-                        redistribute,
-                    ));
-                    global.write().await.kernel_abort_handles.extend([
-                        conn_handle.abort_handle(),
-                        bgp_to_kernel.abort_handle(),
-                        kernel_to_bgp.abort_handle(),
-                    ]);
-                    log::info!("kernel route integration enabled");
-                }
-                Err(e) => {
-                    log::error!("failed to enable kernel route integration: {:?}", e);
-                }
+            if let Err(e) = start_kernel_tasks(&tables, &global, redistribute).await {
+                log::error!("failed to enable kernel route integration: {:?}", e);
             }
         }
         if let Some(groups) = bgp.as_ref().and_then(|x| x.peer_groups.as_ref()) {
