@@ -5950,6 +5950,11 @@ fn is_ibgp_learned(source: &table::Source) -> bool {
 /// Returns `true` when the path should be suppressed (not sent to `dest_role`).
 /// In plain iBGP mode (`cluster_id` is None) all iBGP-learned paths are
 /// suppressed.  In RR mode only non-client -> non-client is suppressed.
+fn rs_isolation_suppress(source: &table::Source, dest_role: PeerRole) -> bool {
+    // RS-client routes must not reach non-RS-client peers, and vice versa.
+    source.is_rs_client() != matches!(dest_role, PeerRole::RsClient)
+}
+
 fn ibgp_split_horizon_suppress(
     source: &table::Source,
     dest_role: PeerRole,
@@ -6003,6 +6008,9 @@ fn process_nlri_change(
                 return None;
             }
             if ibgp_split_horizon_suppress(&best.source, export_ctx.role, cluster_id) {
+                return None;
+            }
+            if rs_isolation_suppress(&best.source, export_ctx.role) {
                 return None;
             }
             Some(best)
@@ -6060,6 +6068,7 @@ fn process_nlri_change(
             .iter()
             .filter(|p| p.source.remote_addr != remote_addr)
             .filter(|p| !ibgp_split_horizon_suppress(&p.source, export_ctx.role, cluster_id))
+            .filter(|p| !rs_isolation_suppress(&p.source, export_ctx.role))
             .take(effective_max)
             .filter_map(|path| {
                 let mut nexthop = path.nexthop;
@@ -9510,6 +9519,112 @@ mod tests {
                 &ibgp_rr_client_ctx(),
                 None,
                 Some(CLUSTER_ID),
+            );
+
+            assert!(em.was_sent(Family::IPV4, &net));
+            assert_eq!(
+                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                1
+            );
+        }
+
+        // ---- RS isolation ----
+
+        fn rs_client_source(addr: &str) -> Arc<table::Source> {
+            let ip: IpAddr = addr.parse().unwrap();
+            Arc::new(table::Source::new(
+                ip,
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                65002,
+                65001,
+                Ipv4Addr::new(10, 0, 0, 1),
+                true,
+                false,
+            ))
+        }
+
+        fn rs_client_ctx() -> PeerExportContext {
+            PeerExportContext {
+                role: PeerRole::RsClient,
+                local_asn: 65001,
+                local_addr: "127.0.0.1".parse().unwrap(),
+                link_addr: None,
+                confederation_id: 0,
+            }
+        }
+
+        // RS-client source must not reach a non-RS-client (eBGP) peer.
+        #[test]
+        fn rs_isolation_suppresses_rs_client_route_to_ebgp_peer() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path(1, rs_client_source(PEER));
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+            );
+
+            assert!(!em.was_sent(Family::IPV4, &net));
+            assert_eq!(
+                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                0
+            );
+        }
+
+        // Non-RS-client (eBGP) source must not reach an RS-client peer.
+        #[test]
+        fn rs_isolation_suppresses_ebgp_route_to_rs_client_peer() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path(1, source(PEER));
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &rs_client_ctx(),
+                None,
+                None,
+            );
+
+            assert!(!em.was_sent(Family::IPV4, &net));
+            assert_eq!(
+                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                0
+            );
+        }
+
+        // RS-client source must be forwarded to another RS-client peer.
+        #[test]
+        fn rs_isolation_forwards_rs_client_route_to_rs_client_peer() {
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path(1, rs_client_source(PEER));
+            let update = change(net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &rs_client_ctx(),
+                None,
+                None,
             );
 
             assert!(em.was_sent(Family::IPV4, &net));

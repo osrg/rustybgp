@@ -548,6 +548,10 @@ impl Source {
         self.rr_client
     }
 
+    pub fn is_rs_client(&self) -> bool {
+        self.rs_client
+    }
+
     pub fn mark_stale(&self) {
         self.stale.store(true, Ordering::Relaxed);
     }
