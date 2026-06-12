@@ -923,6 +923,51 @@ impl TryFrom<&api::Peer> for PeerParams {
     }
 }
 
+/// Parse an afi-safis slice from YAML config into (families, send_max) maps.
+///
+/// Returns a map of Family -> add-path mode (RFC 7911 2-bit: bit0=RX, bit1=TX)
+/// and a separate send_max map for families where add-path TX is configured.
+fn parse_afi_safis_yaml(
+    afi_safis: &[config::AfiSafi],
+) -> (FnvHashMap<Family, u8>, FnvHashMap<Family, usize>) {
+    let mut base_families: Vec<Family> = Vec::new();
+    let addpath_entries: Vec<(packet::Family, u8, usize)> = afi_safis
+        .iter()
+        .filter(|x| {
+            let name = x.config.as_ref().and_then(|c| c.afi_safi_name.as_ref());
+            let Some(f) = name else { return false };
+            if let Ok(family) = convert::family_from_config(f) {
+                base_families.push(family);
+            }
+            true
+        })
+        .filter_map(|x| {
+            let ap_config = x.add_paths.as_ref()?.config.as_ref()?;
+            let rx = ap_config.receive.unwrap_or(false);
+            let send_max = ap_config.send_max.unwrap_or(0) as usize;
+            let tx = send_max > 0;
+            let mode = u8::from(rx) | (u8::from(tx) << 1);
+            if mode == 0 {
+                return None;
+            }
+            let family =
+                convert::family_from_config(x.config.as_ref()?.afi_safi_name.as_ref()?).ok()?;
+            Some((family, mode, send_max))
+        })
+        .collect();
+
+    let mut families: FnvHashMap<Family, u8> =
+        base_families.into_iter().map(|f| (f, 0u8)).collect();
+    let mut send_max: FnvHashMap<Family, usize> = FnvHashMap::default();
+    for (f, mode, sm) in addpath_entries {
+        families.insert(f, mode & 0x3);
+        if sm > 0 {
+            send_max.insert(f, sm);
+        }
+    }
+    (families, send_max)
+}
+
 impl TryFrom<&config::Neighbor> for PeerParams {
     type Error = String;
 
@@ -939,44 +984,7 @@ impl TryFrom<&config::Neighbor> for PeerParams {
         let transport_config = n.transport.as_ref().and_then(|t| t.config.as_ref());
         let timer_config = n.timers.as_ref().and_then(|t| t.config.as_ref());
 
-        // Collect address families and add-path configuration.
-        let mut base_families: Vec<Family> = Vec::new();
-        let addpath_entries: Vec<(packet::Family, u8, usize)> = afi_safis
-            .iter()
-            .filter(|x| {
-                let name = x.config.as_ref().and_then(|c| c.afi_safi_name.as_ref());
-                let Some(f) = name else { return false };
-                if let Ok(family) = convert::family_from_config(f) {
-                    base_families.push(family);
-                }
-                true
-            })
-            .filter_map(|x| {
-                let ap_config = x.add_paths.as_ref()?.config.as_ref()?;
-                let rx = ap_config.receive.unwrap_or(false);
-                let send_max = ap_config.send_max.unwrap_or(0) as usize;
-                let tx = send_max > 0;
-                let mode = u8::from(rx) | (u8::from(tx) << 1);
-                if mode == 0 {
-                    return None;
-                }
-                let family =
-                    convert::family_from_config(x.config.as_ref()?.afi_safi_name.as_ref()?).ok()?;
-                Some((family, mode, send_max))
-            })
-            .collect();
-
-        // Build families map: start with plain entries, then override with add-path modes.
-        let mut families: FnvHashMap<Family, u8> =
-            base_families.into_iter().map(|f| (f, 0u8)).collect();
-        let mut send_max: FnvHashMap<Family, usize> = FnvHashMap::default();
-        for (f, mode, sm) in addpath_entries {
-            // RFC 7911 mode is 2 bits: bit 0 = receive, bit 1 = send
-            families.insert(f, mode & 0x3);
-            if sm > 0 {
-                send_max.insert(f, sm);
-            }
-        }
+        let (families, send_max) = parse_afi_safis_yaml(afi_safis);
 
         // Build GR helper config from graceful-restart + per-family mp-graceful-restart.
         let graceful_restart = {
@@ -1114,6 +1122,8 @@ struct PeerGroup {
     multihop_ttl: Option<u8>,
     auth_password: Option<String>,
     connect_retry_time: Option<u64>,
+    families: FnvHashMap<Family, u8>,
+    send_max: FnvHashMap<Family, usize>,
 }
 
 fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
@@ -1176,6 +1186,28 @@ fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
             enabled: true,
             multihop_ttl: ttl as u32,
         }),
+        afi_safis: pg
+            .families
+            .iter()
+            .map(|(family, mode)| api::AfiSafi {
+                config: Some(api::AfiSafiConfig {
+                    family: Some(convert::family_to_api(*family)),
+                    ..Default::default()
+                }),
+                add_paths: if *mode != 0 {
+                    Some(api::AddPaths {
+                        config: Some(api::AddPathsConfig {
+                            receive: (*mode & 1) != 0,
+                            send_max: pg.send_max.get(family).copied().unwrap_or(0) as u32,
+                        }),
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                },
+                ..Default::default()
+            })
+            .collect(),
         ..Default::default()
     }
 }
@@ -1221,6 +1253,18 @@ impl From<api::PeerGroup> for PeerGroup {
                 .and_then(|t| t.config)
                 .map(|c| c.connect_retry)
                 .filter(|&t| t != 0),
+            families: p
+                .afi_safis
+                .iter()
+                .filter(|x| x.config.as_ref().is_some_and(|c| c.family.is_some()))
+                .map(|x| {
+                    let f = convert::family_from_api(
+                        x.config.as_ref().unwrap().family.as_ref().unwrap(),
+                    );
+                    (f, 0u8)
+                })
+                .collect(),
+            send_max: FnvHashMap::default(),
         }
     }
 }
@@ -1228,6 +1272,8 @@ impl From<api::PeerGroup> for PeerGroup {
 impl PeerGroup {
     fn from_yaml(pg: &config::PeerGroup) -> Self {
         let timer_config = pg.timers.as_ref().and_then(|t| t.config.as_ref());
+        let (families, send_max) =
+            parse_afi_safis_yaml(pg.afi_safis.as_deref().unwrap_or_default());
         PeerGroup {
             as_number: pg.config.as_ref().and_then(|c| c.peer_as).unwrap_or(0),
             dynamic_peers: Vec::new(),
@@ -1281,6 +1327,8 @@ impl PeerGroup {
                 .and_then(|c| c.connect_retry)
                 .map(|t| t as u64)
                 .filter(|&t| t != 0),
+            families,
+            send_max,
         }
     }
 }
@@ -3582,8 +3630,8 @@ async fn accept_connection(
                     .unwrap_or(PeerParams::DEFAULT_CONNECT_RETRY_TIME),
                 multihop_ttl: group.multihop_ttl,
                 password: group.auth_password.clone(),
-                families: FnvHashMap::default(),
-                send_max: FnvHashMap::default(),
+                families: group.families.clone(),
+                send_max: group.send_max.clone(),
                 prefix_limits: FnvHashMap::default(),
                 graceful_restart: None,
             };
@@ -3924,6 +3972,8 @@ impl Global {
                     multihop_ttl: None,
                     auth_password: None,
                     connect_retry_time: None,
+                    families: FnvHashMap::default(),
+                    send_max: FnvHashMap::default(),
                 },
             );
         }
@@ -6068,6 +6118,8 @@ mod tests {
                     multihop_ttl: None,
                     auth_password: None,
                     connect_retry_time: None,
+                    families: FnvHashMap::default(),
+                    send_max: FnvHashMap::default(),
                 },
             );
         }
@@ -6109,6 +6161,8 @@ mod tests {
                     multihop_ttl: Some(5),
                     auth_password: Some("secret".to_string()),
                     connect_retry_time: Some(30),
+                    families: FnvHashMap::default(),
+                    send_max: FnvHashMap::default(),
                 },
             );
         }
@@ -6392,6 +6446,195 @@ mod tests {
         };
         let pg = PeerGroup::from_yaml(&yaml_pg);
         assert!(pg.multihop_ttl.is_none());
+    }
+
+    // --- PeerGroup families tests ---
+
+    fn make_api_peer_group_with_families(name: &str) -> api::PeerGroup {
+        api::PeerGroup {
+            conf: Some(api::PeerGroupConf {
+                peer_group_name: name.to_string(),
+                peer_asn: 65002,
+                ..Default::default()
+            }),
+            afi_safis: vec![
+                api::AfiSafi {
+                    config: Some(api::AfiSafiConfig {
+                        family: Some(api::Family {
+                            afi: api::family::Afi::Ip as i32,
+                            safi: api::family::Safi::Unicast as i32,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                api::AfiSafi {
+                    config: Some(api::AfiSafiConfig {
+                        family: Some(api::Family {
+                            afi: api::family::Afi::Ip6 as i32,
+                            safi: api::family::Safi::Unicast as i32,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_group_grpc_families_roundtrip() {
+        let svc = make_grpc_service();
+        svc.add_peer_group(tonic::Request::new(api::AddPeerGroupRequest {
+            peer_group: Some(make_api_peer_group_with_families("grp")),
+        }))
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        svc.list_peer_group(tonic::Request::new(api::ListPeerGroupRequest {
+            peer_group_name: "grp".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .for_each(|r| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(r.unwrap().peer_group.unwrap()).await;
+            }
+        })
+        .await;
+
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.afi_safis.len(), 2);
+        let afis: Vec<i32> = got
+            .afi_safis
+            .iter()
+            .map(|a| a.config.as_ref().unwrap().family.as_ref().unwrap().afi)
+            .collect();
+        assert!(afis.contains(&(api::family::Afi::Ip as i32)));
+        assert!(afis.contains(&(api::family::Afi::Ip6 as i32)));
+    }
+
+    #[test]
+    fn peer_group_yaml_families_parsed() {
+        let yaml_pg = config::PeerGroup {
+            config: Some(config::PeerGroupConfig {
+                peer_group_name: Some("g".to_string()),
+                ..Default::default()
+            }),
+            afi_safis: Some(vec![
+                config::AfiSafi {
+                    config: Some(config::AfiSafiConfig {
+                        afi_safi_name: Some(config::AfiSafiType::Ipv4Unicast),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                config::AfiSafi {
+                    config: Some(config::AfiSafiConfig {
+                        afi_safi_name: Some(config::AfiSafiType::Ipv6Unicast),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let pg = PeerGroup::from_yaml(&yaml_pg);
+        assert_eq!(pg.families.len(), 2);
+        assert!(pg.families.contains_key(&Family::IPV4));
+        assert!(pg.families.contains_key(&Family::IPV6));
+        assert!(pg.send_max.is_empty());
+    }
+
+    #[test]
+    fn peer_group_yaml_addpath_send_max_parsed() {
+        let yaml_pg = config::PeerGroup {
+            config: Some(config::PeerGroupConfig {
+                peer_group_name: Some("g".to_string()),
+                ..Default::default()
+            }),
+            afi_safis: Some(vec![config::AfiSafi {
+                config: Some(config::AfiSafiConfig {
+                    afi_safi_name: Some(config::AfiSafiType::Ipv4Unicast),
+                    ..Default::default()
+                }),
+                add_paths: Some(config::AddPaths {
+                    config: Some(config::AddPathsConfig {
+                        receive: Some(true),
+                        send_max: Some(4),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let pg = PeerGroup::from_yaml(&yaml_pg);
+        assert_eq!(pg.families.len(), 1);
+        // mode: bit0=RX(1), bit1=TX(1) -> 3
+        assert_eq!(*pg.families.get(&Family::IPV4).unwrap(), 3u8);
+        assert_eq!(*pg.send_max.get(&Family::IPV4).unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn dynamic_peer_inherits_families_from_group() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut families = FnvHashMap::default();
+        families.insert(Family::IPV4, 0u8);
+        families.insert(Family::IPV6, 0u8);
+
+        {
+            let mut g = global.write().await;
+            g.peer_group.insert(
+                "fam-group".to_string(),
+                PeerGroup {
+                    as_number: 65002,
+                    dynamic_peers: vec![DynamicPeer {
+                        prefix: packet::IpNet::new(remote_addr, 32),
+                    }],
+                    route_server_client: false,
+                    holdtime: None,
+                    local_asn: 0,
+                    passive: false,
+                    route_reflector: RouteReflectorConfig::default(),
+                    multihop_ttl: None,
+                    auth_password: None,
+                    connect_retry_time: None,
+                    families,
+                    send_max: FnvHashMap::default(),
+                },
+            );
+        }
+
+        let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(h.is_some());
+
+        let g = global.read().await;
+        let peer = g.peers.get(&remote_addr).unwrap();
+        // Inherited families should appear in local_cap as MultiProtocol capabilities.
+        let mp_families: Vec<Family> = peer
+            .config
+            .local_cap
+            .iter()
+            .filter_map(|c| {
+                if let packet::Capability::MultiProtocol(f) = c {
+                    Some(*f)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(mp_families.contains(&Family::IPV4));
+        assert!(mp_families.contains(&Family::IPV6));
     }
 
     fn cease_notification() -> bgp::Message {
