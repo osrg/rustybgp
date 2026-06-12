@@ -1,4 +1,4 @@
-module gen_vpn_nlri
+module testgen
 
 go 1.24.5
 
