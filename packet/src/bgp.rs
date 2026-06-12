@@ -985,6 +985,76 @@ impl Attribute {
         }
     }
 
+    /// Prepend `as_number` to the AS_CONFED_SEQUENCE segment of this AS_PATH.
+    ///
+    /// Used when advertising to a Confed-eBGP peer (RFC 5065 §5.1): the local
+    /// Member-AS is added to the front of the confederation path so that other
+    /// members can detect loops.
+    pub fn as_path_prepend_confed(&self, as_number: u32) -> Attribute {
+        assert_eq!(self.code, Attribute::AS_PATH);
+        let buf = self.binary().unwrap();
+        let len = buf.len() as u64;
+
+        let data = if len != 0 && buf[0] == Attribute::AS_PATH_TYPE_CONFED_SEQ && buf[1] < 255 {
+            let mut new_buf = Vec::with_capacity(len as usize + 4);
+            new_buf.put_u8(buf[0]);
+            new_buf.put_u8(buf[1] + 1);
+            new_buf.put_u32(as_number);
+            new_buf.put(&buf[2..]);
+            AttributeData::Bin(new_buf)
+        } else if len == 0 {
+            let mut new_buf = Vec::with_capacity(6);
+            new_buf.put_u8(Attribute::AS_PATH_TYPE_CONFED_SEQ);
+            new_buf.put_u8(1);
+            new_buf.put_u32(as_number);
+            AttributeData::Bin(new_buf)
+        } else {
+            let mut new_buf = Vec::with_capacity(len as usize + 6);
+            new_buf.put_u8(Attribute::AS_PATH_TYPE_CONFED_SEQ);
+            new_buf.put_u8(1);
+            new_buf.put_u32(as_number);
+            new_buf.put(&buf[..]);
+            AttributeData::Bin(new_buf)
+        };
+        Attribute {
+            code: self.code,
+            flags: self.flags,
+            data,
+        }
+    }
+
+    /// Remove all AS_CONFED_SEQUENCE and AS_CONFED_SET segments from this AS_PATH.
+    ///
+    /// Used when advertising to an external eBGP peer (RFC 5065 §5.1): confed
+    /// segments are internal and must not leak outside the confederation.
+    pub fn as_path_strip_confed(&self) -> Attribute {
+        assert_eq!(self.code, Attribute::AS_PATH);
+        let buf = self.binary().unwrap();
+        let len = buf.len() as u64;
+        let mut c = Cursor::new(buf);
+        let mut new_buf: Vec<u8> = Vec::with_capacity(len as usize);
+
+        while c.position() < len {
+            let seg_type = c.read_u8().unwrap();
+            let seg_len = c.read_u8().unwrap();
+            let seg_bytes = seg_len as usize * 4;
+            let start = c.position() as usize;
+            c.set_position(c.position() + seg_bytes as u64);
+            if seg_type != Attribute::AS_PATH_TYPE_CONFED_SEQ
+                && seg_type != Attribute::AS_PATH_TYPE_CONFED_SET
+            {
+                new_buf.put_u8(seg_type);
+                new_buf.put_u8(seg_len);
+                new_buf.put(&buf[start..start + seg_bytes]);
+            }
+        }
+        Attribute {
+            code: self.code,
+            flags: self.flags,
+            data: AttributeData::Bin(new_buf),
+        }
+    }
+
     pub fn as_path_origin(&self) -> Option<u32> {
         let buf = self.binary().unwrap();
         let len = buf.len() as u64;
@@ -1280,6 +1350,7 @@ pub struct PeerCodecBuilder {
     remote_asn: u32,
     extended_length: bool,
     family: Vec<Family>,
+    confederation_id: u32,
 }
 
 impl Default for PeerCodecBuilder {
@@ -1295,6 +1366,7 @@ impl PeerCodecBuilder {
             remote_asn: 0,
             extended_length: false,
             family: Vec::new(),
+            confederation_id: 0,
         }
     }
 
@@ -1309,11 +1381,17 @@ impl PeerCodecBuilder {
             remote_asn: self.remote_asn,
             extended_length: self.extended_length,
             channel,
+            confederation_id: self.confederation_id,
         }
     }
 
     pub fn local_asn(&mut self, asn: u32) -> &mut Self {
         self.local_asn = asn;
+        self
+    }
+
+    pub fn confederation_id(&mut self, id: u32) -> &mut Self {
+        self.confederation_id = id;
         self
     }
 
@@ -1328,6 +1406,8 @@ pub struct PeerCodec {
     local_asn: u32,
     remote_asn: u32,
     pub channel: FnvHashMap<Family, Channel>,
+    /// Confederation Identifier for external AS_PATH loop detection (0 = disabled).
+    confederation_id: u32,
 }
 
 impl PeerCodec {
@@ -1883,15 +1963,27 @@ impl PeerCodec {
                     }
 
                     if !error_withdraw {
-                        match attr[*seen.get(&Attribute::AS_PATH).unwrap()]
-                            .as_path_count(self.local_asn)
-                        {
+                        let as_path = &attr[*seen.get(&Attribute::AS_PATH).unwrap()];
+                        match as_path.as_path_count(self.local_asn) {
                             Ok(v) => {
                                 if v > 0 {
                                     error_withdraw = true
                                 }
                             }
                             Err(_) => error_withdraw = true,
+                        }
+                        if !error_withdraw
+                            && self.confederation_id != 0
+                            && self.confederation_id != self.local_asn
+                        {
+                            match as_path.as_path_count(self.confederation_id) {
+                                Ok(v) => {
+                                    if v > 0 {
+                                        error_withdraw = true
+                                    }
+                                }
+                                Err(_) => error_withdraw = true,
+                            }
                         }
                     }
                 }
@@ -2116,6 +2208,135 @@ impl PeerCodec {
                 Ok(())
             }
             _ => self.do_encode(msg, dst, &mut done_idx),
+        }
+    }
+}
+
+#[cfg(test)]
+mod confed_as_path_tests {
+    use super::*;
+
+    fn as_path(data: Vec<u8>) -> Attribute {
+        Attribute::new_with_bin(Attribute::AS_PATH, data).unwrap()
+    }
+
+    fn seg_bytes(seg_type: u8, asns: &[u32]) -> Vec<u8> {
+        let mut v = vec![seg_type, asns.len() as u8];
+        for &a in asns {
+            v.extend_from_slice(&a.to_be_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn as_path_prepend_confed_to_empty() {
+        let result = Attribute::empty_as_path().as_path_prepend_confed(65001);
+        let buf = result.binary().unwrap();
+        assert_eq!(
+            buf,
+            &seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001])
+        );
+    }
+
+    #[test]
+    fn as_path_prepend_confed_extends_existing() {
+        let input = as_path(seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65002]));
+        let result = input.as_path_prepend_confed(65001);
+        let buf = result.binary().unwrap();
+        assert_eq!(
+            buf,
+            &seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001, 65002])
+        );
+    }
+
+    #[test]
+    fn as_path_prepend_confed_full_segment_creates_new() {
+        let full: Vec<u32> = (0..255).map(|i| 65000 + i).collect();
+        let input = as_path(seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &full));
+        let result = input.as_path_prepend_confed(65001);
+        let buf = result.binary().unwrap();
+        let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001]);
+        expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &full));
+        assert_eq!(buf, &expected);
+    }
+
+    #[test]
+    fn as_path_prepend_confed_over_seq_segment() {
+        let input = as_path(seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65100]));
+        let result = input.as_path_prepend_confed(65001);
+        let buf = result.binary().unwrap();
+        let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001]);
+        expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65100]));
+        assert_eq!(buf, &expected);
+    }
+
+    #[test]
+    fn as_path_strip_confed_removes_confed_segments() {
+        let mut data = seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001]);
+        data.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65100]));
+        data.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SET, &[65050]));
+        data.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65200]));
+        let result = as_path(data).as_path_strip_confed();
+        let buf = result.binary().unwrap();
+        let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65100]);
+        expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65200]));
+        assert_eq!(buf, &expected);
+    }
+
+    #[test]
+    fn as_path_strip_confed_only_confed_gives_empty() {
+        let mut data = seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001]);
+        data.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SET, &[65050]));
+        let result = as_path(data).as_path_strip_confed();
+        assert!(result.binary().unwrap().is_empty());
+    }
+
+    /// Build a minimal BGP UPDATE message (including 19-byte header) whose
+    /// AS_PATH contains `asn` in an AS_SEQUENCE segment.
+    fn update_msg_with_asn_in_path(asn: u32) -> Vec<u8> {
+        let origin: [u8; 4] = [0x40, 0x01, 0x01, 0x00]; // ORIGIN IGP
+        let asn_b = asn.to_be_bytes();
+        let as_path_attr: [u8; 9] = [
+            0x40, 0x02, 0x06, // transitive, AS_PATH, len=6
+            0x02, 0x01, // AS_SEQUENCE, count=1
+            asn_b[0], asn_b[1], asn_b[2], asn_b[3],
+        ];
+        let nexthop: [u8; 7] = [0x40, 0x03, 0x04, 1, 1, 1, 1]; // NEXT_HOP 1.1.1.1
+        let nlri: [u8; 4] = [24, 10, 0, 1]; // 10.0.1.0/24
+
+        let attr_len = (origin.len() + as_path_attr.len() + nexthop.len()) as u16;
+        let total_len = (19u16 + 2 + 2 + attr_len + nlri.len() as u16).to_be_bytes();
+
+        let mut msg = vec![0xff; 16]; // marker
+        msg.extend_from_slice(&total_len);
+        msg.push(2); // UPDATE
+        msg.extend_from_slice(&[0x00, 0x00]); // withdrawn_len
+        msg.extend_from_slice(&attr_len.to_be_bytes());
+        msg.extend_from_slice(&origin);
+        msg.extend_from_slice(&as_path_attr);
+        msg.extend_from_slice(&nexthop);
+        msg.extend_from_slice(&nlri);
+        msg
+    }
+
+    #[test]
+    fn confederation_id_loop_detected_on_rx() {
+        let confederation_id: u32 = 65000;
+        let mut codec = PeerCodecBuilder::new()
+            .local_asn(65001)
+            .confederation_id(confederation_id)
+            .families(vec![Family::IPV4])
+            .build();
+
+        let msg = update_msg_with_asn_in_path(confederation_id);
+        let result = codec.parse_message(&msg).unwrap();
+        if let Message::Update(update) = result {
+            assert!(
+                update.reach.is_none(),
+                "route with confederation_id in AS_PATH must be treated as withdrawn"
+            );
+        } else {
+            panic!("expected UPDATE message");
         }
     }
 }

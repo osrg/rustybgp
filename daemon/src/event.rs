@@ -3819,6 +3819,7 @@ async fn accept_connection(
         context,
         local_router_id: peer.config.local_router_id,
         cluster_id,
+        confederation_id: confederation.as_ref().map_or(0, |(id, _)| *id),
     };
     PeerSession::new(stream, remote_addr, role, Some(close_rx), res)
 }
@@ -4522,6 +4523,8 @@ struct PeerExportContext {
     local_asn: u32,
     local_addr: IpAddr,
     link_addr: Option<Ipv6Addr>,
+    /// Confederation Identifier (0 = not in a confederation).
+    confederation_id: u32,
 }
 
 impl PeerExportContext {
@@ -4534,6 +4537,7 @@ impl PeerExportContext {
     fn build_codec(&self) -> bgp::PeerCodec {
         bgp::PeerCodecBuilder::new()
             .local_asn(self.local_asn)
+            .confederation_id(self.confederation_id)
             .build()
     }
 
@@ -4547,25 +4551,49 @@ impl PeerExportContext {
     /// RS client: pass through unchanged.
     fn export_attrs(&self, attrs: &Arc<Vec<bgp::Attribute>>) -> Arc<Vec<bgp::Attribute>> {
         match self.role {
-            // ConfedEbgp: Phase 2+3 will prepend CONFED_SEQUENCE and retain LOCAL_PREF.
-            PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient | PeerRole::ConfedEbgp => {
-                attrs.clone()
-            }
-            PeerRole::Ebgp => {
+            PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient => attrs.clone(),
+            PeerRole::ConfedEbgp => {
+                // Prepend local Member-AS to AS_CONFED_SEQUENCE; retain LOCAL_PREF.
                 let has_as_path = attrs.iter().any(|a| a.code() == bgp::Attribute::AS_PATH);
                 let mut new_attrs: Vec<bgp::Attribute> = attrs
                     .iter()
-                    .filter(|a| a.code() != bgp::Attribute::LOCAL_PREF)
                     .map(|a| {
                         if a.code() == bgp::Attribute::AS_PATH {
-                            a.as_path_prepend(self.local_asn)
+                            a.as_path_prepend_confed(self.local_asn)
                         } else {
                             a.clone()
                         }
                     })
                     .collect();
                 if !has_as_path {
-                    new_attrs.push(bgp::Attribute::empty_as_path().as_path_prepend(self.local_asn));
+                    new_attrs.push(
+                        bgp::Attribute::empty_as_path().as_path_prepend_confed(self.local_asn),
+                    );
+                }
+                Arc::new(new_attrs)
+            }
+            PeerRole::Ebgp => {
+                // Strip any CONFED segments, then prepend the externally visible AS number
+                // (confederation_id when inside a confederation, local_asn otherwise).
+                let prepend_asn = if self.confederation_id != 0 {
+                    self.confederation_id
+                } else {
+                    self.local_asn
+                };
+                let has_as_path = attrs.iter().any(|a| a.code() == bgp::Attribute::AS_PATH);
+                let mut new_attrs: Vec<bgp::Attribute> = attrs
+                    .iter()
+                    .filter(|a| a.code() != bgp::Attribute::LOCAL_PREF)
+                    .map(|a| {
+                        if a.code() == bgp::Attribute::AS_PATH {
+                            a.as_path_strip_confed().as_path_prepend(prepend_asn)
+                        } else {
+                            a.clone()
+                        }
+                    })
+                    .collect();
+                if !has_as_path {
+                    new_attrs.push(bgp::Attribute::empty_as_path().as_path_prepend(prepend_asn));
                 }
                 Arc::new(new_attrs)
             }
@@ -4590,12 +4618,8 @@ impl PeerExportContext {
         };
         match (self.role, nexthop) {
             (_, None) => local(),
-            // ConfedEbgp: Phase 2+3 will rewrite nexthop to local address (same as Ebgp).
-            (
-                PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient | PeerRole::ConfedEbgp,
-                Some(nh),
-            ) => nh,
-            (PeerRole::Ebgp, Some(_)) => local(),
+            (PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient, Some(nh)) => nh,
+            (PeerRole::ConfedEbgp | PeerRole::Ebgp, Some(_)) => local(),
         }
     }
 }
@@ -4624,6 +4648,8 @@ struct PeerResources {
     /// RFC 4456 cluster-id for RR attribute manipulation and loop detection.
     /// None for eBGP/RS-client sessions where RR logic does not apply.
     cluster_id: Option<Ipv4Addr>,
+    /// Confederation Identifier for AS_PATH loop detection (0 = not configured).
+    confederation_id: u32,
 }
 
 /// I/O driver for one TCP connection (one BGP session).
@@ -4710,6 +4736,7 @@ impl PeerSession {
             local_asn: res.local_asn,
             local_addr,
             link_addr,
+            confederation_id: res.confederation_id,
         };
         let framer = BgpFramer::new(export_ctx.build_codec());
 
@@ -4793,6 +4820,7 @@ impl PeerSession {
                 local_asn,
                 local_addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 link_addr: None,
+                confederation_id: 0,
             },
             state: Arc::new(PeerState {
                 fsm: AtomicU8::new(0),
@@ -8311,6 +8339,7 @@ mod tests {
                 local_asn: 65001,
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
+                confederation_id: 0,
             }
         }
 
@@ -8832,6 +8861,7 @@ mod tests {
                 local_asn: 65001,
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
+                confederation_id: 0,
             }
         }
 
@@ -9029,6 +9059,124 @@ mod tests {
             assert_eq!(exported, original, "iBGP nexthop must be unchanged");
         }
 
+        // ---- Confederation: export_attrs / export_nexthop ----
+
+        fn confed_ebgp_ctx() -> PeerExportContext {
+            PeerExportContext {
+                role: PeerRole::ConfedEbgp,
+                local_asn: 65001,
+                local_addr: "127.0.0.1".parse().unwrap(),
+                link_addr: None,
+                confederation_id: 65000,
+            }
+        }
+
+        fn ebgp_confed_ctx() -> PeerExportContext {
+            PeerExportContext {
+                role: PeerRole::Ebgp,
+                local_asn: 65001,
+                local_addr: "127.0.0.1".parse().unwrap(),
+                link_addr: None,
+                confederation_id: 65000,
+            }
+        }
+
+        fn attr_with_confed_seq() -> Arc<Vec<packet::Attribute>> {
+            // AS_PATH: AS_CONFED_SEQ [65002] followed by AS_SEQ [65100]
+            let mut data: Vec<u8> = vec![packet::Attribute::AS_PATH_TYPE_CONFED_SEQ, 1];
+            data.extend_from_slice(&65002u32.to_be_bytes());
+            data.extend_from_slice(&[packet::Attribute::AS_PATH_TYPE_SEQ, 1]);
+            data.extend_from_slice(&65100u32.to_be_bytes());
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 100).unwrap(),
+                packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, data).unwrap(),
+            ])
+        }
+
+        #[test]
+        fn confed_ebgp_export_attrs_prepends_confed_seq() {
+            let ctx = confed_ebgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_aspath());
+            let aspath = exported
+                .iter()
+                .find(|a| a.code() == packet::Attribute::AS_PATH)
+                .expect("AS_PATH must be present");
+            let buf = aspath.binary().unwrap();
+            assert_eq!(
+                buf[0],
+                packet::Attribute::AS_PATH_TYPE_CONFED_SEQ,
+                "first segment must be AS_CONFED_SEQ"
+            );
+            assert_eq!(buf[1], 1, "segment must have one entry");
+            let asn = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+            assert_eq!(asn, 65001, "prepended ASN must be local_asn");
+        }
+
+        #[test]
+        fn confed_ebgp_export_attrs_retains_local_pref() {
+            let ctx = confed_ebgp_ctx();
+            let attrs = Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
+            ]);
+            let exported = ctx.export_attrs(&attrs);
+            assert!(
+                exported
+                    .iter()
+                    .any(|a| a.code() == packet::Attribute::LOCAL_PREF),
+                "ConfedEbgp must retain LOCAL_PREF"
+            );
+        }
+
+        #[test]
+        fn ebgp_with_confederation_strips_confed_and_prepends_id() {
+            let ctx = ebgp_confed_ctx();
+            let exported = ctx.export_attrs(&attr_with_confed_seq());
+            let aspath = exported
+                .iter()
+                .find(|a| a.code() == packet::Attribute::AS_PATH)
+                .expect("AS_PATH must be present");
+            let buf = aspath.binary().unwrap();
+            // First segment must be AS_SEQUENCE with confederation_id (65000)
+            assert_eq!(
+                buf[0],
+                packet::Attribute::AS_PATH_TYPE_SEQ,
+                "first segment must be AS_SEQUENCE"
+            );
+            let prepended = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+            assert_eq!(prepended, 65000, "prepended ASN must be confederation_id");
+            // No CONFED segments must remain
+            assert!(
+                !buf.windows(1)
+                    .enumerate()
+                    .step_by(1)
+                    .any(|(i, _)| i % 1 == 0
+                        && (buf[i] == packet::Attribute::AS_PATH_TYPE_CONFED_SEQ
+                            || buf[i] == packet::Attribute::AS_PATH_TYPE_CONFED_SET)),
+                "CONFED segments must be stripped"
+            );
+            // LOCAL_PREF must be gone
+            assert!(
+                exported
+                    .iter()
+                    .all(|a| a.code() != packet::Attribute::LOCAL_PREF),
+                "LOCAL_PREF must be stripped for Ebgp"
+            );
+        }
+
+        #[test]
+        fn confed_ebgp_export_nexthop_rewrites_to_local() {
+            let ctx = confed_ebgp_ctx(); // local_addr = 127.0.0.1
+            let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
+            let exported = ctx.export_nexthop(Some(original));
+            assert_eq!(
+                exported,
+                bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                "ConfedEbgp nexthop must be rewritten to local_addr"
+            );
+        }
+
         // ---- Route Reflector: split horizon relaxation ----
 
         fn rr_client_source(addr: &str) -> Arc<table::Source> {
@@ -9050,6 +9198,7 @@ mod tests {
                 local_asn: 65001,
                 local_addr: "127.0.0.1".parse().unwrap(),
                 link_addr: None,
+                confederation_id: 0,
             }
         }
 
