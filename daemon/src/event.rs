@@ -274,6 +274,10 @@ struct PeerConfig {
     /// detection without holding the global lock.
     local_router_id: Ipv4Addr,
     multihop_ttl: Option<u8>,
+    /// GTSM minimum TTL (RFC 5082); None = GTSM disabled.
+    /// When set, outgoing TTL is 255 and incoming packets below this value are dropped.
+    /// Takes priority over multihop_ttl when both are configured.
+    ttl_security: Option<u8>,
     password: Option<String>,
     /// Per-family prefix limits from config.
     /// Used to initialize PeerSession::prefix_counters in accept_connection().
@@ -505,6 +509,7 @@ struct PeerParams {
     holdtime: u64,
     connect_retry_time: u64,
     multihop_ttl: Option<u8>,
+    ttl_security: Option<u8>,
     password: Option<String>,
     /// Per-family add-path mode (RFC 7911 2-bit flags); mode 0 means plain MP.
     families: FnvHashMap<Family, u8>,
@@ -628,6 +633,7 @@ impl PeerParams {
                 route_reflector: self.route_reflector.clone(),
                 local_router_id: Ipv4Addr::from(local_router_id),
                 multihop_ttl: self.multihop_ttl,
+                ttl_security: self.ttl_security,
                 password: self.password,
                 prefix_limits: self.prefix_limits,
                 graceful_restart: self.graceful_restart,
@@ -785,6 +791,10 @@ impl From<&PeerView> for api::Peer {
             }),
             afi_safis: afisafis,
             graceful_restart,
+            ttl_security: p.config.ttl_security.map(|ttl_min| api::TtlSecurity {
+                enabled: true,
+                ttl_min: ttl_min as u32,
+            }),
             ..Default::default()
         }
     }
@@ -871,6 +881,18 @@ impl TryFrom<&api::Peer> for PeerParams {
             multihop_ttl: p.ebgp_multihop.as_ref().and_then(|x| {
                 if x.enabled && x.multihop_ttl != 0 {
                     Some(x.multihop_ttl as u8)
+                } else {
+                    None
+                }
+            }),
+            ttl_security: p.ttl_security.as_ref().and_then(|ts| {
+                if ts.enabled {
+                    let min = if ts.ttl_min == 0 {
+                        255
+                    } else {
+                        ts.ttl_min as u8
+                    };
+                    Some(min)
                 } else {
                     None
                 }
@@ -1093,6 +1115,21 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                 .as_ref()
                 .and_then(|m| m.config.as_ref())
                 .and_then(|c| c.enabled.filter(|&en| en).and(c.multihop_ttl)),
+            ttl_security: n
+                .ttl_security
+                .as_ref()
+                .and_then(|ts| ts.config.as_ref())
+                .and_then(|c| {
+                    if c.enabled.unwrap_or(false) {
+                        Some(
+                            c.ttl_min
+                                .map(|v| if v == 0 { 255 } else { v })
+                                .unwrap_or(255),
+                        )
+                    } else {
+                        None
+                    }
+                }),
             password: c.auth_password.clone(),
             families,
             send_max,
@@ -1115,6 +1152,7 @@ struct PeerGroup {
     passive: bool,
     route_reflector: RouteReflectorConfig,
     multihop_ttl: Option<u8>,
+    ttl_security: Option<u8>,
     auth_password: Option<String>,
     connect_retry_time: Option<u64>,
     families: FnvHashMap<Family, u8>,
@@ -1224,6 +1262,10 @@ fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
             notification_enabled: gr.notification_enabled,
             ..Default::default()
         }),
+        ttl_security: pg.ttl_security.map(|ttl_min| api::TtlSecurity {
+            enabled: true,
+            ttl_min: ttl_min as u32,
+        }),
         ..Default::default()
     }
 }
@@ -1256,6 +1298,18 @@ impl From<api::PeerGroup> for PeerGroup {
             multihop_ttl: p.ebgp_multihop.and_then(|x| {
                 if x.enabled && x.multihop_ttl != 0 {
                     Some(x.multihop_ttl as u8)
+                } else {
+                    None
+                }
+            }),
+            ttl_security: p.ttl_security.as_ref().and_then(|ts| {
+                if ts.enabled {
+                    let min = if ts.ttl_min == 0 {
+                        255
+                    } else {
+                        ts.ttl_min as u8
+                    };
+                    Some(min)
                 } else {
                     None
                 }
@@ -1330,6 +1384,21 @@ impl PeerGroup {
                 .and_then(|c| {
                     if c.enabled.unwrap_or(false) {
                         c.multihop_ttl
+                    } else {
+                        None
+                    }
+                }),
+            ttl_security: pg
+                .ttl_security
+                .as_ref()
+                .and_then(|ts| ts.config.as_ref())
+                .and_then(|c| {
+                    if c.enabled.unwrap_or(false) {
+                        Some(
+                            c.ttl_min
+                                .map(|v| if v == 0 { 255 } else { v })
+                                .unwrap_or(255),
+                        )
                     } else {
                         None
                     }
@@ -1771,6 +1840,7 @@ impl GoBgpService for GrpcService {
                 route_reflector: new_params.route_reflector.clone(),
                 local_router_id: Ipv4Addr::from(router_id),
                 multihop_ttl: new_params.multihop_ttl,
+                ttl_security: new_params.ttl_security,
                 password: new_params.password.clone(),
                 prefix_limits: new_params.prefix_limits,
                 graceful_restart: new_params.graceful_restart.clone(),
@@ -3652,6 +3722,7 @@ async fn accept_connection(
                     .connect_retry_time
                     .unwrap_or(PeerParams::DEFAULT_CONNECT_RETRY_TIME),
                 multihop_ttl: group.multihop_ttl,
+                ttl_security: group.ttl_security,
                 password: group.auth_password.clone(),
                 families: group.families.clone(),
                 send_max: group.send_max.clone(),
@@ -3662,7 +3733,11 @@ async fn accept_connection(
             g.peers.get_mut(&remote_addr).unwrap()
         }
     };
-    if let Some(ttl) = peer.config.multihop_ttl {
+    if let Some(ttl_min) = peer.config.ttl_security {
+        // GTSM (RFC 5082): send with TTL=255, drop incoming below ttl_min.
+        let _ = stream.set_ttl(255);
+        auth::set_min_ttl(stream.as_raw_fd(), &remote_addr, ttl_min);
+    } else if let Some(ttl) = peer.config.multihop_ttl {
         if peer.config.expected_remote_asn != peer.config.local_asn {
             let _ = stream.set_ttl(ttl.into());
         }
@@ -3993,6 +4068,7 @@ impl Global {
                     passive: false,
                     route_reflector: RouteReflectorConfig::default(),
                     multihop_ttl: None,
+                    ttl_security: None,
                     auth_password: None,
                     connect_retry_time: None,
                     families: FnvHashMap::default(),
@@ -5977,6 +6053,7 @@ mod tests {
             holdtime: PeerParams::DEFAULT_HOLD_TIME,
             connect_retry_time: PeerParams::DEFAULT_CONNECT_RETRY_TIME,
             multihop_ttl: None,
+            ttl_security: None,
             password: None,
             families: FnvHashMap::default(),
             send_max: FnvHashMap::default(),
@@ -6140,6 +6217,7 @@ mod tests {
                     passive: false,
                     route_reflector: RouteReflectorConfig::default(),
                     multihop_ttl: None,
+                    ttl_security: None,
                     auth_password: None,
                     connect_retry_time: None,
                     families: FnvHashMap::default(),
@@ -6184,6 +6262,7 @@ mod tests {
                         route_reflector_cluster_id: Some(cluster_id),
                     },
                     multihop_ttl: Some(5),
+                    ttl_security: None,
                     auth_password: Some("secret".to_string()),
                     connect_retry_time: Some(30),
                     families: FnvHashMap::default(),
@@ -6786,6 +6865,7 @@ mod tests {
                     passive: false,
                     route_reflector: RouteReflectorConfig::default(),
                     multihop_ttl: None,
+                    ttl_security: None,
                     auth_password: None,
                     connect_retry_time: None,
                     families,
@@ -6820,6 +6900,175 @@ mod tests {
         assert!(has_gr_cap);
     }
 
+    // --- PeerGroup ttl_security tests ---
+
+    #[tokio::test]
+    async fn peer_group_grpc_ttl_security_roundtrip() {
+        let svc = make_grpc_service();
+        svc.add_peer_group(tonic::Request::new(api::AddPeerGroupRequest {
+            peer_group: Some(api::PeerGroup {
+                conf: Some(api::PeerGroupConf {
+                    peer_group_name: "ts-grp".to_string(),
+                    ..Default::default()
+                }),
+                ttl_security: Some(api::TtlSecurity {
+                    enabled: true,
+                    ttl_min: 200,
+                }),
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        svc.list_peer_group(tonic::Request::new(api::ListPeerGroupRequest {
+            peer_group_name: "ts-grp".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .for_each(|r| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(r.unwrap().peer_group.unwrap()).await;
+            }
+        })
+        .await;
+
+        let got = rx.recv().await.unwrap();
+        let ts = got
+            .ttl_security
+            .as_ref()
+            .expect("ttl_security should be Some");
+        assert!(ts.enabled);
+        assert_eq!(ts.ttl_min, 200);
+    }
+
+    #[tokio::test]
+    async fn peer_group_grpc_ttl_security_default_min() {
+        // ttl_min == 0 with enabled=true should default to 255.
+        let svc = make_grpc_service();
+        svc.add_peer_group(tonic::Request::new(api::AddPeerGroupRequest {
+            peer_group: Some(api::PeerGroup {
+                conf: Some(api::PeerGroupConf {
+                    peer_group_name: "ts-default".to_string(),
+                    ..Default::default()
+                }),
+                ttl_security: Some(api::TtlSecurity {
+                    enabled: true,
+                    ttl_min: 0,
+                }),
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        svc.list_peer_group(tonic::Request::new(api::ListPeerGroupRequest {
+            peer_group_name: "ts-default".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .for_each(|r| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(r.unwrap().peer_group.unwrap()).await;
+            }
+        })
+        .await;
+
+        let got = rx.recv().await.unwrap();
+        let ts = got
+            .ttl_security
+            .as_ref()
+            .expect("ttl_security should be Some");
+        assert!(ts.enabled);
+        assert_eq!(ts.ttl_min, 255);
+    }
+
+    #[test]
+    fn peer_group_yaml_ttl_security_parsed() {
+        let yaml_pg = config::PeerGroup {
+            config: Some(config::PeerGroupConfig {
+                peer_group_name: Some("g".to_string()),
+                ..Default::default()
+            }),
+            ttl_security: Some(config::TtlSecurity {
+                config: Some(config::TtlSecurityConfig {
+                    enabled: Some(true),
+                    ttl_min: Some(200),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pg = PeerGroup::from_yaml(&yaml_pg);
+        assert_eq!(pg.ttl_security, Some(200u8));
+    }
+
+    #[test]
+    fn peer_group_yaml_ttl_security_default_min() {
+        let yaml_pg = config::PeerGroup {
+            config: Some(config::PeerGroupConfig {
+                peer_group_name: Some("g".to_string()),
+                ..Default::default()
+            }),
+            ttl_security: Some(config::TtlSecurity {
+                config: Some(config::TtlSecurityConfig {
+                    enabled: Some(true),
+                    ttl_min: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pg = PeerGroup::from_yaml(&yaml_pg);
+        assert_eq!(pg.ttl_security, Some(255u8));
+    }
+
+    #[tokio::test]
+    async fn dynamic_peer_inherits_ttl_security_from_group() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        {
+            let mut g = global.write().await;
+            g.peer_group.insert(
+                "ts-group".to_string(),
+                PeerGroup {
+                    as_number: 65002,
+                    dynamic_peers: vec![DynamicPeer {
+                        prefix: packet::IpNet::new(remote_addr, 32),
+                    }],
+                    route_server_client: false,
+                    holdtime: None,
+                    local_asn: 0,
+                    passive: false,
+                    route_reflector: RouteReflectorConfig::default(),
+                    multihop_ttl: None,
+                    ttl_security: Some(200),
+                    auth_password: None,
+                    connect_retry_time: None,
+                    families: FnvHashMap::default(),
+                    send_max: FnvHashMap::default(),
+                    graceful_restart: None,
+                },
+            );
+        }
+
+        let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(h.is_some());
+
+        let g = global.read().await;
+        let peer = g.peers.get(&remote_addr).unwrap();
+        assert_eq!(peer.config.ttl_security, Some(200u8));
+    }
+
     #[tokio::test]
     async fn dynamic_peer_inherits_families_from_group() {
         let global = make_global();
@@ -6846,6 +7095,7 @@ mod tests {
                     passive: false,
                     route_reflector: RouteReflectorConfig::default(),
                     multihop_ttl: None,
+                    ttl_security: None,
                     auth_password: None,
                     connect_retry_time: None,
                     families,

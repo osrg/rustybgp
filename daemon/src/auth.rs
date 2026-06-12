@@ -73,3 +73,36 @@ pub(crate) fn set_md5sig(rawfd: RawFd, addr: &IpAddr, key: &str) {
 // for now, let's keep things simple
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn set_md5sig(_rawfd: RawFd, _addr: &IpAddr, _key: &str) {}
+
+/// Set the minimum acceptable TTL for incoming packets (RFC 5082 GTSM).
+/// Packets arriving with TTL < ttl_min are dropped by the kernel.
+/// IPv4 uses IP_MINTTL; IPv6 uses IPV6_MINHOPCOUNT.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_min_ttl(rawfd: RawFd, addr: &IpAddr, ttl_min: u8) {
+    let ttl_min = ttl_min as libc::c_int;
+    unsafe {
+        match addr {
+            IpAddr::V4(_) => {
+                let _ = libc::setsockopt(
+                    rawfd,
+                    libc::IPPROTO_IP,
+                    libc::IP_MINTTL,
+                    &ttl_min as *const _ as *const _,
+                    std::mem::size_of::<libc::c_int>() as u32,
+                );
+            }
+            IpAddr::V6(_) => {
+                let _ = libc::setsockopt(
+                    rawfd,
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_MINHOPCOUNT,
+                    &ttl_min as *const _ as *const _,
+                    std::mem::size_of::<libc::c_int>() as u32,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn set_min_ttl(_rawfd: RawFd, _addr: &IpAddr, _ttl_min: u8) {}
