@@ -79,7 +79,7 @@ pub(crate) type TableHandle = Arc<TableManager>;
 pub(crate) struct TableManager {
     pub(crate) shards: Vec<Mutex<TableShard>>,
     rpki: std::sync::RwLock<table::RpkiTable>,
-    pub(crate) kernel_tx: ArcSwapOption<mpsc::UnboundedSender<packet::KernelRouteChange>>,
+    pub(crate) kernel_tx: ArcSwapOption<mpsc::UnboundedSender<kernel::KernelRouteChange>>,
     pub(crate) import_policy: ArcSwapOption<table::PolicyAssignment>,
     pub(crate) export_policy: ArcSwapOption<table::PolicyAssignment>,
     next_sub_id: std::sync::atomic::AtomicU64,
@@ -770,7 +770,7 @@ impl TableShard {
         &mut self,
         addr: IpAddr,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
     ) {
         for change in self.rtable.drop(addr, family) {
             self.distribute_update(change, kernel_tx);
@@ -781,7 +781,7 @@ impl TableShard {
         &mut self,
         addr: IpAddr,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
     ) {
         for change in self.rtable.restale(addr, family) {
             self.distribute_update(change, kernel_tx);
@@ -814,18 +814,23 @@ impl TableShard {
     fn distribute_update(
         &self,
         update: table::NlriChange,
-        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
     ) {
         // Kernel route update for rank-1 best (raw, without export policy).
         // kernel_tx is rarely set, so check it first.
         if let Some(tx) = kernel_tx
             && update.best_changed
         {
-            let nexthops = match update.new_best() {
-                None => vec![],
-                Some(best) => best.nexthop.into_iter().collect(),
+            let nexthops: Vec<_> = if update.new_best().is_none() {
+                vec![]
+            } else {
+                update
+                    .ecmp_paths()
+                    .into_iter()
+                    .filter_map(|p| p.nexthop)
+                    .collect()
             };
-            let _ = tx.send(packet::KernelRouteChange {
+            let _ = tx.send(kernel::KernelRouteChange {
                 net: update.net.clone(),
                 nexthops,
             });
@@ -851,7 +856,7 @@ impl TableShard {
         &mut self,
         peer: std::net::IpAddr,
         import_policy: Option<&table::PolicyAssignment>,
-        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
     ) {
         let paths = self.rtable.collect_adj_in_paths(peer);
         for (family, net, remote_path_id, mut nh, source, original_attr, timestamp) in paths {
@@ -878,7 +883,7 @@ impl TableShard {
         &mut self,
         addr: IpAddr,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
     ) {
         for change in self.rtable.drop_stale(addr, family, None) {
             self.distribute_update(change, kernel_tx);
@@ -888,7 +893,7 @@ impl TableShard {
     pub(crate) fn end_deferral(
         &mut self,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<packet::KernelRouteChange>>,
+        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
     ) {
         for change in self.rtable.end_deferral(family) {
             self.distribute_update(change, kernel_tx);

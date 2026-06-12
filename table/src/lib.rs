@@ -527,6 +527,41 @@ impl NlriChange {
     pub fn new_best(&self) -> Option<&Path> {
         self.current_paths.first()
     }
+
+    /// All paths tied with the best through BGP decision steps 1-6
+    /// (LocalPref, AS_PATH length, Origin, eBGP/iBGP, stale, CLUSTER_LIST
+    /// length), excluding the final router-id tiebreaker.
+    ///
+    /// Returns an empty slice when there are no paths.  Used to build the
+    /// ECMP nexthop set for kernel FIB installation.
+    pub fn ecmp_paths(&self) -> Vec<&Path> {
+        let Some(best) = self.current_paths.first() else {
+            return vec![];
+        };
+        let best_pa = PathAttribute::new(best.attr.clone());
+        let key = (
+            best_pa.attr_local_preference(),
+            best_pa.attr_as_path_length(),
+            best_pa.attr_origin(),
+            best.source.peer_type(),
+            best.source.is_stale(),
+            best_pa.attr_cluster_list_length(),
+        );
+        self.current_paths
+            .iter()
+            .take_while(|p| {
+                let pa = PathAttribute::new(p.attr.clone());
+                (
+                    pa.attr_local_preference(),
+                    pa.attr_as_path_length(),
+                    pa.attr_origin(),
+                    p.source.peer_type(),
+                    p.source.is_stale(),
+                    pa.attr_cluster_list_length(),
+                ) == key
+            })
+            .collect()
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -5282,5 +5317,75 @@ mod tests {
         assert_eq!(dests.len(), 1);
         // RsLocal must expose original_attr (pre-import-policy), not post-import.
         assert_eq!(dests[0].paths[0].attr, original);
+    }
+
+    fn make_nlri_change(paths: Vec<Path>) -> NlriChange {
+        NlriChange {
+            family: Family::IPV4,
+            net: nlri(10, 0, 0, 0, 24),
+            best_changed: true,
+            any_changed: true,
+            replaced_path_id: None,
+            current_paths: Arc::new(paths),
+        }
+    }
+
+    fn path_with_nh(src: Arc<Source>, nexthop_addr: u8, attr: Arc<Vec<packet::Attribute>>) -> Path {
+        Path {
+            local_path_id: 0,
+            source: src,
+            nexthop: Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, nexthop_addr))),
+            attr,
+        }
+    }
+
+    #[test]
+    fn ecmp_paths_empty_when_no_paths() {
+        let change = make_nlri_change(vec![]);
+        assert!(change.ecmp_paths().is_empty());
+    }
+
+    #[test]
+    fn ecmp_paths_single_path() {
+        let src = source(1, 65001, 65000, 1);
+        let change = make_nlri_change(vec![path_with_nh(src, 1, empty_attrs())]);
+        assert_eq!(change.ecmp_paths().len(), 1);
+    }
+
+    #[test]
+    fn ecmp_paths_two_equal_paths() {
+        // Two iBGP paths with identical attributes differ only in router-id
+        // (captured in source.router_id) -- both should be ECMP candidates.
+        let src1 = source(1, 65000, 65000, 1);
+        let src2 = source(2, 65000, 65000, 2);
+        let attr = empty_attrs();
+        let change = make_nlri_change(vec![
+            path_with_nh(src1, 1, attr.clone()),
+            path_with_nh(src2, 2, attr.clone()),
+        ]);
+        assert_eq!(change.ecmp_paths().len(), 2);
+    }
+
+    #[test]
+    fn ecmp_paths_stops_at_lower_local_pref() {
+        // First path has LocalPref 200, second has 100 -- only the first is ECMP.
+        let src1 = source(1, 65000, 65000, 1);
+        let src2 = source(2, 65000, 65000, 2);
+        let change = make_nlri_change(vec![
+            path_with_nh(src1, 1, attrs_with_local_pref(200)),
+            path_with_nh(src2, 2, attrs_with_local_pref(100)),
+        ]);
+        assert_eq!(change.ecmp_paths().len(), 1);
+    }
+
+    #[test]
+    fn ecmp_paths_stops_at_longer_as_path() {
+        let src1 = source(1, 65001, 65000, 1);
+        let src2 = source(2, 65002, 65000, 2);
+        let change = make_nlri_change(vec![
+            path_with_nh(src1, 1, attrs_with_as_path_len(1)),
+            path_with_nh(src2, 2, attrs_with_as_path_len(2)),
+        ]);
+        assert_eq!(change.ecmp_paths().len(), 1);
     }
 }

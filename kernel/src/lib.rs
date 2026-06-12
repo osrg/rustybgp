@@ -9,9 +9,17 @@ use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::route::RouteMessage;
 use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteProtocol};
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
-use rtnetlink::{MulticastGroup, RouteMessageBuilder};
+use rtnetlink::{MulticastGroup, RouteMessageBuilder, RouteNextHopBuilder};
 
 pub use rtnetlink::packet_route::route::RouteProtocol as Protocol;
+
+/// A route change to be applied to the kernel FIB.
+///
+/// `nexthops` empty means withdraw; non-empty installs (multipath when >1).
+pub struct KernelRouteChange {
+    pub net: packet::Nlri,
+    pub nexthops: Vec<packet::bgp::Nexthop>,
+}
 
 /// Convert a GoBGP-style route type string to a `Protocol` value.
 ///
@@ -120,24 +128,85 @@ impl Handle {
 
     /// Apply a `KernelRouteChange` to the kernel FIB.
     ///
-    /// Empty `nexthops` withdraws the route; non-empty installs it.
-    /// MUP NLRIs are silently ignored (not representable as kernel routes).
-    /// Family mismatches between dst and nexthop are also silently skipped.
-    pub async fn apply(&self, change: &packet::KernelRouteChange) -> Result<(), Error> {
+    /// Empty `nexthops` withdraws the route; one nexthop installs a
+    /// single-path route; two or more nexthops install via `RTA_MULTIPATH`.
+    /// MUP/VPN NLRIs and family mismatches are silently ignored.
+    pub async fn apply(&self, change: &KernelRouteChange) -> Result<(), Error> {
         let (dst, prefix_len) = match change.net {
             packet::Nlri::V4(net) => (IpAddr::V4(net.addr), net.mask),
             packet::Nlri::V6(net) => (IpAddr::V6(net.addr), net.mask),
-            packet::Nlri::Mup(_) | packet::Nlri::VpnV4(_) | packet::Nlri::VpnV6(_) => return Ok(()),
+            packet::Nlri::Mup(_) | packet::Nlri::VpnV4(_) | packet::Nlri::VpnV6(_) => {
+                return Ok(());
+            }
         };
         if change.nexthops.is_empty() {
             return self.withdraw(dst, prefix_len).await;
         }
-        // Use the first nexthop; multipath support to be added later.
-        let nexthop = change.nexthops[0].addr();
-        match self.install(dst, prefix_len, nexthop, 0).await {
+        let addrs: Vec<IpAddr> = change.nexthops.iter().map(|nh| nh.addr()).collect();
+        let result = if addrs.len() == 1 {
+            self.install(dst, prefix_len, addrs[0], 0).await
+        } else {
+            self.install_ecmp(dst, prefix_len, &addrs).await
+        };
+        match result {
             Err(Error::FamilyMismatch) => Ok(()),
             other => other,
         }
+    }
+
+    /// Install a multipath BGP route into the kernel FIB via `RTA_MULTIPATH`.
+    ///
+    /// Nexthops with a mismatched address family are silently skipped.
+    /// Returns `FamilyMismatch` only when all nexthops are filtered out.
+    async fn install_ecmp(
+        &self,
+        dst: IpAddr,
+        prefix_len: u8,
+        nexthops: &[IpAddr],
+    ) -> Result<(), Error> {
+        match dst {
+            IpAddr::V4(dst_v4) => {
+                let nhs: Vec<_> = nexthops
+                    .iter()
+                    .filter_map(|&nh| {
+                        RouteNextHopBuilder::new_ipv4()
+                            .via(nh)
+                            .ok()
+                            .map(|b| b.build())
+                    })
+                    .collect();
+                if nhs.is_empty() {
+                    return Err(Error::FamilyMismatch);
+                }
+                let msg = RouteMessageBuilder::<Ipv4Addr>::new()
+                    .destination_prefix(dst_v4, prefix_len)
+                    .protocol(RouteProtocol::Bgp)
+                    .multipath(nhs)
+                    .build();
+                self.inner.route().add(msg).replace().execute().await?;
+            }
+            IpAddr::V6(dst_v6) => {
+                let nhs: Vec<_> = nexthops
+                    .iter()
+                    .filter_map(|&nh| {
+                        RouteNextHopBuilder::new_ipv6()
+                            .via(nh)
+                            .ok()
+                            .map(|b| b.build())
+                    })
+                    .collect();
+                if nhs.is_empty() {
+                    return Err(Error::FamilyMismatch);
+                }
+                let msg = RouteMessageBuilder::<Ipv6Addr>::new()
+                    .destination_prefix(dst_v6, prefix_len)
+                    .protocol(RouteProtocol::Bgp)
+                    .multipath(nhs)
+                    .build();
+                self.inner.route().add(msg).replace().execute().await?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove a BGP route from the kernel FIB.
