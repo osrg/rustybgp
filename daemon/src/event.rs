@@ -1567,6 +1567,12 @@ impl GoBgpService for GrpcService {
                 format!("invalid router-id: {}", g.router_id),
             )
         })?;
+        if let Some(c) = g.confederation.filter(|c| c.enabled && c.identifier != 0) {
+            global.confederation = Some(ConfederationConfig {
+                id: c.identifier,
+                members: c.member_as_list.into_iter().collect(),
+            });
+        }
         self.init.notify_one();
 
         Ok(tonic::Response::new(api::StartBgpResponse {}))
@@ -3501,6 +3507,17 @@ fn create_listen_socket(addr: String, port: u16) -> std::io::Result<std::net::Tc
 
 pub(crate) type GlobalHandle = Arc<tokio::sync::RwLock<Global>>;
 
+/// Active BGP confederation configuration (RFC 5065).
+///
+/// Present only when confederation is enabled.  Set once at StartBgp time;
+/// no dynamic changes are supported (same as GoBGP).
+struct ConfederationConfig {
+    /// Externally visible AS number (Confederation Identifier).
+    id: u32,
+    /// Member-AS numbers.  O(1) lookup for ConfedEbgp peer classification.
+    members: FnvHashSet<u32>,
+}
+
 pub(crate) struct Global {
     asn: u32,
     pub(crate) router_id: Ipv4Addr,
@@ -3508,6 +3525,8 @@ pub(crate) struct Global {
     listen_sockets: Vec<RawFd>,
     pub(crate) peers: FnvHashMap<IpAddr, Peer>,
     peer_group: FnvHashMap<String, PeerGroup>,
+
+    confederation: Option<ConfederationConfig>,
 
     ptable: table::PolicyTable,
 
@@ -3538,7 +3557,11 @@ impl From<&Global> for api::Global {
             use_multiple_paths: false,
             route_selection_options: None,
             default_route_distance: None,
-            confederation: None,
+            confederation: g.confederation.as_ref().map(|c| api::Confederation {
+                enabled: true,
+                identifier: c.id,
+                member_as_list: c.members.iter().copied().collect(),
+            }),
             graceful_restart: None,
             bind_to_device: "".to_string(),
         }
@@ -3557,6 +3580,8 @@ impl Global {
 
             peers: FnvHashMap::default(),
             peer_group: FnvHashMap::default(),
+
+            confederation: None,
 
             ptable: table::PolicyTable::new(),
 
@@ -3667,6 +3692,7 @@ async fn accept_connection(
     let remote_addr = remote_sockaddr.ip();
     let mut g = global.write().await;
     let is_restarting = g.selection_deferral.is_some();
+    let confederation = g.confederation.as_ref().map(|c| (c.id, c.members.clone()));
     let peer = match g.peers.get_mut(&remote_addr) {
         Some(peer) => {
             if peer.admin_down {
@@ -3763,6 +3789,11 @@ async fn accept_connection(
         } else {
             PeerRole::Ibgp
         }
+    } else if confederation
+        .as_ref()
+        .is_some_and(|(_, members)| members.contains(&peer.config.expected_remote_asn))
+    {
+        PeerRole::ConfedEbgp
     } else {
         PeerRole::Ebgp
     };
@@ -3823,6 +3854,25 @@ impl Global {
                 notify.clone().notify_one();
                 g.asn = as_number;
                 g.router_id = router_id;
+            }
+            if let Some((id, c)) = bgp
+                .as_ref()
+                .and_then(|x| x.global.as_ref())
+                .and_then(|x| x.confederation.as_ref())
+                .and_then(|x| x.config.as_ref())
+                .filter(|c| c.enabled.unwrap_or(false))
+                .and_then(|c| c.identifier.filter(|&id| id != 0).map(|id| (id, c)))
+            {
+                g.confederation = Some(ConfederationConfig {
+                    id,
+                    members: c
+                        .member_as_list
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .copied()
+                        .collect(),
+                });
             }
         }
         if let Some(mrt) = bgp.as_ref().and_then(|x| x.mrt_dump.as_ref()) {
@@ -4456,6 +4506,9 @@ enum PeerRole {
     Ibgp,
     IbgpRrClient,
     Ebgp,
+    /// Session between two different Member-ASes within the same confederation.
+    /// Keeps LOCAL_PREF (unlike regular eBGP) and uses CONFED_SEQUENCE for AS_PATH.
+    ConfedEbgp,
     RsClient,
 }
 
@@ -4494,7 +4547,10 @@ impl PeerExportContext {
     /// RS client: pass through unchanged.
     fn export_attrs(&self, attrs: &Arc<Vec<bgp::Attribute>>) -> Arc<Vec<bgp::Attribute>> {
         match self.role {
-            PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient => attrs.clone(),
+            // ConfedEbgp: Phase 2+3 will prepend CONFED_SEQUENCE and retain LOCAL_PREF.
+            PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient | PeerRole::ConfedEbgp => {
+                attrs.clone()
+            }
             PeerRole::Ebgp => {
                 let has_as_path = attrs.iter().any(|a| a.code() == bgp::Attribute::AS_PATH);
                 let mut new_attrs: Vec<bgp::Attribute> = attrs
@@ -4534,7 +4590,11 @@ impl PeerExportContext {
         };
         match (self.role, nexthop) {
             (_, None) => local(),
-            (PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient, Some(nh)) => nh,
+            // ConfedEbgp: Phase 2+3 will rewrite nexthop to local address (same as Ebgp).
+            (
+                PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient | PeerRole::ConfedEbgp,
+                Some(nh),
+            ) => nh,
             (PeerRole::Ebgp, Some(_)) => local(),
         }
     }
@@ -6193,6 +6253,146 @@ mod tests {
 
         let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
         assert!(h.is_none());
+    }
+
+    // --- Confederation tests ---
+
+    #[test]
+    fn confederation_api_parses_id_and_members() {
+        let mut g = Global::new();
+        g.asn = 65001;
+        let conf = api::Confederation {
+            enabled: true,
+            identifier: 65000,
+            member_as_list: vec![65001, 65002, 65003],
+        };
+        if let Some(c) = Some(conf).filter(|c| c.enabled && c.identifier != 0) {
+            g.confederation = Some(ConfederationConfig {
+                id: c.identifier,
+                members: c.member_as_list.into_iter().collect(),
+            });
+        }
+        let conf = g.confederation.as_ref().unwrap();
+        assert_eq!(conf.id, 65000);
+        assert!(conf.members.contains(&65001));
+        assert!(conf.members.contains(&65002));
+        assert!(conf.members.contains(&65003));
+    }
+
+    #[test]
+    fn confederation_api_disabled_flag_ignored() {
+        let mut g = Global::new();
+        g.asn = 65001;
+        let conf = api::Confederation {
+            enabled: false,
+            identifier: 65000,
+            member_as_list: vec![65002],
+        };
+        if let Some(c) = Some(conf).filter(|c| c.enabled && c.identifier != 0) {
+            g.confederation = Some(ConfederationConfig {
+                id: c.identifier,
+                members: c.member_as_list.into_iter().collect(),
+            });
+        }
+        assert!(g.confederation.is_none());
+    }
+
+    #[test]
+    fn confederation_yaml_parses_id_and_members() {
+        let conf_config = config::generate::ConfederationConfig {
+            enabled: Some(true),
+            identifier: Some(65000),
+            member_as_list: Some(vec![65001, 65002]),
+        };
+        let mut g = Global::new();
+        g.asn = 65001;
+        if let Some((id, c)) = conf_config
+            .enabled
+            .filter(|&e| e)
+            .and(conf_config.identifier.filter(|&id| id != 0))
+            .map(|id| (id, &conf_config))
+        {
+            g.confederation = Some(ConfederationConfig {
+                id,
+                members: c
+                    .member_as_list
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .copied()
+                    .collect(),
+            });
+        }
+        let conf = g.confederation.as_ref().unwrap();
+        assert_eq!(conf.id, 65000);
+        assert!(conf.members.contains(&65001));
+        assert!(conf.members.contains(&65002));
+    }
+
+    #[tokio::test]
+    async fn accept_confed_ebgp_peer_gets_confed_role() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        {
+            let mut g = global.write().await;
+            g.confederation = Some(ConfederationConfig {
+                id: 65000,
+                members: [65002].into_iter().collect(),
+            });
+            g.add_peer(
+                PeerParams {
+                    expected_remote_asn: 65002,
+                    local_asn: 65001,
+                    ..default_peer_params(remote_addr)
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        let session = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(session.is_some());
+        assert_eq!(
+            session.unwrap().export_ctx.role,
+            PeerRole::ConfedEbgp,
+            "peer in confederation member AS must get ConfedEbgp role"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_non_member_peer_gets_ebgp_role() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        {
+            let mut g = global.write().await;
+            g.confederation = Some(ConfederationConfig {
+                id: 65000,
+                members: [65002].into_iter().collect(),
+            });
+            g.add_peer(
+                PeerParams {
+                    expected_remote_asn: 65099,
+                    local_asn: 65001,
+                    ..default_peer_params(remote_addr)
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        let session = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(session.is_some());
+        assert_eq!(
+            session.unwrap().export_ctx.role,
+            PeerRole::Ebgp,
+            "peer outside confederation must remain Ebgp"
+        );
     }
 
     #[tokio::test]
