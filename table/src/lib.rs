@@ -568,6 +568,22 @@ static LOCAL_SOURCE: LazyLock<Arc<Source>> = LazyLock::new(|| {
     })
 });
 
+/// Canonical source for kernel-redistributed routes (static, connected, etc.).
+/// Distinct from LOCAL_SOURCE so kernel routes and gRPC-injected routes can be
+/// distinguished and withdrawn independently.
+static KERNEL_SOURCE: LazyLock<Arc<Source>> = LazyLock::new(|| {
+    Arc::new(Source {
+        remote_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        remote_asn: 0,
+        local_asn: 0,
+        router_id: 0,
+        rs_client: false,
+        rr_client: false,
+        stale: AtomicBool::new(false),
+    })
+});
+
 impl Source {
     pub fn local() -> Arc<Self> {
         Arc::clone(&LOCAL_SOURCE)
@@ -575,6 +591,14 @@ impl Source {
 
     pub fn is_local(&self) -> bool {
         std::ptr::eq(self as *const Source, Arc::as_ptr(&LOCAL_SOURCE))
+    }
+
+    pub fn kernel() -> Arc<Self> {
+        Arc::clone(&KERNEL_SOURCE)
+    }
+
+    pub fn is_kernel(&self) -> bool {
+        std::ptr::eq(self as *const Source, Arc::as_ptr(&KERNEL_SOURCE))
     }
 
     pub fn new(

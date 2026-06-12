@@ -19,6 +19,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
+use rustybgp_kernel as kernel;
 use rustybgp_packet::{self as packet, Family, bgp};
 use rustybgp_table as table;
 
@@ -614,6 +615,143 @@ impl TableManager {
             }
         }
     }
+
+    /// Inject a kernel-redistributed route into the BGP RIB.
+    pub(crate) async fn inject_kernel_route(&self, kr: kernel::KernelRoute) {
+        let Some((family, net, nexthop, attr)) = kernel_route_to_path(&kr) else {
+            return;
+        };
+        self.insert_route(
+            table::Source::kernel(),
+            family,
+            net,
+            Some(nexthop),
+            attr,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .await;
+    }
+
+    /// Withdraw a kernel-redistributed route from the BGP RIB.
+    pub(crate) async fn withdraw_kernel_route(&self, dst: std::net::IpAddr, prefix_len: u8) {
+        let nlri = ip_to_nlri(dst, prefix_len);
+        let family = nlri_family(&nlri);
+        self.remove_route(
+            table::Source::kernel(),
+            family,
+            packet::PathNlri { nlri, path_id: 0 },
+            None,
+            std::time::SystemTime::now(),
+        )
+        .await;
+    }
+}
+
+/// Convert a `KernelRoute` to the components needed by `insert_route`.
+///
+/// Returns `None` when the route has no usable nexthop or the family cannot
+/// be determined (e.g. MUP/VPN NLRIs).
+pub(crate) fn kernel_route_to_path(
+    kr: &kernel::KernelRoute,
+) -> Option<(
+    Family,
+    packet::PathNlri,
+    bgp::Nexthop,
+    Arc<Vec<packet::Attribute>>,
+)> {
+    let nexthop_ip = kr.nexthop?;
+    let nexthop = match nexthop_ip {
+        std::net::IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
+        std::net::IpAddr::V6(v6) => bgp::Nexthop::V6(v6),
+    };
+    let (nlri, family) = match kr.dst {
+        std::net::IpAddr::V4(addr) => {
+            let nlri = packet::Nlri::V4(packet::bgp::Ipv4Net {
+                addr,
+                mask: kr.prefix_len,
+            });
+            (nlri, Family::IPV4)
+        }
+        std::net::IpAddr::V6(addr) => {
+            let nlri = packet::Nlri::V6(packet::bgp::Ipv6Net {
+                addr,
+                mask: kr.prefix_len,
+            });
+            (nlri, Family::IPV6)
+        }
+    };
+    let mut attrs = vec![
+        packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0) // 0 = IGP
+            .unwrap(),
+        packet::Attribute::empty_as_path(),
+    ];
+    if kr.metric > 0
+        && let Some(med) =
+            packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, kr.metric)
+    {
+        attrs.push(med);
+    }
+    Some((
+        family,
+        packet::PathNlri { nlri, path_id: 0 },
+        nexthop,
+        Arc::new(attrs),
+    ))
+}
+
+fn ip_to_nlri(dst: std::net::IpAddr, prefix_len: u8) -> packet::Nlri {
+    match dst {
+        std::net::IpAddr::V4(addr) => packet::Nlri::V4(packet::bgp::Ipv4Net {
+            addr,
+            mask: prefix_len,
+        }),
+        std::net::IpAddr::V6(addr) => packet::Nlri::V6(packet::bgp::Ipv6Net {
+            addr,
+            mask: prefix_len,
+        }),
+    }
+}
+
+fn nlri_family(nlri: &packet::Nlri) -> Family {
+    match nlri {
+        packet::Nlri::V4(_) => Family::IPV4,
+        packet::Nlri::V6(_) => Family::IPV6,
+        _ => Family::IPV4,
+    }
+}
+
+/// Consume a stream of `kernel::RouteEvent`s and inject/withdraw routes into
+/// the BGP RIB.
+///
+/// `redistribute` is the list of `kernel::Protocol` values to accept; events
+/// from other protocols are silently dropped.  Pass an empty list to accept all
+/// protocols.
+///
+/// Accepts any `Stream<Item = kernel::RouteEvent>` so callers can substitute a
+/// mock channel in tests.
+pub(crate) async fn run_kernel_routes(
+    tables: Arc<TableManager>,
+    mut rx: impl futures::Stream<Item = kernel::RouteEvent> + Unpin + Send,
+    redistribute: Vec<kernel::Protocol>,
+) {
+    use futures::StreamExt;
+    while let Some(event) = rx.next().await {
+        match event {
+            kernel::RouteEvent::Add(kr) => {
+                if !redistribute.is_empty() && !redistribute.contains(&kr.protocol) {
+                    continue;
+                }
+                tables.inject_kernel_route(kr).await;
+            }
+            kernel::RouteEvent::Delete(kr) => {
+                if !redistribute.is_empty() && !redistribute.contains(&kr.protocol) {
+                    continue;
+                }
+                tables.withdraw_kernel_route(kr.dst, kr.prefix_len).await;
+            }
+        }
+    }
 }
 
 pub(crate) struct TableShard {
@@ -755,5 +893,170 @@ impl TableShard {
         for change in self.rtable.end_deferral(family) {
             self.distribute_update(change, kernel_tx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn kr_v4(
+        dst: &str,
+        prefix_len: u8,
+        nexthop: &str,
+        metric: u32,
+        protocol: kernel::Protocol,
+    ) -> kernel::KernelRoute {
+        kernel::KernelRoute {
+            dst: dst.parse().unwrap(),
+            prefix_len,
+            nexthop: Some(nexthop.parse().unwrap()),
+            metric,
+            protocol,
+        }
+    }
+
+    fn kr_v6(
+        dst: &str,
+        prefix_len: u8,
+        nexthop: &str,
+        metric: u32,
+        protocol: kernel::Protocol,
+    ) -> kernel::KernelRoute {
+        kernel::KernelRoute {
+            dst: dst.parse().unwrap(),
+            prefix_len,
+            nexthop: Some(nexthop.parse().unwrap()),
+            metric,
+            protocol,
+        }
+    }
+
+    // --- kernel_route_to_path unit tests (no Netlink needed) ---
+
+    #[test]
+    fn kernel_route_to_path_v4_static() {
+        let kr = kr_v4("10.0.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
+        let (family, net, nexthop, attrs) = kernel_route_to_path(&kr).unwrap();
+        assert_eq!(family, Family::IPV4);
+        assert!(matches!(net.nlri, packet::Nlri::V4(_)));
+        assert!(matches!(nexthop, packet::bgp::Nexthop::V4(a) if a == Ipv4Addr::new(192,168,1,1)));
+        // Origin IGP (code=1, value=0) must be present.
+        assert!(attrs.iter().any(|a| a.code() == packet::Attribute::ORIGIN));
+        // AS_PATH must be present.
+        assert!(attrs.iter().any(|a| a.code() == packet::Attribute::AS_PATH));
+        // No MED when metric == 0.
+        assert!(
+            !attrs
+                .iter()
+                .any(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
+        );
+    }
+
+    #[test]
+    fn kernel_route_to_path_v4_with_metric() {
+        let kr = kr_v4("10.1.0.0", 24, "192.168.1.1", 100, kernel::Protocol::Ospf);
+        let (_, _, _, attrs) = kernel_route_to_path(&kr).unwrap();
+        assert!(
+            attrs
+                .iter()
+                .any(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
+        );
+    }
+
+    #[test]
+    fn kernel_route_to_path_v6() {
+        let kr = kr_v6("2001:db8::", 32, "fe80::1", 0, kernel::Protocol::Static);
+        let (family, net, nexthop, _) = kernel_route_to_path(&kr).unwrap();
+        assert_eq!(family, Family::IPV6);
+        assert!(matches!(net.nlri, packet::Nlri::V6(_)));
+        assert!(matches!(nexthop, packet::bgp::Nexthop::V6(_)));
+    }
+
+    #[test]
+    fn kernel_route_to_path_no_nexthop_returns_none() {
+        let kr = kernel::KernelRoute {
+            dst: "10.0.0.0".parse().unwrap(),
+            prefix_len: 24,
+            nexthop: None,
+            metric: 0,
+            protocol: kernel::Protocol::Static,
+        };
+        assert!(kernel_route_to_path(&kr).is_none());
+    }
+
+    // --- run_kernel_routes integration tests (mock stream, no Netlink) ---
+
+    fn make_tables() -> Arc<TableManager> {
+        Arc::new(TableManager::new(1))
+    }
+
+    #[tokio::test]
+    async fn run_kernel_routes_injects_static_route() {
+        use futures::stream;
+        let tables = make_tables();
+        let kr = kr_v4("10.0.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
+        let events = stream::iter(vec![kernel::RouteEvent::Add(kr)]);
+        run_kernel_routes(tables.clone(), events, vec![]).await;
+        let paths = tables
+            .collect_paths(
+                rustybgp_table::TableQuery::Global,
+                Family::IPV4,
+                vec![],
+                false,
+            )
+            .await;
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].paths[0].source.is_kernel(), true);
+    }
+
+    #[tokio::test]
+    async fn run_kernel_routes_withdraw_removes_route() {
+        use futures::stream;
+        let tables = make_tables();
+        let kr = kr_v4("10.0.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
+        let add = kernel::RouteEvent::Add(kr.clone());
+        let del = kernel::RouteEvent::Delete(kr);
+        let events = stream::iter(vec![add, del]);
+        run_kernel_routes(tables.clone(), events, vec![]).await;
+        let paths = tables
+            .collect_paths(
+                rustybgp_table::TableQuery::Global,
+                Family::IPV4,
+                vec![],
+                false,
+            )
+            .await;
+        assert_eq!(paths.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_kernel_routes_protocol_filter() {
+        use futures::stream;
+        let tables = make_tables();
+        // Add a Kernel (connected) route and a Static route.
+        let connected = kr_v4("10.1.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Kernel);
+        let statik = kr_v4("10.2.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
+        let events = stream::iter(vec![
+            kernel::RouteEvent::Add(connected),
+            kernel::RouteEvent::Add(statik),
+        ]);
+        // Only accept Static; Kernel/connected must be filtered out.
+        run_kernel_routes(tables.clone(), events, vec![kernel::Protocol::Static]).await;
+        let paths = tables
+            .collect_paths(
+                rustybgp_table::TableQuery::Global,
+                Family::IPV4,
+                vec![],
+                false,
+            )
+            .await;
+        assert_eq!(paths.len(), 1);
+        let dst = match &paths[0].net {
+            packet::Nlri::V4(n) => n.addr,
+            _ => panic!("expected V4"),
+        };
+        assert_eq!(dst, Ipv4Addr::new(10, 2, 0, 0));
     }
 }

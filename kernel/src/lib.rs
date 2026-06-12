@@ -11,6 +11,27 @@ use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteProtocol
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
 use rtnetlink::{MulticastGroup, RouteMessageBuilder};
 
+pub use rtnetlink::packet_route::route::RouteProtocol as Protocol;
+
+/// Convert a GoBGP-style route type string to a `Protocol` value.
+///
+/// Accepted strings (case-insensitive): "connect", "static", "ospf", "isis",
+/// "rip", "eigrp", "bgp", "babel", "zebra".  Returns `None` for unknown types.
+pub fn route_type_to_protocol(s: &str) -> Option<Protocol> {
+    match s.to_ascii_lowercase().as_str() {
+        "connect" => Some(Protocol::Kernel),
+        "static" => Some(Protocol::Static),
+        "ospf" => Some(Protocol::Ospf),
+        "isis" => Some(Protocol::Isis),
+        "rip" => Some(Protocol::Rip),
+        "eigrp" => Some(Protocol::Eigrp),
+        "bgp" => Some(Protocol::Bgp),
+        "babel" => Some(Protocol::Babel),
+        "zebra" => Some(Protocol::Zebra),
+        _ => None,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("io: {0}")]

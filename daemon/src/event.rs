@@ -3319,13 +3319,19 @@ impl GoBgpService for GrpcService {
     }
     async fn enable_zebra(
         &self,
-        _request: tonic::Request<api::EnableZebraRequest>,
+        request: tonic::Request<api::EnableZebraRequest>,
     ) -> Result<tonic::Response<api::EnableZebraResponse>, tonic::Status> {
         if self.tables.kernel_tx.load().is_some() {
             return Ok(tonic::Response::new(api::EnableZebraResponse {}));
         }
-        match kernel::Handle::new() {
-            Ok((handle, connection)) => {
+        let request = request.into_inner();
+        let redistribute: Vec<kernel::Protocol> = request
+            .route_types
+            .iter()
+            .filter_map(|s| kernel::route_type_to_protocol(s))
+            .collect();
+        match kernel::Handle::with_route_monitor() {
+            Ok((handle, connection, route_events)) => {
                 tokio::spawn(connection);
                 let (tx, mut rx) = mpsc::unbounded_channel();
                 tokio::spawn(async move {
@@ -3336,6 +3342,12 @@ impl GoBgpService for GrpcService {
                     }
                 });
                 self.tables.kernel_tx.store(Some(Arc::new(tx)));
+                let tables = self.tables.clone();
+                tokio::spawn(table_manager::run_kernel_routes(
+                    tables,
+                    route_events,
+                    redistribute,
+                ));
                 log::info!("kernel route integration enabled");
                 Ok(tonic::Response::new(api::EnableZebraResponse {}))
             }
@@ -4060,14 +4072,20 @@ impl Global {
                 }
             }
         }
-        if bgp
+        if let Some(zebra_cfg) = bgp
             .as_ref()
             .and_then(|x| x.zebra.as_ref())
             .and_then(|x| x.config.as_ref())
-            .is_some_and(|x| x.enabled == Some(true))
+            .filter(|x| x.enabled == Some(true))
         {
-            match kernel::Handle::new() {
-                Ok((handle, connection)) => {
+            let redistribute: Vec<kernel::Protocol> = zebra_cfg
+                .redistribute_route_type_list
+                .iter()
+                .flatten()
+                .filter_map(|s| kernel::route_type_to_protocol(s))
+                .collect();
+            match kernel::Handle::with_route_monitor() {
+                Ok((handle, connection, route_events)) => {
                     tokio::spawn(connection);
                     let (tx, mut rx) = mpsc::unbounded_channel();
                     tokio::spawn(async move {
@@ -4078,6 +4096,12 @@ impl Global {
                         }
                     });
                     tables.kernel_tx.store(Some(Arc::new(tx)));
+                    let tables_arc = tables.clone();
+                    tokio::spawn(table_manager::run_kernel_routes(
+                        tables_arc,
+                        route_events,
+                        redistribute,
+                    ));
                     log::info!("kernel route integration enabled");
                 }
                 Err(e) => {
@@ -4357,7 +4381,7 @@ impl Global {
     }
 }
 
-use crate::table_manager::{PeerDownData, PeerUpData, SubscriptionId, TableManager};
+use crate::table_manager::{self, PeerDownData, PeerUpData, SubscriptionId, TableManager};
 // Re-export for mrt.rs and bmp.rs which import from crate::event.
 pub(crate) use crate::table_manager::{AdjRibInChange, BgpEvent, TableHandle};
 
