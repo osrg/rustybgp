@@ -1106,9 +1106,14 @@ struct DynamicPeer {
 struct PeerGroup {
     as_number: u32,
     dynamic_peers: Vec<DynamicPeer>,
-    // passive: bool,
     route_server_client: bool,
     holdtime: Option<u64>,
+    local_asn: u32,
+    passive: bool,
+    route_reflector: RouteReflectorConfig,
+    multihop_ttl: Option<u8>,
+    auth_password: Option<String>,
+    connect_retry_time: Option<u64>,
 }
 
 fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
@@ -1116,16 +1121,27 @@ fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
         conf: Some(api::PeerGroupConf {
             peer_group_name: name.to_string(),
             peer_asn: pg.as_number,
+            local_asn: pg.local_asn,
+            auth_password: pg.auth_password.clone().unwrap_or_default(),
             ..Default::default()
         }),
-        timers: pg.holdtime.map(|h| api::Timers {
-            config: Some(api::TimersConfig {
-                hold_time: h,
-                keepalive_interval: h / 3,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
+        timers: {
+            let has_holdtime = pg.holdtime.is_some();
+            let has_connect_retry = pg.connect_retry_time.is_some();
+            if has_holdtime || has_connect_retry {
+                Some(api::Timers {
+                    config: Some(api::TimersConfig {
+                        hold_time: pg.holdtime.unwrap_or(0),
+                        keepalive_interval: pg.holdtime.map(|h| h / 3).unwrap_or(0),
+                        connect_retry: pg.connect_retry_time.unwrap_or(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            } else {
+                None
+            }
+        },
         route_server: if pg.route_server_client {
             Some(api::RouteServer {
                 route_server_client: true,
@@ -1134,21 +1150,137 @@ fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
         } else {
             None
         },
+        transport: if pg.passive {
+            Some(api::Transport {
+                passive_mode: true,
+                ..Default::default()
+            })
+        } else {
+            None
+        },
+        route_reflector: if pg.route_reflector.route_reflector_client
+            || pg.route_reflector.route_reflector_cluster_id.is_some()
+        {
+            Some(api::RouteReflector {
+                route_reflector_client: pg.route_reflector.route_reflector_client,
+                route_reflector_cluster_id: pg
+                    .route_reflector
+                    .route_reflector_cluster_id
+                    .map(|a| a.to_string())
+                    .unwrap_or_default(),
+            })
+        } else {
+            None
+        },
+        ebgp_multihop: pg.multihop_ttl.map(|ttl| api::EbgpMultihop {
+            enabled: true,
+            multihop_ttl: ttl as u32,
+        }),
         ..Default::default()
     }
 }
 
 impl From<api::PeerGroup> for PeerGroup {
     fn from(p: api::PeerGroup) -> PeerGroup {
+        let conf = p.conf.as_ref();
         PeerGroup {
-            as_number: p.conf.map_or(0, |c| c.peer_asn),
+            as_number: conf.map_or(0, |c| c.peer_asn),
             dynamic_peers: Vec::new(),
             route_server_client: p.route_server.is_some_and(|c| c.route_server_client),
             holdtime: p
                 .timers
-                .and_then(|t| t.config)
+                .as_ref()
+                .and_then(|t| t.config.as_ref())
                 .map(|c| c.hold_time)
                 .filter(|&h| h != 0),
+            local_asn: conf.map_or(0, |c| c.local_asn),
+            passive: p.transport.is_some_and(|t| t.passive_mode),
+            route_reflector: {
+                let rr = p.route_reflector.as_ref();
+                RouteReflectorConfig {
+                    route_reflector_client: rr.is_some_and(|x| x.route_reflector_client),
+                    route_reflector_cluster_id: rr
+                        .map(|x| x.route_reflector_cluster_id.as_str())
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| Ipv4Addr::from_str(s).ok()),
+                }
+            },
+            multihop_ttl: p.ebgp_multihop.and_then(|x| {
+                if x.enabled && x.multihop_ttl != 0 {
+                    Some(x.multihop_ttl as u8)
+                } else {
+                    None
+                }
+            }),
+            auth_password: conf
+                .map(|c| c.auth_password.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            connect_retry_time: p
+                .timers
+                .and_then(|t| t.config)
+                .map(|c| c.connect_retry)
+                .filter(|&t| t != 0),
+        }
+    }
+}
+
+impl PeerGroup {
+    fn from_yaml(pg: &config::PeerGroup) -> Self {
+        let timer_config = pg.timers.as_ref().and_then(|t| t.config.as_ref());
+        PeerGroup {
+            as_number: pg.config.as_ref().and_then(|c| c.peer_as).unwrap_or(0),
+            dynamic_peers: Vec::new(),
+            route_server_client: pg
+                .route_server
+                .as_ref()
+                .and_then(|rs| rs.config.as_ref())
+                .and_then(|c| c.route_server_client)
+                .unwrap_or(false),
+            holdtime: timer_config
+                .and_then(|c| c.hold_time)
+                .map(|h| h as u64)
+                .filter(|&h| h != 0),
+            local_asn: pg.config.as_ref().and_then(|c| c.local_as).unwrap_or(0),
+            passive: pg
+                .transport
+                .as_ref()
+                .and_then(|t| t.config.as_ref())
+                .and_then(|c| c.passive_mode)
+                .unwrap_or(false),
+            route_reflector: {
+                let rr = pg.route_reflector.as_ref().and_then(|r| r.config.as_ref());
+                RouteReflectorConfig {
+                    route_reflector_client: rr
+                        .and_then(|c| c.route_reflector_client)
+                        .unwrap_or(false),
+                    route_reflector_cluster_id: rr
+                        .and_then(|c| c.route_reflector_cluster_id.as_deref())
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| Ipv4Addr::from_str(s).ok()),
+                }
+            },
+            multihop_ttl: pg
+                .ebgp_multihop
+                .as_ref()
+                .and_then(|m| m.config.as_ref())
+                .and_then(|c| {
+                    if c.enabled.unwrap_or(false) {
+                        c.multihop_ttl
+                    } else {
+                        None
+                    }
+                }),
+            auth_password: pg
+                .config
+                .as_ref()
+                .and_then(|c| c.auth_password.as_deref())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            connect_retry_time: timer_config
+                .and_then(|c| c.connect_retry)
+                .map(|t| t as u64)
+                .filter(|&t| t != 0),
         }
     }
 }
@@ -1958,6 +2090,12 @@ impl GoBgpService for GrpcService {
                 entry.as_number = updated.as_number;
                 entry.route_server_client = updated.route_server_client;
                 entry.holdtime = updated.holdtime;
+                entry.local_asn = updated.local_asn;
+                entry.passive = updated.passive;
+                entry.route_reflector = updated.route_reflector;
+                entry.multihop_ttl = updated.multihop_ttl;
+                entry.auth_password = updated.auth_password;
+                entry.connect_retry_time = updated.connect_retry_time;
                 Ok(tonic::Response::new(api::UpdatePeerGroupResponse {
                     needs_soft_reset_in: false,
                 }))
@@ -3415,51 +3553,41 @@ async fn accept_connection(
             peer
         }
         None => {
-            let mut is_dynamic = false;
-            let mut rs_client = false;
-            let mut remote_asn = 0;
-            let mut holdtime = None;
-            for p in &g.peer_group {
-                for d in &p.1.dynamic_peers {
-                    if d.prefix.contains(&remote_addr) {
-                        remote_asn = p.1.as_number;
-                        is_dynamic = true;
-                        rs_client = p.1.route_server_client;
-                        holdtime = p.1.holdtime;
-                        break;
-                    }
-                }
-            }
-            if !is_dynamic {
+            let group = g.peer_group.values().find(|pg| {
+                pg.dynamic_peers
+                    .iter()
+                    .any(|d| d.prefix.contains(&remote_addr))
+            });
+            let Some(group) = group else {
                 log::warn!(
                     "can't find configuration a new passive connection {}",
                     remote_addr
                 );
                 return None;
-            }
-            let _ = g.add_peer(
-                PeerParams {
-                    remote_addr,
-                    remote_port: Global::BGP_PORT,
-                    expected_remote_asn: remote_asn,
-                    local_asn: 0,
-                    passive: false,
-                    rs_client,
-                    route_reflector: RouteReflectorConfig::default(),
-                    delete_on_disconnected: true,
-                    admin_down: false,
-                    state: SessionState::Active,
-                    holdtime: holdtime.unwrap_or(PeerParams::DEFAULT_HOLD_TIME),
-                    connect_retry_time: PeerParams::DEFAULT_CONNECT_RETRY_TIME,
-                    multihop_ttl: None,
-                    password: None,
-                    families: FnvHashMap::default(),
-                    send_max: FnvHashMap::default(),
-                    prefix_limits: FnvHashMap::default(),
-                    graceful_restart: None,
-                },
-                None,
-            );
+            };
+            let params = PeerParams {
+                remote_addr,
+                remote_port: Global::BGP_PORT,
+                expected_remote_asn: group.as_number,
+                local_asn: group.local_asn,
+                passive: group.passive,
+                rs_client: group.route_server_client,
+                route_reflector: group.route_reflector.clone(),
+                delete_on_disconnected: true,
+                admin_down: false,
+                state: SessionState::Active,
+                holdtime: group.holdtime.unwrap_or(PeerParams::DEFAULT_HOLD_TIME),
+                connect_retry_time: group
+                    .connect_retry_time
+                    .unwrap_or(PeerParams::DEFAULT_CONNECT_RETRY_TIME),
+                multihop_ttl: group.multihop_ttl,
+                password: group.auth_password.clone(),
+                families: FnvHashMap::default(),
+                send_max: FnvHashMap::default(),
+                prefix_limits: FnvHashMap::default(),
+                graceful_restart: None,
+            };
+            let _ = g.add_peer(params, None);
             g.peers.get_mut(&remote_addr).unwrap()
         }
     };
@@ -3622,28 +3750,7 @@ impl Global {
             let mut server = global.write().await;
             for pg in groups {
                 if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {
-                    server.peer_group.insert(
-                        name,
-                        PeerGroup {
-                            as_number: pg.config.as_ref().map_or(0, |x| x.peer_as.map_or(0, |x| x)),
-                            dynamic_peers: Vec::new(),
-                            route_server_client: pg.route_server.as_ref().is_some_and(|x| {
-                                x.config
-                                    .as_ref()
-                                    .is_some_and(|x| x.route_server_client.unwrap_or(false))
-                            }),
-                            holdtime: pg.timers.as_ref().and_then(|x| {
-                                x.config
-                                    .as_ref()
-                                    .and_then(|x| x.hold_time.as_ref().map(|x| *x as u64))
-                            }),
-                            // passive: pg.transport.as_ref().map_or(false, |x| {
-                            //     x.config
-                            //         .as_ref()
-                            //         .map_or(false, |x| x.passive_mode.map_or(false, |x| x))
-                            // }),
-                        },
-                    );
+                    server.peer_group.insert(name, PeerGroup::from_yaml(pg));
                 }
             }
         }
@@ -3809,9 +3916,14 @@ impl Global {
                             prefix: packet::IpNet::from_str("::/0").unwrap(),
                         },
                     ],
-                    // passive: true,
                     route_server_client: false,
                     holdtime: None,
+                    local_asn: 0,
+                    passive: false,
+                    route_reflector: RouteReflectorConfig::default(),
+                    multihop_ttl: None,
+                    auth_password: None,
+                    connect_retry_time: None,
                 },
             );
         }
@@ -5950,6 +6062,12 @@ mod tests {
                     }],
                     route_server_client: false,
                     holdtime: None,
+                    local_asn: 0,
+                    passive: false,
+                    route_reflector: RouteReflectorConfig::default(),
+                    multihop_ttl: None,
+                    auth_password: None,
+                    connect_retry_time: None,
                 },
             );
         }
@@ -5961,6 +6079,319 @@ mod tests {
         assert!(g.peers.contains_key(&remote_addr));
         let peer = g.peers.get(&remote_addr).unwrap();
         assert!(peer.config.delete_on_disconnected);
+    }
+
+    #[tokio::test]
+    async fn dynamic_peer_inherits_all_group_fields() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+        let cluster_id: Ipv4Addr = "1.2.3.4".parse().unwrap();
+
+        {
+            let mut g = global.write().await;
+            g.peer_group.insert(
+                "full-group".to_string(),
+                PeerGroup {
+                    as_number: 65002,
+                    dynamic_peers: vec![DynamicPeer {
+                        prefix: packet::IpNet::new(remote_addr, 32),
+                    }],
+                    route_server_client: false,
+                    holdtime: Some(90),
+                    local_asn: 65001,
+                    passive: true,
+                    route_reflector: RouteReflectorConfig {
+                        route_reflector_client: true,
+                        route_reflector_cluster_id: Some(cluster_id),
+                    },
+                    multihop_ttl: Some(5),
+                    auth_password: Some("secret".to_string()),
+                    connect_retry_time: Some(30),
+                },
+            );
+        }
+
+        let h = accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+        assert!(h.is_some());
+
+        let g = global.read().await;
+        let peer = g.peers.get(&remote_addr).unwrap();
+        assert_eq!(peer.config.expected_remote_asn, 65002);
+        assert_eq!(peer.config.local_asn, 65001);
+        assert!(peer.config.passive);
+        assert!(peer.config.route_reflector.route_reflector_client);
+        assert_eq!(
+            peer.config.route_reflector.route_reflector_cluster_id,
+            Some(cluster_id)
+        );
+        assert_eq!(peer.config.multihop_ttl, Some(5));
+        assert_eq!(peer.config.password, Some("secret".to_string()));
+        assert_eq!(peer.config.holdtime, 90);
+        assert_eq!(peer.config.connect_retry_time, 30);
+        assert!(peer.config.delete_on_disconnected);
+    }
+
+    // --- PeerGroup gRPC round-trip tests ---
+
+    fn make_full_api_peer_group(name: &str) -> api::PeerGroup {
+        api::PeerGroup {
+            conf: Some(api::PeerGroupConf {
+                peer_group_name: name.to_string(),
+                peer_asn: 65002,
+                local_asn: 65001,
+                auth_password: "secret".to_string(),
+                ..Default::default()
+            }),
+            timers: Some(api::Timers {
+                config: Some(api::TimersConfig {
+                    hold_time: 90,
+                    connect_retry: 30,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            route_server: Some(api::RouteServer {
+                route_server_client: false,
+                ..Default::default()
+            }),
+            transport: Some(api::Transport {
+                passive_mode: true,
+                ..Default::default()
+            }),
+            route_reflector: Some(api::RouteReflector {
+                route_reflector_client: true,
+                route_reflector_cluster_id: "1.2.3.4".to_string(),
+            }),
+            ebgp_multihop: Some(api::EbgpMultihop {
+                enabled: true,
+                multihop_ttl: 5,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_group_grpc_roundtrip_all_fields() {
+        let svc = make_grpc_service();
+        let pg = make_full_api_peer_group("grp");
+        svc.add_peer_group(tonic::Request::new(api::AddPeerGroupRequest {
+            peer_group: Some(pg),
+        }))
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        svc.list_peer_group(tonic::Request::new(api::ListPeerGroupRequest {
+            peer_group_name: "grp".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .for_each(|r| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(r.unwrap().peer_group.unwrap()).await;
+            }
+        })
+        .await;
+
+        let got = rx.recv().await.unwrap();
+        let conf = got.conf.as_ref().unwrap();
+        assert_eq!(conf.peer_asn, 65002);
+        assert_eq!(conf.local_asn, 65001);
+        assert_eq!(conf.auth_password, "secret");
+        let tc = got.timers.as_ref().unwrap().config.as_ref().unwrap();
+        assert_eq!(tc.hold_time, 90);
+        assert_eq!(tc.connect_retry, 30);
+        assert!(got.transport.as_ref().unwrap().passive_mode);
+        let rr = got.route_reflector.as_ref().unwrap();
+        assert!(rr.route_reflector_client);
+        assert_eq!(rr.route_reflector_cluster_id, "1.2.3.4");
+        let mh = got.ebgp_multihop.as_ref().unwrap();
+        assert!(mh.enabled);
+        assert_eq!(mh.multihop_ttl, 5);
+    }
+
+    #[tokio::test]
+    async fn peer_group_grpc_update_all_fields() {
+        let svc = make_grpc_service();
+
+        // Add with initial values.
+        svc.add_peer_group(tonic::Request::new(api::AddPeerGroupRequest {
+            peer_group: Some(make_full_api_peer_group("grp")),
+        }))
+        .await
+        .unwrap();
+
+        // Update with new values.
+        let updated = api::PeerGroup {
+            conf: Some(api::PeerGroupConf {
+                peer_group_name: "grp".to_string(),
+                peer_asn: 65003,
+                local_asn: 65004,
+                auth_password: "new-secret".to_string(),
+                ..Default::default()
+            }),
+            timers: Some(api::Timers {
+                config: Some(api::TimersConfig {
+                    hold_time: 120,
+                    connect_retry: 60,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            transport: Some(api::Transport {
+                passive_mode: false,
+                ..Default::default()
+            }),
+            ebgp_multihop: Some(api::EbgpMultihop {
+                enabled: true,
+                multihop_ttl: 10,
+            }),
+            ..Default::default()
+        };
+        svc.update_peer_group(tonic::Request::new(api::UpdatePeerGroupRequest {
+            peer_group: Some(updated),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        svc.list_peer_group(tonic::Request::new(api::ListPeerGroupRequest {
+            peer_group_name: "grp".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .for_each(|r| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(r.unwrap().peer_group.unwrap()).await;
+            }
+        })
+        .await;
+
+        let got = rx.recv().await.unwrap();
+        let conf = got.conf.as_ref().unwrap();
+        assert_eq!(conf.peer_asn, 65003);
+        assert_eq!(conf.local_asn, 65004);
+        assert_eq!(conf.auth_password, "new-secret");
+        let tc = got.timers.as_ref().unwrap().config.as_ref().unwrap();
+        assert_eq!(tc.hold_time, 120);
+        assert_eq!(tc.connect_retry, 60);
+        assert!(
+            !got.transport
+                .as_ref()
+                .map(|t| t.passive_mode)
+                .unwrap_or(false)
+        );
+        let mh = got.ebgp_multihop.as_ref().unwrap();
+        assert_eq!(mh.multihop_ttl, 10);
+    }
+
+    // --- PeerGroup YAML parsing tests ---
+
+    fn make_yaml_peer_group() -> config::PeerGroup {
+        config::PeerGroup {
+            config: Some(config::PeerGroupConfig {
+                peer_group_name: Some("yaml-grp".to_string()),
+                peer_as: Some(65002),
+                local_as: Some(65001),
+                auth_password: Some("yaml-secret".to_string()),
+                ..Default::default()
+            }),
+            timers: Some(config::Timers {
+                config: Some(config::TimersConfig {
+                    hold_time: Some(90.0),
+                    connect_retry: Some(30.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            transport: Some(config::Transport {
+                config: Some(config::TransportConfig {
+                    passive_mode: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            route_reflector: Some(config::RouteReflector {
+                config: Some(config::RouteReflectorConfig {
+                    route_reflector_client: Some(true),
+                    route_reflector_cluster_id: Some("1.2.3.4".to_string()),
+                }),
+                ..Default::default()
+            }),
+            ebgp_multihop: Some(config::EbgpMultihop {
+                config: Some(config::EbgpMultihopConfig {
+                    enabled: Some(true),
+                    multihop_ttl: Some(5),
+                }),
+                ..Default::default()
+            }),
+            route_server: Some(config::RouteServer {
+                config: Some(config::RouteServerConfig {
+                    route_server_client: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn peer_group_yaml_parses_all_fields() {
+        let pg = PeerGroup::from_yaml(&make_yaml_peer_group());
+        assert_eq!(pg.as_number, 65002);
+        assert_eq!(pg.local_asn, 65001);
+        assert_eq!(pg.auth_password, Some("yaml-secret".to_string()));
+        assert_eq!(pg.holdtime, Some(90));
+        assert_eq!(pg.connect_retry_time, Some(30));
+        assert!(pg.passive);
+        assert!(pg.route_reflector.route_reflector_client);
+        assert_eq!(
+            pg.route_reflector.route_reflector_cluster_id,
+            Some("1.2.3.4".parse().unwrap())
+        );
+        assert_eq!(pg.multihop_ttl, Some(5));
+    }
+
+    #[test]
+    fn peer_group_yaml_empty_password_becomes_none() {
+        let yaml_pg = config::PeerGroup {
+            config: Some(config::PeerGroupConfig {
+                peer_group_name: Some("g".to_string()),
+                auth_password: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pg = PeerGroup::from_yaml(&yaml_pg);
+        assert!(pg.auth_password.is_none());
+    }
+
+    #[test]
+    fn peer_group_yaml_multihop_disabled_yields_none() {
+        let yaml_pg = config::PeerGroup {
+            config: Some(config::PeerGroupConfig {
+                peer_group_name: Some("g".to_string()),
+                ..Default::default()
+            }),
+            ebgp_multihop: Some(config::EbgpMultihop {
+                config: Some(config::EbgpMultihopConfig {
+                    enabled: Some(false),
+                    multihop_ttl: Some(5),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pg = PeerGroup::from_yaml(&yaml_pg);
+        assert!(pg.multihop_ttl.is_none());
     }
 
     fn cease_notification() -> bgp::Message {
