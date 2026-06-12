@@ -111,6 +111,10 @@ pub enum TableQuery {
     /// Adj-RIB-Out for the given peer: best paths that would be sent to that peer,
     /// with export attribute transformations applied.
     AdjOut(IpAddr),
+    /// Route Server local-RIB view for the given RS client: the best path
+    /// from all RS-client peers excluding `peer` itself, with pre-import-policy
+    /// attributes (equivalent to GoBGP TABLE_TYPE_LOCAL with an RS client address).
+    RsLocal(IpAddr),
 }
 
 /// Controls how a prefix in a query is matched against RIB entries.
@@ -811,6 +815,32 @@ impl Table {
             .collect()
     }
 
+    /// Returns the RS local-RIB best path for `peer`: the best path from all
+    /// RS-client peers excluding `peer` itself.
+    ///
+    /// Uses pre-import-policy attributes (`original_attr`) so callers see what
+    /// the originating peer actually sent, mirroring GoBGP's rsRib behaviour.
+    fn rs_local_paths(dst: &Destination, peer: IpAddr) -> Vec<PathEntry> {
+        let best = dst
+            .entry
+            .iter()
+            .filter(|e| {
+                e.path.source.rs_client && e.path.source.remote_addr != peer && !e.is_filtered()
+            })
+            .max();
+        best.into_iter()
+            .map(|p| PathEntry {
+                source: p.path.source.clone(),
+                remote_path_id: 0,
+                timestamp: p.timestamp,
+                attr: p.original_attr.clone(),
+                validation: None,
+                stale: p.path.source.is_stale(),
+                filtered: false,
+            })
+            .collect()
+    }
+
     /// Returns the best path(s) that would be sent to `peer` (Adj-RIB-Out view).
     ///
     /// Excludes paths learned from `peer` itself to prevent readvertisement.
@@ -909,6 +939,7 @@ impl Table {
                         family,
                         export_policy.as_deref(),
                     ),
+                    TableQuery::RsLocal(peer) => Self::rs_local_paths(dst, peer),
                 };
                 DestinationEntry {
                     net: net.clone(),
@@ -5082,5 +5113,150 @@ mod tests {
             mask: 8,
         });
         assert!(vpn_to_local_nlri(&plain).is_none());
+    }
+
+    fn rs_source(addr: u8, remote_asn: u32) -> Arc<Source> {
+        Arc::new(Source::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, addr)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
+            remote_asn,
+            65000,
+            Ipv4Addr::new(0, 0, 0, addr),
+            true, // rs_client
+            false,
+        ))
+    }
+
+    #[test]
+    fn rs_local_returns_other_rs_client_best_path() {
+        let peer1 = rs_source(1, 65001);
+        let peer2 = rs_source(2, 65002);
+        let n1 = nlri(10, 0, 1, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &peer2, &n1);
+
+        let peer1_addr = peer1.remote_addr;
+        let dests: Vec<_> = rt
+            .destinations(
+                TableQuery::RsLocal(peer1_addr),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
+            .collect();
+        assert_eq!(dests.len(), 1);
+        assert_eq!(dests[0].paths.len(), 1);
+        assert_eq!(dests[0].paths[0].source.remote_addr, peer2.remote_addr);
+    }
+
+    #[test]
+    fn rs_local_excludes_queried_peer_own_paths() {
+        let peer1 = rs_source(1, 65001);
+        let peer2 = rs_source(2, 65002);
+        let n1 = nlri(10, 0, 1, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &peer1, &n1);
+        insert_path(&mut rt, &peer2, &n1);
+
+        // RsLocal(peer1) must not include peer1's own path.
+        let peer1_addr = peer1.remote_addr;
+        let dests: Vec<_> = rt
+            .destinations(
+                TableQuery::RsLocal(peer1_addr),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
+            .collect();
+        assert_eq!(dests.len(), 1);
+        assert_eq!(dests[0].paths.len(), 1);
+        assert_eq!(dests[0].paths[0].source.remote_addr, peer2.remote_addr);
+    }
+
+    #[test]
+    fn rs_local_excludes_non_rs_client_paths() {
+        // peer1 is RS client; peer2 is a regular eBGP peer (rs_client=false).
+        let peer1 = rs_source(1, 65001);
+        let peer2 = source(2, 65002, 65000, 2); // rs_client=false
+        let n1 = nlri(10, 0, 1, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &peer2, &n1);
+
+        // RsLocal(peer1) must not include non-RS-client peer2's path.
+        let peer1_addr = peer1.remote_addr;
+        let dests: Vec<_> = rt
+            .destinations(
+                TableQuery::RsLocal(peer1_addr),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
+            .collect();
+        assert_eq!(dests.len(), 0);
+    }
+
+    #[test]
+    fn rs_local_empty_when_no_other_rs_clients() {
+        let peer1 = rs_source(1, 65001);
+        let n1 = nlri(10, 0, 1, 0, 24);
+
+        let mut rt = Table::new();
+        insert_path(&mut rt, &peer1, &n1);
+
+        let peer1_addr = peer1.remote_addr;
+        let dests: Vec<_> = rt
+            .destinations(
+                TableQuery::RsLocal(peer1_addr),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
+            .collect();
+        assert_eq!(dests.len(), 0, "no other RS clients -> empty result");
+    }
+
+    #[test]
+    fn rs_local_uses_original_attr() {
+        let peer1 = rs_source(1, 65001);
+        let peer2 = rs_source(2, 65002);
+        let n1 = nlri(10, 0, 1, 0, 24);
+
+        // Insert peer2's path; original_attr differs from post-import attr.
+        let original = attrs_with_local_pref(200);
+        let post_import = attrs_with_local_pref(100);
+        let mut rt = Table::new();
+        rt.insert(
+            peer2.clone(),
+            Family::IPV4,
+            n1.clone(),
+            0,
+            nh(),
+            post_import.clone(),
+            Some(original.clone()),
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+
+        let peer1_addr = peer1.remote_addr;
+        let dests: Vec<_> = rt
+            .destinations(
+                TableQuery::RsLocal(peer1_addr),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
+            .collect();
+        assert_eq!(dests.len(), 1);
+        // RsLocal must expose original_attr (pre-import-policy), not post-import.
+        assert_eq!(dests[0].paths[0].attr, original);
     }
 }

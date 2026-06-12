@@ -2509,7 +2509,27 @@ impl GoBgpService for GrpcService {
                 }
                 api::TableType::Global => table::TableQuery::Global,
                 api::TableType::Local => {
-                    return Err(tonic::Status::unimplemented("Not yet implemented"));
+                    if request.name.is_empty() {
+                        table::TableQuery::Global
+                    } else {
+                        let peer_addr = IpAddr::from_str(&request.name).map_err(|_| {
+                            tonic::Status::new(
+                                tonic::Code::InvalidArgument,
+                                "invalid neighbor name",
+                            )
+                        })?;
+                        let global = self.global.read().await;
+                        let peer = global.peers.get(&peer_addr).ok_or_else(|| {
+                            tonic::Status::not_found(format!("neighbor {} not found", peer_addr))
+                        })?;
+                        if !peer.config.route_server_client {
+                            return Err(tonic::Status::new(
+                                tonic::Code::InvalidArgument,
+                                format!("neighbor {} does not have local rib", peer_addr),
+                            ));
+                        }
+                        table::TableQuery::RsLocal(peer_addr)
+                    }
                 }
                 api::TableType::Vrf => {
                     let vrf_name = request.name.clone();
