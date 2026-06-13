@@ -476,6 +476,7 @@ fn route_address_to_ip(addr: &RouteAddress) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     async fn new_handle() -> Handle {
         let (handle, connection) = Handle::new().unwrap();
@@ -675,5 +676,355 @@ mod tests {
         assert!(matches!(event, KernelRouteEvent::Delete(_)));
 
         drop(handle);
+    }
+
+    // --- route_type_to_protocol unit tests (no network namespace) ---
+
+    #[test]
+    fn route_type_to_protocol_known_strings() {
+        assert_eq!(route_type_to_protocol("connect"), Some(Protocol::Kernel));
+        assert_eq!(route_type_to_protocol("static"), Some(Protocol::Static));
+        assert_eq!(route_type_to_protocol("ospf"), Some(Protocol::Ospf));
+        assert_eq!(route_type_to_protocol("isis"), Some(Protocol::Isis));
+        assert_eq!(route_type_to_protocol("rip"), Some(Protocol::Rip));
+        assert_eq!(route_type_to_protocol("eigrp"), Some(Protocol::Eigrp));
+        assert_eq!(route_type_to_protocol("bgp"), Some(Protocol::Bgp));
+        assert_eq!(route_type_to_protocol("babel"), Some(Protocol::Babel));
+        assert_eq!(route_type_to_protocol("zebra"), Some(Protocol::Zebra));
+    }
+
+    #[test]
+    fn route_type_to_protocol_case_insensitive() {
+        assert_eq!(route_type_to_protocol("STATIC"), Some(Protocol::Static));
+        assert_eq!(route_type_to_protocol("Ospf"), Some(Protocol::Ospf));
+        assert_eq!(route_type_to_protocol("BGP"), Some(Protocol::Bgp));
+    }
+
+    #[test]
+    fn route_type_to_protocol_unknown_returns_none() {
+        assert_eq!(route_type_to_protocol(""), None);
+        assert_eq!(route_type_to_protocol("unknown"), None);
+        assert_eq!(route_type_to_protocol("rip2"), None);
+    }
+
+    // --- Handle::apply / KernelRouteChange tests ---
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_apply_install_v4() {
+        let handle = new_handle().await;
+        let net = packet::Nlri::V4(packet::bgp::Ipv4Net {
+            addr: "10.6.0.0".parse().unwrap(),
+            mask: 24,
+        });
+        let nh = packet::bgp::Nexthop::V4("127.0.0.1".parse().unwrap());
+        handle
+            .apply(&KernelRouteChange {
+                net,
+                nexthops: vec![nh],
+            })
+            .await
+            .unwrap();
+        let routes = handle.dump_bgp_routes().await.unwrap();
+        let dst: IpAddr = "10.6.0.0".parse().unwrap();
+        assert!(routes.iter().any(|r| r.dst == dst && r.prefix_len == 24));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_apply_withdraw_v4() {
+        let handle = new_handle().await;
+        let net = packet::Nlri::V4(packet::bgp::Ipv4Net {
+            addr: "10.7.0.0".parse().unwrap(),
+            mask: 24,
+        });
+        let nh = packet::bgp::Nexthop::V4("127.0.0.1".parse().unwrap());
+        handle
+            .apply(&KernelRouteChange {
+                net: net.clone(),
+                nexthops: vec![nh],
+            })
+            .await
+            .unwrap();
+        handle
+            .apply(&KernelRouteChange {
+                net,
+                nexthops: vec![],
+            })
+            .await
+            .unwrap();
+        let routes = handle.dump_bgp_routes().await.unwrap();
+        let dst: IpAddr = "10.7.0.0".parse().unwrap();
+        assert!(!routes.iter().any(|r| r.dst == dst));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_apply_ecmp_v4() {
+        let handle = new_handle().await;
+        let net = packet::Nlri::V4(packet::bgp::Ipv4Net {
+            addr: "10.8.0.0".parse().unwrap(),
+            mask: 24,
+        });
+        let nh1 = packet::bgp::Nexthop::V4("127.0.0.1".parse().unwrap());
+        let nh2 = packet::bgp::Nexthop::V4("127.0.0.2".parse().unwrap());
+        handle
+            .apply(&KernelRouteChange {
+                net,
+                nexthops: vec![nh1, nh2],
+            })
+            .await
+            .unwrap();
+        let routes = handle.dump_bgp_routes().await.unwrap();
+        let dst: IpAddr = "10.8.0.0".parse().unwrap();
+        assert!(routes.iter().any(|r| r.dst == dst && r.prefix_len == 24));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_apply_ecmp_v6() {
+        let handle = new_handle().await;
+        ip(&["link", "add", "dummy1", "type", "dummy"]);
+        ip(&["link", "set", "dummy1", "up"]);
+        ip(&["addr", "add", "2001:db8:2::1/64", "dev", "dummy1"]);
+
+        let net = packet::Nlri::V6(packet::bgp::Ipv6Net {
+            addr: "2001:db8:3::".parse().unwrap(),
+            mask: 48,
+        });
+        let nh1 = packet::bgp::Nexthop::V6("2001:db8:2::2".parse().unwrap());
+        let nh2 = packet::bgp::Nexthop::V6("2001:db8:2::3".parse().unwrap());
+        handle
+            .apply(&KernelRouteChange {
+                net,
+                nexthops: vec![nh1, nh2],
+            })
+            .await
+            .unwrap();
+        let routes = handle.dump_bgp_routes().await.unwrap();
+        let dst: IpAddr = "2001:db8:3::".parse().unwrap();
+        assert!(routes.iter().any(|r| r.dst == dst && r.prefix_len == 48));
+
+        ip(&["link", "del", "dummy1"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_apply_family_mismatch_silenced() {
+        let handle = new_handle().await;
+        let net = packet::Nlri::V4(packet::bgp::Ipv4Net {
+            addr: "10.9.0.0".parse().unwrap(),
+            mask: 24,
+        });
+        // IPv6 nexthop for IPv4 prefix: FamilyMismatch is silenced in apply()
+        let nh = packet::bgp::Nexthop::V6("::1".parse().unwrap());
+        let result = handle
+            .apply(&KernelRouteChange {
+                net,
+                nexthops: vec![nh],
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "apply() must silence FamilyMismatch: {result:?}"
+        );
+    }
+
+    // --- Handle::install extras ---
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_install_default_route_v4() {
+        let handle = new_handle().await;
+        let dst: IpAddr = "0.0.0.0".parse().unwrap();
+        let gw: IpAddr = "127.0.0.1".parse().unwrap();
+        handle.install(dst, 0, gw, 0).await.unwrap();
+        let routes = handle.dump_bgp_routes().await.unwrap();
+        assert!(routes.iter().any(|r| r.dst == dst && r.prefix_len == 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_install_metric_v4() {
+        let handle = new_handle().await;
+        let dst: IpAddr = "10.5.0.0".parse().unwrap();
+        let gw: IpAddr = "127.0.0.1".parse().unwrap();
+        handle.install(dst, 24, gw, 200).await.unwrap();
+        let routes = handle.dump_bgp_routes().await.unwrap();
+        let route = routes
+            .iter()
+            .find(|r| r.dst == dst && r.prefix_len == 24)
+            .unwrap();
+        assert_eq!(route.metric, 200);
+    }
+
+    // --- KernelService tests ---
+
+    fn make_service() -> (
+        KernelService,
+        KernelHandle,
+        tokio::sync::mpsc::UnboundedReceiver<KernelEvent>,
+    ) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<KernelEvent>();
+        let (service, handle) = KernelService::start(vec![], event_tx).unwrap();
+        (service, handle, event_rx)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_service_bgp_echo_filtered() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<KernelEvent>();
+        let (service, handle) = KernelService::start(vec![], event_tx).unwrap();
+
+        // Install a BGP route via KernelHandle — its Netlink echo must be filtered
+        let net = packet::Nlri::V4(packet::bgp::Ipv4Net {
+            addr: "10.20.0.0".parse().unwrap(),
+            mask: 24,
+        });
+        let nh = packet::bgp::Nexthop::V4("127.0.0.1".parse().unwrap());
+        handle.apply(KernelRouteChange {
+            net,
+            nexthops: vec![nh],
+        });
+
+        // Wait generously for the Netlink echo to be generated and processed
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Add a sentinel static route to confirm the event channel is working
+        ip(&[
+            "route",
+            "add",
+            "10.21.0.0/24",
+            "via",
+            "127.0.0.1",
+            "proto",
+            "static",
+        ]);
+
+        // Drain events until the sentinel; fail if the BGP echo appears first
+        let saw_echo = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(KernelEvent::Route(event)) = event_rx.recv().await else {
+                    break false;
+                };
+                let dst = match &event {
+                    KernelRouteEvent::Add(kr) | KernelRouteEvent::Delete(kr) => kr.dst,
+                };
+                if dst == "10.20.0.0".parse::<IpAddr>().unwrap() {
+                    break true; // echo leaked
+                }
+                if dst == "10.21.0.0".parse::<IpAddr>().unwrap() {
+                    break false; // sentinel arrived cleanly
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for sentinel event");
+
+        assert!(!saw_echo, "BGP-tagged route must not appear in event_rx");
+        ip(&["route", "del", "10.21.0.0/24"]);
+        drop(service);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_service_redistribute_filter() {
+        // Only accept Static; a custom protocol (100) must be filtered out
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<KernelEvent>();
+        let (service, _handle) = KernelService::start(vec![Protocol::Static], event_tx).unwrap();
+
+        ip(&[
+            "route",
+            "add",
+            "10.30.0.0/24",
+            "via",
+            "127.0.0.1",
+            "proto",
+            "100",
+        ]); // filtered
+        ip(&[
+            "route",
+            "add",
+            "10.31.0.0/24",
+            "via",
+            "127.0.0.1",
+            "proto",
+            "static",
+        ]); // sentinel
+
+        let saw_custom = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(KernelEvent::Route(event)) = event_rx.recv().await else {
+                    break false;
+                };
+                let dst = match &event {
+                    KernelRouteEvent::Add(kr) | KernelRouteEvent::Delete(kr) => kr.dst,
+                };
+                if dst == "10.30.0.0".parse::<IpAddr>().unwrap() {
+                    break true; // custom protocol leaked
+                }
+                if dst == "10.31.0.0".parse::<IpAddr>().unwrap() {
+                    break false; // sentinel arrived, custom was filtered
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for sentinel event");
+
+        assert!(!saw_custom, "non-redistribute protocol must be filtered");
+        ip(&["route", "del", "10.30.0.0/24"]);
+        ip(&["route", "del", "10.31.0.0/24"]);
+        drop(service);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_service_redistributes_all() {
+        // Empty redistribute list accepts all non-BGP protocols
+        let (service, _handle, mut event_rx) = make_service();
+
+        ip(&[
+            "route",
+            "add",
+            "10.40.0.0/24",
+            "via",
+            "127.0.0.1",
+            "proto",
+            "static",
+        ]);
+
+        let arrived = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(KernelEvent::Route(KernelRouteEvent::Add(kr)))
+                        if kr.dst == "10.40.0.0".parse::<IpAddr>().unwrap()
+                            && kr.prefix_len == 24 =>
+                    {
+                        break true;
+                    }
+                    None => break false,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(arrived, "static route should arrive on event_rx");
+        ip(&["route", "del", "10.40.0.0/24"]);
+        drop(service);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_service_drop_closes_channel() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<KernelEvent>();
+        let (service, _handle) = KernelService::start(vec![], event_tx).unwrap();
+        drop(service); // aborts the task, dropping event_tx inside run_service_loop
+        let result = tokio::time::timeout(Duration::from_millis(500), event_rx.recv()).await;
+        assert!(
+            matches!(result, Ok(None)),
+            "channel must close after KernelService is dropped"
+        );
     }
 }
