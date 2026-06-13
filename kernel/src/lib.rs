@@ -52,7 +52,7 @@ pub enum Error {
 
 /// A route change event from the kernel.
 #[derive(Debug, Clone)]
-pub enum RouteEvent {
+pub enum KernelRouteEvent {
     Add(KernelRoute),
     Delete(KernelRoute),
 }
@@ -84,7 +84,7 @@ impl Handle {
     /// Open a netlink connection with route monitoring.
     ///
     /// Subscribes to IPv4/IPv6 route multicast groups and returns a stream
-    /// of `RouteEvent`s for all route changes (including those made by other
+    /// of `KernelRouteEvent`s for all route changes (including those made by other
     /// processes).
     ///
     /// Typical startup sequence:
@@ -95,7 +95,7 @@ impl Handle {
         (
             Self,
             impl Future<Output = ()>,
-            impl futures::Stream<Item = RouteEvent>,
+            impl futures::Stream<Item = KernelRouteEvent>,
         ),
         Error,
     > {
@@ -321,13 +321,13 @@ impl Handle {
 
 fn parse_route_event(
     msg: rtnetlink::packet_core::NetlinkMessage<RouteNetlinkMessage>,
-) -> Option<RouteEvent> {
+) -> Option<KernelRouteEvent> {
     match msg.payload {
         NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route_msg)) => {
-            Handle::parse_route(&route_msg).map(RouteEvent::Add)
+            Handle::parse_route(&route_msg).map(KernelRouteEvent::Add)
         }
         NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRoute(route_msg)) => {
-            Handle::parse_route(&route_msg).map(RouteEvent::Delete)
+            Handle::parse_route(&route_msg).map(KernelRouteEvent::Delete)
         }
         _ => None,
     }
@@ -465,7 +465,7 @@ mod tests {
         // Receive the event with a timeout
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while let Some(event) = events.next().await {
-                if let RouteEvent::Add(ref kr) = event {
+                if let KernelRouteEvent::Add(ref kr) = event {
                     let expected: IpAddr = "192.168.99.0".parse().unwrap();
                     if kr.dst == expected && kr.prefix_len == 24 {
                         return event;
@@ -477,11 +477,11 @@ mod tests {
         .await
         .expect("timed out waiting for route event");
 
-        if let RouteEvent::Add(kr) = event {
+        if let KernelRouteEvent::Add(kr) = event {
             assert_eq!(kr.dst, "192.168.99.0".parse::<IpAddr>().unwrap());
             assert_eq!(kr.prefix_len, 24);
         } else {
-            panic!("expected RouteEvent::Add");
+            panic!("expected KernelRouteEvent::Add");
         }
 
         // Verify the static route is NOT in the BGP dump (different protocol)
@@ -512,7 +512,7 @@ mod tests {
         // Drain the Add event
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while let Some(event) = events.next().await {
-                if let RouteEvent::Add(ref kr) = event {
+                if let KernelRouteEvent::Add(ref kr) = event {
                     let expected: IpAddr = "192.168.100.0".parse().unwrap();
                     if kr.dst == expected {
                         return;
@@ -528,7 +528,7 @@ mod tests {
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while let Some(event) = events.next().await {
-                if let RouteEvent::Delete(ref kr) = event {
+                if let KernelRouteEvent::Delete(ref kr) = event {
                     let expected: IpAddr = "192.168.100.0".parse().unwrap();
                     if kr.dst == expected {
                         return event;
@@ -540,7 +540,7 @@ mod tests {
         .await
         .expect("timed out waiting for delete event");
 
-        assert!(matches!(event, RouteEvent::Delete(_)));
+        assert!(matches!(event, KernelRouteEvent::Delete(_)));
 
         drop(handle);
     }

@@ -721,30 +721,30 @@ fn nlri_family(nlri: &packet::Nlri) -> Family {
     }
 }
 
-/// Consume a stream of `kernel::RouteEvent`s and inject/withdraw routes into
+/// Consume a stream of `kernel::KernelRouteEvent`s and inject/withdraw routes into
 /// the BGP RIB.
 ///
 /// `redistribute` is the list of `kernel::Protocol` values to accept; events
 /// from other protocols are silently dropped.  Pass an empty list to accept all
 /// protocols.
 ///
-/// Accepts any `Stream<Item = kernel::RouteEvent>` so callers can substitute a
+/// Accepts any `Stream<Item = kernel::KernelRouteEvent>` so callers can substitute a
 /// mock channel in tests.
 pub(crate) async fn run_kernel_routes(
     tables: Arc<TableManager>,
-    mut rx: impl futures::Stream<Item = kernel::RouteEvent> + Unpin + Send,
+    mut rx: impl futures::Stream<Item = kernel::KernelRouteEvent> + Unpin + Send,
     redistribute: Vec<kernel::Protocol>,
 ) {
     use futures::StreamExt;
     while let Some(event) = rx.next().await {
         match event {
-            kernel::RouteEvent::Add(kr) => {
+            kernel::KernelRouteEvent::Add(kr) => {
                 if !redistribute.is_empty() && !redistribute.contains(&kr.protocol) {
                     continue;
                 }
                 tables.inject_kernel_route(kr).await;
             }
-            kernel::RouteEvent::Delete(kr) => {
+            kernel::KernelRouteEvent::Delete(kr) => {
                 if !redistribute.is_empty() && !redistribute.contains(&kr.protocol) {
                     continue;
                 }
@@ -1002,7 +1002,7 @@ mod tests {
         use futures::stream;
         let tables = make_tables();
         let kr = kr_v4("10.0.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
-        let events = stream::iter(vec![kernel::RouteEvent::Add(kr)]);
+        let events = stream::iter(vec![kernel::KernelRouteEvent::Add(kr)]);
         run_kernel_routes(tables.clone(), events, vec![]).await;
         let paths = tables
             .collect_paths(
@@ -1021,8 +1021,8 @@ mod tests {
         use futures::stream;
         let tables = make_tables();
         let kr = kr_v4("10.0.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
-        let add = kernel::RouteEvent::Add(kr.clone());
-        let del = kernel::RouteEvent::Delete(kr);
+        let add = kernel::KernelRouteEvent::Add(kr.clone());
+        let del = kernel::KernelRouteEvent::Delete(kr);
         let events = stream::iter(vec![add, del]);
         run_kernel_routes(tables.clone(), events, vec![]).await;
         let paths = tables
@@ -1044,8 +1044,8 @@ mod tests {
         let connected = kr_v4("10.1.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Kernel);
         let statik = kr_v4("10.2.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
         let events = stream::iter(vec![
-            kernel::RouteEvent::Add(connected),
-            kernel::RouteEvent::Add(statik),
+            kernel::KernelRouteEvent::Add(connected),
+            kernel::KernelRouteEvent::Add(statik),
         ]);
         // Only accept Static; Kernel/connected must be filtered out.
         run_kernel_routes(tables.clone(), events, vec![kernel::Protocol::Static]).await;
