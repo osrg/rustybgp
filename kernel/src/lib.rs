@@ -23,6 +23,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use rustybgp_packet as packet;
 
 use futures::StreamExt;
+#[cfg(test)]
 use futures::stream::TryStreamExt;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::route::RouteMessage;
@@ -86,7 +87,7 @@ pub struct KernelRoute {
     pub protocol: RouteProtocol,
 }
 
-pub struct Handle {
+struct Handle {
     inner: rtnetlink::Handle,
 }
 
@@ -95,7 +96,8 @@ impl Handle {
     ///
     /// The returned future must be spawned with `tokio::spawn` to drive the
     /// netlink socket I/O.
-    pub fn new() -> Result<(Self, impl Future<Output = ()>), Error> {
+    #[cfg(test)]
+    fn new() -> Result<(Self, impl Future<Output = ()>), Error> {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         Ok((Self { inner: handle }, connection))
     }
@@ -110,7 +112,7 @@ impl Handle {
     /// 1. Call `with_route_monitor()` to start listening (no events lost)
     /// 2. Call `dump_bgp_routes()` to get current state
     /// 3. Process events from the stream for ongoing changes
-    pub fn with_route_monitor() -> Result<
+    fn with_route_monitor() -> Result<
         (
             Self,
             impl Future<Output = ()>,
@@ -131,7 +133,7 @@ impl Handle {
     /// Both `dst` and `nexthop` must be the same address family.
     /// The route is tagged with `RTPROT_BGP` (186).
     /// Uses `NLM_F_CREATE | NLM_F_REPLACE` for atomic add-or-replace.
-    pub async fn install(
+    async fn install(
         &self,
         dst: IpAddr,
         prefix_len: u8,
@@ -150,7 +152,7 @@ impl Handle {
     /// Empty `nexthops` withdraws the route; one nexthop installs a
     /// single-path route; two or more nexthops install via `RTA_MULTIPATH`.
     /// MUP/VPN NLRIs and family mismatches are silently ignored.
-    pub async fn apply(&self, change: &KernelRouteChange) -> Result<(), Error> {
+    async fn apply(&self, change: &KernelRouteChange) -> Result<(), Error> {
         let (dst, prefix_len) = match change.net {
             packet::Nlri::V4(net) => (IpAddr::V4(net.addr), net.mask),
             packet::Nlri::V6(net) => (IpAddr::V6(net.addr), net.mask),
@@ -229,7 +231,7 @@ impl Handle {
     }
 
     /// Remove a BGP route from the kernel FIB.
-    pub async fn withdraw(&self, dst: IpAddr, prefix_len: u8) -> Result<(), Error> {
+    async fn withdraw(&self, dst: IpAddr, prefix_len: u8) -> Result<(), Error> {
         let msg = match dst {
             IpAddr::V4(addr) => RouteMessageBuilder::<Ipv4Addr>::new()
                 .destination_prefix(addr, prefix_len)
@@ -245,7 +247,8 @@ impl Handle {
     }
 
     /// Dump all routes tagged with `RTPROT_BGP` from the kernel.
-    pub async fn dump_bgp_routes(&self) -> Result<Vec<KernelRoute>, Error> {
+    #[cfg(test)]
+    async fn dump_bgp_routes(&self) -> Result<Vec<KernelRoute>, Error> {
         let mut routes = Vec::new();
 
         for family in [AddressFamily::Inet, AddressFamily::Inet6] {
