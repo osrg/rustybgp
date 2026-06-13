@@ -300,9 +300,22 @@ struct RibEntry {
 
 impl RibEntry {
     const FLAG_FILTERED: u8 = 1 << 0;
+    const FLAG_NEXTHOP_INVALID: u8 = 1 << 1;
 
     fn is_filtered(&self) -> bool {
         self.flags & RibEntry::FLAG_FILTERED != 0
+    }
+
+    fn is_nexthop_invalid(&self) -> bool {
+        self.flags & RibEntry::FLAG_NEXTHOP_INVALID != 0
+    }
+
+    fn set_nexthop_invalid(&mut self, invalid: bool) {
+        if invalid {
+            self.flags |= RibEntry::FLAG_NEXTHOP_INVALID;
+        } else {
+            self.flags &= !RibEntry::FLAG_NEXTHOP_INVALID;
+        }
     }
 
     fn originator_id(&self) -> u32 {
@@ -403,7 +416,9 @@ impl Destination {
     }
 
     fn unfiltered_iter(&self) -> impl Iterator<Item = &RibEntry> + '_ {
-        self.entry.iter().filter(|p| !p.is_filtered())
+        self.entry
+            .iter()
+            .filter(|p| !p.is_filtered() && !p.is_nexthop_invalid())
     }
 
     fn unfiltered_best(&self) -> Option<&RibEntry> {
@@ -1019,10 +1034,16 @@ impl Table {
         attr: Arc<Vec<packet::Attribute>>,
         original_attr: Option<Arc<Vec<packet::Attribute>>>,
         filtered: bool,
+        nexthop_invalid: bool,
         prefix_limit: Option<(u32, &Arc<AtomicU64>)>,
         timestamp: SystemTime,
     ) -> InsertResult {
-        let flags = if filtered { RibEntry::FLAG_FILTERED } else { 0 };
+        let flags = if filtered { RibEntry::FLAG_FILTERED } else { 0 }
+            | if nexthop_invalid {
+                RibEntry::FLAG_NEXTHOP_INVALID
+            } else {
+                0
+            };
 
         let rt = self.ribs.entry(family).or_default();
         let deferring = rt.deferring;
@@ -1168,6 +1189,28 @@ impl Table {
         self.collect_loc_rib_paths(&family)
     }
 
+    /// Returns the nexthop currently stored for the given (remote_addr, family, net, path_id).
+    /// Used by callers to look up the old nexthop before calling insert() so they can
+    /// unregister it from NHT tracking when the path is replaced.
+    pub fn lookup_nexthop(
+        &self,
+        remote_addr: IpAddr,
+        family: Family,
+        net: &packet::Nlri,
+        path_id: u32,
+    ) -> Option<bgp::Nexthop> {
+        self.ribs
+            .get(&family)?
+            .destinations
+            .get(net)?
+            .entry
+            .iter()
+            .find(|e| e.path.source.remote_addr == remote_addr && e.remote_path_id == path_id)
+            .and_then(|e| e.path.nexthop)
+    }
+
+    /// Returns the routing change (if any) and the nexthop of the removed path.
+    /// The nexthop is used by the caller to unregister NHT tracking.
     pub fn remove(
         &mut self,
         source: Arc<Source>,
@@ -1175,15 +1218,21 @@ impl Table {
         net: packet::Nlri,
         remote_id: u32,
         prefix_counter: Option<&Arc<AtomicU64>>,
-    ) -> Option<NlriChange> {
-        let rt = self.ribs.get_mut(&family)?;
-        let dst = rt.destinations.get_mut(&net)?;
+    ) -> (Option<NlriChange>, Option<bgp::Nexthop>) {
+        let Some(rt) = self.ribs.get_mut(&family) else {
+            return (None, None);
+        };
+        let Some(dst) = rt.destinations.get_mut(&net) else {
+            return (None, None);
+        };
         // Match by remote_addr + path_id, not by Arc identity.  This correctly
         // removes a stale path from a previous GR session (different Source Arc
         // but same peer) when the peer reconnects and sends a WITHDRAW.
-        let i = dst.entry.iter().position(|e| {
+        let Some(i) = dst.entry.iter().position(|e| {
             e.path.source.remote_addr == source.remote_addr && e.remote_path_id == remote_id
-        })?;
+        }) else {
+            return (None, None);
+        };
 
         // Capture (source, attr) Arc pointers before removal for best_changed detection.
         let old_best_key = dst
@@ -1191,7 +1240,9 @@ impl Table {
             .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
         let was_unfiltered = !dst.entry[i].is_filtered();
 
-        let removed_was_unfiltered = !dst.entry.remove(i).is_filtered();
+        let removed = dst.entry.remove(i);
+        let removed_nexthop = removed.path.nexthop;
+        let removed_was_unfiltered = !removed.is_filtered();
 
         // Decrement prefix counter if this peer has no more paths for this prefix.
         let peer_still_has_path = dst
@@ -1218,7 +1269,7 @@ impl Table {
 
         if dst.entry.is_empty() {
             rt.destinations.remove(&net);
-            return if was_unfiltered {
+            let change = if was_unfiltered {
                 Some(NlriChange {
                     family,
                     net,
@@ -1230,6 +1281,7 @@ impl Table {
             } else {
                 None
             };
+            return (change, removed_nexthop);
         }
 
         let new_best_key = dst
@@ -1239,23 +1291,28 @@ impl Table {
         let any_changed = was_unfiltered;
 
         if !best_changed && !any_changed {
-            return None;
+            return (None, removed_nexthop);
         }
 
         let current_paths = Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
 
-        Some(NlriChange {
-            family,
-            net,
-            best_changed,
-            any_changed,
-            replaced_path_id: None,
-            current_paths,
-        })
+        (
+            Some(NlriChange {
+                family,
+                net,
+                best_changed,
+                any_changed,
+                replaced_path_id: None,
+                current_paths,
+            }),
+            removed_nexthop,
+        )
     }
 
-    pub fn drop(&mut self, addr: IpAddr, family: Family) -> Vec<NlriChange> {
+    /// Returns routing changes and the nexthops of all removed paths (for NHT unregistration).
+    pub fn drop(&mut self, addr: IpAddr, family: Family) -> (Vec<NlriChange>, Vec<IpAddr>) {
         let mut changes = Vec::new();
+        let mut removed_nexthops: Vec<IpAddr> = Vec::new();
         if let Some(fm) = self.route_stats.get_mut(&addr) {
             fm.remove(&family);
             if fm.is_empty() {
@@ -1268,11 +1325,18 @@ impl Table {
                     return true;
                 }
                 let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
-                let removed_any_unfiltered = dst
-                    .entry
-                    .iter()
-                    .any(|e| e.path.source.remote_addr == addr && !e.is_filtered());
+                let removed_any_unfiltered = dst.entry.iter().any(|e| {
+                    e.path.source.remote_addr == addr && !e.is_filtered() && !e.is_nexthop_invalid()
+                });
 
+                // Collect nexthops before removing entries.
+                for e in dst.entry.iter() {
+                    if e.path.source.remote_addr == addr
+                        && let Some(nh) = e.path.nexthop
+                    {
+                        removed_nexthops.push(nh.addr());
+                    }
+                }
                 dst.entry.retain(|e| e.path.source.remote_addr != addr);
 
                 if !removed_any_unfiltered {
@@ -1292,13 +1356,8 @@ impl Table {
                 }
 
                 let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
-                let current_paths = Arc::new(
-                    dst.entry
-                        .iter()
-                        .filter(|e| !e.is_filtered())
-                        .map(|e| e.path.clone())
-                        .collect(),
-                );
+                let current_paths =
+                    Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
                 changes.push(NlriChange {
                     family,
                     net: net.clone(),
@@ -1310,20 +1369,24 @@ impl Table {
                 true
             });
         }
-        changes
+        (changes, removed_nexthops)
     }
 
     /// Remove only stale paths from `addr` in `family` and re-run best-path
     /// selection.  Used by GR helpers after EOR or deferral timer expiry, where
     /// the peer may have already sent fresh routes in the new session that must
     /// not be disturbed.
+    ///
+    /// Returns routing changes and the nexthops of all removed paths (for NHT
+    /// unregistration).
     pub fn drop_stale(
         &mut self,
         addr: IpAddr,
         family: Family,
         prefix_counter: Option<&Arc<AtomicU64>>,
-    ) -> Vec<NlriChange> {
+    ) -> (Vec<NlriChange>, Vec<IpAddr>) {
         let mut changes = Vec::new();
+        let mut removed_nexthops: Vec<IpAddr> = Vec::new();
         if let Some(rt) = self.ribs.get_mut(&family) {
             rt.destinations.retain(|net, dst| {
                 if !dst
@@ -1339,8 +1402,18 @@ impl Table {
                     e.path.source.remote_addr == addr
                         && e.path.source.is_stale()
                         && !e.is_filtered()
+                        && !e.is_nexthop_invalid()
                 });
 
+                // Collect nexthops before removing.
+                for e in dst.entry.iter() {
+                    if e.path.source.remote_addr == addr
+                        && e.path.source.is_stale()
+                        && let Some(nh) = e.path.nexthop
+                    {
+                        removed_nexthops.push(nh.addr());
+                    }
+                }
                 dst.entry
                     .retain(|e| !(e.path.source.remote_addr == addr && e.path.source.is_stale()));
 
@@ -1368,13 +1441,8 @@ impl Table {
                 }
 
                 let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
-                let current_paths = Arc::new(
-                    dst.entry
-                        .iter()
-                        .filter(|e| !e.is_filtered())
-                        .map(|e| e.path.clone())
-                        .collect(),
-                );
+                let current_paths =
+                    Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
                 changes.push(NlriChange {
                     family,
                     net: net.clone(),
@@ -1385,6 +1453,61 @@ impl Table {
                 });
                 true
             });
+        }
+        (changes, removed_nexthops)
+    }
+
+    /// Update the nexthop-invalid flag for all paths whose nexthop equals `addr`.
+    ///
+    /// When `reachable` is false, those paths are excluded from best-path
+    /// selection as if they were import-filtered.  When `reachable` is true,
+    /// the flag is cleared and they become eligible again.
+    ///
+    /// Returns one `NlriChange` per destination where the flag changed.
+    pub fn update_nexthop_validity(&mut self, addr: IpAddr, reachable: bool) -> Vec<NlriChange> {
+        let mut changes = Vec::new();
+        for (family, rt) in &mut self.ribs {
+            for (net, dst) in &mut rt.destinations {
+                // Phase 1: capture best before modification.
+                let old_best_key = dst
+                    .entry
+                    .iter()
+                    .find(|p| !p.is_filtered() && !p.is_nexthop_invalid())
+                    .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
+
+                // Phase 2: update flags for matching entries.
+                let mut any_changed = false;
+                for entry in &mut dst.entry {
+                    if entry.path.nexthop.map(|nh| nh.addr()) == Some(addr) {
+                        let now_invalid = !reachable;
+                        if entry.is_nexthop_invalid() != now_invalid {
+                            entry.set_nexthop_invalid(now_invalid);
+                            any_changed = true;
+                        }
+                    }
+                }
+                if !any_changed {
+                    continue;
+                }
+
+                // Phase 3: compute change after modification.
+                let new_best_key = dst
+                    .entry
+                    .iter()
+                    .find(|p| !p.is_filtered() && !p.is_nexthop_invalid())
+                    .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
+                let best_changed = old_best_key != new_best_key;
+                let current_paths =
+                    Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
+                changes.push(NlriChange {
+                    family: *family,
+                    net: net.clone(),
+                    best_changed,
+                    any_changed: true,
+                    replaced_path_id: None,
+                    current_paths,
+                });
+            }
         }
         changes
     }
@@ -1806,6 +1929,7 @@ mod tests {
             attrs.clone(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -1817,6 +1941,7 @@ mod tests {
             nh(),
             attrs.clone(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1830,6 +1955,7 @@ mod tests {
             attrs.clone(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -1841,6 +1967,7 @@ mod tests {
             nh(),
             attrs.clone(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1887,6 +2014,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -1908,6 +2036,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -1920,6 +2049,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1945,6 +2075,7 @@ mod tests {
             attrs_with_local_pref(100),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -1956,6 +2087,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(200),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -1982,6 +2114,7 @@ mod tests {
             attrs_with_as_path_len(3),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -1993,6 +2126,7 @@ mod tests {
             nh(),
             attrs_with_as_path_len(1),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2020,6 +2154,7 @@ mod tests {
             attrs_with_origin(2),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2032,6 +2167,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2059,6 +2195,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2071,6 +2208,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2098,6 +2236,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2110,6 +2249,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2154,6 +2294,7 @@ mod tests {
             attrs_with_cluster_list(&[1, 2]),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2166,6 +2307,7 @@ mod tests {
             nh(),
             attrs_with_cluster_list(&[1]),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2192,6 +2334,7 @@ mod tests {
             attrs_with_cluster_list(&[1]),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2204,6 +2347,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2240,6 +2384,7 @@ mod tests {
             },
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2262,6 +2407,7 @@ mod tests {
                 Arc::new(attrs)
             },
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2291,6 +2437,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2303,11 +2450,12 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
         // Remove best (router_id=1) → s2 promoted to best
-        let update = rt.remove(s1, Family::IPV4, net, 0, None);
+        let (update, _) = rt.remove(s1, Family::IPV4, net, 0, None);
         assert!(update.as_ref().unwrap().best_changed);
         let best = update.as_ref().unwrap().new_best().unwrap();
         assert_eq!(
@@ -2331,6 +2479,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2343,11 +2492,12 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
         // Remove non-best (router_id=2) → best unchanged, s1 still best
-        let update = rt.remove(s2, Family::IPV4, net, 0, None);
+        let (update, _) = rt.remove(s2, Family::IPV4, net, 0, None);
         assert!(!update.as_ref().unwrap().best_changed);
         assert!(update.as_ref().unwrap().any_changed);
         let best = update.as_ref().unwrap().new_best().unwrap();
@@ -2371,10 +2521,11 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
-        let update = rt.remove(s1, Family::IPV4, net, 0, None);
+        let (update, _) = rt.remove(s1, Family::IPV4, net, 0, None);
         // Withdrawal: best gone
         assert!(update.as_ref().unwrap().best_changed);
         assert!(update.as_ref().unwrap().new_best().is_none());
@@ -2396,6 +2547,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2414,6 +2566,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2438,6 +2591,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2451,6 +2605,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2467,6 +2622,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2492,6 +2648,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2504,6 +2661,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2518,6 +2676,7 @@ mod tests {
             attrs_with_local_pref(200),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2543,6 +2702,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2555,6 +2715,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2570,6 +2731,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2583,6 +2745,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2609,6 +2772,7 @@ mod tests {
             attrs_with_local_pref(200),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2620,6 +2784,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(100),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2634,6 +2799,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(50),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2665,6 +2831,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2678,6 +2845,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2693,6 +2861,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2705,6 +2874,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(50),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2730,6 +2900,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2759,6 +2930,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2772,6 +2944,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2806,6 +2979,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2817,6 +2991,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -2858,6 +3033,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2870,6 +3046,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -2881,6 +3058,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3219,6 +3397,7 @@ mod tests {
             attrs_with_local_pref(200),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3232,6 +3411,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(50),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3259,6 +3439,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3273,6 +3454,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3296,6 +3478,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3310,6 +3493,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3323,6 +3507,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3346,6 +3531,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3359,6 +3545,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3381,6 +3568,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3404,6 +3592,7 @@ mod tests {
             attrs_with_local_pref(100),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3417,6 +3606,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(100),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3432,11 +3622,12 @@ mod tests {
             attrs_with_local_pref(100),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
         // remove s2 (best) → s3 becomes new best
-        let update = rt.remove(s2, Family::IPV4, net, 0, None);
+        let (update, _) = rt.remove(s2, Family::IPV4, net, 0, None);
         assert!(update.as_ref().unwrap().best_changed);
         let best = update.as_ref().unwrap().new_best().unwrap();
         assert!(Arc::ptr_eq(&best.source, &s3));
@@ -3456,6 +3647,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3470,11 +3662,12 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
         // remove s2 → all filtered → withdrawal (best_changed=true, new_best=None)
-        let update = rt.remove(s2, Family::IPV4, net, 0, None);
+        let (update, _) = rt.remove(s2, Family::IPV4, net, 0, None);
         assert!(update.as_ref().unwrap().best_changed);
         assert!(update.as_ref().unwrap().new_best().is_none());
     }
@@ -3496,6 +3689,7 @@ mod tests {
             attrs.clone(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3509,6 +3703,7 @@ mod tests {
             nh(),
             attrs.clone(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3524,11 +3719,12 @@ mod tests {
             attrs.clone(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
         // drop s2 → s3 becomes new best
-        let changes = rt.drop(s2.remote_addr, Family::IPV4);
+        let (changes, _) = rt.drop(s2.remote_addr, Family::IPV4);
         assert_eq!(changes.len(), 1);
         assert!(changes[0].best_changed);
         let best = changes[0].new_best().unwrap();
@@ -3550,6 +3746,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3564,11 +3761,12 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
         // drop s1 (filtered) → no best change
-        let changes = rt.drop(s1.remote_addr, Family::IPV4);
+        let (changes, _) = rt.drop(s1.remote_addr, Family::IPV4);
         assert!(changes.is_empty());
     }
 
@@ -3589,6 +3787,7 @@ mod tests {
             attrs.clone(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3602,6 +3801,7 @@ mod tests {
             nh(),
             attrs.clone(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3638,6 +3838,7 @@ mod tests {
             attrs_with_local_pref(100),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3672,6 +3873,7 @@ mod tests {
             empty_attrs(),
             None,
             true,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3684,6 +3886,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3714,6 +3917,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3730,6 +3934,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3777,6 +3982,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3796,6 +4002,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(200),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3826,6 +4033,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3839,12 +4047,13 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
 
         // Remove s1 → s2 becomes new best; s1_id was the old best
-        let update = rt.remove(s1, Family::IPV4, net, 0, None);
+        let (update, _) = rt.remove(s1, Family::IPV4, net, 0, None);
         assert!(update.as_ref().unwrap().best_changed);
         // s1_id (1) is no longer in current_paths
         assert!(
@@ -3876,6 +4085,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3887,6 +4097,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3924,6 +4135,7 @@ mod tests {
             attrs_with_origin(0),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3954,6 +4166,7 @@ mod tests {
             attrs_with_origin(0),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -3969,6 +4182,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -3996,6 +4210,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4028,6 +4243,7 @@ mod tests {
             attrs_with_origin(0),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4040,12 +4256,13 @@ mod tests {
             attrs_with_origin(0),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
 
         stale_src.mark_stale();
-        let changes = rt.drop_stale(stale_src.remote_addr, Family::IPV4, None);
+        let (changes, _) = rt.drop_stale(stale_src.remote_addr, Family::IPV4, None);
 
         // The stale path is gone but the fresh one remains as rank=1.
         let best = flat_best(&rt, &Family::IPV4);
@@ -4072,6 +4289,7 @@ mod tests {
             attrs_with_origin(0),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4096,11 +4314,12 @@ mod tests {
             attrs_with_origin(0),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
 
-        let changes = rt.drop_stale(s.remote_addr, Family::IPV4, None);
+        let (changes, _) = rt.drop_stale(s.remote_addr, Family::IPV4, None);
         assert!(changes.is_empty());
         assert_eq!(flat_best(&rt, &Family::IPV4).len(), 1);
     }
@@ -4125,6 +4344,7 @@ mod tests {
             attrs_with_origin(0),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4136,6 +4356,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4188,6 +4409,7 @@ mod tests {
             attrs_with_origin(0),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4216,6 +4438,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4264,6 +4487,7 @@ mod tests {
             attrs_with_origin(0),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4277,7 +4501,7 @@ mod tests {
         );
 
         // Session 2 sends WITHDRAW (id=0) for the same prefix.
-        let update = rt.remove(s2, Family::IPV4, net, 0, None);
+        let (update, _) = rt.remove(s2, Family::IPV4, net, 0, None);
 
         // The stale path must be removed.
         assert!(
@@ -4308,6 +4532,7 @@ mod tests {
             attrs_with_origin(0),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4319,6 +4544,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4336,6 +4562,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4366,6 +4593,7 @@ mod tests {
             nh(),
             attrs_with_origin(0),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4405,6 +4633,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4442,6 +4671,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4472,6 +4702,7 @@ mod tests {
                 empty_attrs(),
                 None,
                 false,
+                false,
                 None,
                 SystemTime::UNIX_EPOCH,
             );
@@ -4486,6 +4717,7 @@ mod tests {
                 nh(),
                 empty_attrs(),
                 None,
+                false,
                 false,
                 None,
                 SystemTime::UNIX_EPOCH,
@@ -4532,6 +4764,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4561,6 +4794,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             pl,
             SystemTime::UNIX_EPOCH,
@@ -4595,6 +4829,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             Some((max, &counter)),
             SystemTime::UNIX_EPOCH,
         );
@@ -4609,6 +4844,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             Some((max, &counter)),
             SystemTime::UNIX_EPOCH,
@@ -4646,6 +4882,7 @@ mod tests {
                 empty_attrs(),
                 None,
                 false,
+                false,
                 Some((max, &counter)),
                 SystemTime::UNIX_EPOCH,
             );
@@ -4668,6 +4905,7 @@ mod tests {
             empty_attrs(),
             None,
             false,
+            false,
             Some((max, &counter)),
             SystemTime::UNIX_EPOCH,
         );
@@ -4687,6 +4925,7 @@ mod tests {
             nh(),
             empty_attrs(),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4749,6 +4988,7 @@ mod tests {
             attrs_with_local_pref(100),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4760,6 +5000,7 @@ mod tests {
             nh(),
             attrs_with_local_pref(200),
             None,
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -4934,6 +5175,7 @@ mod tests {
             empty_attrs(),
             None,
             true, // filtered = true
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -4997,6 +5239,7 @@ mod tests {
             post_policy.clone(),
             Some(original.clone()),
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -5035,6 +5278,7 @@ mod tests {
             attr.clone(),
             None,
             false,
+            false,
             None,
             SystemTime::UNIX_EPOCH,
         );
@@ -5069,6 +5313,7 @@ mod tests {
             nh(),
             post_policy,
             Some(original.clone()),
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,
@@ -5299,6 +5544,7 @@ mod tests {
             nh(),
             post_import.clone(),
             Some(original.clone()),
+            false,
             false,
             None,
             SystemTime::UNIX_EPOCH,

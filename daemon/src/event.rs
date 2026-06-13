@@ -4348,6 +4348,9 @@ impl Global {
                             Some(kernel::KernelEvent::Route(kernel::KernelRouteEvent::Delete(kr))) => {
                                 tables.withdraw_kernel_route(kr.dst, kr.prefix_len).await;
                             }
+                            Some(kernel::KernelEvent::NexthopUpdate { addr, reachable }) => {
+                                tables.update_nexthop_validity(addr, reachable).await;
+                            }
                             None => {}
                         }
                     }
@@ -8160,6 +8163,7 @@ mod tests {
                 attrs.clone(),
                 None,
                 false,
+                false,
                 None,
                 std::time::SystemTime::UNIX_EPOCH,
             );
@@ -8171,6 +8175,7 @@ mod tests {
                 Some(nh6),
                 attrs.clone(),
                 None,
+                false,
                 false,
                 None,
                 std::time::SystemTime::UNIX_EPOCH,
@@ -8225,6 +8230,7 @@ mod tests {
                 Some(nh4),
                 attrs,
                 None,
+                false,
                 false,
                 None,
                 std::time::SystemTime::UNIX_EPOCH,

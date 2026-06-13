@@ -27,7 +27,7 @@ use futures::StreamExt;
 use futures::stream::TryStreamExt;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::route::RouteMessage;
-use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteProtocol};
+use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteFlags, RouteProtocol};
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
 use rtnetlink::{MulticastGroup, RouteMessageBuilder, RouteNextHopBuilder};
 
@@ -267,6 +267,38 @@ impl Handle {
         Ok(routes)
     }
 
+    /// Query the kernel FIB for a non-BGP route to `addr`.
+    ///
+    /// Uses `RTM_F_FIB_MATCH` so the kernel returns the actual FIB entry with
+    /// its original protocol.  Returns `true` only when an IGP or kernel route
+    /// covers `addr`; BGP-learned routes are excluded to prevent circular
+    /// reachability (a BGP default route must not make BGP nexthops appear
+    /// reachable).
+    async fn lookup_route(&self, addr: IpAddr) -> bool {
+        match addr {
+            IpAddr::V4(v4) => {
+                let mut msg = RouteMessageBuilder::<Ipv4Addr>::new()
+                    .destination_prefix(v4, 32)
+                    .build();
+                msg.header.flags |= RouteFlags::FibMatch;
+                matches!(
+                    self.inner.route().get(msg).execute().next().await,
+                    Some(Ok(ref r)) if r.header.protocol != RouteProtocol::Bgp
+                )
+            }
+            IpAddr::V6(v6) => {
+                let mut msg = RouteMessageBuilder::<Ipv6Addr>::new()
+                    .destination_prefix(v6, 128)
+                    .build();
+                msg.header.flags |= RouteFlags::FibMatch;
+                matches!(
+                    self.inner.route().get(msg).execute().next().await,
+                    Some(Ok(ref r)) if r.header.protocol != RouteProtocol::Bgp
+                )
+            }
+        }
+    }
+
     async fn install_v4(
         &self,
         dst: Ipv4Addr,
@@ -344,10 +376,17 @@ impl Handle {
 /// An event delivered by [`KernelService`] to the daemon event loop.
 pub enum KernelEvent {
     Route(KernelRouteEvent),
+    /// Nexthop reachability change detected by nexthop tracking.
+    NexthopUpdate {
+        addr: IpAddr,
+        reachable: bool,
+    },
 }
 
 enum Request {
     Apply(KernelRouteChange),
+    RegisterNexthop(IpAddr),
+    UnregisterNexthop(IpAddr),
 }
 
 /// Shareable sender for submitting kernel FIB changes.
@@ -366,6 +405,26 @@ impl KernelHandle {
     /// [`KernelService`] task. Errors are logged there.
     pub fn apply(&self, change: KernelRouteChange) {
         let _ = self.tx.send(Request::Apply(change));
+    }
+
+    /// Register a nexthop address for reachability tracking.
+    ///
+    /// The service queries the kernel for the current reachability of `addr`
+    /// and emits an initial [`KernelEvent::NexthopUpdate`].  Subsequent route
+    /// changes that might affect `addr` trigger re-checks.  Multiple
+    /// registrations for the same address are reference-counted; call
+    /// [`unregister_nexthop`] once per [`register_nexthop`] call.
+    pub fn register_nexthop(&self, addr: IpAddr) {
+        let _ = self.tx.send(Request::RegisterNexthop(addr));
+    }
+
+    /// Release one registration for nexthop tracking.
+    ///
+    /// When the reference count reaches zero the address is no longer watched
+    /// and no further [`KernelEvent::NexthopUpdate`] events will be emitted
+    /// for it.
+    pub fn unregister_nexthop(&self, addr: IpAddr) {
+        let _ = self.tx.send(Request::UnregisterNexthop(addr));
     }
 }
 
@@ -419,7 +478,12 @@ async fn run_service_loop(
     event_tx: tokio::sync::mpsc::UnboundedSender<KernelEvent>,
     redistribute: Vec<Protocol>,
 ) {
+    use std::collections::HashMap;
     tokio::spawn(connection);
+    // nexthop addr -> reference count
+    let mut watched: HashMap<IpAddr, u32> = HashMap::new();
+    // last known reachability for each watched nexthop
+    let mut nexthop_state: HashMap<IpAddr, bool> = HashMap::new();
     loop {
         tokio::select! {
             event = route_events.next() => {
@@ -428,14 +492,21 @@ async fn run_service_loop(
                     KernelRouteEvent::Add(kr) | KernelRouteEvent::Delete(kr) => kr.protocol,
                 };
                 // Skip routes we installed ourselves to avoid processing our own echoes.
-                if protocol == RouteProtocol::Bgp {
-                    continue;
+                if protocol != RouteProtocol::Bgp {
+                    // Apply redistribution filter (empty list = accept all protocols).
+                    if redistribute.is_empty() || redistribute.contains(&protocol) {
+                        let _ = event_tx.send(KernelEvent::Route(event));
+                    }
                 }
-                // Apply redistribution filter (empty list = accept all protocols).
-                if !redistribute.is_empty() && !redistribute.contains(&protocol) {
-                    continue;
+                // Any route change may affect watched nexthop reachability.
+                let addrs: Vec<IpAddr> = watched.keys().copied().collect();
+                for addr in addrs {
+                    let reachable = handle.lookup_route(addr).await;
+                    if nexthop_state.get(&addr) != Some(&reachable) {
+                        nexthop_state.insert(addr, reachable);
+                        let _ = event_tx.send(KernelEvent::NexthopUpdate { addr, reachable });
+                    }
                 }
-                let _ = event_tx.send(KernelEvent::Route(event));
             }
             req = req_rx.recv() => {
                 let Some(req) = req else { break };
@@ -443,6 +514,28 @@ async fn run_service_loop(
                     Request::Apply(change) => {
                         if let Err(e) = handle.apply(&change).await {
                             log::error!("kernel route update failed: {}", e);
+                        }
+                    }
+                    Request::RegisterNexthop(addr) => {
+                        let count = watched.entry(addr).or_insert(0);
+                        *count += 1;
+                        if *count == 1 {
+                            // First registration: emit the current reachability state.
+                            let reachable = handle.lookup_route(addr).await;
+                            nexthop_state.insert(addr, reachable);
+                            let _ = event_tx.send(KernelEvent::NexthopUpdate { addr, reachable });
+                        }
+                    }
+                    Request::UnregisterNexthop(addr) => {
+                        if let std::collections::hash_map::Entry::Occupied(mut e) =
+                            watched.entry(addr)
+                        {
+                            if *e.get() <= 1 {
+                                e.remove();
+                                nexthop_state.remove(&addr);
+                            } else {
+                                *e.get_mut() -= 1;
+                            }
                         }
                     }
                 }
@@ -1012,6 +1105,226 @@ mod tests {
 
         assert!(arrived, "static route should arrive on event_rx");
         ip(&["route", "del", "10.40.0.0/24"]);
+        drop(service);
+    }
+
+    // --- NHT (nexthop tracking) integration tests ---
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_nht_loopback_reachable() {
+        // 127.0.0.1 is always reachable via the local route table.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<KernelEvent>();
+        let (service, handle) = KernelService::start(vec![], event_tx).unwrap();
+
+        handle.register_nexthop("127.0.0.1".parse().unwrap());
+
+        let reachable = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(KernelEvent::NexthopUpdate { addr, reachable })
+                        if addr == "127.0.0.1".parse::<IpAddr>().unwrap() =>
+                    {
+                        break reachable;
+                    }
+                    None => panic!("channel closed"),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for initial NexthopUpdate");
+
+        assert!(reachable, "127.0.0.1 should be reachable via local table");
+        drop(service);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_nht_unreachable_after_route_delete() {
+        // A nexthop is reachable via a static route; deleting that route
+        // must trigger NexthopUpdate { reachable: false }.
+        ip(&[
+            "route",
+            "add",
+            "10.60.0.0/24",
+            "via",
+            "127.0.0.1",
+            "proto",
+            "static",
+        ]);
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<KernelEvent>();
+        let (service, handle) = KernelService::start(vec![], event_tx).unwrap();
+
+        let nh: IpAddr = "10.60.0.1".parse().unwrap();
+        handle.register_nexthop(nh);
+
+        // Drain the initial reachability event.
+        let initially_reachable = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(KernelEvent::NexthopUpdate { addr, reachable }) if addr == nh => {
+                        break reachable;
+                    }
+                    None => panic!("channel closed"),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for initial NexthopUpdate");
+        assert!(
+            initially_reachable,
+            "10.60.0.1 should be reachable via 10.60.0.0/24"
+        );
+
+        // Remove the covering route; the service must detect the change.
+        ip(&["route", "del", "10.60.0.0/24"]);
+
+        let now_reachable = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(KernelEvent::NexthopUpdate { addr, reachable }) if addr == nh => {
+                        break reachable;
+                    }
+                    None => panic!("channel closed"),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for unreachable NexthopUpdate");
+        assert!(
+            !now_reachable,
+            "10.60.0.1 should become unreachable after route delete"
+        );
+
+        drop(service);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_nht_reachable_after_route_add() {
+        // Register a nexthop with no covering route (unreachable), then add
+        // a route and confirm NexthopUpdate { reachable: true } is emitted.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<KernelEvent>();
+        let (service, handle) = KernelService::start(vec![], event_tx).unwrap();
+
+        let nh: IpAddr = "10.61.0.1".parse().unwrap();
+        handle.register_nexthop(nh);
+
+        // Initial state: unreachable.
+        let initially_reachable = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(KernelEvent::NexthopUpdate { addr, reachable }) if addr == nh => {
+                        break reachable;
+                    }
+                    None => panic!("channel closed"),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for initial NexthopUpdate");
+        assert!(!initially_reachable, "10.61.0.1 should start unreachable");
+
+        // Add a route that covers the nexthop.
+        ip(&[
+            "route",
+            "add",
+            "10.61.0.0/24",
+            "via",
+            "127.0.0.1",
+            "proto",
+            "static",
+        ]);
+
+        let now_reachable = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(KernelEvent::NexthopUpdate { addr, reachable }) if addr == nh => {
+                        break reachable;
+                    }
+                    None => panic!("channel closed"),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for reachable NexthopUpdate");
+        assert!(
+            now_reachable,
+            "10.61.0.1 should become reachable after route add"
+        );
+
+        ip(&["route", "del", "10.61.0.0/24"]);
+        drop(service);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_nht_unregister_stops_tracking() {
+        // After unregistering, no further NexthopUpdate events must arrive
+        // even when a route to the nexthop changes.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<KernelEvent>();
+        let (service, handle) = KernelService::start(vec![], event_tx).unwrap();
+
+        let nh: IpAddr = "10.62.0.1".parse().unwrap();
+        handle.register_nexthop(nh);
+
+        // Drain the initial event.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(KernelEvent::NexthopUpdate { addr, .. }) if addr == nh => break,
+                    None => panic!("channel closed"),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for initial NexthopUpdate");
+
+        // Unregister: service must stop tracking this nexthop.
+        handle.unregister_nexthop(nh);
+
+        // Add a sentinel static route (different prefix) so the event loop
+        // processes at least one more route event after the unregister.
+        ip(&[
+            "route",
+            "add",
+            "10.62.1.0/24",
+            "via",
+            "127.0.0.1",
+            "proto",
+            "static",
+        ]);
+
+        // Drain events until the sentinel route event; fail if a NexthopUpdate
+        // for the unregistered nexthop arrives.
+        let saw_nht = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(KernelEvent::NexthopUpdate { addr, .. }) if addr == nh => {
+                        break true; // unexpected
+                    }
+                    Some(KernelEvent::Route(KernelRouteEvent::Add(ref kr)))
+                        if kr.dst == "10.62.1.0".parse::<IpAddr>().unwrap() =>
+                    {
+                        break false; // sentinel arrived cleanly
+                    }
+                    None => break false,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(!saw_nht, "NexthopUpdate must not arrive after unregister");
+        ip(&["route", "del", "10.62.1.0/24"]);
         drop(service);
     }
 

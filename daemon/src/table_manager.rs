@@ -12,7 +12,7 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
@@ -82,6 +82,9 @@ pub(crate) struct TableManager {
     pub(crate) kernel_handle: ArcSwapOption<kernel::KernelHandle>,
     pub(crate) import_policy: ArcSwapOption<table::PolicyAssignment>,
     pub(crate) export_policy: ArcSwapOption<table::PolicyAssignment>,
+    /// Set of nexthop addresses currently considered unreachable by NHT.
+    /// Written only from the event loop (serialized); read lock-free from any shard.
+    pub(crate) nexthop_invalid: ArcSwap<FnvHashSet<IpAddr>>,
     next_sub_id: std::sync::atomic::AtomicU64,
     subscribers: Mutex<FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>>,
     vrfs: Mutex<FnvHashMap<String, table::Vrf>>,
@@ -108,6 +111,7 @@ impl TableManager {
             kernel_handle: ArcSwapOption::const_empty(),
             import_policy: ArcSwapOption::const_empty(),
             export_policy: ArcSwapOption::const_empty(),
+            nexthop_invalid: ArcSwap::new(Arc::new(FnvHashSet::default())),
             next_sub_id: std::sync::atomic::AtomicU64::new(0),
             subscribers: Mutex::new(FnvHashMap::default()),
             vrfs: Mutex::new(FnvHashMap::default()),
@@ -232,6 +236,7 @@ impl TableManager {
     ) -> bool {
         let import_policy = self.import_policy.load_full();
         let kernel_handle = self.kernel_handle.load_full();
+        let nht_set = self.nexthop_invalid.load();
         let idx = self.dealer(&net.nlri);
         let mut t = self.shards[idx].lock().await;
         t.notify_adj_rib_in(
@@ -242,6 +247,9 @@ impl TableManager {
             nexthop,
             timestamp,
         );
+        let old_nh = t
+            .rtable
+            .lookup_nexthop(source.remote_addr, family, &net.nlri, net.path_id);
         let mut nh = nexthop;
         let original_attr = Arc::clone(&attr);
         let (filtered, post_policy_attr) = crate::policy::apply_import(
@@ -251,9 +259,10 @@ impl TableManager {
             &attr,
             &mut nh,
         );
+        let nexthop_invalid_flag = nh.is_some_and(|n| nht_set.contains(&n.addr()));
         let pl = prefix_limit.as_ref().map(|(max, counter)| (*max, counter));
         match t.rtable.insert(
-            source,
+            source.clone(),
             family,
             net.nlri,
             net.path_id,
@@ -261,14 +270,18 @@ impl TableManager {
             post_policy_attr,
             Some(original_attr),
             filtered,
+            nexthop_invalid_flag,
             pl,
             timestamp,
         ) {
             table::InsertResult::PrefixLimitExceeded => return true,
             table::InsertResult::Changed(update) => {
+                nht_register(kernel_handle.as_deref(), &source, nh, old_nh);
                 t.distribute_update(update, kernel_handle.as_deref());
             }
-            table::InsertResult::NoChange => {}
+            table::InsertResult::NoChange => {
+                nht_register(kernel_handle.as_deref(), &source, nh, old_nh);
+            }
         }
         false
     }
@@ -294,11 +307,18 @@ impl TableManager {
             timestamp,
         );
         let counter_ref = prefix_counter.as_ref();
-        if let Some(update) = t
-            .rtable
-            .remove(source, family, net.nlri, net.path_id, counter_ref)
-        {
+        let (change, old_nh) =
+            t.rtable
+                .remove(source.clone(), family, net.nlri, net.path_id, counter_ref);
+        if let Some(update) = change {
             t.distribute_update(update, kernel_handle.as_deref());
+        }
+        if let Some(nh) = old_nh
+            && !source.is_kernel()
+            && !source.is_local()
+            && let Some(handle) = kernel_handle.as_deref()
+        {
+            handle.unregister_nexthop(nh.addr());
         }
     }
 
@@ -307,9 +327,15 @@ impl TableManager {
     pub(crate) async fn soft_reset_in(&self, peer: IpAddr) {
         let import_policy = self.import_policy.load_full();
         let kernel_handle = self.kernel_handle.load_full();
+        let nht_set = self.nexthop_invalid.load_full();
         for shard in &self.shards {
             let mut t = shard.lock().await;
-            t.soft_reset_in(peer, import_policy.as_deref(), kernel_handle.as_deref());
+            t.soft_reset_in(
+                peer,
+                import_policy.as_deref(),
+                kernel_handle.as_deref(),
+                &nht_set,
+            );
         }
     }
 
@@ -616,6 +642,31 @@ impl TableManager {
         }
     }
 
+    /// Update the reachability state of a nexthop address received from NHT.
+    ///
+    /// Updates the `nexthop_invalid` ArcSwap set so that newly inserted paths
+    /// see the current reachability, then walks all shards to flip
+    /// `FLAG_NEXTHOP_INVALID` on affected paths and distribute routing changes.
+    pub(crate) async fn update_nexthop_validity(&self, addr: IpAddr, reachable: bool) {
+        // Update the ArcSwap set.  Loads/swaps are serialized through the event loop.
+        let current = self.nexthop_invalid.load_full();
+        let mut new_set = (*current).clone();
+        if reachable {
+            new_set.remove(&addr);
+        } else {
+            new_set.insert(addr);
+        }
+        self.nexthop_invalid.store(Arc::new(new_set));
+
+        let kernel_handle = self.kernel_handle.load_full();
+        for shard in &self.shards {
+            let mut t = shard.lock().await;
+            for change in t.rtable.update_nexthop_validity(addr, reachable) {
+                t.distribute_update(change, kernel_handle.as_deref());
+            }
+        }
+    }
+
     /// Inject a kernel-redistributed route into the BGP RIB.
     pub(crate) async fn inject_kernel_route(&self, kr: kernel::KernelRoute) {
         let Some((family, net, nexthop, attr)) = kernel_route_to_path(&kr) else {
@@ -721,6 +772,31 @@ fn nlri_family(nlri: &packet::Nlri) -> Family {
     }
 }
 
+/// Register the new nexthop and unregister the old one for NHT tracking.
+///
+/// Called after every path insert (Changed or NoChange) for paths from
+/// non-kernel, non-local sources.  When `new_nh == old_nh` the register and
+/// unregister calls cancel out via the kernel service's reference counter.
+fn nht_register(
+    kernel_handle: Option<&kernel::KernelHandle>,
+    source: &table::Source,
+    new_nh: Option<bgp::Nexthop>,
+    old_nh: Option<bgp::Nexthop>,
+) {
+    if source.is_kernel() || source.is_local() {
+        return;
+    }
+    let Some(handle) = kernel_handle else {
+        return;
+    };
+    if let Some(nh) = new_nh {
+        handle.register_nexthop(nh.addr());
+    }
+    if let Some(nh) = old_nh {
+        handle.unregister_nexthop(nh.addr());
+    }
+}
+
 pub(crate) struct TableShard {
     pub(crate) rtable: table::Table,
     pub(crate) peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
@@ -739,8 +815,14 @@ impl TableShard {
         family: Family,
         kernel_handle: Option<&kernel::KernelHandle>,
     ) {
-        for change in self.rtable.drop(addr, family) {
+        let (changes, nexthops) = self.rtable.drop(addr, family);
+        for change in changes {
             self.distribute_update(change, kernel_handle);
+        }
+        if let Some(handle) = kernel_handle {
+            for nh in nexthops {
+                handle.unregister_nexthop(nh);
+            }
         }
     }
 
@@ -824,13 +906,31 @@ impl TableShard {
         peer: std::net::IpAddr,
         import_policy: Option<&table::PolicyAssignment>,
         kernel_handle: Option<&kernel::KernelHandle>,
+        nexthop_invalid: &FnvHashSet<IpAddr>,
     ) {
         let paths = self.rtable.collect_adj_in_paths(peer);
         for (family, net, remote_path_id, mut nh, source, original_attr, timestamp) in paths {
+            let old_nh =
+                self.rtable
+                    .lookup_nexthop(source.remote_addr, family, &net, remote_path_id);
             let (filtered, post_policy_attr) =
                 crate::policy::apply_import(import_policy, &source, &net, &original_attr, &mut nh);
-            if let table::InsertResult::Changed(update) = self.rtable.insert(
-                source,
+            let nexthop_invalid_flag = nh.is_some_and(|n| nexthop_invalid.contains(&n.addr()));
+            // Propagate policy-induced nexthop change into NHT tracking.
+            if !source.is_kernel()
+                && !source.is_local()
+                && old_nh.map(|o| o.addr()) != nh.map(|n| n.addr())
+                && let Some(handle) = kernel_handle
+            {
+                if let Some(new_nh) = nh {
+                    handle.register_nexthop(new_nh.addr());
+                }
+                if let Some(old) = old_nh {
+                    handle.unregister_nexthop(old.addr());
+                }
+            }
+            match self.rtable.insert(
+                source.clone(),
                 family,
                 net,
                 remote_path_id,
@@ -838,10 +938,14 @@ impl TableShard {
                 post_policy_attr,
                 Some(original_attr),
                 filtered,
+                nexthop_invalid_flag,
                 None,
                 timestamp,
             ) {
-                self.distribute_update(update, kernel_handle);
+                table::InsertResult::Changed(update) => {
+                    self.distribute_update(update, kernel_handle);
+                }
+                table::InsertResult::NoChange | table::InsertResult::PrefixLimitExceeded => {}
             }
         }
     }
@@ -852,8 +956,14 @@ impl TableShard {
         family: Family,
         kernel_handle: Option<&kernel::KernelHandle>,
     ) {
-        for change in self.rtable.drop_stale(addr, family, None) {
+        let (changes, nexthops) = self.rtable.drop_stale(addr, family, None);
+        for change in changes {
             self.distribute_update(change, kernel_handle);
+        }
+        if let Some(handle) = kernel_handle {
+            for nh in nexthops {
+                handle.unregister_nexthop(nh);
+            }
         }
     }
 
@@ -998,5 +1108,103 @@ mod tests {
             )
             .await;
         assert_eq!(paths.len(), 0);
+    }
+
+    // --- NHT (Nexthop Tracking) tests ---
+
+    fn make_peer_source(remote: &str, local: &str, remote_asn: u32) -> Arc<table::Source> {
+        Arc::new(table::Source::new(
+            remote.parse().unwrap(),
+            local.parse().unwrap(),
+            remote_asn,
+            65001,
+            remote.parse().unwrap(),
+            false,
+            false,
+        ))
+    }
+
+    async fn insert_v4_route(
+        tables: &TableManager,
+        source: Arc<table::Source>,
+        prefix: &str,
+        nexthop: &str,
+    ) {
+        let nlri: packet::Nlri = prefix.parse().unwrap();
+        let net = packet::PathNlri::new(nlri);
+        let nh: std::net::Ipv4Addr = nexthop.parse().unwrap();
+        tables
+            .insert_route(
+                source,
+                Family::IPV4,
+                net,
+                Some(packet::bgp::Nexthop::V4(nh)),
+                Arc::new(vec![]),
+                None,
+                std::time::SystemTime::UNIX_EPOCH,
+            )
+            .await;
+    }
+
+    fn loc_rib_len(tables: &TableManager, shard: usize, family: Family) -> usize {
+        // SAFETY: called in a synchronous context after all async inserts complete.
+        // We use try_lock() to avoid blocking; the test controls concurrency.
+        tables.shards[shard]
+            .try_lock()
+            .expect("shard locked unexpectedly")
+            .rtable
+            .collect_loc_rib_paths(&family)
+            .len()
+    }
+
+    #[tokio::test]
+    async fn nht_invalid_nexthop_excluded_from_best() {
+        let tables = make_tables();
+        let src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
+        insert_v4_route(&tables, src, "192.168.1.0/24", "10.0.0.2").await;
+
+        assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 1);
+
+        tables
+            .update_nexthop_validity("10.0.0.2".parse().unwrap(), false)
+            .await;
+
+        // Nexthop is now invalid: path must be excluded from loc-RIB.
+        assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 0);
+    }
+
+    #[tokio::test]
+    async fn nht_valid_nexthop_restored() {
+        let tables = make_tables();
+        let src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
+        insert_v4_route(&tables, src, "192.168.1.0/24", "10.0.0.2").await;
+
+        tables
+            .update_nexthop_validity("10.0.0.2".parse().unwrap(), false)
+            .await;
+        assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 0);
+
+        // Nexthop becomes reachable again: path must be restored to loc-RIB.
+        tables
+            .update_nexthop_validity("10.0.0.2".parse().unwrap(), true)
+            .await;
+        assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 1);
+    }
+
+    #[tokio::test]
+    async fn nht_new_path_with_already_invalid_nexthop() {
+        let tables = make_tables();
+
+        // Mark the nexthop unreachable BEFORE the path arrives.
+        tables
+            .update_nexthop_validity("10.0.0.2".parse().unwrap(), false)
+            .await;
+
+        let src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
+        insert_v4_route(&tables, src, "192.168.1.0/24", "10.0.0.2").await;
+
+        // The path must not appear in loc-RIB: the ArcSwap set was checked
+        // at insertion time and nexthop_invalid_flag was set.
+        assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 0);
     }
 }
