@@ -86,7 +86,7 @@ pub(crate) struct TableManager {
     pub(crate) export_policy: ArcSwapOption<table::PolicyAssignment>,
     /// Set of nexthop addresses currently considered unreachable by NHT.
     /// Written only from the event loop (serialized); read lock-free from any shard.
-    pub(crate) nexthop_invalid: ArcSwap<FnvHashSet<IpAddr>>,
+    nexthop_invalid: ArcSwap<FnvHashSet<IpAddr>>,
     next_sub_id: std::sync::atomic::AtomicU64,
     subscribers: Mutex<FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>>,
     vrfs: SharedVrfs,
@@ -748,7 +748,7 @@ impl TableManager {
 ///
 /// Returns `None` when the route has no usable nexthop or the family cannot
 /// be determined (e.g. MUP/VPN NLRIs).
-pub(crate) fn kernel_route_to_path(
+fn kernel_route_to_path(
     kr: &kernel::KernelRoute,
 ) -> Option<(
     Family,
@@ -868,18 +868,18 @@ fn nht_register(
 
 pub(crate) struct TableShard {
     pub(crate) rtable: table::Table,
-    pub(crate) peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
-    pub(crate) subscribers: FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>,
+    peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
+    subscribers: FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>,
     pub(crate) addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
     vrfs: SharedVrfs,
 }
 
 impl TableShard {
-    pub(crate) fn has_addpath(&self, addr: &IpAddr, family: &Family) -> bool {
+    fn has_addpath(&self, addr: &IpAddr, family: &Family) -> bool {
         self.addpath.get(addr).is_some_and(|e| e.contains(family))
     }
 
-    pub(crate) fn disconnected(
+    fn disconnected(
         &mut self,
         addr: IpAddr,
         family: Family,
@@ -896,7 +896,7 @@ impl TableShard {
         }
     }
 
-    pub(crate) fn mark_stale(
+    fn mark_stale(
         &mut self,
         addr: IpAddr,
         family: Family,
@@ -907,7 +907,7 @@ impl TableShard {
         }
     }
 
-    pub(crate) fn notify_adj_rib_in(
+    fn notify_adj_rib_in(
         &self,
         source: Arc<table::Source>,
         family: Family,
@@ -1008,7 +1008,7 @@ impl TableShard {
     ///
     /// Stale paths (GR helper mode) are skipped; see
     /// [`table::Table::collect_adj_in_paths`] for the rationale.
-    pub(crate) fn soft_reset_in(
+    fn soft_reset_in(
         &mut self,
         peer: std::net::IpAddr,
         import_policy: Option<&table::PolicyAssignment>,
@@ -1057,7 +1057,7 @@ impl TableShard {
         }
     }
 
-    pub(crate) fn drop_stale(
+    fn drop_stale(
         &mut self,
         addr: IpAddr,
         family: Family,
@@ -1074,11 +1074,7 @@ impl TableShard {
         }
     }
 
-    pub(crate) fn end_deferral(
-        &mut self,
-        family: Family,
-        kernel_handle: Option<&kernel::KernelHandle>,
-    ) {
+    fn end_deferral(&mut self, family: Family, kernel_handle: Option<&kernel::KernelHandle>) {
         for change in self.rtable.end_deferral(family) {
             self.distribute_update(change, kernel_handle);
         }

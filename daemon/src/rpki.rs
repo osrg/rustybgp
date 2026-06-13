@@ -33,7 +33,7 @@ pub(crate) struct RpkiState {
     pub(crate) uptime: AtomicU64,
     pub(crate) downtime: AtomicU64,
     pub(crate) up: AtomicBool,
-    pub(crate) session_id: AtomicU16,
+    session_id: AtomicU16,
     pub(crate) serial: AtomicU32,
     pub(crate) received_ipv4: AtomicI64,
     pub(crate) received_ipv6: AtomicI64,
@@ -47,7 +47,7 @@ pub(crate) struct RpkiState {
 }
 
 impl RpkiState {
-    pub(crate) fn update(&self, msg: &rpki::Message) {
+    fn update(&self, msg: &rpki::Message) {
         match msg {
             rpki::Message::SerialNotify { .. } => {
                 self.serial_notify.fetch_add(1, Ordering::Relaxed);

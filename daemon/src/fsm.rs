@@ -151,7 +151,7 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(
+    fn new(
         local_asn: u32,
         local_router_id: u32,
         local_cap: Vec<Capability>,
@@ -176,12 +176,12 @@ impl Connection {
         }
     }
 
-    pub(crate) fn state(&self) -> State {
+    fn state(&self) -> State {
         self.state
     }
 
     #[cfg(test)]
-    pub(crate) fn negotiated_holdtime(&self) -> u64 {
+    fn negotiated_holdtime(&self) -> u64 {
         self.negotiated_holdtime
     }
 
@@ -189,12 +189,12 @@ impl Connection {
         &self.send_max
     }
 
-    pub(crate) fn remote_id(&self) -> u32 {
+    fn remote_id(&self) -> u32 {
         self.remote_id
     }
 
     /// Process an input event and return actions for the I/O driver.
-    pub(crate) fn process(&mut self, input: Input) -> Vec<Output> {
+    fn process(&mut self, input: Input) -> Vec<Output> {
         match input {
             Input::Connected(_) => self.on_connected(),
             Input::MessageReceived(msg) => self.on_message(msg),
@@ -469,7 +469,7 @@ impl PeerFsm {
     }
 
     /// Close a connection, removing it from its slot.
-    pub(crate) fn close_connection(&mut self, role: Role) {
+    fn close_connection(&mut self, role: Role) {
         match role {
             Role::Active => self.active = None,
             Role::Passive => self.passive = None,
@@ -492,7 +492,7 @@ impl PeerFsm {
     }
 
     /// Mutable reference to the Connection for the given role.
-    pub(crate) fn connection_mut(&mut self, role: Role) -> Option<&mut Connection> {
+    fn connection_mut(&mut self, role: Role) -> Option<&mut Connection> {
         match role {
             Role::Active => self.active.as_mut(),
             Role::Passive => self.passive.as_mut(),

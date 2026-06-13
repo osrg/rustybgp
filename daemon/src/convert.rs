@@ -199,7 +199,7 @@ pub(crate) fn rt_from_api(rt: &api::RouteTarget) -> Result<[u8; 8], Error> {
 }
 
 /// Convert an 8-byte RT wire value back to `api::RouteTarget`.
-pub(crate) fn rt_to_api(rt: &[u8; 8]) -> api::RouteTarget {
+fn rt_to_api(rt: &[u8; 8]) -> api::RouteTarget {
     use api::route_target::Rt;
     let rt_val = match rt[0] {
         0x00 => Rt::TwoOctetAsSpecific(api::TwoOctetAsSpecificExtended {
@@ -234,7 +234,7 @@ pub(crate) fn vrf_to_api(vrf: &rustybgp_table::Vrf) -> api::Vrf {
     }
 }
 
-pub(crate) fn rd_to_api(rd: &RouteDistinguisher) -> api::RouteDistinguisher {
+fn rd_to_api(rd: &RouteDistinguisher) -> api::RouteDistinguisher {
     let v = match *rd {
         RouteDistinguisher::TwoOctetAs { admin, assigned } => {
             api::route_distinguisher::Rd::TwoOctetAsn(api::RouteDistinguisherTwoOctetAsn {
@@ -997,7 +997,7 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
     }
 }
 
-pub(crate) fn prefix_sid_to_api(sid: &prefix_sid::PrefixSid) -> api::PrefixSid {
+fn prefix_sid_to_api(sid: &prefix_sid::PrefixSid) -> api::PrefixSid {
     let tlvs = sid
         .tlvs
         .iter()
@@ -1075,7 +1075,7 @@ fn srv6_service_sub_sub_tlvs_to_api(
     map
 }
 
-pub(crate) fn prefix_sid_from_api(p: api::PrefixSid) -> Result<prefix_sid::PrefixSid, Error> {
+fn prefix_sid_from_api(p: api::PrefixSid) -> Result<prefix_sid::PrefixSid, Error> {
     let mut tlvs = Vec::with_capacity(p.tlvs.len());
     for tlv in p.tlvs {
         let inner = tlv
@@ -2034,7 +2034,7 @@ pub(crate) fn roa_to_api(net: &IpNet, roa: &rustybgp_table::Roa) -> api::Roa {
     }
 }
 
-pub(crate) fn rpki_validation_to_api(v: rustybgp_table::RpkiValidation) -> api::Validation {
+fn rpki_validation_to_api(v: rustybgp_table::RpkiValidation) -> api::Validation {
     let mut result = api::Validation {
         state: match v.state {
             rustybgp_table::RpkiValidationState::NotFound => api::ValidationState::NotFound as i32,
@@ -2207,9 +2207,7 @@ fn bgp_defined_sets_to_api(sets: &config::BgpDefinedSets) -> Result<Vec<api::Def
     Ok(v)
 }
 
-pub(crate) fn defined_sets_to_api(
-    sets: &config::DefinedSets,
-) -> Result<Vec<api::DefinedSet>, Error> {
+fn defined_sets_to_api(sets: &config::DefinedSets) -> Result<Vec<api::DefinedSet>, Error> {
     let mut v = Vec::new();
     if let Some(sets) = &sets.prefix_sets {
         for s in sets {
@@ -2555,7 +2553,7 @@ fn actions_from_config(a: &config::Actions) -> Result<api::Actions, Error> {
     })
 }
 
-pub(crate) fn statement_from_config(s: &config::Statement) -> Result<api::Statement, Error> {
+fn statement_from_config(s: &config::Statement) -> Result<api::Statement, Error> {
     let u = Uuid::new_v4().to_string();
     let name = match s.name.as_ref() {
         Some(n) => n.to_string(),
