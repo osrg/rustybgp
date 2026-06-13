@@ -1483,11 +1483,28 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    // Returns true when the error is EOPNOTSUPP (-95), which means the vrf
+    // kernel module is not loaded in this environment.
+    fn is_vrf_unsupported(e: &Error) -> bool {
+        if let Error::Rtnetlink(rtnetlink::Error::NetlinkError(msg)) = e {
+            msg.code.map(|c| c.get()) == Some(-95)
+        } else {
+            false
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires network namespace"]
     async fn test_create_and_delete_vrf() {
         let handle = new_handle().await;
-        handle.create_vrf("testvrf", 100).await.unwrap();
+        match handle.create_vrf("testvrf", 100).await {
+            Ok(()) => {}
+            Err(ref e) if is_vrf_unsupported(e) => {
+                eprintln!("SKIP: vrf kernel module not available");
+                return;
+            }
+            Err(e) => panic!("create_vrf failed: {e}"),
+        }
 
         // Verify device exists as a VRF type.
         let out = ip_output(&["link", "show", "type", "vrf"]);
@@ -1506,7 +1523,14 @@ mod tests {
     #[ignore = "requires network namespace"]
     async fn test_vrf_route_install_and_withdraw() {
         let handle = new_handle().await;
-        handle.create_vrf("vrf-red", 200).await.unwrap();
+        match handle.create_vrf("vrf-red", 200).await {
+            Ok(()) => {}
+            Err(ref e) if is_vrf_unsupported(e) => {
+                eprintln!("SKIP: vrf kernel module not available");
+                return;
+            }
+            Err(e) => panic!("create_vrf failed: {e}"),
+        }
 
         let net = packet::Nlri::V4(packet::bgp::Ipv4Net {
             addr: "10.99.0.0".parse().unwrap(),
