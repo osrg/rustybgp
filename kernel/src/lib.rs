@@ -1,3 +1,22 @@
+//! Kernel FIB integration via Linux Netlink.
+//!
+//! # Types
+//!
+//! Three types cover the two traffic directions:
+//!
+//! **Kernel → BGP (notification)**
+//! - [`KernelRouteEvent`] — async route-change notification produced by the
+//!   Netlink multicast subscription in [`Handle::with_route_monitor`].
+//!   Delivered spontaneously whenever any process changes the kernel FIB.
+//! - [`KernelRoute`] — a single route entry carried inside a
+//!   [`KernelRouteEvent`], also returned by point queries such as
+//!   `RTM_GETROUTE` (used by nexthop tracking).
+//!
+//! **BGP → Kernel (command)**
+//! - [`KernelRouteChange`] — instruction to install or withdraw a BGP route,
+//!   consumed by [`Handle::apply`].  Empty `nexthops` means withdraw;
+//!   multiple nexthops install via `RTA_MULTIPATH` (ECMP).
+
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
