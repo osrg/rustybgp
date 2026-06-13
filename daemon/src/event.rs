@@ -4351,6 +4351,9 @@ impl Global {
                             Some(kernel::KernelEvent::NexthopUpdate { addr, reachable }) => {
                                 tables.update_nexthop_validity(addr, reachable).await;
                             }
+                            Some(kernel::KernelEvent::Address(addr_event)) => {
+                                tables.handle_address_event(addr_event).await;
+                            }
                             None => {}
                         }
                     }

@@ -26,6 +26,7 @@ use futures::StreamExt;
 #[cfg(test)]
 use futures::stream::TryStreamExt;
 use rtnetlink::packet_core::NetlinkPayload;
+use rtnetlink::packet_route::address::{AddressAttribute, AddressMessage};
 use rtnetlink::packet_route::route::RouteMessage;
 use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteFlags, RouteProtocol};
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
@@ -123,15 +124,17 @@ impl Handle {
         (
             Self,
             impl Future<Output = ()>,
-            impl futures::Stream<Item = KernelRouteEvent>,
+            impl futures::Stream<Item = KernelEvent>,
         ),
         Error,
     > {
         let (connection, handle, messages) = rtnetlink::new_multicast_connection(&[
             MulticastGroup::Ipv4Route,
             MulticastGroup::Ipv6Route,
+            MulticastGroup::Ipv4Ifaddr,
+            MulticastGroup::Ipv6Ifaddr,
         ])?;
-        let stream = messages.filter_map(|(msg, _)| std::future::ready(parse_route_event(msg)));
+        let stream = messages.filter_map(|(msg, _)| std::future::ready(parse_netlink_event(msg)));
         Ok((Self { inner: handle }, connection, stream))
     }
 
@@ -460,6 +463,21 @@ impl Handle {
     }
 }
 
+/// Interface address received from the kernel.
+#[derive(Debug, Clone)]
+pub struct KernelAddress {
+    pub ifindex: u32,
+    pub addr: IpAddr,
+    pub prefix_len: u8,
+}
+
+/// An interface address change event.
+#[derive(Debug, Clone)]
+pub enum KernelAddressEvent {
+    Add(KernelAddress),
+    Delete(KernelAddress),
+}
+
 /// An event delivered by [`KernelService`] to the daemon event loop.
 pub enum KernelEvent {
     Route(KernelRouteEvent),
@@ -468,6 +486,8 @@ pub enum KernelEvent {
         addr: IpAddr,
         reachable: bool,
     },
+    /// Interface address added or removed.
+    Address(KernelAddressEvent),
 }
 
 enum Request {
@@ -558,12 +578,12 @@ impl KernelService {
         redistribute: Vec<Protocol>,
         event_tx: tokio::sync::mpsc::UnboundedSender<KernelEvent>,
     ) -> Result<(Self, KernelHandle), Error> {
-        let (handle, connection, route_events) = Handle::with_route_monitor()?;
+        let (handle, connection, events) = Handle::with_route_monitor()?;
         let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(run_service_loop(
             handle,
             connection,
-            route_events,
+            events,
             req_rx,
             event_tx,
             redistribute,
@@ -581,7 +601,7 @@ impl Drop for KernelService {
 async fn run_service_loop(
     handle: Handle,
     connection: impl Future<Output = ()> + Send + 'static,
-    mut route_events: impl futures::Stream<Item = KernelRouteEvent> + Unpin + Send,
+    mut events: impl futures::Stream<Item = KernelEvent> + Unpin + Send,
     mut req_rx: tokio::sync::mpsc::UnboundedReceiver<Request>,
     event_tx: tokio::sync::mpsc::UnboundedSender<KernelEvent>,
     redistribute: Vec<Protocol>,
@@ -594,26 +614,34 @@ async fn run_service_loop(
     let mut nexthop_state: HashMap<IpAddr, bool> = HashMap::new();
     loop {
         tokio::select! {
-            event = route_events.next() => {
+            event = events.next() => {
                 let Some(event) = event else { break };
-                let protocol = match &event {
-                    KernelRouteEvent::Add(kr) | KernelRouteEvent::Delete(kr) => kr.protocol,
-                };
-                // Skip routes we installed ourselves to avoid processing our own echoes.
-                if protocol != RouteProtocol::Bgp {
-                    // Apply redistribution filter (empty list = accept all protocols).
-                    if redistribute.is_empty() || redistribute.contains(&protocol) {
-                        let _ = event_tx.send(KernelEvent::Route(event));
+                match event {
+                    KernelEvent::Route(route_event) => {
+                        let protocol = match &route_event {
+                            KernelRouteEvent::Add(kr) | KernelRouteEvent::Delete(kr) => kr.protocol,
+                        };
+                        // Skip routes we installed ourselves to avoid processing our own echoes.
+                        if protocol != RouteProtocol::Bgp {
+                            // Apply redistribution filter (empty list = accept all protocols).
+                            if redistribute.is_empty() || redistribute.contains(&protocol) {
+                                let _ = event_tx.send(KernelEvent::Route(route_event));
+                            }
+                        }
+                        // Any route change may affect watched nexthop reachability.
+                        let addrs: Vec<IpAddr> = watched.keys().copied().collect();
+                        for addr in addrs {
+                            let reachable = handle.lookup_route(addr).await;
+                            if nexthop_state.get(&addr) != Some(&reachable) {
+                                nexthop_state.insert(addr, reachable);
+                                let _ = event_tx.send(KernelEvent::NexthopUpdate { addr, reachable });
+                            }
+                        }
                     }
-                }
-                // Any route change may affect watched nexthop reachability.
-                let addrs: Vec<IpAddr> = watched.keys().copied().collect();
-                for addr in addrs {
-                    let reachable = handle.lookup_route(addr).await;
-                    if nexthop_state.get(&addr) != Some(&reachable) {
-                        nexthop_state.insert(addr, reachable);
-                        let _ = event_tx.send(KernelEvent::NexthopUpdate { addr, reachable });
+                    KernelEvent::Address(addr_event) => {
+                        let _ = event_tx.send(KernelEvent::Address(addr_event));
                     }
+                    KernelEvent::NexthopUpdate { .. } => {}
                 }
             }
             req = req_rx.recv() => {
@@ -662,17 +690,63 @@ async fn run_service_loop(
     }
 }
 
-fn parse_route_event(
+fn parse_netlink_event(
     msg: rtnetlink::packet_core::NetlinkMessage<RouteNetlinkMessage>,
-) -> Option<KernelRouteEvent> {
+) -> Option<KernelEvent> {
     match msg.payload {
         NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route_msg)) => {
-            Handle::parse_route(&route_msg).map(KernelRouteEvent::Add)
+            Handle::parse_route(&route_msg).map(|r| KernelEvent::Route(KernelRouteEvent::Add(r)))
         }
         NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRoute(route_msg)) => {
-            Handle::parse_route(&route_msg).map(KernelRouteEvent::Delete)
+            Handle::parse_route(&route_msg).map(|r| KernelEvent::Route(KernelRouteEvent::Delete(r)))
+        }
+        NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewAddress(addr_msg)) => {
+            parse_kernel_address(addr_msg).map(|a| KernelEvent::Address(KernelAddressEvent::Add(a)))
+        }
+        NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelAddress(addr_msg)) => {
+            parse_kernel_address(addr_msg)
+                .map(|a| KernelEvent::Address(KernelAddressEvent::Delete(a)))
         }
         _ => None,
+    }
+}
+
+/// Parse an `RTM_NEWADDR` / `RTM_DELADDR` message into a [`KernelAddress`].
+///
+/// Returns `None` for loopback or link-local addresses, which should not be
+/// injected into BGP.
+fn parse_kernel_address(msg: AddressMessage) -> Option<KernelAddress> {
+    let prefix_len = msg.header.prefix_len;
+    let ifindex = msg.header.index;
+    // IFA_LOCAL is the local address; IFA_ADDRESS may be the peer on P2P links.
+    let mut local: Option<IpAddr> = None;
+    let mut address: Option<IpAddr> = None;
+    for attr in &msg.attributes {
+        match attr {
+            AddressAttribute::Local(a) => local = Some(*a),
+            AddressAttribute::Address(a) => address = Some(*a),
+            _ => {}
+        }
+    }
+    let addr = local.or(address)?;
+    if addr.is_loopback() || is_link_local(addr) {
+        return None;
+    }
+    Some(KernelAddress {
+        ifindex,
+        addr,
+        prefix_len,
+    })
+}
+
+fn is_link_local(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let b = v6.octets();
+            // fe80::/10
+            b[0] == 0xfe && (b[1] & 0xc0) == 0x80
+        }
     }
 }
 
@@ -809,7 +883,7 @@ mod tests {
         // Receive the event with a timeout
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while let Some(event) = events.next().await {
-                if let KernelRouteEvent::Add(ref kr) = event {
+                if let KernelEvent::Route(KernelRouteEvent::Add(ref kr)) = event {
                     let expected: IpAddr = "192.168.99.0".parse().unwrap();
                     if kr.dst == expected && kr.prefix_len == 24 {
                         return event;
@@ -821,11 +895,11 @@ mod tests {
         .await
         .expect("timed out waiting for route event");
 
-        if let KernelRouteEvent::Add(kr) = event {
+        if let KernelEvent::Route(KernelRouteEvent::Add(kr)) = event {
             assert_eq!(kr.dst, "192.168.99.0".parse::<IpAddr>().unwrap());
             assert_eq!(kr.prefix_len, 24);
         } else {
-            panic!("expected KernelRouteEvent::Add");
+            panic!("expected KernelEvent::Route(Add)");
         }
 
         // Verify the static route is NOT in the BGP dump (different protocol)
@@ -856,7 +930,7 @@ mod tests {
         // Drain the Add event
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while let Some(event) = events.next().await {
-                if let KernelRouteEvent::Add(ref kr) = event {
+                if let KernelEvent::Route(KernelRouteEvent::Add(ref kr)) = event {
                     let expected: IpAddr = "192.168.100.0".parse().unwrap();
                     if kr.dst == expected {
                         return;
@@ -872,7 +946,7 @@ mod tests {
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while let Some(event) = events.next().await {
-                if let KernelRouteEvent::Delete(ref kr) = event {
+                if let KernelEvent::Route(KernelRouteEvent::Delete(ref kr)) = event {
                     let expected: IpAddr = "192.168.100.0".parse().unwrap();
                     if kr.dst == expected {
                         return event;
@@ -884,7 +958,10 @@ mod tests {
         .await
         .expect("timed out waiting for delete event");
 
-        assert!(matches!(event, KernelRouteEvent::Delete(_)));
+        assert!(matches!(
+            event,
+            KernelEvent::Route(KernelRouteEvent::Delete(_))
+        ));
 
         drop(handle);
     }
@@ -1577,5 +1654,81 @@ mod tests {
         );
 
         handle.delete_vrf("vrf-red").await.unwrap();
+    }
+
+    // --- Address (RTMGRP_IFADDR) monitoring tests ---
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_address_monitor_add_and_delete() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<KernelEvent>();
+        let (service, _handle) = KernelService::start(vec![], event_tx).unwrap();
+
+        // Add a dummy link and assign an address to it.
+        ip(&["link", "add", "dummy-am", "type", "dummy"]);
+        ip(&["link", "set", "dummy-am", "up"]);
+        ip(&["addr", "add", "10.77.0.1/24", "dev", "dummy-am"]);
+
+        let addr_added = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(KernelEvent::Address(KernelAddressEvent::Add(ref ka)))
+                        if ka.addr == "10.77.0.1".parse::<IpAddr>().unwrap()
+                            && ka.prefix_len == 24 =>
+                    {
+                        break true;
+                    }
+                    None => break false,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            addr_added,
+            "KernelAddressEvent::Add(10.77.0.1/24) must arrive"
+        );
+
+        ip(&["addr", "del", "10.77.0.1/24", "dev", "dummy-am"]);
+
+        let addr_deleted = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(KernelEvent::Address(KernelAddressEvent::Delete(ref ka)))
+                        if ka.addr == "10.77.0.1".parse::<IpAddr>().unwrap()
+                            && ka.prefix_len == 24 =>
+                    {
+                        break true;
+                    }
+                    None => break false,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            addr_deleted,
+            "KernelAddressEvent::Delete(10.77.0.1/24) must arrive"
+        );
+
+        ip(&["link", "del", "dummy-am"]);
+        drop(service);
+    }
+
+    // --- apply_prefix_mask unit tests ---
+
+    #[test]
+    fn parse_address_loopback_filtered() {
+        // Verify is_link_local and loopback helpers don't panic.
+        assert!(is_link_local("169.254.1.1".parse::<IpAddr>().unwrap()));
+        assert!(!is_link_local("10.0.0.1".parse::<IpAddr>().unwrap()));
+        let fe80: IpAddr = "fe80::1".parse().unwrap();
+        assert!(is_link_local(fe80));
+        let global: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(!is_link_local(global));
     }
 }

@@ -718,6 +718,30 @@ impl TableManager {
         )
         .await;
     }
+
+    /// Inject or withdraw a Connected route triggered by an interface address event.
+    ///
+    /// The route destination is the network prefix (interface address masked by
+    /// prefix_len); the BGP nexthop is the interface address itself per RFC 4271 §5.1.3.
+    pub(crate) async fn handle_address_event(&self, event: kernel::KernelAddressEvent) {
+        let (ka, is_add) = match event {
+            kernel::KernelAddressEvent::Add(a) => (a, true),
+            kernel::KernelAddressEvent::Delete(a) => (a, false),
+        };
+        let network = apply_prefix_mask(ka.addr, ka.prefix_len);
+        if is_add {
+            let kr = kernel::KernelRoute {
+                dst: network,
+                prefix_len: ka.prefix_len,
+                nexthop: Some(ka.addr),
+                metric: 0,
+                protocol: kernel::Protocol::Kernel,
+            };
+            self.inject_kernel_route(kr).await;
+        } else {
+            self.withdraw_kernel_route(network, ka.prefix_len).await;
+        }
+    }
 }
 
 /// Convert a `KernelRoute` to the components needed by `insert_route`.
@@ -790,6 +814,30 @@ fn nlri_family(nlri: &packet::Nlri) -> Family {
         packet::Nlri::V4(_) => Family::IPV4,
         packet::Nlri::V6(_) => Family::IPV6,
         _ => Family::IPV4,
+    }
+}
+
+/// Apply a prefix mask to an IP address, returning the network address.
+fn apply_prefix_mask(addr: std::net::IpAddr, prefix_len: u8) -> std::net::IpAddr {
+    match addr {
+        std::net::IpAddr::V4(v4) => {
+            let bits = u32::from(v4);
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(bits & mask))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let bits = u128::from(v6);
+            let mask = if prefix_len == 0 {
+                0u128
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(bits & mask))
+        }
     }
 }
 
@@ -1265,5 +1313,44 @@ mod tests {
         // The path must not appear in loc-RIB: the ArcSwap set was checked
         // at insertion time and nexthop_invalid_flag was set.
         assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 0);
+    }
+
+    // --- apply_prefix_mask unit tests ---
+
+    #[test]
+    fn apply_prefix_mask_v4() {
+        use std::net::IpAddr;
+        let addr: IpAddr = "192.168.1.5".parse().unwrap();
+        assert_eq!(
+            apply_prefix_mask(addr, 24),
+            "192.168.1.0".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            apply_prefix_mask(addr, 16),
+            "192.168.0.0".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            apply_prefix_mask(addr, 0),
+            "0.0.0.0".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            apply_prefix_mask(addr, 32),
+            "192.168.1.5".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn apply_prefix_mask_v6() {
+        use std::net::IpAddr;
+        let addr: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(
+            apply_prefix_mask(addr, 32),
+            "2001:db8::".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(apply_prefix_mask(addr, 0), "::".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            apply_prefix_mask(addr, 128),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
     }
 }
