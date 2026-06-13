@@ -54,6 +54,9 @@ pub struct Vrf {
     pub import_rt: HashSet<[u8; 8]>,
     pub export_rt: Vec<[u8; 8]>,
     pub label: packet::mpls::MplsLabel,
+    /// Linux routing table ID for kernel FIB integration.  Zero means no
+    /// kernel table is associated with this VRF.
+    pub id: u32,
 }
 
 impl Vrf {
@@ -5336,6 +5339,7 @@ mod tests {
             import_rt: import_rts.into_iter().collect(),
             export_rt: Vec::new(),
             label: packet::mpls::MplsLabel::new(16),
+            id: 0,
         }
     }
 

@@ -29,7 +29,7 @@ use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::route::RouteMessage;
 use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteFlags, RouteProtocol};
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
-use rtnetlink::{MulticastGroup, RouteMessageBuilder, RouteNextHopBuilder};
+use rtnetlink::{LinkVrf, MulticastGroup, RouteMessageBuilder, RouteNextHopBuilder};
 
 pub use rtnetlink::packet_route::route::RouteProtocol as Protocol;
 
@@ -43,6 +43,9 @@ pub struct KernelRouteChange {
     /// that BGP MED is reflected in the kernel FIB, matching GoBGP behaviour.
     /// Zero means no explicit priority (kernel default).
     pub metric: u32,
+    /// Linux routing table ID for VRF FIB integration.  `None` targets the
+    /// main routing table; `Some(id)` targets the VRF-associated table.
+    pub table_id: Option<u32>,
 }
 
 /// Convert a GoBGP-style route type string to a `Protocol` value.
@@ -132,6 +135,30 @@ impl Handle {
         Ok((Self { inner: handle }, connection, stream))
     }
 
+    /// Create a Linux VRF device with the given routing table ID.
+    async fn create_vrf(&self, name: &str, table_id: u32) -> Result<(), Error> {
+        self.inner
+            .link()
+            .add(LinkVrf::new(name, table_id).build())
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a Linux VRF device by name.
+    async fn delete_vrf(&self, name: &str) -> Result<(), Error> {
+        let mut stream = self
+            .inner
+            .link()
+            .get()
+            .match_name(name.to_string())
+            .execute();
+        if let Some(Ok(msg)) = stream.next().await {
+            self.inner.link().del(msg.header.index).execute().await?;
+        }
+        Ok(())
+    }
+
     /// Install a BGP route into the kernel FIB.
     ///
     /// Both `dst` and `nexthop` must be the same address family.
@@ -143,10 +170,15 @@ impl Handle {
         prefix_len: u8,
         nexthop: IpAddr,
         metric: u32,
+        table_id: Option<u32>,
     ) -> Result<(), Error> {
         match (dst, nexthop) {
-            (IpAddr::V4(dst), IpAddr::V4(gw)) => self.install_v4(dst, prefix_len, gw, metric).await,
-            (IpAddr::V6(dst), IpAddr::V6(gw)) => self.install_v6(dst, prefix_len, gw, metric).await,
+            (IpAddr::V4(dst), IpAddr::V4(gw)) => {
+                self.install_v4(dst, prefix_len, gw, metric, table_id).await
+            }
+            (IpAddr::V6(dst), IpAddr::V6(gw)) => {
+                self.install_v6(dst, prefix_len, gw, metric, table_id).await
+            }
             _ => Err(Error::FamilyMismatch),
         }
     }
@@ -165,13 +197,14 @@ impl Handle {
             }
         };
         if change.nexthops.is_empty() {
-            return self.withdraw(dst, prefix_len).await;
+            return self.withdraw(dst, prefix_len, change.table_id).await;
         }
         let addrs: Vec<IpAddr> = change.nexthops.iter().map(|nh| nh.addr()).collect();
         let result = if addrs.len() == 1 {
-            self.install(dst, prefix_len, addrs[0], change.metric).await
+            self.install(dst, prefix_len, addrs[0], change.metric, change.table_id)
+                .await
         } else {
-            self.install_ecmp(dst, prefix_len, &addrs, change.metric)
+            self.install_ecmp(dst, prefix_len, &addrs, change.metric, change.table_id)
                 .await
         };
         match result {
@@ -190,6 +223,7 @@ impl Handle {
         prefix_len: u8,
         nexthops: &[IpAddr],
         metric: u32,
+        table_id: Option<u32>,
     ) -> Result<(), Error> {
         match dst {
             IpAddr::V4(dst_v4) => {
@@ -205,13 +239,20 @@ impl Handle {
                 if nhs.is_empty() {
                     return Err(Error::FamilyMismatch);
                 }
-                let msg = RouteMessageBuilder::<Ipv4Addr>::new()
+                let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
                     .destination_prefix(dst_v4, prefix_len)
                     .protocol(RouteProtocol::Bgp)
                     .priority(metric)
-                    .multipath(nhs)
-                    .build();
-                self.inner.route().add(msg).replace().execute().await?;
+                    .multipath(nhs);
+                if let Some(tid) = table_id {
+                    builder = builder.table_id(tid);
+                }
+                self.inner
+                    .route()
+                    .add(builder.build())
+                    .replace()
+                    .execute()
+                    .await?;
             }
             IpAddr::V6(dst_v6) => {
                 let nhs: Vec<_> = nexthops
@@ -226,29 +267,51 @@ impl Handle {
                 if nhs.is_empty() {
                     return Err(Error::FamilyMismatch);
                 }
-                let msg = RouteMessageBuilder::<Ipv6Addr>::new()
+                let mut builder = RouteMessageBuilder::<Ipv6Addr>::new()
                     .destination_prefix(dst_v6, prefix_len)
                     .protocol(RouteProtocol::Bgp)
                     .priority(metric)
-                    .multipath(nhs)
-                    .build();
-                self.inner.route().add(msg).replace().execute().await?;
+                    .multipath(nhs);
+                if let Some(tid) = table_id {
+                    builder = builder.table_id(tid);
+                }
+                self.inner
+                    .route()
+                    .add(builder.build())
+                    .replace()
+                    .execute()
+                    .await?;
             }
         }
         Ok(())
     }
 
     /// Remove a BGP route from the kernel FIB.
-    async fn withdraw(&self, dst: IpAddr, prefix_len: u8) -> Result<(), Error> {
+    async fn withdraw(
+        &self,
+        dst: IpAddr,
+        prefix_len: u8,
+        table_id: Option<u32>,
+    ) -> Result<(), Error> {
         let msg = match dst {
-            IpAddr::V4(addr) => RouteMessageBuilder::<Ipv4Addr>::new()
-                .destination_prefix(addr, prefix_len)
-                .protocol(RouteProtocol::Bgp)
-                .build(),
-            IpAddr::V6(addr) => RouteMessageBuilder::<Ipv6Addr>::new()
-                .destination_prefix(addr, prefix_len)
-                .protocol(RouteProtocol::Bgp)
-                .build(),
+            IpAddr::V4(addr) => {
+                let mut b = RouteMessageBuilder::<Ipv4Addr>::new()
+                    .destination_prefix(addr, prefix_len)
+                    .protocol(RouteProtocol::Bgp);
+                if let Some(tid) = table_id {
+                    b = b.table_id(tid);
+                }
+                b.build()
+            }
+            IpAddr::V6(addr) => {
+                let mut b = RouteMessageBuilder::<Ipv6Addr>::new()
+                    .destination_prefix(addr, prefix_len)
+                    .protocol(RouteProtocol::Bgp);
+                if let Some(tid) = table_id {
+                    b = b.table_id(tid);
+                }
+                b.build()
+            }
         };
         self.inner.route().del(msg).execute().await?;
         Ok(())
@@ -313,14 +376,22 @@ impl Handle {
         prefix_len: u8,
         nexthop: Ipv4Addr,
         metric: u32,
+        table_id: Option<u32>,
     ) -> Result<(), Error> {
-        let msg = RouteMessageBuilder::<Ipv4Addr>::new()
+        let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
             .destination_prefix(dst, prefix_len)
             .gateway(nexthop)
             .protocol(RouteProtocol::Bgp)
-            .priority(metric)
-            .build();
-        self.inner.route().add(msg).replace().execute().await?;
+            .priority(metric);
+        if let Some(tid) = table_id {
+            builder = builder.table_id(tid);
+        }
+        self.inner
+            .route()
+            .add(builder.build())
+            .replace()
+            .execute()
+            .await?;
         Ok(())
     }
 
@@ -330,14 +401,22 @@ impl Handle {
         prefix_len: u8,
         nexthop: Ipv6Addr,
         metric: u32,
+        table_id: Option<u32>,
     ) -> Result<(), Error> {
-        let msg = RouteMessageBuilder::<Ipv6Addr>::new()
+        let mut builder = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix(dst, prefix_len)
             .gateway(nexthop)
             .protocol(RouteProtocol::Bgp)
-            .priority(metric)
-            .build();
-        self.inner.route().add(msg).replace().execute().await?;
+            .priority(metric);
+        if let Some(tid) = table_id {
+            builder = builder.table_id(tid);
+        }
+        self.inner
+            .route()
+            .add(builder.build())
+            .replace()
+            .execute()
+            .await?;
         Ok(())
     }
 
@@ -395,6 +474,8 @@ enum Request {
     Apply(KernelRouteChange),
     RegisterNexthop(IpAddr),
     UnregisterNexthop(IpAddr),
+    CreateVrf { name: String, table_id: u32 },
+    DeleteVrf { name: String },
 }
 
 /// Shareable sender for submitting kernel FIB changes.
@@ -413,6 +494,25 @@ impl KernelHandle {
     /// [`KernelService`] task. Errors are logged there.
     pub fn apply(&self, change: KernelRouteChange) {
         let _ = self.tx.send(Request::Apply(change));
+    }
+
+    /// Create a Linux VRF device and its associated routing table.
+    ///
+    /// Fire-and-forget: errors are logged inside the [`KernelService`] task.
+    pub fn create_vrf(&self, name: &str, table_id: u32) {
+        let _ = self.tx.send(Request::CreateVrf {
+            name: name.to_string(),
+            table_id,
+        });
+    }
+
+    /// Delete a Linux VRF device by name.
+    ///
+    /// Fire-and-forget: errors are logged inside the [`KernelService`] task.
+    pub fn delete_vrf(&self, name: &str) {
+        let _ = self.tx.send(Request::DeleteVrf {
+            name: name.to_string(),
+        });
     }
 
     /// Register a nexthop address for reachability tracking.
@@ -546,6 +646,16 @@ async fn run_service_loop(
                             }
                         }
                     }
+                    Request::CreateVrf { name, table_id } => {
+                        if let Err(e) = handle.create_vrf(&name, table_id).await {
+                            log::error!("vrf create failed ({}): {}", name, e);
+                        }
+                    }
+                    Request::DeleteVrf { name } => {
+                        if let Err(e) = handle.delete_vrf(&name).await {
+                            log::error!("vrf delete failed ({}): {}", name, e);
+                        }
+                    }
                 }
             }
         }
@@ -605,7 +715,7 @@ mod tests {
 
         let dst: IpAddr = "10.0.0.0".parse().unwrap();
         let gw: IpAddr = "127.0.0.1".parse().unwrap();
-        handle.install(dst, 24, gw, 100).await.unwrap();
+        handle.install(dst, 24, gw, 100, None).await.unwrap();
 
         let routes = handle.dump_bgp_routes().await.unwrap();
         assert!(routes.iter().any(|r| r.dst == dst && r.prefix_len == 24));
@@ -618,8 +728,8 @@ mod tests {
 
         let dst: IpAddr = "10.1.0.0".parse().unwrap();
         let gw: IpAddr = "127.0.0.1".parse().unwrap();
-        handle.install(dst, 24, gw, 100).await.unwrap();
-        handle.withdraw(dst, 24).await.unwrap();
+        handle.install(dst, 24, gw, 100, None).await.unwrap();
+        handle.withdraw(dst, 24, None).await.unwrap();
 
         let routes = handle.dump_bgp_routes().await.unwrap();
         assert!(!routes.iter().any(|r| r.dst == dst && r.prefix_len == 24));
@@ -638,7 +748,7 @@ mod tests {
 
         let dst: IpAddr = "2001:db8:1::".parse().unwrap();
         let gw: IpAddr = "2001:db8::2".parse().unwrap();
-        handle.install(dst, 48, gw, 100).await.unwrap();
+        handle.install(dst, 48, gw, 100, None).await.unwrap();
 
         let routes = handle.dump_bgp_routes().await.unwrap();
         assert!(routes.iter().any(|r| r.dst == dst && r.prefix_len == 48));
@@ -655,8 +765,8 @@ mod tests {
         let gw1: IpAddr = "127.0.0.1".parse().unwrap();
         let gw2: IpAddr = "127.0.0.2".parse().unwrap();
 
-        handle.install(dst, 24, gw1, 100).await.unwrap();
-        handle.install(dst, 24, gw2, 100).await.unwrap();
+        handle.install(dst, 24, gw1, 100, None).await.unwrap();
+        handle.install(dst, 24, gw2, 100, None).await.unwrap();
 
         let routes = handle.dump_bgp_routes().await.unwrap();
         let route = routes
@@ -674,7 +784,7 @@ mod tests {
         let dst: IpAddr = "10.0.0.0".parse().unwrap();
         let gw: IpAddr = "::1".parse().unwrap();
         assert!(matches!(
-            handle.install(dst, 24, gw, 100).await,
+            handle.install(dst, 24, gw, 100, None).await,
             Err(Error::FamilyMismatch)
         ));
     }
@@ -824,6 +934,7 @@ mod tests {
                 net,
                 nexthops: vec![nh],
                 metric: 0,
+                table_id: None,
             })
             .await
             .unwrap();
@@ -846,6 +957,7 @@ mod tests {
                 net: net.clone(),
                 nexthops: vec![nh],
                 metric: 0,
+                table_id: None,
             })
             .await
             .unwrap();
@@ -854,6 +966,7 @@ mod tests {
                 net,
                 nexthops: vec![],
                 metric: 0,
+                table_id: None,
             })
             .await
             .unwrap();
@@ -877,6 +990,7 @@ mod tests {
                 net,
                 nexthops: vec![nh1, nh2],
                 metric: 0,
+                table_id: None,
             })
             .await
             .unwrap();
@@ -904,6 +1018,7 @@ mod tests {
                 net,
                 nexthops: vec![nh1, nh2],
                 metric: 0,
+                table_id: None,
             })
             .await
             .unwrap();
@@ -929,6 +1044,7 @@ mod tests {
                 net,
                 nexthops: vec![nh],
                 metric: 0,
+                table_id: None,
             })
             .await;
         assert!(
@@ -945,7 +1061,7 @@ mod tests {
         let handle = new_handle().await;
         let dst: IpAddr = "0.0.0.0".parse().unwrap();
         let gw: IpAddr = "127.0.0.1".parse().unwrap();
-        handle.install(dst, 0, gw, 0).await.unwrap();
+        handle.install(dst, 0, gw, 0, None).await.unwrap();
         let routes = handle.dump_bgp_routes().await.unwrap();
         assert!(routes.iter().any(|r| r.dst == dst && r.prefix_len == 0));
     }
@@ -956,7 +1072,7 @@ mod tests {
         let handle = new_handle().await;
         let dst: IpAddr = "10.5.0.0".parse().unwrap();
         let gw: IpAddr = "127.0.0.1".parse().unwrap();
-        handle.install(dst, 24, gw, 200).await.unwrap();
+        handle.install(dst, 24, gw, 200, None).await.unwrap();
         let routes = handle.dump_bgp_routes().await.unwrap();
         let route = routes
             .iter()
@@ -993,6 +1109,7 @@ mod tests {
             net,
             nexthops: vec![nh],
             metric: 0,
+            table_id: None,
         });
 
         // Wait generously for the Netlink echo to be generated and processed
@@ -1354,5 +1471,87 @@ mod tests {
             matches!(result, Ok(None)),
             "channel must close after KernelService is dropped"
         );
+    }
+
+    // --- VRF device and route tests ---
+
+    fn ip_output(args: &[&str]) -> String {
+        let out = std::process::Command::new("ip")
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_create_and_delete_vrf() {
+        let handle = new_handle().await;
+        handle.create_vrf("testvrf", 100).await.unwrap();
+
+        // Verify device exists as a VRF type.
+        let out = ip_output(&["link", "show", "type", "vrf"]);
+        assert!(out.contains("testvrf"), "VRF device not found: {out}");
+
+        handle.delete_vrf("testvrf").await.unwrap();
+
+        let out = ip_output(&["link", "show", "type", "vrf"]);
+        assert!(
+            !out.contains("testvrf"),
+            "VRF device still present after delete"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network namespace"]
+    async fn test_vrf_route_install_and_withdraw() {
+        let handle = new_handle().await;
+        handle.create_vrf("vrf-red", 200).await.unwrap();
+
+        let net = packet::Nlri::V4(packet::bgp::Ipv4Net {
+            addr: "10.99.0.0".parse().unwrap(),
+            mask: 24,
+        });
+        let nh = packet::bgp::Nexthop::V4("127.0.0.1".parse().unwrap());
+        handle
+            .apply(&KernelRouteChange {
+                net: net.clone(),
+                nexthops: vec![nh],
+                metric: 0,
+                table_id: Some(200),
+            })
+            .await
+            .unwrap();
+
+        // Route must appear in the VRF table, not the main table.
+        let vrf_routes = ip_output(&["route", "show", "table", "200"]);
+        assert!(
+            vrf_routes.contains("10.99.0.0/24"),
+            "route not in VRF table: {vrf_routes}"
+        );
+        let main_routes = ip_output(&["route", "show"]);
+        assert!(
+            !main_routes.contains("10.99.0.0/24"),
+            "route must not appear in main table: {main_routes}"
+        );
+
+        // Withdraw from VRF table.
+        handle
+            .apply(&KernelRouteChange {
+                net,
+                nexthops: vec![],
+                metric: 0,
+                table_id: Some(200),
+            })
+            .await
+            .unwrap();
+
+        let vrf_routes = ip_output(&["route", "show", "table", "200"]);
+        assert!(
+            !vrf_routes.contains("10.99.0.0/24"),
+            "route still in VRF table after withdraw: {vrf_routes}"
+        );
+
+        handle.delete_vrf("vrf-red").await.unwrap();
     }
 }

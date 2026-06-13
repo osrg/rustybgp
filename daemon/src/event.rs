@@ -2686,7 +2686,7 @@ impl GoBgpService for GrpcService {
             .map(convert::rt_from_api)
             .collect::<Result<Vec<_>, _>>()?;
         self.tables
-            .add_vrf(name, rd, import_rt, export_rt)
+            .add_vrf(name, rd, import_rt, export_rt, vrf.id)
             .await
             .map_err(Error::Table)?;
         Ok(tonic::Response::new(api::AddVrfResponse {}))

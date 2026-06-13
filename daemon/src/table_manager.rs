@@ -76,6 +76,8 @@ pub(crate) struct Subscription {
 
 pub(crate) type TableHandle = Arc<TableManager>;
 
+type SharedVrfs = Arc<ArcSwap<FnvHashMap<String, table::Vrf>>>;
+
 pub(crate) struct TableManager {
     pub(crate) shards: Vec<Mutex<TableShard>>,
     rpki: std::sync::RwLock<table::RpkiTable>,
@@ -87,7 +89,7 @@ pub(crate) struct TableManager {
     pub(crate) nexthop_invalid: ArcSwap<FnvHashSet<IpAddr>>,
     next_sub_id: std::sync::atomic::AtomicU64,
     subscribers: Mutex<FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>>,
-    vrfs: Mutex<FnvHashMap<String, table::Vrf>>,
+    vrfs: SharedVrfs,
     next_label: std::sync::atomic::AtomicU32,
 }
 
@@ -96,6 +98,7 @@ impl TableManager {
     const LABEL_BASE: u32 = 16;
 
     pub(crate) fn new(num_shards: usize) -> Self {
+        let vrfs: SharedVrfs = Arc::new(ArcSwap::new(Arc::new(FnvHashMap::default())));
         TableManager {
             shards: (0..num_shards)
                 .map(|_| {
@@ -104,6 +107,7 @@ impl TableManager {
                         peer_event_tx: FnvHashMap::default(),
                         subscribers: FnvHashMap::default(),
                         addpath: FnvHashMap::default(),
+                        vrfs: Arc::clone(&vrfs),
                     })
                 })
                 .collect(),
@@ -114,7 +118,7 @@ impl TableManager {
             nexthop_invalid: ArcSwap::new(Arc::new(FnvHashSet::default())),
             next_sub_id: std::sync::atomic::AtomicU64::new(0),
             subscribers: Mutex::new(FnvHashMap::default()),
-            vrfs: Mutex::new(FnvHashMap::default()),
+            vrfs,
             next_label: std::sync::atomic::AtomicU32::new(Self::LABEL_BASE),
         }
     }
@@ -132,33 +136,50 @@ impl TableManager {
         rd: packet::rd::RouteDistinguisher,
         import_rt: std::collections::HashSet<[u8; 8]>,
         export_rt: Vec<[u8; 8]>,
+        id: u32,
     ) -> Result<packet::mpls::MplsLabel, table::TableError> {
-        let mut vrfs = self.vrfs.lock().await;
-        if vrfs.contains_key(&name) {
+        let current = self.vrfs.load_full();
+        if current.contains_key(&name) {
             return Err(table::TableError::AlreadyExists(name));
         }
         let label = self.allocate_label();
-        vrfs.insert(
+        let mut new_map = (*current).clone();
+        new_map.insert(
             name.clone(),
             table::Vrf {
-                name,
+                name: name.clone(),
                 rd,
                 import_rt,
                 export_rt,
                 label,
+                id,
             },
         );
+        self.vrfs.store(Arc::new(new_map));
+        if id > 0
+            && let Some(handle) = self.kernel_handle.load_full().as_deref()
+        {
+            handle.create_vrf(&name, id);
+        }
         Ok(label)
     }
 
     pub(crate) async fn delete_vrf(&self, name: &str) -> Result<(), table::TableError> {
-        let mut vrfs = self.vrfs.lock().await;
-        vrfs.remove(name).ok_or(table::TableError::NotFound)?;
+        let current = self.vrfs.load_full();
+        let id = current.get(name).ok_or(table::TableError::NotFound)?.id;
+        let mut new_map = (*current).clone();
+        new_map.remove(name);
+        self.vrfs.store(Arc::new(new_map));
+        if id > 0
+            && let Some(handle) = self.kernel_handle.load_full().as_deref()
+        {
+            handle.delete_vrf(name);
+        }
         Ok(())
     }
 
     pub(crate) async fn list_vrfs(&self, name: Option<&str>) -> Vec<table::Vrf> {
-        let vrfs = self.vrfs.lock().await;
+        let vrfs = self.vrfs.load();
         match name {
             Some(n) => vrfs.get(n).cloned().into_iter().collect(),
             None => vrfs.values().cloned().collect(),
@@ -179,7 +200,7 @@ impl TableManager {
             Family::IPV6 => Family::IPV6_VPN,
             _ => return None,
         };
-        let vrf = self.vrfs.lock().await.get(vrf_name)?.clone();
+        let vrf = self.vrfs.load().get(vrf_name)?.clone();
         let mut out = Vec::new();
         for shard in &self.shards {
             let t = shard.lock().await;
@@ -802,6 +823,7 @@ pub(crate) struct TableShard {
     pub(crate) peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
     pub(crate) subscribers: FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>,
     pub(crate) addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
+    vrfs: SharedVrfs,
 }
 
 impl TableShard {
@@ -890,9 +912,36 @@ impl TableShard {
                 .unwrap_or(0);
             handle.apply(kernel::KernelRouteChange {
                 net: update.net.clone(),
-                nexthops,
+                nexthops: nexthops.clone(),
                 metric,
+                table_id: None,
             });
+
+            // VRF FIB distribution: for VPN NLRIs, install/withdraw from each
+            // VRF whose import-RT matches the best-path extended communities.
+            // Withdrawals are attempted for all VRFs that have a table_id;
+            // the kernel ignores routes not present in the table.
+            if matches!(update.net, packet::Nlri::VpnV4(_) | packet::Nlri::VpnV6(_)) {
+                let vrfs = self.vrfs.load();
+                for vrf in vrfs.values() {
+                    if vrf.id == 0 {
+                        continue;
+                    }
+                    let Some(local_nlri) = table::vpn_to_local_nlri(&update.net) else {
+                        continue;
+                    };
+                    let distribute = nexthops.is_empty()
+                        || update.new_best().is_some_and(|p| vrf.can_import(&p.attr));
+                    if distribute {
+                        handle.apply(kernel::KernelRouteChange {
+                            net: local_nlri,
+                            nexthops: nexthops.clone(),
+                            metric,
+                            table_id: Some(vrf.id),
+                        });
+                    }
+                }
+            }
         }
 
         // Fan out raw NlriChange to all peer channels.

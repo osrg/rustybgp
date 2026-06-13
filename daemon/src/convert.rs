@@ -230,7 +230,7 @@ pub(crate) fn vrf_to_api(vrf: &rustybgp_table::Vrf) -> api::Vrf {
         rd: Some(rd_to_api(&vrf.rd)),
         import_rt: vrf.import_rt.iter().map(rt_to_api).collect(),
         export_rt: vrf.export_rt.iter().map(rt_to_api).collect(),
-        id: 0,
+        id: vrf.id,
     }
 }
 
