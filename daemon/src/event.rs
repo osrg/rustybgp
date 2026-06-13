@@ -1646,10 +1646,8 @@ impl GoBgpService for GrpcService {
         global.asn = 0;
         global.router_id = Ipv4Addr::new(0, 0, 0, 0);
         global.listen_port = Global::BGP_PORT;
-        for handle in global.kernel_abort_handles.drain(..) {
-            handle.abort();
-        }
-        self.tables.kernel_tx.store(None);
+        global.kernel_service.take();
+        self.tables.kernel_handle.store(None);
         if let Some(tx) = global.stop_tx.take() {
             let _ = tx.send(());
         }
@@ -3325,7 +3323,7 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::EnableZebraRequest>,
     ) -> Result<tonic::Response<api::EnableZebraResponse>, tonic::Status> {
-        if self.tables.kernel_tx.load().is_some() {
+        if self.tables.kernel_handle.load().is_some() {
             return Ok(tonic::Response::new(api::EnableZebraResponse {}));
         }
         let request = request.into_inner();
@@ -3334,14 +3332,19 @@ impl GoBgpService for GrpcService {
             .iter()
             .filter_map(|s| kernel::route_type_to_protocol(s))
             .collect();
-        start_kernel_tasks(&self.tables, &self.global, redistribute)
-            .await
-            .map_err(|e| {
+        let mut global = self.global.write().await;
+        let event_tx = global.kernel_event_tx.clone();
+        let (service, handle) =
+            kernel::KernelService::start(redistribute, event_tx).map_err(|e| {
                 tonic::Status::internal(format!(
                     "failed to enable kernel route integration: {:?}",
                     e
                 ))
             })?;
+        global.kernel_service = Some(service);
+        drop(global);
+        self.tables.kernel_handle.store(Some(Arc::new(handle)));
+        log::info!("kernel route integration enabled");
         Ok(tonic::Response::new(api::EnableZebraResponse {}))
     }
     async fn enable_mrt(
@@ -3682,9 +3685,10 @@ pub(crate) struct Global {
     /// Abort handle for the global Selection_Deferral_Timer (RFC 4724 §4.1).
     selection_deferral_timer: Option<tokio::task::AbortHandle>,
 
-    /// Abort handles for the kernel integration tasks spawned by enable_zebra.
-    /// Aborted and cleared by stop_bgp.
-    kernel_abort_handles: Vec<tokio::task::AbortHandle>,
+    /// Kernel integration service. Drop aborts the background task.
+    kernel_service: Option<kernel::KernelService>,
+    /// Sender end of the kernel event channel; cloned into KernelService::start.
+    kernel_event_tx: mpsc::UnboundedSender<kernel::KernelEvent>,
 
     /// Sending on this channel causes the BGP listener loop to stop, enabling
     /// a subsequent start_bgp call to restart it.  None when BGP is not running.
@@ -3716,7 +3720,7 @@ impl From<&Global> for api::Global {
 impl Global {
     const BGP_PORT: u16 = 179;
 
-    fn new() -> Global {
+    fn new(kernel_event_tx: mpsc::UnboundedSender<kernel::KernelEvent>) -> Global {
         Global {
             asn: 0,
             router_id: Ipv4Addr::new(0, 0, 0, 0),
@@ -3738,7 +3742,8 @@ impl Global {
             selection_deferral: None,
             selection_deferral_timer: None,
 
-            kernel_abort_handles: Vec::new(),
+            kernel_service: None,
+            kernel_event_tx,
 
             stop_tx: None,
         }
@@ -3971,37 +3976,6 @@ async fn accept_connection(
     PeerSession::new(stream, remote_addr, role, Some(close_rx), res)
 }
 
-async fn start_kernel_tasks(
-    tables: &TableHandle,
-    global: &GlobalHandle,
-    redistribute: Vec<kernel::Protocol>,
-) -> Result<(), kernel::Error> {
-    let (handle, connection, route_events) = kernel::Handle::with_route_monitor()?;
-    let conn_handle = tokio::spawn(connection);
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let bgp_to_kernel = tokio::spawn(async move {
-        while let Some(change) = rx.recv().await {
-            if let Err(e) = handle.apply(&change).await {
-                log::error!("kernel route update failed: {}", e);
-            }
-        }
-    });
-    tables.kernel_tx.store(Some(Arc::new(tx)));
-    let tables_clone = tables.clone();
-    let kernel_to_bgp = tokio::spawn(table_manager::run_kernel_routes(
-        tables_clone,
-        route_events,
-        redistribute,
-    ));
-    global.write().await.kernel_abort_handles.extend([
-        conn_handle.abort_handle(),
-        bgp_to_kernel.abort_handle(),
-        kernel_to_bgp.abort_handle(),
-    ]);
-    log::info!("kernel route integration enabled");
-    Ok(())
-}
-
 impl Global {
     async fn serve(
         bgp: Option<config::BgpConfig>,
@@ -4010,7 +3984,9 @@ impl Global {
         active_tx: mpsc::UnboundedSender<TcpStream>,
         mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
     ) {
-        let global: GlobalHandle = Arc::new(tokio::sync::RwLock::new(Global::new()));
+        let (kernel_event_tx, mut kernel_event_rx) =
+            mpsc::unbounded_channel::<kernel::KernelEvent>();
+        let global: GlobalHandle = Arc::new(tokio::sync::RwLock::new(Global::new(kernel_event_tx)));
         let tables: TableHandle = Arc::new(TableManager::new(num_cpus::get()));
         let global_config = bgp
             .as_ref()
@@ -4108,8 +4084,16 @@ impl Global {
                 .flatten()
                 .filter_map(|s| kernel::route_type_to_protocol(s))
                 .collect();
-            if let Err(e) = start_kernel_tasks(&tables, &global, redistribute).await {
-                log::error!("failed to enable kernel route integration: {:?}", e);
+            let event_tx = global.read().await.kernel_event_tx.clone();
+            match kernel::KernelService::start(redistribute, event_tx) {
+                Ok((service, handle)) => {
+                    global.write().await.kernel_service = Some(service);
+                    tables.kernel_handle.store(Some(Arc::new(handle)));
+                    log::info!("kernel route integration enabled");
+                }
+                Err(e) => {
+                    log::error!("failed to enable kernel route integration: {:?}", e);
+                }
             }
         }
         if let Some(groups) = bgp.as_ref().and_then(|x| x.peer_groups.as_ref()) {
@@ -4356,6 +4340,17 @@ impl Global {
                     bgp_listen_futures.push(incoming.next());
                 }
                 futures::select_biased! {
+                    event = kernel_event_rx.recv().fuse() => {
+                        match event {
+                            Some(kernel::KernelEvent::Route(kernel::KernelRouteEvent::Add(kr))) => {
+                                tables.inject_kernel_route(kr).await;
+                            }
+                            Some(kernel::KernelEvent::Route(kernel::KernelRouteEvent::Delete(kr))) => {
+                                tables.withdraw_kernel_route(kr.dst, kr.prefix_len).await;
+                            }
+                            None => {}
+                        }
+                    }
                     stream = bgp_listen_futures.next() => {
                         if let Some(Some(Ok(stream))) = stream
                             && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Passive).await
@@ -4384,7 +4379,7 @@ impl Global {
     }
 }
 
-use crate::table_manager::{self, PeerDownData, PeerUpData, SubscriptionId, TableManager};
+use crate::table_manager::{PeerDownData, PeerUpData, SubscriptionId, TableManager};
 // Re-export for mrt.rs and bmp.rs which import from crate::event.
 pub(crate) use crate::table_manager::{AdjRibInChange, BgpEvent, TableHandle};
 
@@ -6381,7 +6376,8 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn make_global() -> GlobalHandle {
-        let mut g = Global::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx);
         g.asn = 65001;
         g.router_id = Ipv4Addr::new(1, 0, 0, 1);
         Arc::new(tokio::sync::RwLock::new(g))
@@ -6552,7 +6548,8 @@ mod tests {
 
     #[test]
     fn confederation_api_parses_id_and_members() {
-        let mut g = Global::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx);
         g.asn = 65001;
         let conf = api::Confederation {
             enabled: true,
@@ -6574,7 +6571,8 @@ mod tests {
 
     #[test]
     fn confederation_api_disabled_flag_ignored() {
-        let mut g = Global::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx);
         g.asn = 65001;
         let conf = api::Confederation {
             enabled: false,
@@ -6597,7 +6595,8 @@ mod tests {
             identifier: Some(65000),
             member_as_list: Some(vec![65001, 65002]),
         };
-        let mut g = Global::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx);
         g.asn = 65001;
         if let Some((id, c)) = conf_config
             .enabled

@@ -79,7 +79,7 @@ pub(crate) type TableHandle = Arc<TableManager>;
 pub(crate) struct TableManager {
     pub(crate) shards: Vec<Mutex<TableShard>>,
     rpki: std::sync::RwLock<table::RpkiTable>,
-    pub(crate) kernel_tx: ArcSwapOption<mpsc::UnboundedSender<kernel::KernelRouteChange>>,
+    pub(crate) kernel_handle: ArcSwapOption<kernel::KernelHandle>,
     pub(crate) import_policy: ArcSwapOption<table::PolicyAssignment>,
     pub(crate) export_policy: ArcSwapOption<table::PolicyAssignment>,
     next_sub_id: std::sync::atomic::AtomicU64,
@@ -105,7 +105,7 @@ impl TableManager {
                 })
                 .collect(),
             rpki: std::sync::RwLock::new(table::RpkiTable::new()),
-            kernel_tx: ArcSwapOption::const_empty(),
+            kernel_handle: ArcSwapOption::const_empty(),
             import_policy: ArcSwapOption::const_empty(),
             export_policy: ArcSwapOption::const_empty(),
             next_sub_id: std::sync::atomic::AtomicU64::new(0),
@@ -231,7 +231,7 @@ impl TableManager {
         timestamp: std::time::SystemTime,
     ) -> bool {
         let import_policy = self.import_policy.load_full();
-        let kernel_tx = self.kernel_tx.load_full();
+        let kernel_handle = self.kernel_handle.load_full();
         let idx = self.dealer(&net.nlri);
         let mut t = self.shards[idx].lock().await;
         t.notify_adj_rib_in(
@@ -266,7 +266,7 @@ impl TableManager {
         ) {
             table::InsertResult::PrefixLimitExceeded => return true,
             table::InsertResult::Changed(update) => {
-                t.distribute_update(update, kernel_tx.as_deref());
+                t.distribute_update(update, kernel_handle.as_deref());
             }
             table::InsertResult::NoChange => {}
         }
@@ -282,7 +282,7 @@ impl TableManager {
         prefix_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
         timestamp: std::time::SystemTime,
     ) {
-        let kernel_tx = self.kernel_tx.load_full();
+        let kernel_handle = self.kernel_handle.load_full();
         let idx = self.dealer(&net.nlri);
         let mut t = self.shards[idx].lock().await;
         t.notify_adj_rib_in(
@@ -298,7 +298,7 @@ impl TableManager {
             .rtable
             .remove(source, family, net.nlri, net.path_id, counter_ref)
         {
-            t.distribute_update(update, kernel_tx.as_deref());
+            t.distribute_update(update, kernel_handle.as_deref());
         }
     }
 
@@ -306,10 +306,10 @@ impl TableManager {
     /// across every shard and distributes any routing changes to peers.
     pub(crate) async fn soft_reset_in(&self, peer: IpAddr) {
         let import_policy = self.import_policy.load_full();
-        let kernel_tx = self.kernel_tx.load_full();
+        let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
             let mut t = shard.lock().await;
-            t.soft_reset_in(peer, import_policy.as_deref(), kernel_tx.as_deref());
+            t.soft_reset_in(peer, import_policy.as_deref(), kernel_handle.as_deref());
         }
     }
 
@@ -336,31 +336,31 @@ impl TableManager {
     }
 
     pub(crate) async fn drop_families(&self, addr: IpAddr, families: &[Family]) {
-        let kernel_tx = self.kernel_tx.load_full();
+        let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
             let mut t = shard.lock().await;
             for &family in families {
-                t.disconnected(addr, family, kernel_tx.as_deref());
+                t.disconnected(addr, family, kernel_handle.as_deref());
             }
         }
     }
 
     pub(crate) async fn drop_stale_families(&self, addr: IpAddr, families: &[Family]) {
-        let kernel_tx = self.kernel_tx.load_full();
+        let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
             let mut t = shard.lock().await;
             for &family in families {
-                t.drop_stale(addr, family, kernel_tx.as_deref());
+                t.drop_stale(addr, family, kernel_handle.as_deref());
             }
         }
     }
 
     pub(crate) async fn end_deferral_families(&self, families: &[Family]) {
-        let kernel_tx = self.kernel_tx.load_full();
+        let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
             let mut t = shard.lock().await;
             for &family in families {
-                t.end_deferral(family, kernel_tx.as_deref());
+                t.end_deferral(family, kernel_handle.as_deref());
             }
         }
     }
@@ -602,16 +602,16 @@ impl TableManager {
         drop_families: &[Family],
         stale_families: &[Family],
     ) {
-        let kernel_tx = self.kernel_tx.load_full();
+        let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
             let mut t = shard.lock().await;
             t.peer_event_tx.remove(&addr);
             t.addpath.remove(&addr);
             for &family in drop_families {
-                t.disconnected(addr, family, kernel_tx.as_deref());
+                t.disconnected(addr, family, kernel_handle.as_deref());
             }
             for &family in stale_families {
-                t.mark_stale(addr, family, kernel_tx.as_deref());
+                t.mark_stale(addr, family, kernel_handle.as_deref());
             }
         }
     }
@@ -721,39 +721,6 @@ fn nlri_family(nlri: &packet::Nlri) -> Family {
     }
 }
 
-/// Consume a stream of `kernel::KernelRouteEvent`s and inject/withdraw routes into
-/// the BGP RIB.
-///
-/// `redistribute` is the list of `kernel::Protocol` values to accept; events
-/// from other protocols are silently dropped.  Pass an empty list to accept all
-/// protocols.
-///
-/// Accepts any `Stream<Item = kernel::KernelRouteEvent>` so callers can substitute a
-/// mock channel in tests.
-pub(crate) async fn run_kernel_routes(
-    tables: Arc<TableManager>,
-    mut rx: impl futures::Stream<Item = kernel::KernelRouteEvent> + Unpin + Send,
-    redistribute: Vec<kernel::Protocol>,
-) {
-    use futures::StreamExt;
-    while let Some(event) = rx.next().await {
-        match event {
-            kernel::KernelRouteEvent::Add(kr) => {
-                if !redistribute.is_empty() && !redistribute.contains(&kr.protocol) {
-                    continue;
-                }
-                tables.inject_kernel_route(kr).await;
-            }
-            kernel::KernelRouteEvent::Delete(kr) => {
-                if !redistribute.is_empty() && !redistribute.contains(&kr.protocol) {
-                    continue;
-                }
-                tables.withdraw_kernel_route(kr.dst, kr.prefix_len).await;
-            }
-        }
-    }
-}
-
 pub(crate) struct TableShard {
     pub(crate) rtable: table::Table,
     pub(crate) peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
@@ -770,10 +737,10 @@ impl TableShard {
         &mut self,
         addr: IpAddr,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
+        kernel_handle: Option<&kernel::KernelHandle>,
     ) {
         for change in self.rtable.drop(addr, family) {
-            self.distribute_update(change, kernel_tx);
+            self.distribute_update(change, kernel_handle);
         }
     }
 
@@ -781,10 +748,10 @@ impl TableShard {
         &mut self,
         addr: IpAddr,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
+        kernel_handle: Option<&kernel::KernelHandle>,
     ) {
         for change in self.rtable.restale(addr, family) {
-            self.distribute_update(change, kernel_tx);
+            self.distribute_update(change, kernel_handle);
         }
     }
 
@@ -814,11 +781,11 @@ impl TableShard {
     fn distribute_update(
         &self,
         update: table::NlriChange,
-        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
+        kernel_handle: Option<&kernel::KernelHandle>,
     ) {
         // Kernel route update for rank-1 best (raw, without export policy).
-        // kernel_tx is rarely set, so check it first.
-        if let Some(tx) = kernel_tx
+        // kernel_handle is rarely set, so check it first.
+        if let Some(handle) = kernel_handle
             && update.best_changed
         {
             let nexthops: Vec<_> = if update.new_best().is_none() {
@@ -830,7 +797,7 @@ impl TableShard {
                     .filter_map(|p| p.nexthop)
                     .collect()
             };
-            let _ = tx.send(kernel::KernelRouteChange {
+            handle.apply(kernel::KernelRouteChange {
                 net: update.net.clone(),
                 nexthops,
             });
@@ -856,7 +823,7 @@ impl TableShard {
         &mut self,
         peer: std::net::IpAddr,
         import_policy: Option<&table::PolicyAssignment>,
-        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
+        kernel_handle: Option<&kernel::KernelHandle>,
     ) {
         let paths = self.rtable.collect_adj_in_paths(peer);
         for (family, net, remote_path_id, mut nh, source, original_attr, timestamp) in paths {
@@ -874,7 +841,7 @@ impl TableShard {
                 None,
                 timestamp,
             ) {
-                self.distribute_update(update, kernel_tx);
+                self.distribute_update(update, kernel_handle);
             }
         }
     }
@@ -883,20 +850,20 @@ impl TableShard {
         &mut self,
         addr: IpAddr,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
+        kernel_handle: Option<&kernel::KernelHandle>,
     ) {
         for change in self.rtable.drop_stale(addr, family, None) {
-            self.distribute_update(change, kernel_tx);
+            self.distribute_update(change, kernel_handle);
         }
     }
 
     pub(crate) fn end_deferral(
         &mut self,
         family: Family,
-        kernel_tx: Option<&mpsc::UnboundedSender<kernel::KernelRouteChange>>,
+        kernel_handle: Option<&kernel::KernelHandle>,
     ) {
         for change in self.rtable.end_deferral(family) {
-            self.distribute_update(change, kernel_tx);
+            self.distribute_update(change, kernel_handle);
         }
     }
 }
@@ -991,19 +958,17 @@ mod tests {
         assert!(kernel_route_to_path(&kr).is_none());
     }
 
-    // --- run_kernel_routes integration tests (mock stream, no Netlink) ---
+    // --- inject/withdraw kernel route tests (no Netlink needed) ---
 
     fn make_tables() -> Arc<TableManager> {
         Arc::new(TableManager::new(1))
     }
 
     #[tokio::test]
-    async fn run_kernel_routes_injects_static_route() {
-        use futures::stream;
+    async fn inject_kernel_route_adds_path() {
         let tables = make_tables();
         let kr = kr_v4("10.0.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
-        let events = stream::iter(vec![kernel::KernelRouteEvent::Add(kr)]);
-        run_kernel_routes(tables.clone(), events, vec![]).await;
+        tables.inject_kernel_route(kr).await;
         let paths = tables
             .collect_paths(
                 rustybgp_table::TableQuery::Global,
@@ -1017,14 +982,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_kernel_routes_withdraw_removes_route() {
-        use futures::stream;
+    async fn withdraw_kernel_route_removes_path() {
         let tables = make_tables();
         let kr = kr_v4("10.0.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
-        let add = kernel::KernelRouteEvent::Add(kr.clone());
-        let del = kernel::KernelRouteEvent::Delete(kr);
-        let events = stream::iter(vec![add, del]);
-        run_kernel_routes(tables.clone(), events, vec![]).await;
+        tables.inject_kernel_route(kr).await;
+        tables
+            .withdraw_kernel_route("10.0.0.0".parse().unwrap(), 24)
+            .await;
         let paths = tables
             .collect_paths(
                 rustybgp_table::TableQuery::Global,
@@ -1034,34 +998,5 @@ mod tests {
             )
             .await;
         assert_eq!(paths.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn run_kernel_routes_protocol_filter() {
-        use futures::stream;
-        let tables = make_tables();
-        // Add a Kernel (connected) route and a Static route.
-        let connected = kr_v4("10.1.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Kernel);
-        let statik = kr_v4("10.2.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
-        let events = stream::iter(vec![
-            kernel::KernelRouteEvent::Add(connected),
-            kernel::KernelRouteEvent::Add(statik),
-        ]);
-        // Only accept Static; Kernel/connected must be filtered out.
-        run_kernel_routes(tables.clone(), events, vec![kernel::Protocol::Static]).await;
-        let paths = tables
-            .collect_paths(
-                rustybgp_table::TableQuery::Global,
-                Family::IPV4,
-                vec![],
-                false,
-            )
-            .await;
-        assert_eq!(paths.len(), 1);
-        let dst = match &paths[0].net {
-            packet::Nlri::V4(n) => n.addr,
-            _ => panic!("expected V4"),
-        };
-        assert_eq!(dst, Ipv4Addr::new(10, 2, 0, 0));
     }
 }

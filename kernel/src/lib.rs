@@ -338,6 +338,116 @@ impl Handle {
     }
 }
 
+/// An event delivered by [`KernelService`] to the daemon event loop.
+pub enum KernelEvent {
+    Route(KernelRouteEvent),
+}
+
+enum Request {
+    Apply(KernelRouteChange),
+}
+
+/// Shareable sender for submitting kernel FIB changes.
+///
+/// Obtained from [`KernelService::start`]. Multiple clones can be held
+/// concurrently (e.g. from different table shards).
+#[derive(Clone)]
+pub struct KernelHandle {
+    tx: tokio::sync::mpsc::UnboundedSender<Request>,
+}
+
+impl KernelHandle {
+    /// Schedule a FIB install or withdraw.
+    ///
+    /// Fire-and-forget: the actual Netlink call happens inside the
+    /// [`KernelService`] task. Errors are logged there.
+    pub fn apply(&self, change: KernelRouteChange) {
+        let _ = self.tx.send(Request::Apply(change));
+    }
+}
+
+/// Lifecycle owner for the kernel integration background task.
+///
+/// Drop to stop the task. Obtained from [`KernelService::start`].
+pub struct KernelService {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl KernelService {
+    /// Start the kernel integration service.
+    ///
+    /// Spawns an internal task that drives the Netlink route-monitor socket,
+    /// filters route events (skipping BGP-tagged echoes and non-redistributed
+    /// protocols), forwards matching events to `event_tx`, and processes
+    /// [`KernelHandle::apply`] requests via Netlink.
+    ///
+    /// Returns `(service, handle)`. The `handle` can be cloned freely; all
+    /// clones share the same channel into this service. Drop `service` to stop
+    /// the background task.
+    pub fn start(
+        redistribute: Vec<Protocol>,
+        event_tx: tokio::sync::mpsc::UnboundedSender<KernelEvent>,
+    ) -> Result<(Self, KernelHandle), Error> {
+        let (handle, connection, route_events) = Handle::with_route_monitor()?;
+        let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_service_loop(
+            handle,
+            connection,
+            route_events,
+            req_rx,
+            event_tx,
+            redistribute,
+        ));
+        Ok((Self { task }, KernelHandle { tx: req_tx }))
+    }
+}
+
+impl Drop for KernelService {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn run_service_loop(
+    handle: Handle,
+    connection: impl Future<Output = ()> + Send + 'static,
+    mut route_events: impl futures::Stream<Item = KernelRouteEvent> + Unpin + Send,
+    mut req_rx: tokio::sync::mpsc::UnboundedReceiver<Request>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<KernelEvent>,
+    redistribute: Vec<Protocol>,
+) {
+    tokio::spawn(connection);
+    loop {
+        tokio::select! {
+            event = route_events.next() => {
+                let Some(event) = event else { break };
+                let protocol = match &event {
+                    KernelRouteEvent::Add(kr) | KernelRouteEvent::Delete(kr) => kr.protocol,
+                };
+                // Skip routes we installed ourselves to avoid processing our own echoes.
+                if protocol == RouteProtocol::Bgp {
+                    continue;
+                }
+                // Apply redistribution filter (empty list = accept all protocols).
+                if !redistribute.is_empty() && !redistribute.contains(&protocol) {
+                    continue;
+                }
+                let _ = event_tx.send(KernelEvent::Route(event));
+            }
+            req = req_rx.recv() => {
+                let Some(req) = req else { break };
+                match req {
+                    Request::Apply(change) => {
+                        if let Err(e) = handle.apply(&change).await {
+                            log::error!("kernel route update failed: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn parse_route_event(
     msg: rtnetlink::packet_core::NetlinkMessage<RouteNetlinkMessage>,
 ) -> Option<KernelRouteEvent> {
