@@ -879,9 +879,19 @@ impl TableShard {
                     .filter_map(|p| p.nexthop)
                     .collect()
             };
+            let metric = update
+                .new_best()
+                .and_then(|p| {
+                    p.attr
+                        .iter()
+                        .find(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
+                })
+                .and_then(|a| a.value())
+                .unwrap_or(0);
             handle.apply(kernel::KernelRouteChange {
                 net: update.net.clone(),
                 nexthops,
+                metric,
             });
         }
 

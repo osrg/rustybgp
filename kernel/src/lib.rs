@@ -39,6 +39,10 @@ pub use rtnetlink::packet_route::route::RouteProtocol as Protocol;
 pub struct KernelRouteChange {
     pub net: packet::Nlri,
     pub nexthops: Vec<packet::bgp::Nexthop>,
+    /// RTA_PRIORITY (kernel route metric). Set to the best-path MED value so
+    /// that BGP MED is reflected in the kernel FIB, matching GoBGP behaviour.
+    /// Zero means no explicit priority (kernel default).
+    pub metric: u32,
 }
 
 /// Convert a GoBGP-style route type string to a `Protocol` value.
@@ -165,9 +169,10 @@ impl Handle {
         }
         let addrs: Vec<IpAddr> = change.nexthops.iter().map(|nh| nh.addr()).collect();
         let result = if addrs.len() == 1 {
-            self.install(dst, prefix_len, addrs[0], 0).await
+            self.install(dst, prefix_len, addrs[0], change.metric).await
         } else {
-            self.install_ecmp(dst, prefix_len, &addrs).await
+            self.install_ecmp(dst, prefix_len, &addrs, change.metric)
+                .await
         };
         match result {
             Err(Error::FamilyMismatch) => Ok(()),
@@ -184,6 +189,7 @@ impl Handle {
         dst: IpAddr,
         prefix_len: u8,
         nexthops: &[IpAddr],
+        metric: u32,
     ) -> Result<(), Error> {
         match dst {
             IpAddr::V4(dst_v4) => {
@@ -202,6 +208,7 @@ impl Handle {
                 let msg = RouteMessageBuilder::<Ipv4Addr>::new()
                     .destination_prefix(dst_v4, prefix_len)
                     .protocol(RouteProtocol::Bgp)
+                    .priority(metric)
                     .multipath(nhs)
                     .build();
                 self.inner.route().add(msg).replace().execute().await?;
@@ -222,6 +229,7 @@ impl Handle {
                 let msg = RouteMessageBuilder::<Ipv6Addr>::new()
                     .destination_prefix(dst_v6, prefix_len)
                     .protocol(RouteProtocol::Bgp)
+                    .priority(metric)
                     .multipath(nhs)
                     .build();
                 self.inner.route().add(msg).replace().execute().await?;
@@ -815,6 +823,7 @@ mod tests {
             .apply(&KernelRouteChange {
                 net,
                 nexthops: vec![nh],
+                metric: 0,
             })
             .await
             .unwrap();
@@ -836,6 +845,7 @@ mod tests {
             .apply(&KernelRouteChange {
                 net: net.clone(),
                 nexthops: vec![nh],
+                metric: 0,
             })
             .await
             .unwrap();
@@ -843,6 +853,7 @@ mod tests {
             .apply(&KernelRouteChange {
                 net,
                 nexthops: vec![],
+                metric: 0,
             })
             .await
             .unwrap();
@@ -865,6 +876,7 @@ mod tests {
             .apply(&KernelRouteChange {
                 net,
                 nexthops: vec![nh1, nh2],
+                metric: 0,
             })
             .await
             .unwrap();
@@ -891,6 +903,7 @@ mod tests {
             .apply(&KernelRouteChange {
                 net,
                 nexthops: vec![nh1, nh2],
+                metric: 0,
             })
             .await
             .unwrap();
@@ -915,6 +928,7 @@ mod tests {
             .apply(&KernelRouteChange {
                 net,
                 nexthops: vec![nh],
+                metric: 0,
             })
             .await;
         assert!(
@@ -978,6 +992,7 @@ mod tests {
         handle.apply(KernelRouteChange {
             net,
             nexthops: vec![nh],
+            metric: 0,
         });
 
         // Wait generously for the Netlink echo to be generated and processed
