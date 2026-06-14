@@ -15,7 +15,7 @@
 
 use bytes::BytesMut;
 use rustybgp_packet::bgp::{
-    Attribute, Ipv4Net, Ipv6Net, Message, ParsedMessage, ParsedUpdate, PeerCodecBuilder, ReachNlri,
+    Attribute, Ipv4Net, Ipv6Net, Message, ParsedMessage, ParsedUpdate, PeerCodec, ReachNlri,
     UnreachNlri, Update,
 };
 use rustybgp_packet::{Family, Nlri, PathNlri};
@@ -30,7 +30,7 @@ fn ipv6_eor() {
         0x00, 0x1e, 0x02, 0x00, 0x00, 0x00, 0x07, 0x90, 0x0f, 0x00, 0x03, 0x00, 0x02, 0x01,
     ];
     buf.append(&mut body);
-    let mut codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
+    let mut codec = PeerCodec::new(&[Family::IPV6]);
     assert!(codec.parse_message(&buf).is_ok());
 }
 
@@ -67,7 +67,7 @@ fn parse_ipv6_update() {
     .map(PathNlri::new)
     .collect();
 
-    let mut codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
+    let mut codec = PeerCodec::new(&[Family::IPV6]);
     let msg = codec.parse_message(&buf).unwrap();
     match msg {
         ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
@@ -110,7 +110,7 @@ fn build_many_v4_route() {
         unreach: None,
     });
 
-    let codec = PeerCodecBuilder::new().families(vec![Family::IPV4]).build();
+    let codec = PeerCodec::new(&[Family::IPV4]);
     let mut txbuf = BytesMut::with_capacity(4096);
     let mut framer = codec;
     framer.encode_to(&msg, &mut txbuf).unwrap();
@@ -188,7 +188,7 @@ fn many_mp_reach() {
         unreach: None,
     });
 
-    let codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
+    let codec = PeerCodec::new(&[Family::IPV6]);
     let mut txbuf = BytesMut::with_capacity(4096);
     let mut framer = codec;
     framer.encode_to(&msg, &mut txbuf).unwrap();
@@ -232,7 +232,7 @@ fn many_mp_unreach() {
         }),
     });
 
-    let codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
+    let codec = PeerCodec::new(&[Family::IPV6]);
     let mut txbuf = BytesMut::with_capacity(4096);
     let mut framer = codec;
     framer.encode_to(&msg, &mut txbuf).unwrap();

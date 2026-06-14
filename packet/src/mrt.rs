@@ -122,7 +122,7 @@ impl Default for MrtCodec {
 impl MrtCodec {
     pub fn new() -> Self {
         MrtCodec {
-            codec: bgp::PeerCodecBuilder::new().build(),
+            codec: bgp::PeerCodec::new(&[]),
         }
     }
 }
@@ -148,9 +148,13 @@ impl Encoder<&Message> for MrtCodec {
                     } else {
                         unreach.as_ref().unwrap().family
                     };
-                    self.codec
-                        .channel
-                        .insert(family, bgp::Channel::new(family, false, *addpath));
+                    self.codec.families.insert(
+                        family,
+                        bgp::FamilyState {
+                            addpath_rx: false,
+                            addpath_tx: *addpath,
+                        },
+                    );
                 }
                 let subtype = if *addpath {
                     Header::SUBTYPE_AS4_ADDPATH

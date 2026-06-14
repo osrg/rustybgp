@@ -98,7 +98,7 @@ pub(crate) enum Output {
     SetHoldTimer(u64),
     /// Negotiated address-family channels. The driver should configure its
     /// PeerCodec with these.
-    ChannelsNegotiated(FnvHashMap<Family, bgp::Channel>),
+    ChannelsNegotiated(bgp::NegotiatedSession),
     /// The session reached Established. The driver should register the peer
     /// as a route source, populate initial routes, etc.
     SessionEstablished {
@@ -276,14 +276,13 @@ impl Connection {
         out.push(Output::SendMessage(bgp::Message::Keepalive));
 
         // Negotiate capabilities
-        let channels: FnvHashMap<Family, bgp::Channel> =
-            bgp::create_channel(&self.local_cap, &open.capability).collect();
+        let session = bgp::negotiate_families(&self.local_cap, &open.capability);
 
         // Retain send_max only for families where Add-Path TX was negotiated
         self.send_max
-            .retain(|f, _| channels.get(f).is_some_and(|c| c.addpath_tx()));
+            .retain(|f, _| session.families.get(f).is_some_and(|s| s.addpath_tx));
 
-        out.push(Output::ChannelsNegotiated(channels));
+        out.push(Output::ChannelsNegotiated(session));
 
         // Negotiate holdtime
         self.negotiated_holdtime = std::cmp::min(self.local_holdtime, self.remote_holdtime as u64);

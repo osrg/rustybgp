@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use rustybgp_packet::bgp::{
-    Capability, Message, Open, ParsedMessage, PeerCodecBuilder, create_channel,
+    Capability, Message, Open, ParsedMessage, PeerCodec, negotiate_families,
 };
 use rustybgp_packet::{Family, HoldTime, Notification};
 use std::net::Ipv4Addr;
@@ -52,14 +52,14 @@ fn parse_open_caps(cap_bytes: &[u8]) -> Vec<Capability> {
         1,
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
-    match PeerCodecBuilder::new().build().parse_message(&buf).unwrap() {
+    match PeerCodec::new(&[]).parse_message(&buf).unwrap() {
         ParsedMessage::Open(Open { capability, .. }) => capability,
         _ => panic!("expected OPEN"),
     }
 }
 
 fn round_trip(msg: &Message) -> ParsedMessage {
-    let mut framer = PeerCodecBuilder::new().build();
+    let mut framer = PeerCodec::new(&[]);
     let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
     framer.parse_message(&buf).unwrap()
@@ -161,7 +161,7 @@ fn capability_graceful_restart_invalid_len() {
         1,
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
-    match PeerCodecBuilder::new().build().parse_message(&buf) {
+    match PeerCodec::new(&[]).parse_message(&buf) {
         Err(Notification::OpenMalformed) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
@@ -217,7 +217,7 @@ fn capability_add_path_invalid_len() {
         1,
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
-    match PeerCodecBuilder::new().build().parse_message(&buf) {
+    match PeerCodec::new(&[]).parse_message(&buf) {
         Err(Notification::OpenMalformed) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
@@ -306,11 +306,11 @@ fn capability_llgr_round_trip() {
     }
 }
 
-// ─── create_channel negotiation ──────────────────────────────────────────────
+// ─── negotiate_families ──────────────────────────────────────────────────────
 
 #[test]
-fn create_channel_addpath_rx_only() {
-    // Local wants RX (1), remote can TX (2) → local channel gets RX
+fn negotiate_families_addpath_rx_only() {
+    // Local wants RX (1), remote can TX (2) → local gets addpath_rx
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 1)]),
@@ -319,16 +319,16 @@ fn create_channel_addpath_rx_only() {
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 2)]),
     ];
-    let channels: Vec<_> = create_channel(&local, &remote).collect();
-    assert_eq!(channels.len(), 1);
-    let (_, ch) = &channels[0];
-    assert!(ch.addpath_rx());
-    assert!(!ch.addpath_tx());
+    let result = negotiate_families(&local, &remote);
+    assert_eq!(result.families.len(), 1);
+    let s = result.families.get(&Family::IPV4).unwrap();
+    assert!(s.addpath_rx);
+    assert!(!s.addpath_tx);
 }
 
 #[test]
-fn create_channel_addpath_tx_only() {
-    // Local can TX (2), remote wants RX (1) → local channel gets TX
+fn negotiate_families_addpath_tx_only() {
+    // Local can TX (2), remote wants RX (1) → local gets addpath_tx
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 2)]),
@@ -337,16 +337,16 @@ fn create_channel_addpath_tx_only() {
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 1)]),
     ];
-    let channels: Vec<_> = create_channel(&local, &remote).collect();
-    assert_eq!(channels.len(), 1);
-    let (_, ch) = &channels[0];
-    assert!(!ch.addpath_rx());
-    assert!(ch.addpath_tx());
+    let result = negotiate_families(&local, &remote);
+    assert_eq!(result.families.len(), 1);
+    let s = result.families.get(&Family::IPV4).unwrap();
+    assert!(!s.addpath_rx);
+    assert!(s.addpath_tx);
 }
 
 #[test]
-fn create_channel_addpath_both() {
-    // Both sides advertise BOTH (3) → channel gets RX+TX
+fn negotiate_families_addpath_both() {
+    // Both sides advertise BOTH (3) → addpath_rx and addpath_tx
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 3)]),
@@ -355,15 +355,15 @@ fn create_channel_addpath_both() {
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 3)]),
     ];
-    let channels: Vec<_> = create_channel(&local, &remote).collect();
-    assert_eq!(channels.len(), 1);
-    let (_, ch) = &channels[0];
-    assert!(ch.addpath_rx());
-    assert!(ch.addpath_tx());
+    let result = negotiate_families(&local, &remote);
+    assert_eq!(result.families.len(), 1);
+    let s = result.families.get(&Family::IPV4).unwrap();
+    assert!(s.addpath_rx);
+    assert!(s.addpath_tx);
 }
 
 #[test]
-fn create_channel_addpath_no_match() {
+fn negotiate_families_addpath_no_match() {
     // Both sides only want RX (1) → neither can TX → no addpath
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
@@ -373,15 +373,15 @@ fn create_channel_addpath_no_match() {
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 1)]),
     ];
-    let channels: Vec<_> = create_channel(&local, &remote).collect();
-    assert_eq!(channels.len(), 1);
-    let (_, ch) = &channels[0];
-    assert!(!ch.addpath_rx());
-    assert!(!ch.addpath_tx());
+    let result = negotiate_families(&local, &remote);
+    assert_eq!(result.families.len(), 1);
+    let s = result.families.get(&Family::IPV4).unwrap();
+    assert!(!s.addpath_rx);
+    assert!(!s.addpath_tx);
 }
 
 #[test]
-fn create_channel_addpath_mismatched_family() {
+fn negotiate_families_addpath_mismatched_family() {
     // Local has AddPath for IPv4, remote for IPv6 → no addpath on either
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
@@ -393,11 +393,11 @@ fn create_channel_addpath_mismatched_family() {
         Capability::MultiProtocol(Family::IPV6),
         Capability::AddPath(vec![(Family::IPV6, 3)]),
     ];
-    let channels: Vec<_> = create_channel(&local, &remote).collect();
-    assert_eq!(channels.len(), 2);
-    for (_, ch) in &channels {
-        assert!(!ch.addpath_rx());
-        assert!(!ch.addpath_tx());
+    let result = negotiate_families(&local, &remote);
+    assert_eq!(result.families.len(), 2);
+    for (_, s) in result.families.iter() {
+        assert!(!s.addpath_rx);
+        assert!(!s.addpath_tx);
     }
 }
 
@@ -441,7 +441,7 @@ fn capability_extended_nexthop_round_trip() {
 }
 
 #[test]
-fn create_channel_extended_nexthop_bilateral() {
+fn negotiate_families_extended_nexthop_bilateral() {
     // Both sides advertise ExtendedNexthop for IPv4 unicast
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
@@ -451,27 +451,27 @@ fn create_channel_extended_nexthop_bilateral() {
         Capability::MultiProtocol(Family::IPV4),
         Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
     ];
-    let channels: Vec<_> = create_channel(&local, &remote).collect();
-    assert_eq!(channels.len(), 1);
-    assert_eq!(channels[0].0, Family::IPV4);
+    let result = negotiate_families(&local, &remote);
+    assert_eq!(result.families.len(), 1);
+    assert!(result.families.contains_key(&Family::IPV4));
     assert!(
-        channels[0].1.extended_nexthop(),
+        result.extended_nexthop,
         "extended_nexthop must be true when both sides advertise"
     );
 }
 
 #[test]
-fn create_channel_extended_nexthop_unilateral() {
+fn negotiate_families_extended_nexthop_unilateral() {
     // Only local advertises ExtendedNexthop — should NOT be active
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
         Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
     ];
     let remote = vec![Capability::MultiProtocol(Family::IPV4)];
-    let channels: Vec<_> = create_channel(&local, &remote).collect();
-    assert_eq!(channels.len(), 1);
+    let result = negotiate_families(&local, &remote);
+    assert_eq!(result.families.len(), 1);
     assert!(
-        !channels[0].1.extended_nexthop(),
+        !result.extended_nexthop,
         "extended_nexthop must be false when only one side advertises"
     );
 }

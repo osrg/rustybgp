@@ -15,7 +15,7 @@
 
 use rustybgp_packet::bgp::Ipv4Net;
 use rustybgp_packet::bgp::{
-    Attribute, Message, ParsedMessage, ParsedUpdate, PeerCodecBuilder, ReachNlri, Update,
+    Attribute, Message, ParsedMessage, ParsedUpdate, PeerCodec, ReachNlri, Update,
 };
 use rustybgp_packet::{Family, Nlri, PathNlri};
 use std::net::Ipv4Addr;
@@ -24,7 +24,7 @@ use std::sync::Arc;
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn ipv4_codec() -> rustybgp_packet::bgp::PeerCodec {
-    PeerCodecBuilder::new().families(vec![Family::IPV4]).build()
+    PeerCodec::new(&[Family::IPV4])
 }
 
 fn ipv4_prefix(addr: &str, mask: u8) -> PathNlri {

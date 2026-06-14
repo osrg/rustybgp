@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use bytes::{BufMut, BytesMut};
-use rustybgp_packet::bgp::{Message, ParsedMessage, PeerCodecBuilder};
+use rustybgp_packet::bgp::{Message, ParsedMessage, PeerCodec};
 use rustybgp_packet::{Family, Notification};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -29,7 +29,7 @@ fn bgp_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
 }
 
 fn default_codec() -> rustybgp_packet::bgp::PeerCodec {
-    PeerCodecBuilder::new().build()
+    PeerCodec::new(&[])
 }
 
 fn round_trip(msg: &Message) -> ParsedMessage {
@@ -264,7 +264,7 @@ fn framer_bad_header_length() {
     buf.extend_from_slice(&[0xff; 16]);
     buf.extend_from_slice(&10u16.to_be_bytes()); // length field = 10 (< minimum 19)
     buf.put_u8(4); // KEEPALIVE
-    let mut framer = PeerCodecBuilder::new().build();
+    let mut framer = PeerCodec::new(&[]);
     match framer.try_parse(&mut buf) {
         Err(Notification::BadMessageLength { .. }) => {}
         Ok(_) => panic!("expected error"),

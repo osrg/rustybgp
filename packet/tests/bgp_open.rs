@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustybgp_packet::bgp::{Capability, Message, Open, ParsedMessage, PeerCodecBuilder};
+use rustybgp_packet::bgp::{Capability, Message, Open, ParsedMessage, PeerCodec};
 use rustybgp_packet::{Family, HoldTime, Notification};
 use std::net::Ipv4Addr;
 
@@ -47,8 +47,8 @@ fn capability_param(cap_bytes: &[u8]) -> Vec<u8> {
     p
 }
 
-fn default_codec() -> PeerCodecBuilder {
-    PeerCodecBuilder::new()
+fn default_codec() -> PeerCodec {
+    PeerCodec::new(&[])
 }
 
 // ─── parse tests ────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ fn default_codec() -> PeerCodecBuilder {
 fn open_minimal_parse() {
     // OPEN with no optional parameters
     let buf = bgp_msg(1, &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &[]));
-    let mut codec = default_codec().build();
+    let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
         ParsedMessage::Open(Open {
             as_number,
@@ -87,7 +87,7 @@ fn open_with_multiprotocol_ipv4() {
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
 
-    let mut codec = default_codec().build();
+    let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
         ParsedMessage::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
@@ -110,7 +110,7 @@ fn open_with_multiprotocol_ipv6() {
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
 
-    let mut codec = default_codec().build();
+    let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
         ParsedMessage::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
@@ -136,7 +136,7 @@ fn open_with_four_octet_asn() {
         &open_body(23456, 90, "192.0.2.1".parse().unwrap(), &params),
     );
 
-    let mut codec = default_codec().build();
+    let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
         ParsedMessage::Open(Open {
             as_number,
@@ -165,7 +165,7 @@ fn open_with_route_refresh() {
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
 
-    let mut codec = default_codec().build();
+    let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
         ParsedMessage::Open(Open { capability, .. }) => {
             assert!(
@@ -189,7 +189,7 @@ fn open_round_trip_minimal() {
         capability: vec![],
     });
 
-    let mut framer = default_codec().build();
+    let mut framer = default_codec();
     let mut buf = Vec::new();
     framer.encode_to(&original, &mut buf).unwrap();
     let parsed = framer.parse_message(&buf).unwrap();
@@ -227,7 +227,7 @@ fn open_round_trip_with_capabilities() {
         ],
     });
 
-    let mut framer = default_codec().build();
+    let mut framer = default_codec();
     let mut buf = Vec::new();
     framer.encode_to(&original, &mut buf).unwrap();
     let parsed = framer.parse_message(&buf).unwrap();
@@ -273,7 +273,7 @@ fn open_too_short() {
     // Message shorter than minimum OPEN length (29 bytes)
     let body: &[u8] = &[4, 0xFD, 0xEA, 0x00, 0x5A]; // partial body
     let buf = bgp_msg(1, body);
-    let mut codec = default_codec().build();
+    let mut codec = default_codec();
     match codec.parse_message(&buf) {
         Err(Notification::BadMessageLength { .. }) => {}
         Ok(_) => panic!("expected error"),
@@ -289,7 +289,7 @@ fn open_unacceptable_holdtime() {
             1,
             &open_body(65001, bad_holdtime, "192.0.2.1".parse().unwrap(), &[]),
         );
-        let mut codec = default_codec().build();
+        let mut codec = default_codec();
         match codec.parse_message(&buf) {
             Err(Notification::OpenUnacceptableHoldTime { .. }) => {}
             Ok(_) => panic!("expected error for holdtime={}", bad_holdtime),
@@ -306,7 +306,7 @@ fn open_unsupported_optional_parameter() {
         1,
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), params),
     );
-    let mut codec = default_codec().build();
+    let mut codec = default_codec();
     match codec.parse_message(&buf) {
         Err(Notification::OpenUnsupportedOptionalParameter { .. }) => {}
         Ok(_) => panic!("expected error"),

@@ -4787,7 +4787,7 @@ impl PeerExportContext {
     /// The codec handles only wire framing; all attribute transformation and
     /// loop detection is handled in the daemon.
     fn build_codec(&self) -> bgp::PeerCodec {
-        bgp::PeerCodecBuilder::new().build()
+        bgp::PeerCodec::new(&[])
     }
 
     /// Apply per-peer attribute transformation to outgoing route attributes.
@@ -5060,7 +5060,7 @@ impl PeerSession {
         let conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(fsm)));
         context.lock().unwrap().conn_arbiter = Arc::clone(&conn_arbiter);
 
-        let framer = bgp::PeerCodecBuilder::new().build();
+        let framer = bgp::PeerCodec::new(&[]);
 
         PeerSession {
             remote_addr,
@@ -5165,9 +5165,9 @@ impl PeerSession {
         // Collect channel info up front so we don't borrow self.framer across .await.
         let channel_info: Vec<(Family, bool, bool)> = self
             .framer
-            .channel
+            .families
             .iter()
-            .map(|(f, c)| (*f, c.addpath_rx(), c.addpath_tx()))
+            .map(|(f, s)| (*f, s.addpath_rx, s.addpath_tx))
             .collect();
 
         // Create one Source per negotiated family so GR can stale individual families.
@@ -5335,16 +5335,16 @@ impl PeerSession {
                         .flatten()
                         .collect();
                     for (family, mode) in &local_addpath {
-                        match channels.get(family) {
-                            Some(ch) => {
-                                if mode & 0x1 > 0 && !ch.addpath_rx() {
+                        match channels.families.get(family) {
+                            Some(s) => {
+                                if mode & 0x1 > 0 && !s.addpath_rx {
                                     log::warn!(
                                         "add-path receive configured for {:?} but not negotiated with peer {}",
                                         family,
                                         self.remote_addr
                                     );
                                 }
-                                if mode & 0x2 > 0 && !ch.addpath_tx() {
+                                if mode & 0x2 > 0 && !s.addpath_tx {
                                     log::warn!(
                                         "add-path send configured for {:?} but not negotiated with peer {}",
                                         family,
@@ -5361,7 +5361,8 @@ impl PeerSession {
                             }
                         }
                     }
-                    self.framer.channel = channels;
+                    self.framer.extended_nexthop = channels.extended_nexthop;
+                    self.framer.families = channels.families;
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -5550,12 +5551,7 @@ impl PeerSession {
             // traditional NLRI section or via MP_REACH_NLRI (when RFC 8950
             // Extended Nexthop is negotiated). Every other family must use
             // MP_REACH_NLRI.
-            let use_mp = *family != packet::Family::IPV4
-                || self
-                    .framer
-                    .channel
-                    .get(family)
-                    .is_some_and(|c| c.extended_nexthop());
+            let use_mp = *family != packet::Family::IPV4 || self.framer.extended_nexthop;
             for msg in p.drain_messages(*family, use_mp) {
                 let _ = self.framer.encode_to(&msg, &mut txbuf);
                 self.counter_tx.sync(&msg);
@@ -5685,7 +5681,7 @@ impl PeerSession {
         if self.conn_arbiter.lock().unwrap().state(self.role) != SessionState::Established {
             return;
         }
-        if !self.framer.channel.contains_key(&update.family) {
+        if !self.framer.families.contains_key(&update.family) {
             return;
         }
         let effective_max = self
@@ -7743,9 +7739,13 @@ mod tests {
     /// Prepare a PeerSession for tests: open the IPv4 channel
     /// and insert an IPv4 pending bucket, matching what on_established would do.
     fn setup_ipv4_session(conn: &mut PeerSession) {
-        conn.framer
-            .channel
-            .insert(Family::IPV4, bgp::Channel::new(Family::IPV4, false, false));
+        conn.framer.families.insert(
+            Family::IPV4,
+            bgp::FamilyState {
+                addpath_rx: false,
+                addpath_tx: false,
+            },
+        );
         conn.pending
             .insert(Family::IPV4, crate::peer_tx::PendingTx::new(false));
     }

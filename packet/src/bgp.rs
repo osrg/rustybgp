@@ -1592,61 +1592,32 @@ impl Message {
     }
 }
 
-pub struct Channel {
-    family: Family,
-    addpath: u8,
-    extended_nexthop: bool,
+/// Per-family negotiated ADD-PATH capability state.
+pub struct FamilyState {
+    pub addpath_rx: bool,
+    pub addpath_tx: bool,
 }
 
-impl Channel {
-    pub fn addpath_rx(&self) -> bool {
-        self.addpath & 0x1 > 0
-    }
-
-    pub fn addpath_tx(&self) -> bool {
-        self.addpath & 0x2 > 0
-    }
-
-    pub fn extended_nexthop(&self) -> bool {
-        self.extended_nexthop
-    }
-
-    pub fn set_extended_nexthop(&mut self, enabled: bool) {
-        assert!(
-            !enabled || self.family.afi() == Family::AFI_IP,
-            "extended nexthop only valid for IPv4 families"
-        );
-        self.extended_nexthop = enabled;
-    }
-
-    pub fn new(family: Family, rx: bool, tx: bool) -> Self {
-        let mut addpath = 0;
-        if rx {
-            addpath |= 0x1;
-        }
-        if tx {
-            addpath |= 0x2;
-        }
-        Channel {
-            family,
-            addpath,
-            extended_nexthop: false,
-        }
-    }
+/// Result of capability negotiation for a BGP session.
+pub struct NegotiatedSession {
+    /// Active families with their ADD-PATH state.
+    pub families: FnvHashMap<Family, FamilyState>,
+    /// RFC 8950: IPv4 NLRIs use IPv6 next hops (both sides must agree).
+    pub extended_nexthop: bool,
 }
 
-pub fn create_channel(
-    local: &[Capability],
-    remote: &[Capability],
-) -> impl Iterator<Item = (Family, Channel)> {
-    let f = |v: &[Capability]| -> FnvHashMap<Family, Channel> {
-        let mut h = FnvHashMap::default();
+pub fn negotiate_families(local: &[Capability], remote: &[Capability]) -> NegotiatedSession {
+    struct Raw {
+        addpath: u8,
+        extended_nexthop: bool,
+    }
+    let parse = |v: &[Capability]| -> FnvHashMap<Family, Raw> {
+        let mut h: FnvHashMap<Family, Raw> = FnvHashMap::default();
         for c in v {
             if let Capability::MultiProtocol(f) = c {
                 h.insert(
                     *f,
-                    Channel {
-                        family: *f,
+                    Raw {
                         addpath: 0,
                         extended_nexthop: false,
                     },
@@ -1665,8 +1636,6 @@ pub fn create_channel(
         for c in v {
             if let Capability::ExtendedNexthop(v) = c {
                 for (f, nexthop_afi) in v {
-                    // RFC 8950: extended nexthop is only valid for IPv4 families;
-                    // skip (don't panic) if a peer advertises it for other AFIs.
                     if f.afi() != Family::AFI_IP {
                         continue;
                     }
@@ -1680,68 +1649,58 @@ pub fn create_channel(
         }
         h
     };
-    let mut l = f(local);
-    f(remote).into_iter().filter_map(move |(f, rc)| {
-        l.remove(&f).map(|lc| {
-            (
+    let mut lmap = parse(local);
+    let mut families = FnvHashMap::default();
+    let mut extended_nexthop = false;
+    for (f, rc) in parse(remote) {
+        if let Some(lc) = lmap.remove(&f) {
+            let addpath_rx = lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0;
+            let addpath_tx = lc.addpath & 0x2 > 0 && rc.addpath & 0x1 > 0;
+            if lc.extended_nexthop && rc.extended_nexthop {
+                extended_nexthop = true;
+            }
+            families.insert(
                 f,
-                Channel {
-                    family: f,
-                    addpath: {
-                        let rx = u8::from(lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0);
-                        let tx = u8::from(lc.addpath & 0x2 > 0 && rc.addpath & 0x1 > 0);
-                        rx | (tx << 1)
-                    },
-                    extended_nexthop: lc.extended_nexthop & rc.extended_nexthop,
+                FamilyState {
+                    addpath_rx,
+                    addpath_tx,
                 },
-            )
-        })
-    })
-}
-
-pub struct PeerCodecBuilder {
-    extended_length: bool,
-    family: Vec<Family>,
-}
-
-impl Default for PeerCodecBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PeerCodecBuilder {
-    pub fn new() -> Self {
-        PeerCodecBuilder {
-            extended_length: false,
-            family: Vec::new(),
+            );
         }
     }
-
-    pub fn build(&mut self) -> PeerCodec {
-        let channel = self
-            .family
-            .iter()
-            .map(|f| (*f, Channel::new(*f, false, false)))
-            .collect();
-        PeerCodec {
-            extended_length: self.extended_length,
-            channel,
-        }
-    }
-
-    pub fn families(&mut self, v: Vec<Family>) -> &mut Self {
-        self.family = v;
-        self
+    NegotiatedSession {
+        families,
+        extended_nexthop,
     }
 }
 
 pub struct PeerCodec {
-    extended_length: bool,
-    pub channel: FnvHashMap<Family, Channel>,
+    pub extended_length: bool,
+    /// RFC 8950: IPv4 NLRIs use IPv6 next hops.
+    pub extended_nexthop: bool,
+    pub families: FnvHashMap<Family, FamilyState>,
 }
 
 impl PeerCodec {
+    pub fn new(families: &[Family]) -> Self {
+        PeerCodec {
+            extended_length: false,
+            extended_nexthop: false,
+            families: families
+                .iter()
+                .map(|f| {
+                    (
+                        *f,
+                        FamilyState {
+                            addpath_rx: false,
+                            addpath_tx: false,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
     pub fn max_message_length(&self) -> usize {
         if self.extended_length {
             Message::MAX_EXTENDED_LENGTH
@@ -1789,7 +1748,7 @@ impl PeerCodec {
         dst.put_slice(&padded);
         // padding
         dst.put_u8(0);
-        let addpath = self.channel.get(family).is_some_and(|c| c.addpath_tx());
+        let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
         let max_len = 1 + 16 + if addpath { 4 } else { 0 };
         for (i, item) in nets.iter().enumerate().skip(*reach_idx) {
             let PathNlri {
@@ -1834,7 +1793,7 @@ impl PeerCodec {
         dst.put_u16(0);
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
-        let addpath = self.channel.get(family).is_some_and(|c| c.addpath_tx());
+        let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
         let max_len = 1 + 16 + if addpath { 4 } else { 0 };
         for (i, item) in nets.iter().enumerate().skip(*unreach_idx) {
             let PathNlri {
@@ -1918,12 +1877,9 @@ impl PeerCodec {
                         .map(|r| r.family)
                         .or_else(|| unreach.as_ref().map(|u| u.family))
                         .unwrap_or(Family::IPV4);
-                    let addpath = self.channel.get(&family).is_some_and(|c| c.addpath_tx());
+                    let addpath = self.families.get(&family).is_some_and(|s| s.addpath_tx);
                     // RFC 8950: IPv4 uses MP_REACH_NLRI when extended nexthop is negotiated.
-                    let ipv4_via_mp = self
-                        .channel
-                        .get(&Family::IPV4)
-                        .is_some_and(|c| c.extended_nexthop());
+                    let ipv4_via_mp = self.extended_nexthop;
                     dst.put_u8(Message::UPDATE);
                     let pos_withdrawn_len = dst.as_mut().len();
                     dst.put_u16(0);
@@ -2067,12 +2023,12 @@ impl PeerCodec {
     }
 
     fn decode_nlri<C: ParseContext>(
-        &self,
-        chan: &Channel,
+        family: Family,
+        addpath_rx: bool,
         c: &mut BgpReader<C>,
         mut len: usize,
     ) -> Result<PathNlri, Notification> {
-        let id = if chan.addpath_rx() {
+        let id = if addpath_rx {
             if len < 4 {
                 return Err(Notification::UpdateMalformedAttributeList);
             }
@@ -2082,7 +2038,7 @@ impl PeerCodec {
         } else {
             0
         };
-        Nlri::decode(chan.family, c, len).map(|nlri| PathNlri { path_id: id, nlri })
+        Nlri::decode(family, c, len).map(|nlri| PathNlri { path_id: id, nlri })
     }
     pub fn parse_message(&mut self, buf: &[u8]) -> Result<ParsedMessage, Notification> {
         if buf.len() < Message::HEADER_LENGTH as usize {
@@ -2332,22 +2288,34 @@ impl PeerCodec {
                 }
 
                 if (c.position() as usize) < buf.len() {
-                    let chan = self.channel.get(&Family::IPV4).ok_or_else(malformed)?;
+                    let state = self.families.get(&Family::IPV4).ok_or_else(malformed)?;
+                    let addpath_rx = state.addpath_rx;
                     let mut reader = BgpReader::<UpdateCtx>::new(&buf[c.position() as usize..]);
                     while reader.remaining_len() > 0 {
                         let rest = reader.remaining_len();
-                        reach.push(self.decode_nlri(chan, &mut reader, rest)?);
+                        reach.push(Self::decode_nlri(
+                            Family::IPV4,
+                            addpath_rx,
+                            &mut reader,
+                            rest,
+                        )?);
                     }
                 }
 
                 if 0 < withdrawn_len {
-                    let chan = self.channel.get(&Family::IPV4).ok_or_else(malformed)?;
+                    let state = self.families.get(&Family::IPV4).ok_or_else(malformed)?;
+                    let addpath_rx = state.addpath_rx;
                     let start = Message::HEADER_LENGTH as usize + 2;
                     let mut reader =
                         BgpReader::<UpdateCtx>::new(&buf[start..start + withdrawn_len as usize]);
                     while reader.remaining_len() > 0 {
                         let rest = reader.remaining_len();
-                        unreach.push(self.decode_nlri(chan, &mut reader, rest)?);
+                        unreach.push(Self::decode_nlri(
+                            Family::IPV4,
+                            addpath_rx,
+                            &mut reader,
+                            rest,
+                        )?);
                     }
                 }
 
@@ -2369,7 +2337,11 @@ impl PeerCodec {
                     }
                     let safi = c.read_u8().unwrap();
                     mp_reach_family = Family((afi as u32) << 16 | safi as u32);
-                    let chan = self.channel.get(&mp_reach_family).ok_or_else(malformed)?;
+                    let mp_reach_addpath_rx = self
+                        .families
+                        .get(&mp_reach_family)
+                        .ok_or_else(malformed)?
+                        .addpath_rx;
                     let nexthop_len = c.read_u8().unwrap();
                     if buf.len() < 5 + nexthop_len as usize {
                         return Err(err);
@@ -2400,7 +2372,12 @@ impl PeerCodec {
                     let mut reader = BgpReader::<UpdateCtx>::new(&buf[c.position() as usize..]);
                     while reader.remaining_len() > 0 {
                         let rest = reader.remaining_len();
-                        mp_reach_entries.push(self.decode_nlri(chan, &mut reader, rest)?);
+                        mp_reach_entries.push(Self::decode_nlri(
+                            mp_reach_family,
+                            mp_reach_addpath_rx,
+                            &mut reader,
+                            rest,
+                        )?);
                     }
                 }
 
@@ -2419,11 +2396,20 @@ impl PeerCodec {
                     }
                     let safi = c.read_u8().unwrap();
                     mp_unreach_family = Family((afi as u32) << 16 | safi as u32);
-                    let chan = self.channel.get(&mp_unreach_family).ok_or_else(malformed)?;
+                    let mp_unreach_addpath_rx = self
+                        .families
+                        .get(&mp_unreach_family)
+                        .ok_or_else(malformed)?
+                        .addpath_rx;
                     let mut reader = BgpReader::<UpdateCtx>::new(&buf[c.position() as usize..]);
                     while reader.remaining_len() > 0 {
                         let rest = reader.remaining_len();
-                        mp_unreach_entries.push(self.decode_nlri(chan, &mut reader, rest)?);
+                        mp_unreach_entries.push(Self::decode_nlri(
+                            mp_unreach_family,
+                            mp_unreach_addpath_rx,
+                            &mut reader,
+                            rest,
+                        )?);
                     }
                 }
 
