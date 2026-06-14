@@ -60,6 +60,17 @@ fn keepalive_round_trip() {
     }
 }
 
+#[test]
+fn keepalive_with_extra_body_is_error() {
+    // RFC 4271 §4.4: KEEPALIVE must be exactly 19 bytes (header only).
+    let buf = bgp_msg(4, &[0x00]); // 20 bytes
+    let mut codec = default_codec();
+    match codec.parse_message(&buf) {
+        Err(Notification::BadMessageLength { .. }) => {}
+        other => panic!("expected BadMessageLength, got {:?}", other.err()),
+    }
+}
+
 // ─── NOTIFICATION ────────────────────────────────────────────────────────────
 
 #[test]

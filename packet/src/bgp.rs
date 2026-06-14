@@ -2547,7 +2547,12 @@ impl PeerCodec {
                     ),
                 ))
             }
-            Message::KEEPALIVE => Ok(ParsedMessage::Keepalive),
+            Message::KEEPALIVE => {
+                if buf.len() != Message::HEADER_LENGTH as usize {
+                    return Err(header_len_error);
+                }
+                Ok(ParsedMessage::Keepalive)
+            }
             Message::ROUTE_REFRESH => {
                 const ROUTE_REFRESH_LENGTH: usize = Message::HEADER_LENGTH as usize + 4;
                 if buf.len() < ROUTE_REFRESH_LENGTH {
