@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use rustybgp_packet::bgp::{Capability, Message, Open, ParsedMessage, PeerCodecBuilder};
-use rustybgp_packet::{BgpFramer, Family, HoldTime, Notification};
+use rustybgp_packet::{Family, HoldTime, Notification};
 use std::net::Ipv4Addr;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -189,10 +189,10 @@ fn open_round_trip_minimal() {
         capability: vec![],
     });
 
-    let mut framer = BgpFramer::new(default_codec().build());
+    let mut framer = default_codec().build();
     let mut buf = Vec::new();
     framer.encode_to(&original, &mut buf).unwrap();
-    let parsed = framer.inner_mut().parse_message(&buf).unwrap();
+    let parsed = framer.parse_message(&buf).unwrap();
 
     match parsed {
         ParsedMessage::Open(Open {
@@ -227,10 +227,10 @@ fn open_round_trip_with_capabilities() {
         ],
     });
 
-    let mut framer = BgpFramer::new(default_codec().build());
+    let mut framer = default_codec().build();
     let mut buf = Vec::new();
     framer.encode_to(&original, &mut buf).unwrap();
-    let parsed = framer.inner_mut().parse_message(&buf).unwrap();
+    let parsed = framer.parse_message(&buf).unwrap();
 
     match parsed {
         ParsedMessage::Open(Open {

@@ -20,7 +20,7 @@ use rustybgp_packet::bgp::{
 use rustybgp_packet::mup;
 use rustybgp_packet::prefix_sid;
 use rustybgp_packet::rd::RouteDistinguisher;
-use rustybgp_packet::{BgpFramer, Family, Nlri, PathNlri};
+use rustybgp_packet::{Family, Nlri, PathNlri};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
@@ -73,10 +73,10 @@ fn ipv6_prefix(addr: &str, mask: u8) -> PathNlri {
 
 /// Encode + parse a message and return the parsed result.
 fn round_trip(msg: &Message, codec: rustybgp_packet::bgp::PeerCodec) -> ParsedMessage {
-    let mut framer = BgpFramer::new(codec);
+    let mut framer = codec;
     let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
-    framer.inner_mut().parse_message(&buf).unwrap()
+    framer.parse_message(&buf).unwrap()
 }
 
 // ─── IPv4 announce / withdraw ────────────────────────────────────────────────

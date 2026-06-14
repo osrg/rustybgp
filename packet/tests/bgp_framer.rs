@@ -14,8 +14,8 @@
 // limitations under the License.
 
 use bytes::BytesMut;
-use rustybgp_packet::bgp::{Message, ParsedMessage, PeerCodecBuilder};
-use rustybgp_packet::{BgpFramer, Notification};
+use rustybgp_packet::Notification;
+use rustybgp_packet::bgp::{Message, ParsedMessage, PeerCodec, PeerCodecBuilder};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -37,8 +37,8 @@ fn bgp_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
     buf
 }
 
-fn default_framer() -> BgpFramer {
-    BgpFramer::new(PeerCodecBuilder::new().build())
+fn default_framer() -> PeerCodec {
+    PeerCodecBuilder::new().build()
 }
 
 // ─── basic framing tests ─────────────────────────────────────────────────────
@@ -178,11 +178,9 @@ fn framer_unknown_message_type() {
 #[test]
 fn framer_mixed_message_types() {
     // KEEPALIVE followed by ROUTE-REFRESH for IPv4
-    let mut framer = BgpFramer::new(
-        PeerCodecBuilder::new()
-            .families(vec![rustybgp_packet::Family::IPV4])
-            .build(),
-    );
+    let mut framer = PeerCodecBuilder::new()
+        .families(vec![rustybgp_packet::Family::IPV4])
+        .build();
     let mut buf = BytesMut::new();
 
     // KEEPALIVE

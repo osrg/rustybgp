@@ -20,11 +20,9 @@ pub use self::bgp::{
     UnreachNlri, Update,
 };
 pub use self::error::{Error, Notification};
-pub use self::frame::BgpFramer;
 
 pub mod bmp;
 pub mod error;
-pub mod frame;
 pub mod mpls;
 pub mod mrt;
 pub mod mup;

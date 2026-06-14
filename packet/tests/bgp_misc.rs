@@ -15,7 +15,7 @@
 
 use bytes::{BufMut, BytesMut};
 use rustybgp_packet::bgp::{Message, ParsedMessage, PeerCodecBuilder};
-use rustybgp_packet::{BgpFramer, Family, Notification};
+use rustybgp_packet::{Family, Notification};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -33,10 +33,10 @@ fn default_codec() -> rustybgp_packet::bgp::PeerCodec {
 }
 
 fn round_trip(msg: &Message) -> ParsedMessage {
-    let mut framer = BgpFramer::new(default_codec());
+    let mut framer = default_codec();
     let mut buf = BytesMut::new();
     framer.encode_to(msg, &mut buf).unwrap();
-    framer.inner_mut().parse_message(&buf).unwrap()
+    framer.parse_message(&buf).unwrap()
 }
 
 // ─── KEEPALIVE ───────────────────────────────────────────────────────────────
@@ -258,13 +258,13 @@ fn parse_message_too_short_buffer() {
 
 #[test]
 fn framer_bad_header_length() {
-    // BgpFramer detects when the header's length field is below the minimum.
+    // PeerCodec::try_parse detects when the header's length field is below the minimum.
     // parse_message doesn't check the header length field — that's framing's job.
     let mut buf = bytes::BytesMut::with_capacity(19);
     buf.extend_from_slice(&[0xff; 16]);
     buf.extend_from_slice(&10u16.to_be_bytes()); // length field = 10 (< minimum 19)
     buf.put_u8(4); // KEEPALIVE
-    let mut framer = BgpFramer::new(PeerCodecBuilder::new().build());
+    let mut framer = PeerCodecBuilder::new().build();
     match framer.try_parse(&mut buf) {
         Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
         Ok(_) => panic!("expected error"),

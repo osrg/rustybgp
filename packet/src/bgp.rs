@@ -15,7 +15,7 @@
 
 use crate::error::{Error, Notification};
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use bytes::BufMut;
+use bytes::{BufMut, BytesMut};
 use fnv::FnvHashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::Into;
@@ -2430,6 +2430,28 @@ impl PeerCodec {
             }
             _ => self.do_encode(msg, dst, &mut done_idx),
         }
+    }
+
+    /// Try to parse one complete BGP message from a stream buffer.
+    /// Returns `Ok(None)` if there are not enough bytes yet.
+    pub fn try_parse(&mut self, src: &mut BytesMut) -> Result<Option<ParsedMessage>, crate::Error> {
+        let buffer_len = src.len();
+        if buffer_len < Message::HEADER_LENGTH as usize {
+            return Ok(None);
+        }
+        let message_len = (&src[16..18]).read_u16::<NetworkEndian>().unwrap() as usize;
+        if message_len < Message::HEADER_LENGTH as usize || message_len > self.max_message_length()
+        {
+            return Err(crate::Notification::BadMessageLength {
+                data: src[16..18].to_vec(),
+            }
+            .into());
+        }
+        if buffer_len < message_len {
+            return Ok(None);
+        }
+        let buf = src.split_to(message_len);
+        Ok(Some(self.parse_message(&buf)?))
     }
 }
 

@@ -17,7 +17,7 @@ use rustybgp_packet::bgp::Ipv4Net;
 use rustybgp_packet::bgp::{
     Attribute, Message, ParsedMessage, ParsedUpdate, PeerCodecBuilder, ReachNlri, Update,
 };
-use rustybgp_packet::{BgpFramer, Family, Nlri, PathNlri};
+use rustybgp_packet::{Family, Nlri, PathNlri};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -51,10 +51,10 @@ fn base_attrs(nexthop: Ipv4Addr) -> Vec<Attribute> {
 }
 
 fn round_trip(msg: &Message) -> ParsedMessage {
-    let mut framer = BgpFramer::new(ipv4_codec());
+    let mut framer = ipv4_codec();
     let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
-    framer.inner_mut().parse_message(&buf).unwrap()
+    framer.parse_message(&buf).unwrap()
 }
 
 fn update_with_attrs(attrs: Vec<Attribute>) -> Message {

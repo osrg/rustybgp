@@ -16,7 +16,7 @@
 use rustybgp_packet::bgp::{
     Capability, Message, Open, ParsedMessage, PeerCodecBuilder, create_channel,
 };
-use rustybgp_packet::{BgpFramer, Family, HoldTime, Notification};
+use rustybgp_packet::{Family, HoldTime, Notification};
 use std::net::Ipv4Addr;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -59,10 +59,10 @@ fn parse_open_caps(cap_bytes: &[u8]) -> Vec<Capability> {
 }
 
 fn round_trip(msg: &Message) -> ParsedMessage {
-    let mut framer = BgpFramer::new(PeerCodecBuilder::new().build());
+    let mut framer = PeerCodecBuilder::new().build();
     let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
-    framer.inner_mut().parse_message(&buf).unwrap()
+    framer.parse_message(&buf).unwrap()
 }
 
 fn open_with(caps: Vec<Capability>) -> Message {

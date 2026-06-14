@@ -18,7 +18,7 @@ use rustybgp_packet::bgp::{
     Attribute, Ipv4Net, Ipv6Net, Message, ParsedMessage, ParsedUpdate, PeerCodecBuilder, ReachNlri,
     UnreachNlri, Update,
 };
-use rustybgp_packet::{BgpFramer, Family, Nlri, PathNlri};
+use rustybgp_packet::{Family, Nlri, PathNlri};
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -112,7 +112,7 @@ fn build_many_v4_route() {
 
     let codec = PeerCodecBuilder::new().families(vec![Family::IPV4]).build();
     let mut txbuf = BytesMut::with_capacity(4096);
-    let mut framer = BgpFramer::new(codec);
+    let mut framer = codec;
     framer.encode_to(&msg, &mut txbuf).unwrap();
 
     let mut recv = Vec::new();
@@ -190,7 +190,7 @@ fn many_mp_reach() {
 
     let codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
     let mut txbuf = BytesMut::with_capacity(4096);
-    let mut framer = BgpFramer::new(codec);
+    let mut framer = codec;
     framer.encode_to(&msg, &mut txbuf).unwrap();
 
     let mut recv = Vec::new();
@@ -234,7 +234,7 @@ fn many_mp_unreach() {
 
     let codec = PeerCodecBuilder::new().families(vec![Family::IPV6]).build();
     let mut txbuf = BytesMut::with_capacity(4096);
-    let mut framer = BgpFramer::new(codec);
+    let mut framer = codec;
     framer.encode_to(&msg, &mut txbuf).unwrap();
 
     let mut recv = Vec::new();

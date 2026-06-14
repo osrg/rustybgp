@@ -38,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
-use rustybgp_packet::{self as packet, BgpFramer, Family, HoldTime, bgp, bmp};
+use rustybgp_packet::{self as packet, Family, HoldTime, bgp, bmp};
 
 use crate::api;
 use crate::auth;
@@ -4959,7 +4959,7 @@ struct PeerSession {
 
     // --- session I/O state ---
     urgent: Vec<bgp::Message>,
-    framer: BgpFramer,
+    framer: bgp::PeerCodec,
     keepalive_futures: FuturesUnordered<tokio::time::Sleep>,
     holdtime_futures: FuturesUnordered<tokio::time::Sleep>,
     pending: FnvHashMap<Family, crate::peer_tx::PendingTx>,
@@ -4992,7 +4992,7 @@ impl PeerSession {
             link_addr,
             confederation_id: res.confederation_id,
         };
-        let framer = BgpFramer::new(export_ctx.build_codec());
+        let framer = export_ctx.build_codec();
 
         let prefix_counters = res
             .prefix_limits
@@ -5065,7 +5065,7 @@ impl PeerSession {
         let conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(fsm)));
         context.lock().unwrap().conn_arbiter = Arc::clone(&conn_arbiter);
 
-        let framer = BgpFramer::new(bgp::PeerCodecBuilder::new().build());
+        let framer = bgp::PeerCodecBuilder::new().build();
 
         PeerSession {
             remote_addr,
@@ -5170,7 +5170,6 @@ impl PeerSession {
         // Collect channel info up front so we don't borrow self.framer across .await.
         let channel_info: Vec<(Family, bool, bool)> = self
             .framer
-            .inner()
             .channel
             .iter()
             .map(|(f, c)| (*f, c.addpath_rx(), c.addpath_tx()))
@@ -5367,7 +5366,7 @@ impl PeerSession {
                             }
                         }
                     }
-                    self.framer.inner_mut().channel = channels;
+                    self.framer.channel = channels;
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -5559,7 +5558,6 @@ impl PeerSession {
             let use_mp = *family != packet::Family::IPV4
                 || self
                     .framer
-                    .inner()
                     .channel
                     .get(family)
                     .is_some_and(|c| c.extended_nexthop());
@@ -5682,7 +5680,7 @@ impl PeerSession {
         if self.conn_arbiter.lock().unwrap().state(self.role) != SessionState::Established {
             return;
         }
-        if !self.framer.inner().channel.contains_key(&update.family) {
+        if !self.framer.channel.contains_key(&update.family) {
             return;
         }
         let effective_max = self
@@ -7692,7 +7690,6 @@ mod tests {
     /// and insert an IPv4 pending bucket, matching what on_established would do.
     fn setup_ipv4_session(conn: &mut PeerSession) {
         conn.framer
-            .inner_mut()
             .channel
             .insert(Family::IPV4, bgp::Channel::new(Family::IPV4, false, false));
         conn.pending
