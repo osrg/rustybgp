@@ -1191,7 +1191,7 @@ mod tests {
             )
             .await;
         assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].paths[0].source.is_kernel(), true);
+        assert!(paths[0].paths[0].source.is_kernel());
     }
 
     #[tokio::test]

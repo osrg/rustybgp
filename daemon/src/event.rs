@@ -7157,7 +7157,6 @@ mod tests {
                     config: Some(config::AddPathsConfig {
                         receive: Some(true),
                         send_max: Some(4),
-                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -8085,7 +8084,7 @@ mod tests {
 
     #[test]
     fn drop_on_disconnect_no_gr_drops_all_families() {
-        let families = vec![Family::IPV4, Family::IPV6];
+        let families = [Family::IPV4, Family::IPV6];
         let result = families_to_drop_on_disconnect(families.iter(), None);
         assert_eq!(result.len(), 2);
         assert!(result.contains(&Family::IPV4));
@@ -8094,7 +8093,7 @@ mod tests {
 
     #[test]
     fn drop_on_disconnect_gr_for_all_drops_nothing() {
-        let families = vec![Family::IPV4, Family::IPV6];
+        let families = [Family::IPV4, Family::IPV6];
         let negotiated_gr = NegotiatedGr {
             families: vec![Family::IPV4, Family::IPV6],
             restart_time: Duration::from_secs(90),
@@ -8106,7 +8105,7 @@ mod tests {
 
     #[test]
     fn drop_on_disconnect_gr_for_ipv4_only_drops_ipv6() {
-        let families = vec![Family::IPV4, Family::IPV6];
+        let families = [Family::IPV4, Family::IPV6];
         let negotiated_gr = NegotiatedGr {
             families: vec![Family::IPV4],
             restart_time: Duration::from_secs(90),
@@ -8178,7 +8177,7 @@ mod tests {
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
         };
-        let session_families = vec![Family::IPV4, Family::IPV6];
+        let session_families = [Family::IPV4, Family::IPV6];
         let drop_families =
             families_to_drop_on_disconnect(session_families.iter(), Some(&negotiated_gr));
         tables.drop_families(remote_addr, &drop_families).await;
@@ -8237,7 +8236,7 @@ mod tests {
         );
 
         // No GR: all families dropped.
-        let session_families = vec![Family::IPV4];
+        let session_families = [Family::IPV4];
         let drop_families = families_to_drop_on_disconnect(session_families.iter(), None);
         tables.drop_families(remote_addr, &drop_families).await;
 
@@ -9398,12 +9397,10 @@ mod tests {
             assert_eq!(prepended, 65000, "prepended ASN must be confederation_id");
             // No CONFED segments must remain
             assert!(
-                !buf.windows(1)
-                    .enumerate()
-                    .step_by(1)
-                    .any(|(i, _)| i % 1 == 0
-                        && (buf[i] == packet::Attribute::AS_PATH_TYPE_CONFED_SEQ
-                            || buf[i] == packet::Attribute::AS_PATH_TYPE_CONFED_SET)),
+                !buf.iter().any(|&b| {
+                    b == packet::Attribute::AS_PATH_TYPE_CONFED_SEQ
+                        || b == packet::Attribute::AS_PATH_TYPE_CONFED_SET
+                }),
                 "CONFED segments must be stripped"
             );
             // LOCAL_PREF must be gone
@@ -9552,10 +9549,10 @@ mod tests {
         ) -> Arc<Vec<packet::Attribute>> {
             let msgs = pending.drain_messages(Family::IPV4, false);
             for msg in msgs {
-                if let bgp::Message::Update(bgp::Update::Routes { reach, attr, .. }) = msg {
-                    if reach.as_ref().is_some_and(|r| !r.entries.is_empty()) {
-                        return attr;
-                    }
+                if let bgp::Message::Update(bgp::Update::Routes { reach, attr, .. }) = msg
+                    && reach.as_ref().is_some_and(|r| !r.entries.is_empty())
+                {
+                    return attr;
                 }
             }
             panic!("no reach message found");

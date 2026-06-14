@@ -23,7 +23,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: build
         run: |
-          cargo clippy -- -D warnings
+          cargo clippy --tests -- -D warnings
           cargo test --verbose --all
           cargo fmt -- --check
       - name: kernel integration tests

@@ -2271,6 +2271,7 @@ mod tests {
         ])
     }
 
+    #[allow(dead_code)]
     fn attrs_with_originator(id: u8) -> Arc<Vec<packet::Attribute>> {
         Arc::new(vec![
             packet::Attribute::new_with_value(
@@ -3071,7 +3072,7 @@ mod tests {
 
     #[test]
     fn policy_prefix_reject() {
-        let rt = Table::new();
+        let _rt = Table::new();
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3121,7 +3122,7 @@ mod tests {
 
     #[test]
     fn policy_default_accept() {
-        let rt = Table::new();
+        let _rt = Table::new();
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3172,7 +3173,7 @@ mod tests {
 
     #[test]
     fn policy_nexthop_action_address() {
-        let rt = Table::new();
+        let _rt = Table::new();
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3232,7 +3233,7 @@ mod tests {
 
     #[test]
     fn policy_nexthop_action_self() {
-        let rt = Table::new();
+        let _rt = Table::new();
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3291,7 +3292,7 @@ mod tests {
 
     #[test]
     fn policy_nexthop_no_match_unchanged() {
-        let rt = Table::new();
+        let _rt = Table::new();
         let mut ptable = PolicyTable::new();
 
         ptable

@@ -190,6 +190,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
 
+    #[allow(dead_code)]
     fn src() -> Arc<table::Source> {
         Arc::new(table::Source::new(
             IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)),
@@ -315,17 +316,16 @@ mod tests {
         let msgs = p.drain_messages(Family::IPV4, false);
         let mut origins: Vec<u32> = Vec::new();
         for msg in &msgs {
-            if let bgp::Message::Update(bgp::Update::Routes { reach, attr, .. }) = msg {
-                if let Some(reach) = reach {
-                    if !reach.entries.is_empty() {
-                        let origin = attr
-                            .iter()
-                            .find(|a| a.code() == packet::Attribute::ORIGIN)
-                            .and_then(|a| a.value())
-                            .unwrap();
-                        origins.push(origin);
-                    }
-                }
+            if let bgp::Message::Update(bgp::Update::Routes { reach, attr, .. }) = msg
+                && let Some(reach) = reach
+                && !reach.entries.is_empty()
+            {
+                let origin = attr
+                    .iter()
+                    .find(|a| a.code() == packet::Attribute::ORIGIN)
+                    .and_then(|a| a.value())
+                    .unwrap();
+                origins.push(origin);
             }
         }
         origins.sort();
