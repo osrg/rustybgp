@@ -1255,7 +1255,7 @@ fn invalid_origin_value_treat_as_withdraw() {
     let parsed = ipv4_codec()
         .parse_message(&buf)
         .expect("parse must not fail");
-    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
     assert_eq!(msgs.len(), 1);
     assert!(
         matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
@@ -1276,7 +1276,7 @@ fn malformed_community_length_treat_as_withdraw() {
     let parsed = ipv4_codec()
         .parse_message(&buf)
         .expect("parse must not fail");
-    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
     assert_eq!(msgs.len(), 1);
     assert!(
         matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
@@ -1297,7 +1297,7 @@ fn malformed_aggregator_length_treat_as_withdraw() {
     let parsed = ipv4_codec()
         .parse_message(&buf)
         .expect("parse must not fail");
-    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
     assert_eq!(msgs.len(), 1);
     assert!(
         matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
@@ -1318,7 +1318,7 @@ fn malformed_cluster_list_length_discarded() {
     let parsed = ipv4_codec()
         .parse_message(&buf)
         .expect("parse must not fail");
-    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
     // The route must still be accepted; CLUSTER_LIST is silently discarded.
     assert_eq!(msgs.len(), 1);
     assert!(
@@ -1357,7 +1357,7 @@ fn malformed_aspath_truncated_segment_treat_as_withdraw() {
     let parsed = ipv4_codec()
         .parse_message(&buf)
         .expect("parse must not fail");
-    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
     assert_eq!(msgs.len(), 1);
     assert!(
         matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
@@ -1386,10 +1386,79 @@ fn malformed_aspath_invalid_segment_type_treat_as_withdraw() {
     let parsed = ipv4_codec()
         .parse_message(&buf)
         .expect("parse must not fail");
-    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
     assert_eq!(msgs.len(), 1);
     assert!(
         matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
         "invalid AS_PATH segment type must trigger treat-as-withdraw"
     );
+}
+
+// ─── eBGP attribute filtering (RFC 4271 §5.1.5, RFC 4456 §8) ─────────────────
+
+/// Build a raw IPv4 UPDATE that carries LOCAL_PREF, ORIGINATOR_ID, and CLUSTER_LIST
+/// in addition to the minimal well-known attributes and the NLRI 10.0.0.0/8.
+fn raw_update_with_ibgp_attrs() -> Vec<u8> {
+    let mut attr_bytes = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]); // ORIGIN=IGP
+    attr_bytes.extend_from_slice(&base_attrs_without_origin());
+    // LOCAL_PREF = 100 (flags: well-known discretionary = transitive)
+    attr_bytes.extend_from_slice(&[0x40, 0x05, 0x04, 0x00, 0x00, 0x00, 0x64]);
+    // ORIGINATOR_ID = 192.0.2.1 (flags: optional non-transitive)
+    attr_bytes.extend_from_slice(&[0x80, 0x09, 0x04, 0xC0, 0x00, 0x02, 0x01]);
+    // CLUSTER_LIST = [0x00000001] (flags: optional non-transitive)
+    attr_bytes.extend_from_slice(&[0x80, 0x0A, 0x04, 0x00, 0x00, 0x00, 0x01]);
+    raw_update_with_attrs(&attr_bytes)
+}
+
+#[test]
+fn ebgp_discards_local_pref_originator_id_cluster_list() {
+    // LOCAL_PREF, ORIGINATOR_ID, and CLUSTER_LIST MUST be discarded when received
+    // from a non-confederation eBGP peer (RFC 4271 §5.1.5, RFC 4456 §8).
+    let buf = raw_update_with_ibgp_attrs();
+    let parsed = ipv4_codec()
+        .parse_message(&buf)
+        .expect("parse must not fail");
+    let msgs: Vec<Message> = validate_message(parsed, true).unwrap().collect();
+
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Reach { .. })),
+        "route must be accepted despite iBGP-only attributes"
+    );
+    if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
+        assert!(
+            attr.iter().all(|a| !matches!(
+                a.code(),
+                Attribute::LOCAL_PREF | Attribute::ORIGINATOR_ID | Attribute::CLUSTER_LIST
+            )),
+            "LOCAL_PREF, ORIGINATOR_ID, CLUSTER_LIST must be absent after eBGP filtering"
+        );
+    }
+}
+
+#[test]
+fn ibgp_retains_local_pref_originator_id_cluster_list() {
+    // The same attributes MUST be retained when received from an iBGP peer.
+    let buf = raw_update_with_ibgp_attrs();
+    let parsed = ipv4_codec()
+        .parse_message(&buf)
+        .expect("parse must not fail");
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+
+    assert_eq!(msgs.len(), 1);
+    if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
+        assert!(
+            attr.iter().any(|a| a.code() == Attribute::LOCAL_PREF),
+            "LOCAL_PREF must be retained for iBGP"
+        );
+        assert!(
+            attr.iter().any(|a| a.code() == Attribute::ORIGINATOR_ID),
+            "ORIGINATOR_ID must be retained for iBGP"
+        );
+        assert!(
+            attr.iter().any(|a| a.code() == Attribute::CLUSTER_LIST),
+            "CLUSTER_LIST must be retained for iBGP"
+        );
+    }
 }

@@ -1618,14 +1618,21 @@ pub enum ParsedMessage {
 
 /// Validate a parsed BGP message and normalize it into send-path `Message`s.
 ///
+/// `is_ebgp` must be `true` when the message was received from a non-confederation
+/// eBGP peer.  When true, LOCAL_PREF, ORIGINATOR_ID, and CLUSTER_LIST are silently
+/// discarded per RFC 4271 §5.1.5 and RFC 4456 §8.
+///
 /// Returns `Err(Notification)` when the session must send that `Notification`
 /// and close.  Returns `Ok(iter)` otherwise; the iterator yields the resulting
 /// `Message`s (normally 1, 2 for a multi-family UPDATE, 0 for discard-only
 /// attribute errors with no NLRIs).
-pub fn validate_message(msg: ParsedMessage) -> Result<impl Iterator<Item = Message>, Notification> {
+pub fn validate_message(
+    msg: ParsedMessage,
+    is_ebgp: bool,
+) -> Result<impl Iterator<Item = Message>, Notification> {
     let msgs: Vec<Message> = match msg {
         ParsedMessage::Open(open) => vec![Message::Open(open)],
-        ParsedMessage::Update(update) => validate_update(update)?,
+        ParsedMessage::Update(update) => validate_update(update, is_ebgp)?,
         ParsedMessage::Notification(n) => vec![Message::Notification(n)],
         ParsedMessage::Keepalive => vec![Message::Keepalive],
         ParsedMessage::RouteRefresh { family } => vec![Message::RouteRefresh { family }],
@@ -1633,7 +1640,7 @@ pub fn validate_message(msg: ParsedMessage) -> Result<impl Iterator<Item = Messa
     Ok(msgs.into_iter())
 }
 
-fn validate_update(update: ParsedUpdate) -> Result<Vec<Message>, Notification> {
+fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, Notification> {
     match update {
         ParsedUpdate::EndOfRib(family) => Ok(vec![Message::Update(Update::EndOfRib(family))]),
         ParsedUpdate::Routes {
@@ -1671,6 +1678,24 @@ fn validate_update(update: ParsedUpdate) -> Result<Vec<Message>, Notification> {
                 }
                 return Ok(msgs);
             }
+
+            // RFC 4271 §5.1.5, RFC 4456 §8: discard iBGP-only attributes received
+            // from non-confederation eBGP peers.
+            let attrs: Vec<Attribute> = if is_ebgp {
+                attrs
+                    .into_iter()
+                    .filter(|a| {
+                        !matches!(
+                            a.code(),
+                            Attribute::LOCAL_PREF
+                                | Attribute::ORIGINATOR_ID
+                                | Attribute::CLUSTER_LIST
+                        )
+                    })
+                    .collect()
+            } else {
+                attrs
+            };
 
             // Normal path: attribute-discard errors are already absent from attrs.
             let attr = Arc::new(attrs);
