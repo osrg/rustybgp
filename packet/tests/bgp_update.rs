@@ -736,6 +736,62 @@ fn mp_reach_zero_nexthop_flowspec_is_ok() {
     );
 }
 
+// ─── VPN nexthop round-trip ──────────────────────────────────────────────────
+
+fn vpnv4_codec() -> PeerCodec {
+    let caps = vec![Capability::MultiProtocol(Family::IPV4_VPN)];
+    PeerCodec::negotiate(&caps, &caps)
+}
+
+#[test]
+fn update_vpnv4_nexthop_roundtrip() {
+    use rustybgp_packet::mpls::{MplsLabel, MplsLabelStack};
+    use rustybgp_packet::vpn::VpnV4Nlri;
+
+    let rd = RouteDistinguisher::TwoOctetAs {
+        admin: 65001,
+        assigned: 1,
+    };
+    let prefix = rustybgp_packet::bgp::Ipv4Net {
+        addr: "10.0.1.0".parse().unwrap(),
+        mask: 24,
+    };
+    let nlri = PathNlri::new(Nlri::VpnV4(VpnV4Nlri {
+        labels: MplsLabelStack::new(vec![MplsLabel::new(100)]),
+        rd,
+        prefix,
+    }));
+    let nexthop = Nexthop::V4("192.0.2.1".parse().unwrap());
+
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4_VPN,
+        entries: vec![nlri.clone()],
+        nexthop: Some(nexthop),
+        attr: Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+        ]),
+    });
+
+    match round_trip(&msg, vpnv4_codec()) {
+        ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+            let r = mp_reach.expect("mp_reach must be present for VPNv4");
+            assert_eq!(r.family, Family::IPV4_VPN);
+            assert_eq!(
+                r.nexthop,
+                Some(nexthop),
+                "nexthop mismatch after VPN RD strip"
+            );
+            assert_eq!(r.entries, vec![nlri]);
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
 // ─── encode_to split tests ────────────────────────────────────────────────────
 
 fn check_message_sizes(raw: &[u8]) {
