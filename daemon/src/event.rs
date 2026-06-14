@@ -7687,7 +7687,7 @@ mod tests {
                 as_number: 65002,
                 holdtime: HoldTime::new(90).unwrap(),
                 router_id: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
-                capability: vec![],
+                capability: vec![bgp::Capability::FourOctetAsNumber(65002)],
             });
             let mut arb = conn.conn_arbiter.lock().unwrap();
             arb.process(
@@ -7927,7 +7927,7 @@ mod tests {
             as_number: 65001,
             holdtime: HoldTime::new(90).unwrap(),
             router_id: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
-            capability: vec![],
+            capability: vec![bgp::Capability::FourOctetAsNumber(65001)],
         });
 
         {

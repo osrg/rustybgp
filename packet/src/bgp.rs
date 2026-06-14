@@ -48,6 +48,8 @@ pub enum Notification {
     OpenBadBgpIdentifier,
     #[error("open error: unsupported optional parameter")]
     OpenUnsupportedOptionalParameter { data: Vec<u8> },
+    #[error("open error: unsupported capability")]
+    OpenUnsupportedCapability { data: Vec<u8> },
     #[error("open error: unacceptable hold time")]
     OpenUnacceptableHoldTime { data: Vec<u8> },
 
@@ -100,6 +102,7 @@ impl Notification {
             | Self::OpenBadPeerAs
             | Self::OpenBadBgpIdentifier
             | Self::OpenUnsupportedOptionalParameter { .. }
+            | Self::OpenUnsupportedCapability { .. }
             | Self::OpenUnacceptableHoldTime { .. } => 2,
             Self::UpdateMalformedAttributeList | Self::UpdateOptionalAttributeError => 3,
             Self::HoldTimerExpired => 4,
@@ -124,6 +127,7 @@ impl Notification {
             Self::OpenBadPeerAs => 2,
             Self::OpenBadBgpIdentifier => 3,
             Self::OpenUnsupportedOptionalParameter { .. } => 4,
+            Self::OpenUnsupportedCapability { .. } => 7,
             Self::OpenUnacceptableHoldTime { .. } => 6,
             Self::UpdateMalformedAttributeList => 1,
             Self::UpdateOptionalAttributeError => 9,
@@ -146,6 +150,7 @@ impl Notification {
             | Self::BadMessageType { data }
             | Self::OpenUnsupportedVersionNumber { data }
             | Self::OpenUnsupportedOptionalParameter { data }
+            | Self::OpenUnsupportedCapability { data }
             | Self::OpenUnacceptableHoldTime { data }
             | Self::RouteRefreshInvalidLength { data }
             | Self::Other { data, .. } => data,
@@ -169,6 +174,7 @@ impl Notification {
             (2, 2) => Self::OpenBadPeerAs,
             (2, 3) => Self::OpenBadBgpIdentifier,
             (2, 4) => Self::OpenUnsupportedOptionalParameter { data },
+            (2, 7) => Self::OpenUnsupportedCapability { data },
             (2, 6) => Self::OpenUnacceptableHoldTime { data },
             (3, 1) => Self::UpdateMalformedAttributeList,
             (3, 9) => Self::UpdateOptionalAttributeError,
@@ -756,7 +762,7 @@ impl Capability {
     const EXTENDED_NEXTHOP: u8 = 5;
     //    const EXTENDED_MESSAGE: u8 = 6;
     const GRACEFUL_RESTART: u8 = 64;
-    const FOUR_OCTET_AS_NUMBER: u8 = 65;
+    pub const FOUR_OCTET_AS_NUMBER: u8 = 65;
     const ADD_PATH: u8 = 69;
     const ENHANCED_ROUTE_REFRESH: u8 = 70;
     const LONG_LIVED_GRACEFUL_RESTART: u8 = 71;

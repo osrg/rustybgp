@@ -262,6 +262,23 @@ impl Connection {
             return out;
         }
 
+        // Require 4-octet ASN capability (RFC 6793).
+        // 2-octet-only peers are not supported; refuse to prevent silent AS_PATH corruption.
+        let peer_as4 = open
+            .capability
+            .iter()
+            .any(|c| matches!(c, Capability::FourOctetAsNumber(_)));
+        if !peer_as4 {
+            // RFC 5492 §4: data contains the capability TLV we require.
+            let mut cap_data = vec![Capability::FOUR_OCTET_AS_NUMBER, 4];
+            cap_data.extend_from_slice(&self.local_asn.to_be_bytes());
+            out.push(Output::SendMessage(bgp::Message::Notification(
+                rustybgp_packet::Notification::OpenUnsupportedCapability { data: cap_data },
+            )));
+            out.push(Output::SessionDown(SessionDownReason::AdminShutdown));
+            return out;
+        }
+
         // Store remote parameters
         self.remote_asn = open.as_number;
         self.remote_id = open.router_id;
@@ -666,7 +683,10 @@ mod tests {
             as_number: asn,
             holdtime: HoldTime::new(holdtime).unwrap(),
             router_id,
-            capability: vec![Capability::MultiProtocol(Family::IPV4)],
+            capability: vec![
+                Capability::MultiProtocol(Family::IPV4),
+                Capability::FourOctetAsNumber(asn),
+            ],
         })
     }
 
@@ -1225,7 +1245,10 @@ mod tests {
             as_number: asn,
             holdtime: HoldTime::new(60).unwrap(),
             router_id,
-            capability: vec![Capability::MultiProtocol(Family::IPV4)],
+            capability: vec![
+                Capability::MultiProtocol(Family::IPV4),
+                Capability::FourOctetAsNumber(asn),
+            ],
         })
     }
 
