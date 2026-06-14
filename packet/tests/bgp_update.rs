@@ -828,170 +828,232 @@ fn decode_all(buf: &mut BytesMut, codec: &mut PeerCodec) -> Vec<ParsedMessage> {
     msgs
 }
 
+fn assert_encode_decode_splits<F>(
+    codec: &mut PeerCodec,
+    msg: &Message,
+    expected: &[PathNlri],
+    collect: F,
+) where
+    F: Fn(ParsedMessage) -> Option<Vec<PathNlri>>,
+{
+    let mut raw = Vec::new();
+    let wire_count = codec.encode_to(msg, &mut raw).unwrap();
+    assert!(
+        wire_count > 1,
+        "expected split, got wire_count={}",
+        wire_count
+    );
+    check_message_sizes(&raw);
+    let mut buf = BytesMut::from(raw.as_slice());
+    let all_nlri: Vec<PathNlri> = decode_all(&mut buf, codec)
+        .into_iter()
+        .filter_map(collect)
+        .flatten()
+        .collect();
+    assert_eq!(all_nlri.len(), expected.len(), "NLRI count mismatch");
+    for p in expected {
+        assert!(all_nlri.contains(p), "missing NLRI: {:?}", p);
+    }
+}
+
+fn ipv4_entries(n: u32) -> Vec<PathNlri> {
+    (0..n)
+        .map(|i| ipv4_prefix(&format!("10.{}.{}.0", i / 256, i % 256), 24))
+        .collect()
+}
+
+fn ipv4_entries_addpath(n: u32) -> Vec<PathNlri> {
+    (0..n)
+        .map(|i| PathNlri {
+            path_id: i + 1,
+            nlri: Nlri::V4(Ipv4Net {
+                addr: format!("10.{}.{}.0", i / 256, i % 256).parse().unwrap(),
+                mask: 24,
+            }),
+        })
+        .collect()
+}
+
+fn ipv6_entries(n: u16) -> Vec<PathNlri> {
+    (0..n)
+        .map(|i| {
+            PathNlri::new(Nlri::V6(Ipv6Net {
+                addr: Ipv6Addr::new(0x2001, 0x0db8, i, 0, 0, 0, 0, 0),
+                mask: 48,
+            }))
+        })
+        .collect()
+}
+
+fn ipv6_entries_addpath(n: u16) -> Vec<PathNlri> {
+    (0..n)
+        .map(|i| PathNlri {
+            path_id: i as u32 + 1,
+            nlri: Nlri::V6(Ipv6Net {
+                addr: Ipv6Addr::new(0x2001, 0x0db8, i, 0, 0, 0, 0, 0),
+                mask: 48,
+            }),
+        })
+        .collect()
+}
+
+fn ipv4_addpath_codec() -> PeerCodec {
+    let caps = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::AddPath(vec![(Family::IPV4, 3)]),
+    ];
+    PeerCodec::negotiate(&caps, &caps)
+}
+
+fn ipv6_addpath_codec() -> PeerCodec {
+    let caps = vec![
+        Capability::MultiProtocol(Family::IPV6),
+        Capability::AddPath(vec![(Family::IPV6, 3)]),
+    ];
+    PeerCodec::negotiate(&caps, &caps)
+}
+
+fn ipv6_attrs_no_nh() -> Arc<Vec<Attribute>> {
+    Arc::new(vec![
+        Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+        Attribute::new_with_bin(
+            Attribute::AS_PATH,
+            vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+        )
+        .unwrap(),
+    ])
+}
+
 #[test]
 fn encode_to_splits_ipv4_reach() {
     let mut codec = ipv4_codec();
-    let entries: Vec<PathNlri> = (0u32..1500)
-        .map(|i| ipv4_prefix(&format!("10.{}.{}.0", i / 256, i % 256), 24))
-        .collect();
+    let entries = ipv4_entries(1500);
     let msg = Message::Update(Update::Reach {
         family: Family::IPV4,
         entries: entries.clone(),
         nexthop: None,
         attr: ipv4_attrs("192.0.2.1".parse().unwrap()),
     });
-
-    let mut raw = Vec::new();
-    let wire_count = codec.encode_to(&msg, &mut raw).unwrap();
-    assert!(
-        wire_count > 1,
-        "expected split, got wire_count={}",
-        wire_count
-    );
-    check_message_sizes(&raw);
-
-    let mut buf = BytesMut::from(raw.as_slice());
-    let all_nlri: Vec<PathNlri> = decode_all(&mut buf, &mut codec)
-        .into_iter()
-        .filter_map(|m| match m {
-            ParsedMessage::Update(ParsedUpdate::Routes { reach: Some(r), .. }) => Some(r.entries),
-            _ => None,
-        })
-        .flatten()
-        .collect();
-    assert_eq!(all_nlri.len(), entries.len(), "NLRI count mismatch");
-    for p in &entries {
-        assert!(all_nlri.contains(p), "missing NLRI: {:?}", p);
-    }
+    assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+        ParsedMessage::Update(ParsedUpdate::Routes { reach: Some(r), .. }) => Some(r.entries),
+        _ => None,
+    });
 }
 
 #[test]
 fn encode_to_splits_ipv4_unreach() {
     let mut codec = ipv4_codec();
-    let entries: Vec<PathNlri> = (0u32..1500)
-        .map(|i| ipv4_prefix(&format!("10.{}.{}.0", i / 256, i % 256), 24))
-        .collect();
+    let entries = ipv4_entries(1500);
     let msg = Message::Update(Update::Unreach {
         family: Family::IPV4,
         entries: entries.clone(),
     });
-
-    let mut raw = Vec::new();
-    let wire_count = codec.encode_to(&msg, &mut raw).unwrap();
-    assert!(
-        wire_count > 1,
-        "expected split, got wire_count={}",
-        wire_count
-    );
-    check_message_sizes(&raw);
-
-    let mut buf = BytesMut::from(raw.as_slice());
-    let all_nlri: Vec<PathNlri> = decode_all(&mut buf, &mut codec)
-        .into_iter()
-        .filter_map(|m| match m {
-            ParsedMessage::Update(ParsedUpdate::Routes {
-                unreach: Some(r), ..
-            }) => Some(r.entries),
-            _ => None,
-        })
-        .flatten()
-        .collect();
-    assert_eq!(all_nlri.len(), entries.len(), "NLRI count mismatch");
-    for p in &entries {
-        assert!(all_nlri.contains(p), "missing NLRI: {:?}", p);
-    }
+    assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+        ParsedMessage::Update(ParsedUpdate::Routes {
+            unreach: Some(r), ..
+        }) => Some(r.entries),
+        _ => None,
+    });
 }
 
 #[test]
 fn encode_to_splits_ipv6_reach() {
     let mut codec = ipv6_codec();
-    let entries: Vec<PathNlri> = (0u16..800)
-        .map(|i| {
-            PathNlri::new(Nlri::V6(Ipv6Net {
-                addr: Ipv6Addr::new(0x2001, 0x0db8, i, 0, 0, 0, 0, 0),
-                mask: 48,
-            }))
-        })
-        .collect();
+    let entries = ipv6_entries(800);
     let msg = Message::Update(Update::Reach {
         family: Family::IPV6,
         entries: entries.clone(),
         nexthop: Some(Nexthop::V6("2001:db8::1".parse().unwrap())),
-        attr: Arc::new(vec![
-            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
-            Attribute::new_with_bin(
-                Attribute::AS_PATH,
-                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
-            )
-            .unwrap(),
-        ]),
+        attr: ipv6_attrs_no_nh(),
     });
-
-    let mut raw = Vec::new();
-    let wire_count = codec.encode_to(&msg, &mut raw).unwrap();
-    assert!(
-        wire_count > 1,
-        "expected split, got wire_count={}",
-        wire_count
-    );
-    check_message_sizes(&raw);
-
-    let mut buf = BytesMut::from(raw.as_slice());
-    let all_nlri: Vec<PathNlri> = decode_all(&mut buf, &mut codec)
-        .into_iter()
-        .filter_map(|m| match m {
-            ParsedMessage::Update(ParsedUpdate::Routes {
-                mp_reach: Some(r), ..
-            }) => Some(r.entries),
-            _ => None,
-        })
-        .flatten()
-        .collect();
-    assert_eq!(all_nlri.len(), entries.len(), "NLRI count mismatch");
-    for p in &entries {
-        assert!(all_nlri.contains(p), "missing NLRI: {:?}", p);
-    }
+    assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+        ParsedMessage::Update(ParsedUpdate::Routes {
+            mp_reach: Some(r), ..
+        }) => Some(r.entries),
+        _ => None,
+    });
 }
 
 #[test]
 fn encode_to_splits_ipv6_unreach() {
     let mut codec = ipv6_codec();
-    let entries: Vec<PathNlri> = (0u16..800)
-        .map(|i| {
-            PathNlri::new(Nlri::V6(Ipv6Net {
-                addr: Ipv6Addr::new(0x2001, 0x0db8, i, 0, 0, 0, 0, 0),
-                mask: 48,
-            }))
-        })
-        .collect();
+    let entries = ipv6_entries(800);
     let msg = Message::Update(Update::Unreach {
         family: Family::IPV6,
         entries: entries.clone(),
     });
+    assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+        ParsedMessage::Update(ParsedUpdate::Routes {
+            mp_unreach: Some(r),
+            ..
+        }) => Some(r.entries),
+        _ => None,
+    });
+}
 
-    let mut raw = Vec::new();
-    let wire_count = codec.encode_to(&msg, &mut raw).unwrap();
-    assert!(
-        wire_count > 1,
-        "expected split, got wire_count={}",
-        wire_count
-    );
-    check_message_sizes(&raw);
+#[test]
+fn encode_to_splits_ipv4_reach_addpath() {
+    let mut codec = ipv4_addpath_codec();
+    let entries = ipv4_entries_addpath(700);
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: entries.clone(),
+        nexthop: None,
+        attr: ipv4_attrs("192.0.2.1".parse().unwrap()),
+    });
+    assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+        ParsedMessage::Update(ParsedUpdate::Routes { reach: Some(r), .. }) => Some(r.entries),
+        _ => None,
+    });
+}
 
-    let mut buf = BytesMut::from(raw.as_slice());
-    let all_nlri: Vec<PathNlri> = decode_all(&mut buf, &mut codec)
-        .into_iter()
-        .filter_map(|m| match m {
-            ParsedMessage::Update(ParsedUpdate::Routes {
-                mp_unreach: Some(r),
-                ..
-            }) => Some(r.entries),
-            _ => None,
-        })
-        .flatten()
-        .collect();
-    assert_eq!(all_nlri.len(), entries.len(), "NLRI count mismatch");
-    for p in &entries {
-        assert!(all_nlri.contains(p), "missing NLRI: {:?}", p);
-    }
+#[test]
+fn encode_to_splits_ipv4_unreach_addpath() {
+    let mut codec = ipv4_addpath_codec();
+    let entries = ipv4_entries_addpath(700);
+    let msg = Message::Update(Update::Unreach {
+        family: Family::IPV4,
+        entries: entries.clone(),
+    });
+    assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+        ParsedMessage::Update(ParsedUpdate::Routes {
+            unreach: Some(r), ..
+        }) => Some(r.entries),
+        _ => None,
+    });
+}
+
+#[test]
+fn encode_to_splits_ipv6_reach_addpath() {
+    let mut codec = ipv6_addpath_codec();
+    let entries = ipv6_entries_addpath(500);
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV6,
+        entries: entries.clone(),
+        nexthop: Some(Nexthop::V6("2001:db8::1".parse().unwrap())),
+        attr: ipv6_attrs_no_nh(),
+    });
+    assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+        ParsedMessage::Update(ParsedUpdate::Routes {
+            mp_reach: Some(r), ..
+        }) => Some(r.entries),
+        _ => None,
+    });
+}
+
+#[test]
+fn encode_to_splits_ipv6_unreach_addpath() {
+    let mut codec = ipv6_addpath_codec();
+    let entries = ipv6_entries_addpath(500);
+    let msg = Message::Update(Update::Unreach {
+        family: Family::IPV6,
+        entries: entries.clone(),
+    });
+    assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+        ParsedMessage::Update(ParsedUpdate::Routes {
+            mp_unreach: Some(r),
+            ..
+        }) => Some(r.entries),
+        _ => None,
+    });
 }

@@ -2005,6 +2005,7 @@ impl PeerCodec {
                         if pos_head + self.max_message_length() > dst.as_mut().len() + max_len {
                             if addpath {
                                 dst.put_u32(item.path_id);
+                                withdrawn_len += 4;
                             }
                             withdrawn_len += item.nlri.encode(dst).unwrap();
                             count += 1;
