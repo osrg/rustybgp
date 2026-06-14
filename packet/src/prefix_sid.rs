@@ -20,23 +20,22 @@
 //! so the attribute round-trips byte-for-byte regardless of the
 //! specific TLV mix an originator chose.
 
-use crate::error::{Error, Notification};
 use byteorder::{NetworkEndian, ReadBytesExt};
 use bytes::BufMut;
 use std::io::{self, Cursor, Read};
 use std::net::Ipv6Addr;
 
-fn malformed() -> Error {
-    Notification::UpdateMalformedAttributeList.into()
+fn malformed() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "malformed Prefix-SID attribute")
 }
 
 /// Read a `[type: 1][length: 2 BE]` header plus `length` bytes of value.
 /// Returns the type byte and the (owned) value bytes, and advances `c`.
-fn read_tlv_header<T: io::Read>(c: &mut T) -> Result<(u8, Vec<u8>), Error> {
-    let type_id = c.read_u8().map_err(|_| malformed())?;
-    let len = c.read_u16::<NetworkEndian>().map_err(|_| malformed())? as usize;
+fn read_tlv_header<T: io::Read>(c: &mut T) -> Result<(u8, Vec<u8>), io::Error> {
+    let type_id = c.read_u8()?;
+    let len = c.read_u16::<NetworkEndian>()? as usize;
     let mut value = vec![0u8; len];
-    c.read_exact(&mut value).map_err(|_| malformed())?;
+    c.read_exact(&mut value)?;
     Ok((type_id, value))
 }
 
@@ -100,7 +99,7 @@ pub struct Srv6SidStructureSubSubTlv {
 }
 
 impl PrefixSid {
-    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+    pub fn decode(data: &[u8]) -> Result<Self, io::Error> {
         let mut c = Cursor::new(data);
         let total = data.len() as u64;
         let mut tlvs = Vec::new();
@@ -130,7 +129,7 @@ impl PrefixSidTlv {
     /// TLV type for SRv6 L2 Service.
     pub const TLV_SRV6_L2_SERVICE: u8 = 6;
 
-    fn decode(type_id: u8, value: &[u8]) -> Result<Self, Error> {
+    fn decode(type_id: u8, value: &[u8]) -> Result<Self, io::Error> {
         match type_id {
             Self::TLV_SRV6_L3_SERVICE => {
                 Ok(PrefixSidTlv::Srv6L3Service(Srv6ServiceTlv::decode(value)?))
@@ -159,13 +158,13 @@ impl PrefixSidTlv {
 }
 
 impl Srv6ServiceTlv {
-    fn decode(data: &[u8]) -> Result<Self, Error> {
+    fn decode(data: &[u8]) -> Result<Self, io::Error> {
         if data.is_empty() {
             return Err(malformed());
         }
         let mut c = Cursor::new(data);
         let total = data.len() as u64;
-        let reserved = c.read_u8().map_err(|_| malformed())?;
+        let reserved = c.read_u8()?;
         let mut sub_tlvs = Vec::new();
         while c.position() < total {
             let (type_id, value) = read_tlv_header(&mut c)?;
@@ -188,7 +187,7 @@ impl Srv6ServiceSubTlv {
     /// Sub-TLV type for SRv6 SID Information (RFC 9252 §3.1).
     pub const SUBTLV_SRV6_INFORMATION: u8 = 1;
 
-    fn decode(type_id: u8, value: &[u8]) -> Result<Self, Error> {
+    fn decode(type_id: u8, value: &[u8]) -> Result<Self, io::Error> {
         match type_id {
             Self::SUBTLV_SRV6_INFORMATION => Ok(Srv6ServiceSubTlv::Information(
                 Srv6InformationSubTlv::decode(value)?,
@@ -215,19 +214,19 @@ impl Srv6InformationSubTlv {
     /// Reserved(1) + SID(16) + Flags(1) + Endpoint Behavior(2) + Reserved(1) = 21 bytes.
     const FIXED_LEN: usize = 21;
 
-    fn decode(data: &[u8]) -> Result<Self, Error> {
+    fn decode(data: &[u8]) -> Result<Self, io::Error> {
         if data.len() < Self::FIXED_LEN {
             return Err(malformed());
         }
         let mut c = Cursor::new(data);
         let total = data.len() as u64;
-        let _reserved = c.read_u8().map_err(|_| malformed())?;
+        let _reserved = c.read_u8()?;
         let mut sid_bytes = [0u8; 16];
-        c.read_exact(&mut sid_bytes).map_err(|_| malformed())?;
+        c.read_exact(&mut sid_bytes)?;
         let sid = Ipv6Addr::from(sid_bytes);
-        let flags = c.read_u8().map_err(|_| malformed())?;
-        let endpoint_behavior = c.read_u16::<NetworkEndian>().map_err(|_| malformed())?;
-        let _reserved = c.read_u8().map_err(|_| malformed())?;
+        let flags = c.read_u8()?;
+        let endpoint_behavior = c.read_u16::<NetworkEndian>()?;
+        let _reserved = c.read_u8()?;
         let mut sub_sub_tlvs = Vec::new();
         while c.position() < total {
             let (type_id, value) = read_tlv_header(&mut c)?;
@@ -259,7 +258,7 @@ impl Srv6ServiceDataSubSubTlv {
     /// Sub-Sub-TLV type for SRv6 SID Structure (RFC 9252 §3.2.1).
     pub const SUBSUBTLV_SRV6_SID_STRUCTURE: u8 = 1;
 
-    fn decode(type_id: u8, value: &[u8]) -> Result<Self, Error> {
+    fn decode(type_id: u8, value: &[u8]) -> Result<Self, io::Error> {
         match type_id {
             Self::SUBSUBTLV_SRV6_SID_STRUCTURE => Ok(Srv6ServiceDataSubSubTlv::Structure(
                 Srv6SidStructureSubSubTlv::decode(value)?,
@@ -285,18 +284,18 @@ impl Srv6SidStructureSubSubTlv {
     /// Fixed 6-octet value (RFC 9252 §3.2.1).
     pub const LEN: usize = 6;
 
-    fn decode(data: &[u8]) -> Result<Self, Error> {
+    fn decode(data: &[u8]) -> Result<Self, io::Error> {
         if data.len() < Self::LEN {
             return Err(malformed());
         }
         let mut c = Cursor::new(data);
         Ok(Srv6SidStructureSubSubTlv {
-            locator_block_length: c.read_u8().map_err(|_| malformed())?,
-            locator_node_length: c.read_u8().map_err(|_| malformed())?,
-            function_length: c.read_u8().map_err(|_| malformed())?,
-            argument_length: c.read_u8().map_err(|_| malformed())?,
-            transposition_length: c.read_u8().map_err(|_| malformed())?,
-            transposition_offset: c.read_u8().map_err(|_| malformed())?,
+            locator_block_length: c.read_u8()?,
+            locator_node_length: c.read_u8()?,
+            function_length: c.read_u8()?,
+            argument_length: c.read_u8()?,
+            transposition_length: c.read_u8()?,
+            transposition_offset: c.read_u8()?,
         })
     }
 

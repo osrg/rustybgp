@@ -13,10 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Notification};
+use crate::error::Error;
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::BufMut;
 use std::fmt;
+use std::io;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
@@ -39,10 +40,11 @@ impl RouteDistinguisher {
     const TYPE_IPV4: u16 = 1;
     const TYPE_FOUR_OCTET_AS: u16 = 2;
 
-    pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let malformed: Error = Notification::UpdateMalformedAttributeList.into();
+    pub fn decode(data: &[u8]) -> Result<Self, io::Error> {
+        let malformed =
+            || io::Error::new(io::ErrorKind::InvalidData, "malformed Route Distinguisher");
         if data.len() != Self::LEN {
-            return Err(malformed);
+            return Err(malformed());
         }
         let rd_type = NetworkEndian::read_u16(&data[0..2]);
         match rd_type {
@@ -58,7 +60,7 @@ impl RouteDistinguisher {
                 admin: NetworkEndian::read_u32(&data[2..6]),
                 assigned: NetworkEndian::read_u16(&data[6..8]),
             }),
-            _ => Err(malformed),
+            _ => Err(malformed()),
         }
     }
 
@@ -101,24 +103,32 @@ impl FromStr for RouteDistinguisher {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Error> {
-        let malformed = || -> Error { Notification::UpdateMalformedAttributeList.into() };
-        let (admin_str, assigned_str) = s.rsplit_once(':').ok_or_else(malformed)?;
+        let invalid = |msg: &str| Error::InvalidArgument(format!("invalid RD '{}': {}", s, msg));
+        let (admin_str, assigned_str) = s.rsplit_once(':').ok_or_else(|| invalid("missing ':'"))?;
         if let Ok(addr) = admin_str.parse::<Ipv4Addr>() {
-            let assigned: u16 = assigned_str.parse().map_err(|_| malformed())?;
+            let assigned: u16 = assigned_str
+                .parse()
+                .map_err(|_| invalid("assigned number out of range"))?;
             return Ok(RouteDistinguisher::Ipv4 {
                 admin: addr,
                 assigned,
             });
         }
-        let admin: u32 = admin_str.parse().map_err(|_| malformed())?;
+        let admin: u32 = admin_str
+            .parse()
+            .map_err(|_| invalid("admin field is not a number"))?;
         if admin <= u16::MAX as u32 {
-            let assigned: u32 = assigned_str.parse().map_err(|_| malformed())?;
+            let assigned: u32 = assigned_str
+                .parse()
+                .map_err(|_| invalid("assigned number out of range"))?;
             Ok(RouteDistinguisher::TwoOctetAs {
                 admin: admin as u16,
                 assigned,
             })
         } else {
-            let assigned: u16 = assigned_str.parse().map_err(|_| malformed())?;
+            let assigned: u16 = assigned_str
+                .parse()
+                .map_err(|_| invalid("assigned number out of range"))?;
             Ok(RouteDistinguisher::FourOctetAs { admin, assigned })
         }
     }

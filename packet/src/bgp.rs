@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Notification};
+use crate::error::Error;
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use fnv::FnvHashMap;
@@ -25,6 +25,126 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{fmt, io};
+use thiserror::Error;
+
+/// Typed BGP NOTIFICATION content (RFC 4271 §4.5, RFC 6608 §3, RFC 7313 §5).
+/// Represents the error code, subcode, and data of a BGP NOTIFICATION message.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum Notification {
+    // Code 1: Message Header Error
+    #[error("header error: bad message length")]
+    BadMessageLength { data: Vec<u8> },
+    #[error("header error: bad message type")]
+    BadMessageType { data: Vec<u8> },
+
+    // Code 2: OPEN Message Error
+    #[error("open error: malformed")]
+    OpenMalformed,
+    #[error("open error: unsupported optional parameter")]
+    OpenUnsupportedOptionalParameter { data: Vec<u8> },
+    #[error("open error: unacceptable hold time")]
+    OpenUnacceptableHoldTime { data: Vec<u8> },
+
+    // Code 3: UPDATE Message Error
+    #[error("update error: malformed attribute list")]
+    UpdateMalformedAttributeList,
+    #[error("update error: optional attribute error")]
+    UpdateOptionalAttributeError,
+
+    // Code 5: FSM Error
+    #[error("FSM error: unexpected state {state}")]
+    FsmUnexpectedState { state: u8 },
+
+    // Code 7: ROUTE-REFRESH Message Error
+    #[error("route-refresh error: invalid message length")]
+    RouteRefreshInvalidLength { data: Vec<u8> },
+
+    // Catch-all for received NOTIFICATION messages
+    #[error("notification code={code} subcode={subcode}")]
+    Other {
+        code: u8,
+        subcode: u8,
+        data: Vec<u8>,
+    },
+}
+
+impl Notification {
+    /// Returns the BGP NOTIFICATION error code.
+    pub fn notification_code(&self) -> u8 {
+        match self {
+            Self::BadMessageLength { .. } | Self::BadMessageType { .. } => 1,
+            Self::OpenMalformed
+            | Self::OpenUnsupportedOptionalParameter { .. }
+            | Self::OpenUnacceptableHoldTime { .. } => 2,
+            Self::UpdateMalformedAttributeList | Self::UpdateOptionalAttributeError => 3,
+            Self::FsmUnexpectedState { .. } => 5,
+            Self::RouteRefreshInvalidLength { .. } => 7,
+            Self::Other { code, .. } => *code,
+        }
+    }
+
+    /// Returns the BGP NOTIFICATION subcode.
+    pub fn notification_subcode(&self) -> u8 {
+        match self {
+            Self::BadMessageLength { .. } => 2,
+            Self::BadMessageType { .. } => 3,
+            Self::OpenMalformed => 0,
+            Self::OpenUnsupportedOptionalParameter { .. } => 4,
+            Self::OpenUnacceptableHoldTime { .. } => 6,
+            Self::UpdateMalformedAttributeList => 1,
+            Self::UpdateOptionalAttributeError => 9,
+            Self::FsmUnexpectedState { state } => *state,
+            Self::RouteRefreshInvalidLength { .. } => 1,
+            Self::Other { subcode, .. } => *subcode,
+        }
+    }
+
+    /// Returns the BGP NOTIFICATION data.
+    pub fn notification_data(&self) -> &[u8] {
+        match self {
+            Self::BadMessageLength { data }
+            | Self::BadMessageType { data }
+            | Self::OpenUnsupportedOptionalParameter { data }
+            | Self::OpenUnacceptableHoldTime { data }
+            | Self::RouteRefreshInvalidLength { data }
+            | Self::Other { data, .. } => data,
+            _ => &[],
+        }
+    }
+
+    /// Returns true if this is a CEASE Hard Reset (RFC 8538 §3: code 6, subcode 9).
+    /// Hard Reset terminates GR even when the N-bit is negotiated.
+    pub fn is_hard_reset(&self) -> bool {
+        matches!(
+            self,
+            Self::Other {
+                code: 6,
+                subcode: 9,
+                ..
+            }
+        )
+    }
+
+    /// Constructs a `Notification` from a received NOTIFICATION message.
+    pub fn from_notification(code: u8, subcode: u8, data: Vec<u8>) -> Self {
+        match (code, subcode) {
+            (1, 2) => Self::BadMessageLength { data },
+            (1, 3) => Self::BadMessageType { data },
+            (2, 0) => Self::OpenMalformed,
+            (2, 4) => Self::OpenUnsupportedOptionalParameter { data },
+            (2, 6) => Self::OpenUnacceptableHoldTime { data },
+            (3, 1) => Self::UpdateMalformedAttributeList,
+            (3, 9) => Self::UpdateOptionalAttributeError,
+            (5, state) => Self::FsmUnexpectedState { state },
+            (7, 1) => Self::RouteRefreshInvalidLength { data },
+            _ => Self::Other {
+                code,
+                subcode,
+                data,
+            },
+        }
+    }
+}
 
 trait ParseContext: 'static {
     fn truncated() -> Notification;
@@ -2646,6 +2766,51 @@ mod confed_as_path_tests {
             );
         } else {
             panic!("expected UPDATE Routes message");
+        }
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[test]
+    fn hard_reset_is_cease_subcode_9() {
+        let err = Notification::Other {
+            code: 6,
+            subcode: 9,
+            data: vec![],
+        };
+        assert!(err.is_hard_reset());
+    }
+
+    #[test]
+    fn cease_other_subcodes_are_not_hard_reset() {
+        for subcode in [0u8, 1, 2, 3, 4, 5, 6, 7, 8] {
+            let err = Notification::Other {
+                code: 6,
+                subcode,
+                data: vec![],
+            };
+            assert!(
+                !err.is_hard_reset(),
+                "subcode {subcode} should not be hard reset"
+            );
+        }
+    }
+
+    #[test]
+    fn non_cease_codes_are_not_hard_reset() {
+        for code in [1u8, 2, 3, 5, 7] {
+            let err = Notification::Other {
+                code,
+                subcode: 9,
+                data: vec![],
+            };
+            assert!(
+                !err.is_hard_reset(),
+                "code {code} subcode 9 should not be hard reset"
+            );
         }
     }
 }

@@ -12,7 +12,6 @@
 // implied.  See the License for the specific language governing
 // permissions and limitations under the License.
 
-use crate::error::{Error, Notification};
 use bytes::BufMut;
 use std::io;
 
@@ -72,12 +71,11 @@ impl MplsLabelStack {
     }
 
     /// Decode a label stack from `c`, reading 3-byte labels until BoS=1.
-    pub fn decode<T: io::Read>(c: &mut T) -> Result<Self, Error> {
+    pub fn decode<T: io::Read>(c: &mut T) -> Result<Self, io::Error> {
         let mut labels = Vec::new();
         loop {
             let mut buf = [0u8; 3];
-            c.read_exact(&mut buf)
-                .map_err(|_| Error::from(Notification::UpdateMalformedAttributeList))?;
+            c.read_exact(&mut buf)?;
             let bos = (buf[2] & 1) != 0;
             labels.push(MplsLabel::decode(&buf));
             if bos {

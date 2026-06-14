@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn session_down_to_bmp_remote_notification_preserved() {
-        let msg = bgp::Message::Notification(rustybgp_packet::error::Notification::Other {
+        let msg = bgp::Message::Notification(rustybgp_packet::Notification::Other {
             code: 6,
             subcode: 0,
             data: vec![],
@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn session_down_to_bmp_local_notification_preserved() {
-        let msg = bgp::Message::Notification(rustybgp_packet::error::Notification::Other {
+        let msg = bgp::Message::Notification(rustybgp_packet::Notification::Other {
             code: 6,
             subcode: 0,
             data: vec![],

@@ -5750,11 +5750,10 @@ impl PeerSession {
         // For UPDATE Routes: if FSM didn't reject (no SessionDown), process routes.
         if let Some((reach, unreach, attr)) = route_fields {
             if has_session_down {
-                return Err(Error::Packet(
+                return Err(Error::Notification(
                     rustybgp_packet::Notification::FsmUnexpectedState {
                         state: u8::from(self.conn_arbiter.lock().unwrap().state(self.role)),
-                    }
-                    .into(),
+                    },
                 ));
             }
             let rx_timestamp = std::time::SystemTime::now();
@@ -8486,7 +8485,7 @@ mod tests {
 
     fn cease(subcode: u8) -> crate::fsm::SessionDownReason {
         crate::fsm::SessionDownReason::RemoteNotification(bgp::Message::Notification(
-            rustybgp_packet::error::Notification::Other {
+            rustybgp_packet::Notification::Other {
                 code: 6,
                 subcode,
                 data: vec![],
@@ -8496,7 +8495,7 @@ mod tests {
 
     fn local_cease(subcode: u8) -> crate::fsm::SessionDownReason {
         crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(
-            rustybgp_packet::error::Notification::Other {
+            rustybgp_packet::Notification::Other {
                 code: 6,
                 subcode,
                 data: vec![],

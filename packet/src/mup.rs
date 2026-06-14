@@ -17,7 +17,7 @@
 //! Implements Architecture Type 1 (3GPP-5G) and route types 1..4.
 
 use crate::bgp::Family;
-use crate::error::{Error, Notification};
+
 use crate::rd::RouteDistinguisher;
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::BufMut;
@@ -37,11 +37,11 @@ pub const EC_TYPE_MUP: u8 = 0x0c;
 /// Sub-type for the Direct-Type Segment Identifier Extended Community.
 pub const EC_SUBTYPE_MUP_DIRECT_SEG: u8 = 0x00;
 
-fn malformed() -> Error {
-    Notification::UpdateMalformedAttributeList.into()
+fn malformed() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "malformed MUP NLRI")
 }
 
-fn addr_bit_len(family: Family) -> Result<u8, Error> {
+fn addr_bit_len(family: Family) -> Result<u8, io::Error> {
     match family.afi() {
         Family::AFI_IP => Ok(32),
         Family::AFI_IP6 => Ok(128),
@@ -49,7 +49,7 @@ fn addr_bit_len(family: Family) -> Result<u8, Error> {
     }
 }
 
-fn decode_ip(family: Family, bytes: &[u8]) -> Result<IpAddr, Error> {
+fn decode_ip(family: Family, bytes: &[u8]) -> Result<IpAddr, io::Error> {
     match (family.afi(), bytes.len()) {
         (Family::AFI_IP, 4) => Ok(IpAddr::V4(Ipv4Addr::new(
             bytes[0], bytes[1], bytes[2], bytes[3],
@@ -63,7 +63,7 @@ fn decode_ip(family: Family, bytes: &[u8]) -> Result<IpAddr, Error> {
     }
 }
 
-fn decode_prefix(family: Family, bit_len: u8, bytes: &[u8]) -> Result<IpAddr, Error> {
+fn decode_prefix(family: Family, bit_len: u8, bytes: &[u8]) -> Result<IpAddr, io::Error> {
     let max_bits = addr_bit_len(family)?;
     if bit_len > max_bits {
         return Err(malformed());
@@ -152,12 +152,12 @@ pub struct MupType2SessionTransformedRoute {
 impl MupNlri {
     /// Decode a single MUP NLRI from `c`, consuming `4 + body_length` bytes.
     /// `len` is the upper bound of bytes remaining in the enclosing buffer.
-    pub fn decode<T: io::Read>(family: Family, c: &mut T, len: usize) -> Result<Self, Error> {
+    pub fn decode<T: io::Read>(family: Family, c: &mut T, len: usize) -> Result<Self, io::Error> {
         if len < 4 {
             return Err(malformed());
         }
         let mut header = [0u8; 4];
-        c.read_exact(&mut header).map_err(|_| malformed())?;
+        c.read_exact(&mut header)?;
         let arch_type = header[0];
         if arch_type != ARCH_TYPE_3GPP_5G {
             return Err(malformed());
@@ -169,7 +169,7 @@ impl MupNlri {
         }
         let mut body = vec![0u8; body_len];
         if body_len > 0 {
-            c.read_exact(&mut body).map_err(|_| malformed())?;
+            c.read_exact(&mut body)?;
         }
         match route_type {
             ROUTE_TYPE_INTERWORK_SEGMENT_DISCOVERY => Ok(MupNlri::InterworkSegmentDiscovery(
@@ -255,7 +255,7 @@ impl fmt::Display for MupNlri {
 }
 
 impl MupInterworkSegmentDiscoveryRoute {
-    fn decode(family: Family, data: &[u8]) -> Result<Self, Error> {
+    fn decode(family: Family, data: &[u8]) -> Result<Self, io::Error> {
         if data.len() < RouteDistinguisher::LEN + 1 {
             return Err(malformed());
         }
@@ -284,7 +284,7 @@ impl MupInterworkSegmentDiscoveryRoute {
 }
 
 impl MupDirectSegmentDiscoveryRoute {
-    fn decode(family: Family, data: &[u8]) -> Result<Self, Error> {
+    fn decode(family: Family, data: &[u8]) -> Result<Self, io::Error> {
         if data.len() < RouteDistinguisher::LEN {
             return Err(malformed());
         }
@@ -303,7 +303,7 @@ impl MupDirectSegmentDiscoveryRoute {
 }
 
 impl MupType1SessionTransformedRoute {
-    fn decode(family: Family, data: &[u8]) -> Result<Self, Error> {
+    fn decode(family: Family, data: &[u8]) -> Result<Self, io::Error> {
         let rd_end = RouteDistinguisher::LEN;
         if data.len() < rd_end + 1 {
             return Err(malformed());
@@ -384,7 +384,7 @@ impl MupType1SessionTransformedRoute {
 }
 
 impl MupType2SessionTransformedRoute {
-    fn decode(family: Family, data: &[u8]) -> Result<Self, Error> {
+    fn decode(family: Family, data: &[u8]) -> Result<Self, io::Error> {
         let rd_end = RouteDistinguisher::LEN;
         if data.len() < rd_end + 1 {
             return Err(malformed());
@@ -447,7 +447,7 @@ pub struct MupExtended {
 impl MupExtended {
     pub const LEN: usize = 8;
 
-    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+    pub fn decode(data: &[u8]) -> Result<Self, io::Error> {
         if data.len() != Self::LEN {
             return Err(malformed());
         }
@@ -646,7 +646,7 @@ mod tests {
         );
     }
 
-    fn decode_slice(family: Family, data: &[u8]) -> Result<MupNlri, Error> {
+    fn decode_slice(family: Family, data: &[u8]) -> Result<MupNlri, io::Error> {
         let len = data.len();
         let mut c = Cursor::new(data);
         MupNlri::decode(family, &mut c, len)

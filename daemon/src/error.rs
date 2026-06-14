@@ -33,6 +33,8 @@ pub(crate) enum Error {
     StdIoErr(#[from] std::io::Error),
     #[error("packet error")]
     Packet(#[from] rustybgp_packet::Error),
+    #[error("BGP notification: {0}")]
+    Notification(rustybgp_packet::Notification),
     #[error("table error")]
     Table(#[from] rustybgp_table::TableError),
 }

@@ -21,7 +21,6 @@
 //!   ceil(prefix_bits/8) bytes IP prefix (significant octets only)
 
 use crate::bgp::{Ipv4Net, Ipv6Net};
-use crate::error::{Error, Notification};
 use crate::mpls::MplsLabelStack;
 use crate::rd::RouteDistinguisher;
 use byteorder::ReadBytesExt;
@@ -33,8 +32,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// RD is always 64 bits on the wire.
 const VPN_RD_BITS: u8 = 64;
 
-fn malformed() -> Error {
-    Notification::UpdateMalformedAttributeList.into()
+fn malformed() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "malformed VPN NLRI")
 }
 
 /// VPNv4 NLRI (AFI=1, SAFI=128).
@@ -55,7 +54,7 @@ pub struct VpnV6Nlri {
 
 impl VpnV4Nlri {
     /// Decode a single VPNv4 NLRI from `c`. `len` is the remaining buffer bytes.
-    pub fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Self, Error> {
+    pub fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Self, io::Error> {
         // Minimum: 1-byte length + 3-byte label + 8-byte RD
         if len < 1 + 3 + RouteDistinguisher::LEN {
             return Err(malformed());
@@ -112,7 +111,7 @@ impl VpnV4Nlri {
 
 impl VpnV6Nlri {
     /// Decode a single VPNv6 NLRI from `c`. `len` is the remaining buffer bytes.
-    pub fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Self, Error> {
+    pub fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Self, io::Error> {
         // Minimum: 1-byte length + 3-byte label + 8-byte RD
         if len < 1 + 3 + RouteDistinguisher::LEN {
             return Err(malformed());
