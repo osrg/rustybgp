@@ -256,11 +256,7 @@ impl Connection {
         // Validate ASN if pre-configured
         if self.expected_remote_asn != 0 && self.expected_remote_asn != open.as_number {
             out.push(Output::SendMessage(bgp::Message::Notification(
-                rustybgp_packet::Notification::Other {
-                    code: 2,
-                    subcode: 2,
-                    data: vec![],
-                },
+                rustybgp_packet::Notification::OpenBadPeerAs,
             )));
             out.push(Output::SessionDown(SessionDownReason::AdminShutdown));
             return out;

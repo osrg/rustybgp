@@ -40,6 +40,8 @@ pub enum Notification {
     // Code 2: OPEN Message Error
     #[error("open error: malformed")]
     OpenMalformed,
+    #[error("open error: bad peer AS")]
+    OpenBadPeerAs,
     #[error("open error: unsupported optional parameter")]
     OpenUnsupportedOptionalParameter { data: Vec<u8> },
     #[error("open error: unacceptable hold time")]
@@ -86,6 +88,7 @@ impl Notification {
         match self {
             Self::BadMessageLength { .. } | Self::BadMessageType { .. } => 1,
             Self::OpenMalformed
+            | Self::OpenBadPeerAs
             | Self::OpenUnsupportedOptionalParameter { .. }
             | Self::OpenUnacceptableHoldTime { .. } => 2,
             Self::UpdateMalformedAttributeList | Self::UpdateOptionalAttributeError => 3,
@@ -106,6 +109,7 @@ impl Notification {
             Self::BadMessageLength { .. } => 2,
             Self::BadMessageType { .. } => 3,
             Self::OpenMalformed => 0,
+            Self::OpenBadPeerAs => 2,
             Self::OpenUnsupportedOptionalParameter { .. } => 4,
             Self::OpenUnacceptableHoldTime { .. } => 6,
             Self::UpdateMalformedAttributeList => 1,
@@ -146,6 +150,7 @@ impl Notification {
             (1, 2) => Self::BadMessageLength { data },
             (1, 3) => Self::BadMessageType { data },
             (2, 0) => Self::OpenMalformed,
+            (2, 2) => Self::OpenBadPeerAs,
             (2, 4) => Self::OpenUnsupportedOptionalParameter { data },
             (2, 6) => Self::OpenUnacceptableHoldTime { data },
             (3, 1) => Self::UpdateMalformedAttributeList,
