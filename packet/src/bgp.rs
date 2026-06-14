@@ -2230,8 +2230,6 @@ impl PeerCodec {
                 }
                 let mut seen = FnvHashMap::default();
                 let attr_end = c.position() + attr_len as u64;
-                let mut pre_code = 0;
-                let mut unsorted = false;
                 let mut error_attrs: Vec<AttributeError> = Vec::new();
                 let mut attr_idx = 0;
                 let reach_len = buf.len() as u64 - attr_end;
@@ -2241,10 +2239,6 @@ impl PeerCodec {
                     }
                     let flags = c.read_u8().unwrap();
                     let code = c.read_u8().unwrap();
-                    if code < pre_code {
-                        unsorted = true;
-                    }
-                    pre_code = code;
                     let alen = if flags & Attribute::FLAG_EXTENDED != 0 {
                         if attr_end < c.position() + 2 {
                             break;
@@ -2385,10 +2379,6 @@ impl PeerCodec {
                             rest,
                         )?);
                     }
-                }
-
-                if unsorted {
-                    attr.sort_unstable_by_key(|a| a.code());
                 }
 
                 if let Some(a) = mp_reach_attr {
