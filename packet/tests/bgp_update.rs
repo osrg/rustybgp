@@ -14,8 +14,8 @@
 // limitations under the License.
 
 use rustybgp_packet::bgp::{
-    Attribute, Ipv4Net, Ipv6Net, Message, Nexthop, ParsedMessage, ParsedUpdate, PeerCodec,
-    ReachNlri, UnreachNlri, Update,
+    Attribute, Capability, Ipv4Net, Ipv6Net, Message, Nexthop, ParsedMessage, ParsedUpdate,
+    PeerCodec, ReachNlri, UnreachNlri, Update,
 };
 use rustybgp_packet::mup;
 use rustybgp_packet::prefix_sid;
@@ -27,11 +27,15 @@ use std::sync::Arc;
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn ipv4_codec() -> rustybgp_packet::bgp::PeerCodec {
-    PeerCodec::new(&[Family::IPV4])
+    let mut c = PeerCodec::new();
+    c.set_family(Family::IPV4, Default::default());
+    c
 }
 
 fn ipv6_codec() -> rustybgp_packet::bgp::PeerCodec {
-    PeerCodec::new(&[Family::IPV6])
+    let mut c = PeerCodec::new();
+    c.set_family(Family::IPV6, Default::default());
+    c
 }
 
 /// Minimum valid attributes for an eBGP IPv4 UPDATE.
@@ -311,9 +315,11 @@ fn update_attr_med_dropped_on_encode() {
 // ─── RFC 8950: IPv4 NLRI with IPv6 Next Hop ─────────────────────────────────
 
 fn ipv4_extended_nexthop_codec() -> PeerCodec {
-    let mut codec = PeerCodec::new(&[Family::IPV4]);
-    codec.extended_nexthop = true;
-    codec
+    let local = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
+    ];
+    PeerCodec::negotiate(&local, &local)
 }
 
 #[test]
@@ -539,11 +545,15 @@ fn update_passes_through_unknown_prefix_sid_tlv() {
 // ─── MUP SAFI announce / withdraw ────────────────────────────────────────────
 
 fn ipv4_mup_codec() -> PeerCodec {
-    PeerCodec::new(&[Family::IPV4_MUP])
+    let mut c = PeerCodec::new();
+    c.set_family(Family::IPV4_MUP, Default::default());
+    c
 }
 
 fn ipv6_mup_codec() -> PeerCodec {
-    PeerCodec::new(&[Family::IPV6_MUP])
+    let mut c = PeerCodec::new();
+    c.set_family(Family::IPV6_MUP, Default::default());
+    c
 }
 
 fn mup_rd() -> RouteDistinguisher {

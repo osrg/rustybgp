@@ -96,9 +96,9 @@ pub(crate) enum Output {
     SetKeepaliveTimer(u64),
     /// Arm or re-arm the hold timer (receive direction, seconds).
     SetHoldTimer(u64),
-    /// Negotiated address-family channels. The driver should configure its
-    /// PeerCodec with these.
-    ChannelsNegotiated(bgp::NegotiatedSession),
+    /// Codec configured from the negotiated capabilities. The driver should
+    /// replace its PeerCodec with this.
+    SessionNegotiated(bgp::PeerCodec),
     /// The session reached Established. The driver should register the peer
     /// as a route source, populate initial routes, etc.
     SessionEstablished {
@@ -275,14 +275,10 @@ impl Connection {
         // Send KEEPALIVE in response to OPEN
         out.push(Output::SendMessage(bgp::Message::Keepalive));
 
-        // Negotiate capabilities
-        let session = bgp::negotiate_families(&self.local_cap, &open.capability);
-
-        // Retain send_max only for families where Add-Path TX was negotiated
-        self.send_max
-            .retain(|f, _| session.families.get(f).is_some_and(|s| s.addpath_tx));
-
-        out.push(Output::ChannelsNegotiated(session));
+        out.push(Output::SessionNegotiated(bgp::PeerCodec::negotiate(
+            &self.local_cap,
+            &open.capability,
+        )));
 
         // Negotiate holdtime
         self.negotiated_holdtime = std::cmp::min(self.local_holdtime, self.remote_holdtime as u64);
@@ -721,7 +717,7 @@ mod tests {
         )));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::ChannelsNegotiated(_)
+            Output::SessionNegotiated(_)
         )));
         assert!(has_output(&out, |o| matches!(
             o,

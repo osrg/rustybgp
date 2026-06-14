@@ -38,7 +38,7 @@ fn bgp_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
 }
 
 fn default_framer() -> PeerCodec {
-    PeerCodec::new(&[])
+    PeerCodec::new()
 }
 
 // ─── basic framing tests ─────────────────────────────────────────────────────
@@ -178,7 +178,14 @@ fn framer_unknown_message_type() {
 #[test]
 fn framer_mixed_message_types() {
     // KEEPALIVE followed by ROUTE-REFRESH for IPv4
-    let mut framer = PeerCodec::new(&[rustybgp_packet::Family::IPV4]);
+    let mut framer = {
+        let mut c = PeerCodec::new();
+        c.set_family(
+            rustybgp_packet::Family::IPV4,
+            rustybgp_packet::bgp::FamilyState::default(),
+        );
+        c
+    };
     let mut buf = BytesMut::new();
 
     // KEEPALIVE

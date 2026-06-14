@@ -122,7 +122,7 @@ impl Default for MrtCodec {
 impl MrtCodec {
     pub fn new() -> Self {
         MrtCodec {
-            codec: bgp::PeerCodec::new(&[]),
+            codec: bgp::PeerCodec::new(),
         }
     }
 }
@@ -148,11 +148,11 @@ impl Encoder<&Message> for MrtCodec {
                     } else {
                         unreach.as_ref().unwrap().family
                     };
-                    self.codec.families.insert(
+                    self.codec.set_family(
                         family,
                         bgp::FamilyState {
-                            addpath_rx: false,
                             addpath_tx: *addpath,
+                            ..Default::default()
                         },
                     );
                 }

@@ -13,9 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustybgp_packet::bgp::{
-    Capability, Message, Open, ParsedMessage, PeerCodec, negotiate_families,
-};
+use rustybgp_packet::bgp::{Capability, Message, Open, ParsedMessage, PeerCodec};
 use rustybgp_packet::{Family, HoldTime, Notification};
 use std::net::Ipv4Addr;
 
@@ -52,14 +50,14 @@ fn parse_open_caps(cap_bytes: &[u8]) -> Vec<Capability> {
         1,
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
-    match PeerCodec::new(&[]).parse_message(&buf).unwrap() {
+    match PeerCodec::new().parse_message(&buf).unwrap() {
         ParsedMessage::Open(Open { capability, .. }) => capability,
         _ => panic!("expected OPEN"),
     }
 }
 
 fn round_trip(msg: &Message) -> ParsedMessage {
-    let mut framer = PeerCodec::new(&[]);
+    let mut framer = PeerCodec::new();
     let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
     framer.parse_message(&buf).unwrap()
@@ -161,7 +159,7 @@ fn capability_graceful_restart_invalid_len() {
         1,
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
-    match PeerCodec::new(&[]).parse_message(&buf) {
+    match PeerCodec::new().parse_message(&buf) {
         Err(Notification::OpenMalformed) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
@@ -217,7 +215,7 @@ fn capability_add_path_invalid_len() {
         1,
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
-    match PeerCodec::new(&[]).parse_message(&buf) {
+    match PeerCodec::new().parse_message(&buf) {
         Err(Notification::OpenMalformed) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
@@ -309,7 +307,7 @@ fn capability_llgr_round_trip() {
 // ─── negotiate_families ──────────────────────────────────────────────────────
 
 #[test]
-fn negotiate_families_addpath_rx_only() {
+fn negotiate_addpath_rx_only() {
     // Local wants RX (1), remote can TX (2) → local gets addpath_rx
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
@@ -319,15 +317,15 @@ fn negotiate_families_addpath_rx_only() {
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 2)]),
     ];
-    let result = negotiate_families(&local, &remote);
-    assert_eq!(result.families.len(), 1);
-    let s = result.families.get(&Family::IPV4).unwrap();
+    let codec = PeerCodec::negotiate(&local, &remote);
+    assert_eq!(codec.families_iter().count(), 1);
+    let s = codec.family_state(Family::IPV4).unwrap();
     assert!(s.addpath_rx);
     assert!(!s.addpath_tx);
 }
 
 #[test]
-fn negotiate_families_addpath_tx_only() {
+fn negotiate_addpath_tx_only() {
     // Local can TX (2), remote wants RX (1) → local gets addpath_tx
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
@@ -337,15 +335,15 @@ fn negotiate_families_addpath_tx_only() {
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 1)]),
     ];
-    let result = negotiate_families(&local, &remote);
-    assert_eq!(result.families.len(), 1);
-    let s = result.families.get(&Family::IPV4).unwrap();
+    let codec = PeerCodec::negotiate(&local, &remote);
+    assert_eq!(codec.families_iter().count(), 1);
+    let s = codec.family_state(Family::IPV4).unwrap();
     assert!(!s.addpath_rx);
     assert!(s.addpath_tx);
 }
 
 #[test]
-fn negotiate_families_addpath_both() {
+fn negotiate_addpath_both() {
     // Both sides advertise BOTH (3) → addpath_rx and addpath_tx
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
@@ -355,15 +353,15 @@ fn negotiate_families_addpath_both() {
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 3)]),
     ];
-    let result = negotiate_families(&local, &remote);
-    assert_eq!(result.families.len(), 1);
-    let s = result.families.get(&Family::IPV4).unwrap();
+    let codec = PeerCodec::negotiate(&local, &remote);
+    assert_eq!(codec.families_iter().count(), 1);
+    let s = codec.family_state(Family::IPV4).unwrap();
     assert!(s.addpath_rx);
     assert!(s.addpath_tx);
 }
 
 #[test]
-fn negotiate_families_addpath_no_match() {
+fn negotiate_addpath_no_match() {
     // Both sides only want RX (1) → neither can TX → no addpath
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
@@ -373,15 +371,15 @@ fn negotiate_families_addpath_no_match() {
         Capability::MultiProtocol(Family::IPV4),
         Capability::AddPath(vec![(Family::IPV4, 1)]),
     ];
-    let result = negotiate_families(&local, &remote);
-    assert_eq!(result.families.len(), 1);
-    let s = result.families.get(&Family::IPV4).unwrap();
+    let codec = PeerCodec::negotiate(&local, &remote);
+    assert_eq!(codec.families_iter().count(), 1);
+    let s = codec.family_state(Family::IPV4).unwrap();
     assert!(!s.addpath_rx);
     assert!(!s.addpath_tx);
 }
 
 #[test]
-fn negotiate_families_addpath_mismatched_family() {
+fn negotiate_addpath_mismatched_family() {
     // Local has AddPath for IPv4, remote for IPv6 → no addpath on either
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
@@ -393,9 +391,10 @@ fn negotiate_families_addpath_mismatched_family() {
         Capability::MultiProtocol(Family::IPV6),
         Capability::AddPath(vec![(Family::IPV6, 3)]),
     ];
-    let result = negotiate_families(&local, &remote);
-    assert_eq!(result.families.len(), 2);
-    for (_, s) in result.families.iter() {
+    let codec = PeerCodec::negotiate(&local, &remote);
+    assert_eq!(codec.families_iter().count(), 2);
+    for f in [Family::IPV4, Family::IPV6] {
+        let s = codec.family_state(f).unwrap();
         assert!(!s.addpath_rx);
         assert!(!s.addpath_tx);
     }
@@ -441,7 +440,7 @@ fn capability_extended_nexthop_round_trip() {
 }
 
 #[test]
-fn negotiate_families_extended_nexthop_bilateral() {
+fn negotiate_extended_nexthop_bilateral() {
     // Both sides advertise ExtendedNexthop for IPv4 unicast
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
@@ -451,27 +450,19 @@ fn negotiate_families_extended_nexthop_bilateral() {
         Capability::MultiProtocol(Family::IPV4),
         Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
     ];
-    let result = negotiate_families(&local, &remote);
-    assert_eq!(result.families.len(), 1);
-    assert!(result.families.contains_key(&Family::IPV4));
-    assert!(
-        result.extended_nexthop,
-        "extended_nexthop must be true when both sides advertise"
-    );
+    let codec = PeerCodec::negotiate(&local, &remote);
+    assert_eq!(codec.families_iter().count(), 1);
+    assert!(codec.has_family(Family::IPV4));
 }
 
 #[test]
-fn negotiate_families_extended_nexthop_unilateral() {
+fn negotiate_extended_nexthop_unilateral() {
     // Only local advertises ExtendedNexthop — should NOT be active
     let local = vec![
         Capability::MultiProtocol(Family::IPV4),
         Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
     ];
     let remote = vec![Capability::MultiProtocol(Family::IPV4)];
-    let result = negotiate_families(&local, &remote);
-    assert_eq!(result.families.len(), 1);
-    assert!(
-        !result.extended_nexthop,
-        "extended_nexthop must be false when only one side advertises"
-    );
+    let codec = PeerCodec::negotiate(&local, &remote);
+    assert_eq!(codec.families_iter().count(), 1);
 }

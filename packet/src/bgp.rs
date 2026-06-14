@@ -1593,112 +1593,121 @@ impl Message {
 }
 
 /// Per-family negotiated ADD-PATH capability state.
+#[derive(Default)]
 pub struct FamilyState {
     pub addpath_rx: bool,
     pub addpath_tx: bool,
 }
 
-/// Result of capability negotiation for a BGP session.
-pub struct NegotiatedSession {
-    /// Active families with their ADD-PATH state.
-    pub families: FnvHashMap<Family, FamilyState>,
-    /// RFC 8950: IPv4 NLRIs use IPv6 next hops (both sides must agree).
-    pub extended_nexthop: bool,
+pub struct PeerCodec {
+    pub extended_length: bool,
+    extended_nexthop: bool,
+    families: FnvHashMap<Family, FamilyState>,
 }
 
-pub fn negotiate_families(local: &[Capability], remote: &[Capability]) -> NegotiatedSession {
-    struct Raw {
-        addpath: u8,
-        extended_nexthop: bool,
+impl Default for PeerCodec {
+    fn default() -> Self {
+        Self::new()
     }
-    let parse = |v: &[Capability]| -> FnvHashMap<Family, Raw> {
-        let mut h: FnvHashMap<Family, Raw> = FnvHashMap::default();
-        for c in v {
-            if let Capability::MultiProtocol(f) = c {
-                h.insert(
-                    *f,
-                    Raw {
-                        addpath: 0,
-                        extended_nexthop: false,
+}
+
+impl PeerCodec {
+    pub fn new() -> Self {
+        PeerCodec {
+            extended_length: false,
+            extended_nexthop: false,
+            families: FnvHashMap::default(),
+        }
+    }
+
+    /// Build a `PeerCodec` from the capabilities advertised by both sides.
+    pub fn negotiate(local: &[Capability], remote: &[Capability]) -> Self {
+        struct Raw {
+            addpath: u8,
+            extended_nexthop: bool,
+        }
+        let parse = |v: &[Capability]| -> FnvHashMap<Family, Raw> {
+            let mut h: FnvHashMap<Family, Raw> = FnvHashMap::default();
+            for c in v {
+                if let Capability::MultiProtocol(f) = c {
+                    h.insert(
+                        *f,
+                        Raw {
+                            addpath: 0,
+                            extended_nexthop: false,
+                        },
+                    );
+                }
+            }
+            for c in v {
+                if let Capability::AddPath(v) = c {
+                    for (f, mode) in v {
+                        if let Some(fc) = h.get_mut(f) {
+                            fc.addpath = *mode;
+                        }
+                    }
+                }
+            }
+            for c in v {
+                if let Capability::ExtendedNexthop(v) = c {
+                    for (f, nexthop_afi) in v {
+                        if f.afi() != Family::AFI_IP {
+                            continue;
+                        }
+                        if *nexthop_afi == Family::AFI_IP6
+                            && let Some(fc) = h.get_mut(f)
+                        {
+                            fc.extended_nexthop = true;
+                        }
+                    }
+                }
+            }
+            h
+        };
+        let mut lmap = parse(local);
+        let mut families = FnvHashMap::default();
+        let mut extended_nexthop = false;
+        for (f, rc) in parse(remote) {
+            if let Some(lc) = lmap.remove(&f) {
+                let addpath_rx = lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0;
+                let addpath_tx = lc.addpath & 0x2 > 0 && rc.addpath & 0x1 > 0;
+                if lc.extended_nexthop && rc.extended_nexthop {
+                    extended_nexthop = true;
+                }
+                families.insert(
+                    f,
+                    FamilyState {
+                        addpath_rx,
+                        addpath_tx,
                     },
                 );
             }
         }
-        for c in v {
-            if let Capability::AddPath(v) = c {
-                for (f, mode) in v {
-                    if let Some(fc) = h.get_mut(f) {
-                        fc.addpath = *mode;
-                    }
-                }
-            }
-        }
-        for c in v {
-            if let Capability::ExtendedNexthop(v) = c {
-                for (f, nexthop_afi) in v {
-                    if f.afi() != Family::AFI_IP {
-                        continue;
-                    }
-                    if *nexthop_afi == Family::AFI_IP6
-                        && let Some(fc) = h.get_mut(f)
-                    {
-                        fc.extended_nexthop = true;
-                    }
-                }
-            }
-        }
-        h
-    };
-    let mut lmap = parse(local);
-    let mut families = FnvHashMap::default();
-    let mut extended_nexthop = false;
-    for (f, rc) in parse(remote) {
-        if let Some(lc) = lmap.remove(&f) {
-            let addpath_rx = lc.addpath & 0x1 > 0 && rc.addpath & 0x2 > 0;
-            let addpath_tx = lc.addpath & 0x2 > 0 && rc.addpath & 0x1 > 0;
-            if lc.extended_nexthop && rc.extended_nexthop {
-                extended_nexthop = true;
-            }
-            families.insert(
-                f,
-                FamilyState {
-                    addpath_rx,
-                    addpath_tx,
-                },
-            );
-        }
-    }
-    NegotiatedSession {
-        families,
-        extended_nexthop,
-    }
-}
-
-pub struct PeerCodec {
-    pub extended_length: bool,
-    /// RFC 8950: IPv4 NLRIs use IPv6 next hops.
-    pub extended_nexthop: bool,
-    pub families: FnvHashMap<Family, FamilyState>,
-}
-
-impl PeerCodec {
-    pub fn new(families: &[Family]) -> Self {
         PeerCodec {
             extended_length: false,
-            extended_nexthop: false,
-            families: families
-                .iter()
-                .map(|f| {
-                    (
-                        *f,
-                        FamilyState {
-                            addpath_rx: false,
-                            addpath_tx: false,
-                        },
-                    )
-                })
-                .collect(),
+            extended_nexthop,
+            families,
         }
+    }
+
+    /// Returns true if `family` was negotiated for this session.
+    pub fn has_family(&self, family: Family) -> bool {
+        self.families.contains_key(&family)
+    }
+
+    /// Returns the ADD-PATH state for `family`, or `None` if not negotiated.
+    pub fn family_state(&self, family: Family) -> Option<&FamilyState> {
+        self.families.get(&family)
+    }
+
+    /// Insert or update a family entry (used by MRT/BMP encoders).
+    pub fn set_family(&mut self, family: Family, state: FamilyState) {
+        self.families.insert(family, state);
+    }
+
+    /// Iterate over all negotiated families.
+    pub fn families_iter(&self) -> impl Iterator<Item = Family> + '_ {
+        self.families.keys().copied()
     }
 
     pub fn max_message_length(&self) -> usize {

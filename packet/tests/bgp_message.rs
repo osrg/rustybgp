@@ -30,7 +30,11 @@ fn ipv6_eor() {
         0x00, 0x1e, 0x02, 0x00, 0x00, 0x00, 0x07, 0x90, 0x0f, 0x00, 0x03, 0x00, 0x02, 0x01,
     ];
     buf.append(&mut body);
-    let mut codec = PeerCodec::new(&[Family::IPV6]);
+    let mut codec = {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV6, Default::default());
+        c
+    };
     assert!(codec.parse_message(&buf).is_ok());
 }
 
@@ -67,7 +71,11 @@ fn parse_ipv6_update() {
     .map(PathNlri::new)
     .collect();
 
-    let mut codec = PeerCodec::new(&[Family::IPV6]);
+    let mut codec = {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV6, Default::default());
+        c
+    };
     let msg = codec.parse_message(&buf).unwrap();
     match msg {
         ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
@@ -110,7 +118,11 @@ fn build_many_v4_route() {
         unreach: None,
     });
 
-    let codec = PeerCodec::new(&[Family::IPV4]);
+    let codec = {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV4, Default::default());
+        c
+    };
     let mut txbuf = BytesMut::with_capacity(4096);
     let mut framer = codec;
     framer.encode_to(&msg, &mut txbuf).unwrap();
@@ -188,7 +200,11 @@ fn many_mp_reach() {
         unreach: None,
     });
 
-    let codec = PeerCodec::new(&[Family::IPV6]);
+    let codec = {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV6, Default::default());
+        c
+    };
     let mut txbuf = BytesMut::with_capacity(4096);
     let mut framer = codec;
     framer.encode_to(&msg, &mut txbuf).unwrap();
@@ -232,7 +248,11 @@ fn many_mp_unreach() {
         }),
     });
 
-    let codec = PeerCodec::new(&[Family::IPV6]);
+    let codec = {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV6, Default::default());
+        c
+    };
     let mut txbuf = BytesMut::with_capacity(4096);
     let mut framer = codec;
     framer.encode_to(&msg, &mut txbuf).unwrap();

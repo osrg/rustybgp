@@ -104,11 +104,10 @@ impl PendingTx {
     ///
     /// `family` is the address family for this PendingTx.
     /// `addpath_tx` controls whether path_id is included in NLRI encoding.
-    /// `use_mp` controls whether IPv4 uses MP_REACH (RFC 8950 extended nexthop).
     ///
     /// Returns a list of UPDATE messages ready for encoding. The caller is
     /// responsible for encoding and writing them to the wire.
-    pub(crate) fn drain_messages(&mut self, family: Family, _use_mp: bool) -> Vec<bgp::Message> {
+    pub(crate) fn drain_messages(&mut self, family: Family) -> Vec<bgp::Message> {
         let mut messages = Vec::new();
 
         // 1. Withdrawals
@@ -224,7 +223,7 @@ mod tests {
         p.reach(nlri("20.0.0.0/24"), 0, nh(), attr(0));
 
         assert!(!p.is_empty());
-        let msgs = p.drain_messages(Family::IPV4, false);
+        let msgs = p.drain_messages(Family::IPV4);
         // Same attributes → batched into 1 UPDATE + EOR
         assert_eq!(msgs.len(), 2);
         if let bgp::Message::Update(bgp::Update::Routes { reach, .. }) = &msgs[0] {
@@ -241,7 +240,7 @@ mod tests {
         let mut p = PendingTx::new(false);
         p.unreach(nlri("10.0.0.0/24"), 0);
 
-        let msgs = p.drain_messages(Family::IPV4, false);
+        let msgs = p.drain_messages(Family::IPV4);
         // withdrawal + EOR
         assert_eq!(msgs.len(), 2);
         if let bgp::Message::Update(bgp::Update::Routes { unreach, .. }) = &msgs[0] {
@@ -258,7 +257,7 @@ mod tests {
         p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
         p.unreach(nlri("10.0.0.0/24"), 0);
 
-        let msgs = p.drain_messages(Family::IPV4, false);
+        let msgs = p.drain_messages(Family::IPV4);
         // withdrawal + EOR
         assert_eq!(msgs.len(), 2);
         if let bgp::Message::Update(bgp::Update::Routes { reach, unreach, .. }) = &msgs[0] {
@@ -275,7 +274,7 @@ mod tests {
         p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0)); // origin=IGP
         p.reach(nlri("20.0.0.0/24"), 0, nh(), attr(1)); // origin=EGP
 
-        let msgs = p.drain_messages(Family::IPV4, false);
+        let msgs = p.drain_messages(Family::IPV4);
         // Different attributes → 2 UPDATEs + EOR
         assert_eq!(msgs.len(), 3);
     }
@@ -313,7 +312,7 @@ mod tests {
         assert_eq!(p.bucket.get(&old_attr).unwrap().len(), 1);
 
         // Drain and verify: 2 UPDATEs with correct NLRIs
-        let msgs = p.drain_messages(Family::IPV4, false);
+        let msgs = p.drain_messages(Family::IPV4);
         let mut origins: Vec<u32> = Vec::new();
         for msg in &msgs {
             if let bgp::Message::Update(bgp::Update::Routes { reach, attr, .. }) = msg
@@ -340,7 +339,7 @@ mod tests {
         p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
 
         // The final state is a reach (withdrawal was cancelled by re-advertisement)
-        let msgs = p.drain_messages(Family::IPV4, false);
+        let msgs = p.drain_messages(Family::IPV4);
         assert!(msgs.iter().any(|m| {
             matches!(m, bgp::Message::Update(bgp::Update::Routes { reach, .. })
                 if reach.as_ref().is_some_and(|r| !r.entries.is_empty()))
@@ -354,7 +353,7 @@ mod tests {
     #[test]
     fn eor_generated_when_empty() {
         let mut p = PendingTx::new(false);
-        let msgs = p.drain_messages(Family::IPV4, false);
+        let msgs = p.drain_messages(Family::IPV4);
         assert_eq!(msgs.len(), 1);
         assert!(
             matches!(
@@ -365,7 +364,7 @@ mod tests {
         );
 
         // Not generated again
-        let msgs = p.drain_messages(Family::IPV4, false);
+        let msgs = p.drain_messages(Family::IPV4);
         assert!(msgs.is_empty());
     }
 
@@ -374,7 +373,7 @@ mod tests {
         let mut p = PendingTx::new(false);
         p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
         // Drain produces reach UPDATE + EOR
-        let msgs = p.drain_messages(Family::IPV4, false);
+        let msgs = p.drain_messages(Family::IPV4);
         assert_eq!(msgs.len(), 2);
         // First: reach
         if let bgp::Message::Update(bgp::Update::Routes { reach, .. }) = &msgs[0] {
@@ -393,27 +392,11 @@ mod tests {
     }
 
     #[test]
-    fn use_mp_routes_through_reach() {
-        // _use_mp is a hint to PeerCodec for RFC 8950 extended nexthop; drain_messages
-        // always puts NLRIs in reach regardless.
-        let mut p = PendingTx::new(false);
-        p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
-
-        let msgs = p.drain_messages(Family::IPV4, true);
-        assert_eq!(msgs.len(), 2);
-        if let bgp::Message::Update(bgp::Update::Routes { reach, .. }) = &msgs[0] {
-            assert!(reach.as_ref().is_some_and(|r| !r.entries.is_empty()));
-        } else {
-            panic!("expected Update");
-        }
-    }
-
-    #[test]
     fn addpath_includes_path_id() {
         let mut p = PendingTx::new(true);
         p.reach(nlri("10.0.0.0/24"), 42, nh(), attr(0));
 
-        let msgs = p.drain_messages(Family::IPV4, false);
+        let msgs = p.drain_messages(Family::IPV4);
         if let bgp::Message::Update(bgp::Update::Routes { reach, .. }) = &msgs[0] {
             assert_eq!(reach.as_ref().unwrap().entries[0].path_id, 42);
         } else {

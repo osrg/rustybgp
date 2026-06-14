@@ -48,7 +48,7 @@ fn capability_param(cap_bytes: &[u8]) -> Vec<u8> {
 }
 
 fn default_codec() -> PeerCodec {
-    PeerCodec::new(&[])
+    PeerCodec::new()
 }
 
 // ─── parse tests ────────────────────────────────────────────────────────────

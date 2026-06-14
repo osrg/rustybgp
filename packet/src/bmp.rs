@@ -101,7 +101,7 @@ impl PeerDownReason {
     fn encode(&self, c: &mut BytesMut) -> Result<(), Error> {
         c.put_u8(self.code());
         c.put_slice(&[0; 3]);
-        let mut codec = bgp::PeerCodec::new(&[]);
+        let mut codec = bgp::PeerCodec::new();
         match self {
             Self::LocalNotification(notification) => {
                 let mut buf = bytes::BytesMut::with_capacity(4096);
@@ -189,7 +189,7 @@ impl Default for BmpCodec {
 impl BmpCodec {
     pub fn new() -> Self {
         BmpCodec {
-            codec: bgp::PeerCodec::new(&[]),
+            codec: bgp::PeerCodec::new(),
         }
     }
 }
@@ -218,11 +218,11 @@ impl Encoder<&Message> for BmpCodec {
                     } else {
                         unreach.as_ref().unwrap().family
                     };
-                    self.codec.families.insert(
+                    self.codec.set_family(
                         family,
                         bgp::FamilyState {
-                            addpath_rx: false,
                             addpath_tx: *addpath,
+                            ..Default::default()
                         },
                     );
                 }

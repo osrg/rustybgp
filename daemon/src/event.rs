@@ -4787,7 +4787,7 @@ impl PeerExportContext {
     /// The codec handles only wire framing; all attribute transformation and
     /// loop detection is handled in the daemon.
     fn build_codec(&self) -> bgp::PeerCodec {
-        bgp::PeerCodec::new(&[])
+        bgp::PeerCodec::new()
     }
 
     /// Apply per-peer attribute transformation to outgoing route attributes.
@@ -4954,7 +4954,7 @@ struct PeerSession {
 
     // --- session I/O state ---
     urgent: Vec<bgp::Message>,
-    framer: bgp::PeerCodec,
+    codec: bgp::PeerCodec,
     keepalive_futures: FuturesUnordered<tokio::time::Sleep>,
     holdtime_futures: FuturesUnordered<tokio::time::Sleep>,
     pending: FnvHashMap<Family, crate::peer_tx::PendingTx>,
@@ -4987,7 +4987,7 @@ impl PeerSession {
             link_addr,
             confederation_id: res.confederation_id,
         };
-        let framer = export_ctx.build_codec();
+        let codec = export_ctx.build_codec();
 
         let prefix_counters = res
             .prefix_limits
@@ -5025,7 +5025,7 @@ impl PeerSession {
             local_router_id: res.local_router_id,
             cluster_id: res.cluster_id,
             urgent: Vec::new(),
-            framer,
+            codec,
             keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
                 .into_iter()
                 .collect(),
@@ -5060,7 +5060,7 @@ impl PeerSession {
         let conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(fsm)));
         context.lock().unwrap().conn_arbiter = Arc::clone(&conn_arbiter);
 
-        let framer = bgp::PeerCodec::new(&[]);
+        let codec = bgp::PeerCodec::new();
 
         PeerSession {
             remote_addr,
@@ -5100,7 +5100,7 @@ impl PeerSession {
             local_router_id: Ipv4Addr::new(1, 0, 0, 1),
             cluster_id: None,
             urgent: vec![],
-            framer,
+            codec,
             keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
                 .into_iter()
                 .collect(),
@@ -5162,16 +5162,11 @@ impl PeerSession {
         let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
         let router_id = Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed));
 
-        // Collect channel info up front so we don't borrow self.framer across .await.
-        let channel_info: Vec<(Family, bool, bool)> = self
-            .framer
-            .families
-            .iter()
-            .map(|(f, s)| (*f, s.addpath_rx, s.addpath_tx))
-            .collect();
+        // Collect families up front so we don't borrow self.codec across .await.
+        let families: Vec<Family> = self.codec.families_iter().collect();
 
         // Create one Source per negotiated family so GR can stale individual families.
-        for (family, _, _) in &channel_info {
+        for family in &families {
             self.source.insert(
                 *family,
                 Arc::new(table::Source::new(
@@ -5187,19 +5182,21 @@ impl PeerSession {
         }
 
         let mut addpath = FnvHashSet::default();
-        for (family, addpath_rx, addpath_tx) in &channel_info {
-            if *addpath_rx {
-                addpath.insert(*family);
+        for family in &families {
+            if let Some(s) = self.codec.family_state(*family) {
+                if s.addpath_rx {
+                    addpath.insert(*family);
+                }
+                self.pending
+                    .insert(*family, crate::peer_tx::PendingTx::new(s.addpath_tx));
             }
-            self.pending
-                .insert(*family, crate::peer_tx::PendingTx::new(*addpath_tx));
         }
 
         let export_policy = self.tables.export_policy.load_full();
         let peer_event_rx = self
             .tables
             .register_peer(self.remote_addr, addpath, |rtable| {
-                for (f, _, _) in &channel_info {
+                for f in &families {
                     let effective_max = self
                         .conn_arbiter
                         .lock()
@@ -5319,50 +5316,9 @@ impl PeerSession {
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
-                    crate::fsm::Output::ChannelsNegotiated(channels),
+                    crate::fsm::Output::SessionNegotiated(codec),
                 ) => {
-                    // Log Add-Path warnings for locally configured but not negotiated families
-                    let local_addpath: Vec<(Family, u8)> = self
-                        .local_cap
-                        .iter()
-                        .filter_map(|c| {
-                            if let packet::Capability::AddPath(v) = c {
-                                Some(v.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .flatten()
-                        .collect();
-                    for (family, mode) in &local_addpath {
-                        match channels.families.get(family) {
-                            Some(s) => {
-                                if mode & 0x1 > 0 && !s.addpath_rx {
-                                    log::warn!(
-                                        "add-path receive configured for {:?} but not negotiated with peer {}",
-                                        family,
-                                        self.remote_addr
-                                    );
-                                }
-                                if mode & 0x2 > 0 && !s.addpath_tx {
-                                    log::warn!(
-                                        "add-path send configured for {:?} but not negotiated with peer {}",
-                                        family,
-                                        self.remote_addr
-                                    );
-                                }
-                            }
-                            None => {
-                                log::warn!(
-                                    "add-path configured for {:?} but family not negotiated with peer {}",
-                                    family,
-                                    self.remote_addr
-                                );
-                            }
-                        }
-                    }
-                    self.framer.extended_nexthop = channels.extended_nexthop;
-                    self.framer.families = channels.families;
+                    self.codec = codec;
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -5528,7 +5484,7 @@ impl PeerSession {
         let mut txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
         for _ in 0..self.urgent.len() {
             let msg = self.urgent.remove(0);
-            let _ = self.framer.encode_to(&msg, &mut txbuf);
+            let _ = self.codec.encode_to(&msg, &mut txbuf);
             (*self.counter_tx).sync(&msg);
 
             if txbuf.len() > self.txbuf_size {
@@ -5547,13 +5503,8 @@ impl PeerSession {
         txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
         let any_update_pending = self.pending.values().any(|p| !p.is_empty());
         for (family, p) in self.pending.iter_mut() {
-            // IPv4-unicast can carry reachability either in the UPDATE's
-            // traditional NLRI section or via MP_REACH_NLRI (when RFC 8950
-            // Extended Nexthop is negotiated). Every other family must use
-            // MP_REACH_NLRI.
-            let use_mp = *family != packet::Family::IPV4 || self.framer.extended_nexthop;
-            for msg in p.drain_messages(*family, use_mp) {
-                let _ = self.framer.encode_to(&msg, &mut txbuf);
+            for msg in p.drain_messages(*family) {
+                let _ = self.codec.encode_to(&msg, &mut txbuf);
                 self.counter_tx.sync(&msg);
 
                 if txbuf.len() > self.txbuf_size {
@@ -5681,7 +5632,7 @@ impl PeerSession {
         if self.conn_arbiter.lock().unwrap().state(self.role) != SessionState::Established {
             return;
         }
-        if !self.framer.families.contains_key(&update.family) {
+        if !self.codec.has_family(update.family) {
             return;
         }
         let effective_max = self
@@ -5903,7 +5854,7 @@ impl PeerSession {
                                 self.process_effects(effects, global).await;
                             }
                             Ok(_) => loop {
-                                    match self.framer.try_parse(&mut rxbuf) {
+                                    match self.codec.try_parse(&mut rxbuf) {
                                     Ok(msg) => match msg {
                                         Some(parsed) => {
                                             match bgp::validate_message(parsed) {
@@ -7739,13 +7690,8 @@ mod tests {
     /// Prepare a PeerSession for tests: open the IPv4 channel
     /// and insert an IPv4 pending bucket, matching what on_established would do.
     fn setup_ipv4_session(conn: &mut PeerSession) {
-        conn.framer.families.insert(
-            Family::IPV4,
-            bgp::FamilyState {
-                addpath_rx: false,
-                addpath_tx: false,
-            },
-        );
+        conn.codec
+            .set_family(Family::IPV4, bgp::FamilyState::default());
         conn.pending
             .insert(Family::IPV4, crate::peer_tx::PendingTx::new(false));
     }
@@ -8753,7 +8699,7 @@ mod tests {
 
             assert!(em.was_sent(Family::IPV4, &net));
             assert!(em.contains_path(Family::IPV4, &net, 0)); // non-addpath uses path_id=0
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             let reach = reach_entries(&msgs);
             assert_eq!(reach.len(), 1);
             assert_eq!(reach[0].0, net);
@@ -8780,7 +8726,7 @@ mod tests {
             );
 
             assert!(!em.was_sent(Family::IPV4, &net));
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             let unreach = unreach_entries(&msgs);
             assert_eq!(unreach.len(), 1);
             assert_eq!(unreach[0].0, net);
@@ -8852,7 +8798,7 @@ mod tests {
                 None,
             );
             assert!(em.was_sent(Family::IPV4, &net));
-            pending.drain_messages(Family::IPV4, false); // flush
+            pending.drain_messages(Family::IPV4); // flush
 
             // 2. Withdraw
             process_nlri_change(
@@ -8866,7 +8812,7 @@ mod tests {
                 None,
             );
             assert!(!em.was_sent(Family::IPV4, &net));
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             assert_eq!(unreach_entries(&msgs).len(), 1);
         }
 
@@ -8916,7 +8862,7 @@ mod tests {
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
             assert!(em.contains_path(Family::IPV4, &net, 2));
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             let reach = reach_entries(&msgs);
             let pids: std::collections::HashSet<u32> = reach.iter().map(|e| e.1).collect();
             assert!(pids.contains(&1));
@@ -8948,7 +8894,7 @@ mod tests {
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
             assert!(!em.contains_path(Family::IPV4, &net, 2));
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             let unreach = unreach_entries(&msgs);
             assert_eq!(unreach.len(), 1);
             assert_eq!(unreach[0].1, 2);
@@ -8977,7 +8923,7 @@ mod tests {
                 None,
             );
 
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             let reach = reach_entries(&msgs);
             // Only path_id=1 re-advertised; path_id=2 unchanged
             assert_eq!(reach.len(), 1);
@@ -9013,7 +8959,7 @@ mod tests {
             assert!(em.contains_path(Family::IPV4, &net, 3));
             assert!(em.contains_path(Family::IPV4, &net, 1));
             assert!(!em.contains_path(Family::IPV4, &net, 2)); // pushed out
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
             let unreach_pids: Vec<u32> = unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
             assert!(reach_pids.contains(&3));
@@ -9051,7 +8997,7 @@ mod tests {
             assert!(!em.contains_path(Family::IPV4, &net, 1)); // withdrawn
             assert!(em.contains_path(Family::IPV4, &net, 2)); // kept
             assert!(em.contains_path(Family::IPV4, &net, 3)); // entered window
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
             let unreach_pids: Vec<u32> = unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
             assert!(reach_pids.contains(&3));
@@ -9080,7 +9026,7 @@ mod tests {
             );
 
             assert!(!em.was_sent(Family::IPV4, &net));
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             let unreach_pids: std::collections::HashSet<u32> =
                 unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
             assert!(unreach_pids.contains(&1));
@@ -9142,7 +9088,7 @@ mod tests {
             assert!(em.contains_path(Family::IPV4, &net, 1));
             assert!(!em.contains_path(Family::IPV4, &net, 2)); // self path not sent
             assert!(em.contains_path(Family::IPV4, &net, 3));
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
             assert_eq!(reach_pids.len(), 2);
             assert!(reach_pids.contains(&1));
@@ -9223,7 +9169,7 @@ mod tests {
 
             // Must send a withdrawal for the previously-sent route
             assert!(!em.was_sent(Family::IPV4, &net));
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             assert_eq!(unreach_entries(&msgs).len(), 1);
         }
 
@@ -9249,7 +9195,7 @@ mod tests {
 
             // eBGP-learned route CAN be forwarded to iBGP peer
             assert!(em.was_sent(Family::IPV4, &net));
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             assert_eq!(reach_entries(&msgs).len(), 1);
         }
 
@@ -9278,7 +9224,7 @@ mod tests {
             // Only the eBGP-learned path (pid=2) should be advertised
             assert!(!em.contains_path(Family::IPV4, &net, 1));
             assert!(em.contains_path(Family::IPV4, &net, 2));
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             let reach = reach_entries(&msgs);
             assert_eq!(reach.len(), 1);
             assert_eq!(reach[0].1, 2);
@@ -9557,7 +9503,7 @@ mod tests {
 
             assert!(em.was_sent(Family::IPV4, &net));
             assert_eq!(
-                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 1
             );
         }
@@ -9584,7 +9530,7 @@ mod tests {
 
             assert!(em.was_sent(Family::IPV4, &net));
             assert_eq!(
-                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 1
             );
         }
@@ -9607,7 +9553,7 @@ mod tests {
         fn drain_first_reach_attrs(
             pending: &mut crate::peer_tx::PendingTx,
         ) -> Arc<Vec<packet::Attribute>> {
-            let msgs = pending.drain_messages(Family::IPV4, false);
+            let msgs = pending.drain_messages(Family::IPV4);
             for msg in msgs {
                 if let bgp::Message::Update(bgp::Update::Routes { reach, attr, .. }) = msg
                     && reach.as_ref().is_some_and(|r| !r.entries.is_empty())
@@ -9821,7 +9767,7 @@ mod tests {
 
             assert!(em.was_sent(Family::IPV4, &net));
             assert_eq!(
-                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 1
             );
         }
@@ -9873,7 +9819,7 @@ mod tests {
 
             assert!(!em.was_sent(Family::IPV4, &net));
             assert_eq!(
-                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 0
             );
         }
@@ -9900,7 +9846,7 @@ mod tests {
 
             assert!(!em.was_sent(Family::IPV4, &net));
             assert_eq!(
-                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 0
             );
         }
@@ -9927,7 +9873,7 @@ mod tests {
 
             assert!(em.was_sent(Family::IPV4, &net));
             assert_eq!(
-                reach_entries(&pending.drain_messages(Family::IPV4, false)).len(),
+                reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 1
             );
         }

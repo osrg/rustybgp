@@ -24,7 +24,9 @@ use std::sync::Arc;
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn ipv4_codec() -> rustybgp_packet::bgp::PeerCodec {
-    PeerCodec::new(&[Family::IPV4])
+    let mut c = PeerCodec::new();
+    c.set_family(Family::IPV4, rustybgp_packet::bgp::FamilyState::default());
+    c
 }
 
 fn ipv4_prefix(addr: &str, mask: u8) -> PathNlri {
