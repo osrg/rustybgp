@@ -2408,19 +2408,16 @@ impl PeerCodec {
                         ) => {}
                         0 => return Err(err),
                         4 | 16 | 32 => {
-                            for _ in 0..nexthop_len {
-                                data.push(c.read_u8().unwrap());
-                            }
+                            let pos = c.position() as usize;
+                            data.extend_from_slice(&buf[pos..pos + nexthop_len as usize]);
+                            c.set_position(pos as u64 + nexthop_len as u64);
                             mp_nexthop = Nexthop::from_bytes(&data);
                         }
                         // VPN nexthop (RFC 4364 §4.3.2): 8-byte RD (must be 0) + IP address.
                         12 | 24 => {
-                            for _ in 0..8 {
-                                c.read_u8().unwrap();
-                            }
-                            for _ in 0..(nexthop_len - 8) {
-                                data.push(c.read_u8().unwrap());
-                            }
+                            let pos = c.position() as usize;
+                            data.extend_from_slice(&buf[pos + 8..pos + nexthop_len as usize]);
+                            c.set_position(pos as u64 + nexthop_len as u64);
                             mp_nexthop = Nexthop::from_bytes(&data);
                         }
                         _ => return Err(err),
