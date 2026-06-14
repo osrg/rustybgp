@@ -1481,33 +1481,33 @@ impl GrpcService {
             let a = convert::attr_from_api(a).map_err(|_| {
                 tonic::Status::new(tonic::Code::InvalidArgument, "invalid attribute")
             })?;
-            if a.code() == bgp::Attribute::MP_REACH {
-                // MP_REACH binary: [AFI:2][SAFI:1][NH_LEN:1][nexthop:NH_LEN][reserved:1][NLRI...]
-                // Extract just the nexthop.
-                nexthop = a.binary().and_then(|b| {
-                    let len = *b.get(3)? as usize;
-                    if b.len() < 5 + len {
-                        return None;
+            match a.code() {
+                bgp::Attribute::MP_REACH => {
+                    // MP_REACH binary: [AFI:2][SAFI:1][NH_LEN:1][nexthop:NH_LEN][reserved:1][NLRI...]
+                    // Extract just the nexthop.
+                    nexthop = a.binary().and_then(|b| {
+                        let len = *b.get(3)? as usize;
+                        if b.len() < 5 + len {
+                            return None;
+                        }
+                        bgp::Nexthop::from_bytes(&b[4..4 + len])
+                    });
+                    if nexthop.is_none() {
+                        return Err(tonic::Status::new(
+                            tonic::Code::InvalidArgument,
+                            "malformed MP_REACH nexthop",
+                        ));
                     }
-                    bgp::Nexthop::from_bytes(&b[4..4 + len])
-                });
-                if nexthop.is_none() {
-                    return Err(tonic::Status::new(
-                        tonic::Code::InvalidArgument,
-                        "malformed MP_REACH nexthop",
-                    ));
                 }
-            } else if a.code() == bgp::Attribute::NEXTHOP {
-                nexthop = a.binary().and_then(|b| bgp::Nexthop::from_bytes(b));
-            } else if a.code() == bgp::Attribute::ORIGINATOR_ID
-                || a.code() == bgp::Attribute::CLUSTER_LIST
-            {
-                // Strip RR attributes from locally injected routes; they are
-                // added by the RR on reflection and must not be set by operators.
-            } else if a.code() == bgp::Attribute::MP_UNREACH {
-                // MP_UNREACH has no meaning for an add_path request; ignore it.
-            } else {
-                attr.push(a);
+                bgp::Attribute::NEXTHOP => {
+                    nexthop = a.binary().and_then(|b| bgp::Nexthop::from_bytes(b));
+                }
+                // RR attributes are added on reflection and must not be set by operators.
+                // MP_UNREACH has no meaning in an add_path request.
+                bgp::Attribute::ORIGINATOR_ID
+                | bgp::Attribute::CLUSTER_LIST
+                | bgp::Attribute::MP_UNREACH => {}
+                _ => attr.push(a),
             }
         }
         if !attr.iter().any(|a| a.code() == bgp::Attribute::ORIGIN) {
