@@ -1504,15 +1504,19 @@ impl GrpcService {
             {
                 // Strip RR attributes from locally injected routes; they are
                 // added by the RR on reflection and must not be set by operators.
+            } else if a.code() == bgp::Attribute::MP_UNREACH {
+                // MP_UNREACH has no meaning for an add_path request; ignore it.
             } else {
                 attr.push(a);
             }
         }
-        let attrs = if attr.is_empty() {
-            None
-        } else {
-            Some(Arc::new(attr))
-        };
+        if !attr.iter().any(|a| a.code() == bgp::Attribute::ORIGIN) {
+            attr.push(bgp::Attribute::new_with_value(bgp::Attribute::ORIGIN, 0).unwrap());
+        }
+        if !attr.iter().any(|a| a.code() == bgp::Attribute::AS_PATH) {
+            attr.push(bgp::Attribute::empty_as_path());
+        }
+        let attrs = Some(Arc::new(attr));
         Ok((
             family,
             vec![packet::PathNlri {
