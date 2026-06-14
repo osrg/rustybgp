@@ -1332,3 +1332,64 @@ fn malformed_cluster_list_length_discarded() {
         );
     }
 }
+
+// ─── AS_PATH segment structure validation (RFC 4271 §4.3) ─────────────────────
+
+#[test]
+fn malformed_aspath_truncated_segment_treat_as_withdraw() {
+    // AS_PATH segment claims count=2 (8 bytes of ASNs) but only 4 bytes follow.
+    // AS_PATH is well-known mandatory: treat-as-withdraw per RFC 7606 §5.4.
+    let as_path_data: Vec<u8> = vec![
+        0x02, // AS_SEQUENCE
+        0x02, // count=2
+        0x00, 0x00, 0xFD, 0xEA, // only one 4-octet ASN (truncated)
+    ];
+    let mut attr_bytes = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]); // ORIGIN=IGP
+    // AS_PATH with 6 bytes: type=SEQ, count=2, but only 4 bytes of ASN data
+    attr_bytes.push(0x40); // flags: transitive
+    attr_bytes.push(0x02); // code: AS_PATH
+    attr_bytes.push(as_path_data.len() as u8);
+    attr_bytes.extend_from_slice(&as_path_data);
+    attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xC0, 0x00, 0x02, 0x01]); // NEXTHOP
+
+    let buf = raw_update_with_attrs(&attr_bytes);
+    let parsed = ipv4_codec()
+        .parse_message(&buf)
+        .expect("parse must not fail");
+    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
+        "truncated AS_PATH segment must trigger treat-as-withdraw"
+    );
+}
+
+#[test]
+fn malformed_aspath_invalid_segment_type_treat_as_withdraw() {
+    // AS_PATH segment type 5 is undefined (valid range: 1-4, RFC 4271/5065).
+    // AS_PATH is well-known mandatory: treat-as-withdraw per RFC 7606 §5.4.
+    let as_path_data: Vec<u8> = vec![
+        0x05, // invalid segment type
+        0x01, // count=1
+        0x00, 0x00, 0xFD, 0xEA, // ASN 65002
+    ];
+    let mut attr_bytes = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]); // ORIGIN=IGP
+    attr_bytes.push(0x40); // flags: transitive
+    attr_bytes.push(0x02); // code: AS_PATH
+    attr_bytes.push(as_path_data.len() as u8);
+    attr_bytes.extend_from_slice(&as_path_data);
+    attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xC0, 0x00, 0x02, 0x01]); // NEXTHOP
+
+    let buf = raw_update_with_attrs(&attr_bytes);
+    let parsed = ipv4_codec()
+        .parse_message(&buf)
+        .expect("parse must not fail");
+    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
+        "invalid AS_PATH segment type must trigger treat-as-withdraw"
+    );
+}

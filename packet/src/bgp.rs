@@ -1162,6 +1162,29 @@ impl Attribute {
                 }
                 AttributeData::Val(c.read_u32::<NetworkEndian>().map_err(|_| ())?)
             }
+            Self::AS_PATH => {
+                let mut b = vec![0u8; len as usize];
+                c.read_exact(&mut b).map_err(|_| ())?;
+                // RFC 4271 §4.3: validate segment structure.
+                // Each segment: 1-byte type (1-4), 1-byte count, count*4 bytes of 4-octet ASNs.
+                let mut pos = 0usize;
+                while pos < b.len() {
+                    if pos + 2 > b.len() {
+                        return Err(());
+                    }
+                    let seg_type = b[pos];
+                    let seg_count = b[pos + 1] as usize;
+                    if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET).contains(&seg_type)
+                    {
+                        return Err(());
+                    }
+                    pos += 2 + seg_count * 4;
+                    if pos > b.len() {
+                        return Err(());
+                    }
+                }
+                AttributeData::Bin(b)
+            }
             Self::ATOMIC_AGGREGATE => {
                 // RFC 4271 §5.1.6: ATOMIC_AGGREGATE has zero-length value
                 if len != 0 {
