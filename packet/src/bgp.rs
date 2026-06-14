@@ -1149,13 +1149,70 @@ impl Attribute {
                 if len != 1 {
                     return Err(());
                 }
-                AttributeData::Val(c.read_u8().map_err(|_| ())? as u32)
+                let val = c.read_u8().map_err(|_| ())? as u32;
+                // RFC 4271 §4.3: valid values are 0 (IGP), 1 (EGP), 2 (INCOMPLETE)
+                if val > Self::ORIGIN_INCOMPLETE as u32 {
+                    return Err(());
+                }
+                AttributeData::Val(val)
             }
             Self::MULTI_EXIT_DESC | Self::LOCAL_PREF | Self::ORIGINATOR_ID => {
                 if len != 4 {
                     return Err(());
                 }
                 AttributeData::Val(c.read_u32::<NetworkEndian>().map_err(|_| ())?)
+            }
+            Self::ATOMIC_AGGREGATE => {
+                // RFC 4271 §5.1.6: ATOMIC_AGGREGATE has zero-length value
+                if len != 0 {
+                    return Err(());
+                }
+                AttributeData::Bin(vec![])
+            }
+            Self::AGGREGATOR => {
+                // RFC 4271 §5.1.7: 2-octet ASN (6 bytes) or 4-octet ASN (8 bytes, RFC 6793 §4.2.3)
+                if len != 6 && len != 8 {
+                    return Err(());
+                }
+                let mut b = vec![0u8; len as usize];
+                c.read_exact(&mut b).map_err(|_| ())?;
+                AttributeData::Bin(b)
+            }
+            Self::COMMUNITY => {
+                // RFC 1997 §4: each community value is 4 octets
+                if !len.is_multiple_of(4) {
+                    return Err(());
+                }
+                let mut b = vec![0u8; len as usize];
+                c.read_exact(&mut b).map_err(|_| ())?;
+                AttributeData::Bin(b)
+            }
+            Self::EXTENDED_COMMUNITY => {
+                // RFC 4360 §4: each extended community value is 8 octets
+                if !len.is_multiple_of(8) {
+                    return Err(());
+                }
+                let mut b = vec![0u8; len as usize];
+                c.read_exact(&mut b).map_err(|_| ())?;
+                AttributeData::Bin(b)
+            }
+            Self::CLUSTER_LIST => {
+                // RFC 4456 §8: each cluster ID is 4 octets
+                if !len.is_multiple_of(4) {
+                    return Err(());
+                }
+                let mut b = vec![0u8; len as usize];
+                c.read_exact(&mut b).map_err(|_| ())?;
+                AttributeData::Bin(b)
+            }
+            Self::LARGE_COMMUNITY => {
+                // RFC 8092 §2: each large community value is 12 octets
+                if !len.is_multiple_of(12) {
+                    return Err(());
+                }
+                let mut b = vec![0u8; len as usize];
+                c.read_exact(&mut b).map_err(|_| ())?;
+                AttributeData::Bin(b)
             }
             _ => {
                 let mut b = Vec::with_capacity(len.into());

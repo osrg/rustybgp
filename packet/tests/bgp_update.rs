@@ -21,7 +21,7 @@ use rustybgp_packet::bgp::{
 use rustybgp_packet::mup;
 use rustybgp_packet::prefix_sid;
 use rustybgp_packet::rd::RouteDistinguisher;
-use rustybgp_packet::{Family, Nlri, Notification, PathNlri};
+use rustybgp_packet::{Family, Nlri, Notification, PathNlri, validate_message};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
@@ -1214,4 +1214,121 @@ fn encode_to_splits_ipv6_unreach_addpath() {
         }) => Some(r.entries),
         _ => None,
     });
+}
+
+// ─── Attribute content validation (RFC 4271, 1997, 4360, 8092, 4456) ─────────
+
+/// Build a raw IPv4 UPDATE with the given attributes and the NLRI 10.0.0.0/8.
+fn raw_update_with_attrs(attr_bytes: &[u8]) -> Vec<u8> {
+    let nlri: &[u8] = &[0x08, 0x0A]; // 10.0.0.0/8
+    let attr_len = attr_bytes.len() as u16;
+    let total = 19u16 + 2 + 2 + attr_len + nlri.len() as u16;
+    let mut buf = vec![0xffu8; 16];
+    buf.extend_from_slice(&total.to_be_bytes());
+    buf.push(2); // UPDATE
+    buf.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_len=0
+    buf.extend_from_slice(&attr_len.to_be_bytes());
+    buf.extend_from_slice(attr_bytes);
+    buf.extend_from_slice(nlri);
+    buf
+}
+
+/// AS_PATH + NEXTHOP attribute bytes to accompany an IPv4 reach (no ORIGIN).
+fn base_attrs_without_origin() -> Vec<u8> {
+    let mut v = Vec::new();
+    // AS_PATH = AS_SEQUENCE [65002]
+    v.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xFD, 0xEA]);
+    // NEXTHOP = 192.0.2.1
+    v.extend_from_slice(&[0x40, 0x03, 0x04, 0xC0, 0x00, 0x02, 0x01]);
+    v
+}
+
+#[test]
+fn invalid_origin_value_treat_as_withdraw() {
+    // ORIGIN value 3 is out of range (0=IGP, 1=EGP, 2=INCOMPLETE).
+    // Per RFC 7606 §5.2, a well-known mandatory attribute error causes treat-as-withdraw.
+    let mut attr_bytes = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x03]); // ORIGIN=3 (invalid)
+    attr_bytes.extend_from_slice(&base_attrs_without_origin());
+
+    let buf = raw_update_with_attrs(&attr_bytes);
+    let parsed = ipv4_codec()
+        .parse_message(&buf)
+        .expect("parse must not fail");
+    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
+        "malformed ORIGIN must trigger treat-as-withdraw"
+    );
+}
+
+#[test]
+fn malformed_community_length_treat_as_withdraw() {
+    // COMMUNITY length 3 is not a multiple of 4 (RFC 1997 §4).
+    // COMMUNITY is optional transitive: treat-as-withdraw per RFC 7606 §5.2.
+    let mut attr_bytes = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]); // ORIGIN=IGP
+    attr_bytes.extend_from_slice(&base_attrs_without_origin());
+    attr_bytes.extend_from_slice(&[0xC0, 0x08, 0x03, 0xFD, 0xE9, 0x00]); // COMMUNITY, len=3
+
+    let buf = raw_update_with_attrs(&attr_bytes);
+    let parsed = ipv4_codec()
+        .parse_message(&buf)
+        .expect("parse must not fail");
+    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
+        "malformed COMMUNITY must trigger treat-as-withdraw"
+    );
+}
+
+#[test]
+fn malformed_aggregator_length_treat_as_withdraw() {
+    // AGGREGATOR with 3 bytes is invalid (must be 6 or 8).
+    // AGGREGATOR is optional transitive: treat-as-withdraw per RFC 7606 §5.2.
+    let mut attr_bytes = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]); // ORIGIN=IGP
+    attr_bytes.extend_from_slice(&base_attrs_without_origin());
+    attr_bytes.extend_from_slice(&[0xC0, 0x07, 0x03, 0x00, 0x01, 0x00]); // AGGREGATOR, len=3
+
+    let buf = raw_update_with_attrs(&attr_bytes);
+    let parsed = ipv4_codec()
+        .parse_message(&buf)
+        .expect("parse must not fail");
+    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
+        "malformed AGGREGATOR must trigger treat-as-withdraw"
+    );
+}
+
+#[test]
+fn malformed_cluster_list_length_discarded() {
+    // CLUSTER_LIST length 3 is not a multiple of 4 (RFC 4456 §8).
+    // CLUSTER_LIST is optional non-transitive: the attribute is discarded, not treat-as-withdraw.
+    let mut attr_bytes = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]); // ORIGIN=IGP
+    attr_bytes.extend_from_slice(&base_attrs_without_origin());
+    attr_bytes.extend_from_slice(&[0x80, 0x0A, 0x03, 0x00, 0x00, 0x01]); // CLUSTER_LIST, len=3
+
+    let buf = raw_update_with_attrs(&attr_bytes);
+    let parsed = ipv4_codec()
+        .parse_message(&buf)
+        .expect("parse must not fail");
+    let msgs: Vec<Message> = validate_message(parsed).unwrap().collect();
+    // The route must still be accepted; CLUSTER_LIST is silently discarded.
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Reach { .. })),
+        "malformed optional non-transitive attr must be discarded, route accepted"
+    );
+    if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
+        assert!(
+            attr.iter().all(|a| a.code() != Attribute::CLUSTER_LIST),
+            "discarded CLUSTER_LIST must not appear in decoded attrs"
+        );
+    }
 }
