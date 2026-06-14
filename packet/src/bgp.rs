@@ -2012,11 +2012,9 @@ impl PeerCodec {
                             break;
                         }
                     }
-                    if withdrawn_len > 0 {
-                        (&mut dst.as_mut()[pos_withdrawn_len..])
-                            .write_u16::<NetworkEndian>(withdrawn_len)
-                            .unwrap();
-                    }
+                    (&mut dst.as_mut()[pos_withdrawn_len..])
+                        .write_u16::<NetworkEndian>(withdrawn_len)
+                        .unwrap();
                     // Empty path attributes section.
                     dst.put_u16(0);
                     count
