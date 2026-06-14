@@ -2200,12 +2200,10 @@ impl PeerCodec {
                 const MINIMUM_UPDATE_LENGTH: usize = 23;
                 let malformed = || Notification::UpdateMalformedAttributeList;
                 let mut mp_reach_family = Family::IPV4;
-                let mut mp_unreach_family = Family::IPV4;
                 let mut attr = Vec::new();
                 let mut reach = Vec::new();
                 let mut unreach = Vec::new();
                 let mut mp_reach_entries: Vec<PathNlri> = Vec::new();
-                let mut mp_unreach_entries: Vec<PathNlri> = Vec::new();
                 let mut mp_reach_attr = None;
                 let mut mp_unreach_attr = None;
                 let mut reach_nexthop: Option<Nexthop> = None;
@@ -2432,8 +2430,7 @@ impl PeerCodec {
                     }
                 }
 
-                let mp_unreach_present = mp_unreach_attr.is_some();
-                if let Some(a) = mp_unreach_attr {
+                let mp_unreach: Option<(Family, Vec<PathNlri>)> = if let Some(a) = mp_unreach_attr {
                     let err = Notification::UpdateOptionalAttributeError;
                     let buf = a.binary().unwrap();
                     if buf.len() < 3 {
@@ -2446,36 +2443,29 @@ impl PeerCodec {
                         _ => return Err(err),
                     }
                     let safi = c.read_u8().unwrap();
-                    mp_unreach_family = Family((afi as u32) << 16 | safi as u32);
-                    let mp_unreach_addpath_rx = self
-                        .families
-                        .get(&mp_unreach_family)
-                        .ok_or_else(malformed)?
-                        .addpath_rx;
+                    let family = Family((afi as u32) << 16 | safi as u32);
+                    let addpath_rx = self.families.get(&family).ok_or_else(malformed)?.addpath_rx;
+                    let mut entries = Vec::new();
                     let mut reader = BgpReader::<UpdateCtx>::new(&buf[c.position() as usize..]);
                     while reader.remaining_len() > 0 {
                         let rest = reader.remaining_len();
-                        mp_unreach_entries.push(Self::decode_nlri(
-                            mp_unreach_family,
-                            mp_unreach_addpath_rx,
-                            &mut reader,
-                            rest,
-                        )?);
+                        entries.push(Self::decode_nlri(family, addpath_rx, &mut reader, rest)?);
                     }
-                }
+                    Some((family, entries))
+                } else {
+                    None
+                };
 
                 // non-IPv4 EOR: MP_UNREACH_NLRI with no NLRIs and no other content (RFC 4724 §2)
-                if mp_unreach_entries.is_empty()
-                    && mp_unreach_present
+                if let Some((family, entries)) = &mp_unreach
+                    && entries.is_empty()
                     && reach.is_empty()
                     && mp_reach_entries.is_empty()
                     && unreach.is_empty()
                     && attr.is_empty()
                     && error_attrs.is_empty()
                 {
-                    return Ok(ParsedMessage::Update(ParsedUpdate::EndOfRib(
-                        mp_unreach_family,
-                    )));
+                    return Ok(ParsedMessage::Update(ParsedUpdate::EndOfRib(*family)));
                 }
 
                 Ok(ParsedMessage::Update(ParsedUpdate::Routes {
@@ -2506,14 +2496,9 @@ impl PeerCodec {
                             entries: unreach,
                         })
                     },
-                    mp_unreach: if mp_unreach_entries.is_empty() {
-                        None
-                    } else {
-                        Some(UnreachNlri {
-                            family: mp_unreach_family,
-                            entries: mp_unreach_entries,
-                        })
-                    },
+                    mp_unreach: mp_unreach
+                        .filter(|(_, entries)| !entries.is_empty())
+                        .map(|(family, entries)| UnreachNlri { family, entries }),
                     error_attrs,
                 }))
             }
