@@ -805,6 +805,41 @@ fn duplicate_non_mp_attr_is_skipped() {
     }
 }
 
+#[test]
+fn duplicate_mp_reach_is_error() {
+    // Two MP_REACH_NLRI attributes in one UPDATE must be rejected
+    // (RFC 4760 §5 implies uniqueness; RFC 7606 §4 lists it as a session reset).
+    // Minimal MP_REACH_NLRI: AFI=IPv6, SAFI=unicast, nexthop_len=16, nexthop=::, SNPA=0.
+    let mp_reach: Vec<u8> = {
+        let mut v = vec![
+            0x80, 0x0E, 0x15, // optional, MP_REACH_NLRI(14), len=21
+            0x00, 0x02, // AFI=IPv6
+            0x01, // SAFI=unicast
+            0x10, // nexthop_len=16
+        ];
+        v.extend_from_slice(&[0u8; 16]); // nexthop=::
+        v.push(0x00); // SNPA count=0
+        v
+    };
+
+    let attr_len = (mp_reach.len() * 2) as u16;
+    let total = 19u16 + 2 + 2 + attr_len;
+    let mut buf = vec![0xffu8; 16];
+    buf.extend_from_slice(&total.to_be_bytes());
+    buf.push(2); // UPDATE
+    buf.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_len=0
+    buf.extend_from_slice(&attr_len.to_be_bytes());
+    buf.extend_from_slice(&mp_reach);
+    buf.extend_from_slice(&mp_reach); // duplicate
+
+    let mut codec = ipv6_codec();
+    match codec.parse_message(&buf) {
+        Err(Notification::UpdateMalformedAttributeList) => {}
+        Err(e) => panic!("expected UpdateMalformedAttributeList, got {}", e),
+        Ok(_) => panic!("expected Err, got Ok"),
+    }
+}
+
 // ─── VPN nexthop round-trip ──────────────────────────────────────────────────
 
 fn vpnv4_codec() -> PeerCodec {
