@@ -1700,7 +1700,6 @@ pub fn create_channel(
 }
 
 pub struct PeerCodecBuilder {
-    remote_asn: u32,
     extended_length: bool,
     family: Vec<Family>,
 }
@@ -1714,7 +1713,6 @@ impl Default for PeerCodecBuilder {
 impl PeerCodecBuilder {
     pub fn new() -> Self {
         PeerCodecBuilder {
-            remote_asn: 0,
             extended_length: false,
             family: Vec::new(),
         }
@@ -1727,7 +1725,6 @@ impl PeerCodecBuilder {
             .map(|f| (*f, Channel::new(*f, false, false)))
             .collect();
         PeerCodec {
-            remote_asn: self.remote_asn,
             extended_length: self.extended_length,
             channel,
         }
@@ -1741,7 +1738,6 @@ impl PeerCodecBuilder {
 
 pub struct PeerCodec {
     extended_length: bool,
-    remote_asn: u32,
     pub channel: FnvHashMap<Family, Channel>,
 }
 
@@ -2122,6 +2118,7 @@ impl PeerCodec {
                     return Err(Notification::OpenMalformed);
                 }
                 let param_end = c.position() + param_len as u64;
+                let mut four_octet_asn: u32 = 0;
                 let mut cap = Vec::new();
                 while c.position() < param_end {
                     if param_end < c.position() + 2 {
@@ -2147,7 +2144,7 @@ impl PeerCodec {
                             match Capability::decode(cap_type, &mut c, cap_len) {
                                 Ok(decoded) => {
                                     if let Capability::FourOctetAsNumber(asn) = &decoded {
-                                        self.remote_asn = *asn;
+                                        four_octet_asn = *asn;
                                     }
                                     cap.push(decoded);
                                 }
@@ -2165,9 +2162,7 @@ impl PeerCodec {
                     }
                 }
                 if as_number == Capability::TRANS_ASN as u32 {
-                    as_number = self.remote_asn;
-                } else {
-                    self.remote_asn = as_number;
+                    as_number = four_octet_asn;
                 }
 
                 Ok(ParsedMessage::Open(Open {
