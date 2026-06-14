@@ -2212,15 +2212,12 @@ impl PeerCodec {
             Message::UPDATE => {
                 const MINIMUM_UPDATE_LENGTH: usize = 23;
                 let malformed = || Notification::UpdateMalformedAttributeList;
-                let mut mp_reach_family = Family::IPV4;
                 let mut attr = Vec::new();
                 let mut reach = Vec::new();
                 let mut unreach = Vec::new();
-                let mut mp_reach_entries: Vec<PathNlri> = Vec::new();
                 let mut mp_reach_attr = None;
                 let mut mp_unreach_attr = None;
                 let mut reach_nexthop: Option<Nexthop> = None;
-                let mut mp_nexthop: Option<Nexthop> = None;
                 if buf.len() < MINIMUM_UPDATE_LENGTH {
                     return Err(header_len_error);
                 }
@@ -2375,7 +2372,9 @@ impl PeerCodec {
                     )?;
                 }
 
-                if let Some(a) = mp_reach_attr {
+                let mp_reach: Option<(Family, Vec<PathNlri>, Option<Nexthop>)> = if let Some(a) =
+                    mp_reach_attr
+                {
                     let err = Notification::UpdateOptionalAttributeError;
                     let buf = a.binary().unwrap();
                     if buf.len() < 5 {
@@ -2388,47 +2387,46 @@ impl PeerCodec {
                         _ => return Err(err),
                     }
                     let safi = c.read_u8().unwrap();
-                    mp_reach_family = Family((afi as u32) << 16 | safi as u32);
-                    let mp_reach_addpath_rx = self
-                        .families
-                        .get(&mp_reach_family)
-                        .ok_or_else(malformed)?
-                        .addpath_rx;
+                    let family = Family((afi as u32) << 16 | safi as u32);
+                    let addpath_rx = self.families.get(&family).ok_or_else(malformed)?.addpath_rx;
                     let nexthop_len = c.read_u8().unwrap();
                     if buf.len() < 5 + nexthop_len as usize {
                         return Err(err);
                     }
                     let mut data = Vec::with_capacity(nexthop_len as usize);
-                    match nexthop_len {
+                    let nexthop = match nexthop_len {
                         // FlowSpec carries no nexthop (RFC 8955 §4). Any other
                         // family with nexthop_len=0 is malformed.
                         0 if matches!(
-                            mp_reach_family.safi(),
+                            family.safi(),
                             Family::SAFI_FLOWSPEC | Family::SAFI_FLOWSPEC_VPN
-                        ) => {}
+                        ) =>
+                        {
+                            None
+                        }
                         0 => return Err(err),
                         4 | 16 | 32 => {
                             let pos = c.position() as usize;
                             data.extend_from_slice(&buf[pos..pos + nexthop_len as usize]);
                             c.set_position(pos as u64 + nexthop_len as u64);
-                            mp_nexthop = Nexthop::from_bytes(&data);
+                            Nexthop::from_bytes(&data)
                         }
                         // VPN nexthop (RFC 4364 §4.3.2): 8-byte RD (must be 0) + IP address.
                         12 | 24 => {
                             let pos = c.position() as usize;
                             data.extend_from_slice(&buf[pos + 8..pos + nexthop_len as usize]);
                             c.set_position(pos as u64 + nexthop_len as u64);
-                            mp_nexthop = Nexthop::from_bytes(&data);
+                            Nexthop::from_bytes(&data)
                         }
                         _ => return Err(err),
-                    }
+                    };
                     c.read_u8().unwrap();
-                    mp_reach_entries = Self::decode_nlri_list(
-                        mp_reach_family,
-                        mp_reach_addpath_rx,
-                        &buf[c.position() as usize..],
-                    )?;
-                }
+                    let entries =
+                        Self::decode_nlri_list(family, addpath_rx, &buf[c.position() as usize..])?;
+                    Some((family, entries, nexthop))
+                } else {
+                    None
+                };
 
                 let mp_unreach: Option<(Family, Vec<PathNlri>)> = if let Some(a) = mp_unreach_attr {
                     let err = Notification::UpdateOptionalAttributeError;
@@ -2456,7 +2454,7 @@ impl PeerCodec {
                 if let Some((family, entries)) = &mp_unreach
                     && entries.is_empty()
                     && reach.is_empty()
-                    && mp_reach_entries.is_empty()
+                    && mp_reach.as_ref().is_none_or(|(_, e, _)| e.is_empty())
                     && unreach.is_empty()
                     && attr.is_empty()
                     && error_attrs.is_empty()
@@ -2470,11 +2468,13 @@ impl PeerCodec {
                         entries: reach,
                         nexthop: reach_nexthop,
                     }),
-                    mp_reach: (!mp_reach_entries.is_empty()).then_some(ReachNlri {
-                        family: mp_reach_family,
-                        entries: mp_reach_entries,
-                        nexthop: mp_nexthop,
-                    }),
+                    mp_reach: mp_reach.filter(|(_, entries, _)| !entries.is_empty()).map(
+                        |(family, entries, nexthop)| ReachNlri {
+                            family,
+                            entries,
+                            nexthop,
+                        },
+                    ),
                     attrs: attr,
                     unreach: (!unreach.is_empty()).then_some(UnreachNlri {
                         family: Family::IPV4,
