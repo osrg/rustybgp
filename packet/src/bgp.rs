@@ -40,8 +40,12 @@ pub enum Notification {
     // Code 2: OPEN Message Error
     #[error("open error: malformed")]
     OpenMalformed,
+    #[error("open error: unsupported version number")]
+    OpenUnsupportedVersionNumber { data: Vec<u8> },
     #[error("open error: bad peer AS")]
     OpenBadPeerAs,
+    #[error("open error: bad BGP identifier")]
+    OpenBadBgpIdentifier,
     #[error("open error: unsupported optional parameter")]
     OpenUnsupportedOptionalParameter { data: Vec<u8> },
     #[error("open error: unacceptable hold time")]
@@ -92,7 +96,9 @@ impl Notification {
         match self {
             Self::BadMessageLength { .. } | Self::BadMessageType { .. } => 1,
             Self::OpenMalformed
+            | Self::OpenUnsupportedVersionNumber { .. }
             | Self::OpenBadPeerAs
+            | Self::OpenBadBgpIdentifier
             | Self::OpenUnsupportedOptionalParameter { .. }
             | Self::OpenUnacceptableHoldTime { .. } => 2,
             Self::UpdateMalformedAttributeList | Self::UpdateOptionalAttributeError => 3,
@@ -114,7 +120,9 @@ impl Notification {
             Self::BadMessageLength { .. } => 2,
             Self::BadMessageType { .. } => 3,
             Self::OpenMalformed => 0,
+            Self::OpenUnsupportedVersionNumber { .. } => 1,
             Self::OpenBadPeerAs => 2,
+            Self::OpenBadBgpIdentifier => 3,
             Self::OpenUnsupportedOptionalParameter { .. } => 4,
             Self::OpenUnacceptableHoldTime { .. } => 6,
             Self::UpdateMalformedAttributeList => 1,
@@ -136,6 +144,7 @@ impl Notification {
         match self {
             Self::BadMessageLength { data }
             | Self::BadMessageType { data }
+            | Self::OpenUnsupportedVersionNumber { data }
             | Self::OpenUnsupportedOptionalParameter { data }
             | Self::OpenUnacceptableHoldTime { data }
             | Self::RouteRefreshInvalidLength { data }
@@ -156,7 +165,9 @@ impl Notification {
             (1, 2) => Self::BadMessageLength { data },
             (1, 3) => Self::BadMessageType { data },
             (2, 0) => Self::OpenMalformed,
+            (2, 1) => Self::OpenUnsupportedVersionNumber { data },
             (2, 2) => Self::OpenBadPeerAs,
+            (2, 3) => Self::OpenBadBgpIdentifier,
             (2, 4) => Self::OpenUnsupportedOptionalParameter { data },
             (2, 6) => Self::OpenUnacceptableHoldTime { data },
             (3, 1) => Self::UpdateMalformedAttributeList,
@@ -2101,7 +2112,10 @@ impl PeerCodec {
                 let version = c.read_u8().unwrap();
                 // BGP version must be 4 (RFC 4271 §4.2)
                 if version != 4 {
-                    return Err(Notification::OpenMalformed);
+                    // data: 2-octet max supported version (RFC 4271 §6.2)
+                    return Err(Notification::OpenUnsupportedVersionNumber {
+                        data: 4u16.to_be_bytes().to_vec(),
+                    });
                 }
                 let mut as_number = c.read_u16::<NetworkEndian>().unwrap() as u32;
                 let raw_holdtime = c.read_u16::<NetworkEndian>().unwrap();
@@ -2110,6 +2124,14 @@ impl PeerCodec {
                         data: raw_holdtime.to_be_bytes().to_vec(),
                     })?;
                 let router_id = c.read_u32::<NetworkEndian>().unwrap();
+                // BGP Identifier must be a valid unicast address (RFC 4271 §6.2)
+                let router_id_addr = Ipv4Addr::from(router_id);
+                if router_id_addr.is_unspecified()
+                    || router_id_addr.is_broadcast()
+                    || router_id_addr.is_multicast()
+                {
+                    return Err(Notification::OpenBadBgpIdentifier);
+                }
                 let param_len = c.read_u8().unwrap();
                 if buf.len() < MINIMUM_OPEN_LENGTH + param_len as usize {
                     return Err(Notification::OpenMalformed);
