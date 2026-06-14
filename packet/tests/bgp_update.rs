@@ -1462,3 +1462,100 @@ fn ibgp_retains_local_pref_originator_id_cluster_list() {
         );
     }
 }
+
+/// Raw IPv6-only UPDATE with ORIGIN + AS_PATH + MP_REACH_NLRI (no traditional NLRI,
+/// no separate NEXTHOP attribute). The nexthop is carried inside MP_REACH_NLRI.
+fn raw_ipv6_mpreach_update() -> Vec<u8> {
+    let mut attr_bytes: Vec<u8> = Vec::new();
+    // ORIGIN = IGP
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+    // AS_PATH = AS_SEQUENCE [65002]
+    attr_bytes.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xea]);
+    // MP_REACH_NLRI: AFI=IPv6, SAFI=unicast, nexthop=2001:db8::, NLRI=2001:db8::/32
+    let mp: &[u8] = &[
+        0x00, 0x02, // AFI = IPv6
+        0x01, // SAFI = unicast
+        0x10, // nexthop_len = 16
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, // 2001:db8::
+        0x00, // SNPA = 0
+        0x20, 0x20, 0x01, 0x0d, 0xb8, // 2001:db8::/32
+    ];
+    attr_bytes.push(0x80); // optional non-transitive
+    attr_bytes.push(0x0e); // type = MP_REACH_NLRI
+    attr_bytes.push(mp.len() as u8);
+    attr_bytes.extend_from_slice(mp);
+
+    let attr_len = attr_bytes.len() as u16;
+    let total = 19u16 + 2 + 2 + attr_len; // no traditional NLRI
+    let mut buf = vec![0xffu8; 16];
+    buf.extend_from_slice(&total.to_be_bytes());
+    buf.push(2); // UPDATE
+    buf.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_len = 0
+    buf.extend_from_slice(&attr_len.to_be_bytes());
+    buf.extend_from_slice(&attr_bytes);
+    buf
+}
+
+#[test]
+fn missing_origin_treat_as_withdraw() {
+    // AS_PATH + NEXTHOP present, ORIGIN absent.
+    // BIRD and FRR treat missing mandatory attributes as withdraw (session continues).
+    let mut attr_bytes: Vec<u8> = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xea]); // AS_PATH
+    attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xc0, 0x00, 0x02, 0x01]); // NEXTHOP
+    let buf = raw_update_with_attrs(&attr_bytes);
+    let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
+        "missing ORIGIN must trigger treat-as-withdraw"
+    );
+}
+
+#[test]
+fn missing_aspath_treat_as_withdraw() {
+    // ORIGIN + NEXTHOP present, AS_PATH absent.
+    let mut attr_bytes: Vec<u8> = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]); // ORIGIN = IGP
+    attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xc0, 0x00, 0x02, 0x01]); // NEXTHOP
+    let buf = raw_update_with_attrs(&attr_bytes);
+    let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
+        "missing AS_PATH must trigger treat-as-withdraw"
+    );
+}
+
+#[test]
+fn missing_nexthop_ipv4_treat_as_withdraw() {
+    // ORIGIN + AS_PATH present, NEXTHOP absent for traditional IPv4 NLRI.
+    let mut attr_bytes: Vec<u8> = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]); // ORIGIN = IGP
+    attr_bytes.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xea]); // AS_PATH
+    let buf = raw_update_with_attrs(&attr_bytes);
+    let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Unreach { .. })),
+        "missing NEXTHOP for IPv4 traditional NLRI must trigger treat-as-withdraw"
+    );
+}
+
+#[test]
+fn missing_nexthop_attr_with_mpreach_ok() {
+    // MP_REACH_NLRI carries its own nexthop; no separate NEXTHOP attribute is required.
+    // An IPv6 UPDATE without a NEXTHOP attribute must NOT trigger treat-as-withdraw.
+    let buf = raw_ipv6_mpreach_update();
+    let parsed = ipv6_codec().parse_message(&buf).expect("parse ok");
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Reach { .. })),
+        "IPv6 MP_REACH without NEXTHOP attribute must be accepted"
+    );
+}

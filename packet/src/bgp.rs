@@ -1657,14 +1657,30 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
             attrs,
             error_attrs,
         } => {
+            // RFC 4271 §6.3 / BIRD+FRR practice: missing well-known mandatory
+            // attributes are treated as withdraw (session-drop per RFC 4271 §6.3,
+            // but both BIRD and FRR use treat-as-withdraw for operability).
+            // Malformed well-known attrs are already in error_attrs and trigger
+            // treat-as-withdraw through the check below; only absent attrs need
+            // the missing-mandatory path here.
+            // NEXTHOP is extracted into reach.nexthop (from the NEXTHOP attribute
+            // for traditional IPv4, or from MP_REACH_NLRI for other families) and
+            // never appears in attrs, so its presence is checked via the ReachNlri.
+            let missing_mandatory = (reach.is_some() || mp_reach.is_some())
+                && (!attrs.iter().any(|a| a.code() == Attribute::ORIGIN)
+                    || !attrs.iter().any(|a| a.code() == Attribute::AS_PATH)
+                    || reach.as_ref().is_some_and(|r| r.nexthop.is_none())
+                    || mp_reach.as_ref().is_some_and(|r| r.nexthop.is_none()));
+
             // RFC 7606: classify each attribute error.
             // Optional non-transitive: attribute discard (already absent from attrs).
             // Well-known or optional transitive: treat-as-withdraw.
-            let treat_as_withdraw = error_attrs.iter().any(|e| {
-                let optional = e.attr_flags & Attribute::FLAG_OPTIONAL != 0;
-                let transitive = e.attr_flags & Attribute::FLAG_TRANSITIVE != 0;
-                !optional || transitive
-            });
+            let treat_as_withdraw = missing_mandatory
+                || error_attrs.iter().any(|e| {
+                    let optional = e.attr_flags & Attribute::FLAG_OPTIONAL != 0;
+                    let transitive = e.attr_flags & Attribute::FLAG_TRANSITIVE != 0;
+                    !optional || transitive
+                });
 
             if treat_as_withdraw {
                 let mut msgs: Vec<Message> = Vec::new();
