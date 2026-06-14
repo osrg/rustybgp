@@ -14,13 +14,13 @@
 // limitations under the License.
 
 use rustybgp_packet::bgp::{
-    Attribute, Capability, Ipv4Net, Ipv6Net, Message, Nexthop, ParsedMessage, ParsedUpdate,
-    PeerCodec, ReachNlri, UnreachNlri, Update,
+    Attribute, Capability, FamilyState, Ipv4Net, Ipv6Net, Message, Nexthop, ParsedMessage,
+    ParsedUpdate, PeerCodec, ReachNlri, UnreachNlri, Update,
 };
 use rustybgp_packet::mup;
 use rustybgp_packet::prefix_sid;
 use rustybgp_packet::rd::RouteDistinguisher;
-use rustybgp_packet::{Family, Nlri, PathNlri};
+use rustybgp_packet::{Family, Nlri, Notification, PathNlri};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
@@ -732,4 +732,57 @@ fn update_mup_with_ext_community() {
         }
         _ => panic!("expected Update"),
     }
+}
+
+// ─── MP_REACH_NLRI nexthop_len=0 (RFC 8955 §4 / GoBGP issue #3450) ──────────
+
+fn mp_reach_zero_nexthop_update(afi: u16, safi: u8) -> Vec<u8> {
+    // Builds a minimal UPDATE with one MP_REACH_NLRI attribute that has
+    // nexthop_len=0 and no NLRI entries.
+    let attr: Vec<u8> = vec![
+        0x80,
+        0x0E, // flags=optional|non-transitive, type=MP_REACH_NLRI(14)
+        0x05, // attr length = 5
+        (afi >> 8) as u8,
+        afi as u8, // AFI
+        safi,      // SAFI
+        0x00,      // nexthop_len = 0
+        0x00,      // SNPA count = 0
+    ];
+    let attr_len = attr.len() as u16;
+    let total = 19u16 + 2 + 2 + attr_len;
+    let mut buf = vec![0xff; 16];
+    buf.extend_from_slice(&total.to_be_bytes());
+    buf.push(2); // UPDATE
+    buf.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_len
+    buf.extend_from_slice(&attr_len.to_be_bytes()); // total_attr_len
+    buf.extend_from_slice(&attr);
+    buf
+}
+
+#[test]
+fn mp_reach_zero_nexthop_non_flowspec_is_error() {
+    // nexthop_len=0 for IPv4 unicast (non-FlowSpec) must be rejected per
+    // RFC 4760 §3 -- BIRD rejects this with bgp_parse_error (GoBGP #3450).
+    let buf = mp_reach_zero_nexthop_update(Family::AFI_IP, 1);
+    let mut codec = PeerCodec::new();
+    codec.set_family(Family::IPV4, FamilyState::default());
+    match codec.parse_message(&buf) {
+        Err(Notification::UpdateOptionalAttributeError) => {}
+        Err(e) => panic!("expected UpdateOptionalAttributeError, got Err({})", e),
+        Ok(_) => panic!("expected Err, got Ok"),
+    }
+}
+
+#[test]
+fn mp_reach_zero_nexthop_flowspec_is_ok() {
+    // nexthop_len=0 is valid for FlowSpec (RFC 8955 §4).
+    let ipv4_flowspec = Family::new((Family::AFI_IP as u32) << 16 | 133);
+    let buf = mp_reach_zero_nexthop_update(Family::AFI_IP, 133);
+    let mut codec = PeerCodec::new();
+    codec.set_family(ipv4_flowspec, FamilyState::default());
+    assert!(
+        codec.parse_message(&buf).is_ok(),
+        "FlowSpec nexthop_len=0 must be accepted"
+    );
 }

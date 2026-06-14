@@ -272,6 +272,8 @@ impl Family {
 
     const SAFI_UNICAST: u8 = 1;
     const SAFI_MUP: u8 = 85;
+    const SAFI_FLOWSPEC: u8 = 133;
+    const SAFI_FLOWSPEC_VPN: u8 = 134;
     const SAFI_MPLS_VPN: u8 = 128;
     const SAFI_MPLS_VPN6: u8 = 129;
 
@@ -2411,8 +2413,13 @@ impl PeerCodec {
                     }
                     let mut data = Vec::with_capacity(nexthop_len as usize);
                     match nexthop_len {
-                        // Flowspec and similar AFIs carry no nexthop (RFC 5575 §4).
-                        0 => {}
+                        // FlowSpec carries no nexthop (RFC 8955 §4). Any other
+                        // family with nexthop_len=0 is malformed.
+                        0 if matches!(
+                            mp_reach_family.safi(),
+                            Family::SAFI_FLOWSPEC | Family::SAFI_FLOWSPEC_VPN
+                        ) => {}
+                        0 => return Err(err),
                         4 | 16 | 32 => {
                             for _ in 0..nexthop_len {
                                 data.push(c.read_u8().unwrap());
