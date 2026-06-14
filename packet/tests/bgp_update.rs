@@ -209,6 +209,34 @@ fn update_ipv6_withdraw() {
     }
 }
 
+// ─── IPv6 dual nexthop (RFC 2545) ────────────────────────────────────────────
+
+#[test]
+fn update_ipv6_dual_nexthop_roundtrip() {
+    // RFC 2545 §3: nexthop_len=32 carries global (16B) + link-local (16B).
+    let prefix = ipv6_prefix("2001:db8::", 32);
+    let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+    let nexthop = Nexthop::V6LinkLocal(global, link_local);
+
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV6,
+        entries: vec![prefix.clone()],
+        nexthop: Some(nexthop),
+        attr: ipv6_attrs_no_nh(),
+    });
+
+    match round_trip(&msg, ipv6_codec()) {
+        ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+            let r = mp_reach.expect("mp_reach must be present");
+            assert_eq!(r.family, Family::IPV6);
+            assert_eq!(r.entries, vec![prefix]);
+            assert_eq!(r.nexthop, Some(nexthop), "dual nexthop must round-trip");
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
 // ─── End-of-RIB ──────────────────────────────────────────────────────────────
 
 #[test]
