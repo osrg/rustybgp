@@ -1579,11 +1579,8 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::StopBgpRequest>,
     ) -> Result<tonic::Response<api::StopBgpResponse>, tonic::Status> {
         let allow_gr = request.into_inner().allow_graceful_restart;
-        let cease = bgp::Message::Notification(rustybgp_packet::Notification::Other {
-            code: 6,
-            subcode: 3,
-            data: vec![],
-        });
+        let cease =
+            bgp::Message::Notification(rustybgp_packet::Notification::CeasePeerDeconfigured);
 
         let mut global = self.global.write().await;
         if global.asn == 0 {
@@ -1691,11 +1688,7 @@ impl GoBgpService for GrpcService {
                     let mut ctx = p.context.lock().unwrap();
                     ctx.force_down(
                         CloseReason::SendMessage(bgp::Message::Notification(
-                            rustybgp_packet::Notification::Other {
-                                code: 6,
-                                subcode: 3,
-                                data: vec![],
-                            },
+                            rustybgp_packet::Notification::CeasePeerDeconfigured,
                         )),
                         true,
                     );
@@ -1870,11 +1863,7 @@ impl GoBgpService for GrpcService {
                 let mut ctx = peer.context.lock().unwrap();
                 ctx.force_down(
                     CloseReason::SendMessage(bgp::Message::Notification(
-                        rustybgp_packet::Notification::Other {
-                            code: 6,
-                            subcode: 3,
-                            data: vec![],
-                        },
+                        rustybgp_packet::Notification::CeasePeerDeconfigured,
                     )),
                     true,
                 );
@@ -1924,11 +1913,7 @@ impl GoBgpService for GrpcService {
             let mut ctx = peer.context.lock().unwrap();
             ctx.force_down(
                 CloseReason::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::Notification::Other {
-                        code: 6,
-                        subcode: 3,
-                        data: vec![],
-                    },
+                    rustybgp_packet::Notification::CeasePeerDeconfigured,
                 )),
                 false,
             );
@@ -5710,11 +5695,9 @@ impl PeerSession {
             }
             let rx_timestamp = std::time::SystemTime::now();
             if self.rx_update(reach, unreach, attr, rx_timestamp).await {
-                let cease = bgp::Message::Notification(rustybgp_packet::Notification::Other {
-                    code: 6,
-                    subcode: 1,
-                    data: vec![],
-                });
+                let cease = bgp::Message::Notification(
+                    rustybgp_packet::Notification::CeaseMaxPrefixReached,
+                );
                 self.urgent.insert(0, cease.clone());
                 self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(cease));
                 return Ok(());
@@ -7620,11 +7603,7 @@ mod tests {
     }
 
     fn cease_notification() -> bgp::Message {
-        bgp::Message::Notification(packet::Notification::Other {
-            code: 6,    // Cease
-            subcode: 7, // Connection Collision Resolution
-            data: vec![],
-        })
+        bgp::Message::Notification(packet::Notification::CeaseConnectionCollision)
     }
 
     /// Helper: add a peer and return a passive PeerSession via accept_connection.
@@ -8529,8 +8508,11 @@ mod tests {
 
     #[test]
     fn gr_on_disconnect_hard_reset_never_applies() {
-        assert!(gr_on_disconnect(&Some(cease(9)), make_negotiated_gr(false)).is_none());
-        assert!(gr_on_disconnect(&Some(cease(9)), make_negotiated_gr(true)).is_none());
+        let hard_reset = crate::fsm::SessionDownReason::RemoteNotification(
+            bgp::Message::Notification(rustybgp_packet::Notification::CeaseHardReset),
+        );
+        assert!(gr_on_disconnect(&Some(hard_reset.clone()), make_negotiated_gr(false)).is_none());
+        assert!(gr_on_disconnect(&Some(hard_reset), make_negotiated_gr(true)).is_none());
     }
 
     #[test]
@@ -8541,7 +8523,10 @@ mod tests {
 
     #[test]
     fn gr_on_disconnect_local_hard_reset_never_applies() {
-        assert!(gr_on_disconnect(&Some(local_cease(9)), make_negotiated_gr(true)).is_none());
+        let hard_reset = crate::fsm::SessionDownReason::LocalNotification(
+            bgp::Message::Notification(rustybgp_packet::Notification::CeaseHardReset),
+        );
+        assert!(gr_on_disconnect(&Some(hard_reset), make_negotiated_gr(true)).is_none());
     }
 
     #[test]

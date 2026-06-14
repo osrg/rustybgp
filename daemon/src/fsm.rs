@@ -392,11 +392,7 @@ impl Connection {
     fn on_admin_shutdown(&mut self) -> Vec<Output> {
         vec![
             Output::SendMessage(bgp::Message::Notification(
-                rustybgp_packet::Notification::Other {
-                    code: 6,
-                    subcode: 2,
-                    data: vec![],
-                },
+                rustybgp_packet::Notification::CeaseAdminShutdown,
             )),
             Output::SessionDown(SessionDownReason::AdminShutdown),
         ]
@@ -629,11 +625,7 @@ impl PeerFsm {
         let outputs = vec![PeerFsmOutput::Connection(
             loser,
             Output::SendMessage(bgp::Message::Notification(
-                rustybgp_packet::Notification::Other {
-                    code: 6,    // Cease
-                    subcode: 7, // Connection Collision Resolution
-                    data: vec![],
-                },
+                rustybgp_packet::Notification::CeaseConnectionCollision,
             )),
         )];
 

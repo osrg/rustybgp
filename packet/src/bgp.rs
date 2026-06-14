@@ -55,6 +55,18 @@ pub enum Notification {
     #[error("FSM error: unexpected state {state}")]
     FsmUnexpectedState { state: u8 },
 
+    // Code 6: Cease (RFC 4486)
+    #[error("cease: maximum number of prefixes reached")]
+    CeaseMaxPrefixReached,
+    #[error("cease: administrative shutdown")]
+    CeaseAdminShutdown,
+    #[error("cease: peer deconfigured")]
+    CeasePeerDeconfigured,
+    #[error("cease: connection collision resolution")]
+    CeaseConnectionCollision,
+    #[error("cease: hard reset")]
+    CeaseHardReset,
+
     // Code 7: ROUTE-REFRESH Message Error
     #[error("route-refresh error: invalid message length")]
     RouteRefreshInvalidLength { data: Vec<u8> },
@@ -78,6 +90,11 @@ impl Notification {
             | Self::OpenUnacceptableHoldTime { .. } => 2,
             Self::UpdateMalformedAttributeList | Self::UpdateOptionalAttributeError => 3,
             Self::FsmUnexpectedState { .. } => 5,
+            Self::CeaseMaxPrefixReached
+            | Self::CeaseAdminShutdown
+            | Self::CeasePeerDeconfigured
+            | Self::CeaseConnectionCollision
+            | Self::CeaseHardReset => 6,
             Self::RouteRefreshInvalidLength { .. } => 7,
             Self::Other { code, .. } => *code,
         }
@@ -94,6 +111,11 @@ impl Notification {
             Self::UpdateMalformedAttributeList => 1,
             Self::UpdateOptionalAttributeError => 9,
             Self::FsmUnexpectedState { state } => *state,
+            Self::CeaseMaxPrefixReached => 1,
+            Self::CeaseAdminShutdown => 2,
+            Self::CeasePeerDeconfigured => 3,
+            Self::CeaseConnectionCollision => 7,
+            Self::CeaseHardReset => 9,
             Self::RouteRefreshInvalidLength { .. } => 1,
             Self::Other { subcode, .. } => *subcode,
         }
@@ -115,14 +137,7 @@ impl Notification {
     /// Returns true if this is a CEASE Hard Reset (RFC 8538 §3: code 6, subcode 9).
     /// Hard Reset terminates GR even when the N-bit is negotiated.
     pub fn is_hard_reset(&self) -> bool {
-        matches!(
-            self,
-            Self::Other {
-                code: 6,
-                subcode: 9,
-                ..
-            }
-        )
+        matches!(self, Self::CeaseHardReset)
     }
 
     /// Constructs a `Notification` from a received NOTIFICATION message.
@@ -136,6 +151,11 @@ impl Notification {
             (3, 1) => Self::UpdateMalformedAttributeList,
             (3, 9) => Self::UpdateOptionalAttributeError,
             (5, state) => Self::FsmUnexpectedState { state },
+            (6, 1) => Self::CeaseMaxPrefixReached,
+            (6, 2) => Self::CeaseAdminShutdown,
+            (6, 3) => Self::CeasePeerDeconfigured,
+            (6, 7) => Self::CeaseConnectionCollision,
+            (6, 9) => Self::CeaseHardReset,
             (7, 1) => Self::RouteRefreshInvalidLength { data },
             _ => Self::Other {
                 code,
@@ -2646,12 +2666,9 @@ mod notification_tests {
 
     #[test]
     fn hard_reset_is_cease_subcode_9() {
-        let err = Notification::Other {
-            code: 6,
-            subcode: 9,
-            data: vec![],
-        };
-        assert!(err.is_hard_reset());
+        assert!(Notification::CeaseHardReset.is_hard_reset());
+        // from_notification maps (6,9) to CeaseHardReset
+        assert!(Notification::from_notification(6, 9, vec![]).is_hard_reset());
     }
 
     #[test]
