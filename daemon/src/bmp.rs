@@ -72,16 +72,14 @@ fn flush_peer_snapshot(
         for ((family, _), change) in &peer_routes {
             families_seen.insert(*family);
             let attrs = change.attrs.as_ref().unwrap();
-            let update = bgp::Message::Update(bgp::Update {
-                reach: Some(packet::bgp::NlriSet {
+            let update = bgp::Message::Update(bgp::Update::Routes {
+                reach: Some(packet::bgp::ReachNlri {
                     family: *family,
                     entries: change.nlris.clone(),
+                    nexthop: change.nexthop,
                 }),
-                mp_reach: None,
                 attr: attrs.clone(),
                 unreach: None,
-                mp_unreach: None,
-                nexthop: change.nexthop,
             });
             messages.push(bmp::Message::RouteMonitoring {
                 header: bmp::PerPeerHeader::new(
@@ -115,28 +113,23 @@ fn flush_peer_snapshot(
 /// Convert a live `AdjRibInChange` to the BGP UPDATE used in RouteMonitoring.
 fn adj_rib_in_to_bmp_update(change: &AdjRibInChange) -> bgp::Message {
     if let Some(ref attrs) = change.attrs {
-        bgp::Message::Update(bgp::Update {
-            reach: Some(packet::bgp::NlriSet {
+        bgp::Message::Update(bgp::Update::Routes {
+            reach: Some(packet::bgp::ReachNlri {
                 family: change.family,
                 entries: change.nlris.clone(),
+                nexthop: change.nexthop,
             }),
-            mp_reach: None,
             attr: attrs.clone(),
             unreach: None,
-            mp_unreach: None,
-            nexthop: change.nexthop,
         })
     } else {
-        bgp::Message::Update(bgp::Update {
+        bgp::Message::Update(bgp::Update::Routes {
             reach: None,
-            mp_reach: None,
             attr: Arc::new(Vec::new()),
-            unreach: None,
-            mp_unreach: Some(packet::bgp::NlriSet {
+            unreach: Some(packet::bgp::UnreachNlri {
                 family: change.family,
                 entries: change.nlris.clone(),
             }),
-            nexthop: None,
         })
     }
 }
@@ -705,7 +698,7 @@ mod tests {
 
     #[test]
     fn session_down_to_bmp_remote_notification_preserved() {
-        let msg = bgp::Message::Notification(rustybgp_packet::error::BgpError::Other {
+        let msg = bgp::Message::Notification(rustybgp_packet::error::Notification::Other {
             code: 6,
             subcode: 0,
             data: vec![],
@@ -718,7 +711,7 @@ mod tests {
 
     #[test]
     fn session_down_to_bmp_local_notification_preserved() {
-        let msg = bgp::Message::Notification(rustybgp_packet::error::BgpError::Other {
+        let msg = bgp::Message::Notification(rustybgp_packet::error::Notification::Other {
             code: 6,
             subcode: 0,
             data: vec![],

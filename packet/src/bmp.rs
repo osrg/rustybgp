@@ -212,13 +212,7 @@ impl Encoder<&Message> for BmpCodec {
             } => {
                 header.encode(c).unwrap();
                 let mut buf = bytes::BytesMut::with_capacity(4096);
-                if let bgp::Message::Update(bgp::Update {
-                    reach,
-                    unreach,
-                    attr: _,
-                    ..
-                }) = update
-                {
+                if let bgp::Message::Update(bgp::Update::Routes { reach, unreach, .. }) = update {
                     let family = if let Some(s) = reach {
                         s.family
                     } else {

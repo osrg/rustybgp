@@ -13,8 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustybgp_packet::bgp::{Capability, Message, Open, PeerCodecBuilder, create_channel};
-use rustybgp_packet::{BgpError, BgpFramer, Family, HoldTime};
+use rustybgp_packet::bgp::{
+    Capability, Message, Open, ParsedMessage, PeerCodecBuilder, create_channel,
+};
+use rustybgp_packet::{BgpFramer, Family, HoldTime, Notification};
 use std::net::Ipv4Addr;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -51,12 +53,12 @@ fn parse_open_caps(cap_bytes: &[u8]) -> Vec<Capability> {
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
     match PeerCodecBuilder::new().build().parse_message(&buf).unwrap() {
-        Message::Open(Open { capability, .. }) => capability,
+        ParsedMessage::Open(Open { capability, .. }) => capability,
         _ => panic!("expected OPEN"),
     }
 }
 
-fn round_trip(msg: &Message) -> Message {
+fn round_trip(msg: &Message) -> ParsedMessage {
     let mut framer = BgpFramer::new(PeerCodecBuilder::new().build());
     let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
@@ -129,7 +131,7 @@ fn capability_graceful_restart_round_trip() {
         families: vec![(Family::IPV4, 0x80), (Family::IPV6, 0x00)],
     }]);
     match round_trip(&original) {
-        Message::Open(Open { capability, .. }) => {
+        ParsedMessage::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
             match &capability[0] {
                 Capability::GracefulRestart {
@@ -160,7 +162,7 @@ fn capability_graceful_restart_invalid_len() {
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
     match PeerCodecBuilder::new().build().parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::OpenMalformed)) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::OpenMalformed)) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -173,7 +175,7 @@ fn capability_add_path_round_trip() {
     // mode=3: send+receive
     let original = open_with(vec![Capability::AddPath(vec![(Family::IPV4, 3)])]);
     match round_trip(&original) {
-        Message::Open(Open { capability, .. }) => {
+        ParsedMessage::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
             assert!(matches!(
                 &capability[0],
@@ -191,7 +193,7 @@ fn capability_add_path_multiple_families() {
         (Family::IPV6, 2), // send only
     ])]);
     match round_trip(&original) {
-        Message::Open(Open { capability, .. }) => {
+        ParsedMessage::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
             match &capability[0] {
                 Capability::AddPath(v) => {
@@ -216,7 +218,7 @@ fn capability_add_path_invalid_len() {
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
     match PeerCodecBuilder::new().build().parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::OpenMalformed)) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::OpenMalformed)) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -228,7 +230,7 @@ fn capability_add_path_invalid_len() {
 fn capability_enhanced_route_refresh_round_trip() {
     let original = open_with(vec![Capability::EnhancedRouteRefresh]);
     match round_trip(&original) {
-        Message::Open(Open { capability, .. }) => {
+        ParsedMessage::Open(Open { capability, .. }) => {
             assert!(
                 capability
                     .iter()
@@ -270,7 +272,7 @@ fn capability_fqdn_round_trip() {
         domain: "example.com".to_string(),
     }]);
     match round_trip(&original) {
-        Message::Open(Open { capability, .. }) => {
+        ParsedMessage::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
             assert!(matches!(
                 &capability[0],
@@ -292,7 +294,7 @@ fn capability_llgr_round_trip() {
         3600, // stale time in seconds
     )])]);
     match round_trip(&original) {
-        Message::Open(Open { capability, .. }) => {
+        ParsedMessage::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
             assert!(matches!(
                 &capability[0],
@@ -424,7 +426,7 @@ fn capability_extended_nexthop_round_trip() {
         Family::AFI_IP6,
     )])]);
     match round_trip(&original) {
-        Message::Open(Open { capability, .. }) => {
+        ParsedMessage::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
             match &capability[0] {
                 Capability::ExtendedNexthop(v) => {

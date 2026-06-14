@@ -83,23 +83,20 @@ impl MessageCounter {
     fn sync(&self, msg: &bgp::Message) -> bool {
         let mut ret = false;
         match msg {
-            bgp::Message::Open(bgp::Open { .. }) => {
+            bgp::Message::Open(_) => {
                 let _ = self.open.fetch_add(1, Ordering::Relaxed);
             }
-            bgp::Message::Update(bgp::Update {
-                unreach,
-                mp_unreach,
-                ..
-            }) => {
+            bgp::Message::Update(bgp::Update::Routes { unreach, .. }) => {
                 self.update.fetch_add(1, Ordering::Relaxed);
-
-                let unreach_count = unreach.as_ref().map_or(0, |s| s.entries.len())
-                    + mp_unreach.as_ref().map_or(0, |s| s.entries.len());
+                let unreach_count = unreach.as_ref().map_or(0, |s| s.entries.len());
                 if unreach_count > 0 {
                     self.withdraw_update.fetch_add(1, Ordering::Relaxed);
                     self.withdraw_prefix
                         .fetch_add(unreach_count as u64, Ordering::Relaxed);
                 }
+            }
+            bgp::Message::Update(bgp::Update::EndOfRib(_)) => {
+                self.update.fetch_add(1, Ordering::Relaxed);
             }
             bgp::Message::Notification(_) => {
                 ret = true;
@@ -1582,7 +1579,7 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::StopBgpRequest>,
     ) -> Result<tonic::Response<api::StopBgpResponse>, tonic::Status> {
         let allow_gr = request.into_inner().allow_graceful_restart;
-        let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
+        let cease = bgp::Message::Notification(rustybgp_packet::Notification::Other {
             code: 6,
             subcode: 3,
             data: vec![],
@@ -1694,7 +1691,7 @@ impl GoBgpService for GrpcService {
                     let mut ctx = p.context.lock().unwrap();
                     ctx.force_down(
                         CloseReason::SendMessage(bgp::Message::Notification(
-                            rustybgp_packet::BgpError::Other {
+                            rustybgp_packet::Notification::Other {
                                 code: 6,
                                 subcode: 3,
                                 data: vec![],
@@ -1873,7 +1870,7 @@ impl GoBgpService for GrpcService {
                 let mut ctx = peer.context.lock().unwrap();
                 ctx.force_down(
                     CloseReason::SendMessage(bgp::Message::Notification(
-                        rustybgp_packet::BgpError::Other {
+                        rustybgp_packet::Notification::Other {
                             code: 6,
                             subcode: 3,
                             data: vec![],
@@ -1927,7 +1924,7 @@ impl GoBgpService for GrpcService {
             let mut ctx = peer.context.lock().unwrap();
             ctx.force_down(
                 CloseReason::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::BgpError::Other {
+                    rustybgp_packet::Notification::Other {
                         code: 6,
                         subcode: 3,
                         data: vec![],
@@ -5607,10 +5604,9 @@ impl PeerSession {
     /// The caller must send a CEASE NOTIFICATION and close the session.
     async fn rx_update(
         &mut self,
-        reach: Option<packet::NlriSet>,
-        unreach: Option<packet::NlriSet>,
+        reach: Option<bgp::ReachNlri>,
+        unreach: Option<packet::UnreachNlri>,
         attr: Arc<Vec<packet::Attribute>>,
-        nexthop: Option<bgp::Nexthop>,
         timestamp: std::time::SystemTime,
     ) -> bool {
         // RFC 4456 §8 loop detection: discard UPDATE if ORIGINATOR_ID equals
@@ -5636,6 +5632,7 @@ impl PeerSession {
         }
         if let Some(s) = reach {
             let family = s.family;
+            let nexthop = s.nexthop;
             let source = self.source[&family].clone();
             let prefix_limit = self
                 .prefix_counters
@@ -5719,16 +5716,19 @@ impl PeerSession {
         remote_sockaddr: SocketAddr,
         msg: bgp::Message,
     ) -> std::result::Result<(), Error> {
-        // Extract UPDATE fields before passing to FSM (FSM doesn't process routes).
-        let update_fields = if let bgp::Message::Update(ref u) = msg {
-            Some((
-                u.reach.clone(),
-                u.mp_reach.clone(),
-                u.attr.clone(),
-                u.unreach.clone(),
-                u.mp_unreach.clone(),
-                u.nexthop,
-            ))
+        // Extract UPDATE fields before consuming msg into the FSM.
+        let route_fields = if let bgp::Message::Update(bgp::Update::Routes {
+            reach,
+            unreach,
+            attr,
+        }) = &msg
+        {
+            Some((reach.clone(), unreach.clone(), attr.clone()))
+        } else {
+            None
+        };
+        let eor_family = if let bgp::Message::Update(bgp::Update::EndOfRib(f)) = &msg {
+            Some(*f)
         } else {
             None
         };
@@ -5749,25 +5749,19 @@ impl PeerSession {
             .await;
         self.process_effects(effects, global).await;
 
-        // For UPDATE messages: if FSM didn't reject (no SessionDown), process routes.
-        if let Some((reach, mp_reach, attr, unreach, mp_unreach, nexthop)) = update_fields {
+        // For UPDATE Routes: if FSM didn't reject (no SessionDown), process routes.
+        if let Some((reach, unreach, attr)) = route_fields {
             if has_session_down {
                 return Err(Error::Packet(
-                    rustybgp_packet::BgpError::FsmUnexpectedState {
+                    rustybgp_packet::Notification::FsmUnexpectedState {
                         state: u8::from(self.conn_arbiter.lock().unwrap().state(self.role)),
                     }
                     .into(),
                 ));
             }
             let rx_timestamp = std::time::SystemTime::now();
-            let prefix_limit_exceeded = self
-                .rx_update(reach.clone(), unreach, attr.clone(), nexthop, rx_timestamp)
-                .await
-                || self
-                    .rx_update(mp_reach, mp_unreach.clone(), attr, nexthop, rx_timestamp)
-                    .await;
-            if prefix_limit_exceeded {
-                let cease = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
+            if self.rx_update(reach, unreach, attr, rx_timestamp).await {
+                let cease = bgp::Message::Notification(rustybgp_packet::Notification::Other {
                     code: 6,
                     subcode: 1,
                     data: vec![],
@@ -5776,25 +5770,15 @@ impl PeerSession {
                 self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(cease));
                 return Ok(());
             }
+        }
 
-            // Detect End-of-RIB: empty NlriSet with no attributes.
-            // IPv4 EOR: reach has empty entries; other families: mp_unreach has empty entries.
-            if self.negotiated_gr.is_some() {
-                let mut eor_effects = Vec::new();
-                if let Some(r) = &reach
-                    && r.entries.is_empty()
-                {
-                    eor_effects.push(GlobalEffect::GrEorReceived { family: r.family });
-                }
-                if let Some(u) = &mp_unreach
-                    && u.entries.is_empty()
-                {
-                    eor_effects.push(GlobalEffect::GrEorReceived { family: u.family });
-                }
-                if !eor_effects.is_empty() {
-                    self.process_effects(eor_effects, global).await;
-                }
-            }
+        // For UPDATE EndOfRib: signal GR if negotiated.
+        if let Some(family) = eor_family
+            && !has_session_down
+            && self.negotiated_gr.is_some()
+        {
+            self.process_effects(vec![GlobalEffect::GrEorReceived { family }], global)
+                .await;
         }
         Ok(())
     }
@@ -5923,9 +5907,20 @@ impl PeerSession {
                             Ok(_) => loop {
                                     match self.framer.try_parse(&mut rxbuf) {
                                     Ok(msg) => match msg {
-                                        Some(msg) => {
-                                            (*self.counter_rx).sync(&msg);
-                                            let _ = self.rx_msg(global, local_sockaddr, remote_sockaddr, msg).await;
+                                        Some(parsed) => {
+                                            match bgp::validate_message(parsed) {
+                                                Err(notif) => {
+                                                    self.urgent.insert(0, bgp::Message::Notification(notif.clone()));
+                                                    self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(notif)));
+                                                    break;
+                                                }
+                                                Ok(iter) => {
+                                                    for msg in iter {
+                                                        (*self.counter_rx).sync(&msg);
+                                                        let _ = self.rx_msg(global, local_sockaddr, remote_sockaddr, msg).await;
+                                                    }
+                                                }
+                                            }
                                         }
                                         None => {
                                             // partial read
@@ -5933,7 +5928,7 @@ impl PeerSession {
                                         },
                                     }
                                     Err(e) => {
-                                        // Bypass FSM: BgpError already encodes the
+                                        // Bypass FSM: Notification already encodes the
                                         // correct NOTIFICATION; the FSM has no
                                         // decision to make here.
                                         if let rustybgp_packet::Error::Bgp(ref bgp_err) = e {
@@ -7626,7 +7621,7 @@ mod tests {
     }
 
     fn cease_notification() -> bgp::Message {
-        bgp::Message::Notification(packet::BgpError::Other {
+        bgp::Message::Notification(packet::Notification::Other {
             code: 6,    // Cease
             subcode: 7, // Connection Collision Resolution
             data: vec![],
@@ -8498,7 +8493,7 @@ mod tests {
 
     fn cease(subcode: u8) -> crate::fsm::SessionDownReason {
         crate::fsm::SessionDownReason::RemoteNotification(bgp::Message::Notification(
-            rustybgp_packet::error::BgpError::Other {
+            rustybgp_packet::error::Notification::Other {
                 code: 6,
                 subcode,
                 data: vec![],
@@ -8508,7 +8503,7 @@ mod tests {
 
     fn local_cease(subcode: u8) -> crate::fsm::SessionDownReason {
         crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(
-            rustybgp_packet::error::BgpError::Other {
+            rustybgp_packet::error::Notification::Other {
                 code: 6,
                 subcode,
                 data: vec![],
@@ -8637,13 +8632,8 @@ mod tests {
         fn reach_entries(msgs: &[bgp::Message]) -> Vec<(packet::Nlri, u32)> {
             let mut out = Vec::new();
             for msg in msgs {
-                if let bgp::Message::Update(u) = msg {
-                    for e in u
-                        .reach
-                        .iter()
-                        .chain(u.mp_reach.iter())
-                        .flat_map(|s| &s.entries)
-                    {
+                if let bgp::Message::Update(bgp::Update::Routes { reach, .. }) = msg {
+                    for e in reach.iter().flat_map(|s| &s.entries) {
                         out.push((e.nlri.clone(), e.path_id));
                     }
                 }
@@ -8655,13 +8645,8 @@ mod tests {
         fn unreach_entries(msgs: &[bgp::Message]) -> Vec<(packet::Nlri, u32)> {
             let mut out = Vec::new();
             for msg in msgs {
-                if let bgp::Message::Update(u) = msg {
-                    for e in u
-                        .unreach
-                        .iter()
-                        .chain(u.mp_unreach.iter())
-                        .flat_map(|s| &s.entries)
-                    {
+                if let bgp::Message::Update(bgp::Update::Routes { unreach, .. }) = msg {
+                    for e in unreach.iter().flat_map(|s| &s.entries) {
                         out.push((e.nlri.clone(), e.path_id));
                     }
                 }
@@ -9575,9 +9560,9 @@ mod tests {
         ) -> Arc<Vec<packet::Attribute>> {
             let msgs = pending.drain_messages(Family::IPV4, false);
             for msg in msgs {
-                if let bgp::Message::Update(u) = msg {
-                    if u.reach.as_ref().is_some_and(|r| !r.entries.is_empty()) {
-                        return u.attr;
+                if let bgp::Message::Update(bgp::Update::Routes { reach, attr, .. }) = msg {
+                    if reach.as_ref().is_some_and(|r| !r.entries.is_empty()) {
+                        return attr;
                     }
                 }
             }
@@ -10684,10 +10669,11 @@ neighbor-address = "10.0.0.1"
     // source lookup, so no source setup is required; the absence of an inserted
     // route is verified via table_state().
 
-    fn reach_set(prefix: &str) -> Option<packet::NlriSet> {
-        Some(packet::NlriSet {
+    fn reach_set(prefix: &str) -> Option<bgp::ReachNlri> {
+        Some(bgp::ReachNlri {
             family: Family::IPV4,
             entries: vec![packet::PathNlri::new(prefix.parse().unwrap())],
+            nexthop: None,
         })
     }
 
@@ -10711,7 +10697,6 @@ neighbor-address = "10.0.0.1"
                 reach_set("10.0.0.0/24"),
                 None,
                 attrs,
-                None,
                 std::time::SystemTime::now(),
             )
             .await;
@@ -10739,7 +10724,6 @@ neighbor-address = "10.0.0.1"
                 reach_set("10.0.0.0/24"),
                 None,
                 attrs,
-                None,
                 std::time::SystemTime::now(),
             )
             .await;
@@ -10772,7 +10756,6 @@ neighbor-address = "10.0.0.1"
                 reach_set("10.0.0.0/24"),
                 None,
                 attrs,
-                None,
                 std::time::SystemTime::now(),
             )
             .await;

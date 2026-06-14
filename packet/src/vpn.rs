@@ -21,7 +21,7 @@
 //!   ceil(prefix_bits/8) bytes IP prefix (significant octets only)
 
 use crate::bgp::{Ipv4Net, Ipv6Net};
-use crate::error::{BgpError, Error};
+use crate::error::{Error, Notification};
 use crate::mpls::MplsLabelStack;
 use crate::rd::RouteDistinguisher;
 use byteorder::ReadBytesExt;
@@ -34,7 +34,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 const VPN_RD_BITS: u8 = 64;
 
 fn malformed() -> Error {
-    BgpError::UpdateMalformedAttributeList.into()
+    Notification::UpdateMalformedAttributeList.into()
 }
 
 /// VPNv4 NLRI (AFI=1, SAFI=128).

@@ -142,13 +142,7 @@ impl Encoder<&Message> for MrtCodec {
                 body,
                 addpath,
             } => {
-                if let bgp::Message::Update(bgp::Update {
-                    reach,
-                    unreach,
-                    attr: _,
-                    ..
-                }) = body
-                {
+                if let bgp::Message::Update(bgp::Update::Routes { reach, unreach, .. }) = body {
                     let family = if let Some(s) = reach {
                         s.family
                     } else {

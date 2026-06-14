@@ -14,8 +14,8 @@
 // limitations under the License.
 
 use bytes::BytesMut;
-use rustybgp_packet::bgp::{Message, PeerCodecBuilder};
-use rustybgp_packet::{BgpError, BgpFramer};
+use rustybgp_packet::bgp::{Message, ParsedMessage, PeerCodecBuilder};
+use rustybgp_packet::{BgpFramer, Notification};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ fn framer_complete_keepalive() {
     let mut framer = default_framer();
     let mut buf = BytesMut::from(keepalive_bytes().as_slice());
     let result = framer.try_parse(&mut buf).unwrap();
-    assert!(matches!(result, Some(Message::Keepalive)));
+    assert!(matches!(result, Some(ParsedMessage::Keepalive)));
     assert_eq!(buf.len(), 0); // consumed
 }
 
@@ -83,7 +83,7 @@ fn framer_partial_message() {
     // Second chunk: add the remaining 9 bytes
     buf.extend_from_slice(&bytes[10..]);
     let result = framer.try_parse(&mut buf).unwrap();
-    assert!(matches!(result, Some(Message::Keepalive)));
+    assert!(matches!(result, Some(ParsedMessage::Keepalive)));
     assert_eq!(buf.len(), 0);
 }
 
@@ -98,12 +98,12 @@ fn framer_two_messages_in_buffer() {
 
     // First parse: consumes one message
     let r1 = framer.try_parse(&mut buf).unwrap();
-    assert!(matches!(r1, Some(Message::Keepalive)));
+    assert!(matches!(r1, Some(ParsedMessage::Keepalive)));
     assert_eq!(buf.len(), 19); // one message remains
 
     // Second parse: consumes second message
     let r2 = framer.try_parse(&mut buf).unwrap();
-    assert!(matches!(r2, Some(Message::Keepalive)));
+    assert!(matches!(r2, Some(ParsedMessage::Keepalive)));
     assert_eq!(buf.len(), 0);
 
     // Third parse: empty
@@ -121,7 +121,7 @@ fn framer_message_then_partial() {
 
     // First parse: succeeds
     let r1 = framer.try_parse(&mut buf).unwrap();
-    assert!(matches!(r1, Some(Message::Keepalive)));
+    assert!(matches!(r1, Some(ParsedMessage::Keepalive)));
     assert_eq!(buf.len(), 5);
 
     // Second parse: partial → None
@@ -141,7 +141,7 @@ fn framer_header_length_below_minimum() {
     let mut framer = default_framer();
     let mut bmut = BytesMut::from(buf.as_slice());
     match framer.try_parse(&mut bmut) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::BadMessageLength { .. })) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
         other => panic!("expected BadMessageLength, got {:?}", other.map(|_| "ok")),
     }
 }
@@ -156,7 +156,7 @@ fn framer_header_length_exceeds_max() {
     let mut framer = default_framer();
     let mut bmut = BytesMut::from(buf.as_slice());
     match framer.try_parse(&mut bmut) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::BadMessageLength { .. })) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
         other => panic!("expected BadMessageLength, got {:?}", other.map(|_| "ok")),
     }
 }
@@ -168,7 +168,7 @@ fn framer_unknown_message_type() {
     let mut framer = default_framer();
     let mut bmut = BytesMut::from(buf.as_slice());
     match framer.try_parse(&mut bmut) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::BadMessageType { .. })) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageType { .. })) => {}
         other => panic!("expected BadMessageType, got {:?}", other.map(|_| "ok")),
     }
 }
@@ -191,12 +191,12 @@ fn framer_mixed_message_types() {
     buf.extend_from_slice(&bgp_msg(5, &[0x00, 0x01, 0x00, 0x01]));
 
     let m1 = framer.try_parse(&mut buf).unwrap();
-    assert!(matches!(m1, Some(Message::Keepalive)));
+    assert!(matches!(m1, Some(ParsedMessage::Keepalive)));
 
     let m2 = framer.try_parse(&mut buf).unwrap();
     assert!(matches!(
         m2,
-        Some(Message::RouteRefresh { family })
+        Some(ParsedMessage::RouteRefresh { family })
         if family == rustybgp_packet::Family::IPV4
     ));
 

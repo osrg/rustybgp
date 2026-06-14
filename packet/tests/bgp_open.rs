@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustybgp_packet::bgp::{Capability, Message, Open, PeerCodecBuilder};
-use rustybgp_packet::{BgpError, BgpFramer, Family, HoldTime};
+use rustybgp_packet::bgp::{Capability, Message, Open, ParsedMessage, PeerCodecBuilder};
+use rustybgp_packet::{BgpFramer, Family, HoldTime, Notification};
 use std::net::Ipv4Addr;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@ fn open_minimal_parse() {
     let buf = bgp_msg(1, &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &[]));
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
-        Message::Open(Open {
+        ParsedMessage::Open(Open {
             as_number,
             holdtime,
             router_id,
@@ -89,7 +89,7 @@ fn open_with_multiprotocol_ipv4() {
 
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
-        Message::Open(Open { capability, .. }) => {
+        ParsedMessage::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
             assert!(matches!(
                 &capability[0],
@@ -112,7 +112,7 @@ fn open_with_multiprotocol_ipv6() {
 
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
-        Message::Open(Open { capability, .. }) => {
+        ParsedMessage::Open(Open { capability, .. }) => {
             assert_eq!(capability.len(), 1);
             assert!(matches!(
                 &capability[0],
@@ -138,7 +138,7 @@ fn open_with_four_octet_asn() {
 
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
-        Message::Open(Open {
+        ParsedMessage::Open(Open {
             as_number,
             capability,
             ..
@@ -167,7 +167,7 @@ fn open_with_route_refresh() {
 
     let mut codec = default_codec().build();
     match codec.parse_message(&buf).unwrap() {
-        Message::Open(Open { capability, .. }) => {
+        ParsedMessage::Open(Open { capability, .. }) => {
             assert!(
                 capability
                     .iter()
@@ -195,7 +195,7 @@ fn open_round_trip_minimal() {
     let parsed = framer.inner_mut().parse_message(&buf).unwrap();
 
     match parsed {
-        Message::Open(Open {
+        ParsedMessage::Open(Open {
             as_number,
             holdtime,
             router_id,
@@ -233,7 +233,7 @@ fn open_round_trip_with_capabilities() {
     let parsed = framer.inner_mut().parse_message(&buf).unwrap();
 
     match parsed {
-        Message::Open(Open {
+        ParsedMessage::Open(Open {
             as_number,
             holdtime,
             capability,
@@ -275,7 +275,7 @@ fn open_too_short() {
     let buf = bgp_msg(1, body);
     let mut codec = default_codec().build();
     match codec.parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::BadMessageLength { .. })) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -291,7 +291,7 @@ fn open_unacceptable_holdtime() {
         );
         let mut codec = default_codec().build();
         match codec.parse_message(&buf) {
-            Err(rustybgp_packet::Error::Bgp(BgpError::OpenUnacceptableHoldTime { .. })) => {}
+            Err(rustybgp_packet::Error::Bgp(Notification::OpenUnacceptableHoldTime { .. })) => {}
             Ok(_) => panic!("expected error for holdtime={}", bad_holdtime),
             Err(e) => panic!("unexpected error for holdtime={}: {}", bad_holdtime, e),
         }
@@ -308,7 +308,9 @@ fn open_unsupported_optional_parameter() {
     );
     let mut codec = default_codec().build();
     match codec.parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::OpenUnsupportedOptionalParameter { .. })) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::OpenUnsupportedOptionalParameter {
+            ..
+        })) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }

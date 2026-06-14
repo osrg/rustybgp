@@ -14,8 +14,8 @@
 // limitations under the License.
 
 use bytes::{BufMut, BytesMut};
-use rustybgp_packet::bgp::{Message, PeerCodecBuilder};
-use rustybgp_packet::{BgpError, BgpFramer, Family};
+use rustybgp_packet::bgp::{Message, ParsedMessage, PeerCodecBuilder};
+use rustybgp_packet::{BgpFramer, Family, Notification};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ fn default_codec() -> rustybgp_packet::bgp::PeerCodec {
     PeerCodecBuilder::new().build()
 }
 
-fn round_trip(msg: &Message) -> Message {
+fn round_trip(msg: &Message) -> ParsedMessage {
     let mut framer = BgpFramer::new(default_codec());
     let mut buf = BytesMut::new();
     framer.encode_to(msg, &mut buf).unwrap();
@@ -48,14 +48,14 @@ fn keepalive_parse() {
     let mut codec = default_codec();
     assert!(matches!(
         codec.parse_message(&buf).unwrap(),
-        Message::Keepalive
+        ParsedMessage::Keepalive
     ));
 }
 
 #[test]
 fn keepalive_round_trip() {
     match round_trip(&Message::Keepalive) {
-        Message::Keepalive => {}
+        ParsedMessage::Keepalive => {}
         _ => panic!("expected Keepalive"),
     }
 }
@@ -69,7 +69,7 @@ fn notification_parse() {
     let buf = bgp_msg(3, body);
     let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
-        Message::Notification(err) => {
+        ParsedMessage::Notification(err) => {
             assert_eq!(err.notification_code(), 1);
             assert_eq!(err.notification_subcode(), 2);
             assert_eq!(err.notification_data(), &[0x00u8, 0x13]);
@@ -85,7 +85,7 @@ fn notification_parse_no_data() {
     let buf = bgp_msg(3, body);
     let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
-        Message::Notification(err) => {
+        ParsedMessage::Notification(err) => {
             assert_eq!(err.notification_code(), 4);
             assert_eq!(err.notification_subcode(), 0);
             assert!(err.notification_data().is_empty());
@@ -96,12 +96,12 @@ fn notification_parse_no_data() {
 
 #[test]
 fn notification_round_trip() {
-    // Use BadMessageLength (code=1, subcode=2) which preserves data in BgpError
-    let original = Message::Notification(BgpError::BadMessageLength {
+    // Use BadMessageLength (code=1, subcode=2) which preserves data in Notification
+    let original = Message::Notification(Notification::BadMessageLength {
         data: vec![0xDE, 0xAD, 0xBE, 0xEF],
     });
     match round_trip(&original) {
-        Message::Notification(err) => {
+        ParsedMessage::Notification(err) => {
             assert_eq!(err.notification_code(), 1);
             assert_eq!(err.notification_subcode(), 2);
             assert_eq!(err.notification_data(), &[0xDEu8, 0xAD, 0xBE, 0xEF]);
@@ -110,47 +110,47 @@ fn notification_round_trip() {
     }
 }
 
-// ─── BgpError ↔ Notification mapping ─────────────────────────────────────────
+// ─── Notification ↔ Notification mapping ─────────────────────────────────────────
 
 #[test]
 fn bgerror_from_notification_known_codes() {
-    // Verify BgpError::from_notification maps known codes correctly
+    // Verify Notification::from_notification maps known codes correctly
     assert!(matches!(
-        BgpError::from_notification(1, 2, vec![]),
-        BgpError::BadMessageLength { .. }
+        Notification::from_notification(1, 2, vec![]),
+        Notification::BadMessageLength { .. }
     ));
     assert!(matches!(
-        BgpError::from_notification(1, 3, vec![]),
-        BgpError::BadMessageType { .. }
+        Notification::from_notification(1, 3, vec![]),
+        Notification::BadMessageType { .. }
     ));
     assert!(matches!(
-        BgpError::from_notification(2, 0, vec![]),
-        BgpError::OpenMalformed
+        Notification::from_notification(2, 0, vec![]),
+        Notification::OpenMalformed
     ));
     assert!(matches!(
-        BgpError::from_notification(2, 4, vec![]),
-        BgpError::OpenUnsupportedOptionalParameter { .. }
+        Notification::from_notification(2, 4, vec![]),
+        Notification::OpenUnsupportedOptionalParameter { .. }
     ));
     assert!(matches!(
-        BgpError::from_notification(2, 6, vec![]),
-        BgpError::OpenUnacceptableHoldTime { .. }
+        Notification::from_notification(2, 6, vec![]),
+        Notification::OpenUnacceptableHoldTime { .. }
     ));
     assert!(matches!(
-        BgpError::from_notification(3, 1, vec![]),
-        BgpError::UpdateMalformedAttributeList
+        Notification::from_notification(3, 1, vec![]),
+        Notification::UpdateMalformedAttributeList
     ));
     assert!(matches!(
-        BgpError::from_notification(7, 1, vec![]),
-        BgpError::RouteRefreshInvalidLength { .. }
+        Notification::from_notification(7, 1, vec![]),
+        Notification::RouteRefreshInvalidLength { .. }
     ));
 }
 
 #[test]
 fn bgerror_from_notification_unknown_code() {
-    let err = BgpError::from_notification(99, 0, vec![0xAB]);
+    let err = Notification::from_notification(99, 0, vec![0xAB]);
     assert!(matches!(
         err,
-        BgpError::Other {
+        Notification::Other {
             code: 99,
             subcode: 0,
             ..
@@ -161,14 +161,14 @@ fn bgerror_from_notification_unknown_code() {
 #[test]
 fn bgerror_notification_code_round_trip() {
     // notification_code/subcode/data round-trips correctly
-    let err = BgpError::BadMessageLength {
+    let err = Notification::BadMessageLength {
         data: vec![0x10, 0x00],
     };
     assert_eq!(err.notification_code(), 1);
     assert_eq!(err.notification_subcode(), 2);
     assert_eq!(err.notification_data(), &[0x10, 0x00]);
 
-    let err = BgpError::FsmUnexpectedState { state: 3 };
+    let err = Notification::FsmUnexpectedState { state: 3 };
     assert_eq!(err.notification_code(), 5);
     assert_eq!(err.notification_subcode(), 3);
 }
@@ -182,7 +182,7 @@ fn route_refresh_ipv4() {
     let buf = bgp_msg(5, body);
     let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
-        Message::RouteRefresh { family } => {
+        ParsedMessage::RouteRefresh { family } => {
             assert_eq!(family, Family::IPV4);
         }
         _ => panic!("expected RouteRefresh"),
@@ -196,7 +196,7 @@ fn route_refresh_ipv6() {
     let buf = bgp_msg(5, body);
     let mut codec = default_codec();
     match codec.parse_message(&buf).unwrap() {
-        Message::RouteRefresh { family } => {
+        ParsedMessage::RouteRefresh { family } => {
             assert_eq!(family, Family::IPV6);
         }
         _ => panic!("expected RouteRefresh"),
@@ -209,7 +209,7 @@ fn route_refresh_round_trip() {
         family: Family::IPV4,
     };
     match round_trip(&original) {
-        Message::RouteRefresh { family } => {
+        ParsedMessage::RouteRefresh { family } => {
             assert_eq!(family, Family::IPV4);
         }
         _ => panic!("expected RouteRefresh"),
@@ -223,7 +223,7 @@ fn route_refresh_too_long() {
     let buf = bgp_msg(5, body);
     let mut codec = default_codec();
     match codec.parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::RouteRefreshInvalidLength { .. })) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::RouteRefreshInvalidLength { .. })) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -237,7 +237,7 @@ fn bad_message_type() {
     let buf = bgp_msg(99, &[]);
     let mut codec = default_codec();
     match codec.parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::BadMessageType { .. })) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageType { .. })) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -250,7 +250,7 @@ fn parse_message_too_short_buffer() {
     let buf: Vec<u8> = vec![0xff; 10]; // 10 bytes < HEADER_LENGTH=19
     let mut codec = default_codec();
     match codec.parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::BadMessageLength { .. })) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -266,7 +266,7 @@ fn framer_bad_header_length() {
     buf.put_u8(4); // KEEPALIVE
     let mut framer = BgpFramer::new(PeerCodecBuilder::new().build());
     match framer.try_parse(&mut buf) {
-        Err(rustybgp_packet::Error::Bgp(BgpError::BadMessageLength { .. })) => {}
+        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }

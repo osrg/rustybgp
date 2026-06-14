@@ -14,7 +14,9 @@
 // limitations under the License.
 
 use rustybgp_packet::bgp::Ipv4Net;
-use rustybgp_packet::bgp::{Attribute, Message, NlriSet, PeerCodecBuilder, Update};
+use rustybgp_packet::bgp::{
+    Attribute, Message, ParsedMessage, ParsedUpdate, PeerCodecBuilder, ReachNlri, Update,
+};
 use rustybgp_packet::{BgpFramer, Family, Nlri, PathNlri};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -48,7 +50,7 @@ fn base_attrs(nexthop: Ipv4Addr) -> Vec<Attribute> {
     ]
 }
 
-fn round_trip(msg: &Message) -> Message {
+fn round_trip(msg: &Message) -> ParsedMessage {
     let mut framer = BgpFramer::new(ipv4_codec());
     let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
@@ -56,16 +58,14 @@ fn round_trip(msg: &Message) -> Message {
 }
 
 fn update_with_attrs(attrs: Vec<Attribute>) -> Message {
-    Message::Update(Update {
-        reach: Some(NlriSet {
+    Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
         }),
-        mp_reach: None,
         attr: Arc::new(attrs),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     })
 }
 
@@ -190,8 +190,8 @@ fn attribute_local_pref_round_trip() {
     attrs.push(Attribute::new_with_value(Attribute::LOCAL_PREF, 200).unwrap());
 
     match round_trip(&update_with_attrs(attrs)) {
-        Message::Update(Update { attr, .. }) => {
-            let lp = attr
+        ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+            let lp = attrs
                 .iter()
                 .find(|a| a.code() == Attribute::LOCAL_PREF)
                 .expect("LOCAL_PREF must be present");
@@ -227,8 +227,8 @@ fn attribute_as_path_round_trip() {
     attrs.push(Attribute::new_with_value(Attribute::LOCAL_PREF, 100).unwrap());
 
     match round_trip(&update_with_attrs(attrs)) {
-        Message::Update(Update { attr, .. }) => {
-            let ap = attr
+        ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+            let ap = attrs
                 .iter()
                 .find(|a| a.code() == Attribute::AS_PATH)
                 .expect("AS_PATH must be present");
@@ -249,8 +249,8 @@ fn attribute_large_community_round_trip() {
     attrs.push(Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, lc.clone()).unwrap());
 
     match round_trip(&update_with_attrs(attrs)) {
-        Message::Update(Update { attr, .. }) => {
-            let lc_attr = attr
+        ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+            let lc_attr = attrs
                 .iter()
                 .find(|a| a.code() == Attribute::LARGE_COMMUNITY)
                 .expect("LARGE_COMMUNITY must be present");
@@ -268,8 +268,8 @@ fn attribute_extended_community_round_trip() {
     attrs.push(Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, ec.clone()).unwrap());
 
     match round_trip(&update_with_attrs(attrs)) {
-        Message::Update(Update { attr, .. }) => {
-            let ec_attr = attr
+        ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+            let ec_attr = attrs
                 .iter()
                 .find(|a| a.code() == Attribute::EXTENDED_COMMUNITY)
                 .expect("EXTENDED_COMMUNITY must be present");

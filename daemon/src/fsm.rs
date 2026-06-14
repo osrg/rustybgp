@@ -65,12 +65,16 @@ impl TryFrom<u8> for State {
 }
 
 /// Events fed into the session FSM.
+// MessageReceived carries ReceivedMessage (216 bytes) while other variants are at most 1 byte.
+// The ReceivedMessage data (NlriSets, Vecs) is already heap-allocated; boxing here would only
+// add an extra allocation per received message.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Input {
     /// TCP connection established; start the OPEN exchange.
     /// The bool indicates whether the local speaker is currently the restarting
     /// speaker (R-bit in the GR capability of the OPEN).
     Connected(bool),
-    /// A complete BGP message was received from the peer.
+    /// A complete BGP message was received from the peer (post-validation).
     MessageReceived(bgp::Message),
     /// The keepalive timer fired (send direction: we may need to send KEEPALIVE).
     KeepaliveTimerExpired,
@@ -239,7 +243,7 @@ impl Connection {
         if self.state != State::OpenSent {
             return vec![
                 Output::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::BgpError::FsmUnexpectedState {
+                    rustybgp_packet::Notification::FsmUnexpectedState {
                         state: u8::from(self.state),
                     },
                 )),
@@ -252,7 +256,7 @@ impl Connection {
         // Validate ASN if pre-configured
         if self.expected_remote_asn != 0 && self.expected_remote_asn != open.as_number {
             out.push(Output::SendMessage(bgp::Message::Notification(
-                rustybgp_packet::BgpError::Other {
+                rustybgp_packet::Notification::Other {
                     code: 2,
                     subcode: 2,
                     data: vec![],
@@ -316,7 +320,7 @@ impl Connection {
             }
             _ => vec![
                 Output::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::BgpError::FsmUnexpectedState {
+                    rustybgp_packet::Notification::FsmUnexpectedState {
                         state: u8::from(self.state),
                     },
                 )),
@@ -329,7 +333,7 @@ impl Connection {
         if self.state != State::Established {
             return vec![
                 Output::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::BgpError::FsmUnexpectedState {
+                    rustybgp_packet::Notification::FsmUnexpectedState {
                         state: u8::from(self.state),
                     },
                 )),
@@ -339,7 +343,7 @@ impl Connection {
         vec![Output::SetHoldTimer(self.negotiated_holdtime)]
     }
 
-    fn on_notification(&mut self, err: rustybgp_packet::BgpError) -> Vec<Output> {
+    fn on_notification(&mut self, err: rustybgp_packet::Notification) -> Vec<Output> {
         vec![Output::SessionDown(SessionDownReason::RemoteNotification(
             bgp::Message::Notification(err),
         ))]
@@ -349,7 +353,7 @@ impl Connection {
         if self.state != State::Established {
             return vec![
                 Output::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::BgpError::FsmUnexpectedState {
+                    rustybgp_packet::Notification::FsmUnexpectedState {
                         state: u8::from(self.state),
                     },
                 )),
@@ -393,7 +397,7 @@ impl Connection {
     fn on_admin_shutdown(&mut self) -> Vec<Output> {
         vec![
             Output::SendMessage(bgp::Message::Notification(
-                rustybgp_packet::BgpError::Other {
+                rustybgp_packet::Notification::Other {
                     code: 6,
                     subcode: 2,
                     data: vec![],
@@ -630,7 +634,7 @@ impl PeerFsm {
         let outputs = vec![PeerFsmOutput::Connection(
             loser,
             Output::SendMessage(bgp::Message::Notification(
-                rustybgp_packet::BgpError::Other {
+                rustybgp_packet::Notification::Other {
                     code: 6,    // Cease
                     subcode: 7, // Connection Collision Resolution
                     data: vec![],
@@ -1041,13 +1045,10 @@ mod tests {
         assert_eq!(s.state(), State::Established);
 
         // UPDATE received → reset hold timer to full negotiated_holdtime
-        let update = bgp::Message::Update(bgp::Update {
+        let update = bgp::Message::Update(bgp::Update::Routes {
             reach: None,
-            mp_reach: None,
             unreach: None,
-            mp_unreach: None,
             attr: std::sync::Arc::new(Vec::new()),
-            nexthop: None,
         });
         let out = s.process(Input::MessageReceived(update));
         assert!(has_output(&out, |o| matches!(o, Output::SetHoldTimer(60))));
@@ -1125,7 +1126,7 @@ mod tests {
         let mut s = basic_connection();
         let _ = s.process(Input::Connected(false));
 
-        let notif = bgp::Message::Notification(rustybgp_packet::BgpError::Other {
+        let notif = bgp::Message::Notification(rustybgp_packet::Notification::Other {
             code: 6,
             subcode: 4,
             data: vec![],
@@ -1143,13 +1144,10 @@ mod tests {
         let _ = s.process(Input::Connected(false));
         assert_eq!(s.state(), State::OpenSent);
 
-        let update = bgp::Message::Update(bgp::Update {
+        let update = bgp::Message::Update(bgp::Update::Routes {
             reach: None,
-            mp_reach: None,
             unreach: None,
-            mp_unreach: None,
             attr: std::sync::Arc::new(Vec::new()),
-            nexthop: None,
         });
         let out = s.process(Input::MessageReceived(update));
         assert!(has_output(&out, |o| matches!(o, Output::SessionDown(_))));

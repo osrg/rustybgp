@@ -36,28 +36,23 @@ fn adj_rib_in_to_mrt(change: &AdjRibInChange) -> mrt::Message {
         true,
     );
     let body = if let Some(attrs) = &change.attrs {
-        bgp::Message::Update(bgp::Update {
-            reach: Some(packet::bgp::NlriSet {
+        bgp::Message::Update(bgp::Update::Routes {
+            reach: Some(packet::bgp::ReachNlri {
                 family: change.family,
                 entries: change.nlris.clone(),
+                nexthop: change.nexthop,
             }),
-            mp_reach: None,
             attr: attrs.clone(),
             unreach: None,
-            mp_unreach: None,
-            nexthop: change.nexthop,
         })
     } else {
-        bgp::Message::Update(bgp::Update {
+        bgp::Message::Update(bgp::Update::Routes {
             reach: None,
-            mp_reach: None,
             attr: Arc::new(Vec::new()),
-            unreach: None,
-            mp_unreach: Some(packet::bgp::NlriSet {
+            unreach: Some(packet::bgp::UnreachNlri {
                 family: change.family,
                 entries: change.nlris.clone(),
             }),
-            nexthop: None,
         })
     };
     mrt::Message::Mp {

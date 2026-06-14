@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{BgpError, Error};
+use crate::error::{Error, Notification};
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::BufMut;
 use std::fmt;
@@ -40,7 +40,7 @@ impl RouteDistinguisher {
     const TYPE_FOUR_OCTET_AS: u16 = 2;
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let malformed: Error = BgpError::UpdateMalformedAttributeList.into();
+        let malformed: Error = Notification::UpdateMalformedAttributeList.into();
         if data.len() != Self::LEN {
             return Err(malformed);
         }
@@ -101,7 +101,7 @@ impl FromStr for RouteDistinguisher {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Error> {
-        let malformed = || -> Error { BgpError::UpdateMalformedAttributeList.into() };
+        let malformed = || -> Error { Notification::UpdateMalformedAttributeList.into() };
         let (admin_str, assigned_str) = s.rsplit_once(':').ok_or_else(malformed)?;
         if let Ok(addr) = admin_str.parse::<Ipv4Addr>() {
             let assigned: u16 = assigned_str.parse().map_err(|_| malformed())?;

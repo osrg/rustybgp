@@ -14,10 +14,12 @@
 // limitations under the License.
 
 pub mod bgp;
+pub use self::bgp::validate_message;
 pub use self::bgp::{
-    Attribute, Capability, Family, HoldTime, IpNet, Nlri, NlriSet, Open, PathNlri, Update,
+    Attribute, Capability, Family, HoldTime, IpNet, Nlri, Open, ParsedMessage, PathNlri, ReachNlri,
+    UnreachNlri, Update,
 };
-pub use self::error::{BgpError, Error};
+pub use self::error::{Error, Notification};
 pub use self::frame::BgpFramer;
 
 pub mod bmp;

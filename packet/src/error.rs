@@ -18,16 +18,17 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("BGP: {0}")]
-    Bgp(#[from] BgpError),
+    Bgp(#[from] Notification),
     #[error("parse error: {0}")]
     InvalidArgument(String),
     #[error("io error: {0}")]
     StdIoErr(#[from] std::io::Error),
 }
 
-/// Typed BGP NOTIFICATION error (RFC 4271 §4.5, RFC 6608 §3, RFC 7313 §5)
+/// Typed BGP NOTIFICATION content (RFC 4271 §4.5, RFC 6608 §3, RFC 7313 §5).
+/// Represents the error code, subcode, and data of a BGP NOTIFICATION message.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum BgpError {
+pub enum Notification {
     // Code 1: Message Header Error
     #[error("header error: bad message length")]
     BadMessageLength { data: Vec<u8> },
@@ -65,7 +66,7 @@ pub enum BgpError {
     },
 }
 
-impl BgpError {
+impl Notification {
     /// Returns the BGP NOTIFICATION error code.
     pub fn notification_code(&self) -> u8 {
         match self {
@@ -122,7 +123,7 @@ impl BgpError {
         )
     }
 
-    /// Constructs a `BgpError` from a received NOTIFICATION message.
+    /// Constructs a `Notification` from a received NOTIFICATION message.
     pub fn from_notification(code: u8, subcode: u8, data: Vec<u8>) -> Self {
         match (code, subcode) {
             (1, 2) => Self::BadMessageLength { data },
@@ -149,7 +150,7 @@ mod tests {
 
     #[test]
     fn hard_reset_is_cease_subcode_9() {
-        let err = BgpError::Other {
+        let err = Notification::Other {
             code: 6,
             subcode: 9,
             data: vec![],
@@ -160,7 +161,7 @@ mod tests {
     #[test]
     fn cease_other_subcodes_are_not_hard_reset() {
         for subcode in [0u8, 1, 2, 3, 4, 5, 6, 7, 8] {
-            let err = BgpError::Other {
+            let err = Notification::Other {
                 code: 6,
                 subcode,
                 data: vec![],
@@ -175,7 +176,7 @@ mod tests {
     #[test]
     fn non_cease_codes_are_not_hard_reset() {
         for code in [1u8, 2, 3, 5, 7] {
-            let err = BgpError::Other {
+            let err = Notification::Other {
                 code,
                 subcode: 9,
                 data: vec![],

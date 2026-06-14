@@ -17,7 +17,7 @@
 //! Implements Architecture Type 1 (3GPP-5G) and route types 1..4.
 
 use crate::bgp::Family;
-use crate::error::{BgpError, Error};
+use crate::error::{Error, Notification};
 use crate::rd::RouteDistinguisher;
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::BufMut;
@@ -38,7 +38,7 @@ pub const EC_TYPE_MUP: u8 = 0x0c;
 pub const EC_SUBTYPE_MUP_DIRECT_SEG: u8 = 0x00;
 
 fn malformed() -> Error {
-    BgpError::UpdateMalformedAttributeList.into()
+    Notification::UpdateMalformedAttributeList.into()
 }
 
 fn addr_bit_len(family: Family) -> Result<u8, Error> {

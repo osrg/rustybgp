@@ -17,7 +17,7 @@ use byteorder::{NetworkEndian, ReadBytesExt};
 use bytes::{BufMut, BytesMut};
 
 use crate::bgp;
-use crate::error::{BgpError, Error};
+use crate::error::{Error, Notification};
 
 /// BGP framing layer: detects message boundaries in a `BytesMut` stream
 /// and delegates parsing to the inner `PeerCodec`.
@@ -38,7 +38,7 @@ impl BgpFramer {
 
     /// Try to parse one complete BGP message from `src`.
     /// Returns `Ok(None)` if there are not enough bytes yet.
-    pub fn try_parse(&mut self, src: &mut BytesMut) -> Result<Option<bgp::Message>, Error> {
+    pub fn try_parse(&mut self, src: &mut BytesMut) -> Result<Option<bgp::ParsedMessage>, Error> {
         let buffer_len = src.len();
         if buffer_len < bgp::Message::HEADER_LENGTH as usize {
             return Ok(None);
@@ -47,7 +47,7 @@ impl BgpFramer {
         if message_len < bgp::Message::HEADER_LENGTH as usize
             || message_len > self.0.max_message_length()
         {
-            return Err(BgpError::BadMessageLength {
+            return Err(Notification::BadMessageLength {
                 data: src[16..18].to_vec(),
             }
             .into());

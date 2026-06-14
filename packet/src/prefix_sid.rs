@@ -20,14 +20,14 @@
 //! so the attribute round-trips byte-for-byte regardless of the
 //! specific TLV mix an originator chose.
 
-use crate::error::{BgpError, Error};
+use crate::error::{Error, Notification};
 use byteorder::{NetworkEndian, ReadBytesExt};
 use bytes::BufMut;
 use std::io::{self, Cursor, Read};
 use std::net::Ipv6Addr;
 
 fn malformed() -> Error {
-    BgpError::UpdateMalformedAttributeList.into()
+    Notification::UpdateMalformedAttributeList.into()
 }
 
 /// Read a `[type: 1][length: 2 BE]` header plus `length` bytes of value.

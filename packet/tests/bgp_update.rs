@@ -14,7 +14,8 @@
 // limitations under the License.
 
 use rustybgp_packet::bgp::{
-    Attribute, Ipv4Net, Ipv6Net, Message, Nexthop, NlriSet, PeerCodec, PeerCodecBuilder, Update,
+    Attribute, Ipv4Net, Ipv6Net, Message, Nexthop, ParsedMessage, ParsedUpdate, PeerCodec,
+    PeerCodecBuilder, ReachNlri, UnreachNlri, Update,
 };
 use rustybgp_packet::mup;
 use rustybgp_packet::prefix_sid;
@@ -71,7 +72,7 @@ fn ipv6_prefix(addr: &str, mask: u8) -> PathNlri {
 }
 
 /// Encode + parse a message and return the parsed result.
-fn round_trip(msg: &Message, codec: rustybgp_packet::bgp::PeerCodec) -> Message {
+fn round_trip(msg: &Message, codec: rustybgp_packet::bgp::PeerCodec) -> ParsedMessage {
     let mut framer = BgpFramer::new(codec);
     let mut buf = Vec::new();
     framer.encode_to(msg, &mut buf).unwrap();
@@ -83,20 +84,18 @@ fn round_trip(msg: &Message, codec: rustybgp_packet::bgp::PeerCodec) -> Message 
 #[test]
 fn update_ipv4_announce() {
     let prefix = ipv4_prefix("10.0.0.0", 8);
-    let msg = Message::Update(Update {
-        reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4,
             entries: vec![prefix.clone()],
+            nexthop: None,
         }),
-        mp_reach: None,
         attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
-        Message::Update(Update { reach, unreach, .. }) => {
+        ParsedMessage::Update(ParsedUpdate::Routes { reach, unreach, .. }) => {
             assert!(unreach.is_none());
             let s = reach.unwrap();
             assert_eq!(s.family, Family::IPV4);
@@ -116,20 +115,18 @@ fn update_ipv4_announce_multiple() {
         })
         .collect();
 
-    let msg = Message::Update(Update {
-        reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4,
             entries: prefixes.clone(),
+            nexthop: None,
         }),
-        mp_reach: None,
         attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
-        Message::Update(Update { reach, .. }) => {
+        ParsedMessage::Update(ParsedUpdate::Routes { reach, .. }) => {
             let s = reach.unwrap();
             assert_eq!(s.entries.len(), 3);
             // All prefixes should be present (order may differ for large tables,
@@ -145,20 +142,17 @@ fn update_ipv4_announce_multiple() {
 #[test]
 fn update_ipv4_withdraw() {
     let prefix = ipv4_prefix("10.0.0.0", 8);
-    let msg = Message::Update(Update {
+    let msg = Message::Update(Update::Routes {
         reach: None,
-        mp_reach: None,
         attr: Arc::new(Vec::new()),
-        unreach: Some(NlriSet {
+        unreach: Some(UnreachNlri {
             family: Family::IPV4,
             entries: vec![prefix.clone()],
         }),
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
-        Message::Update(Update { reach, unreach, .. }) => {
+        ParsedMessage::Update(ParsedUpdate::Routes { reach, unreach, .. }) => {
             assert!(reach.is_none());
             let s = unreach.unwrap();
             assert_eq!(s.family, Family::IPV4);
@@ -175,11 +169,11 @@ fn update_ipv6_announce() {
     let prefix = ipv6_prefix("2001:db8::", 32);
     let nexthop_bytes: Vec<u8> = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec();
 
-    let msg = Message::Update(Update {
-        reach: None,
-        mp_reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV6,
             entries: vec![prefix.clone()],
+            nexthop: None,
         }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
@@ -191,12 +185,10 @@ fn update_ipv6_announce() {
             Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes).unwrap(),
         ]),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv6_codec()) {
-        Message::Update(Update {
+        ParsedMessage::Update(ParsedUpdate::Routes {
             mp_reach,
             mp_unreach,
             ..
@@ -213,20 +205,17 @@ fn update_ipv6_announce() {
 #[test]
 fn update_ipv6_withdraw() {
     let prefix = ipv6_prefix("2001:db8::", 32);
-    let msg = Message::Update(Update {
+    let msg = Message::Update(Update::Routes {
         reach: None,
-        mp_reach: None,
         attr: Arc::new(Vec::new()),
-        unreach: None,
-        mp_unreach: Some(NlriSet {
+        unreach: Some(UnreachNlri {
             family: Family::IPV6,
             entries: vec![prefix.clone()],
         }),
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv6_codec()) {
-        Message::Update(Update {
+        ParsedMessage::Update(ParsedUpdate::Routes {
             mp_reach,
             mp_unreach,
             ..
@@ -246,44 +235,21 @@ fn update_ipv6_withdraw() {
 fn update_eor_ipv4() {
     let msg = Message::eor(Family::IPV4);
     match round_trip(&msg, ipv4_codec()) {
-        Message::Update(Update {
-            reach,
-            unreach,
-            attr,
-            ..
-        }) => {
-            let s = reach.unwrap();
-            assert_eq!(s.family, Family::IPV4);
-            assert!(s.entries.is_empty(), "IPv4 EOR must have empty NLRI");
-            assert!(unreach.is_none());
-            assert!(attr.is_empty());
+        ParsedMessage::Update(ParsedUpdate::EndOfRib(family)) => {
+            assert_eq!(family, Family::IPV4);
         }
-        _ => panic!("expected Update"),
+        _ => panic!("expected EndOfRib(IPV4)"),
     }
 }
 
 #[test]
 fn update_eor_ipv6() {
     let msg = Message::eor(Family::IPV6);
-    // IPv6 EOR: MP_UNREACH with empty prefix list.
-    // After round-trip, the empty unreach list is normalized to None.
     match round_trip(&msg, ipv6_codec()) {
-        Message::Update(Update {
-            reach,
-            unreach,
-            mp_unreach,
-            attr,
-            ..
-        }) => {
-            assert!(reach.is_none());
-            // IPv6 EOR: mp_unreach is present but empty after parsing
-            assert!(unreach.is_none());
-            assert!(
-                mp_unreach.is_none() || mp_unreach.as_ref().map_or(true, |s| s.entries.is_empty())
-            );
-            assert!(attr.is_empty());
+        ParsedMessage::Update(ParsedUpdate::EndOfRib(family)) => {
+            assert_eq!(family, Family::IPV6);
         }
-        _ => panic!("expected Update"),
+        _ => panic!("expected EndOfRib(IPV6)"),
     }
 }
 
@@ -291,22 +257,20 @@ fn update_eor_ipv6() {
 
 #[test]
 fn update_attr_origin_igp() {
-    let msg = Message::Update(Update {
-        reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
         }),
-        mp_reach: None,
         attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
-        Message::Update(Update { attr, reach, .. }) => {
+        ParsedMessage::Update(ParsedUpdate::Routes { attrs, reach, .. }) => {
             assert!(!reach.unwrap().entries.is_empty());
-            let origin = attr
+            let origin = attrs
                 .iter()
                 .find(|a| a.code() == Attribute::ORIGIN)
                 .expect("ORIGIN attribute must be present");
@@ -325,25 +289,24 @@ fn update_attr_med_dropped_on_encode() {
     let mut attrs = (*ipv4_attrs("192.0.2.254".parse().unwrap())).clone();
     attrs.push(Attribute::new_with_value(Attribute::MULTI_EXIT_DESC, med_value).unwrap());
 
-    let msg = Message::Update(Update {
-        reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
         }),
-        mp_reach: None,
         attr: Arc::new(attrs),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
-        Message::Update(Update { attr, reach, .. }) => {
+        ParsedMessage::Update(ParsedUpdate::Routes { attrs, reach, .. }) => {
             // Routes should be present (not withdrawn)
             assert!(!reach.unwrap().entries.is_empty());
             // MED is dropped because it's optional non-transitive
             assert!(
-                attr.iter()
+                attrs
+                    .iter()
                     .find(|a| a.code() == Attribute::MULTI_EXIT_DESC)
                     .is_none(),
                 "MED must be dropped on encode (non-transitive optional attribute)"
@@ -372,11 +335,11 @@ fn update_ipv4_with_ipv6_nexthop() {
     let prefix = ipv4_prefix("10.0.0.0", 8);
     let nexthop_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
 
-    let msg = Message::Update(Update {
-        reach: None,
-        mp_reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4,
             entries: vec![prefix.clone()],
+            nexthop: Some(Nexthop::V6(nexthop_v6)),
         }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
@@ -387,16 +350,11 @@ fn update_ipv4_with_ipv6_nexthop() {
             .unwrap(),
         ]),
         unreach: None,
-        mp_unreach: None,
-        nexthop: Some(Nexthop::V6(nexthop_v6)),
     });
 
     match round_trip(&msg, ipv4_extended_nexthop_codec()) {
-        Message::Update(Update {
-            reach,
-            mp_reach,
-            nexthop,
-            ..
+        ParsedMessage::Update(ParsedUpdate::Routes {
+            reach, mp_reach, ..
         }) => {
             // IPv4 NLRI must come back via mp_reach (not traditional reach)
             assert!(reach.is_none(), "reach must be None for extended nexthop");
@@ -404,7 +362,7 @@ fn update_ipv4_with_ipv6_nexthop() {
             assert_eq!(s.family, Family::IPV4);
             assert_eq!(s.entries, vec![prefix]);
             // Nexthop must be the IPv6 address
-            assert_eq!(nexthop, Some(Nexthop::V6(nexthop_v6)));
+            assert_eq!(s.nexthop, Some(Nexthop::V6(nexthop_v6)));
         }
         _ => panic!("expected Update"),
     }
@@ -413,20 +371,17 @@ fn update_ipv4_with_ipv6_nexthop() {
 #[test]
 fn update_ipv4_extended_nexthop_withdraw() {
     let prefix = ipv4_prefix("10.0.0.0", 8);
-    let msg = Message::Update(Update {
+    let msg = Message::Update(Update::Routes {
         reach: None,
-        mp_reach: None,
         attr: Arc::new(Vec::new()),
-        unreach: None,
-        mp_unreach: Some(NlriSet {
+        unreach: Some(UnreachNlri {
             family: Family::IPV4,
             entries: vec![prefix.clone()],
         }),
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_extended_nexthop_codec()) {
-        Message::Update(Update {
+        ParsedMessage::Update(ParsedUpdate::Routes {
             unreach,
             mp_unreach,
             ..
@@ -449,22 +404,20 @@ fn update_attr_community() {
         Attribute::new_with_bin(Attribute::COMMUNITY, community.to_be_bytes().to_vec()).unwrap(),
     );
 
-    let msg = Message::Update(Update {
-        reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
         }),
-        mp_reach: None,
         attr: Arc::new(attrs),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
-        Message::Update(Update { attr, reach, .. }) => {
+        ParsedMessage::Update(ParsedUpdate::Routes { attrs, reach, .. }) => {
             assert!(!reach.unwrap().entries.is_empty());
-            let comm = attr
+            let comm = attrs
                 .iter()
                 .find(|a| a.code() == Attribute::COMMUNITY)
                 .expect("COMMUNITY attribute must be present");
@@ -510,12 +463,12 @@ fn update_ipv4_with_prefix_sid() {
     };
     let sid_bytes = sid.to_vec();
 
-    let msg = Message::Update(Update {
-        reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4,
             entries: vec![prefix.clone()],
+            nexthop: None,
         }),
-        mp_reach: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
@@ -531,14 +484,12 @@ fn update_ipv4_with_prefix_sid() {
             Attribute::new_with_bin(Attribute::PREFIX_SID, sid_bytes.clone()).unwrap(),
         ]),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
-        Message::Update(Update { reach, attr, .. }) => {
+        ParsedMessage::Update(ParsedUpdate::Routes { reach, attrs, .. }) => {
             assert_eq!(reach.unwrap().entries, vec![prefix]);
-            let a = attr
+            let a = attrs
                 .iter()
                 .find(|a| a.code() == Attribute::PREFIX_SID)
                 .expect("PREFIX_SID must be present");
@@ -564,12 +515,12 @@ fn update_passes_through_unknown_prefix_sid_tlv() {
     let sid_bytes = sid.to_vec();
     assert_eq!(sid_bytes, vec![0x55, 0x00, 0x03, 0xAA, 0xBB, 0xCC]);
 
-    let msg = Message::Update(Update {
-        reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4,
             entries: vec![prefix.clone()],
+            nexthop: None,
         }),
-        mp_reach: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
@@ -585,13 +536,11 @@ fn update_passes_through_unknown_prefix_sid_tlv() {
             Attribute::new_with_bin(Attribute::PREFIX_SID, sid_bytes.clone()).unwrap(),
         ]),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
-        Message::Update(Update { attr, .. }) => {
-            let a = attr
+        ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+            let a = attrs
                 .iter()
                 .find(|a| a.code() == Attribute::PREFIX_SID)
                 .expect("PREFIX_SID must be present");
@@ -634,11 +583,11 @@ fn update_ipv4_mup_announce() {
         },
     )));
     let nexthop: Ipv4Addr = "10.0.0.1".parse().unwrap();
-    let msg = Message::Update(Update {
-        reach: None,
-        mp_reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4_MUP,
             entries: vec![nlri.clone()],
+            nexthop: None,
         }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
@@ -650,12 +599,10 @@ fn update_ipv4_mup_announce() {
             Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
         ]),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_mup_codec()) {
-        Message::Update(Update {
+        ParsedMessage::Update(ParsedUpdate::Routes {
             mp_reach,
             mp_unreach,
             ..
@@ -678,11 +625,11 @@ fn update_ipv6_mup_announce() {
         },
     )));
     let nexthop_bytes: Vec<u8> = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec();
-    let msg = Message::Update(Update {
-        reach: None,
-        mp_reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV6_MUP,
             entries: vec![nlri.clone()],
+            nexthop: None,
         }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
@@ -694,12 +641,10 @@ fn update_ipv6_mup_announce() {
             Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes).unwrap(),
         ]),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv6_mup_codec()) {
-        Message::Update(Update {
+        ParsedMessage::Update(ParsedUpdate::Routes {
             mp_reach,
             mp_unreach,
             ..
@@ -723,20 +668,17 @@ fn update_mup_withdraw() {
             teid: 0xdead_beef,
         },
     )));
-    let msg = Message::Update(Update {
+    let msg = Message::Update(Update::Routes {
         reach: None,
-        mp_reach: None,
         attr: Arc::new(Vec::new()),
-        unreach: None,
-        mp_unreach: Some(NlriSet {
+        unreach: Some(UnreachNlri {
             family: Family::IPV4_MUP,
             entries: vec![nlri.clone()],
         }),
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_mup_codec()) {
-        Message::Update(Update {
+        ParsedMessage::Update(ParsedUpdate::Routes {
             mp_reach,
             mp_unreach,
             ..
@@ -767,11 +709,11 @@ fn update_mup_with_ext_community() {
     }
     .encode(&mut ec_bytes);
     let nexthop: Ipv4Addr = "10.0.0.1".parse().unwrap();
-    let msg = Message::Update(Update {
-        reach: None,
-        mp_reach: Some(NlriSet {
+    let msg = Message::Update(Update::Routes {
+        reach: Some(ReachNlri {
             family: Family::IPV4_MUP,
             entries: vec![nlri.clone()],
+            nexthop: None,
         }),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
@@ -784,15 +726,15 @@ fn update_mup_with_ext_community() {
             Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, ec_bytes.clone()).unwrap(),
         ]),
         unreach: None,
-        mp_unreach: None,
-        nexthop: None,
     });
 
     match round_trip(&msg, ipv4_mup_codec()) {
-        Message::Update(Update { mp_reach, attr, .. }) => {
+        ParsedMessage::Update(ParsedUpdate::Routes {
+            mp_reach, attrs, ..
+        }) => {
             let s = mp_reach.unwrap();
             assert_eq!(s.entries, vec![nlri]);
-            let ec = attr
+            let ec = attrs
                 .iter()
                 .find(|a| a.code() == Attribute::EXTENDED_COMMUNITY)
                 .expect("EXTENDED_COMMUNITY missing");
