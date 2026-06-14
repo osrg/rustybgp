@@ -13,7 +13,6 @@
 // permissions and limitations under the License.
 
 use futures::{FutureExt, StreamExt};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
@@ -21,7 +20,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::Encoder;
 use tokio_util::sync::CancellationToken;
 
-use rustybgp_packet::{self as packet, bgp, mrt};
+use rustybgp_packet::{bgp, mrt};
 
 use crate::error::Error;
 use crate::event::{AdjRibInChange, BgpEvent, TableHandle};
@@ -36,23 +35,16 @@ fn adj_rib_in_to_mrt(change: &AdjRibInChange) -> mrt::Message {
         true,
     );
     let body = if let Some(attrs) = &change.attrs {
-        bgp::Message::Update(bgp::Update::Routes {
-            reach: Some(packet::bgp::ReachNlri {
-                family: change.family,
-                entries: change.nlris.clone(),
-                nexthop: change.nexthop,
-            }),
+        bgp::Message::Update(bgp::Update::Reach {
+            family: change.family,
+            entries: change.nlris.clone(),
+            nexthop: change.nexthop,
             attr: attrs.clone(),
-            unreach: None,
         })
     } else {
-        bgp::Message::Update(bgp::Update::Routes {
-            reach: None,
-            attr: Arc::new(Vec::new()),
-            unreach: Some(packet::bgp::UnreachNlri {
-                family: change.family,
-                entries: change.nlris.clone(),
-            }),
+        bgp::Message::Update(bgp::Update::Unreach {
+            family: change.family,
+            entries: change.nlris.clone(),
         })
     };
     mrt::Message::Mp {

@@ -1033,11 +1033,7 @@ mod tests {
         assert_eq!(s.state(), State::Established);
 
         // UPDATE received → reset hold timer to full negotiated_holdtime
-        let update = bgp::Message::Update(bgp::Update::Routes {
-            reach: None,
-            unreach: None,
-            attr: std::sync::Arc::new(Vec::new()),
-        });
+        let update = bgp::Message::eor(rustybgp_packet::Family::IPV4);
         let out = s.process(Input::MessageReceived(update));
         assert!(has_output(&out, |o| matches!(o, Output::SetHoldTimer(60))));
         assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
@@ -1132,11 +1128,7 @@ mod tests {
         let _ = s.process(Input::Connected(false));
         assert_eq!(s.state(), State::OpenSent);
 
-        let update = bgp::Message::Update(bgp::Update::Routes {
-            reach: None,
-            unreach: None,
-            attr: std::sync::Arc::new(Vec::new()),
-        });
+        let update = bgp::Message::eor(rustybgp_packet::Family::IPV4);
         let out = s.process(Input::MessageReceived(update));
         assert!(has_output(&out, |o| matches!(o, Output::SessionDown(_))));
     }

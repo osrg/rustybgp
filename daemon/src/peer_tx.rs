@@ -120,10 +120,9 @@ impl PendingTx {
                     nlri,
                 })
                 .collect();
-            messages.push(bgp::Message::Update(bgp::Update::Routes {
-                reach: None,
-                attr: Arc::new(Vec::new()),
-                unreach: Some(packet::UnreachNlri { family, entries }),
+            messages.push(bgp::Message::Update(bgp::Update::Unreach {
+                family,
+                entries,
             }));
         }
 
@@ -146,14 +145,11 @@ impl PendingTx {
                 .next()
                 .and_then(|k| self.reach.get(k).map(|(_, nh)| *nh));
 
-            messages.push(bgp::Message::Update(bgp::Update::Routes {
-                reach: Some(packet::ReachNlri {
-                    family,
-                    entries,
-                    nexthop,
-                }),
+            messages.push(bgp::Message::Update(bgp::Update::Reach {
+                family,
+                entries,
+                nexthop,
                 attr: attr.clone(),
-                unreach: None,
             }));
             sent_attrs.push(attr.clone());
 
@@ -226,9 +222,8 @@ mod tests {
         let msgs = p.drain_messages(Family::IPV4);
         // Same attributes → batched into 1 UPDATE + EOR
         assert_eq!(msgs.len(), 2);
-        if let bgp::Message::Update(bgp::Update::Routes { reach, .. }) = &msgs[0] {
-            assert!(reach.is_some());
-            assert_eq!(reach.as_ref().unwrap().entries.len(), 2);
+        if let bgp::Message::Update(bgp::Update::Reach { entries, .. }) = &msgs[0] {
+            assert_eq!(entries.len(), 2);
         } else {
             panic!("expected Update");
         }
@@ -243,8 +238,8 @@ mod tests {
         let msgs = p.drain_messages(Family::IPV4);
         // withdrawal + EOR
         assert_eq!(msgs.len(), 2);
-        if let bgp::Message::Update(bgp::Update::Routes { unreach, .. }) = &msgs[0] {
-            assert!(unreach.is_some());
+        if let bgp::Message::Update(bgp::Update::Unreach { entries, .. }) = &msgs[0] {
+            assert!(!entries.is_empty());
         } else {
             panic!("expected Update");
         }
@@ -260,9 +255,8 @@ mod tests {
         let msgs = p.drain_messages(Family::IPV4);
         // withdrawal + EOR
         assert_eq!(msgs.len(), 2);
-        if let bgp::Message::Update(bgp::Update::Routes { reach, unreach, .. }) = &msgs[0] {
-            assert!(unreach.is_some());
-            assert!(reach.is_none());
+        if let bgp::Message::Update(bgp::Update::Unreach { entries, .. }) = &msgs[0] {
+            assert!(!entries.is_empty());
         } else {
             panic!("expected Update");
         }
@@ -315,9 +309,8 @@ mod tests {
         let msgs = p.drain_messages(Family::IPV4);
         let mut origins: Vec<u32> = Vec::new();
         for msg in &msgs {
-            if let bgp::Message::Update(bgp::Update::Routes { reach, attr, .. }) = msg
-                && let Some(reach) = reach
-                && !reach.entries.is_empty()
+            if let bgp::Message::Update(bgp::Update::Reach { entries, attr, .. }) = msg
+                && !entries.is_empty()
             {
                 let origin = attr
                     .iter()
@@ -340,14 +333,14 @@ mod tests {
 
         // The final state is a reach (withdrawal was cancelled by re-advertisement)
         let msgs = p.drain_messages(Family::IPV4);
-        assert!(msgs.iter().any(|m| {
-            matches!(m, bgp::Message::Update(bgp::Update::Routes { reach, .. })
-                if reach.as_ref().is_some_and(|r| !r.entries.is_empty()))
-        }));
-        assert!(!msgs.iter().any(|m| {
-            matches!(m, bgp::Message::Update(bgp::Update::Routes { unreach, .. })
-                if unreach.is_some())
-        }));
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, bgp::Message::Update(bgp::Update::Reach { entries, .. }) if !entries.is_empty())));
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, bgp::Message::Update(bgp::Update::Unreach { .. })))
+        );
     }
 
     #[test]
@@ -376,8 +369,8 @@ mod tests {
         let msgs = p.drain_messages(Family::IPV4);
         assert_eq!(msgs.len(), 2);
         // First: reach
-        if let bgp::Message::Update(bgp::Update::Routes { reach, .. }) = &msgs[0] {
-            assert!(reach.as_ref().is_some_and(|r| !r.entries.is_empty()));
+        if let bgp::Message::Update(bgp::Update::Reach { entries, .. }) = &msgs[0] {
+            assert!(!entries.is_empty());
         } else {
             panic!("expected reach Update");
         }
@@ -397,8 +390,8 @@ mod tests {
         p.reach(nlri("10.0.0.0/24"), 42, nh(), attr(0));
 
         let msgs = p.drain_messages(Family::IPV4);
-        if let bgp::Message::Update(bgp::Update::Routes { reach, .. }) = &msgs[0] {
-            assert_eq!(reach.as_ref().unwrap().entries[0].path_id, 42);
+        if let bgp::Message::Update(bgp::Update::Reach { entries, .. }) = &msgs[0] {
+            assert_eq!(entries[0].path_id, 42);
         } else {
             panic!("expected Update");
         }

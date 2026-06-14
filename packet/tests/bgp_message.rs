@@ -15,8 +15,7 @@
 
 use bytes::BytesMut;
 use rustybgp_packet::bgp::{
-    Attribute, Ipv4Net, Ipv6Net, Message, ParsedMessage, ParsedUpdate, PeerCodec, ReachNlri,
-    UnreachNlri, Update,
+    Attribute, Ipv4Net, Ipv6Net, Message, ParsedMessage, ParsedUpdate, PeerCodec, Update,
 };
 use rustybgp_packet::{Family, Nlri, PathNlri};
 use std::collections::HashSet;
@@ -104,18 +103,15 @@ fn build_many_v4_route() {
 
     let mut set: HashSet<PathNlri> = net.iter().cloned().map(PathNlri::new).collect();
 
-    let mut msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4,
-            entries: net.iter().cloned().map(PathNlri::new).collect(),
-            nexthop: None,
-        }),
+    let mut msg = Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: net.iter().cloned().map(PathNlri::new).collect(),
+        nexthop: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
             Attribute::new_with_bin(Attribute::NEXTHOP, vec![0, 0, 0, 0]).unwrap(),
         ]),
-        unreach: None,
     });
 
     let codec = {
@@ -143,13 +139,9 @@ fn build_many_v4_route() {
     }
     assert_eq!(set.len(), 0);
 
-    msg = Message::Update(Update::Routes {
-        reach: None,
-        attr: Arc::new(Vec::new()),
-        unreach: Some(UnreachNlri {
-            family: Family::IPV4,
-            entries: net.iter().cloned().map(PathNlri::new).collect(),
-        }),
+    msg = Message::Update(Update::Unreach {
+        family: Family::IPV4,
+        entries: net.iter().cloned().map(PathNlri::new).collect(),
     });
     for n in &net {
         set.insert(PathNlri::new(n.clone()));
@@ -186,18 +178,15 @@ fn many_mp_reach() {
 
     let mut set: HashSet<PathNlri> = net.iter().cloned().map(PathNlri::new).collect();
 
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV6,
-            entries: net.iter().cloned().map(PathNlri::new).collect(),
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV6,
+        entries: net.iter().cloned().map(PathNlri::new).collect(),
+        nexthop: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
             Attribute::new_with_bin(Attribute::NEXTHOP, (0..31).collect::<Vec<u8>>()).unwrap(),
         ]),
-        unreach: None,
     });
 
     let codec = {
@@ -239,13 +228,9 @@ fn many_mp_unreach() {
 
     let mut set: HashSet<PathNlri> = net.iter().cloned().map(PathNlri::new).collect();
 
-    let msg = Message::Update(Update::Routes {
-        reach: None,
-        attr: Arc::new(Vec::new()),
-        unreach: Some(UnreachNlri {
-            family: Family::IPV6,
-            entries: net.iter().cloned().map(PathNlri::new).collect(),
-        }),
+    let msg = Message::Update(Update::Unreach {
+        family: Family::IPV6,
+        entries: net.iter().cloned().map(PathNlri::new).collect(),
     });
 
     let codec = {

@@ -1441,13 +1441,18 @@ pub struct Open {
 /// Same rule applies for `unreach`.
 #[derive(Clone)]
 pub enum Update {
-    /// Route announcements and/or withdrawals.
-    Routes {
-        /// Reachable NLRIs with nexthop.
-        reach: Option<ReachNlri>,
-        /// Withdrawn NLRIs.
-        unreach: Option<UnreachNlri>,
+    /// Route announcement: NLRIs with their nexthop and path attributes.
+    Reach {
+        family: Family,
+        entries: Vec<PathNlri>,
+        /// `None` only for AFIs that carry no nexthop (e.g. Flowspec).
+        nexthop: Option<Nexthop>,
         attr: Arc<Vec<Attribute>>,
+    },
+    /// Route withdrawal.
+    Unreach {
+        family: Family,
+        entries: Vec<PathNlri>,
     },
     /// End-of-RIB marker for `family` (RFC 4724 §2).
     EndOfRib(Family),
@@ -1569,25 +1574,19 @@ fn validate_update(update: ParsedUpdate) -> Result<Vec<Message>, Notification> {
             });
 
             if treat_as_withdraw {
-                let empty = Arc::new(Vec::new());
                 let mut msgs: Vec<Message> = Vec::new();
                 // Convert announced NLRIs to withdrawals.
                 for r in reach.into_iter().chain(mp_reach) {
-                    msgs.push(Message::Update(Update::Routes {
-                        reach: None,
-                        unreach: Some(UnreachNlri {
-                            family: r.family,
-                            entries: r.entries,
-                        }),
-                        attr: empty.clone(),
+                    msgs.push(Message::Update(Update::Unreach {
+                        family: r.family,
+                        entries: r.entries,
                     }));
                 }
                 // Pass through any withdrawals already in the UPDATE.
                 for u in unreach.into_iter().chain(mp_unreach) {
-                    msgs.push(Message::Update(Update::Routes {
-                        reach: None,
-                        unreach: Some(u),
-                        attr: empty.clone(),
+                    msgs.push(Message::Update(Update::Unreach {
+                        family: u.family,
+                        entries: u.entries,
                     }));
                 }
                 return Ok(msgs);
@@ -1597,21 +1596,32 @@ fn validate_update(update: ParsedUpdate) -> Result<Vec<Message>, Notification> {
             let attr = Arc::new(attrs);
             let mut msgs: Vec<Message> = Vec::new();
 
-            // Traditional IPv4 reach/unreach.
-            if reach.is_some() || unreach.is_some() {
-                msgs.push(Message::Update(Update::Routes {
-                    reach,
-                    unreach,
+            if let Some(r) = reach {
+                msgs.push(Message::Update(Update::Reach {
+                    family: r.family,
+                    entries: r.entries,
+                    nexthop: r.nexthop,
                     attr: attr.clone(),
                 }));
             }
-
-            // MP_REACH/MP_UNREACH: non-IPv4 or RFC 8950 IPv4.
-            if mp_reach.is_some() || mp_unreach.is_some() {
-                msgs.push(Message::Update(Update::Routes {
-                    reach: mp_reach,
-                    unreach: mp_unreach,
+            if let Some(u) = unreach {
+                msgs.push(Message::Update(Update::Unreach {
+                    family: u.family,
+                    entries: u.entries,
+                }));
+            }
+            if let Some(r) = mp_reach {
+                msgs.push(Message::Update(Update::Reach {
+                    family: r.family,
+                    entries: r.entries,
+                    nexthop: r.nexthop,
                     attr,
+                }));
+            }
+            if let Some(u) = mp_unreach {
+                msgs.push(Message::Update(Update::Unreach {
+                    family: u.family,
+                    entries: u.entries,
                 }));
             }
 
@@ -1763,15 +1773,16 @@ impl PeerCodec {
         }
     }
 
+    // Encodes MP_REACH_NLRI for `entries` (already sliced to the current start).
+    // Returns (attr_bytes_written, n_nlri_encoded).
     fn mp_reach_encode<B: BufMut + AsMut<[u8]>>(
         &self,
         buf_head: usize,
         dst: &mut B,
-        reach: &ReachNlri,
-        reach_idx: &mut usize,
-    ) -> Result<u16, ()> {
-        let family = &reach.family;
-        let nets = &reach.entries;
+        family: &Family,
+        entries: &[PathNlri],
+        nexthop: &Option<Nexthop>,
+    ) -> (u16, usize) {
         let pos_head = dst.as_mut().len();
         // always use extended length
         dst.put_u8(
@@ -1786,7 +1797,7 @@ impl PeerCodec {
         // before routes enter PendingTx, so the nexthop here is already the export
         // nexthop.  VPN families prefix the nexthop with an 8-byte zero RD (RFC 4364
         // §4.3.2); other families pad IPv4 to 16 bytes for MP_REACH.
-        let nh_bytes = reach.nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
+        let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
         let padded = if matches!(family, &Family::IPV4_VPN | &Family::IPV6_VPN) {
             let mut v = vec![0u8; 8];
             v.extend_from_slice(&nh_bytes);
@@ -1800,21 +1811,18 @@ impl PeerCodec {
         };
         dst.put_u8(padded.len() as u8);
         dst.put_slice(&padded);
-        // padding
+        // SNPA padding
         dst.put_u8(0);
         let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
         let max_len = 1 + 16 + if addpath { 4 } else { 0 };
-        for (i, item) in nets.iter().enumerate().skip(*reach_idx) {
-            let PathNlri {
-                nlri: net,
-                path_id: id,
-            } = item;
+        let mut n_encoded = 0;
+        for item in entries {
             if buf_head + self.max_message_length() > dst.as_mut().len() + max_len {
                 if addpath {
-                    dst.put_u32(*id);
+                    dst.put_u32(item.path_id);
                 }
-                net.encode(dst).unwrap();
-                *reach_idx = i;
+                item.nlri.encode(dst).unwrap();
+                n_encoded += 1;
             } else {
                 break;
             }
@@ -1823,20 +1831,18 @@ impl PeerCodec {
         (&mut dst.as_mut()[pos_bin..])
             .write_u16::<NetworkEndian>(mp_len - 4)
             .unwrap();
-
-        Ok(mp_len)
+        (mp_len, n_encoded)
     }
 
+    // Encodes MP_UNREACH_NLRI for `entries` (already sliced to the current start).
+    // Returns (attr_bytes_written, n_nlri_encoded).
     fn mp_unreach_encode<B: BufMut + AsMut<[u8]>>(
         &self,
         buf_head: usize,
-        _: Arc<Vec<Attribute>>,
         dst: &mut B,
-        unreach: &UnreachNlri,
-        unreach_idx: &mut usize,
-    ) -> Result<u16, ()> {
-        let family = &unreach.family;
-        let nets = &unreach.entries;
+        family: &Family,
+        entries: &[PathNlri],
+    ) -> (u16, usize) {
         let pos_head = dst.as_mut().len();
         // always use extended length
         dst.put_u8(
@@ -1849,17 +1855,14 @@ impl PeerCodec {
         dst.put_u8(family.safi());
         let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
         let max_len = 1 + 16 + if addpath { 4 } else { 0 };
-        for (i, item) in nets.iter().enumerate().skip(*unreach_idx) {
-            let PathNlri {
-                nlri: net,
-                path_id: id,
-            } = item;
+        let mut n_encoded = 0;
+        for item in entries {
             if buf_head + self.max_message_length() > dst.as_mut().len() + max_len {
                 if addpath {
-                    dst.put_u32(*id);
+                    dst.put_u32(item.path_id);
                 }
-                net.encode(dst).unwrap();
-                *unreach_idx = i;
+                item.nlri.encode(dst).unwrap();
+                n_encoded += 1;
             } else {
                 break;
             }
@@ -1868,15 +1871,18 @@ impl PeerCodec {
         (&mut dst.as_mut()[pos_bin..])
             .write_u16::<NetworkEndian>(mp_len - 4)
             .unwrap();
-        Ok(mp_len)
+        (mp_len, n_encoded)
     }
 
+    // Encodes one wire BGP message starting at `start` (index into the entries
+    // slice for Reach/Unreach).  Returns the new start position (start +
+    // n_encoded), or 0 for message types that have no entries.
     fn do_encode<B: BufMut + AsMut<[u8]>>(
         &mut self,
         item: &Message,
         dst: &mut B,
-        reach_idx: &mut usize,
-    ) -> Result<(), Error> {
+        start: usize,
+    ) -> Result<usize, Error> {
         let pos_head = dst.as_mut().len();
         dst.put_u64(u64::MAX);
         dst.put_u64(u64::MAX);
@@ -1884,7 +1890,7 @@ impl PeerCodec {
         let pos_header_len = dst.as_mut().len();
         dst.put_u16(Message::HEADER_LENGTH);
 
-        match item {
+        let n_encoded = match item {
             Message::Open(Open {
                 as_number,
                 holdtime,
@@ -1918,63 +1924,35 @@ impl PeerCodec {
                 (&mut dst.as_mut()[op_param_len_pos..])
                     .write_u8(cap_len + 2_u8)
                     .unwrap();
+                0
             }
-            Message::Update(update) => match update {
-                Update::Routes {
-                    reach,
-                    unreach,
-                    attr,
-                } => {
-                    let attrs = attr.clone();
-                    let family = reach
-                        .as_ref()
-                        .map(|r| r.family)
-                        .or_else(|| unreach.as_ref().map(|u| u.family))
-                        .unwrap_or(Family::IPV4);
-                    let addpath = self.families.get(&family).is_some_and(|s| s.addpath_tx);
-                    // RFC 8950: IPv4 uses MP_REACH_NLRI when extended nexthop is negotiated.
-                    let ipv4_via_mp = self.extended_nexthop;
-                    dst.put_u8(Message::UPDATE);
-                    let pos_withdrawn_len = dst.as_mut().len();
-                    dst.put_u16(0);
-                    let mut withdrawn_len = 0;
-                    // Traditional IPv4 withdrawn routes (only when not using MP for IPv4)
-                    if let Some(unreach) = &unreach
-                        && unreach.family == Family::IPV4
-                        && !ipv4_via_mp
-                    {
-                        let max_len = 5 + if addpath { 4 } else { 0 };
-                        for (i, item) in unreach.entries.iter().enumerate().skip(*reach_idx) {
-                            if pos_head + self.max_message_length() > dst.as_mut().len() + max_len {
-                                if addpath {
-                                    dst.put_u32(item.path_id);
-                                }
-                                withdrawn_len += item.nlri.encode(dst).unwrap();
-                                *reach_idx = i;
-                            } else {
-                                break;
-                            }
-                        }
+            Message::Update(Update::Reach {
+                family,
+                entries,
+                nexthop,
+                attr,
+            }) => {
+                let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
+                // RFC 8950: IPv4 uses MP_REACH_NLRI when extended nexthop is negotiated.
+                let ipv4_via_mp = self.extended_nexthop;
+                dst.put_u8(Message::UPDATE);
+                // No withdrawn routes in a Reach message.
+                dst.put_u16(0);
+                let pos_attr_len = dst.as_mut().len();
+                dst.put_u16(0);
+                let mut attr_len: u16 = 0;
+
+                // Write transitive path attributes.
+                for a in attr.as_ref() {
+                    if a.flags & Attribute::FLAG_TRANSITIVE > 0 {
+                        attr_len += a.encode_wire(dst);
                     }
-                    if withdrawn_len != 0 {
-                        (&mut dst.as_mut()[pos_withdrawn_len..])
-                            .write_u16::<NetworkEndian>(withdrawn_len)
-                            .unwrap();
-                    }
-                    let pos_attr_len = dst.as_mut().len();
-                    dst.put_u16(0);
-                    let mut attr_len = 0;
-                    for a in &*attrs {
-                        if a.flags & Attribute::FLAG_TRANSITIVE > 0 {
-                            attr_len += a.encode_wire(dst);
-                        }
-                    }
-                    // NEXTHOP attribute for traditional IPv4 reach (not used when RFC 8950 active).
-                    if let Some(r) = &reach
-                        && r.family == Family::IPV4
-                        && !ipv4_via_mp
-                        && !r.entries.is_empty()
-                        && let Some(nh) = r.nexthop
+                }
+
+                if *family == Family::IPV4 && !ipv4_via_mp {
+                    // Traditional IPv4: NEXTHOP attribute + NLRI section after attrs.
+                    if !entries[start..].is_empty()
+                        && let Some(nh) = nexthop
                         && let IpAddr::V4(v4) = nh.addr()
                     {
                         let nh_attr =
@@ -1982,90 +1960,122 @@ impl PeerCodec {
                                 .unwrap();
                         attr_len += nh_attr.encode_wire(dst);
                     }
-                    // MP_REACH_NLRI (non-IPv4, or IPv4 with RFC 8950 extended nexthop)
-                    if let Some(r) = &reach
-                        && (r.family != Family::IPV4 || ipv4_via_mp)
-                    {
-                        attr_len += self.mp_reach_encode(pos_head, dst, r, reach_idx).unwrap();
-                    }
-                    // MP_UNREACH_NLRI (non-IPv4, or IPv4 with RFC 8950 extended nexthop)
-                    if let Some(u) = &unreach
-                        && (u.family != Family::IPV4 || ipv4_via_mp)
-                    {
-                        attr_len += self
-                            .mp_unreach_encode(pos_head, attr.clone(), dst, u, reach_idx)
-                            .unwrap();
-                    }
                     (&mut dst.as_mut()[pos_attr_len..])
                         .write_u16::<NetworkEndian>(attr_len)
                         .unwrap();
-                    // Traditional IPv4 NLRI (not used when RFC 8950 active)
-                    if let Some(r) = reach
-                        && r.family == Family::IPV4
-                        && !ipv4_via_mp
-                    {
-                        let max_len = 5 + if addpath { 4 } else { 0 };
-                        for (i, item) in r.entries.iter().enumerate().skip(*reach_idx) {
-                            if pos_head + self.max_message_length() > dst.as_mut().len() + max_len {
-                                if addpath {
-                                    dst.put_u32(item.path_id);
-                                }
-                                let _ = item.nlri.encode(dst);
-                                *reach_idx = i;
-                            } else {
-                                break;
+                    let max_len = 5 + if addpath { 4 } else { 0 };
+                    let mut count = 0;
+                    for item in &entries[start..] {
+                        if pos_head + self.max_message_length() > dst.as_mut().len() + max_len {
+                            if addpath {
+                                dst.put_u32(item.path_id);
                             }
+                            item.nlri.encode(dst).unwrap();
+                            count += 1;
+                        } else {
+                            break;
                         }
                     }
-                }
-                Update::EndOfRib(family) => {
-                    dst.put_u8(Message::UPDATE);
-                    // No withdrawn routes
-                    dst.put_u16(0);
-                    let pos_attr_len = dst.as_mut().len();
-                    dst.put_u16(0);
-                    let mut attr_len = 0u16;
-                    if *family != Family::IPV4 {
-                        // Non-IPv4 EOR: empty MP_UNREACH_NLRI (RFC 4724 §2).
-                        let empty = UnreachNlri::new(*family);
-                        attr_len += self
-                            .mp_unreach_encode(
-                                pos_head,
-                                Arc::new(Vec::new()),
-                                dst,
-                                &empty,
-                                reach_idx,
-                            )
-                            .unwrap();
-                    }
-                    // IPv4 EOR: all-zero length fields, no attributes, no NLRI.
+                    count
+                } else {
+                    // MP_REACH_NLRI (non-IPv4 or IPv4 with RFC 8950 extended nexthop).
+                    let (mp_len, count) =
+                        self.mp_reach_encode(pos_head, dst, family, &entries[start..], nexthop);
+                    attr_len += mp_len;
                     (&mut dst.as_mut()[pos_attr_len..])
                         .write_u16::<NetworkEndian>(attr_len)
                         .unwrap();
+                    count
                 }
-            },
+            }
+            Message::Update(Update::Unreach { family, entries }) => {
+                let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
+                // RFC 8950: IPv4 uses MP_UNREACH_NLRI when extended nexthop is negotiated.
+                let ipv4_via_mp = self.extended_nexthop;
+                dst.put_u8(Message::UPDATE);
+
+                if *family == Family::IPV4 && !ipv4_via_mp {
+                    // Traditional IPv4 withdrawn routes section.
+                    let pos_withdrawn_len = dst.as_mut().len();
+                    dst.put_u16(0);
+                    let max_len = 5 + if addpath { 4 } else { 0 };
+                    let mut withdrawn_len: u16 = 0;
+                    let mut count = 0;
+                    for item in &entries[start..] {
+                        if pos_head + self.max_message_length() > dst.as_mut().len() + max_len {
+                            if addpath {
+                                dst.put_u32(item.path_id);
+                            }
+                            withdrawn_len += item.nlri.encode(dst).unwrap();
+                            count += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if withdrawn_len > 0 {
+                        (&mut dst.as_mut()[pos_withdrawn_len..])
+                            .write_u16::<NetworkEndian>(withdrawn_len)
+                            .unwrap();
+                    }
+                    // Empty path attributes section.
+                    dst.put_u16(0);
+                    count
+                } else {
+                    // MP_UNREACH_NLRI.
+                    dst.put_u16(0); // withdrawn routes length = 0
+                    let pos_attr_len = dst.as_mut().len();
+                    dst.put_u16(0);
+                    let (mp_len, count) =
+                        self.mp_unreach_encode(pos_head, dst, family, &entries[start..]);
+                    (&mut dst.as_mut()[pos_attr_len..])
+                        .write_u16::<NetworkEndian>(mp_len)
+                        .unwrap();
+                    count
+                }
+            }
+            Message::Update(Update::EndOfRib(family)) => {
+                dst.put_u8(Message::UPDATE);
+                // No withdrawn routes.
+                dst.put_u16(0);
+                let pos_attr_len = dst.as_mut().len();
+                dst.put_u16(0);
+                let mut attr_len = 0u16;
+                if *family != Family::IPV4 {
+                    // Non-IPv4 EOR: empty MP_UNREACH_NLRI (RFC 4724 §2).
+                    let (mp_len, _) = self.mp_unreach_encode(pos_head, dst, family, &[]);
+                    attr_len += mp_len;
+                }
+                // IPv4 EOR: all-zero length fields, no attributes, no NLRI.
+                (&mut dst.as_mut()[pos_attr_len..])
+                    .write_u16::<NetworkEndian>(attr_len)
+                    .unwrap();
+                0
+            }
             Message::Notification(err) => {
                 dst.put_u8(Message::NOTIFICATION);
                 dst.put_u8(err.notification_code());
                 dst.put_u8(err.notification_subcode());
                 dst.put_slice(err.notification_data());
+                0
             }
             Message::Keepalive => {
                 dst.put_u8(Message::KEEPALIVE);
+                0
             }
             Message::RouteRefresh {
                 family: Family(family),
             } => {
                 dst.put_u8(Message::ROUTE_REFRESH);
                 dst.put_u32(*family);
+                0
             }
-        }
+        };
 
         let pos_end = dst.as_mut().len();
         (&mut dst.as_mut()[pos_header_len..])
             .write_u16::<NetworkEndian>((pos_end - pos_head) as u16)?;
 
-        Ok(())
+        Ok(start + n_encoded)
     }
 
     fn decode_nlri<C: ParseContext>(
@@ -2570,30 +2580,34 @@ impl PeerCodec {
         }
     }
 
+    /// Encode `msg` into `dst`, splitting into multiple wire UPDATE messages
+    /// if entries exceed the per-message size limit.  Returns the number of
+    /// wire messages written (always >= 1).
     pub fn encode_to<B: BufMut + AsMut<[u8]>>(
         &mut self,
         msg: &Message,
         dst: &mut B,
-    ) -> Result<(), Error> {
-        let mut done_idx = 0;
-        match msg {
-            Message::Update(Update::Routes { reach, unreach, .. }) => {
-                // Determine the number of iterations needed for splitting large route sets.
-                let total = std::cmp::max(
-                    reach.as_ref().map_or(0, |s| s.entries.len()).max(1),
-                    unreach.as_ref().map_or(0, |s| s.entries.len()).max(1),
-                );
-                loop {
-                    self.do_encode(msg, dst, &mut done_idx)?;
-                    done_idx += 1;
-                    if total == 0 || done_idx >= total {
-                        break;
-                    }
-                }
-                Ok(())
-            }
-            _ => self.do_encode(msg, dst, &mut done_idx),
+    ) -> Result<usize, Error> {
+        let total = match msg {
+            Message::Update(Update::Reach { entries, .. }) => entries.len(),
+            Message::Update(Update::Unreach { entries, .. }) => entries.len(),
+            _ => 0,
+        };
+        if total == 0 {
+            self.do_encode(msg, dst, 0)?;
+            return Ok(1);
         }
+        let mut start = 0;
+        let mut wire_count = 0;
+        while start < total {
+            let end = self.do_encode(msg, dst, start)?;
+            wire_count += 1;
+            if end <= start {
+                break; // safety guard: no progress
+            }
+            start = end;
+        }
+        Ok(wire_count)
     }
 
     /// Try to parse one complete BGP message from a stream buffer.

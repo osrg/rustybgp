@@ -469,13 +469,10 @@ pub struct Reach {
 
 impl From<Reach> for bgp::Message {
     fn from(c: Reach) -> bgp::Message {
-        bgp::Message::Update(bgp::Update::Routes {
-            reach: Some(packet::bgp::ReachNlri {
-                family: c.family,
-                entries: vec![c.net],
-                nexthop: c.nexthop,
-            }),
-            unreach: None,
+        bgp::Message::Update(bgp::Update::Reach {
+            family: c.family,
+            entries: vec![c.net],
+            nexthop: c.nexthop,
             attr: c.attr,
         })
     }

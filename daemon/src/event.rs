@@ -80,26 +80,62 @@ impl From<&MessageCounter> for api::Message {
 }
 
 impl MessageCounter {
-    fn sync(&self, msg: &bgp::Message) -> bool {
+    // Count one received wire frame (called before validate_message splits it).
+    fn sync_rx(&self, msg: &bgp::ParsedMessage) -> bool {
         let mut ret = false;
         match msg {
-            bgp::Message::Open(_) => {
+            bgp::ParsedMessage::Open(_) => {
                 let _ = self.open.fetch_add(1, Ordering::Relaxed);
             }
-            bgp::Message::Update(bgp::Update::Routes { unreach, .. }) => {
+            bgp::ParsedMessage::Update(bgp::ParsedUpdate::Routes {
+                unreach,
+                mp_unreach,
+                ..
+            }) => {
                 self.update.fetch_add(1, Ordering::Relaxed);
-                let unreach_count = unreach.as_ref().map_or(0, |s| s.entries.len());
+                let unreach_count = unreach.as_ref().map_or(0, |s| s.entries.len())
+                    + mp_unreach.as_ref().map_or(0, |s| s.entries.len());
                 if unreach_count > 0 {
                     self.withdraw_update.fetch_add(1, Ordering::Relaxed);
                     self.withdraw_prefix
                         .fetch_add(unreach_count as u64, Ordering::Relaxed);
                 }
             }
-            bgp::Message::Update(bgp::Update::EndOfRib(_)) => {
+            bgp::ParsedMessage::Update(bgp::ParsedUpdate::EndOfRib(_)) => {
                 self.update.fetch_add(1, Ordering::Relaxed);
             }
-            bgp::Message::Notification(_) => {
+            bgp::ParsedMessage::Notification(_) => {
                 ret = true;
+                let _ = self.notification.fetch_add(1, Ordering::Relaxed);
+            }
+            bgp::ParsedMessage::Keepalive => {
+                let _ = self.keepalive.fetch_add(1, Ordering::Relaxed);
+            }
+            bgp::ParsedMessage::RouteRefresh { .. } => {
+                let _ = self.refresh.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.total.fetch_add(1, Ordering::Relaxed);
+        ret
+    }
+
+    // Count wire_count encoded wire frames for a transmitted message.
+    fn sync_tx(&self, msg: &bgp::Message, wire_count: usize) {
+        match msg {
+            bgp::Message::Update(bgp::Update::Unreach { entries, .. }) => {
+                self.update.fetch_add(wire_count as u64, Ordering::Relaxed);
+                self.withdraw_update
+                    .fetch_add(wire_count as u64, Ordering::Relaxed);
+                self.withdraw_prefix
+                    .fetch_add(entries.len() as u64, Ordering::Relaxed);
+            }
+            bgp::Message::Update(_) => {
+                self.update.fetch_add(wire_count as u64, Ordering::Relaxed);
+            }
+            bgp::Message::Open(_) => {
+                let _ = self.open.fetch_add(1, Ordering::Relaxed);
+            }
+            bgp::Message::Notification(_) => {
                 let _ = self.notification.fetch_add(1, Ordering::Relaxed);
             }
             bgp::Message::Keepalive => {
@@ -109,8 +145,7 @@ impl MessageCounter {
                 let _ = self.refresh.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.total.fetch_add(1, Ordering::Relaxed);
-        ret
+        self.total.fetch_add(wire_count as u64, Ordering::Relaxed);
     }
 }
 
@@ -5473,8 +5508,8 @@ impl PeerSession {
         let mut txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
         for _ in 0..self.urgent.len() {
             let msg = self.urgent.remove(0);
-            let _ = self.codec.encode_to(&msg, &mut txbuf);
-            (*self.counter_tx).sync(&msg);
+            let wire_count = self.codec.encode_to(&msg, &mut txbuf).unwrap_or(1);
+            (*self.counter_tx).sync_tx(&msg, wire_count);
 
             if txbuf.len() > self.txbuf_size {
                 let buf = txbuf.freeze();
@@ -5493,8 +5528,8 @@ impl PeerSession {
         let any_update_pending = self.pending.values().any(|p| !p.is_empty());
         for (family, p) in self.pending.iter_mut() {
             for msg in p.drain_messages(*family) {
-                let _ = self.codec.encode_to(&msg, &mut txbuf);
-                self.counter_tx.sync(&msg);
+                let wire_count = self.codec.encode_to(&msg, &mut txbuf).unwrap_or(1);
+                self.counter_tx.sync_tx(&msg, wire_count);
 
                 if txbuf.len() > self.txbuf_size {
                     let buf = txbuf.freeze();
@@ -5656,15 +5691,30 @@ impl PeerSession {
         msg: bgp::Message,
     ) -> std::result::Result<(), Error> {
         // Extract UPDATE fields before consuming msg into the FSM.
-        let route_fields = if let bgp::Message::Update(bgp::Update::Routes {
-            reach,
-            unreach,
-            attr,
-        }) = &msg
-        {
-            Some((reach.clone(), unreach.clone(), attr.clone()))
-        } else {
-            None
+        let route_fields = match &msg {
+            bgp::Message::Update(bgp::Update::Reach {
+                family,
+                entries,
+                nexthop,
+                attr,
+            }) => Some((
+                Some(packet::bgp::ReachNlri {
+                    family: *family,
+                    entries: entries.clone(),
+                    nexthop: *nexthop,
+                }),
+                None,
+                attr.clone(),
+            )),
+            bgp::Message::Update(bgp::Update::Unreach { family, entries }) => Some((
+                None,
+                Some(packet::UnreachNlri {
+                    family: *family,
+                    entries: entries.clone(),
+                }),
+                Arc::new(Vec::new()),
+            )),
+            _ => None,
         };
         let eor_family = if let bgp::Message::Update(bgp::Update::EndOfRib(f)) = &msg {
             Some(*f)
@@ -5844,6 +5894,8 @@ impl PeerSession {
                                     match self.codec.try_parse(&mut rxbuf) {
                                     Ok(msg) => match msg {
                                         Some(parsed) => {
+                                            // Count one wire frame before validate_message moves `parsed`.
+                                            (*self.counter_rx).sync_rx(&parsed);
                                             match bgp::validate_message(parsed) {
                                                 Err(notif) => {
                                                     self.urgent.insert(0, bgp::Message::Notification(notif.clone()));
@@ -5852,11 +5904,7 @@ impl PeerSession {
                                                 }
                                                 Ok(iter) => {
                                                     for msg in iter {
-                                                        if let bgp::Message::Update(bgp::Update::Routes {
-                                                            ref attr,
-                                                            reach: Some(_),
-                                                            ..
-                                                        }) = msg
+                                                        if let bgp::Message::Update(bgp::Update::Reach { attr, .. }) = &msg
                                                             && is_as_loop(
                                                                 attr,
                                                                 self.export_ctx.local_asn,
@@ -5865,7 +5913,6 @@ impl PeerSession {
                                                         {
                                                             continue;
                                                         }
-                                                        (*self.counter_rx).sync(&msg);
                                                         let _ = self.rx_msg(global, local_sockaddr, remote_sockaddr, msg).await;
                                                     }
                                                 }
@@ -8618,8 +8665,8 @@ mod tests {
         fn reach_entries(msgs: &[bgp::Message]) -> Vec<(packet::Nlri, u32)> {
             let mut out = Vec::new();
             for msg in msgs {
-                if let bgp::Message::Update(bgp::Update::Routes { reach, .. }) = msg {
-                    for e in reach.iter().flat_map(|s| &s.entries) {
+                if let bgp::Message::Update(bgp::Update::Reach { entries, .. }) = msg {
+                    for e in entries {
                         out.push((e.nlri.clone(), e.path_id));
                     }
                 }
@@ -8631,8 +8678,8 @@ mod tests {
         fn unreach_entries(msgs: &[bgp::Message]) -> Vec<(packet::Nlri, u32)> {
             let mut out = Vec::new();
             for msg in msgs {
-                if let bgp::Message::Update(bgp::Update::Routes { unreach, .. }) = msg {
-                    for e in unreach.iter().flat_map(|s| &s.entries) {
+                if let bgp::Message::Update(bgp::Update::Unreach { entries, .. }) = msg {
+                    for e in entries {
                         out.push((e.nlri.clone(), e.path_id));
                     }
                 }
@@ -9544,8 +9591,8 @@ mod tests {
         ) -> Arc<Vec<packet::Attribute>> {
             let msgs = pending.drain_messages(Family::IPV4);
             for msg in msgs {
-                if let bgp::Message::Update(bgp::Update::Routes { reach, attr, .. }) = msg
-                    && reach.as_ref().is_some_and(|r| !r.entries.is_empty())
+                if let bgp::Message::Update(bgp::Update::Reach { entries, attr, .. }) = msg
+                    && !entries.is_empty()
                 {
                     return attr;
                 }

@@ -14,9 +14,7 @@
 // limitations under the License.
 
 use rustybgp_packet::bgp::Ipv4Net;
-use rustybgp_packet::bgp::{
-    Attribute, Message, ParsedMessage, ParsedUpdate, PeerCodec, ReachNlri, Update,
-};
+use rustybgp_packet::bgp::{Attribute, Message, ParsedMessage, ParsedUpdate, PeerCodec, Update};
 use rustybgp_packet::{Family, Nlri, PathNlri};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -57,14 +55,11 @@ fn round_trip(msg: &Message) -> ParsedMessage {
 }
 
 fn update_with_attrs(attrs: Vec<Attribute>) -> Message {
-    Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4,
-            entries: vec![ipv4_prefix("10.0.0.0", 8)],
-            nexthop: None,
-        }),
+    Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: vec![ipv4_prefix("10.0.0.0", 8)],
+        nexthop: None,
         attr: Arc::new(attrs),
-        unreach: None,
     })
 }
 

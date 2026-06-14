@@ -72,14 +72,11 @@ fn flush_peer_snapshot(
         for ((family, _), change) in &peer_routes {
             families_seen.insert(*family);
             let attrs = change.attrs.as_ref().unwrap();
-            let update = bgp::Message::Update(bgp::Update::Routes {
-                reach: Some(packet::bgp::ReachNlri {
-                    family: *family,
-                    entries: change.nlris.clone(),
-                    nexthop: change.nexthop,
-                }),
+            let update = bgp::Message::Update(bgp::Update::Reach {
+                family: *family,
+                entries: change.nlris.clone(),
+                nexthop: change.nexthop,
                 attr: attrs.clone(),
-                unreach: None,
             });
             messages.push(bmp::Message::RouteMonitoring {
                 header: bmp::PerPeerHeader::new(
@@ -113,23 +110,16 @@ fn flush_peer_snapshot(
 /// Convert a live `AdjRibInChange` to the BGP UPDATE used in RouteMonitoring.
 fn adj_rib_in_to_bmp_update(change: &AdjRibInChange) -> bgp::Message {
     if let Some(ref attrs) = change.attrs {
-        bgp::Message::Update(bgp::Update::Routes {
-            reach: Some(packet::bgp::ReachNlri {
-                family: change.family,
-                entries: change.nlris.clone(),
-                nexthop: change.nexthop,
-            }),
+        bgp::Message::Update(bgp::Update::Reach {
+            family: change.family,
+            entries: change.nlris.clone(),
+            nexthop: change.nexthop,
             attr: attrs.clone(),
-            unreach: None,
         })
     } else {
-        bgp::Message::Update(bgp::Update::Routes {
-            reach: None,
-            attr: Arc::new(Vec::new()),
-            unreach: Some(packet::bgp::UnreachNlri {
-                family: change.family,
-                entries: change.nlris.clone(),
-            }),
+        bgp::Message::Update(bgp::Update::Unreach {
+            family: change.family,
+            entries: change.nlris.clone(),
         })
     }
 }

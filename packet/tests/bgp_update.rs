@@ -15,7 +15,7 @@
 
 use rustybgp_packet::bgp::{
     Attribute, Capability, FamilyState, Ipv4Net, Ipv6Net, Message, Nexthop, ParsedMessage,
-    ParsedUpdate, PeerCodec, ReachNlri, UnreachNlri, Update,
+    ParsedUpdate, PeerCodec, Update,
 };
 use rustybgp_packet::mup;
 use rustybgp_packet::prefix_sid;
@@ -80,14 +80,11 @@ fn round_trip(msg: &Message, codec: rustybgp_packet::bgp::PeerCodec) -> ParsedMe
 #[test]
 fn update_ipv4_announce() {
     let prefix = ipv4_prefix("10.0.0.0", 8);
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4,
-            entries: vec![prefix.clone()],
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: vec![prefix.clone()],
+        nexthop: None,
         attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -111,14 +108,11 @@ fn update_ipv4_announce_multiple() {
         })
         .collect();
 
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4,
-            entries: prefixes.clone(),
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: prefixes.clone(),
+        nexthop: None,
         attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -138,13 +132,9 @@ fn update_ipv4_announce_multiple() {
 #[test]
 fn update_ipv4_withdraw() {
     let prefix = ipv4_prefix("10.0.0.0", 8);
-    let msg = Message::Update(Update::Routes {
-        reach: None,
-        attr: Arc::new(Vec::new()),
-        unreach: Some(UnreachNlri {
-            family: Family::IPV4,
-            entries: vec![prefix.clone()],
-        }),
+    let msg = Message::Update(Update::Unreach {
+        family: Family::IPV4,
+        entries: vec![prefix.clone()],
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -165,12 +155,10 @@ fn update_ipv6_announce() {
     let prefix = ipv6_prefix("2001:db8::", 32);
     let nexthop_bytes: Vec<u8> = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec();
 
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV6,
-            entries: vec![prefix.clone()],
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV6,
+        entries: vec![prefix.clone()],
+        nexthop: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
@@ -180,7 +168,6 @@ fn update_ipv6_announce() {
             .unwrap(),
             Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes).unwrap(),
         ]),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv6_codec()) {
@@ -201,13 +188,9 @@ fn update_ipv6_announce() {
 #[test]
 fn update_ipv6_withdraw() {
     let prefix = ipv6_prefix("2001:db8::", 32);
-    let msg = Message::Update(Update::Routes {
-        reach: None,
-        attr: Arc::new(Vec::new()),
-        unreach: Some(UnreachNlri {
-            family: Family::IPV6,
-            entries: vec![prefix.clone()],
-        }),
+    let msg = Message::Update(Update::Unreach {
+        family: Family::IPV6,
+        entries: vec![prefix.clone()],
     });
 
     match round_trip(&msg, ipv6_codec()) {
@@ -253,14 +236,11 @@ fn update_eor_ipv6() {
 
 #[test]
 fn update_attr_origin_igp() {
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4,
-            entries: vec![ipv4_prefix("10.0.0.0", 8)],
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: vec![ipv4_prefix("10.0.0.0", 8)],
+        nexthop: None,
         attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -285,14 +265,11 @@ fn update_attr_med_dropped_on_encode() {
     let mut attrs = (*ipv4_attrs("192.0.2.254".parse().unwrap())).clone();
     attrs.push(Attribute::new_with_value(Attribute::MULTI_EXIT_DESC, med_value).unwrap());
 
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4,
-            entries: vec![ipv4_prefix("10.0.0.0", 8)],
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: vec![ipv4_prefix("10.0.0.0", 8)],
+        nexthop: None,
         attr: Arc::new(attrs),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -327,12 +304,10 @@ fn update_ipv4_with_ipv6_nexthop() {
     let prefix = ipv4_prefix("10.0.0.0", 8);
     let nexthop_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
 
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4,
-            entries: vec![prefix.clone()],
-            nexthop: Some(Nexthop::V6(nexthop_v6)),
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: vec![prefix.clone()],
+        nexthop: Some(Nexthop::V6(nexthop_v6)),
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
@@ -341,7 +316,6 @@ fn update_ipv4_with_ipv6_nexthop() {
             )
             .unwrap(),
         ]),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv4_extended_nexthop_codec()) {
@@ -363,13 +337,9 @@ fn update_ipv4_with_ipv6_nexthop() {
 #[test]
 fn update_ipv4_extended_nexthop_withdraw() {
     let prefix = ipv4_prefix("10.0.0.0", 8);
-    let msg = Message::Update(Update::Routes {
-        reach: None,
-        attr: Arc::new(Vec::new()),
-        unreach: Some(UnreachNlri {
-            family: Family::IPV4,
-            entries: vec![prefix.clone()],
-        }),
+    let msg = Message::Update(Update::Unreach {
+        family: Family::IPV4,
+        entries: vec![prefix.clone()],
     });
 
     match round_trip(&msg, ipv4_extended_nexthop_codec()) {
@@ -396,14 +366,11 @@ fn update_attr_community() {
         Attribute::new_with_bin(Attribute::COMMUNITY, community.to_be_bytes().to_vec()).unwrap(),
     );
 
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4,
-            entries: vec![ipv4_prefix("10.0.0.0", 8)],
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: vec![ipv4_prefix("10.0.0.0", 8)],
+        nexthop: None,
         attr: Arc::new(attrs),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -455,12 +422,10 @@ fn update_ipv4_with_prefix_sid() {
     };
     let sid_bytes = sid.to_vec();
 
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4,
-            entries: vec![prefix.clone()],
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: vec![prefix.clone()],
+        nexthop: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
@@ -475,7 +440,6 @@ fn update_ipv4_with_prefix_sid() {
             .unwrap(),
             Attribute::new_with_bin(Attribute::PREFIX_SID, sid_bytes.clone()).unwrap(),
         ]),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -507,12 +471,10 @@ fn update_passes_through_unknown_prefix_sid_tlv() {
     let sid_bytes = sid.to_vec();
     assert_eq!(sid_bytes, vec![0x55, 0x00, 0x03, 0xAA, 0xBB, 0xCC]);
 
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4,
-            entries: vec![prefix.clone()],
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4,
+        entries: vec![prefix.clone()],
+        nexthop: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
@@ -527,7 +489,6 @@ fn update_passes_through_unknown_prefix_sid_tlv() {
             .unwrap(),
             Attribute::new_with_bin(Attribute::PREFIX_SID, sid_bytes.clone()).unwrap(),
         ]),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv4_codec()) {
@@ -573,12 +534,10 @@ fn update_ipv4_mup_announce() {
         },
     )));
     let nexthop: Ipv4Addr = "10.0.0.1".parse().unwrap();
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4_MUP,
-            entries: vec![nlri.clone()],
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4_MUP,
+        entries: vec![nlri.clone()],
+        nexthop: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
@@ -588,7 +547,6 @@ fn update_ipv4_mup_announce() {
             .unwrap(),
             Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
         ]),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv4_mup_codec()) {
@@ -615,12 +573,10 @@ fn update_ipv6_mup_announce() {
         },
     )));
     let nexthop_bytes: Vec<u8> = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec();
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV6_MUP,
-            entries: vec![nlri.clone()],
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV6_MUP,
+        entries: vec![nlri.clone()],
+        nexthop: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
@@ -630,7 +586,6 @@ fn update_ipv6_mup_announce() {
             .unwrap(),
             Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes).unwrap(),
         ]),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv6_mup_codec()) {
@@ -658,13 +613,9 @@ fn update_mup_withdraw() {
             teid: 0xdead_beef,
         },
     )));
-    let msg = Message::Update(Update::Routes {
-        reach: None,
-        attr: Arc::new(Vec::new()),
-        unreach: Some(UnreachNlri {
-            family: Family::IPV4_MUP,
-            entries: vec![nlri.clone()],
-        }),
+    let msg = Message::Update(Update::Unreach {
+        family: Family::IPV4_MUP,
+        entries: vec![nlri.clone()],
     });
 
     match round_trip(&msg, ipv4_mup_codec()) {
@@ -699,12 +650,10 @@ fn update_mup_with_ext_community() {
     }
     .encode(&mut ec_bytes);
     let nexthop: Ipv4Addr = "10.0.0.1".parse().unwrap();
-    let msg = Message::Update(Update::Routes {
-        reach: Some(ReachNlri {
-            family: Family::IPV4_MUP,
-            entries: vec![nlri.clone()],
-            nexthop: None,
-        }),
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV4_MUP,
+        entries: vec![nlri.clone()],
+        nexthop: None,
         attr: Arc::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
@@ -715,7 +664,6 @@ fn update_mup_with_ext_community() {
             Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
             Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, ec_bytes.clone()).unwrap(),
         ]),
-        unreach: None,
     });
 
     match round_trip(&msg, ipv4_mup_codec()) {
