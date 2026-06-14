@@ -743,6 +743,11 @@ fn vpnv4_codec() -> PeerCodec {
     PeerCodec::negotiate(&caps, &caps)
 }
 
+fn vpnv6_codec() -> PeerCodec {
+    let caps = vec![Capability::MultiProtocol(Family::IPV6_VPN)];
+    PeerCodec::negotiate(&caps, &caps)
+}
+
 #[test]
 fn update_vpnv4_nexthop_roundtrip() {
     use rustybgp_packet::mpls::{MplsLabel, MplsLabelStack};
@@ -781,6 +786,55 @@ fn update_vpnv4_nexthop_roundtrip() {
         ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
             let r = mp_reach.expect("mp_reach must be present for VPNv4");
             assert_eq!(r.family, Family::IPV4_VPN);
+            assert_eq!(
+                r.nexthop,
+                Some(nexthop),
+                "nexthop mismatch after VPN RD strip"
+            );
+            assert_eq!(r.entries, vec![nlri]);
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+#[test]
+fn update_vpnv6_nexthop_roundtrip() {
+    use rustybgp_packet::mpls::{MplsLabel, MplsLabelStack};
+    use rustybgp_packet::vpn::VpnV6Nlri;
+
+    let rd = RouteDistinguisher::TwoOctetAs {
+        admin: 65001,
+        assigned: 1,
+    };
+    let prefix = Ipv6Net {
+        addr: "2001:db8:1::".parse().unwrap(),
+        mask: 48,
+    };
+    let nlri = PathNlri::new(Nlri::VpnV6(VpnV6Nlri {
+        labels: MplsLabelStack::new(vec![MplsLabel::new(200)]),
+        rd,
+        prefix,
+    }));
+    let nexthop = Nexthop::V6("2001:db8::1".parse().unwrap());
+
+    let msg = Message::Update(Update::Reach {
+        family: Family::IPV6_VPN,
+        entries: vec![nlri.clone()],
+        nexthop: Some(nexthop),
+        attr: Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+        ]),
+    });
+
+    match round_trip(&msg, vpnv6_codec()) {
+        ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+            let r = mp_reach.expect("mp_reach must be present for VPNv6");
+            assert_eq!(r.family, Family::IPV6_VPN);
             assert_eq!(
                 r.nexthop,
                 Some(nexthop),
