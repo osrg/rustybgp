@@ -367,7 +367,12 @@ impl Connection {
     fn on_hold_timer_expired(&mut self) -> Vec<Output> {
         match self.state {
             State::OpenSent | State::OpenConfirm | State::Established => {
-                vec![Output::SessionDown(SessionDownReason::HoldTimerExpired)]
+                let notif =
+                    bgp::Message::Notification(rustybgp_packet::Notification::HoldTimerExpired);
+                vec![
+                    Output::SendMessage(notif),
+                    Output::SessionDown(SessionDownReason::HoldTimerExpired),
+                ]
             }
             _ => Vec::new(),
         }

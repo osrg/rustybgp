@@ -53,6 +53,10 @@ pub enum Notification {
     #[error("update error: optional attribute error")]
     UpdateOptionalAttributeError,
 
+    // Code 4: Hold Timer Expired
+    #[error("hold timer expired")]
+    HoldTimerExpired,
+
     // Code 5: FSM Error
     #[error("FSM error: unexpected state {state}")]
     FsmUnexpectedState { state: u8 },
@@ -92,6 +96,7 @@ impl Notification {
             | Self::OpenUnsupportedOptionalParameter { .. }
             | Self::OpenUnacceptableHoldTime { .. } => 2,
             Self::UpdateMalformedAttributeList | Self::UpdateOptionalAttributeError => 3,
+            Self::HoldTimerExpired => 4,
             Self::FsmUnexpectedState { .. } => 5,
             Self::CeaseMaxPrefixReached
             | Self::CeaseAdminShutdown
@@ -114,6 +119,7 @@ impl Notification {
             Self::OpenUnacceptableHoldTime { .. } => 6,
             Self::UpdateMalformedAttributeList => 1,
             Self::UpdateOptionalAttributeError => 9,
+            Self::HoldTimerExpired => 0,
             Self::FsmUnexpectedState { state } => *state,
             Self::CeaseMaxPrefixReached => 1,
             Self::CeaseAdminShutdown => 2,
@@ -155,6 +161,7 @@ impl Notification {
             (2, 6) => Self::OpenUnacceptableHoldTime { data },
             (3, 1) => Self::UpdateMalformedAttributeList,
             (3, 9) => Self::UpdateOptionalAttributeError,
+            (4, _) => Self::HoldTimerExpired,
             (5, state) => Self::FsmUnexpectedState { state },
             (6, 1) => Self::CeaseMaxPrefixReached,
             (6, 2) => Self::CeaseAdminShutdown,
