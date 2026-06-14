@@ -764,6 +764,47 @@ fn mp_reach_zero_nexthop_flowspec_is_ok() {
     );
 }
 
+// ─── Duplicate attribute handling ────────────────────────────────────────────
+
+#[test]
+fn duplicate_non_mp_attr_is_skipped() {
+    // A duplicate non-MP attribute must be silently dropped (second occurrence
+    // skipped) so that parsing still succeeds.
+    let community: [u8; 7] = [0xC0, 0x08, 0x04, 0xFD, 0xE9, 0x00, 0x64]; // 65001:100
+    let mut attr_bytes: Vec<u8> = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]); // ORIGIN=IGP
+    attr_bytes.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xFD, 0xEA]); // AS_PATH
+    attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xC0, 0x00, 0x02, 0x01]); // NEXTHOP=192.0.2.1
+    attr_bytes.extend_from_slice(&community);
+    attr_bytes.extend_from_slice(&community); // duplicate
+
+    let attr_len = attr_bytes.len() as u16;
+    let nlri: [u8; 2] = [0x08, 0x0A]; // 10.0.0.0/8
+    let total = 19u16 + 2 + 2 + attr_len + nlri.len() as u16;
+
+    let mut buf = vec![0xffu8; 16];
+    buf.extend_from_slice(&total.to_be_bytes());
+    buf.push(2); // UPDATE
+    buf.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_len=0
+    buf.extend_from_slice(&attr_len.to_be_bytes());
+    buf.extend_from_slice(&attr_bytes);
+    buf.extend_from_slice(&nlri);
+
+    let mut codec = ipv4_codec();
+    match codec.parse_message(&buf) {
+        Ok(ParsedMessage::Update(ParsedUpdate::Routes { attrs, reach, .. })) => {
+            assert!(reach.is_some(), "prefix must be present");
+            let count = attrs
+                .iter()
+                .filter(|a| a.code() == Attribute::COMMUNITY)
+                .count();
+            assert_eq!(count, 1, "duplicate COMMUNITY must be skipped, not doubled");
+        }
+        Ok(_) => panic!("expected Routes"),
+        Err(e) => panic!("unexpected parse error: {}", e),
+    }
+}
+
 // ─── VPN nexthop round-trip ──────────────────────────────────────────────────
 
 fn vpnv4_codec() -> PeerCodec {
