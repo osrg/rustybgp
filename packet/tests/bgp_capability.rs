@@ -162,7 +162,7 @@ fn capability_graceful_restart_invalid_len() {
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
     match PeerCodecBuilder::new().build().parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(Notification::OpenMalformed)) => {}
+        Err(Notification::OpenMalformed) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -218,7 +218,7 @@ fn capability_add_path_invalid_len() {
         &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
     );
     match PeerCodecBuilder::new().build().parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(Notification::OpenMalformed)) => {}
+        Err(Notification::OpenMalformed) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }

@@ -223,7 +223,7 @@ fn route_refresh_too_long() {
     let buf = bgp_msg(5, body);
     let mut codec = default_codec();
     match codec.parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(Notification::RouteRefreshInvalidLength { .. })) => {}
+        Err(Notification::RouteRefreshInvalidLength { .. }) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -237,7 +237,7 @@ fn bad_message_type() {
     let buf = bgp_msg(99, &[]);
     let mut codec = default_codec();
     match codec.parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageType { .. })) => {}
+        Err(Notification::BadMessageType { .. }) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -250,7 +250,7 @@ fn parse_message_too_short_buffer() {
     let buf: Vec<u8> = vec![0xff; 10]; // 10 bytes < HEADER_LENGTH=19
     let mut codec = default_codec();
     match codec.parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
+        Err(Notification::BadMessageLength { .. }) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -266,7 +266,7 @@ fn framer_bad_header_length() {
     buf.put_u8(4); // KEEPALIVE
     let mut framer = PeerCodecBuilder::new().build();
     match framer.try_parse(&mut buf) {
-        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
+        Err(Notification::BadMessageLength { .. }) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }

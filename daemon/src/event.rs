@@ -5929,12 +5929,8 @@ impl PeerSession {
                                         // Bypass FSM: Notification already encodes the
                                         // correct NOTIFICATION; the FSM has no
                                         // decision to make here.
-                                        if let rustybgp_packet::Error::Bgp(ref bgp_err) = e {
-                                            self.urgent.insert(0, bgp::Message::Notification(bgp_err.clone()));
-                                            self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(bgp_err.clone())));
-                                        } else {
-                                            self.shutdown = Some(crate::fsm::SessionDownReason::FsmError);
-                                        }
+                                        self.urgent.insert(0, bgp::Message::Notification(e.clone()));
+                                        self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(e)));
                                         break;
                                     },
                                 }

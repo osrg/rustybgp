@@ -275,7 +275,7 @@ fn open_too_short() {
     let buf = bgp_msg(1, body);
     let mut codec = default_codec().build();
     match codec.parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
+        Err(Notification::BadMessageLength { .. }) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }
@@ -291,7 +291,7 @@ fn open_unacceptable_holdtime() {
         );
         let mut codec = default_codec().build();
         match codec.parse_message(&buf) {
-            Err(rustybgp_packet::Error::Bgp(Notification::OpenUnacceptableHoldTime { .. })) => {}
+            Err(Notification::OpenUnacceptableHoldTime { .. }) => {}
             Ok(_) => panic!("expected error for holdtime={}", bad_holdtime),
             Err(e) => panic!("unexpected error for holdtime={}: {}", bad_holdtime, e),
         }
@@ -308,9 +308,7 @@ fn open_unsupported_optional_parameter() {
     );
     let mut codec = default_codec().build();
     match codec.parse_message(&buf) {
-        Err(rustybgp_packet::Error::Bgp(Notification::OpenUnsupportedOptionalParameter {
-            ..
-        })) => {}
+        Err(Notification::OpenUnsupportedOptionalParameter { .. }) => {}
         Ok(_) => panic!("expected error"),
         Err(e) => panic!("unexpected error: {}", e),
     }

@@ -20,10 +20,85 @@ use fnv::FnvHashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::Into;
 use std::io::Cursor;
+use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{fmt, io};
+
+trait ParseContext: 'static {
+    fn truncated() -> Notification;
+}
+
+struct UpdateCtx;
+impl ParseContext for UpdateCtx {
+    fn truncated() -> Notification {
+        Notification::UpdateMalformedAttributeList
+    }
+}
+
+/// A cursor over a byte slice that returns `Notification` directly on truncation,
+/// eliminating the need to map `io::Error` in the BGP parse path.
+struct BgpReader<'a, C: ParseContext> {
+    buf: &'a [u8],
+    pos: usize,
+    _marker: PhantomData<C>,
+}
+
+impl<'a, C: ParseContext> BgpReader<'a, C> {
+    fn new(buf: &'a [u8]) -> Self {
+        BgpReader {
+            buf,
+            pos: 0,
+            _marker: PhantomData,
+        }
+    }
+
+    fn read_u8(&mut self) -> Result<u8, Notification> {
+        match self.buf.get(self.pos) {
+            Some(&v) => {
+                self.pos += 1;
+                Ok(v)
+            }
+            None => Err(C::truncated()),
+        }
+    }
+
+    fn read_u32_be(&mut self) -> Result<u32, Notification> {
+        if self.pos + 4 > self.buf.len() {
+            return Err(C::truncated());
+        }
+        let v = u32::from_be_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Ok(v)
+    }
+
+    fn remaining_len(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+}
+
+impl<'a, C: ParseContext> io::Read for BgpReader<'a, C> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = self.buf.len() - self.pos;
+        let n = buf.len().min(available);
+        buf[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        if n < buf.len() {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "not enough bytes",
+            ))
+        } else {
+            Ok(n)
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Family(u32);
@@ -207,16 +282,24 @@ impl Nlri {
     }
 
     // Add a new match arm here when introducing a new SAFI.
-    fn decode<T: io::Read>(family: Family, c: &mut T, len: usize) -> Result<Nlri, Error> {
+    fn decode<C: ParseContext>(
+        family: Family,
+        c: &mut BgpReader<C>,
+        len: usize,
+    ) -> Result<Nlri, Notification> {
         match family {
             Family::IPV4 => Ipv4Net::decode(c, len).map(Nlri::V4),
             Family::IPV6 => Ipv6Net::decode(c, len).map(Nlri::V6),
-            Family::IPV4_MUP | Family::IPV6_MUP => {
-                crate::mup::MupNlri::decode(family, c, len).map(Nlri::Mup)
-            }
-            Family::IPV4_VPN => crate::vpn::VpnV4Nlri::decode(c, len).map(Nlri::VpnV4),
-            Family::IPV6_VPN => crate::vpn::VpnV6Nlri::decode(c, len).map(Nlri::VpnV6),
-            _ => Err(Notification::UpdateMalformedAttributeList.into()),
+            Family::IPV4_MUP | Family::IPV6_MUP => crate::mup::MupNlri::decode(family, c, len)
+                .map(Nlri::Mup)
+                .map_err(|_| Notification::UpdateMalformedAttributeList),
+            Family::IPV4_VPN => crate::vpn::VpnV4Nlri::decode(c, len)
+                .map(Nlri::VpnV4)
+                .map_err(|_| Notification::UpdateMalformedAttributeList),
+            Family::IPV6_VPN => crate::vpn::VpnV6Nlri::decode(c, len)
+                .map(Nlri::VpnV6)
+                .map_err(|_| Notification::UpdateMalformedAttributeList),
+            _ => Err(Notification::UpdateMalformedAttributeList),
         }
     }
 }
@@ -350,10 +433,10 @@ pub struct Ipv4Net {
 }
 
 impl Ipv4Net {
-    fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Ipv4Net, Error> {
+    fn decode<C: ParseContext>(c: &mut BgpReader<C>, len: usize) -> Result<Ipv4Net, Notification> {
         let bit_len = c.read_u8()?;
         if len < (bit_len as usize).div_ceil(8) || bit_len > 32 {
-            return Err(Notification::UpdateMalformedAttributeList.into());
+            return Err(Notification::UpdateMalformedAttributeList);
         }
         let mut addr = [0_u8; 4];
         for i in 0..bit_len.div_ceil(8) {
@@ -387,7 +470,7 @@ fn parse_bogus_ipv4net() {
     let mut buf = vec![128];
     buf.append(&mut Ipv6Addr::from(139930210).octets().to_vec());
     let len = buf.len();
-    let mut c = Cursor::new(buf);
+    let mut c = BgpReader::<UpdateCtx>::new(&buf);
     assert!(Ipv4Net::decode(&mut c, len).is_err());
 }
 
@@ -398,10 +481,10 @@ pub struct Ipv6Net {
 }
 
 impl Ipv6Net {
-    fn decode<T: io::Read>(c: &mut T, len: usize) -> Result<Ipv6Net, Error> {
+    fn decode<C: ParseContext>(c: &mut BgpReader<C>, len: usize) -> Result<Ipv6Net, Notification> {
         let bit_len = c.read_u8()?;
         if len < (bit_len as usize).div_ceil(8) || bit_len > 128 {
-            return Err(Notification::UpdateMalformedAttributeList.into());
+            return Err(Notification::UpdateMalformedAttributeList);
         }
         let mut addr = [0_u8; 16];
         for i in 0..bit_len.div_ceil(8) {
@@ -436,7 +519,7 @@ fn parse_bogus_ipv6net() {
     buf.append(&mut Ipv6Addr::from(139930210).octets().to_vec());
     buf.append(&mut (0..8).collect::<Vec<u8>>());
     let len = buf.len();
-    let mut c = Cursor::new(buf);
+    let mut c = BgpReader::<UpdateCtx>::new(&buf);
     assert!(Ipv6Net::decode(&mut c, len).is_err());
 }
 
@@ -444,7 +527,7 @@ fn parse_bogus_ipv6net() {
 fn nlri_decode_ipv4() {
     let buf = vec![24, 10, 0, 0];
     let len = buf.len();
-    let mut c = Cursor::new(buf);
+    let mut c = BgpReader::<UpdateCtx>::new(&buf);
     assert_eq!(
         Nlri::decode(Family::IPV4, &mut c, len).unwrap(),
         Nlri::V4(Ipv4Net {
@@ -458,7 +541,7 @@ fn nlri_decode_ipv4() {
 fn nlri_decode_ipv6() {
     let buf = vec![32, 0x20, 0x01, 0x0d, 0xb8];
     let len = buf.len();
-    let mut c = Cursor::new(buf);
+    let mut c = BgpReader::<UpdateCtx>::new(&buf);
     assert_eq!(
         Nlri::decode(Family::IPV6, &mut c, len).unwrap(),
         Nlri::V6(Ipv6Net {
@@ -472,7 +555,7 @@ fn nlri_decode_ipv6() {
 fn nlri_decode_unsupported_family() {
     let buf = vec![24, 10, 0, 0];
     let len = buf.len();
-    let mut c = Cursor::new(buf);
+    let mut c = BgpReader::<UpdateCtx>::new(&buf);
     let mup_ipv4 = Family::new((Family::AFI_IP as u32) << 16 | 85);
     assert!(Nlri::decode(mup_ipv4, &mut c, len).is_err());
 }
@@ -1890,42 +1973,36 @@ impl PeerCodec {
         Ok(())
     }
 
-    fn decode_nlri<T: io::Read>(
+    fn decode_nlri<C: ParseContext>(
         &self,
         chan: &Channel,
-        c: &mut T,
+        c: &mut BgpReader<C>,
         mut len: usize,
-    ) -> Result<PathNlri, Error> {
-        let malformed: Error = Notification::UpdateMalformedAttributeList.into();
+    ) -> Result<PathNlri, Notification> {
         let id = if chan.addpath_rx() {
             if len < 4 {
-                return Err(malformed);
+                return Err(Notification::UpdateMalformedAttributeList);
             }
-            if let Ok(id) = c.read_u32::<NetworkEndian>() {
-                len -= 4;
-                id
-            } else {
-                return Err(malformed);
-            }
+            let id = c.read_u32_be()?;
+            len -= 4;
+            id
         } else {
             0
         };
         Nlri::decode(chan.family, c, len).map(|nlri| PathNlri { path_id: id, nlri })
     }
-    pub fn parse_message(&mut self, buf: &[u8]) -> Result<ParsedMessage, Error> {
+    pub fn parse_message(&mut self, buf: &[u8]) -> Result<ParsedMessage, Notification> {
         if buf.len() < Message::HEADER_LENGTH as usize {
-            return Err(Notification::BadMessageLength { data: vec![] }.into());
+            return Err(Notification::BadMessageLength { data: vec![] });
         }
         let code = buf[18];
-        let header_len_error: Error = Notification::BadMessageLength {
+        let header_len_error = Notification::BadMessageLength {
             data: (buf[16..18]).to_vec(),
-        }
-        .into();
+        };
 
         match code {
             Message::OPEN => {
                 const MINIMUM_OPEN_LENGTH: usize = 29;
-                let malformed: Error = Notification::OpenMalformed.into();
                 if buf.len() < MINIMUM_OPEN_LENGTH {
                     return Err(header_len_error);
                 }
@@ -1934,7 +2011,7 @@ impl PeerCodec {
                 let version = c.read_u8().unwrap();
                 // BGP version must be 4 (RFC 4271 §4.2)
                 if version != 4 {
-                    return Err(Notification::OpenMalformed.into());
+                    return Err(Notification::OpenMalformed);
                 }
                 let mut as_number = c.read_u16::<NetworkEndian>().unwrap() as u32;
                 let raw_holdtime = c.read_u16::<NetworkEndian>().unwrap();
@@ -1945,30 +2022,30 @@ impl PeerCodec {
                 let router_id = c.read_u32::<NetworkEndian>().unwrap();
                 let param_len = c.read_u8().unwrap();
                 if buf.len() < MINIMUM_OPEN_LENGTH + param_len as usize {
-                    return Err(malformed);
+                    return Err(Notification::OpenMalformed);
                 }
                 let param_end = c.position() + param_len as u64;
                 let mut cap = Vec::new();
                 while c.position() < param_end {
                     if param_end < c.position() + 2 {
-                        return Err(malformed);
+                        return Err(Notification::OpenMalformed);
                     }
                     let op_type = c.read_u8().unwrap();
                     let op_len = c.read_u8().unwrap();
                     if param_end < c.position() + op_len as u64 {
-                        return Err(malformed);
+                        return Err(Notification::OpenMalformed);
                     }
                     if op_type == 2 {
                         let op_end = c.position() + op_len as u64;
                         while c.position() < op_end {
                             if op_end < c.position() + 2 {
-                                return Err(malformed);
+                                return Err(Notification::OpenMalformed);
                             }
                             let cap_type = c.read_u8().unwrap();
                             let cap_len = c.read_u8().unwrap();
 
                             if op_end < c.position() + cap_len as u64 {
-                                return Err(malformed);
+                                return Err(Notification::OpenMalformed);
                             }
                             match Capability::decode(cap_type, &mut c, cap_len) {
                                 Ok(decoded) => {
@@ -1978,7 +2055,7 @@ impl PeerCodec {
                                     cap.push(decoded);
                                 }
                                 Err(_) => {
-                                    return Err(malformed);
+                                    return Err(Notification::OpenMalformed);
                                 }
                             }
                         }
@@ -1987,8 +2064,7 @@ impl PeerCodec {
                             data: buf[c.position() as usize - 2
                                 ..c.position() as usize + op_len as usize]
                                 .to_vec(),
-                        }
-                        .into());
+                        });
                     }
                 }
                 if as_number == Capability::TRANS_ASN as u32 {
@@ -2006,7 +2082,7 @@ impl PeerCodec {
             }
             Message::UPDATE => {
                 const MINIMUM_UPDATE_LENGTH: usize = 23;
-                let malformed = || Error::from(Notification::UpdateMalformedAttributeList);
+                let malformed = || Notification::UpdateMalformedAttributeList;
                 let reach_family = Family::IPV4;
                 let unreach_family = Family::IPV4;
                 let mut mp_reach_family = Family::IPV4;
@@ -2030,7 +2106,9 @@ impl PeerCodec {
                     return Err(malformed());
                 }
                 c.set_position(c.position() + withdrawn_len as u64);
-                let attr_len = c.read_u16::<NetworkEndian>()?;
+                let attr_len = c
+                    .read_u16::<NetworkEndian>()
+                    .map_err(|_| Notification::UpdateMalformedAttributeList)?;
                 if buf.len() < (withdrawn_len + attr_len + MINIMUM_UPDATE_LENGTH as u16).into() {
                     return Err(malformed());
                 }
@@ -2200,26 +2278,21 @@ impl PeerCodec {
 
                 if (c.position() as usize) < buf.len() {
                     let chan = self.channel.get(&Family::IPV4).ok_or_else(malformed)?;
-                    while (c.position() as usize) < buf.len() {
-                        let rest = buf.len() - c.position() as usize;
-
-                        match self.decode_nlri(chan, &mut c, rest) {
-                            Ok(net) => reach.push(net),
-                            Err(err) => return Err(err),
-                        }
+                    let mut reader = BgpReader::<UpdateCtx>::new(&buf[c.position() as usize..]);
+                    while reader.remaining_len() > 0 {
+                        let rest = reader.remaining_len();
+                        reach.push(self.decode_nlri(chan, &mut reader, rest)?);
                     }
                 }
 
                 if 0 < withdrawn_len {
                     let chan = self.channel.get(&Family::IPV4).ok_or_else(malformed)?;
-                    c.set_position(Message::HEADER_LENGTH as u64 + 2);
-                    let withdrawn_end = c.position() + withdrawn_len as u64;
-                    while c.position() < withdrawn_end {
-                        let rest = withdrawn_end - c.position();
-                        match self.decode_nlri(chan, &mut c, rest as usize) {
-                            Ok(net) => unreach.push(net),
-                            Err(err) => return Err(err),
-                        }
+                    let start = Message::HEADER_LENGTH as usize + 2;
+                    let mut reader =
+                        BgpReader::<UpdateCtx>::new(&buf[start..start + withdrawn_len as usize]);
+                    while reader.remaining_len() > 0 {
+                        let rest = reader.remaining_len();
+                        unreach.push(self.decode_nlri(chan, &mut reader, rest)?);
                     }
                 }
 
@@ -2239,7 +2312,7 @@ impl PeerCodec {
                 }
 
                 if let Some(a) = mp_reach_attr {
-                    let err: Error = Notification::UpdateOptionalAttributeError.into();
+                    let err = Notification::UpdateOptionalAttributeError;
                     let buf = a.binary().unwrap();
                     if buf.len() < 5 {
                         return Err(err);
@@ -2280,18 +2353,16 @@ impl PeerCodec {
                         _ => return Err(err),
                     }
                     c.read_u8().unwrap();
-                    while c.position() < buf.len() as u64 {
-                        let rest = buf.len() - c.position() as usize;
-                        match self.decode_nlri(chan, &mut c, rest) {
-                            Ok(net) => mp_reach_entries.push(net),
-                            Err(err) => return Err(err),
-                        }
+                    let mut reader = BgpReader::<UpdateCtx>::new(&buf[c.position() as usize..]);
+                    while reader.remaining_len() > 0 {
+                        let rest = reader.remaining_len();
+                        mp_reach_entries.push(self.decode_nlri(chan, &mut reader, rest)?);
                     }
                 }
 
                 let mp_unreach_present = mp_unreach_attr.is_some();
                 if let Some(a) = mp_unreach_attr {
-                    let err: Error = Notification::UpdateOptionalAttributeError.into();
+                    let err = Notification::UpdateOptionalAttributeError;
                     let buf = a.binary().unwrap();
                     if buf.len() < 3 {
                         return Err(err);
@@ -2305,12 +2376,10 @@ impl PeerCodec {
                     let safi = c.read_u8().unwrap();
                     mp_unreach_family = Family((afi as u32) << 16 | safi as u32);
                     let chan = self.channel.get(&mp_unreach_family).ok_or_else(malformed)?;
-                    while c.position() < buf.len() as u64 {
-                        let rest = buf.len() - c.position() as usize;
-                        match self.decode_nlri(chan, &mut c, rest) {
-                            Ok(net) => mp_unreach_entries.push(net),
-                            Err(err) => return Err(err),
-                        }
+                    let mut reader = BgpReader::<UpdateCtx>::new(&buf[c.position() as usize..]);
+                    while reader.remaining_len() > 0 {
+                        let rest = reader.remaining_len();
+                        mp_unreach_entries.push(self.decode_nlri(chan, &mut reader, rest)?);
                     }
                 }
 
@@ -2392,9 +2461,7 @@ impl PeerCodec {
                     return Err(header_len_error);
                 }
                 if ROUTE_REFRESH_LENGTH < buf.len() {
-                    return Err(
-                        Notification::RouteRefreshInvalidLength { data: buf.to_vec() }.into(),
-                    );
+                    return Err(Notification::RouteRefreshInvalidLength { data: buf.to_vec() });
                 }
                 let mut c = Cursor::new(&buf);
                 c.set_position(Message::HEADER_LENGTH.into());
@@ -2402,7 +2469,7 @@ impl PeerCodec {
                     family: Family(c.read_u32::<NetworkEndian>().unwrap()),
                 })
             }
-            _ => Err(Notification::BadMessageType { data: vec![code] }.into()),
+            _ => Err(Notification::BadMessageType { data: vec![code] }),
         }
     }
 
@@ -2434,7 +2501,7 @@ impl PeerCodec {
 
     /// Try to parse one complete BGP message from a stream buffer.
     /// Returns `Ok(None)` if there are not enough bytes yet.
-    pub fn try_parse(&mut self, src: &mut BytesMut) -> Result<Option<ParsedMessage>, crate::Error> {
+    pub fn try_parse(&mut self, src: &mut BytesMut) -> Result<Option<ParsedMessage>, Notification> {
         let buffer_len = src.len();
         if buffer_len < Message::HEADER_LENGTH as usize {
             return Ok(None);
@@ -2442,10 +2509,9 @@ impl PeerCodec {
         let message_len = (&src[16..18]).read_u16::<NetworkEndian>().unwrap() as usize;
         if message_len < Message::HEADER_LENGTH as usize || message_len > self.max_message_length()
         {
-            return Err(crate::Notification::BadMessageLength {
+            return Err(Notification::BadMessageLength {
                 data: src[16..18].to_vec(),
-            }
-            .into());
+            });
         }
         if buffer_len < message_len {
             return Ok(None);

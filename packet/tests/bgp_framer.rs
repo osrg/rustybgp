@@ -15,7 +15,7 @@
 
 use bytes::BytesMut;
 use rustybgp_packet::Notification;
-use rustybgp_packet::bgp::{Message, ParsedMessage, PeerCodec, PeerCodecBuilder};
+use rustybgp_packet::bgp::{ParsedMessage, PeerCodec, PeerCodecBuilder};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -141,7 +141,7 @@ fn framer_header_length_below_minimum() {
     let mut framer = default_framer();
     let mut bmut = BytesMut::from(buf.as_slice());
     match framer.try_parse(&mut bmut) {
-        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
+        Err(Notification::BadMessageLength { .. }) => {}
         other => panic!("expected BadMessageLength, got {:?}", other.map(|_| "ok")),
     }
 }
@@ -156,7 +156,7 @@ fn framer_header_length_exceeds_max() {
     let mut framer = default_framer();
     let mut bmut = BytesMut::from(buf.as_slice());
     match framer.try_parse(&mut bmut) {
-        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageLength { .. })) => {}
+        Err(Notification::BadMessageLength { .. }) => {}
         other => panic!("expected BadMessageLength, got {:?}", other.map(|_| "ok")),
     }
 }
@@ -168,7 +168,7 @@ fn framer_unknown_message_type() {
     let mut framer = default_framer();
     let mut bmut = BytesMut::from(buf.as_slice());
     match framer.try_parse(&mut bmut) {
-        Err(rustybgp_packet::Error::Bgp(Notification::BadMessageType { .. })) => {}
+        Err(Notification::BadMessageType { .. }) => {}
         other => panic!("expected BadMessageType, got {:?}", other.map(|_| "ok")),
     }
 }
