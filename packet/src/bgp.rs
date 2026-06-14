@@ -16,8 +16,8 @@
 use crate::error::Error;
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
-use fnv::FnvHashMap;
-use std::collections::hash_map::Entry::{Occupied, Vacant};
+use fnv::{FnvHashMap, FnvHashSet};
+
 use std::convert::Into;
 use std::io::Cursor;
 use std::marker::PhantomData;
@@ -2228,10 +2228,9 @@ impl PeerCodec {
                 if buf.len() < (withdrawn_len + attr_len + MINIMUM_UPDATE_LENGTH as u16).into() {
                     return Err(malformed());
                 }
-                let mut seen = FnvHashMap::default();
+                let mut seen = FnvHashSet::default();
                 let attr_end = c.position() + attr_len as u64;
                 let mut error_attrs: Vec<AttributeError> = Vec::new();
-                let mut attr_idx = 0;
                 let reach_len = buf.len() as u64 - attr_end;
                 while c.position() < attr_end {
                     if attr_end < c.position() + 2 {
@@ -2253,18 +2252,12 @@ impl PeerCodec {
                     if attr_end < c.position() + alen as u64 {
                         break;
                     }
-                    match seen.entry(code) {
-                        Occupied(_) => {
-                            if code == Attribute::MP_REACH || code == Attribute::MP_UNREACH {
-                                return Err(malformed());
-                            } else {
-                                c.set_position(c.position() + alen as u64);
-                                continue;
-                            }
+                    if !seen.insert(code) {
+                        if code == Attribute::MP_REACH || code == Attribute::MP_UNREACH {
+                            return Err(malformed());
                         }
-                        Vacant(v) => {
-                            v.insert(attr_idx);
-                        }
+                        c.set_position(c.position() + alen as u64);
+                        continue;
                     }
                     match Attribute::canonical_flags(code) {
                         Some(expected_flags) => {
@@ -2292,7 +2285,6 @@ impl PeerCodec {
                                                 a.binary().and_then(|b| Nexthop::from_bytes(b));
                                         } else {
                                             attr.push(a);
-                                            attr_idx += 1;
                                         }
                                     }
                                     Err(_) => {
@@ -2324,9 +2316,7 @@ impl PeerCodec {
                 }
 
                 if reach_len != 0 || mp_reach_attr.is_some() {
-                    if !seen.contains_key(&Attribute::ORIGIN)
-                        || !seen.contains_key(&Attribute::AS_PATH)
-                    {
+                    if !seen.contains(&Attribute::ORIGIN) || !seen.contains(&Attribute::AS_PATH) {
                         error_attrs.push(AttributeError {
                             attr_code: Attribute::ORIGIN,
                             attr_flags: Attribute::FLAG_TRANSITIVE,
