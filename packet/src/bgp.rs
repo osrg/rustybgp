@@ -1146,7 +1146,7 @@ impl Attribute {
         aslen as usize
     }
 
-    fn as_path_count(&self, asn: u32) -> Result<usize, Error> {
+    pub fn as_path_count(&self, asn: u32) -> Result<usize, Error> {
         let mut num = 0;
 
         let buf = self.binary().unwrap();
@@ -1704,7 +1704,6 @@ pub struct PeerCodecBuilder {
     remote_asn: u32,
     extended_length: bool,
     family: Vec<Family>,
-    confederation_id: u32,
 }
 
 impl Default for PeerCodecBuilder {
@@ -1720,7 +1719,6 @@ impl PeerCodecBuilder {
             remote_asn: 0,
             extended_length: false,
             family: Vec::new(),
-            confederation_id: 0,
         }
     }
 
@@ -1735,17 +1733,11 @@ impl PeerCodecBuilder {
             remote_asn: self.remote_asn,
             extended_length: self.extended_length,
             channel,
-            confederation_id: self.confederation_id,
         }
     }
 
     pub fn local_asn(&mut self, asn: u32) -> &mut Self {
         self.local_asn = asn;
-        self
-    }
-
-    pub fn confederation_id(&mut self, id: u32) -> &mut Self {
-        self.confederation_id = id;
         self
     }
 
@@ -1760,8 +1752,6 @@ pub struct PeerCodec {
     local_asn: u32,
     remote_asn: u32,
     pub channel: FnvHashMap<Family, Channel>,
-    /// Confederation Identifier for external AS_PATH loop detection (0 = disabled).
-    confederation_id: u32,
 }
 
 impl PeerCodec {
@@ -2349,43 +2339,6 @@ impl PeerCodec {
                             attr_flags: Attribute::FLAG_TRANSITIVE,
                         });
                     }
-
-                    if error_attrs.is_empty() {
-                        let as_path = &attr[*seen.get(&Attribute::AS_PATH).unwrap()];
-                        match as_path.as_path_count(self.local_asn) {
-                            Ok(v) => {
-                                if v > 0 {
-                                    error_attrs.push(AttributeError {
-                                        attr_code: Attribute::AS_PATH,
-                                        attr_flags: Attribute::FLAG_TRANSITIVE,
-                                    });
-                                }
-                            }
-                            Err(_) => error_attrs.push(AttributeError {
-                                attr_code: Attribute::AS_PATH,
-                                attr_flags: Attribute::FLAG_TRANSITIVE,
-                            }),
-                        }
-                        if error_attrs.is_empty()
-                            && self.confederation_id != 0
-                            && self.confederation_id != self.local_asn
-                        {
-                            match as_path.as_path_count(self.confederation_id) {
-                                Ok(v) => {
-                                    if v > 0 {
-                                        error_attrs.push(AttributeError {
-                                            attr_code: Attribute::AS_PATH,
-                                            attr_flags: Attribute::FLAG_TRANSITIVE,
-                                        });
-                                    }
-                                }
-                                Err(_) => error_attrs.push(AttributeError {
-                                    attr_code: Attribute::AS_PATH,
-                                    attr_flags: Attribute::FLAG_TRANSITIVE,
-                                }),
-                            }
-                        }
-                    }
                 }
 
                 if c.position() != attr_end {
@@ -2718,55 +2671,6 @@ mod confed_as_path_tests {
         data.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SET, &[65050]));
         let result = as_path(data).as_path_strip_confed();
         assert!(result.binary().unwrap().is_empty());
-    }
-
-    /// Build a minimal BGP UPDATE message (including 19-byte header) whose
-    /// AS_PATH contains `asn` in an AS_SEQUENCE segment.
-    fn update_msg_with_asn_in_path(asn: u32) -> Vec<u8> {
-        let origin: [u8; 4] = [0x40, 0x01, 0x01, 0x00]; // ORIGIN IGP
-        let asn_b = asn.to_be_bytes();
-        let as_path_attr: [u8; 9] = [
-            0x40, 0x02, 0x06, // transitive, AS_PATH, len=6
-            0x02, 0x01, // AS_SEQUENCE, count=1
-            asn_b[0], asn_b[1], asn_b[2], asn_b[3],
-        ];
-        let nexthop: [u8; 7] = [0x40, 0x03, 0x04, 1, 1, 1, 1]; // NEXT_HOP 1.1.1.1
-        let nlri: [u8; 4] = [24, 10, 0, 1]; // 10.0.1.0/24
-
-        let attr_len = (origin.len() + as_path_attr.len() + nexthop.len()) as u16;
-        let total_len = (19u16 + 2 + 2 + attr_len + nlri.len() as u16).to_be_bytes();
-
-        let mut msg = vec![0xff; 16]; // marker
-        msg.extend_from_slice(&total_len);
-        msg.push(2); // UPDATE
-        msg.extend_from_slice(&[0x00, 0x00]); // withdrawn_len
-        msg.extend_from_slice(&attr_len.to_be_bytes());
-        msg.extend_from_slice(&origin);
-        msg.extend_from_slice(&as_path_attr);
-        msg.extend_from_slice(&nexthop);
-        msg.extend_from_slice(&nlri);
-        msg
-    }
-
-    #[test]
-    fn confederation_id_loop_detected_on_rx() {
-        let confederation_id: u32 = 65000;
-        let mut codec = PeerCodecBuilder::new()
-            .local_asn(65001)
-            .confederation_id(confederation_id)
-            .families(vec![Family::IPV4])
-            .build();
-
-        let msg = update_msg_with_asn_in_path(confederation_id);
-        let result = codec.parse_message(&msg).unwrap();
-        if let ParsedMessage::Update(ParsedUpdate::Routes { error_attrs, .. }) = result {
-            assert!(
-                !error_attrs.is_empty(),
-                "route with confederation_id in AS_PATH must have error"
-            );
-        } else {
-            panic!("expected UPDATE Routes message");
-        }
     }
 }
 

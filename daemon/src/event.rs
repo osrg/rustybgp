@@ -4785,13 +4785,11 @@ impl PeerExportContext {
     /// Build a `PeerCodec` for wire encoding.
     ///
     /// The codec carries only session-level parameters needed for decoding
-    /// (local_asn for iBGP loop detection) and message framing.  All attribute
-    /// transformation is handled by `export_attrs`/`export_nexthop` before
-    /// routes enter `PendingTx`.
+    /// (local_asn for iBGP LOCAL_PREF injection) and message framing.  All
+    /// attribute transformation and loop detection is handled in the daemon.
     fn build_codec(&self) -> bgp::PeerCodec {
         bgp::PeerCodecBuilder::new()
             .local_asn(self.local_asn)
-            .confederation_id(self.confederation_id)
             .build()
     }
 
@@ -5913,6 +5911,19 @@ impl PeerSession {
                                                 }
                                                 Ok(iter) => {
                                                     for msg in iter {
+                                                        if let bgp::Message::Update(bgp::Update::Routes {
+                                                            ref attr,
+                                                            reach: Some(_),
+                                                            ..
+                                                        }) = msg
+                                                            && is_as_loop(
+                                                                attr,
+                                                                self.export_ctx.local_asn,
+                                                                self.export_ctx.confederation_id,
+                                                            )
+                                                        {
+                                                            continue;
+                                                        }
                                                         (*self.counter_rx).sync(&msg);
                                                         let _ = self.rx_msg(global, local_sockaddr, remote_sockaddr, msg).await;
                                                     }
@@ -6183,6 +6194,22 @@ fn rr_reflect_attrs(
         new_attrs.push(a);
     }
     Arc::new(new_attrs)
+}
+
+/// Return `true` when the incoming UPDATE contains the local AS (or confederation
+/// identifier) in AS_PATH, indicating a routing loop (RFC 4271 §9.1.2).
+/// Applies only to route announcements; `confederation_id` of 0 disables the
+/// confederation check.
+fn is_as_loop(attr: &Arc<Vec<bgp::Attribute>>, local_asn: u32, confederation_id: u32) -> bool {
+    let Some(as_path) = attr.iter().find(|a| a.code() == bgp::Attribute::AS_PATH) else {
+        return false;
+    };
+    if as_path.as_path_count(local_asn).is_ok_and(|n| n > 0) {
+        return true;
+    }
+    confederation_id != 0
+        && confederation_id != local_asn
+        && as_path.as_path_count(confederation_id).is_ok_and(|n| n > 0)
 }
 
 /// Return `true` if `source` is an iBGP-learned path (not local, not eBGP).
@@ -11148,5 +11175,54 @@ neighbor-address = "10.0.0.1"
 
         assert_eq!(dests_vrf1.len(), 1, "vrf1 must see its own route");
         assert_eq!(dests_vrf2.len(), 0, "vrf2 must not see vrf1's route");
+    }
+}
+
+#[cfg(test)]
+mod as_loop_tests {
+    use super::*;
+
+    fn as_path_attr(asns: &[u32]) -> bgp::Attribute {
+        let mut data = Vec::new();
+        data.push(bgp::Attribute::AS_PATH_TYPE_SEQ);
+        data.push(asns.len() as u8);
+        for asn in asns {
+            data.extend_from_slice(&asn.to_be_bytes());
+        }
+        bgp::Attribute::new_with_bin(bgp::Attribute::AS_PATH, data).unwrap()
+    }
+
+    fn make_attr(asns: &[u32]) -> Arc<Vec<bgp::Attribute>> {
+        Arc::new(vec![as_path_attr(asns)])
+    }
+
+    #[test]
+    fn loop_detected_when_local_asn_in_path() {
+        assert!(is_as_loop(&make_attr(&[65001, 65002]), 65001, 0));
+    }
+
+    #[test]
+    fn no_loop_when_not_in_path() {
+        assert!(!is_as_loop(&make_attr(&[65002, 65003]), 65001, 0));
+    }
+
+    #[test]
+    fn confederation_loop_detected() {
+        assert!(is_as_loop(&make_attr(&[65000, 65001]), 65001, 65000));
+    }
+
+    #[test]
+    fn confederation_id_equal_to_local_asn_not_double_checked() {
+        // When confederation_id == local_asn, the confederation check is skipped
+        // (it would be redundant with the local_asn check).
+        assert!(!is_as_loop(&make_attr(&[65002]), 65001, 65001));
+    }
+
+    #[test]
+    fn no_as_path_attr_is_not_a_loop() {
+        let attr = Arc::new(vec![
+            bgp::Attribute::new_with_value(bgp::Attribute::ORIGIN, 0).unwrap(),
+        ]);
+        assert!(!is_as_loop(&attr, 65001, 0));
     }
 }
