@@ -1964,12 +1964,8 @@ impl PeerCodec {
                     let pos_attr_len = dst.as_mut().len();
                     dst.put_u16(0);
                     let mut attr_len = 0;
-                    let mut has_as_path = false;
                     for a in &*attrs {
                         if a.flags & Attribute::FLAG_TRANSITIVE > 0 {
-                            if a.code() == Attribute::AS_PATH {
-                                has_as_path = true;
-                            }
                             attr_len += a.encode_wire(dst);
                         }
                     }
@@ -1985,10 +1981,6 @@ impl PeerCodec {
                             Attribute::new_with_bin(Attribute::NEXTHOP, v4.octets().to_vec())
                                 .unwrap();
                         attr_len += nh_attr.encode_wire(dst);
-                    }
-                    let has_nlri = reach.as_ref().is_some_and(|r| !r.entries.is_empty());
-                    if !has_as_path && has_nlri {
-                        attr_len += Attribute::empty_as_path().encode_wire(dst);
                     }
                     // MP_REACH_NLRI (non-IPv4, or IPv4 with RFC 8950 extended nexthop)
                     if let Some(r) = &reach
