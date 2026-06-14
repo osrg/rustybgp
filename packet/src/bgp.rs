@@ -2199,8 +2199,6 @@ impl PeerCodec {
             Message::UPDATE => {
                 const MINIMUM_UPDATE_LENGTH: usize = 23;
                 let malformed = || Notification::UpdateMalformedAttributeList;
-                let reach_family = Family::IPV4;
-                let unreach_family = Family::IPV4;
                 let mut mp_reach_family = Family::IPV4;
                 let mut mp_unreach_family = Family::IPV4;
                 let mut attr = Vec::new();
@@ -2485,7 +2483,7 @@ impl PeerCodec {
                         None
                     } else {
                         Some(ReachNlri {
-                            family: reach_family,
+                            family: Family::IPV4,
                             entries: reach,
                             nexthop: reach_nexthop,
                         })
@@ -2504,7 +2502,7 @@ impl PeerCodec {
                         None
                     } else {
                         Some(UnreachNlri {
-                            family: unreach_family,
+                            family: Family::IPV4,
                             entries: unreach,
                         })
                     },
