@@ -2097,6 +2097,19 @@ impl PeerCodec {
         };
         Nlri::decode(family, c, len).map(|nlri| PathNlri { path_id: id, nlri })
     }
+    fn decode_nlri_list(
+        family: Family,
+        addpath_rx: bool,
+        buf: &[u8],
+    ) -> Result<Vec<PathNlri>, Notification> {
+        let mut reader = BgpReader::<UpdateCtx>::new(buf);
+        let mut entries = Vec::new();
+        while reader.remaining_len() > 0 {
+            let rest = reader.remaining_len();
+            entries.push(Self::decode_nlri(family, addpath_rx, &mut reader, rest)?);
+        }
+        Ok(entries)
+    }
     pub fn parse_message(&mut self, buf: &[u8]) -> Result<ParsedMessage, Notification> {
         if buf.len() < Message::HEADER_LENGTH as usize {
             return Err(Notification::BadMessageLength { data: vec![] });
@@ -2336,35 +2349,30 @@ impl PeerCodec {
                 }
 
                 if (c.position() as usize) < buf.len() {
-                    let state = self.families.get(&Family::IPV4).ok_or_else(malformed)?;
-                    let addpath_rx = state.addpath_rx;
-                    let mut reader = BgpReader::<UpdateCtx>::new(&buf[c.position() as usize..]);
-                    while reader.remaining_len() > 0 {
-                        let rest = reader.remaining_len();
-                        reach.push(Self::decode_nlri(
-                            Family::IPV4,
-                            addpath_rx,
-                            &mut reader,
-                            rest,
-                        )?);
-                    }
+                    let addpath_rx = self
+                        .families
+                        .get(&Family::IPV4)
+                        .ok_or_else(malformed)?
+                        .addpath_rx;
+                    reach = Self::decode_nlri_list(
+                        Family::IPV4,
+                        addpath_rx,
+                        &buf[c.position() as usize..],
+                    )?;
                 }
 
                 if 0 < withdrawn_len {
-                    let state = self.families.get(&Family::IPV4).ok_or_else(malformed)?;
-                    let addpath_rx = state.addpath_rx;
+                    let addpath_rx = self
+                        .families
+                        .get(&Family::IPV4)
+                        .ok_or_else(malformed)?
+                        .addpath_rx;
                     let start = Message::HEADER_LENGTH as usize + 2;
-                    let mut reader =
-                        BgpReader::<UpdateCtx>::new(&buf[start..start + withdrawn_len as usize]);
-                    while reader.remaining_len() > 0 {
-                        let rest = reader.remaining_len();
-                        unreach.push(Self::decode_nlri(
-                            Family::IPV4,
-                            addpath_rx,
-                            &mut reader,
-                            rest,
-                        )?);
-                    }
+                    unreach = Self::decode_nlri_list(
+                        Family::IPV4,
+                        addpath_rx,
+                        &buf[start..start + withdrawn_len as usize],
+                    )?;
                 }
 
                 if let Some(a) = mp_reach_attr {
@@ -2418,16 +2426,11 @@ impl PeerCodec {
                         _ => return Err(err),
                     }
                     c.read_u8().unwrap();
-                    let mut reader = BgpReader::<UpdateCtx>::new(&buf[c.position() as usize..]);
-                    while reader.remaining_len() > 0 {
-                        let rest = reader.remaining_len();
-                        mp_reach_entries.push(Self::decode_nlri(
-                            mp_reach_family,
-                            mp_reach_addpath_rx,
-                            &mut reader,
-                            rest,
-                        )?);
-                    }
+                    mp_reach_entries = Self::decode_nlri_list(
+                        mp_reach_family,
+                        mp_reach_addpath_rx,
+                        &buf[c.position() as usize..],
+                    )?;
                 }
 
                 let mp_unreach: Option<(Family, Vec<PathNlri>)> = if let Some(a) = mp_unreach_attr {
@@ -2445,12 +2448,8 @@ impl PeerCodec {
                     let safi = c.read_u8().unwrap();
                     let family = Family((afi as u32) << 16 | safi as u32);
                     let addpath_rx = self.families.get(&family).ok_or_else(malformed)?.addpath_rx;
-                    let mut entries = Vec::new();
-                    let mut reader = BgpReader::<UpdateCtx>::new(&buf[c.position() as usize..]);
-                    while reader.remaining_len() > 0 {
-                        let rest = reader.remaining_len();
-                        entries.push(Self::decode_nlri(family, addpath_rx, &mut reader, rest)?);
-                    }
+                    let entries =
+                        Self::decode_nlri_list(family, addpath_rx, &buf[c.position() as usize..])?;
                     Some((family, entries))
                 } else {
                     None
