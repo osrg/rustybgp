@@ -2468,33 +2468,21 @@ impl PeerCodec {
                 }
 
                 Ok(ParsedMessage::Update(ParsedUpdate::Routes {
-                    reach: if reach.is_empty() {
-                        None
-                    } else {
-                        Some(ReachNlri {
-                            family: Family::IPV4,
-                            entries: reach,
-                            nexthop: reach_nexthop,
-                        })
-                    },
-                    mp_reach: if mp_reach_entries.is_empty() {
-                        None
-                    } else {
-                        Some(ReachNlri {
-                            family: mp_reach_family,
-                            entries: mp_reach_entries,
-                            nexthop: mp_nexthop,
-                        })
-                    },
+                    reach: (!reach.is_empty()).then_some(ReachNlri {
+                        family: Family::IPV4,
+                        entries: reach,
+                        nexthop: reach_nexthop,
+                    }),
+                    mp_reach: (!mp_reach_entries.is_empty()).then_some(ReachNlri {
+                        family: mp_reach_family,
+                        entries: mp_reach_entries,
+                        nexthop: mp_nexthop,
+                    }),
                     attrs: attr,
-                    unreach: if unreach.is_empty() {
-                        None
-                    } else {
-                        Some(UnreachNlri {
-                            family: Family::IPV4,
-                            entries: unreach,
-                        })
-                    },
+                    unreach: (!unreach.is_empty()).then_some(UnreachNlri {
+                        family: Family::IPV4,
+                        entries: unreach,
+                    }),
                     mp_unreach: mp_unreach
                         .filter(|(_, entries)| !entries.is_empty())
                         .map(|(family, entries)| UnreachNlri { family, entries }),
