@@ -24,10 +24,7 @@ use std::sync::Arc;
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn ipv4_codec() -> rustybgp_packet::bgp::PeerCodec {
-    PeerCodecBuilder::new()
-        .local_asn(65001)
-        .families(vec![Family::IPV4])
-        .build()
+    PeerCodecBuilder::new().families(vec![Family::IPV4]).build()
 }
 
 fn ipv4_prefix(addr: &str, mask: u8) -> PathNlri {

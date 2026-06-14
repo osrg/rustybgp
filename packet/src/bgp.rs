@@ -1700,7 +1700,6 @@ pub fn create_channel(
 }
 
 pub struct PeerCodecBuilder {
-    local_asn: u32,
     remote_asn: u32,
     extended_length: bool,
     family: Vec<Family>,
@@ -1715,7 +1714,6 @@ impl Default for PeerCodecBuilder {
 impl PeerCodecBuilder {
     pub fn new() -> Self {
         PeerCodecBuilder {
-            local_asn: 0,
             remote_asn: 0,
             extended_length: false,
             family: Vec::new(),
@@ -1729,16 +1727,10 @@ impl PeerCodecBuilder {
             .map(|f| (*f, Channel::new(*f, false, false)))
             .collect();
         PeerCodec {
-            local_asn: self.local_asn,
             remote_asn: self.remote_asn,
             extended_length: self.extended_length,
             channel,
         }
-    }
-
-    pub fn local_asn(&mut self, asn: u32) -> &mut Self {
-        self.local_asn = asn;
-        self
     }
 
     pub fn families(&mut self, v: Vec<Family>) -> &mut Self {
@@ -1749,7 +1741,6 @@ impl PeerCodecBuilder {
 
 pub struct PeerCodec {
     extended_length: bool,
-    local_asn: u32,
     remote_asn: u32,
     pub channel: FnvHashMap<Family, Channel>,
 }
@@ -1761,10 +1752,6 @@ impl PeerCodec {
         } else {
             Message::MAX_LENGTH
         }
-    }
-
-    fn is_ibgp(&self) -> bool {
-        self.local_asn == self.remote_asn
     }
 
     fn mp_reach_encode<B: BufMut + AsMut<[u8]>>(
@@ -2367,17 +2354,6 @@ impl PeerCodec {
                         let rest = reader.remaining_len();
                         unreach.push(self.decode_nlri(chan, &mut reader, rest)?);
                     }
-                }
-
-                if attr_len > 0 && !seen.contains_key(&Attribute::LOCAL_PREF) && self.is_ibgp() {
-                    unsorted = true;
-                    attr.push(
-                        Attribute::new_with_value(
-                            Attribute::LOCAL_PREF,
-                            Attribute::DEFAULT_LOCAL_PREF,
-                        )
-                        .unwrap(),
-                    );
                 }
 
                 if unsorted {

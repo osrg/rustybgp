@@ -4784,13 +4784,10 @@ struct PeerExportContext {
 impl PeerExportContext {
     /// Build a `PeerCodec` for wire encoding.
     ///
-    /// The codec carries only session-level parameters needed for decoding
-    /// (local_asn for iBGP LOCAL_PREF injection) and message framing.  All
-    /// attribute transformation and loop detection is handled in the daemon.
+    /// The codec handles only wire framing; all attribute transformation and
+    /// loop detection is handled in the daemon.
     fn build_codec(&self) -> bgp::PeerCodec {
-        bgp::PeerCodecBuilder::new()
-            .local_asn(self.local_asn)
-            .build()
+        bgp::PeerCodecBuilder::new().build()
     }
 
     /// Apply per-peer attribute transformation to outgoing route attributes.
@@ -5626,6 +5623,16 @@ impl PeerSession {
                 return false;
             }
         }
+        // Inject default LOCAL_PREF for iBGP announcements that omit it.
+        let attr = if reach.is_some()
+            && matches!(
+                self.export_ctx.role,
+                PeerRole::Ibgp | PeerRole::IbgpRrClient
+            ) {
+            inject_local_pref_if_absent(attr)
+        } else {
+            attr
+        };
         if let Some(s) = reach {
             let family = s.family;
             let nexthop = s.nexthop;
@@ -6210,6 +6217,32 @@ fn is_as_loop(attr: &Arc<Vec<bgp::Attribute>>, local_asn: u32, confederation_id:
     confederation_id != 0
         && confederation_id != local_asn
         && as_path.as_path_count(confederation_id).is_ok_and(|n| n > 0)
+}
+
+/// Inject LOCAL_PREF with the default value when it is absent from `attr`.
+///
+/// RFC 4271 §5.1.5 requires LOCAL_PREF on iBGP UPDATE announcements, but
+/// some implementations omit it.  Inject the default (100) so the RIB
+/// always has a LOCAL_PREF for iBGP paths.  Returns the original `Arc`
+/// unchanged when LOCAL_PREF is already present (no allocation).
+fn inject_local_pref_if_absent(attr: Arc<Vec<packet::Attribute>>) -> Arc<Vec<packet::Attribute>> {
+    if attr
+        .iter()
+        .any(|a| a.code() == packet::Attribute::LOCAL_PREF)
+    {
+        return attr;
+    }
+    let mut new_attr: Vec<packet::Attribute> = (*attr).clone();
+    let pos = new_attr.partition_point(|a| a.code() < packet::Attribute::LOCAL_PREF);
+    new_attr.insert(
+        pos,
+        packet::Attribute::new_with_value(
+            packet::Attribute::LOCAL_PREF,
+            packet::Attribute::DEFAULT_LOCAL_PREF,
+        )
+        .unwrap(),
+    );
+    Arc::new(new_attr)
 }
 
 /// Return `true` if `source` is an iBGP-learned path (not local, not eBGP).
@@ -11224,5 +11257,70 @@ mod as_loop_tests {
             bgp::Attribute::new_with_value(bgp::Attribute::ORIGIN, 0).unwrap(),
         ]);
         assert!(!is_as_loop(&attr, 65001, 0));
+    }
+}
+
+#[cfg(test)]
+mod local_pref_tests {
+    use super::*;
+
+    fn attr_with_codes(codes: &[u8]) -> Arc<Vec<packet::Attribute>> {
+        Arc::new(
+            codes
+                .iter()
+                .map(|&code| packet::Attribute::new_with_value(code, 0).unwrap())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn injects_default_when_absent() {
+        let attr = attr_with_codes(&[packet::Attribute::ORIGIN]);
+        let result = inject_local_pref_if_absent(attr);
+        let lp = result
+            .iter()
+            .find(|a| a.code() == packet::Attribute::LOCAL_PREF);
+        assert!(lp.is_some());
+        assert_eq!(
+            lp.unwrap().value().unwrap(),
+            packet::Attribute::DEFAULT_LOCAL_PREF
+        );
+    }
+
+    #[test]
+    fn preserves_existing_local_pref() {
+        let attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+            packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
+        ]);
+        let result = inject_local_pref_if_absent(Arc::clone(&attr));
+        assert!(Arc::ptr_eq(&result, &attr), "must return the same Arc");
+        let lp = result
+            .iter()
+            .find(|a| a.code() == packet::Attribute::LOCAL_PREF);
+        assert_eq!(lp.unwrap().value().unwrap(), 200);
+    }
+
+    #[test]
+    fn insertion_preserves_attribute_order() {
+        // ORIGIN(1), AS_PATH(2) — LOCAL_PREF(5) must be inserted in code order.
+        let attr = attr_with_codes(&[packet::Attribute::ORIGIN, packet::Attribute::AS_PATH]);
+        let result = inject_local_pref_if_absent(attr);
+        let codes: Vec<u8> = result.iter().map(|a| a.code()).collect();
+        assert!(
+            codes.windows(2).all(|w| w[0] <= w[1]),
+            "attributes out of order: {codes:?}"
+        );
+        assert!(codes.contains(&packet::Attribute::LOCAL_PREF));
+    }
+
+    #[test]
+    fn no_allocation_when_already_present() {
+        // Arc::ptr_eq confirms inject_local_pref_if_absent returns the original Arc.
+        let attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 100).unwrap(),
+        ]);
+        let result = inject_local_pref_if_absent(Arc::clone(&attr));
+        assert!(Arc::ptr_eq(&result, &attr));
     }
 }
