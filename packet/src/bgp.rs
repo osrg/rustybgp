@@ -1798,19 +1798,18 @@ impl PeerCodec {
         // nexthop.  VPN families prefix the nexthop with an 8-byte zero RD (RFC 4364
         // §4.3.2); other families pad IPv4 to 16 bytes for MP_REACH.
         let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
-        let padded = if matches!(family, &Family::IPV4_VPN | &Family::IPV6_VPN) {
-            let mut v = vec![0u8; 8];
-            v.extend_from_slice(&nh_bytes);
-            v
+        if matches!(family, &Family::IPV4_VPN | &Family::IPV6_VPN) {
+            dst.put_u8(8 + nh_bytes.len() as u8);
+            dst.put_bytes(0, 8); // 8-byte zero RD (RFC 4364 §4.3.2)
+            dst.put_slice(&nh_bytes);
         } else if nh_bytes.len() < 16 {
-            let mut v = vec![0u8; 16];
-            v[..nh_bytes.len()].copy_from_slice(&nh_bytes);
-            v
+            dst.put_u8(16);
+            dst.put_slice(&nh_bytes);
+            dst.put_bytes(0, 16 - nh_bytes.len()); // pad to 16 bytes
         } else {
-            nh_bytes
-        };
-        dst.put_u8(padded.len() as u8);
-        dst.put_slice(&padded);
+            dst.put_u8(nh_bytes.len() as u8);
+            dst.put_slice(&nh_bytes);
+        }
         // SNPA padding
         dst.put_u8(0);
         let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
