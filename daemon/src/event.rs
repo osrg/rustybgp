@@ -3845,13 +3845,20 @@ impl Global {
 
     fn add_peer(
         &mut self,
-        params: PeerParams,
+        mut params: PeerParams,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
     ) -> std::result::Result<(), Error> {
         if self.peers.contains_key(&params.remote_addr) {
             return Err(Error::AlreadyExists(
                 "peer address already exists".to_string(),
             ));
+        }
+        // RFC 5065 §4: external peers see the confederation identifier as the
+        // local AS number in OPEN messages, not the member-AS number.
+        if let Some(conf) = &self.confederation
+            && !conf.members.contains(&params.expected_remote_asn)
+        {
+            params.local_asn = conf.id;
         }
         let mut peer = params.build(u32::from(self.router_id), self.asn);
         if peer.admin_down {
@@ -6769,6 +6776,33 @@ mod tests {
             session.unwrap().export_ctx.role,
             PeerRole::Ebgp,
             "peer outside confederation must remain Ebgp"
+        );
+    }
+
+    #[test]
+    fn external_peer_gets_confederation_id_as_local_asn() {
+        // RFC 5065 §4: OPEN my_as for non-member peers must be confederation id.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx);
+        g.asn = 65001;
+        g.router_id = Ipv4Addr::new(1, 0, 0, 1);
+        g.confederation = Some(ConfederationConfig {
+            id: 65000,
+            members: [65001, 65002].into_iter().collect(),
+        });
+        let addr: IpAddr = "127.0.0.1".parse().unwrap();
+        g.add_peer(
+            PeerParams {
+                expected_remote_asn: 65100,
+                ..default_peer_params(addr)
+            },
+            None,
+        )
+        .unwrap();
+        let peer = g.peers.get(&addr).unwrap();
+        assert_eq!(
+            peer.config.local_asn, 65000,
+            "external peer must advertise confederation id in OPEN"
         );
     }
 
