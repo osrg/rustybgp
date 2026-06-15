@@ -2607,11 +2607,18 @@ impl GoBgpService for GrpcService {
                     .map_err(|_| {
                         tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
                     })?,
-                api::TableType::AdjOut => IpAddr::from_str(&request.name)
-                    .map(table::TableQuery::AdjOut)
-                    .map_err(|_| {
+                api::TableType::AdjOut => {
+                    let peer_addr = IpAddr::from_str(&request.name).map_err(|_| {
                         tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
-                    })?,
+                    })?;
+                    let global = self.global.read().await;
+                    let dest_is_rs_client = global
+                        .peers
+                        .get(&peer_addr)
+                        .map(|p| p.config.route_server_client)
+                        .unwrap_or(false);
+                    table::TableQuery::AdjOut(peer_addr, dest_is_rs_client)
+                }
             }
         } else {
             return Err(tonic::Status::new(

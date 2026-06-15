@@ -112,8 +112,9 @@ pub enum TableQuery {
     /// Adj-RIB-In for the given peer: all paths received from that peer.
     AdjIn(IpAddr),
     /// Adj-RIB-Out for the given peer: best paths that would be sent to that peer,
-    /// with export attribute transformations applied.
-    AdjOut(IpAddr),
+    /// with export attribute transformations applied.  The bool is true when the
+    /// destination peer is an RS client (used to apply RS isolation).
+    AdjOut(IpAddr, bool),
     /// Route Server local-RIB view for the given RS client: the best path
     /// from all RS-client peers excluding `peer` itself, with pre-import-policy
     /// attributes (equivalent to GoBGP TABLE_TYPE_LOCAL with an RS client address).
@@ -920,6 +921,7 @@ impl Table {
     fn adj_out_paths(
         dst: &Destination,
         peer: IpAddr,
+        dest_is_rs_client: bool,
         net: packet::Nlri,
         _family: Family,
         export_policy: Option<&PolicyAssignment>,
@@ -927,7 +929,11 @@ impl Table {
         let best = dst.unfiltered_best().map(|p| p as *const RibEntry);
         dst.entry
             .iter()
-            .filter(|p| Some(*p as *const RibEntry) == best && p.path.source.remote_addr != peer)
+            .filter(|p| {
+                Some(*p as *const RibEntry) == best
+                    && p.path.source.remote_addr != peer
+                    && p.path.source.is_rs_client() == dest_is_rs_client
+            })
             .filter_map(|p| {
                 // Apply per-peer AS_PATH transformation for the Adj-RIB-Out view.
                 // RS clients keep the original AS_PATH; other peers get local_asn prepended.
@@ -1004,9 +1010,10 @@ impl Table {
                 let paths = match query {
                     TableQuery::Global => Self::global_paths(dst, enable_filtered),
                     TableQuery::AdjIn(peer) => Self::adj_in_paths(dst, peer, enable_filtered),
-                    TableQuery::AdjOut(peer) => Self::adj_out_paths(
+                    TableQuery::AdjOut(peer, dest_is_rs_client) => Self::adj_out_paths(
                         dst,
                         peer,
+                        dest_is_rs_client,
                         net.clone(),
                         family,
                         export_policy.as_deref(),
@@ -3819,7 +3826,7 @@ mod tests {
         let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
         let dsts: Vec<_> = rt
             .destinations(
-                TableQuery::AdjOut(peer_addr),
+                TableQuery::AdjOut(peer_addr, false),
                 Family::IPV4,
                 vec![],
                 None,
@@ -3854,7 +3861,7 @@ mod tests {
         let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
         let dsts: Vec<_> = rt
             .destinations(
-                TableQuery::AdjOut(peer_addr),
+                TableQuery::AdjOut(peer_addr, false),
                 Family::IPV4,
                 vec![],
                 None,
@@ -3863,6 +3870,129 @@ mod tests {
             .collect();
         // no unfiltered best → destination should be filtered out
         assert!(dsts.is_empty());
+    }
+
+    // --- adj_out RS isolation ---
+
+    fn rs_source_for_adj_out(addr: u8, remote_asn: u32) -> Arc<Source> {
+        Arc::new(Source::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, addr)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
+            remote_asn,
+            65000,
+            Ipv4Addr::new(0, 0, 0, addr),
+            true, // rs_client
+            false,
+        ))
+    }
+
+    #[test]
+    fn adj_out_rs_client_does_not_receive_non_rs_client_path() {
+        // A route learned from a regular eBGP peer must not be sent to an RS client.
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 1, 0, 24);
+        let regular_peer = source(1, 65100, 65000, 1); // rs_client=false
+        rt.insert(
+            regular_peer.clone(),
+            Family::IPV4,
+            net.clone(),
+            0,
+            nh(),
+            attrs_with_local_pref(100),
+            None,
+            false,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+        let rs_client_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        // dest_is_rs_client=true → RS isolation must suppress the non-RS-client route
+        let dsts: Vec<_> = rt
+            .destinations(
+                TableQuery::AdjOut(rs_client_addr, true),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
+            .collect();
+        assert!(
+            dsts.is_empty(),
+            "non-RS-client route must not reach RS-client peer"
+        );
+    }
+
+    #[test]
+    fn adj_out_non_rs_client_does_not_receive_rs_client_path() {
+        // A route learned from an RS client must not be sent to a regular eBGP peer.
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 1, 0, 24);
+        let rs_peer = rs_source_for_adj_out(1, 65001); // rs_client=true
+        rt.insert(
+            rs_peer.clone(),
+            Family::IPV4,
+            net.clone(),
+            0,
+            nh(),
+            attrs_with_local_pref(100),
+            None,
+            false,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+        let regular_peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
+        // dest_is_rs_client=false → RS isolation must suppress the RS-client route
+        let dsts: Vec<_> = rt
+            .destinations(
+                TableQuery::AdjOut(regular_peer_addr, false),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
+            .collect();
+        assert!(
+            dsts.is_empty(),
+            "RS-client route must not reach non-RS-client peer"
+        );
+    }
+
+    #[test]
+    fn adj_out_rs_client_receives_rs_client_path() {
+        // A route learned from an RS client must be sent to another RS client (same isolation group).
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 1, 0, 24);
+        let rs_peer = rs_source_for_adj_out(1, 65001); // rs_client=true
+        rt.insert(
+            rs_peer.clone(),
+            Family::IPV4,
+            net.clone(),
+            0,
+            nh(),
+            attrs_with_local_pref(100),
+            None,
+            false,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+        let other_rs_client_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        // dest_is_rs_client=true → same isolation group, route must be visible
+        let dsts: Vec<_> = rt
+            .destinations(
+                TableQuery::AdjOut(other_rs_client_addr, true),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
+            .collect();
+        assert_eq!(
+            dsts.len(),
+            1,
+            "RS-client route must reach other RS-client peer"
+        );
     }
 
     // --- state() counts ---
@@ -5017,7 +5147,13 @@ mod tests {
         // Ask for what would be sent to s1; the best path (from s2) should be returned.
         let peer1 = s1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(TableQuery::AdjOut(peer1), Family::IPV4, vec![], None, false)
+            .destinations(
+                TableQuery::AdjOut(peer1, false),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
             .collect();
 
         assert_eq!(dests.len(), 1);
@@ -5035,7 +5171,13 @@ mod tests {
 
         let peer1 = s1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(TableQuery::AdjOut(peer1), Family::IPV4, vec![], None, false)
+            .destinations(
+                TableQuery::AdjOut(peer1, false),
+                Family::IPV4,
+                vec![],
+                None,
+                false,
+            )
             .collect();
 
         // The only path came from peer1, so nothing would be sent back to it.

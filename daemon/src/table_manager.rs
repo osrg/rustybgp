@@ -509,7 +509,7 @@ impl TableManager {
         prefixes: Vec<table::PrefixFilter>,
         enable_filtered: bool,
     ) -> Vec<table::DestinationEntry> {
-        let export_policy = if matches!(query, table::TableQuery::AdjOut(_)) {
+        let export_policy = if matches!(query, table::TableQuery::AdjOut(..)) {
             self.export_policy.load_full()
         } else {
             None
