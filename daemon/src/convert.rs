@@ -19,7 +19,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use rustybgp_packet::{
-    Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, mup, prefix_sid, rd::RouteDistinguisher,
+    Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, flowspec, mup, prefix_sid,
+    rd::RouteDistinguisher,
 };
 
 use regex::Regex;
@@ -34,6 +35,153 @@ pub(crate) fn family_to_api(f: Family) -> api::Family {
         afi: f.afi() as i32,
         safi: f.safi() as i32,
     }
+}
+
+fn ops_to_api(ops: &[flowspec::Op]) -> Vec<api::FlowSpecComponentItem> {
+    ops.iter()
+        .map(|op| api::FlowSpecComponentItem {
+            op: op.bits as u32,
+            value: op.value,
+        })
+        .collect()
+}
+
+fn flowspec_v4_to_rules(components: &[flowspec::FlowspecV4Component]) -> Vec<api::FlowSpecRule> {
+    use flowspec::FlowspecV4Component as C;
+    components
+        .iter()
+        .map(|c| {
+            let rule = match c {
+                C::DstPrefix(net) => api::flow_spec_rule::Rule::IpPrefix(api::FlowSpecIpPrefix {
+                    r#type: 1,
+                    prefix_len: net.mask as u32,
+                    prefix: net.addr.to_string(),
+                    offset: 0,
+                }),
+                C::SrcPrefix(net) => api::flow_spec_rule::Rule::IpPrefix(api::FlowSpecIpPrefix {
+                    r#type: 2,
+                    prefix_len: net.mask as u32,
+                    prefix: net.addr.to_string(),
+                    offset: 0,
+                }),
+                C::Protocol(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 3,
+                    items: ops_to_api(ops),
+                }),
+                C::Port(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 4,
+                    items: ops_to_api(ops),
+                }),
+                C::DstPort(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 5,
+                    items: ops_to_api(ops),
+                }),
+                C::SrcPort(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 6,
+                    items: ops_to_api(ops),
+                }),
+                C::IcmpType(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 7,
+                    items: ops_to_api(ops),
+                }),
+                C::IcmpCode(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 8,
+                    items: ops_to_api(ops),
+                }),
+                C::TcpFlags(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 9,
+                    items: ops_to_api(ops),
+                }),
+                C::PacketLen(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 10,
+                    items: ops_to_api(ops),
+                }),
+                C::Dscp(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 11,
+                    items: ops_to_api(ops),
+                }),
+                C::Fragment(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 12,
+                    items: ops_to_api(ops),
+                }),
+            };
+            api::FlowSpecRule { rule: Some(rule) }
+        })
+        .collect()
+}
+
+fn flowspec_v6_to_rules(components: &[flowspec::FlowspecV6Component]) -> Vec<api::FlowSpecRule> {
+    use flowspec::FlowspecV6Component as C;
+    components
+        .iter()
+        .map(|c| {
+            let rule = match c {
+                C::DstPrefix { prefix, offset } => {
+                    api::flow_spec_rule::Rule::IpPrefix(api::FlowSpecIpPrefix {
+                        r#type: 1,
+                        prefix_len: prefix.mask as u32,
+                        prefix: prefix.addr.to_string(),
+                        offset: *offset as u32,
+                    })
+                }
+                C::SrcPrefix { prefix, offset } => {
+                    api::flow_spec_rule::Rule::IpPrefix(api::FlowSpecIpPrefix {
+                        r#type: 2,
+                        prefix_len: prefix.mask as u32,
+                        prefix: prefix.addr.to_string(),
+                        offset: *offset as u32,
+                    })
+                }
+                C::NextHeader(ops) => {
+                    api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                        r#type: 3,
+                        items: ops_to_api(ops),
+                    })
+                }
+                C::Port(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 4,
+                    items: ops_to_api(ops),
+                }),
+                C::DstPort(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 5,
+                    items: ops_to_api(ops),
+                }),
+                C::SrcPort(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 6,
+                    items: ops_to_api(ops),
+                }),
+                C::IcmpType(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 7,
+                    items: ops_to_api(ops),
+                }),
+                C::IcmpCode(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 8,
+                    items: ops_to_api(ops),
+                }),
+                C::TcpFlags(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 9,
+                    items: ops_to_api(ops),
+                }),
+                C::PacketLen(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 10,
+                    items: ops_to_api(ops),
+                }),
+                C::Dscp(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 11,
+                    items: ops_to_api(ops),
+                }),
+                C::Fragment(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 12,
+                    items: ops_to_api(ops),
+                }),
+                C::FlowLabel(ops) => api::flow_spec_rule::Rule::Component(api::FlowSpecComponent {
+                    r#type: 13,
+                    items: ops_to_api(ops),
+                }),
+            };
+            api::FlowSpecRule { rule: Some(rule) }
+        })
+        .collect()
 }
 
 pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
@@ -91,10 +239,28 @@ pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
                 },
             )),
         },
-        Nlri::FlowspecV4(_)
-        | Nlri::FlowspecV6(_)
-        | Nlri::FlowspecVpnV4(_)
-        | Nlri::FlowspecVpnV6(_) => api::Nlri { nlri: None },
+        Nlri::FlowspecV4(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::FlowSpec(api::FlowSpecNlri {
+                rules: flowspec_v4_to_rules(&n.components),
+            })),
+        },
+        Nlri::FlowspecV6(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::FlowSpec(api::FlowSpecNlri {
+                rules: flowspec_v6_to_rules(&n.components),
+            })),
+        },
+        Nlri::FlowspecVpnV4(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::VpnFlowSpec(api::VpnFlowSpecNlri {
+                rd: Some(rd_to_api(&n.rd)),
+                rules: flowspec_v4_to_rules(&n.components),
+            })),
+        },
+        Nlri::FlowspecVpnV6(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::VpnFlowSpec(api::VpnFlowSpecNlri {
+                rd: Some(rd_to_api(&n.rd)),
+                rules: flowspec_v6_to_rules(&n.components),
+            })),
+        },
     }
 }
 
@@ -604,11 +770,15 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
     }
 }
 
-/// Type byte category masks (RFC 4360 §2, RFC 5668 §2).
+/// Type byte category masks (RFC 4360 §2, RFC 5668 §2, RFC 7153 §2).
 const EXTCOM_TYPE_NON_TRANSITIVE: u8 = 0x40;
 const EXTCOM_TYPE_TWO_OCTET_AS: u8 = 0x00;
 const EXTCOM_TYPE_IPV4_ADDRESS: u8 = 0x01;
 const EXTCOM_TYPE_FOUR_OCTET_AS: u8 = 0x02;
+/// Generic Transitive Experimental Use (RFC 7153 §4): sub-types 0x06-0x09 are Flowspec actions.
+const EXTCOM_TYPE_GENERIC_TRANSITIVE: u8 = 0x80;
+const EXTCOM_TYPE_GENERIC_TRANSITIVE_IPV4: u8 = 0x81;
+const EXTCOM_TYPE_GENERIC_TRANSITIVE_4OCTET_AS: u8 = 0x82;
 
 fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
     let start = c.position() as usize;
@@ -656,6 +826,85 @@ fn read_extcom(c: &mut Cursor<&Vec<u8>>) -> api::ExtendedCommunity {
                 segment_id4,
             })
         }
+        EXTCOM_TYPE_GENERIC_TRANSITIVE => match sub_type {
+            0x06 => {
+                let asn = c.read_u16::<NetworkEndian>().unwrap() as u32;
+                let rate = f32::from_bits(c.read_u32::<NetworkEndian>().unwrap());
+                api::extended_community::Extcom::TrafficRate(api::TrafficRateExtended { asn, rate })
+            }
+            0x07 => {
+                for _ in 0..5 {
+                    c.read_u8().unwrap();
+                }
+                let flags = c.read_u8().unwrap();
+                api::extended_community::Extcom::TrafficAction(api::TrafficActionExtended {
+                    terminal: flags & 0x01 != 0,
+                    sample: flags & 0x02 != 0,
+                })
+            }
+            0x08 => {
+                let asn = c.read_u16::<NetworkEndian>().unwrap() as u32;
+                let local_admin = c.read_u32::<NetworkEndian>().unwrap();
+                api::extended_community::Extcom::RedirectTwoOctetAsSpecific(
+                    api::RedirectTwoOctetAsSpecificExtended { asn, local_admin },
+                )
+            }
+            0x09 => {
+                for _ in 0..5 {
+                    c.read_u8().unwrap();
+                }
+                let dscp = c.read_u8().unwrap() as u32 & 0x3F;
+                api::extended_community::Extcom::TrafficRemark(api::TrafficRemarkExtended { dscp })
+            }
+            _ => {
+                let buf = c.get_ref();
+                let value = buf[start..start + 8].to_vec();
+                c.set_position((start + 8) as u64);
+                api::extended_community::Extcom::Unknown(api::UnknownExtended {
+                    r#type: type_high as u32,
+                    value,
+                })
+            }
+        },
+        EXTCOM_TYPE_GENERIC_TRANSITIVE_IPV4 => match sub_type {
+            0x08 => {
+                let addr = Ipv4Addr::from(c.read_u32::<NetworkEndian>().unwrap());
+                let local_admin = c.read_u16::<NetworkEndian>().unwrap() as u32;
+                api::extended_community::Extcom::RedirectIpv4AddressSpecific(
+                    api::RedirectIPv4AddressSpecificExtended {
+                        address: addr.to_string(),
+                        local_admin,
+                    },
+                )
+            }
+            _ => {
+                let buf = c.get_ref();
+                let value = buf[start..start + 8].to_vec();
+                c.set_position((start + 8) as u64);
+                api::extended_community::Extcom::Unknown(api::UnknownExtended {
+                    r#type: type_high as u32,
+                    value,
+                })
+            }
+        },
+        EXTCOM_TYPE_GENERIC_TRANSITIVE_4OCTET_AS => match sub_type {
+            0x08 => {
+                let asn = c.read_u32::<NetworkEndian>().unwrap();
+                let local_admin = c.read_u16::<NetworkEndian>().unwrap() as u32;
+                api::extended_community::Extcom::RedirectFourOctetAsSpecific(
+                    api::RedirectFourOctetAsSpecificExtended { asn, local_admin },
+                )
+            }
+            _ => {
+                let buf = c.get_ref();
+                let value = buf[start..start + 8].to_vec();
+                c.set_position((start + 8) as u64);
+                api::extended_community::Extcom::Unknown(api::UnknownExtended {
+                    r#type: type_high as u32,
+                    value,
+                })
+            }
+        },
         _ => {
             // Copy the full 8-byte chunk so the unknown extcom round-trips.
             let buf = c.get_ref();
@@ -730,6 +979,56 @@ fn write_extcom(c: &mut Cursor<Vec<u8>>, com: api::ExtendedCommunity) -> Result<
                 )));
             }
             c.write_all(&u.value).unwrap();
+        }
+        api::extended_community::Extcom::TrafficRate(t) => {
+            c.write_u8(EXTCOM_TYPE_GENERIC_TRANSITIVE).unwrap();
+            c.write_u8(0x06).unwrap();
+            c.write_u16::<NetworkEndian>(ensure_u16("asn", t.asn)?)
+                .unwrap();
+            c.write_u32::<NetworkEndian>(t.rate.to_bits()).unwrap();
+        }
+        api::extended_community::Extcom::TrafficAction(t) => {
+            c.write_u8(EXTCOM_TYPE_GENERIC_TRANSITIVE).unwrap();
+            c.write_u8(0x07).unwrap();
+            for _ in 0..5 {
+                c.write_u8(0).unwrap();
+            }
+            let flags = u8::from(t.terminal) | (u8::from(t.sample) << 1);
+            c.write_u8(flags).unwrap();
+        }
+        api::extended_community::Extcom::RedirectTwoOctetAsSpecific(t) => {
+            c.write_u8(EXTCOM_TYPE_GENERIC_TRANSITIVE).unwrap();
+            c.write_u8(0x08).unwrap();
+            c.write_u16::<NetworkEndian>(ensure_u16("asn", t.asn)?)
+                .unwrap();
+            c.write_u32::<NetworkEndian>(t.local_admin).unwrap();
+        }
+        api::extended_community::Extcom::TrafficRemark(t) => {
+            c.write_u8(EXTCOM_TYPE_GENERIC_TRANSITIVE).unwrap();
+            c.write_u8(0x09).unwrap();
+            for _ in 0..5 {
+                c.write_u8(0).unwrap();
+            }
+            c.write_u8(ensure_u8("dscp", t.dscp & 0x3F)?).unwrap();
+        }
+        api::extended_community::Extcom::RedirectIpv4AddressSpecific(t) => {
+            c.write_u8(EXTCOM_TYPE_GENERIC_TRANSITIVE_IPV4).unwrap();
+            c.write_u8(0x08).unwrap();
+            let addr: Ipv4Addr = t
+                .address
+                .parse()
+                .map_err(|e| Error::InvalidArgument(format!("invalid extcom address: {}", e)))?;
+            c.write_u32::<NetworkEndian>(addr.into()).unwrap();
+            c.write_u16::<NetworkEndian>(ensure_u16("local_admin", t.local_admin)?)
+                .unwrap();
+        }
+        api::extended_community::Extcom::RedirectFourOctetAsSpecific(t) => {
+            c.write_u8(EXTCOM_TYPE_GENERIC_TRANSITIVE_4OCTET_AS)
+                .unwrap();
+            c.write_u8(0x08).unwrap();
+            c.write_u32::<NetworkEndian>(t.asn).unwrap();
+            c.write_u16::<NetworkEndian>(ensure_u16("local_admin", t.local_admin)?)
+                .unwrap();
         }
         _ => {
             return Err(Error::InvalidArgument(
@@ -3944,5 +4243,94 @@ bgp-actions.set-next-hop = "self"
     fn family_from_config_unsupported_returns_err() {
         use config::generate::AfiSafiType;
         assert!(family_from_config(&AfiSafiType::L3VpnIpv4Unicast).is_err());
+    }
+
+    // --- Flowspec extended community roundtrips ---
+
+    fn extcom_roundtrip(wire: &[u8; 8]) -> api::ExtendedCommunity {
+        let v = wire.to_vec();
+        let ec = read_extcom(&mut Cursor::new(&v));
+        let mut out = Cursor::new(Vec::with_capacity(8));
+        write_extcom(&mut out, ec.clone()).unwrap();
+        assert_eq!(
+            out.into_inner(),
+            wire,
+            "write did not reproduce input bytes"
+        );
+        ec
+    }
+
+    #[test]
+    fn extcom_traffic_rate_roundtrip() {
+        // ASN=65000, rate=100.0 (IEEE 754: 0x42C80000)
+        let wire: [u8; 8] = [0x80, 0x06, 0xFD, 0xE8, 0x42, 0xC8, 0x00, 0x00];
+        let ec = extcom_roundtrip(&wire);
+        let api::extended_community::Extcom::TrafficRate(t) = ec.extcom.unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(t.asn, 65000);
+        assert!((t.rate - 100.0f32).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn extcom_traffic_action_roundtrip() {
+        // terminal=true, sample=true -> flags byte 0x03
+        let wire: [u8; 8] = [0x80, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+        let ec = extcom_roundtrip(&wire);
+        let api::extended_community::Extcom::TrafficAction(t) = ec.extcom.unwrap() else {
+            panic!("wrong variant");
+        };
+        assert!(t.terminal);
+        assert!(t.sample);
+    }
+
+    #[test]
+    fn extcom_redirect_two_octet_as_roundtrip() {
+        // ASN=65000, local_admin=100
+        let wire: [u8; 8] = [0x80, 0x08, 0xFD, 0xE8, 0x00, 0x00, 0x00, 0x64];
+        let ec = extcom_roundtrip(&wire);
+        let api::extended_community::Extcom::RedirectTwoOctetAsSpecific(t) = ec.extcom.unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(t.asn, 65000);
+        assert_eq!(t.local_admin, 100);
+    }
+
+    #[test]
+    fn extcom_traffic_remark_roundtrip() {
+        // DSCP=46 (EF)
+        let wire: [u8; 8] = [0x80, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2E];
+        let ec = extcom_roundtrip(&wire);
+        let api::extended_community::Extcom::TrafficRemark(t) = ec.extcom.unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(t.dscp, 46);
+    }
+
+    #[test]
+    fn extcom_redirect_ipv4_roundtrip() {
+        // 192.0.2.1, local_admin=200
+        let wire: [u8; 8] = [0x81, 0x08, 0xC0, 0x00, 0x02, 0x01, 0x00, 0xC8];
+        let ec = extcom_roundtrip(&wire);
+        let api::extended_community::Extcom::RedirectIpv4AddressSpecific(t) = ec.extcom.unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(t.address, "192.0.2.1");
+        assert_eq!(t.local_admin, 200);
+    }
+
+    #[test]
+    fn extcom_redirect_four_octet_as_roundtrip() {
+        // ASN=131072, local_admin=7
+        let wire: [u8; 8] = [0x82, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00, 0x07];
+        let ec = extcom_roundtrip(&wire);
+        let api::extended_community::Extcom::RedirectFourOctetAsSpecific(t) = ec.extcom.unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(t.asn, 131072);
+        assert_eq!(t.local_admin, 7);
     }
 }
