@@ -1424,6 +1424,28 @@ fn ls_tlvs_to_api(tlvs: &[bgp_ls::LsTlv]) -> api::LsAttribute {
                     sid: *sid,
                 });
             }
+            LsTlv::UnidirectionalLinkDelay {
+                anomalous,
+                delay_us,
+            } => {
+                has_link = true;
+                link.unidirectional_link_delay_anomalous = *anomalous;
+                link.unidirectional_link_delay = *delay_us;
+            }
+            LsTlv::MinMaxUnidirectionalLinkDelay {
+                anomalous,
+                min_us,
+                max_us,
+            } => {
+                has_link = true;
+                link.min_max_unidirectional_link_delay_anomalous = *anomalous;
+                link.min_unidirectional_link_delay = *min_us;
+                link.max_unidirectional_link_delay = *max_us;
+            }
+            LsTlv::UnidirectionalDelayVariation(v) => {
+                has_link = true;
+                link.unidirectional_delay_variation = *v;
+            }
             LsTlv::Srv6EndXSid {
                 endpoint_behavior,
                 flags,
@@ -2355,6 +2377,28 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
                 sid: link.sr_adjacency_sid,
             }
             .encode(&mut dst);
+        }
+        if link.unidirectional_link_delay != 0 || link.unidirectional_link_delay_anomalous {
+            bgp_ls::LsTlv::UnidirectionalLinkDelay {
+                anomalous: link.unidirectional_link_delay_anomalous,
+                delay_us: link.unidirectional_link_delay,
+            }
+            .encode(&mut dst);
+        }
+        if link.min_unidirectional_link_delay != 0
+            || link.max_unidirectional_link_delay != 0
+            || link.min_max_unidirectional_link_delay_anomalous
+        {
+            bgp_ls::LsTlv::MinMaxUnidirectionalLinkDelay {
+                anomalous: link.min_max_unidirectional_link_delay_anomalous,
+                min_us: link.min_unidirectional_link_delay,
+                max_us: link.max_unidirectional_link_delay,
+            }
+            .encode(&mut dst);
+        }
+        if link.unidirectional_delay_variation != 0 {
+            bgp_ls::LsTlv::UnidirectionalDelayVariation(link.unidirectional_delay_variation)
+                .encode(&mut dst);
         }
         if let Some(ex) = &link.srv6_end_x_sid {
             let sids: Vec<[u8; 16]> = ex

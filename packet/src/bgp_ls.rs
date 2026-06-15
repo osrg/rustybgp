@@ -109,6 +109,10 @@ pub const TLV_SRV6_PEER_NODE_SID: u16 = 1104;
 pub const TLV_SRV6_END_X_SID: u16 = 1106;
 // SRv6 SID Structure sub-TLV (RFC 9514 §5.3.2, embedded in SRv6 attribute TLVs)
 pub const TLV_SRV6_SID_STRUCTURE: u16 = 1252;
+// Link Performance Measurement TLVs (RFC 8571)
+pub const TLV_UNIDIRECTIONAL_LINK_DELAY: u16 = 1114;
+pub const TLV_MIN_MAX_UNIDIRECTIONAL_LINK_DELAY: u16 = 1115;
+pub const TLV_UNIDIRECTIONAL_DELAY_VARIATION: u16 = 1116;
 // Prefix Attribute TLVs (RFC 9552)
 pub const TLV_IGP_FLAGS: u16 = 1152;
 pub const TLV_OPAQUE_PREFIX_ATTR: u16 = 1157;
@@ -711,6 +715,17 @@ pub enum LsTlv {
         algorithm: u8,
         sid: u32,
     },
+    // Link Performance Measurement TLVs (RFC 8571)
+    UnidirectionalLinkDelay {
+        anomalous: bool,
+        delay_us: u32,
+    },
+    MinMaxUnidirectionalLinkDelay {
+        anomalous: bool,
+        min_us: u32,
+        max_us: u32,
+    },
+    UnidirectionalDelayVariation(u32),
     // SRv6 Attribute TLVs (RFC 9514, RFC 9086 §5)
     Srv6EndXSid {
         endpoint_behavior: u16,
@@ -860,6 +875,50 @@ impl LsTlv {
                 let mut body = vec![*flags, *algorithm, 0, 0];
                 body.extend_from_slice(&sid_bytes(*sid, flags & 0x80 != 0));
                 write_tlv(dst, TLV_PREFIX_SID, &body);
+            }
+            LsTlv::UnidirectionalLinkDelay {
+                anomalous,
+                delay_us,
+            } => {
+                let a: u8 = if *anomalous { 0x80 } else { 0 };
+                write_tlv(
+                    dst,
+                    TLV_UNIDIRECTIONAL_LINK_DELAY,
+                    &[
+                        a,
+                        (delay_us >> 16) as u8,
+                        (delay_us >> 8) as u8,
+                        *delay_us as u8,
+                    ],
+                );
+            }
+            LsTlv::MinMaxUnidirectionalLinkDelay {
+                anomalous,
+                min_us,
+                max_us,
+            } => {
+                let a: u8 = if *anomalous { 0x80 } else { 0 };
+                write_tlv(
+                    dst,
+                    TLV_MIN_MAX_UNIDIRECTIONAL_LINK_DELAY,
+                    &[
+                        a,
+                        (min_us >> 16) as u8,
+                        (min_us >> 8) as u8,
+                        *min_us as u8,
+                        0, // Reserved
+                        (max_us >> 16) as u8,
+                        (max_us >> 8) as u8,
+                        *max_us as u8,
+                    ],
+                );
+            }
+            LsTlv::UnidirectionalDelayVariation(v) => {
+                write_tlv(
+                    dst,
+                    TLV_UNIDIRECTIONAL_DELAY_VARIATION,
+                    &[0, (v >> 16) as u8, (v >> 8) as u8, *v as u8],
+                );
             }
             LsTlv::Srv6EndXSid {
                 endpoint_behavior,
@@ -1097,6 +1156,36 @@ pub fn parse_ls_attr(data: &[u8]) -> Vec<LsTlv> {
                     algorithm,
                     sid,
                 }
+            }
+            // Unidirectional Link Delay (RFC 8571 §2.1): A(1bit)+Rsv(7bit)+Delay(24bit)
+            TLV_UNIDIRECTIONAL_LINK_DELAY if value.len() >= 4 => {
+                let anomalous = value[0] & 0x80 != 0;
+                let delay_us =
+                    ((value[1] as u32) << 16) | ((value[2] as u32) << 8) | (value[3] as u32);
+                LsTlv::UnidirectionalLinkDelay {
+                    anomalous,
+                    delay_us,
+                }
+            }
+            // Min/Max Unidirectional Link Delay (RFC 8571 §2.2): A+Rsv+Min(24bit)+Rsv+Max(24bit)
+            TLV_MIN_MAX_UNIDIRECTIONAL_LINK_DELAY if value.len() >= 8 => {
+                let anomalous = value[0] & 0x80 != 0;
+                let min_us =
+                    ((value[1] as u32) << 16) | ((value[2] as u32) << 8) | (value[3] as u32);
+                // value[4]: Reserved
+                let max_us =
+                    ((value[5] as u32) << 16) | ((value[6] as u32) << 8) | (value[7] as u32);
+                LsTlv::MinMaxUnidirectionalLinkDelay {
+                    anomalous,
+                    min_us,
+                    max_us,
+                }
+            }
+            // Unidirectional Delay Variation (RFC 8571 §2.3): Reserved(8bit)+Variation(24bit)
+            TLV_UNIDIRECTIONAL_DELAY_VARIATION if value.len() >= 4 => {
+                let variation =
+                    ((value[1] as u32) << 16) | ((value[2] as u32) << 8) | (value[3] as u32);
+                LsTlv::UnidirectionalDelayVariation(variation)
             }
             // SRv6 End.X SID (RFC 9514 §5.1): header(6) + SID(s)(16 each) + sub-TLVs
             TLV_SRV6_END_X_SID if value.len() >= 6 => {
