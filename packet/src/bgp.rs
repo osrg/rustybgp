@@ -302,6 +302,10 @@ impl Family {
         Family((Family::AFI_IP as u32) << 16 | Family::SAFI_MPLS_VPN as u32);
     pub const IPV6_VPN: Family =
         Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_MPLS_VPN6 as u32);
+    pub const IPV4_FLOWSPEC: Family =
+        Family((Family::AFI_IP as u32) << 16 | Family::SAFI_FLOWSPEC as u32);
+    pub const IPV6_FLOWSPEC: Family =
+        Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_FLOWSPEC as u32);
 
     pub fn new(v: u32) -> Self {
         Family(v)
@@ -443,6 +447,8 @@ pub enum Nlri {
     VpnV6(crate::vpn::VpnV6Nlri),
     LabeledV4(crate::labeled::LabeledV4Nlri),
     LabeledV6(crate::labeled::LabeledV6Nlri),
+    FlowspecV4(crate::flowspec::FlowspecV4Nlri),
+    FlowspecV6(crate::flowspec::FlowspecV6Nlri),
 }
 
 impl Nlri {
@@ -455,6 +461,14 @@ impl Nlri {
             Nlri::VpnV6(n) => Ok(n.encode(dst)),
             Nlri::LabeledV4(n) => Ok(n.encode(dst)),
             Nlri::LabeledV6(n) => Ok(n.encode(dst)),
+            Nlri::FlowspecV4(n) => {
+                n.encode(dst);
+                Ok(0)
+            }
+            Nlri::FlowspecV6(n) => {
+                n.encode(dst);
+                Ok(0)
+            }
         }
     }
 
@@ -491,6 +505,12 @@ impl Nlri {
             Family::IPV6_MPLS => crate::labeled::LabeledV6Nlri::decode(c, len, is_reach)
                 .map(Nlri::LabeledV6)
                 .map_err(|_| Notification::UpdateMalformedAttributeList),
+            Family::IPV4_FLOWSPEC => crate::flowspec::FlowspecV4Nlri::decode(c, len)
+                .map(Nlri::FlowspecV4)
+                .map_err(|_| Notification::UpdateMalformedAttributeList),
+            Family::IPV6_FLOWSPEC => crate::flowspec::FlowspecV6Nlri::decode(c, len)
+                .map(Nlri::FlowspecV6)
+                .map_err(|_| Notification::UpdateMalformedAttributeList),
             _ => Err(Notification::UpdateMalformedAttributeList),
         }
     }
@@ -520,6 +540,8 @@ impl fmt::Display for Nlri {
             Nlri::VpnV6(n) => n.fmt(f),
             Nlri::LabeledV4(n) => n.fmt(f),
             Nlri::LabeledV6(n) => n.fmt(f),
+            Nlri::FlowspecV4(n) => n.fmt(f),
+            Nlri::FlowspecV6(n) => n.fmt(f),
         }
     }
 }

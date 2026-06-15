@@ -199,7 +199,9 @@ impl Handle {
             | packet::Nlri::VpnV4(_)
             | packet::Nlri::VpnV6(_)
             | packet::Nlri::LabeledV4(_)
-            | packet::Nlri::LabeledV6(_) => {
+            | packet::Nlri::LabeledV6(_)
+            | packet::Nlri::FlowspecV4(_)
+            | packet::Nlri::FlowspecV6(_) => {
                 return Ok(());
             }
         };
