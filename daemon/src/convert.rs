@@ -1151,6 +1151,12 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
                 })),
             },
         },
+        Attribute::LS => {
+            let tlvs = bgp_ls::parse_ls_attr(a.binary().unwrap());
+            api::Attribute {
+                attr: Some(api::attribute::Attr::Ls(ls_tlvs_to_api(&tlvs))),
+            }
+        }
         _ => api::Attribute {
             attr: Some(api::attribute::Attr::Unknown(api::UnknownAttribute {
                 flags: a.flags() as u32,
@@ -1158,6 +1164,211 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
                 value: a.binary().unwrap().to_owned(),
             })),
         },
+    }
+}
+
+fn peer_sid_flags_to_api(flags: u8) -> api::LsBgpPeerSegmentSidFlags {
+    api::LsBgpPeerSegmentSidFlags {
+        value: flags & 0x80 != 0,
+        local: flags & 0x40 != 0,
+        backup: flags & 0x20 != 0,
+        persistent: flags & 0x10 != 0,
+    }
+}
+
+fn ls_tlvs_to_api(tlvs: &[bgp_ls::LsTlv]) -> api::LsAttribute {
+    use bgp_ls::LsTlv;
+    let mut node = api::LsAttributeNode::default();
+    let mut link = api::LsAttributeLink::default();
+    let mut prefix = api::LsAttributePrefix::default();
+    let mut bgp_peer = api::LsAttributeBgpPeerSegment::default();
+    let mut has_node = false;
+    let mut has_link = false;
+    let mut has_prefix = false;
+    let mut has_bgp_peer = false;
+
+    for tlv in tlvs {
+        match tlv {
+            LsTlv::NodeFlagBits(f) => {
+                has_node = true;
+                node.flags = Some(api::LsNodeFlags {
+                    overload: f & 0x80 != 0,
+                    attached: f & 0x40 != 0,
+                    external: f & 0x20 != 0,
+                    abr: f & 0x10 != 0,
+                    router: f & 0x08 != 0,
+                    v6: f & 0x04 != 0,
+                });
+            }
+            LsTlv::OpaqueNodeAttr(v) => {
+                has_node = true;
+                node.opaque = v.clone();
+            }
+            LsTlv::NodeName(s) => {
+                has_node = true;
+                node.name = s.clone();
+            }
+            LsTlv::IsisArea(v) => {
+                has_node = true;
+                node.isis_area = v.clone();
+            }
+            LsTlv::Ipv4LocalRouterId(a) => {
+                // TLV 1028 appears in Node, Link, and Prefix attribute advertisements.
+                node.local_router_id = a.to_string();
+                link.local_router_id = a.to_string();
+                has_node = true;
+                has_link = true;
+            }
+            LsTlv::Ipv6LocalRouterId(a) => {
+                node.local_router_id_v6 = a.to_string();
+                link.local_router_id_v6 = a.to_string();
+                has_node = true;
+                has_link = true;
+            }
+            LsTlv::Ipv4RemoteRouterId(a) => {
+                has_link = true;
+                link.remote_router_id = a.to_string();
+            }
+            LsTlv::Ipv6RemoteRouterId(a) => {
+                has_link = true;
+                link.remote_router_id_v6 = a.to_string();
+            }
+            LsTlv::SrCapabilities {
+                ipv4_supported,
+                ipv6_supported,
+                ranges,
+            } => {
+                has_node = true;
+                node.sr_capabilities = Some(api::LsSrCapabilities {
+                    ipv4_supported: *ipv4_supported,
+                    ipv6_supported: *ipv6_supported,
+                    ranges: ranges
+                        .iter()
+                        .map(|r| api::LsSrRange {
+                            begin: r.begin,
+                            end: r.end,
+                        })
+                        .collect(),
+                });
+            }
+            LsTlv::SrAlgorithms(v) => {
+                has_node = true;
+                node.sr_algorithms = v.clone();
+            }
+            LsTlv::SrLocalBlock { ranges } => {
+                has_node = true;
+                node.sr_local_block = Some(api::LsSrLocalBlock {
+                    ranges: ranges
+                        .iter()
+                        .map(|r| api::LsSrRange {
+                            begin: r.begin,
+                            end: r.end,
+                        })
+                        .collect(),
+                });
+            }
+            LsTlv::AdminGroup(g) => {
+                has_link = true;
+                link.admin_group = *g;
+            }
+            LsTlv::MaxLinkBandwidth(b) => {
+                has_link = true;
+                link.bandwidth = *b;
+            }
+            LsTlv::MaxReservableBandwidth(b) => {
+                has_link = true;
+                link.reservable_bandwidth = *b;
+            }
+            LsTlv::UnreservedBandwidth(bits) => {
+                has_link = true;
+                link.unreserved_bandwidth = bgp_ls::LsTlv::unreserved_bandwidth_f32(bits).to_vec();
+            }
+            LsTlv::TeDefaultMetric(m) => {
+                has_link = true;
+                link.default_te_metric = *m;
+            }
+            LsTlv::IgpMetric(m) => {
+                has_link = true;
+                link.igp_metric = *m;
+            }
+            LsTlv::Srlg(v) => {
+                has_link = true;
+                link.srlgs = v.clone();
+            }
+            LsTlv::OpaqueLinkAttr(v) => {
+                has_link = true;
+                link.opaque = v.clone();
+            }
+            LsTlv::LinkName(s) => {
+                has_link = true;
+                link.name = s.clone();
+            }
+            LsTlv::AdjSid { sid, .. } => {
+                has_link = true;
+                link.sr_adjacency_sid = *sid;
+            }
+            LsTlv::PeerNodeSid { flags, weight, sid } => {
+                has_bgp_peer = true;
+                bgp_peer.bgp_peer_node_sid = Some(api::LsBgpPeerSegmentSid {
+                    flags: Some(peer_sid_flags_to_api(*flags)),
+                    weight: *weight as u32,
+                    sid: *sid,
+                });
+            }
+            LsTlv::PeerAdjSid { flags, weight, sid } => {
+                has_bgp_peer = true;
+                bgp_peer.bgp_peer_adjacency_sid = Some(api::LsBgpPeerSegmentSid {
+                    flags: Some(peer_sid_flags_to_api(*flags)),
+                    weight: *weight as u32,
+                    sid: *sid,
+                });
+            }
+            LsTlv::PeerSetSid { flags, weight, sid } => {
+                has_bgp_peer = true;
+                bgp_peer.bgp_peer_set_sid = Some(api::LsBgpPeerSegmentSid {
+                    flags: Some(peer_sid_flags_to_api(*flags)),
+                    weight: *weight as u32,
+                    sid: *sid,
+                });
+            }
+            LsTlv::IgpFlags(f) => {
+                has_prefix = true;
+                prefix.igp_flags = Some(api::LsIgpFlags {
+                    down: f & 0x80 != 0,
+                    no_unicast: f & 0x40 != 0,
+                    local_address: f & 0x20 != 0,
+                    propagate_nssa: f & 0x10 != 0,
+                });
+            }
+            LsTlv::OpaquePrefixAttr(v) => {
+                has_prefix = true;
+                prefix.opaque = v.clone();
+            }
+            LsTlv::PrefixSid {
+                flags,
+                algorithm,
+                sid,
+            } => {
+                has_prefix = true;
+                if *algorithm == 0 {
+                    prefix.sr_prefix_sid = *sid;
+                }
+                prefix.sr_prefix_sids.push(api::LsAttributePrefixSid {
+                    algorithm: *algorithm as u32,
+                    flags: *flags as u32,
+                    sid: *sid,
+                });
+            }
+            LsTlv::Unknown { .. } => {}
+        }
+    }
+
+    api::LsAttribute {
+        node: if has_node { Some(node) } else { None },
+        link: if has_link { Some(link) } else { None },
+        prefix: if has_prefix { Some(prefix) } else { None },
+        bgp_peer_segment: if has_bgp_peer { Some(bgp_peer) } else { None },
+        srv6_sid: None,
     }
 }
 

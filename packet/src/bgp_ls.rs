@@ -70,9 +70,10 @@ const TLV_BGP_ROUTER_ID: u16 = 516; // RFC 9086
 const TLV_BGP_CONFEDERATION_MEMBER: u16 = 517; // RFC 9086
 
 // ---------------------------------------------------------------------------
-// BGP-LS Attribute TLV type codes (RFC 9552 §3.3 / Phase 1 subset)
+// BGP-LS Attribute TLV type codes (RFC 9552 §3.3, RFC 9085, RFC 9086)
 // ---------------------------------------------------------------------------
 
+// Node Attribute TLVs (RFC 9552)
 pub const TLV_NODE_FLAG_BITS: u16 = 1024;
 pub const TLV_OPAQUE_NODE_ATTR: u16 = 1025;
 pub const TLV_NODE_NAME: u16 = 1026;
@@ -81,6 +82,11 @@ pub const TLV_IPV4_LOCAL_ROUTER_ID: u16 = 1028;
 pub const TLV_IPV6_LOCAL_ROUTER_ID: u16 = 1029;
 pub const TLV_IPV4_REMOTE_ROUTER_ID: u16 = 1030;
 pub const TLV_IPV6_REMOTE_ROUTER_ID: u16 = 1031;
+// Node SR Attribute TLVs (RFC 9085 §2.1)
+pub const TLV_SR_CAPABILITIES: u16 = 1034;
+pub const TLV_SR_ALGORITHM: u16 = 1035;
+pub const TLV_SR_LOCAL_BLOCK: u16 = 1036;
+// Link Attribute TLVs (RFC 9552)
 pub const TLV_ADMIN_GROUP: u16 = 1088;
 pub const TLV_MAX_LINK_BANDWIDTH: u16 = 1089;
 pub const TLV_MAX_RESERVABLE_BANDWIDTH: u16 = 1090;
@@ -90,8 +96,16 @@ pub const TLV_IGP_METRIC: u16 = 1095;
 pub const TLV_SRLG: u16 = 1096;
 pub const TLV_OPAQUE_LINK_ATTR: u16 = 1097;
 pub const TLV_LINK_NAME: u16 = 1098;
+// Link SR Attribute TLVs (RFC 9085 §2.2, RFC 9086 §4)
+pub const TLV_ADJ_SID: u16 = 1099;
+pub const TLV_PEER_NODE_SID: u16 = 1101;
+pub const TLV_PEER_ADJ_SID: u16 = 1102;
+pub const TLV_PEER_SET_SID: u16 = 1103;
+// Prefix Attribute TLVs (RFC 9552)
 pub const TLV_IGP_FLAGS: u16 = 1152;
 pub const TLV_OPAQUE_PREFIX_ATTR: u16 = 1157;
+// Prefix SR Attribute TLVs (RFC 9085 §2.3)
+pub const TLV_PREFIX_SID: u16 = 1158;
 
 // ---------------------------------------------------------------------------
 // Low-level TLV I/O helpers
@@ -538,6 +552,14 @@ impl fmt::Display for BgpLsNlri {
 // BGP-LS Attribute (Type 29) TLVs
 // ---------------------------------------------------------------------------
 
+/// A contiguous SID/label range [begin, end] (inclusive) from SR Capabilities
+/// or SR Local Block TLVs (RFC 9085 §2.1.2).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SrRange {
+    pub begin: u32,
+    pub end: u32,
+}
+
 /// Parsed representation of a single BGP-LS Attribute TLV (Type 29).
 ///
 /// `f32` fields (bandwidth) are not Hash/Eq; this type is only used for
@@ -553,6 +575,16 @@ pub enum LsTlv {
     Ipv6LocalRouterId(Ipv6Addr),
     Ipv4RemoteRouterId(Ipv4Addr),
     Ipv6RemoteRouterId(Ipv6Addr),
+    // Node SR Attribute TLVs (RFC 9085 §2.1)
+    SrCapabilities {
+        ipv4_supported: bool,
+        ipv6_supported: bool,
+        ranges: Vec<SrRange>,
+    },
+    SrAlgorithms(Vec<u8>),
+    SrLocalBlock {
+        ranges: Vec<SrRange>,
+    },
     // Link Attribute TLVs (RFC 9552)
     AdminGroup(u32),
     MaxLinkBandwidth(f32),
@@ -563,11 +595,42 @@ pub enum LsTlv {
     Srlg(Vec<u32>),
     OpaqueLinkAttr(Vec<u8>),
     LinkName(String),
+    // Link SR Attribute TLVs (RFC 9085 §2.2)
+    AdjSid {
+        flags: u8,
+        weight: u8,
+        sid: u32,
+    },
+    // BGP-EPE Peer SID TLVs (RFC 9086 §4)
+    PeerNodeSid {
+        flags: u8,
+        weight: u8,
+        sid: u32,
+    },
+    PeerAdjSid {
+        flags: u8,
+        weight: u8,
+        sid: u32,
+    },
+    PeerSetSid {
+        flags: u8,
+        weight: u8,
+        sid: u32,
+    },
     // Prefix Attribute TLVs (RFC 9552)
     IgpFlags(u8),
     OpaquePrefixAttr(Vec<u8>),
+    // Prefix SR Attribute TLVs (RFC 9085 §2.3)
+    PrefixSid {
+        flags: u8,
+        algorithm: u8,
+        sid: u32,
+    },
     // Unknown / future TLVs
-    Unknown { tlv_type: u16, value: Vec<u8> },
+    Unknown {
+        tlv_type: u16,
+        value: Vec<u8>,
+    },
 }
 
 impl LsTlv {
@@ -575,6 +638,72 @@ impl LsTlv {
     pub fn unreserved_bandwidth_f32(bits: &[u32; 8]) -> [f32; 8] {
         bits.map(f32::from_bits)
     }
+}
+
+/// Decode the SID value from a 3-byte (label) or 4-byte (index) field.
+///
+/// 3-byte encoding: 20-bit label packed into the top 20 bits (right-shift 4).
+/// 4-byte encoding: 32-bit index, big-endian.
+fn decode_sid_value(b: &[u8]) -> u32 {
+    match b.len() {
+        3 => {
+            let raw = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+            raw >> 4
+        }
+        l if l >= 4 => u32::from_be_bytes(b[..4].try_into().unwrap()),
+        _ => 0,
+    }
+}
+
+/// Decode SR Capability / SRLB range entries from the body that follows the
+/// 2-byte Flags+Reserved header of TLV 1034 or 1036 (RFC 9085 §2.1.2).
+///
+/// Each range entry is: RangeSize(3 bytes) + SID/Label Sub-TLV(type1+len1+value3/4).
+fn decode_sr_ranges(data: &[u8]) -> Vec<SrRange> {
+    let mut ranges = Vec::new();
+    let mut pos = 0;
+    while pos + 5 <= data.len() {
+        // Range Size: 24-bit big-endian
+        let range_size =
+            ((data[pos] as u32) << 16) | ((data[pos + 1] as u32) << 8) | (data[pos + 2] as u32);
+        pos += 3;
+
+        // SID/Label Sub-TLV: Type(1) + Len(1) + Value(3 or 4)
+        if pos + 2 > data.len() {
+            break;
+        }
+        let sub_type = data[pos];
+        let sub_len = data[pos + 1] as usize;
+        pos += 2;
+        if pos + sub_len > data.len() {
+            break;
+        }
+        let sid_bytes = &data[pos..pos + sub_len];
+        pos += sub_len;
+
+        if sub_type != 1 || (sub_len != 3 && sub_len != 4) {
+            continue;
+        }
+        let begin = decode_sid_value(sid_bytes);
+        ranges.push(SrRange {
+            begin,
+            end: begin + range_size.saturating_sub(1),
+        });
+    }
+    ranges
+}
+
+/// Decode Flags(1) + Weight(1) + Reserved(2) + SID(3 or 4 bytes) used by
+/// Adj-SID (1099) and Peer-*-SID (1101-1103) TLVs (RFC 9085/9086).
+fn decode_sid_tlv(value: &[u8]) -> Option<(u8, u8, u32)> {
+    if value.len() < 7 {
+        return None;
+    }
+    let flags = value[0];
+    let weight = value[1];
+    // bytes 2-3 are Reserved
+    let sid = decode_sid_value(&value[4..]);
+    Some((flags, weight, sid))
 }
 
 /// Parse all BGP-LS Attribute TLVs from the attribute value bytes (Type 29).
@@ -602,6 +731,20 @@ pub fn parse_ls_attr(data: &[u8]) -> Vec<LsTlv> {
             TLV_IPV6_REMOTE_ROUTER_ID if value.len() >= 16 => LsTlv::Ipv6RemoteRouterId(
                 Ipv6Addr::from(<[u8; 16]>::try_from(&value[..16]).unwrap()),
             ),
+            // SR Capabilities (RFC 9085 §2.1.2): Flags(1)+Reserved(1)+Ranges
+            TLV_SR_CAPABILITIES if value.len() >= 2 => {
+                let flags = value[0];
+                LsTlv::SrCapabilities {
+                    ipv4_supported: flags & 0x80 != 0,
+                    ipv6_supported: flags & 0x40 != 0,
+                    ranges: decode_sr_ranges(&value[2..]),
+                }
+            }
+            TLV_SR_ALGORITHM => LsTlv::SrAlgorithms(value),
+            // SR Local Block (RFC 9085 §2.1.4): Flags(1)+Reserved(1)+Ranges
+            TLV_SR_LOCAL_BLOCK if value.len() >= 2 => LsTlv::SrLocalBlock {
+                ranges: decode_sr_ranges(&value[2..]),
+            },
             TLV_ADMIN_GROUP if value.len() >= 4 => {
                 LsTlv::AdminGroup(u32::from_be_bytes(value[..4].try_into().unwrap()))
             }
@@ -644,8 +787,50 @@ pub fn parse_ls_attr(data: &[u8]) -> Vec<LsTlv> {
             }
             TLV_OPAQUE_LINK_ATTR => LsTlv::OpaqueLinkAttr(value),
             TLV_LINK_NAME => LsTlv::LinkName(String::from_utf8_lossy(&value).into_owned()),
+            // Adj-SID (RFC 9085 §2.2.1): Flags+Weight+Reserved(2)+SID
+            TLV_ADJ_SID => {
+                if let Some((flags, weight, sid)) = decode_sid_tlv(&value) {
+                    LsTlv::AdjSid { flags, weight, sid }
+                } else {
+                    LsTlv::Unknown { tlv_type, value }
+                }
+            }
+            // BGP-EPE Peer SIDs (RFC 9086 §4): same wire format as Adj-SID
+            TLV_PEER_NODE_SID => {
+                if let Some((flags, weight, sid)) = decode_sid_tlv(&value) {
+                    LsTlv::PeerNodeSid { flags, weight, sid }
+                } else {
+                    LsTlv::Unknown { tlv_type, value }
+                }
+            }
+            TLV_PEER_ADJ_SID => {
+                if let Some((flags, weight, sid)) = decode_sid_tlv(&value) {
+                    LsTlv::PeerAdjSid { flags, weight, sid }
+                } else {
+                    LsTlv::Unknown { tlv_type, value }
+                }
+            }
+            TLV_PEER_SET_SID => {
+                if let Some((flags, weight, sid)) = decode_sid_tlv(&value) {
+                    LsTlv::PeerSetSid { flags, weight, sid }
+                } else {
+                    LsTlv::Unknown { tlv_type, value }
+                }
+            }
             TLV_IGP_FLAGS if !value.is_empty() => LsTlv::IgpFlags(value[0]),
             TLV_OPAQUE_PREFIX_ATTR => LsTlv::OpaquePrefixAttr(value),
+            // Prefix-SID (RFC 9085 §2.3.1): Flags(1)+Algorithm(1)+Reserved(2)+SID
+            TLV_PREFIX_SID if value.len() >= 7 => {
+                let flags = value[0];
+                let algorithm = value[1];
+                // bytes 2-3 are Reserved
+                let sid = decode_sid_value(&value[4..]);
+                LsTlv::PrefixSid {
+                    flags,
+                    algorithm,
+                    sid,
+                }
+            }
             _ => LsTlv::Unknown { tlv_type, value },
         };
         tlvs.push(tlv);
