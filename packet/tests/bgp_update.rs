@@ -1557,3 +1557,49 @@ fn missing_nexthop_attr_with_mpreach_ok() {
         "IPv6 MP_REACH without NEXTHOP attribute must be accepted"
     );
 }
+
+#[test]
+fn flowspec_ipv4_no_nexthop_accepted() {
+    // RFC 8955 §4: Flowspec routes carry no nexthop in MP_REACH_NLRI.
+    // Before the fix, validate_update() treated nexthop=None as a missing
+    // mandatory attribute and converted the route to a withdrawal.
+    //
+    // Flowspec NLRI: length-prefixed component list (RFC 8955 §4).
+    //   nlri_len=3, type=1 (destination prefix), prefix_len=8, prefix=0x0a (10.0.0.0/8)
+    let flowspec_nlri: &[u8] = &[0x03, 0x01, 0x08, 0x0a];
+    let mp: Vec<u8> = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0x00, 0x01]); // AFI = IPv4
+        v.push(133); // SAFI = Flowspec
+        v.push(0x00); // nexthop_len = 0 (RFC 8955 §4)
+        v.push(0x00); // reserved
+        v.extend_from_slice(flowspec_nlri);
+        v
+    };
+    let mut attr_bytes: Vec<u8> = Vec::new();
+    attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]); // ORIGIN = IGP
+    attr_bytes.extend_from_slice(&[0x40, 0x02, 0x00]); // AS_PATH = empty
+    attr_bytes.push(0x80); // optional non-transitive
+    attr_bytes.push(0x0e); // type = MP_REACH_NLRI
+    attr_bytes.push(mp.len() as u8);
+    attr_bytes.extend_from_slice(&mp);
+
+    let attr_len = attr_bytes.len() as u16;
+    let total = 19u16 + 2 + 2 + attr_len;
+    let mut buf = vec![0xffu8; 16];
+    buf.extend_from_slice(&total.to_be_bytes());
+    buf.push(2); // UPDATE
+    buf.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_len = 0
+    buf.extend_from_slice(&attr_len.to_be_bytes());
+    buf.extend_from_slice(&attr_bytes);
+
+    let mut codec = PeerCodec::new();
+    codec.set_family(Family::IPV4_FLOWSPEC, Default::default());
+    let parsed = codec.parse_message(&buf).expect("parse ok");
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+    assert_eq!(msgs.len(), 1);
+    assert!(
+        matches!(&msgs[0], Message::Update(Update::Reach { .. })),
+        "Flowspec MP_REACH with nexthop_len=0 must be accepted, not treated as withdraw"
+    );
+}

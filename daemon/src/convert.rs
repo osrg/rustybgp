@@ -5590,4 +5590,57 @@ bgp-actions.set-next-hop = "self"
         };
         assert!(net_from_api(nlri, Family::IPV4).is_err());
     }
+
+    // --- attr_from_api: Flowspec MpReach ---
+
+    #[test]
+    fn attr_from_api_flowspec_mpreach_empty_nexthops_accepted() {
+        // RFC 8955 §4: Flowspec carries no nexthop.  gobgp sends MpReach with
+        // an empty next_hops list for locally injected Flowspec routes.
+        // Before the fix, attr_from_api() returned an error for empty next_hops.
+        let attr = api::Attribute {
+            attr: Some(api::attribute::Attr::MpReach(api::MpReachNlriAttribute {
+                family: Some(api::Family {
+                    afi: 1,    // IPv4
+                    safi: 133, // Flowspec
+                }),
+                next_hops: vec![],
+                nlris: vec![],
+            })),
+        };
+        let result = attr_from_api(attr);
+        assert!(
+            result.is_ok(),
+            "Flowspec MpReach with empty next_hops must succeed: {:?}",
+            result
+        );
+        let attribute = result.unwrap();
+        assert_eq!(attribute.code(), rustybgp_packet::Attribute::MP_REACH);
+        // Wire format: AFI(2) + SAFI(1) + nexthop_len=0(1) + reserved=0(1) = 5 bytes
+        let data = attribute.binary().expect("MP_REACH must have binary data");
+        assert_eq!(
+            data.len(),
+            5,
+            "Flowspec MP_REACH must encode as 5-byte header with nexthop_len=0"
+        );
+    }
+
+    #[test]
+    fn attr_from_api_flowspec_vpn_mpreach_empty_nexthops_accepted() {
+        // Same as above but for Flowspec VPN (SAFI 134).
+        let attr = api::Attribute {
+            attr: Some(api::attribute::Attr::MpReach(api::MpReachNlriAttribute {
+                family: Some(api::Family {
+                    afi: 1,
+                    safi: 134, // Flowspec VPN
+                }),
+                next_hops: vec![],
+                nlris: vec![],
+            })),
+        };
+        assert!(
+            attr_from_api(attr).is_ok(),
+            "Flowspec VPN MpReach with empty next_hops must succeed"
+        );
+    }
 }
