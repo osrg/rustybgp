@@ -1824,11 +1824,19 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
             // NEXTHOP is extracted into reach.nexthop (from the NEXTHOP attribute
             // for traditional IPv4, or from MP_REACH_NLRI for other families) and
             // never appears in attrs, so its presence is checked via the ReachNlri.
+            // RFC 8955 §4: Flowspec routes carry no nexthop in MP_REACH_NLRI.
+            let mp_reach_missing_nexthop = mp_reach.as_ref().is_some_and(|r| {
+                r.nexthop.is_none()
+                    && !matches!(
+                        r.family.safi(),
+                        Family::SAFI_FLOWSPEC | Family::SAFI_FLOWSPEC_VPN
+                    )
+            });
             let missing_mandatory = (reach.is_some() || mp_reach.is_some())
                 && (!attrs.iter().any(|a| a.code() == Attribute::ORIGIN)
                     || !attrs.iter().any(|a| a.code() == Attribute::AS_PATH)
                     || reach.as_ref().is_some_and(|r| r.nexthop.is_none())
-                    || mp_reach.as_ref().is_some_and(|r| r.nexthop.is_none()));
+                    || mp_reach_missing_nexthop);
 
             // RFC 7606: classify each attribute error.
             // Optional non-transitive: attribute discard (already absent from attrs).

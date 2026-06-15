@@ -2167,6 +2167,18 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
             let family = m
                 .family
                 .ok_or_else(|| Error::InvalidArgument("mp_reach missing family".to_string()))?;
+            // RFC 8955 §4: Flowspec carries no nexthop; encode with nexthop_len=0.
+            // SAFI 133 = Flowspec, 134 = Flowspec VPN (IANA-assigned, stable).
+            let is_flowspec = matches!(family.safi as u8, 133 | 134);
+            if is_flowspec && m.next_hops.is_empty() {
+                let mut c = Cursor::new(Vec::with_capacity(5));
+                c.write_u16::<NetworkEndian>(family.afi as u16).unwrap();
+                c.write_u8(family.safi as u8).unwrap();
+                c.write_u8(0).unwrap(); // nexthop_len = 0
+                c.write_u8(0).unwrap(); // reserved
+                return Attribute::new_with_bin(Attribute::MP_REACH, c.into_inner())
+                    .ok_or(Error::InvalidArgument("unsupported attribute".to_string()));
+            }
             let nh_str = m.next_hops.first().ok_or_else(|| {
                 Error::InvalidArgument("mp_reach must carry at least one nexthop".to_string())
             })?;
