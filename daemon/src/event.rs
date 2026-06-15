@@ -615,6 +615,8 @@ impl PeerParams {
         {
             local_cap.push(four_octet);
         }
+        // Always advertise RFC 8654 Extended Message support.
+        local_cap.push(packet::Capability::ExtendedMessage);
         local_cap
     }
 

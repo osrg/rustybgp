@@ -321,6 +321,11 @@ pub(crate) fn capability_to_api(cap: &Capability) -> api::Capability {
                 api::RouteRefreshCapability {},
             )),
         },
+        Capability::ExtendedMessage => api::Capability {
+            cap: Some(api::capability::Cap::ExtendedMessage(
+                api::ExtendedMessageCapability {},
+            )),
+        },
         Capability::ExtendedNexthop(v) => api::Capability {
             cap: Some(api::capability::Cap::ExtendedNexthop(
                 api::ExtendedNexthopCapability {

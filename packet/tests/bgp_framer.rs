@@ -15,7 +15,7 @@
 
 use bytes::BytesMut;
 use rustybgp_packet::Notification;
-use rustybgp_packet::bgp::{ParsedMessage, PeerCodec};
+use rustybgp_packet::bgp::{Capability, Family, ParsedMessage, PeerCodec};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -204,4 +204,50 @@ fn framer_mixed_message_types() {
     ));
 
     assert!(matches!(framer.try_parse(&mut buf), Ok(None)));
+}
+
+// ─── RFC 8654 extended message tests ─────────────────────────────────────────
+
+fn extended_framer() -> PeerCodec {
+    let cap = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::FourOctetAsNumber(65001),
+        Capability::ExtendedMessage,
+    ];
+    PeerCodec::negotiate(&cap, &cap)
+}
+
+#[test]
+fn framer_extended_accepts_large_message() {
+    // With extended_length negotiated, a message > 4096 bytes must be accepted.
+    // The framer must not return BadMessageLength for lengths up to 65535.
+    let mut framer = extended_framer();
+    assert!(
+        framer.extended_length,
+        "codec must have extended_length=true after negotiating ExtendedMessage"
+    );
+    // Use NOTIFICATION (type 3): only a minimum-length check applies, accepts variable data.
+    // KEEPALIVE (type 4) requires exactly 19 bytes and would fail inside parse_message.
+    let body = vec![0u8; 5000 - 19]; // error_code=0, subcode=0, rest zero data
+    let buf = bgp_msg(3, &body);
+    let mut bmut = BytesMut::from(buf.as_slice());
+    if let Err(Notification::BadMessageLength { .. }) = framer.try_parse(&mut bmut) {
+        panic!("extended framer must not reject messages <= 65535 bytes")
+    }
+}
+
+#[test]
+fn framer_default_rejects_large_message() {
+    // Without extended_length, a message > 4096 bytes must be rejected.
+    let body = vec![0u8; 5000 - 19];
+    let buf = bgp_msg(4, &body);
+    let mut framer = default_framer();
+    let mut bmut = BytesMut::from(buf.as_slice());
+    match framer.try_parse(&mut bmut) {
+        Err(Notification::BadMessageLength { .. }) => {}
+        other => panic!(
+            "default framer must reject messages > 4096 bytes, got {:?}",
+            other.map(|_| "ok")
+        ),
+    }
 }

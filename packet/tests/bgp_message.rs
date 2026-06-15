@@ -15,7 +15,8 @@
 
 use bytes::BytesMut;
 use rustybgp_packet::bgp::{
-    Attribute, Ipv4Net, Ipv6Net, Message, ParsedMessage, ParsedUpdate, PeerCodec, Update,
+    Attribute, Capability, Ipv4Net, Ipv6Net, Message, ParsedMessage, ParsedUpdate, PeerCodec,
+    Update,
 };
 use rustybgp_packet::{Family, Nlri, PathNlri};
 use std::collections::HashSet;
@@ -257,4 +258,38 @@ fn many_mp_unreach() {
         assert!(set.remove(n));
     }
     assert_eq!(set.len(), 0);
+}
+
+#[test]
+fn negotiate_extended_message_both_sides() {
+    // Both sides advertise ExtendedMessage -> extended_length = true.
+    let cap = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::FourOctetAsNumber(65001),
+        Capability::ExtendedMessage,
+    ];
+    let codec = PeerCodec::negotiate(&cap, &cap);
+    assert!(
+        codec.extended_length,
+        "extended_length must be true when both sides advertise ExtendedMessage"
+    );
+}
+
+#[test]
+fn negotiate_extended_message_one_side_only() {
+    // Only local side advertises ExtendedMessage -> extended_length = false.
+    let local = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::FourOctetAsNumber(65001),
+        Capability::ExtendedMessage,
+    ];
+    let remote = vec![
+        Capability::MultiProtocol(Family::IPV4),
+        Capability::FourOctetAsNumber(65002),
+    ];
+    let codec = PeerCodec::negotiate(&local, &remote);
+    assert!(
+        !codec.extended_length,
+        "extended_length must be false when only one side advertises ExtendedMessage"
+    );
 }

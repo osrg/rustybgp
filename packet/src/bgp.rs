@@ -736,7 +736,7 @@ pub enum Capability {
     MultiProtocol(Family),
     RouteRefresh,
     ExtendedNexthop(Vec<(Family, u16)>),
-    //    ExtendedMessage,
+    ExtendedMessage,
     GracefulRestart {
         flags: u8,
         restart_time: u16,
@@ -760,7 +760,7 @@ impl Capability {
     const MULTI_PROTOCOL: u8 = 1;
     const ROUTE_REFRESH: u8 = 2;
     const EXTENDED_NEXTHOP: u8 = 5;
-    //    const EXTENDED_MESSAGE: u8 = 6;
+    const EXTENDED_MESSAGE: u8 = 6;
     const GRACEFUL_RESTART: u8 = 64;
     pub const FOUR_OCTET_AS_NUMBER: u8 = 65;
     const ADD_PATH: u8 = 69;
@@ -777,6 +777,7 @@ impl From<&Capability> for u8 {
             Capability::MultiProtocol(_) => Capability::MULTI_PROTOCOL,
             Capability::RouteRefresh => Capability::ROUTE_REFRESH,
             Capability::ExtendedNexthop(_) => Capability::EXTENDED_NEXTHOP,
+            Capability::ExtendedMessage => Capability::EXTENDED_MESSAGE,
             Capability::GracefulRestart { .. } => Capability::GRACEFUL_RESTART,
             Capability::FourOctetAsNumber(_) => Capability::FOUR_OCTET_AS_NUMBER,
             Capability::AddPath(_) => Capability::ADD_PATH,
@@ -834,6 +835,9 @@ impl Capability {
                     c.put_u8(family.safi());
                     c.put_u8(*mode);
                 }
+            }
+            Capability::ExtendedMessage => {
+                c.put_u8(0);
             }
             Capability::EnhancedRouteRefresh => {
                 c.put_u8(0);
@@ -940,6 +944,12 @@ impl Capability {
                     v.push((Family(afi << 16 | safi), val));
                 }
                 Ok(Capability::AddPath(v))
+            }
+            Self::EXTENDED_MESSAGE => {
+                if len != 0 {
+                    return Err(());
+                }
+                Ok(Capability::ExtendedMessage)
             }
             Self::ENHANCED_ROUTE_REFRESH => {
                 if len != 0 {
@@ -1865,8 +1875,9 @@ impl PeerCodec {
                 );
             }
         }
+        let has = |v: &[Capability]| v.iter().any(|c| matches!(c, Capability::ExtendedMessage));
         PeerCodec {
-            extended_length: false,
+            extended_length: has(local) && has(remote),
             extended_nexthop,
             families,
         }
