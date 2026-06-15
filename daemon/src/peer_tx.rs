@@ -31,7 +31,7 @@ type PendingKey = (packet::Nlri, u32);
 const MAX_TX_COUNT: usize = 2048;
 
 pub(crate) struct PendingTx {
-    reach: FnvHashMap<PendingKey, (Arc<Vec<packet::Attribute>>, Nexthop)>,
+    reach: FnvHashMap<PendingKey, (Arc<Vec<packet::Attribute>>, Option<Nexthop>)>,
     unreach: FnvHashSet<PendingKey>,
     bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<PendingKey>>,
     pending_eor: bool,
@@ -61,7 +61,7 @@ impl PendingTx {
         &mut self,
         nlri: packet::Nlri,
         path_id: u32,
-        nexthop: Nexthop,
+        nexthop: Option<Nexthop>,
         attr: Arc<Vec<packet::Attribute>>,
     ) {
         let pid = if self.addpath_tx { path_id } else { 0 };
@@ -143,7 +143,8 @@ impl PendingTx {
             let nexthop = keys
                 .iter()
                 .next()
-                .and_then(|k| self.reach.get(k).map(|(_, nh)| *nh));
+                .and_then(|k| self.reach.get(k))
+                .and_then(|(_, nh)| *nh);
 
             messages.push(bgp::Message::Update(bgp::Update::Reach {
                 family,
@@ -208,8 +209,8 @@ mod tests {
         ])
     }
 
-    fn nh() -> Nexthop {
-        Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1))
+    fn nh() -> Option<Nexthop> {
+        Some(Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)))
     }
 
     #[test]

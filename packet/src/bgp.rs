@@ -2003,7 +2003,13 @@ impl PeerCodec {
         // nexthop.  VPN families prefix the nexthop with an 8-byte zero RD (RFC 4364
         // §4.3.2); other families pad IPv4 to 16 bytes for MP_REACH.
         let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
-        if matches!(family, &Family::IPV4_VPN | &Family::IPV6_VPN) {
+        if matches!(
+            family.safi(),
+            Family::SAFI_FLOWSPEC | Family::SAFI_FLOWSPEC_VPN
+        ) {
+            // Flowspec carries no nexthop (RFC 8955 §4): nexthop_len=0.
+            dst.put_u8(0);
+        } else if matches!(family, &Family::IPV4_VPN | &Family::IPV6_VPN) {
             dst.put_u8(8 + nh_bytes.len() as u8);
             dst.put_bytes(0, 8); // 8-byte zero RD (RFC 4364 §4.3.2)
             dst.put_slice(&nh_bytes);

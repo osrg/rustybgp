@@ -1522,6 +1522,7 @@ impl GrpcService {
                 bgp::Attribute::MP_REACH => {
                     // MP_REACH binary: [AFI:2][SAFI:1][NH_LEN:1][nexthop:NH_LEN][reserved:1][NLRI...]
                     // Extract just the nexthop.
+                    let nh_len = a.binary().and_then(|b| b.get(3).copied()).unwrap_or(1) as usize;
                     nexthop = a.binary().and_then(|b| {
                         let len = *b.get(3)? as usize;
                         if b.len() < 5 + len {
@@ -1529,7 +1530,16 @@ impl GrpcService {
                         }
                         bgp::Nexthop::from_bytes(&b[4..4 + len])
                     });
-                    if nexthop.is_none() {
+                    // Flowspec carries no nexthop (RFC 8955 §4): nexthop_len=0 is valid.
+                    let flowspec_no_nexthop = nh_len == 0
+                        && matches!(
+                            family,
+                            Family::IPV4_FLOWSPEC
+                                | Family::IPV6_FLOWSPEC
+                                | Family::IPV4_FLOWSPEC_VPN
+                                | Family::IPV6_FLOWSPEC_VPN
+                        );
+                    if nexthop.is_none() && !flowspec_no_nexthop {
                         return Err(tonic::Status::new(
                             tonic::Code::InvalidArgument,
                             "malformed MP_REACH nexthop",
@@ -4880,7 +4890,7 @@ impl PeerExportContext {
     /// eBGP: replace with local_addr (with link-local for IPv6 when available).
     /// iBGP / iBGP-RR-client / RS client: pass through unchanged (next-hop
     /// unchanged).
-    fn export_nexthop(&self, nexthop: Option<bgp::Nexthop>) -> bgp::Nexthop {
+    fn export_nexthop(&self, nexthop: Option<bgp::Nexthop>) -> Option<bgp::Nexthop> {
         let local = || match self.local_addr {
             IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
             IpAddr::V6(v6) => {
@@ -4892,9 +4902,10 @@ impl PeerExportContext {
             }
         };
         match (self.role, nexthop) {
-            (_, None) => local(),
-            (PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient, Some(nh)) => nh,
-            (PeerRole::ConfedEbgp | PeerRole::Ebgp, Some(_)) => local(),
+            // Flowspec carries no nexthop (RFC 8955 §4): preserve None.
+            (_, None) => None,
+            (PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient, Some(nh)) => Some(nh),
+            (PeerRole::ConfedEbgp | PeerRole::Ebgp, Some(_)) => Some(local()),
         }
     }
 }
@@ -9340,7 +9351,7 @@ mod tests {
             let exported = ctx.export_nexthop(Some(original));
             assert_eq!(
                 exported,
-                bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
                 "eBGP nexthop must be rewritten to local_addr"
             );
         }
@@ -9350,7 +9361,7 @@ mod tests {
             let ctx = ibgp_ctx();
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
             let exported = ctx.export_nexthop(Some(original));
-            assert_eq!(exported, original, "iBGP nexthop must be unchanged");
+            assert_eq!(exported, Some(original), "iBGP nexthop must be unchanged");
         }
 
         // ---- Confederation: export_attrs / export_nexthop ----
@@ -9464,7 +9475,7 @@ mod tests {
             let exported = ctx.export_nexthop(Some(original));
             assert_eq!(
                 exported,
-                bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
                 "ConfedEbgp nexthop must be rewritten to local_addr"
             );
         }
