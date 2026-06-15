@@ -4878,6 +4878,7 @@ impl PeerExportContext {
                             bgp::Attribute::LOCAL_PREF
                                 | bgp::Attribute::ORIGINATOR_ID
                                 | bgp::Attribute::CLUSTER_LIST
+                                | bgp::Attribute::MULTI_EXIT_DESC
                         )
                     })
                     .map(|a| {
@@ -9308,6 +9309,13 @@ mod tests {
             ])
         }
 
+        fn attr_with_med() -> Arc<Vec<packet::Attribute>> {
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, 50).unwrap(),
+            ])
+        }
+
         #[test]
         fn ebgp_export_strips_local_pref() {
             let ctx = ebgp_ctx();
@@ -9370,6 +9378,30 @@ mod tests {
                     .any(|a| a.code() == packet::Attribute::LOCAL_PREF
                         && a.value() == Some(packet::Attribute::DEFAULT_LOCAL_PREF)),
                 "iBGP export must inject LOCAL_PREF=100 when absent"
+            );
+        }
+
+        #[test]
+        fn ebgp_export_strips_med() {
+            let ctx = ebgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_med());
+            assert!(
+                exported
+                    .iter()
+                    .all(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC),
+                "MED must be stripped for eBGP (non-transitive, MUST NOT leak to other ASes)"
+            );
+        }
+
+        #[test]
+        fn ibgp_export_keeps_med() {
+            let ctx = ibgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_med());
+            assert!(
+                exported.iter().any(
+                    |a| a.code() == packet::Attribute::MULTI_EXIT_DESC && a.value() == Some(50)
+                ),
+                "MED must be passed through for iBGP"
             );
         }
 

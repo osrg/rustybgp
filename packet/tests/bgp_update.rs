@@ -286,10 +286,10 @@ fn update_attr_origin_igp() {
 }
 
 #[test]
-fn update_attr_med_dropped_on_encode() {
-    // MED (MULTI_EXIT_DESC) is an optional non-transitive attribute.
-    // The encoder only includes transitive attributes, so MED is dropped.
-    // This is correct BGP behavior: MED is not propagated between ASes.
+fn update_attr_med_preserved_on_encode() {
+    // MED (MULTI_EXIT_DESC) is included by the encoder so iBGP peers receive
+    // it.  Stripping for eBGP peers is handled by export_attrs() before the
+    // message reaches the encoder, not inside the encoder itself.
     let med_value: u32 = 150;
     let mut attrs = (*ipv4_attrs("192.0.2.254".parse().unwrap())).clone();
     attrs.push(Attribute::new_with_value(Attribute::MULTI_EXIT_DESC, med_value).unwrap());
@@ -303,15 +303,13 @@ fn update_attr_med_dropped_on_encode() {
 
     match round_trip(&msg, ipv4_codec()) {
         ParsedMessage::Update(ParsedUpdate::Routes { attrs, reach, .. }) => {
-            // Routes should be present (not withdrawn)
             assert!(!reach.unwrap().entries.is_empty());
-            // MED is dropped because it's optional non-transitive
             assert!(
                 attrs
                     .iter()
-                    .find(|a| a.code() == Attribute::MULTI_EXIT_DESC)
-                    .is_none(),
-                "MED must be dropped on encode (non-transitive optional attribute)"
+                    .any(|a| a.code() == Attribute::MULTI_EXIT_DESC
+                        && a.value() == Some(med_value)),
+                "MED must be preserved by the encoder (eBGP stripping is export_attrs()'s job)"
             );
         }
         _ => panic!("expected Update"),

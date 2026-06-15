@@ -2236,12 +2236,18 @@ impl PeerCodec {
                 // Write path attributes.  Encode transitive attrs plus
                 // ORIGINATOR_ID and CLUSTER_LIST, which are optional
                 // non-transitive but required in iBGP UPDATEs (RFC 4456 §8).
+                // MULTI_EXIT_DESC is sent to iBGP peers (export layer strips it
+                // for eBGP per BIRD/FRR convention).
                 // NEXTHOP is written below for traditional IPv4.
                 // MP_REACH/MP_UNREACH are synthesized below for MP paths.
-                // MED (optional non-transitive) is handled at the export layer.
                 for a in attr.as_ref() {
                     if a.flags & Attribute::FLAG_TRANSITIVE > 0
-                        || matches!(a.code(), Attribute::ORIGINATOR_ID | Attribute::CLUSTER_LIST)
+                        || matches!(
+                            a.code(),
+                            Attribute::ORIGINATOR_ID
+                                | Attribute::CLUSTER_LIST
+                                | Attribute::MULTI_EXIT_DESC
+                        )
                     {
                         attr_len += a.encode_wire(dst);
                     }
