@@ -2168,8 +2168,15 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
                 .family
                 .ok_or_else(|| Error::InvalidArgument("mp_reach missing family".to_string()))?;
             // RFC 8955 §4: Flowspec carries no nexthop; encode with nexthop_len=0.
-            // SAFI 133 = Flowspec, 134 = Flowspec VPN (IANA-assigned, stable).
-            let is_flowspec = matches!(family.safi as u8, 133 | 134);
+            let pkt_family =
+                rustybgp_packet::Family::new((family.afi as u32) << 16 | family.safi as u32);
+            let is_flowspec = matches!(
+                pkt_family,
+                rustybgp_packet::Family::IPV4_FLOWSPEC
+                    | rustybgp_packet::Family::IPV6_FLOWSPEC
+                    | rustybgp_packet::Family::IPV4_FLOWSPEC_VPN
+                    | rustybgp_packet::Family::IPV6_FLOWSPEC_VPN
+            );
             if is_flowspec && m.next_hops.is_empty() {
                 let mut c = Cursor::new(Vec::with_capacity(5));
                 c.write_u16::<NetworkEndian>(family.afi as u16).unwrap();

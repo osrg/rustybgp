@@ -1828,8 +1828,11 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
             let mp_reach_missing_nexthop = mp_reach.as_ref().is_some_and(|r| {
                 r.nexthop.is_none()
                     && !matches!(
-                        r.family.safi(),
-                        Family::SAFI_FLOWSPEC | Family::SAFI_FLOWSPEC_VPN
+                        r.family,
+                        Family::IPV4_FLOWSPEC
+                            | Family::IPV6_FLOWSPEC
+                            | Family::IPV4_FLOWSPEC_VPN
+                            | Family::IPV6_FLOWSPEC_VPN
                     )
             });
             let missing_mandatory = (reach.is_some() || mp_reach.is_some())
@@ -2093,8 +2096,11 @@ impl PeerCodec {
         // §4.3.2); other families pad IPv4 to 16 bytes for MP_REACH.
         let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
         if matches!(
-            family.safi(),
-            Family::SAFI_FLOWSPEC | Family::SAFI_FLOWSPEC_VPN
+            *family,
+            Family::IPV4_FLOWSPEC
+                | Family::IPV6_FLOWSPEC
+                | Family::IPV4_FLOWSPEC_VPN
+                | Family::IPV6_FLOWSPEC_VPN
         ) {
             // Flowspec carries no nexthop (RFC 8955 §4): nexthop_len=0.
             dst.put_u8(0);
@@ -2718,8 +2724,11 @@ impl PeerCodec {
                         // FlowSpec carries no nexthop (RFC 8955 §4). Any other
                         // family with nexthop_len=0 is malformed.
                         0 if matches!(
-                            family.safi(),
-                            Family::SAFI_FLOWSPEC | Family::SAFI_FLOWSPEC_VPN
+                            family,
+                            Family::IPV4_FLOWSPEC
+                                | Family::IPV6_FLOWSPEC
+                                | Family::IPV4_FLOWSPEC_VPN
+                                | Family::IPV6_FLOWSPEC_VPN
                         ) =>
                         {
                             None
