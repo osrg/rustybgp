@@ -19,8 +19,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use rustybgp_packet::{
-    Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, flowspec, mup, prefix_sid,
-    rd::RouteDistinguisher,
+    Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, bgp::Ipv4Net, bgp::Ipv6Net, flowspec,
+    mup, prefix_sid, rd::RouteDistinguisher,
 };
 
 use regex::Regex;
@@ -1083,7 +1083,129 @@ pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Fa
     }
 }
 
-pub(crate) fn net_from_api(n: api::Nlri) -> Result<Nlri, Error> {
+fn items_to_ops(items: Vec<api::FlowSpecComponentItem>) -> Vec<flowspec::Op> {
+    items
+        .into_iter()
+        .map(|item| flowspec::Op {
+            bits: item.op as u8,
+            value: item.value,
+        })
+        .collect()
+}
+
+fn rules_to_v4_components(
+    rules: Vec<api::FlowSpecRule>,
+) -> Result<Vec<flowspec::FlowspecV4Component>, Error> {
+    use flowspec::FlowspecV4Component as C;
+    rules
+        .into_iter()
+        .map(|rule| {
+            match rule
+                .rule
+                .ok_or_else(|| Error::InvalidArgument("missing flowspec rule".to_string()))?
+            {
+                api::flow_spec_rule::Rule::IpPrefix(p) => {
+                    let addr: std::net::Ipv4Addr = p.prefix.parse().map_err(|e| {
+                        Error::InvalidArgument(format!("invalid flowspec prefix: {}", e))
+                    })?;
+                    let net = Ipv4Net {
+                        addr,
+                        mask: p.prefix_len as u8,
+                    };
+                    match p.r#type {
+                        1 => Ok(C::DstPrefix(net)),
+                        2 => Ok(C::SrcPrefix(net)),
+                        t => Err(Error::InvalidArgument(format!(
+                            "unknown flowspec prefix type: {}",
+                            t
+                        ))),
+                    }
+                }
+                api::flow_spec_rule::Rule::Component(c) => {
+                    let ops = items_to_ops(c.items);
+                    match c.r#type {
+                        3 => Ok(C::Protocol(ops)),
+                        4 => Ok(C::Port(ops)),
+                        5 => Ok(C::DstPort(ops)),
+                        6 => Ok(C::SrcPort(ops)),
+                        7 => Ok(C::IcmpType(ops)),
+                        8 => Ok(C::IcmpCode(ops)),
+                        9 => Ok(C::TcpFlags(ops)),
+                        10 => Ok(C::PacketLen(ops)),
+                        11 => Ok(C::Dscp(ops)),
+                        12 => Ok(C::Fragment(ops)),
+                        t => Err(Error::InvalidArgument(format!(
+                            "unknown flowspec component type: {}",
+                            t
+                        ))),
+                    }
+                }
+                api::flow_spec_rule::Rule::Mac(_) => Err(Error::InvalidArgument(
+                    "MAC rule not supported for IPv4 Flowspec".to_string(),
+                )),
+            }
+        })
+        .collect()
+}
+
+fn rules_to_v6_components(
+    rules: Vec<api::FlowSpecRule>,
+) -> Result<Vec<flowspec::FlowspecV6Component>, Error> {
+    use flowspec::FlowspecV6Component as C;
+    rules
+        .into_iter()
+        .map(|rule| {
+            match rule
+                .rule
+                .ok_or_else(|| Error::InvalidArgument("missing flowspec rule".to_string()))?
+            {
+                api::flow_spec_rule::Rule::IpPrefix(p) => {
+                    let addr: std::net::Ipv6Addr = p.prefix.parse().map_err(|e| {
+                        Error::InvalidArgument(format!("invalid flowspec prefix: {}", e))
+                    })?;
+                    let prefix = Ipv6Net {
+                        addr,
+                        mask: p.prefix_len as u8,
+                    };
+                    let offset = p.offset as u8;
+                    match p.r#type {
+                        1 => Ok(C::DstPrefix { prefix, offset }),
+                        2 => Ok(C::SrcPrefix { prefix, offset }),
+                        t => Err(Error::InvalidArgument(format!(
+                            "unknown flowspec prefix type: {}",
+                            t
+                        ))),
+                    }
+                }
+                api::flow_spec_rule::Rule::Component(c) => {
+                    let ops = items_to_ops(c.items);
+                    match c.r#type {
+                        3 => Ok(C::NextHeader(ops)),
+                        4 => Ok(C::Port(ops)),
+                        5 => Ok(C::DstPort(ops)),
+                        6 => Ok(C::SrcPort(ops)),
+                        7 => Ok(C::IcmpType(ops)),
+                        8 => Ok(C::IcmpCode(ops)),
+                        9 => Ok(C::TcpFlags(ops)),
+                        10 => Ok(C::PacketLen(ops)),
+                        11 => Ok(C::Dscp(ops)),
+                        12 => Ok(C::Fragment(ops)),
+                        13 => Ok(C::FlowLabel(ops)),
+                        t => Err(Error::InvalidArgument(format!(
+                            "unknown flowspec component type: {}",
+                            t
+                        ))),
+                    }
+                }
+                api::flow_spec_rule::Rule::Mac(_) => Err(Error::InvalidArgument(
+                    "MAC rule not supported for IPv6 Flowspec".to_string(),
+                )),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn net_from_api(n: api::Nlri, family: Family) -> Result<Nlri, Error> {
     match n.nlri {
         Some(api::nlri::Nlri::Prefix(p)) => {
             Nlri::from_str(&format!("{}/{}", p.prefix, p.prefix_len))
@@ -1175,6 +1297,36 @@ pub(crate) fn net_from_api(n: api::Nlri) -> Result<Nlri, Error> {
                     teid: r.teid,
                 },
             )))
+        }
+        Some(api::nlri::Nlri::FlowSpec(n)) => match family {
+            Family::IPV4_FLOWSPEC => Ok(Nlri::FlowspecV4(flowspec::FlowspecV4Nlri {
+                components: rules_to_v4_components(n.rules)?,
+            })),
+            Family::IPV6_FLOWSPEC => Ok(Nlri::FlowspecV6(flowspec::FlowspecV6Nlri {
+                components: rules_to_v6_components(n.rules)?,
+            })),
+            _ => Err(Error::InvalidArgument(
+                "family mismatch for FlowSpec NLRI".to_string(),
+            )),
+        },
+        Some(api::nlri::Nlri::VpnFlowSpec(n)) => {
+            let rd = rd_from_api(
+                n.rd.as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing rd".to_string()))?,
+            )?;
+            match family {
+                Family::IPV4_FLOWSPEC_VPN => Ok(Nlri::FlowspecVpnV4(flowspec::FlowspecVpnV4Nlri {
+                    rd,
+                    components: rules_to_v4_components(n.rules)?,
+                })),
+                Family::IPV6_FLOWSPEC_VPN => Ok(Nlri::FlowspecVpnV6(flowspec::FlowspecVpnV6Nlri {
+                    rd,
+                    components: rules_to_v6_components(n.rules)?,
+                })),
+                _ => Err(Error::InvalidArgument(
+                    "family mismatch for VPN FlowSpec NLRI".to_string(),
+                )),
+            }
         }
         _ => Err(Error::InvalidArgument("invalid NLRI".to_string())),
     }
@@ -4332,5 +4484,83 @@ bgp-actions.set-next-hop = "self"
         };
         assert_eq!(t.asn, 131072);
         assert_eq!(t.local_admin, 7);
+    }
+
+    // --- Flowspec net_from_api roundtrips ---
+
+    fn make_flowspec_rule_prefix(
+        type_num: u32,
+        prefix: &str,
+        prefix_len: u32,
+        offset: u32,
+    ) -> api::FlowSpecRule {
+        api::FlowSpecRule {
+            rule: Some(api::flow_spec_rule::Rule::IpPrefix(api::FlowSpecIpPrefix {
+                r#type: type_num,
+                prefix_len,
+                prefix: prefix.to_string(),
+                offset,
+            })),
+        }
+    }
+
+    fn make_flowspec_rule_component(type_num: u32, op: u32, value: u64) -> api::FlowSpecRule {
+        api::FlowSpecRule {
+            rule: Some(api::flow_spec_rule::Rule::Component(
+                api::FlowSpecComponent {
+                    r#type: type_num,
+                    items: vec![api::FlowSpecComponentItem { op, value }],
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn net_from_api_flowspec_v4_roundtrip() {
+        let nlri = api::Nlri {
+            nlri: Some(api::nlri::Nlri::FlowSpec(api::FlowSpecNlri {
+                rules: vec![
+                    make_flowspec_rule_prefix(1, "10.0.0.0", 24, 0),
+                    make_flowspec_rule_component(6, 0x91, 80), // SrcPort == 80, end
+                ],
+            })),
+        };
+        let net = net_from_api(nlri, Family::IPV4_FLOWSPEC).unwrap();
+        let Nlri::FlowspecV4(n) = net else {
+            panic!("wrong variant")
+        };
+        assert_eq!(n.components.len(), 2);
+        let api_nlri = nlri_to_api(&Nlri::FlowspecV4(n));
+        let api::nlri::Nlri::FlowSpec(f) = api_nlri.nlri.unwrap() else {
+            panic!()
+        };
+        assert_eq!(f.rules.len(), 2);
+    }
+
+    #[test]
+    fn net_from_api_flowspec_v6_roundtrip() {
+        let nlri = api::Nlri {
+            nlri: Some(api::nlri::Nlri::FlowSpec(api::FlowSpecNlri {
+                rules: vec![
+                    make_flowspec_rule_prefix(1, "2001:db8::", 32, 0),
+                    make_flowspec_rule_component(13, 0x91, 1000), // FlowLabel == 1000, end
+                ],
+            })),
+        };
+        let net = net_from_api(nlri, Family::IPV6_FLOWSPEC).unwrap();
+        let Nlri::FlowspecV6(n) = net else {
+            panic!("wrong variant")
+        };
+        assert_eq!(n.components.len(), 2);
+    }
+
+    #[test]
+    fn net_from_api_flowspec_family_mismatch_returns_err() {
+        let nlri = api::Nlri {
+            nlri: Some(api::nlri::Nlri::FlowSpec(api::FlowSpecNlri {
+                rules: vec![],
+            })),
+        };
+        assert!(net_from_api(nlri, Family::IPV4).is_err());
     }
 }

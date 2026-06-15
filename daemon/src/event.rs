@@ -1510,7 +1510,7 @@ impl GrpcService {
             Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
-        let net = convert::net_from_api(path.nlri.ok_or(Error::EmptyArgument)?)
+        let net = convert::net_from_api(path.nlri.ok_or(Error::EmptyArgument)?, family)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
         let mut attr = Vec::new();
         let mut nexthop = None;
