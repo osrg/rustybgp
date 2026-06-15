@@ -1629,6 +1629,61 @@ fn update_with_unknown_optional_attrs() -> Vec<u8> {
     buf
 }
 
+fn update_with_aigp(aigp_flags: u8) -> Vec<u8> {
+    // AIGP TLV type=1, len=11, 8-byte metric
+    let aigp_value: Vec<u8> = vec![1, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut attrs: Vec<u8> = vec![
+        0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+        0x40, 0x02, 0x00, // AS_PATH empty
+        0x40, 0x03, 0x04, 0x0a, 0x00, 0x00, 0x01, // NEXTHOP 10.0.0.1
+    ];
+    attrs.push(aigp_flags);
+    attrs.push(Attribute::AIGP);
+    attrs.push(aigp_value.len() as u8);
+    attrs.extend_from_slice(&aigp_value);
+
+    let nlri: &[u8] = &[0x18, 0x0a, 0x01, 0x02]; // 10.1.2.0/24
+    let attr_len = attrs.len() as u16;
+    let total = 19u16 + 2 + 2 + attr_len + nlri.len() as u16;
+    let mut buf = vec![0xffu8; 16];
+    buf.extend_from_slice(&total.to_be_bytes());
+    buf.push(2); // UPDATE
+    buf.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_len = 0
+    buf.extend_from_slice(&attr_len.to_be_bytes());
+    buf.extend_from_slice(&attrs);
+    buf.extend_from_slice(nlri);
+    buf
+}
+
+#[test]
+fn aigp_with_correct_flags_is_accepted() {
+    // AIGP with FLAG_OPTIONAL (0x80) only: correct per RFC 7311 §2.1.
+    let mut codec = ipv4_codec();
+    let buf = update_with_aigp(0x80);
+    let parsed = codec.parse_message(&buf).expect("parse ok");
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, Message::Update(Update::Reach { .. }))),
+        "AIGP with correct flags (0x80) must yield a Reach message"
+    );
+}
+
+#[test]
+fn aigp_with_wrong_flags_treat_as_withdraw() {
+    // AIGP with FLAG_OPTIONAL | FLAG_TRANSITIVE (0xC0): wrong per RFC 7311 §2.1.
+    // RFC 7606: flag mismatch on optional transitive -> treat-as-withdraw.
+    let mut codec = ipv4_codec();
+    let buf = update_with_aigp(0xC0);
+    let parsed = codec.parse_message(&buf).expect("parse ok");
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+    assert!(
+        msgs.iter()
+            .all(|m| matches!(m, Message::Update(Update::Unreach { .. }))),
+        "AIGP with wrong flags (0xC0) must yield only Unreach (treat-as-withdraw)"
+    );
+}
+
 #[test]
 fn unknown_optional_transitive_attr_is_stored() {
     // RFC 4271 §5.1.4: unknown optional transitive attrs must be stored.

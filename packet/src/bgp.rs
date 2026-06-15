@@ -1321,7 +1321,7 @@ impl Attribute {
             Self::EXTENDED_COMMUNITY => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             Self::AS4_PATH => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             Self::AS4_AGGREGATOR => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
-            Self::AIGP => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
+            Self::AIGP => Some(Self::FLAG_OPTIONAL),
             Self::LARGE_COMMUNITY => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             Self::PREFIX_SID => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             Self::LS => Some(Self::FLAG_OPTIONAL),
@@ -2605,7 +2605,6 @@ impl PeerCodec {
                                 & (Attribute::FLAG_TRANSITIVE | Attribute::FLAG_OPTIONAL)
                                 > 0
                             {
-                                // FIXME: handle aigp case
                                 c.set_position(c.position() + alen as u64);
                                 error_attrs.push(AttributeError {
                                     attr_code: code,

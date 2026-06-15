@@ -4879,6 +4879,7 @@ impl PeerExportContext {
                                 | bgp::Attribute::ORIGINATOR_ID
                                 | bgp::Attribute::CLUSTER_LIST
                                 | bgp::Attribute::MULTI_EXIT_DESC
+                                | bgp::Attribute::AIGP
                         )
                     })
                     .map(|a| {
@@ -9576,6 +9577,34 @@ mod tests {
                     ctx.role
                 );
             }
+        }
+
+        fn aigp_attr() -> Arc<Vec<bgp::Attribute>> {
+            // AIGP TLV: type=1, len=11, value=8-byte metric (all zeros)
+            let aigp_tlv: Vec<u8> = vec![1, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0];
+            Arc::new(vec![
+                bgp::Attribute::new_with_bin(bgp::Attribute::AIGP, aigp_tlv).unwrap(),
+            ])
+        }
+
+        #[test]
+        fn ebgp_export_strips_aigp() {
+            // AIGP is optional non-transitive (RFC 7311 §2.1); must not cross AS boundaries.
+            let exported = ebgp_ctx().export_attrs(&aigp_attr());
+            assert!(
+                exported.iter().all(|a| a.code() != bgp::Attribute::AIGP),
+                "eBGP export must strip AIGP"
+            );
+        }
+
+        #[test]
+        fn ibgp_export_keeps_aigp() {
+            // AIGP is iBGP-safe: non-transitive attrs are forwarded within the AS.
+            let exported = ibgp_ctx().export_attrs(&aigp_attr());
+            assert!(
+                exported.iter().any(|a| a.code() == bgp::Attribute::AIGP),
+                "iBGP export must keep AIGP"
+            );
         }
 
         #[test]
