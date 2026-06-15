@@ -748,6 +748,8 @@ pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Fa
     match f {
         config::generate::AfiSafiType::Ipv4Unicast => Ok(Family::IPV4),
         config::generate::AfiSafiType::Ipv6Unicast => Ok(Family::IPV6),
+        config::generate::AfiSafiType::Ipv4Multicast => Ok(Family::IPV4_MC),
+        config::generate::AfiSafiType::Ipv6Multicast => Ok(Family::IPV6_MC),
         config::generate::AfiSafiType::Ipv4Mup => Ok(Family::IPV4_MUP),
         config::generate::AfiSafiType::Ipv6Mup => Ok(Family::IPV6_MUP),
         _ => Err(()),

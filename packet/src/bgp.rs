@@ -277,6 +277,7 @@ impl Family {
     pub const AFI_IP6: u16 = 2;
 
     const SAFI_UNICAST: u8 = 1;
+    const SAFI_MULTICAST: u8 = 2;
     const SAFI_MUP: u8 = 85;
     const SAFI_FLOWSPEC: u8 = 133;
     const SAFI_FLOWSPEC_VPN: u8 = 134;
@@ -286,6 +287,10 @@ impl Family {
     pub const EMPTY: Family = Family(0);
     pub const IPV4: Family = Family((Family::AFI_IP as u32) << 16 | Family::SAFI_UNICAST as u32);
     pub const IPV6: Family = Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_UNICAST as u32);
+    pub const IPV4_MC: Family =
+        Family((Family::AFI_IP as u32) << 16 | Family::SAFI_MULTICAST as u32);
+    pub const IPV6_MC: Family =
+        Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_MULTICAST as u32);
     pub const IPV4_MUP: Family = Family((Family::AFI_IP as u32) << 16 | Family::SAFI_MUP as u32);
     pub const IPV6_MUP: Family = Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_MUP as u32);
     pub const IPV4_VPN: Family =
@@ -459,8 +464,8 @@ impl Nlri {
         len: usize,
     ) -> Result<Nlri, Notification> {
         match family {
-            Family::IPV4 => Ipv4Net::decode(c, len).map(Nlri::V4),
-            Family::IPV6 => Ipv6Net::decode(c, len).map(Nlri::V6),
+            Family::IPV4 | Family::IPV4_MC => Ipv4Net::decode(c, len).map(Nlri::V4),
+            Family::IPV6 | Family::IPV6_MC => Ipv6Net::decode(c, len).map(Nlri::V6),
             Family::IPV4_MUP | Family::IPV6_MUP => crate::mup::MupNlri::decode(family, c, len)
                 .map(Nlri::Mup)
                 .map_err(|_| Notification::UpdateMalformedAttributeList),
