@@ -9405,6 +9405,98 @@ mod tests {
             );
         }
 
+        fn attr_with_originator_id() -> Arc<Vec<packet::Attribute>> {
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                packet::Attribute::new_with_value(packet::Attribute::ORIGINATOR_ID, 0x0a000001)
+                    .unwrap(),
+            ])
+        }
+
+        fn attr_with_cluster_list() -> Arc<Vec<packet::Attribute>> {
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                packet::Attribute::new_with_bin(
+                    packet::Attribute::CLUSTER_LIST,
+                    vec![0x00, 0x00, 0xff, 0x01],
+                )
+                .unwrap(),
+            ])
+        }
+
+        #[test]
+        fn ebgp_export_strips_originator_id() {
+            let ctx = ebgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_originator_id());
+            assert!(
+                exported
+                    .iter()
+                    .all(|a| a.code() != packet::Attribute::ORIGINATOR_ID),
+                "ORIGINATOR_ID must be stripped for eBGP"
+            );
+        }
+
+        #[test]
+        fn ebgp_export_strips_cluster_list() {
+            let ctx = ebgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_cluster_list());
+            assert!(
+                exported
+                    .iter()
+                    .all(|a| a.code() != packet::Attribute::CLUSTER_LIST),
+                "CLUSTER_LIST must be stripped for eBGP"
+            );
+        }
+
+        #[test]
+        fn ibgp_export_keeps_originator_id() {
+            let ctx = ibgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_originator_id());
+            assert!(
+                exported
+                    .iter()
+                    .any(|a| a.code() == packet::Attribute::ORIGINATOR_ID),
+                "ORIGINATOR_ID must be preserved for iBGP"
+            );
+        }
+
+        #[test]
+        fn ibgp_export_keeps_cluster_list() {
+            let ctx = ibgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_cluster_list());
+            assert!(
+                exported
+                    .iter()
+                    .any(|a| a.code() == packet::Attribute::CLUSTER_LIST),
+                "CLUSTER_LIST must be preserved for iBGP"
+            );
+        }
+
+        #[test]
+        fn rs_client_export_passes_attrs_unchanged() {
+            let ctx = rs_client_ctx();
+            // RS client must pass attrs as-is: no stripping, no LOCAL_PREF injection.
+            let attrs = attr_with_originator_id();
+            let exported = ctx.export_attrs(&attrs);
+            assert_eq!(
+                exported.len(),
+                attrs.len(),
+                "RS client must not add or remove any attributes"
+            );
+            assert!(
+                exported
+                    .iter()
+                    .any(|a| a.code() == packet::Attribute::ORIGINATOR_ID),
+                "RS client must preserve ORIGINATOR_ID"
+            );
+            assert!(
+                exported
+                    .iter()
+                    .all(|a| a.code() != packet::Attribute::LOCAL_PREF),
+                "RS client must not inject LOCAL_PREF"
+            );
+        }
+
         #[test]
         fn ebgp_export_rewrites_nexthop() {
             let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
