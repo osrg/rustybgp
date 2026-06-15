@@ -1,0 +1,32 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.10.1"
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.10.2"
+      peer-as: 65001
+    route-reflector:
+      config:
+        route-reflector-client: true
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+
+  - config:
+      neighbor-address: "172.30.10.3"
+      peer-as: 65001
+    route-reflector:
+      config:
+        route-reflector-client: true
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+
+  - config:
+      neighbor-address: "172.30.11.2"
+      peer-as: 65002
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
