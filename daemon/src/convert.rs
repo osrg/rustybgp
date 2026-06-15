@@ -73,6 +73,24 @@ pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
                 },
             )),
         },
+        Nlri::LabeledV4(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::LabeledPrefix(
+                api::LabeledIpAddressPrefix {
+                    labels: n.labels.labels().iter().map(|l| l.value()).collect(),
+                    prefix_len: n.prefix.mask as u32,
+                    prefix: n.prefix.addr.to_string(),
+                },
+            )),
+        },
+        Nlri::LabeledV6(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::LabeledPrefix(
+                api::LabeledIpAddressPrefix {
+                    labels: n.labels.labels().iter().map(|l| l.value()).collect(),
+                    prefix_len: n.prefix.mask as u32,
+                    prefix: n.prefix.addr.to_string(),
+                },
+            )),
+        },
     }
 }
 
@@ -750,6 +768,8 @@ pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Fa
         config::generate::AfiSafiType::Ipv6Unicast => Ok(Family::IPV6),
         config::generate::AfiSafiType::Ipv4Multicast => Ok(Family::IPV4_MC),
         config::generate::AfiSafiType::Ipv6Multicast => Ok(Family::IPV6_MC),
+        config::generate::AfiSafiType::Ipv4LabelledUnicast => Ok(Family::IPV4_MPLS),
+        config::generate::AfiSafiType::Ipv6LabelledUnicast => Ok(Family::IPV6_MPLS),
         config::generate::AfiSafiType::Ipv4Mup => Ok(Family::IPV4_MUP),
         config::generate::AfiSafiType::Ipv6Mup => Ok(Family::IPV6_MUP),
         _ => Err(()),

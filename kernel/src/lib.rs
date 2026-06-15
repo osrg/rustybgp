@@ -195,7 +195,11 @@ impl Handle {
         let (dst, prefix_len) = match change.net {
             packet::Nlri::V4(net) => (IpAddr::V4(net.addr), net.mask),
             packet::Nlri::V6(net) => (IpAddr::V6(net.addr), net.mask),
-            packet::Nlri::Mup(_) | packet::Nlri::VpnV4(_) | packet::Nlri::VpnV6(_) => {
+            packet::Nlri::Mup(_)
+            | packet::Nlri::VpnV4(_)
+            | packet::Nlri::VpnV6(_)
+            | packet::Nlri::LabeledV4(_)
+            | packet::Nlri::LabeledV6(_) => {
                 return Ok(());
             }
         };

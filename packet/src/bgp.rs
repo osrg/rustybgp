@@ -278,6 +278,7 @@ impl Family {
 
     const SAFI_UNICAST: u8 = 1;
     const SAFI_MULTICAST: u8 = 2;
+    const SAFI_LABELED_UNICAST: u8 = 4;
     const SAFI_MUP: u8 = 85;
     const SAFI_FLOWSPEC: u8 = 133;
     const SAFI_FLOWSPEC_VPN: u8 = 134;
@@ -291,6 +292,10 @@ impl Family {
         Family((Family::AFI_IP as u32) << 16 | Family::SAFI_MULTICAST as u32);
     pub const IPV6_MC: Family =
         Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_MULTICAST as u32);
+    pub const IPV4_MPLS: Family =
+        Family((Family::AFI_IP as u32) << 16 | Family::SAFI_LABELED_UNICAST as u32);
+    pub const IPV6_MPLS: Family =
+        Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_LABELED_UNICAST as u32);
     pub const IPV4_MUP: Family = Family((Family::AFI_IP as u32) << 16 | Family::SAFI_MUP as u32);
     pub const IPV6_MUP: Family = Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_MUP as u32);
     pub const IPV4_VPN: Family =
@@ -436,6 +441,8 @@ pub enum Nlri {
     Mup(crate::mup::MupNlri),
     VpnV4(crate::vpn::VpnV4Nlri),
     VpnV6(crate::vpn::VpnV6Nlri),
+    LabeledV4(crate::labeled::LabeledV4Nlri),
+    LabeledV6(crate::labeled::LabeledV6Nlri),
 }
 
 impl Nlri {
@@ -446,6 +453,8 @@ impl Nlri {
             Nlri::Mup(m) => Ok(m.encode(dst)),
             Nlri::VpnV4(n) => Ok(n.encode(dst)),
             Nlri::VpnV6(n) => Ok(n.encode(dst)),
+            Nlri::LabeledV4(n) => Ok(n.encode(dst)),
+            Nlri::LabeledV6(n) => Ok(n.encode(dst)),
         }
     }
 
@@ -462,6 +471,7 @@ impl Nlri {
         family: Family,
         c: &mut BgpReader<C>,
         len: usize,
+        is_reach: bool,
     ) -> Result<Nlri, Notification> {
         match family {
             Family::IPV4 | Family::IPV4_MC => Ipv4Net::decode(c, len).map(Nlri::V4),
@@ -474,6 +484,12 @@ impl Nlri {
                 .map_err(|_| Notification::UpdateMalformedAttributeList),
             Family::IPV6_VPN => crate::vpn::VpnV6Nlri::decode(c, len)
                 .map(Nlri::VpnV6)
+                .map_err(|_| Notification::UpdateMalformedAttributeList),
+            Family::IPV4_MPLS => crate::labeled::LabeledV4Nlri::decode(c, len, is_reach)
+                .map(Nlri::LabeledV4)
+                .map_err(|_| Notification::UpdateMalformedAttributeList),
+            Family::IPV6_MPLS => crate::labeled::LabeledV6Nlri::decode(c, len, is_reach)
+                .map(Nlri::LabeledV6)
                 .map_err(|_| Notification::UpdateMalformedAttributeList),
             _ => Err(Notification::UpdateMalformedAttributeList),
         }
@@ -502,6 +518,8 @@ impl fmt::Display for Nlri {
             Nlri::Mup(m) => m.fmt(f),
             Nlri::VpnV4(n) => n.fmt(f),
             Nlri::VpnV6(n) => n.fmt(f),
+            Nlri::LabeledV4(n) => n.fmt(f),
+            Nlri::LabeledV6(n) => n.fmt(f),
         }
     }
 }
@@ -705,7 +723,7 @@ fn nlri_decode_ipv4() {
     let len = buf.len();
     let mut c = BgpReader::<UpdateCtx>::new(&buf);
     assert_eq!(
-        Nlri::decode(Family::IPV4, &mut c, len).unwrap(),
+        Nlri::decode(Family::IPV4, &mut c, len, true).unwrap(),
         Nlri::V4(Ipv4Net {
             addr: Ipv4Addr::new(10, 0, 0, 0),
             mask: 24,
@@ -719,7 +737,7 @@ fn nlri_decode_ipv6() {
     let len = buf.len();
     let mut c = BgpReader::<UpdateCtx>::new(&buf);
     assert_eq!(
-        Nlri::decode(Family::IPV6, &mut c, len).unwrap(),
+        Nlri::decode(Family::IPV6, &mut c, len, true).unwrap(),
         Nlri::V6(Ipv6Net {
             addr: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0),
             mask: 32,
@@ -733,7 +751,7 @@ fn nlri_decode_unsupported_family() {
     let len = buf.len();
     let mut c = BgpReader::<UpdateCtx>::new(&buf);
     let mup_ipv4 = Family::new((Family::AFI_IP as u32) << 16 | 85);
-    assert!(Nlri::decode(mup_ipv4, &mut c, len).is_err());
+    assert!(Nlri::decode(mup_ipv4, &mut c, len, true).is_err());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2222,6 +2240,7 @@ impl PeerCodec {
     fn decode_nlri<C: ParseContext>(
         family: Family,
         addpath_rx: bool,
+        is_reach: bool,
         c: &mut BgpReader<C>,
         mut len: usize,
     ) -> Result<PathNlri, Notification> {
@@ -2235,18 +2254,25 @@ impl PeerCodec {
         } else {
             0
         };
-        Nlri::decode(family, c, len).map(|nlri| PathNlri { path_id: id, nlri })
+        Nlri::decode(family, c, len, is_reach).map(|nlri| PathNlri { path_id: id, nlri })
     }
     fn decode_nlri_list(
         family: Family,
         addpath_rx: bool,
+        is_reach: bool,
         buf: &[u8],
     ) -> Result<Vec<PathNlri>, Notification> {
         let mut reader = BgpReader::<UpdateCtx>::new(buf);
         let mut entries = Vec::new();
         while reader.remaining_len() > 0 {
             let rest = reader.remaining_len();
-            entries.push(Self::decode_nlri(family, addpath_rx, &mut reader, rest)?);
+            entries.push(Self::decode_nlri(
+                family,
+                addpath_rx,
+                is_reach,
+                &mut reader,
+                rest,
+            )?);
         }
         Ok(entries)
     }
@@ -2494,6 +2520,7 @@ impl PeerCodec {
                     reach = Self::decode_nlri_list(
                         Family::IPV4,
                         addpath_rx,
+                        true,
                         &buf[c.position() as usize..],
                     )?;
                 }
@@ -2508,6 +2535,7 @@ impl PeerCodec {
                     unreach = Self::decode_nlri_list(
                         Family::IPV4,
                         addpath_rx,
+                        false,
                         &buf[start..start + withdrawn_len as usize],
                     )?;
                 }
@@ -2561,8 +2589,12 @@ impl PeerCodec {
                         _ => return Err(err),
                     };
                     c.read_u8().unwrap();
-                    let entries =
-                        Self::decode_nlri_list(family, addpath_rx, &buf[c.position() as usize..])?;
+                    let entries = Self::decode_nlri_list(
+                        family,
+                        addpath_rx,
+                        true,
+                        &buf[c.position() as usize..],
+                    )?;
                     Some((family, entries, nexthop))
                 } else {
                     None
@@ -2583,8 +2615,12 @@ impl PeerCodec {
                     let safi = c.read_u8().unwrap();
                     let family = Family((afi as u32) << 16 | safi as u32);
                     let addpath_rx = self.families.get(&family).ok_or_else(malformed)?.addpath_rx;
-                    let entries =
-                        Self::decode_nlri_list(family, addpath_rx, &buf[c.position() as usize..])?;
+                    let entries = Self::decode_nlri_list(
+                        family,
+                        addpath_rx,
+                        false,
+                        &buf[c.position() as usize..],
+                    )?;
                     Some((family, entries))
                 } else {
                     None

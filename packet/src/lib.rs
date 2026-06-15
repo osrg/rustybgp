@@ -24,6 +24,7 @@ pub use self::error::Error;
 
 pub mod bmp;
 pub mod error;
+pub mod labeled;
 pub mod mpls;
 pub mod mrt;
 pub mod mup;

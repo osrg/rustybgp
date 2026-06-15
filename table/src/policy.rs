@@ -374,6 +374,7 @@ impl Condition {
                     packet::Nlri::V6(_) => {}
                     packet::Nlri::Mup(_) => {}
                     packet::Nlri::VpnV4(_) | packet::Nlri::VpnV6(_) => {}
+                    packet::Nlri::LabeledV4(_) | packet::Nlri::LabeledV6(_) => {}
                 };
             }
             Condition::AsPath(_name, opt, set) => {
@@ -543,6 +544,8 @@ fn nlri_family(net: &packet::Nlri) -> bgp::Family {
         }
         packet::Nlri::VpnV4(_) => bgp::Family::IPV4_VPN,
         packet::Nlri::VpnV6(_) => bgp::Family::IPV6_VPN,
+        packet::Nlri::LabeledV4(_) => bgp::Family::IPV4_MPLS,
+        packet::Nlri::LabeledV6(_) => bgp::Family::IPV6_MPLS,
     }
 }
 

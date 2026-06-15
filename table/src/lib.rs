@@ -1675,7 +1675,11 @@ impl RpkiTable {
                 let (mut addr, mask) = match net {
                     packet::Nlri::V4(net) => (net.addr.octets().to_vec(), net.mask),
                     packet::Nlri::V6(net) => (net.addr.octets().to_vec(), net.mask),
-                    packet::Nlri::Mup(_) | packet::Nlri::VpnV4(_) | packet::Nlri::VpnV6(_) => {
+                    packet::Nlri::Mup(_)
+                    | packet::Nlri::VpnV4(_)
+                    | packet::Nlri::VpnV6(_)
+                    | packet::Nlri::LabeledV4(_)
+                    | packet::Nlri::LabeledV6(_) => {
                         return None;
                     }
                 };
