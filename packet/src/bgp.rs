@@ -56,8 +56,24 @@ pub enum Notification {
     // Code 3: UPDATE Message Error
     #[error("update error: malformed attribute list")]
     UpdateMalformedAttributeList,
+    #[error("update error: unrecognized well-known attribute")]
+    UpdateUnrecognizedWellKnownAttribute { data: Vec<u8> },
+    #[error("update error: missing well-known attribute")]
+    UpdateMissingWellKnownAttribute { data: Vec<u8> },
+    #[error("update error: attribute flags error")]
+    UpdateAttributeFlagsError { data: Vec<u8> },
+    #[error("update error: attribute length error")]
+    UpdateAttributeLengthError { data: Vec<u8> },
+    #[error("update error: invalid origin attribute")]
+    UpdateInvalidOriginAttribute { data: Vec<u8> },
+    #[error("update error: invalid next hop attribute")]
+    UpdateInvalidNextHopAttribute { data: Vec<u8> },
     #[error("update error: optional attribute error")]
     UpdateOptionalAttributeError,
+    #[error("update error: invalid network field")]
+    UpdateInvalidNetworkField,
+    #[error("update error: malformed AS path")]
+    UpdateMalformedAsPath,
 
     // Code 4: Hold Timer Expired
     #[error("hold timer expired")]
@@ -74,8 +90,16 @@ pub enum Notification {
     CeaseAdminShutdown,
     #[error("cease: peer deconfigured")]
     CeasePeerDeconfigured,
+    #[error("cease: administrative reset")]
+    CeaseAdministrativeReset,
+    #[error("cease: connection rejected")]
+    CeaseConnectionRejected,
+    #[error("cease: other configuration change")]
+    CeaseOtherConfigurationChange,
     #[error("cease: connection collision resolution")]
     CeaseConnectionCollision,
+    #[error("cease: out of resources")]
+    CeaseOutOfResources,
     #[error("cease: hard reset")]
     CeaseHardReset,
 
@@ -104,13 +128,26 @@ impl Notification {
             | Self::OpenUnsupportedOptionalParameter { .. }
             | Self::OpenUnsupportedCapability { .. }
             | Self::OpenUnacceptableHoldTime { .. } => 2,
-            Self::UpdateMalformedAttributeList | Self::UpdateOptionalAttributeError => 3,
+            Self::UpdateMalformedAttributeList
+            | Self::UpdateUnrecognizedWellKnownAttribute { .. }
+            | Self::UpdateMissingWellKnownAttribute { .. }
+            | Self::UpdateAttributeFlagsError { .. }
+            | Self::UpdateAttributeLengthError { .. }
+            | Self::UpdateInvalidOriginAttribute { .. }
+            | Self::UpdateInvalidNextHopAttribute { .. }
+            | Self::UpdateOptionalAttributeError
+            | Self::UpdateInvalidNetworkField
+            | Self::UpdateMalformedAsPath => 3,
             Self::HoldTimerExpired => 4,
             Self::FsmUnexpectedState { .. } => 5,
             Self::CeaseMaxPrefixReached
             | Self::CeaseAdminShutdown
             | Self::CeasePeerDeconfigured
+            | Self::CeaseAdministrativeReset
+            | Self::CeaseConnectionRejected
+            | Self::CeaseOtherConfigurationChange
             | Self::CeaseConnectionCollision
+            | Self::CeaseOutOfResources
             | Self::CeaseHardReset => 6,
             Self::RouteRefreshInvalidLength { .. } => 7,
             Self::Other { code, .. } => *code,
@@ -130,13 +167,25 @@ impl Notification {
             Self::OpenUnsupportedCapability { .. } => 7,
             Self::OpenUnacceptableHoldTime { .. } => 6,
             Self::UpdateMalformedAttributeList => 1,
+            Self::UpdateUnrecognizedWellKnownAttribute { .. } => 2,
+            Self::UpdateMissingWellKnownAttribute { .. } => 3,
+            Self::UpdateAttributeFlagsError { .. } => 4,
+            Self::UpdateAttributeLengthError { .. } => 5,
+            Self::UpdateInvalidOriginAttribute { .. } => 6,
+            Self::UpdateInvalidNextHopAttribute { .. } => 8,
             Self::UpdateOptionalAttributeError => 9,
+            Self::UpdateInvalidNetworkField => 10,
+            Self::UpdateMalformedAsPath => 11,
             Self::HoldTimerExpired => 0,
             Self::FsmUnexpectedState { state } => *state,
             Self::CeaseMaxPrefixReached => 1,
             Self::CeaseAdminShutdown => 2,
             Self::CeasePeerDeconfigured => 3,
+            Self::CeaseAdministrativeReset => 4,
+            Self::CeaseConnectionRejected => 5,
+            Self::CeaseOtherConfigurationChange => 6,
             Self::CeaseConnectionCollision => 7,
+            Self::CeaseOutOfResources => 8,
             Self::CeaseHardReset => 9,
             Self::RouteRefreshInvalidLength { .. } => 1,
             Self::Other { subcode, .. } => *subcode,
@@ -152,6 +201,12 @@ impl Notification {
             | Self::OpenUnsupportedOptionalParameter { data }
             | Self::OpenUnsupportedCapability { data }
             | Self::OpenUnacceptableHoldTime { data }
+            | Self::UpdateUnrecognizedWellKnownAttribute { data }
+            | Self::UpdateMissingWellKnownAttribute { data }
+            | Self::UpdateAttributeFlagsError { data }
+            | Self::UpdateAttributeLengthError { data }
+            | Self::UpdateInvalidOriginAttribute { data }
+            | Self::UpdateInvalidNextHopAttribute { data }
             | Self::RouteRefreshInvalidLength { data }
             | Self::Other { data, .. } => data,
             _ => &[],
@@ -177,13 +232,25 @@ impl Notification {
             (2, 7) => Self::OpenUnsupportedCapability { data },
             (2, 6) => Self::OpenUnacceptableHoldTime { data },
             (3, 1) => Self::UpdateMalformedAttributeList,
+            (3, 2) => Self::UpdateUnrecognizedWellKnownAttribute { data },
+            (3, 3) => Self::UpdateMissingWellKnownAttribute { data },
+            (3, 4) => Self::UpdateAttributeFlagsError { data },
+            (3, 5) => Self::UpdateAttributeLengthError { data },
+            (3, 6) => Self::UpdateInvalidOriginAttribute { data },
+            (3, 8) => Self::UpdateInvalidNextHopAttribute { data },
             (3, 9) => Self::UpdateOptionalAttributeError,
+            (3, 10) => Self::UpdateInvalidNetworkField,
+            (3, 11) => Self::UpdateMalformedAsPath,
             (4, _) => Self::HoldTimerExpired,
             (5, state) => Self::FsmUnexpectedState { state },
             (6, 1) => Self::CeaseMaxPrefixReached,
             (6, 2) => Self::CeaseAdminShutdown,
             (6, 3) => Self::CeasePeerDeconfigured,
+            (6, 4) => Self::CeaseAdministrativeReset,
+            (6, 5) => Self::CeaseConnectionRejected,
+            (6, 6) => Self::CeaseOtherConfigurationChange,
             (6, 7) => Self::CeaseConnectionCollision,
+            (6, 8) => Self::CeaseOutOfResources,
             (6, 9) => Self::CeaseHardReset,
             (7, 1) => Self::RouteRefreshInvalidLength { data },
             _ => Self::Other {

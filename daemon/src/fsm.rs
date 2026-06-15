@@ -1130,11 +1130,8 @@ mod tests {
         let mut s = basic_connection();
         let _ = s.process(Input::Connected(false));
 
-        let notif = bgp::Message::Notification(rustybgp_packet::Notification::Other {
-            code: 6,
-            subcode: 4,
-            data: vec![],
-        });
+        let notif =
+            bgp::Message::Notification(rustybgp_packet::Notification::CeaseAdministrativeReset);
         let out = s.process(Input::MessageReceived(notif));
         assert!(has_output(&out, |o| matches!(
             o,
