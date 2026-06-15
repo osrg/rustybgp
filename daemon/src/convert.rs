@@ -3893,4 +3893,28 @@ bgp-actions.set-next-hop = "self"
         let stmt = first_stmt(&ptable);
         assert_eq!(stmt.actions.nexthop, Some(NexthopAction::PeerSelf));
     }
+
+    // --- family_from_config ---
+
+    #[test]
+    fn family_from_config_known_families() {
+        use config::generate::AfiSafiType;
+        let cases = [
+            (AfiSafiType::Ipv4Unicast, Family::IPV4),
+            (AfiSafiType::Ipv6Unicast, Family::IPV6),
+            (AfiSafiType::Ipv4Multicast, Family::IPV4_MC),
+            (AfiSafiType::Ipv6Multicast, Family::IPV6_MC),
+            (AfiSafiType::Ipv4Mup, Family::IPV4_MUP),
+            (AfiSafiType::Ipv6Mup, Family::IPV6_MUP),
+        ];
+        for (input, want) in cases {
+            assert_eq!(family_from_config(&input), Ok(want), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn family_from_config_unsupported_returns_err() {
+        use config::generate::AfiSafiType;
+        assert!(family_from_config(&AfiSafiType::L3VpnIpv4Unicast).is_err());
+    }
 }
