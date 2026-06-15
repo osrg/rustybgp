@@ -2236,24 +2236,12 @@ impl PeerCodec {
                 dst.put_u16(0);
                 let mut attr_len: u16 = 0;
 
-                // Write path attributes.  Encode transitive attrs plus
-                // ORIGINATOR_ID and CLUSTER_LIST, which are optional
-                // non-transitive but required in iBGP UPDATEs (RFC 4456 §8).
-                // MULTI_EXIT_DESC is sent to iBGP peers (export layer strips it
-                // for eBGP per BIRD/FRR convention).
+                // Write path attributes.  The export layer (export_attrs) is
+                // responsible for attribute selection; encode everything given.
                 // NEXTHOP is written below for traditional IPv4.
                 // MP_REACH/MP_UNREACH are synthesized below for MP paths.
                 for a in attr.as_ref() {
-                    if a.flags & Attribute::FLAG_TRANSITIVE > 0
-                        || matches!(
-                            a.code(),
-                            Attribute::ORIGINATOR_ID
-                                | Attribute::CLUSTER_LIST
-                                | Attribute::MULTI_EXIT_DESC
-                        )
-                    {
-                        attr_len += a.encode_wire(dst);
-                    }
+                    attr_len += a.encode_wire(dst);
                 }
 
                 if *family == Family::IPV4 && !ipv4_via_mp {
