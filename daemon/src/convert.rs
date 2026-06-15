@@ -91,7 +91,10 @@ pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
                 },
             )),
         },
-        Nlri::FlowspecV4(_) | Nlri::FlowspecV6(_) => api::Nlri { nlri: None },
+        Nlri::FlowspecV4(_)
+        | Nlri::FlowspecV6(_)
+        | Nlri::FlowspecVpnV4(_)
+        | Nlri::FlowspecVpnV6(_) => api::Nlri { nlri: None },
     }
 }
 
@@ -775,6 +778,8 @@ pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Fa
         config::generate::AfiSafiType::Ipv6Mup => Ok(Family::IPV6_MUP),
         config::generate::AfiSafiType::Ipv4Flowspec => Ok(Family::IPV4_FLOWSPEC),
         config::generate::AfiSafiType::Ipv6Flowspec => Ok(Family::IPV6_FLOWSPEC),
+        config::generate::AfiSafiType::L3VpnIpv4Flowspec => Ok(Family::IPV4_FLOWSPEC_VPN),
+        config::generate::AfiSafiType::L3VpnIpv6Flowspec => Ok(Family::IPV6_FLOWSPEC_VPN),
         _ => Err(()),
     }
 }

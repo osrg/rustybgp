@@ -56,6 +56,30 @@ func flowspecV6(components []bgp.FlowSpecComponentInterface) []byte {
 	return buf
 }
 
+func flowspecVpnV4(rd bgp.RouteDistinguisherInterface, components []bgp.FlowSpecComponentInterface) []byte {
+	nlri, err := bgp.NewFlowSpecVPN(bgp.RF_FS_IPv4_VPN, rd, components)
+	if err != nil {
+		panic(err)
+	}
+	buf, err := nlri.Serialize()
+	if err != nil {
+		panic(err)
+	}
+	return buf
+}
+
+func flowspecVpnV6(rd bgp.RouteDistinguisherInterface, components []bgp.FlowSpecComponentInterface) []byte {
+	nlri, err := bgp.NewFlowSpecVPN(bgp.RF_FS_IPv6_VPN, rd, components)
+	if err != nil {
+		panic(err)
+	}
+	buf, err := nlri.Serialize()
+	if err != nil {
+		panic(err)
+	}
+	return buf
+}
+
 func main() {
 	// --- V4: DstPrefix only ---
 	{
@@ -125,5 +149,28 @@ func main() {
 		})
 		fmt.Printf("// IPv6 Flowspec: NextHeader=TCP(6), FlowLabel=100\n")
 		fmt.Printf("pub const V6_NEXT_HEADER_TCP_FLOW_LABEL_100: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	rd := bgp.NewRouteDistinguisherTwoOctetAS(65000, 100)
+
+	// --- VPNv4 Flowspec: DstPrefix + Protocol=TCP + RD=65000:100 ---
+	{
+		buf := flowspecVpnV4(rd, []bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecDestinationPrefix(ipPrefix("10.0.1.0/24")),
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_IP_PROTO, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 6),
+			}),
+		})
+		fmt.Printf("// VPNv4 Flowspec: RD=65000:100, DstPrefix=10.0.1.0/24, Protocol=TCP(6)\n")
+		fmt.Printf("pub const VPN_V4_DST_PREFIX_PROTO_TCP: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- VPNv6 Flowspec: DstPrefix + RD=65000:100 ---
+	{
+		buf := flowspecVpnV6(rd, []bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecDestinationPrefix6(ipPrefix("2001:db8::/32"), 0),
+		})
+		fmt.Printf("// VPNv6 Flowspec: RD=65000:100, DstPrefix=2001:db8::/32, offset=0\n")
+		fmt.Printf("pub const VPN_V6_DST_PREFIX: &[u8] = %s;\n\n", rustBytes(buf))
 	}
 }

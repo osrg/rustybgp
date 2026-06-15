@@ -486,6 +486,102 @@ impl fmt::Display for FlowspecV6Nlri {
     }
 }
 
+/// Flowspec VPNv4 NLRI (AFI=1, SAFI=134): RD + IPv4 Flowspec components.
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+pub struct FlowspecVpnV4Nlri {
+    pub rd: crate::rd::RouteDistinguisher,
+    pub components: Vec<FlowspecV4Component>,
+}
+
+impl FlowspecVpnV4Nlri {
+    pub fn decode<R: io::Read>(r: &mut R, len: usize) -> io::Result<Self> {
+        if len < 1 {
+            return Err(malformed());
+        }
+        let (nlri_len, hdr) = read_nlri_len(r)?;
+        if nlri_len + hdr > len || nlri_len < crate::rd::RouteDistinguisher::LEN {
+            return Err(malformed());
+        }
+        let mut buf = vec![0u8; nlri_len];
+        r.read_exact(&mut buf)?;
+        let mut c = io::Cursor::new(&buf);
+        let mut rd_buf = [0u8; crate::rd::RouteDistinguisher::LEN];
+        for b in rd_buf.iter_mut() {
+            *b = c.read_u8()?;
+        }
+        let rd = crate::rd::RouteDistinguisher::decode(&rd_buf).map_err(|_| malformed())?;
+        let mut components = Vec::new();
+        while (c.position() as usize) < nlri_len {
+            components.push(FlowspecV4Component::decode(&mut c)?);
+        }
+        Ok(FlowspecVpnV4Nlri { rd, components })
+    }
+
+    pub fn encode<B: BufMut>(&self, dst: &mut B) {
+        let mut body = Vec::new();
+        self.rd.encode(&mut body);
+        for comp in &self.components {
+            comp.encode(&mut body);
+        }
+        write_nlri_len(body.len(), dst);
+        dst.put_slice(&body);
+    }
+}
+
+/// Flowspec VPNv6 NLRI (AFI=2, SAFI=134): RD + IPv6 Flowspec components.
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+pub struct FlowspecVpnV6Nlri {
+    pub rd: crate::rd::RouteDistinguisher,
+    pub components: Vec<FlowspecV6Component>,
+}
+
+impl FlowspecVpnV6Nlri {
+    pub fn decode<R: io::Read>(r: &mut R, len: usize) -> io::Result<Self> {
+        if len < 1 {
+            return Err(malformed());
+        }
+        let (nlri_len, hdr) = read_nlri_len(r)?;
+        if nlri_len + hdr > len || nlri_len < crate::rd::RouteDistinguisher::LEN {
+            return Err(malformed());
+        }
+        let mut buf = vec![0u8; nlri_len];
+        r.read_exact(&mut buf)?;
+        let mut c = io::Cursor::new(&buf);
+        let mut rd_buf = [0u8; crate::rd::RouteDistinguisher::LEN];
+        for b in rd_buf.iter_mut() {
+            *b = c.read_u8()?;
+        }
+        let rd = crate::rd::RouteDistinguisher::decode(&rd_buf).map_err(|_| malformed())?;
+        let mut components = Vec::new();
+        while (c.position() as usize) < nlri_len {
+            components.push(FlowspecV6Component::decode(&mut c)?);
+        }
+        Ok(FlowspecVpnV6Nlri { rd, components })
+    }
+
+    pub fn encode<B: BufMut>(&self, dst: &mut B) {
+        let mut body = Vec::new();
+        self.rd.encode(&mut body);
+        for comp in &self.components {
+            comp.encode(&mut body);
+        }
+        write_nlri_len(body.len(), dst);
+        dst.put_slice(&body);
+    }
+}
+
+impl fmt::Display for FlowspecVpnV4Nlri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "flowspec-vpnv4[{}]", self.components.len())
+    }
+}
+
+impl fmt::Display for FlowspecVpnV6Nlri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "flowspec-vpnv6[{}]", self.components.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,5 +718,61 @@ mod tests {
         let mut buf = Vec::new();
         nlri.encode(&mut buf);
         assert_eq!(buf, V6_NEXT_HEADER_TCP_FLOW_LABEL_100);
+    }
+
+    // VPNv4 Flowspec: RD=65000:100, DstPrefix=10.0.1.0/24, Protocol=TCP(6)
+    const VPN_V4_DST_PREFIX_PROTO_TCP: &[u8] = &[
+        0x10, 0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x64, 0x01, 0x18, 0x0a, 0x00, 0x01, 0x03,
+        0x81, 0x06,
+    ];
+
+    // VPNv6 Flowspec: RD=65000:100, DstPrefix=2001:db8::/32, offset=0
+    const VPN_V6_DST_PREFIX: &[u8] = &[
+        0x0f, 0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x64, 0x01, 0x20, 0x00, 0x20, 0x01, 0x0d,
+        0xb8,
+    ];
+
+    fn rd() -> crate::rd::RouteDistinguisher {
+        crate::rd::RouteDistinguisher::TwoOctetAs {
+            admin: 65000,
+            assigned: 100,
+        }
+    }
+
+    #[test]
+    fn vpn_v4_roundtrip() {
+        let mut c = Cursor::new(VPN_V4_DST_PREFIX_PROTO_TCP);
+        let nlri = FlowspecVpnV4Nlri::decode(&mut c, VPN_V4_DST_PREFIX_PROTO_TCP.len()).unwrap();
+        assert_eq!(nlri.rd, rd());
+        assert_eq!(nlri.components.len(), 2);
+        let FlowspecV4Component::DstPrefix(net) = &nlri.components[0] else {
+            panic!("expected DstPrefix");
+        };
+        assert_eq!(net.mask, 24);
+        assert_eq!(net.addr, "10.0.1.0".parse::<Ipv4Addr>().unwrap());
+        let FlowspecV4Component::Protocol(ops) = &nlri.components[1] else {
+            panic!("expected Protocol");
+        };
+        assert_eq!(ops[0].value, 6);
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, VPN_V4_DST_PREFIX_PROTO_TCP);
+    }
+
+    #[test]
+    fn vpn_v6_roundtrip() {
+        let mut c = Cursor::new(VPN_V6_DST_PREFIX);
+        let nlri = FlowspecVpnV6Nlri::decode(&mut c, VPN_V6_DST_PREFIX.len()).unwrap();
+        assert_eq!(nlri.rd, rd());
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV6Component::DstPrefix { prefix, offset } = &nlri.components[0] else {
+            panic!("expected DstPrefix");
+        };
+        assert_eq!(prefix.addr, "2001:db8::".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(prefix.mask, 32);
+        assert_eq!(*offset, 0);
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, VPN_V6_DST_PREFIX);
     }
 }
