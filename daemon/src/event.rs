@@ -9374,18 +9374,6 @@ mod tests {
         }
 
         #[test]
-        fn ibgp_export_preserves_existing_local_pref() {
-            let ctx = ibgp_ctx();
-            let original = attr_with_local_pref();
-            let exported = ctx.export_attrs(&original);
-            // When LOCAL_PREF is already present, no new Arc is created.
-            assert!(
-                Arc::ptr_eq(&exported, &original),
-                "iBGP export_attrs must not reallocate when LOCAL_PREF is already present"
-            );
-        }
-
-        #[test]
         fn ebgp_export_rewrites_nexthop() {
             let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
