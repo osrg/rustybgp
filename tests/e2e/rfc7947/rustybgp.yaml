@@ -1,0 +1,32 @@
+global:
+  config:
+    as: 65000
+    router-id: "172.30.30.1"
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.30.2"
+      peer-as: 65001
+    route-server:
+      config:
+        route-server-client: true
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+
+  - config:
+      neighbor-address: "172.30.30.3"
+      peer-as: 65002
+    route-server:
+      config:
+        route-server-client: true
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+
+  - config:
+      neighbor-address: "172.30.30.4"
+      peer-as: 65100
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
