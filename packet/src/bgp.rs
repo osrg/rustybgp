@@ -275,6 +275,7 @@ pub struct Family(u32);
 impl Family {
     pub const AFI_IP: u16 = 1;
     pub const AFI_IP6: u16 = 2;
+    pub const AFI_LS: u16 = 16388;
 
     const SAFI_UNICAST: u8 = 1;
     const SAFI_MULTICAST: u8 = 2;
@@ -284,6 +285,7 @@ impl Family {
     const SAFI_FLOWSPEC_VPN: u8 = 134;
     const SAFI_MPLS_VPN: u8 = 128;
     const SAFI_MPLS_VPN6: u8 = 129;
+    const SAFI_LS: u8 = 71;
 
     pub const EMPTY: Family = Family(0);
     pub const IPV4: Family = Family((Family::AFI_IP as u32) << 16 | Family::SAFI_UNICAST as u32);
@@ -310,6 +312,7 @@ impl Family {
         Family((Family::AFI_IP as u32) << 16 | Family::SAFI_FLOWSPEC_VPN as u32);
     pub const IPV6_FLOWSPEC_VPN: Family =
         Family((Family::AFI_IP6 as u32) << 16 | Family::SAFI_FLOWSPEC_VPN as u32);
+    pub const BGP_LS: Family = Family((Family::AFI_LS as u32) << 16 | Family::SAFI_LS as u32);
 
     pub fn new(v: u32) -> Self {
         Family(v)
@@ -455,6 +458,7 @@ pub enum Nlri {
     FlowspecV6(crate::flowspec::FlowspecV6Nlri),
     FlowspecVpnV4(crate::flowspec::FlowspecVpnV4Nlri),
     FlowspecVpnV6(crate::flowspec::FlowspecVpnV6Nlri),
+    Ls(crate::bgp_ls::BgpLsNlri),
 }
 
 impl Nlri {
@@ -480,6 +484,10 @@ impl Nlri {
                 Ok(0)
             }
             Nlri::FlowspecVpnV6(n) => {
+                n.encode(dst);
+                Ok(0)
+            }
+            Nlri::Ls(n) => {
                 n.encode(dst);
                 Ok(0)
             }
@@ -531,6 +539,9 @@ impl Nlri {
             Family::IPV6_FLOWSPEC_VPN => crate::flowspec::FlowspecVpnV6Nlri::decode(c, len)
                 .map(Nlri::FlowspecVpnV6)
                 .map_err(|_| Notification::UpdateMalformedAttributeList),
+            Family::BGP_LS => crate::bgp_ls::BgpLsNlri::decode(c)
+                .map(Nlri::Ls)
+                .ok_or(Notification::UpdateMalformedAttributeList),
             _ => Err(Notification::UpdateMalformedAttributeList),
         }
     }
@@ -564,6 +575,7 @@ impl fmt::Display for Nlri {
             Nlri::FlowspecV6(n) => n.fmt(f),
             Nlri::FlowspecVpnV4(n) => n.fmt(f),
             Nlri::FlowspecVpnV6(n) => n.fmt(f),
+            Nlri::Ls(n) => n.fmt(f),
         }
     }
 }
@@ -1147,6 +1159,7 @@ impl Attribute {
     pub const AIGP: u8 = 26;
     pub const LARGE_COMMUNITY: u8 = 32;
     pub const PREFIX_SID: u8 = 40;
+    pub const LS: u8 = 29;
 
     pub const AS_PATH_TYPE_SET: u8 = 1;
     pub const AS_PATH_TYPE_SEQ: u8 = 2;
@@ -1222,6 +1235,7 @@ impl Attribute {
             Self::AIGP => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             Self::LARGE_COMMUNITY => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             Self::PREFIX_SID => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
+            Self::LS => Some(Self::FLAG_OPTIONAL),
             _ => None,
         }
     }
@@ -2601,7 +2615,7 @@ impl PeerCodec {
                     let mut c = Cursor::new(buf);
                     let afi = c.read_u16::<NetworkEndian>().unwrap();
                     match afi {
-                        Family::AFI_IP | Family::AFI_IP6 => {}
+                        Family::AFI_IP | Family::AFI_IP6 | Family::AFI_LS => {}
                         _ => return Err(err),
                     }
                     let safi = c.read_u8().unwrap();
@@ -2659,7 +2673,7 @@ impl PeerCodec {
                     let mut c = Cursor::new(buf);
                     let afi = c.read_u16::<NetworkEndian>().unwrap();
                     match afi {
-                        Family::AFI_IP | Family::AFI_IP6 => {}
+                        Family::AFI_IP | Family::AFI_IP6 | Family::AFI_LS => {}
                         _ => return Err(err),
                     }
                     let safi = c.read_u8().unwrap();

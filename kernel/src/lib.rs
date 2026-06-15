@@ -203,7 +203,8 @@ impl Handle {
             | packet::Nlri::FlowspecV4(_)
             | packet::Nlri::FlowspecV6(_)
             | packet::Nlri::FlowspecVpnV4(_)
-            | packet::Nlri::FlowspecVpnV6(_) => {
+            | packet::Nlri::FlowspecVpnV6(_)
+            | packet::Nlri::Ls(_) => {
                 return Ok(());
             }
         };

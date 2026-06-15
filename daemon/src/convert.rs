@@ -19,8 +19,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use rustybgp_packet::{
-    Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, bgp::Ipv4Net, bgp::Ipv6Net, flowspec,
-    mup, prefix_sid, rd::RouteDistinguisher,
+    Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, bgp::Ipv4Net, bgp::Ipv6Net, bgp_ls,
+    flowspec, mup, prefix_sid, rd::RouteDistinguisher,
 };
 
 use regex::Regex;
@@ -261,6 +261,9 @@ pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
                 rules: flowspec_v6_to_rules(&n.components),
             })),
         },
+        Nlri::Ls(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::LsAddrPrefix(ls_nlri_to_api(n))),
+        },
     }
 }
 
@@ -310,6 +313,394 @@ fn mup_nlri_to_api(m: &mup::MupNlri) -> api::nlri::Nlri {
             })
         }
     }
+}
+
+fn node_desc_to_api(nd: &bgp_ls::NodeDescriptor) -> api::LsNodeDescriptor {
+    api::LsNodeDescriptor {
+        asn: nd.asn.unwrap_or(0),
+        bgp_ls_id: nd.bgp_ls_id.unwrap_or(0),
+        ospf_area_id: nd.ospf_area_id.unwrap_or(0),
+        pseudonode: nd.igp_router_id.as_ref().is_some_and(|r| r.len() == 7),
+        igp_router_id: nd
+            .igp_router_id
+            .as_ref()
+            .map_or(String::new(), |r| bgp_ls::format_igp_router_id(r)),
+        bgp_router_id: nd
+            .bgp_router_id
+            .map_or(String::new(), |r| Ipv4Addr::from(r).to_string()),
+        bgp_confederation_member: nd.bgp_confederation_member.unwrap_or(0),
+    }
+}
+
+fn link_desc_to_api(ld: &[bgp_ls::LinkDescTlv]) -> api::LsLinkDescriptor {
+    let mut link_local_id = 0u32;
+    let mut link_remote_id = 0u32;
+    let mut interface_addr_ipv4 = String::new();
+    let mut neighbor_addr_ipv4 = String::new();
+    let mut interface_addr_ipv6 = String::new();
+    let mut neighbor_addr_ipv6 = String::new();
+    for tlv in ld {
+        match tlv {
+            bgp_ls::LinkDescTlv::LinkId { local, remote } => {
+                link_local_id = *local;
+                link_remote_id = *remote;
+            }
+            bgp_ls::LinkDescTlv::Ipv4InterfaceAddr(a) => {
+                interface_addr_ipv4 = Ipv4Addr::from(*a).to_string();
+            }
+            bgp_ls::LinkDescTlv::Ipv4NeighborAddr(a) => {
+                neighbor_addr_ipv4 = Ipv4Addr::from(*a).to_string();
+            }
+            bgp_ls::LinkDescTlv::Ipv6InterfaceAddr(a) => {
+                interface_addr_ipv6 = Ipv6Addr::from(*a).to_string();
+            }
+            bgp_ls::LinkDescTlv::Ipv6NeighborAddr(a) => {
+                neighbor_addr_ipv6 = Ipv6Addr::from(*a).to_string();
+            }
+            _ => {}
+        }
+    }
+    api::LsLinkDescriptor {
+        link_local_id,
+        link_remote_id,
+        interface_addr_ipv4,
+        neighbor_addr_ipv4,
+        interface_addr_ipv6,
+        neighbor_addr_ipv6,
+    }
+}
+
+fn prefix_desc_to_api(pd: &[bgp_ls::PrefixDescTlv], is_ipv6: bool) -> api::LsPrefixDescriptor {
+    let mut ip_reachability = Vec::new();
+    let mut ospf_route_type = 0i32;
+    for tlv in pd {
+        match tlv {
+            bgp_ls::PrefixDescTlv::IpReachability { prefix_len, addr } => {
+                let addr_str = if is_ipv6 {
+                    let mut bytes = [0u8; 16];
+                    let n = addr.len().min(16);
+                    bytes[..n].copy_from_slice(&addr[..n]);
+                    Ipv6Addr::from(bytes).to_string()
+                } else {
+                    let mut bytes = [0u8; 4];
+                    let n = addr.len().min(4);
+                    bytes[..n].copy_from_slice(&addr[..n]);
+                    Ipv4Addr::from(bytes).to_string()
+                };
+                ip_reachability.push(format!("{}/{}", addr_str, prefix_len));
+            }
+            bgp_ls::PrefixDescTlv::OspfRouteType(t) => {
+                ospf_route_type = *t as i32;
+            }
+            _ => {}
+        }
+    }
+    api::LsPrefixDescriptor {
+        ip_reachability,
+        ospf_route_type,
+    }
+}
+
+fn ls_nlri_to_api(n: &bgp_ls::BgpLsNlri) -> api::LsAddrPrefix {
+    use api::ls_addr_prefix::LsNlri;
+    use api::ls_addr_prefix::ls_nlri::Nlri as LsNlriOneof;
+    let (nlri_type, protocol_id, identifier, nlri) = match n {
+        bgp_ls::BgpLsNlri::Node(n) => (
+            api::LsNlriType::Node as i32,
+            n.protocol_id as i32,
+            n.identifier,
+            Some(LsNlri {
+                nlri: Some(LsNlriOneof::Node(api::LsNodeNlri {
+                    local_node: Some(node_desc_to_api(&n.local_node)),
+                })),
+            }),
+        ),
+        bgp_ls::BgpLsNlri::Link(n) => (
+            api::LsNlriType::Link as i32,
+            n.protocol_id as i32,
+            n.identifier,
+            Some(LsNlri {
+                nlri: Some(LsNlriOneof::Link(api::LsLinkNlri {
+                    local_node: Some(node_desc_to_api(&n.local_node)),
+                    remote_node: Some(node_desc_to_api(&n.remote_node)),
+                    link_descriptor: Some(link_desc_to_api(&n.link_desc)),
+                })),
+            }),
+        ),
+        bgp_ls::BgpLsNlri::PrefixV4(n) => (
+            api::LsNlriType::PrefixV4 as i32,
+            n.protocol_id as i32,
+            n.identifier,
+            Some(LsNlri {
+                nlri: Some(LsNlriOneof::PrefixV4(api::LsPrefixV4nlri {
+                    local_node: Some(node_desc_to_api(&n.local_node)),
+                    prefix_descriptor: Some(prefix_desc_to_api(&n.prefix_desc, false)),
+                })),
+            }),
+        ),
+        bgp_ls::BgpLsNlri::PrefixV6(n) => (
+            api::LsNlriType::PrefixV6 as i32,
+            n.protocol_id as i32,
+            n.identifier,
+            Some(LsNlri {
+                nlri: Some(LsNlriOneof::PrefixV6(api::LsPrefixV6nlri {
+                    local_node: Some(node_desc_to_api(&n.local_node)),
+                    prefix_descriptor: Some(prefix_desc_to_api(&n.prefix_desc, true)),
+                })),
+            }),
+        ),
+        bgp_ls::BgpLsNlri::Unknown { .. } => (api::LsNlriType::Unspecified as i32, 0, 0, None),
+    };
+    api::LsAddrPrefix {
+        r#type: nlri_type,
+        nlri,
+        length: 0,
+        protocol_id,
+        identifier,
+    }
+}
+
+fn node_desc_from_api(nd: &api::LsNodeDescriptor) -> Result<bgp_ls::NodeDescriptor, Error> {
+    let igp_router_id = if nd.igp_router_id.is_empty() {
+        None
+    } else {
+        Some(parse_igp_router_id(&nd.igp_router_id)?)
+    };
+    let bgp_router_id = if nd.bgp_router_id.is_empty() {
+        None
+    } else {
+        let addr: Ipv4Addr = nd
+            .bgp_router_id
+            .parse()
+            .map_err(|e| Error::InvalidArgument(format!("invalid bgp_router_id: {}", e)))?;
+        Some(addr.octets())
+    };
+    Ok(bgp_ls::NodeDescriptor {
+        asn: if nd.asn == 0 { None } else { Some(nd.asn) },
+        bgp_ls_id: if nd.bgp_ls_id == 0 {
+            None
+        } else {
+            Some(nd.bgp_ls_id)
+        },
+        ospf_area_id: if nd.ospf_area_id == 0 {
+            None
+        } else {
+            Some(nd.ospf_area_id)
+        },
+        igp_router_id,
+        bgp_router_id,
+        bgp_confederation_member: if nd.bgp_confederation_member == 0 {
+            None
+        } else {
+            Some(nd.bgp_confederation_member)
+        },
+    })
+}
+
+fn parse_igp_router_id(s: &str) -> Result<Vec<u8>, Error> {
+    if let Ok(addr) = s.parse::<Ipv4Addr>() {
+        return Ok(addr.octets().to_vec());
+    }
+    // IS-IS system ID: "xxxx.xxxx.xxxx" (6 bytes) or "xxxx.xxxx.xxxx.xx" (7 bytes)
+    let parts: Vec<&str> = s.split('.').collect();
+    match parts.len() {
+        3 => {
+            let mut bytes = Vec::with_capacity(6);
+            for part in &parts {
+                if part.len() != 4 {
+                    return Err(Error::InvalidArgument(format!(
+                        "invalid igp_router_id: {}",
+                        s
+                    )));
+                }
+                let val = u16::from_str_radix(part, 16)
+                    .map_err(|_| Error::InvalidArgument(format!("invalid igp_router_id: {}", s)))?;
+                bytes.extend_from_slice(&val.to_be_bytes());
+            }
+            Ok(bytes)
+        }
+        4 => {
+            let mut bytes = Vec::with_capacity(7);
+            for (i, part) in parts.iter().enumerate() {
+                if i < 3 {
+                    if part.len() != 4 {
+                        return Err(Error::InvalidArgument(format!(
+                            "invalid igp_router_id: {}",
+                            s
+                        )));
+                    }
+                    let val = u16::from_str_radix(part, 16).map_err(|_| {
+                        Error::InvalidArgument(format!("invalid igp_router_id: {}", s))
+                    })?;
+                    bytes.extend_from_slice(&val.to_be_bytes());
+                } else {
+                    if part.len() != 2 {
+                        return Err(Error::InvalidArgument(format!(
+                            "invalid igp_router_id: {}",
+                            s
+                        )));
+                    }
+                    let val = u8::from_str_radix(part, 16).map_err(|_| {
+                        Error::InvalidArgument(format!("invalid igp_router_id: {}", s))
+                    })?;
+                    bytes.push(val);
+                }
+            }
+            Ok(bytes)
+        }
+        _ => Err(Error::InvalidArgument(format!(
+            "invalid igp_router_id: {}",
+            s
+        ))),
+    }
+}
+
+fn link_desc_from_api(ld: &api::LsLinkDescriptor) -> Vec<bgp_ls::LinkDescTlv> {
+    let mut tlvs = Vec::new();
+    if ld.link_local_id != 0 || ld.link_remote_id != 0 {
+        tlvs.push(bgp_ls::LinkDescTlv::LinkId {
+            local: ld.link_local_id,
+            remote: ld.link_remote_id,
+        });
+    }
+    if !ld.interface_addr_ipv4.is_empty()
+        && let Ok(addr) = ld.interface_addr_ipv4.parse::<Ipv4Addr>()
+    {
+        tlvs.push(bgp_ls::LinkDescTlv::Ipv4InterfaceAddr(addr.octets()));
+    }
+    if !ld.neighbor_addr_ipv4.is_empty()
+        && let Ok(addr) = ld.neighbor_addr_ipv4.parse::<Ipv4Addr>()
+    {
+        tlvs.push(bgp_ls::LinkDescTlv::Ipv4NeighborAddr(addr.octets()));
+    }
+    if !ld.interface_addr_ipv6.is_empty()
+        && let Ok(addr) = ld.interface_addr_ipv6.parse::<Ipv6Addr>()
+    {
+        tlvs.push(bgp_ls::LinkDescTlv::Ipv6InterfaceAddr(addr.octets()));
+    }
+    if !ld.neighbor_addr_ipv6.is_empty()
+        && let Ok(addr) = ld.neighbor_addr_ipv6.parse::<Ipv6Addr>()
+    {
+        tlvs.push(bgp_ls::LinkDescTlv::Ipv6NeighborAddr(addr.octets()));
+    }
+    tlvs
+}
+
+fn prefix_desc_from_api(pd: &api::LsPrefixDescriptor, is_ipv6: bool) -> Vec<bgp_ls::PrefixDescTlv> {
+    let mut tlvs = Vec::new();
+    if pd.ospf_route_type != 0 {
+        tlvs.push(bgp_ls::PrefixDescTlv::OspfRouteType(
+            pd.ospf_route_type as u8,
+        ));
+    }
+    for s in &pd.ip_reachability {
+        let Some((addr_str, len_str)) = s.rsplit_once('/') else {
+            continue;
+        };
+        let Ok(prefix_len) = len_str.parse::<u8>() else {
+            continue;
+        };
+        let octets: Option<Vec<u8>> = if is_ipv6 {
+            addr_str
+                .parse::<Ipv6Addr>()
+                .ok()
+                .map(|a| a.octets().to_vec())
+        } else {
+            addr_str
+                .parse::<Ipv4Addr>()
+                .ok()
+                .map(|a| a.octets().to_vec())
+        };
+        let Some(full_addr) = octets else {
+            continue;
+        };
+        let byte_len = prefix_len.div_ceil(8) as usize;
+        let addr = full_addr[..byte_len.min(full_addr.len())].to_vec();
+        tlvs.push(bgp_ls::PrefixDescTlv::IpReachability { prefix_len, addr });
+    }
+    tlvs
+}
+
+fn ls_nlri_from_api(a: api::LsAddrPrefix) -> Result<Nlri, Error> {
+    use api::ls_addr_prefix::ls_nlri::Nlri as LsNlriOneof;
+    let protocol_id = a.protocol_id as u8;
+    let identifier = a.identifier;
+    let nlri_inner = a.nlri.and_then(|n| n.nlri);
+    let bgp_ls_nlri =
+        match nlri_inner {
+            Some(LsNlriOneof::Node(n)) => {
+                let local_node =
+                    node_desc_from_api(n.local_node.as_ref().ok_or_else(|| {
+                        Error::InvalidArgument("missing local_node".to_string())
+                    })?)?;
+                bgp_ls::BgpLsNlri::Node(bgp_ls::BgpLsNodeNlri {
+                    protocol_id,
+                    identifier,
+                    local_node,
+                })
+            }
+            Some(LsNlriOneof::Link(n)) => {
+                let local_node =
+                    node_desc_from_api(n.local_node.as_ref().ok_or_else(|| {
+                        Error::InvalidArgument("missing local_node".to_string())
+                    })?)?;
+                let remote_node =
+                    node_desc_from_api(n.remote_node.as_ref().ok_or_else(|| {
+                        Error::InvalidArgument("missing remote_node".to_string())
+                    })?)?;
+                let link_desc = n
+                    .link_descriptor
+                    .as_ref()
+                    .map(link_desc_from_api)
+                    .unwrap_or_default();
+                bgp_ls::BgpLsNlri::Link(bgp_ls::BgpLsLinkNlri {
+                    protocol_id,
+                    identifier,
+                    local_node,
+                    remote_node,
+                    link_desc,
+                })
+            }
+            Some(LsNlriOneof::PrefixV4(n)) => {
+                let local_node =
+                    node_desc_from_api(n.local_node.as_ref().ok_or_else(|| {
+                        Error::InvalidArgument("missing local_node".to_string())
+                    })?)?;
+                let prefix_desc = n
+                    .prefix_descriptor
+                    .as_ref()
+                    .map(|pd| prefix_desc_from_api(pd, false))
+                    .unwrap_or_default();
+                bgp_ls::BgpLsNlri::PrefixV4(bgp_ls::BgpLsPrefixNlri {
+                    protocol_id,
+                    identifier,
+                    local_node,
+                    prefix_desc,
+                })
+            }
+            Some(LsNlriOneof::PrefixV6(n)) => {
+                let local_node =
+                    node_desc_from_api(n.local_node.as_ref().ok_or_else(|| {
+                        Error::InvalidArgument("missing local_node".to_string())
+                    })?)?;
+                let prefix_desc = n
+                    .prefix_descriptor
+                    .as_ref()
+                    .map(|pd| prefix_desc_from_api(pd, true))
+                    .unwrap_or_default();
+                bgp_ls::BgpLsNlri::PrefixV6(bgp_ls::BgpLsPrefixNlri {
+                    protocol_id,
+                    identifier,
+                    local_node,
+                    prefix_desc,
+                })
+            }
+            _ => bgp_ls::BgpLsNlri::Unknown {
+                nlri_type: a.r#type as u16,
+                body: Vec::new(),
+            },
+        };
+    Ok(Nlri::Ls(bgp_ls_nlri))
 }
 
 /// Convert an `api::RouteTarget` to its 8-byte wire representation.
@@ -1328,6 +1719,7 @@ pub(crate) fn net_from_api(n: api::Nlri, family: Family) -> Result<Nlri, Error> 
                 )),
             }
         }
+        Some(api::nlri::Nlri::LsAddrPrefix(n)) => ls_nlri_from_api(n),
         _ => Err(Error::InvalidArgument("invalid NLRI".to_string())),
     }
 }
