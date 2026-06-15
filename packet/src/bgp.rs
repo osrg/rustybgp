@@ -369,7 +369,7 @@ impl Family {
     pub const IPV6_FLOWSPEC: Family = Family::new(Family::AFI_IP6, Family::SAFI_FLOWSPEC);
     pub const IPV4_FLOWSPEC_VPN: Family = Family::new(Family::AFI_IP, Family::SAFI_FLOWSPEC_VPN);
     pub const IPV6_FLOWSPEC_VPN: Family = Family::new(Family::AFI_IP6, Family::SAFI_FLOWSPEC_VPN);
-    pub const BGP_LS: Family = Family::new(Family::AFI_LS, Family::SAFI_LS);
+    pub const LS: Family = Family::new(Family::AFI_LS, Family::SAFI_LS);
 
     pub const fn new(afi: u16, safi: u8) -> Self {
         Family((afi as u32) << 16 | safi as u32)
@@ -596,7 +596,7 @@ impl Nlri {
             Family::IPV6_FLOWSPEC_VPN => crate::flowspec::FlowspecVpnV6Nlri::decode(c, len)
                 .map(Nlri::FlowspecVpnV6)
                 .map_err(|_| Notification::UpdateMalformedAttributeList),
-            Family::BGP_LS => crate::bgp_ls::BgpLsNlri::decode(c)
+            Family::LS => crate::bgp_ls::BgpLsNlri::decode(c)
                 .map(Nlri::Ls)
                 .ok_or(Notification::UpdateMalformedAttributeList),
             _ => Err(Notification::UpdateMalformedAttributeList),
