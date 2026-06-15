@@ -2233,9 +2233,16 @@ impl PeerCodec {
                 dst.put_u16(0);
                 let mut attr_len: u16 = 0;
 
-                // Write transitive path attributes.
+                // Write path attributes.  Encode transitive attrs plus
+                // ORIGINATOR_ID and CLUSTER_LIST, which are optional
+                // non-transitive but required in iBGP UPDATEs (RFC 4456 §8).
+                // NEXTHOP is written below for traditional IPv4.
+                // MP_REACH/MP_UNREACH are synthesized below for MP paths.
+                // MED (optional non-transitive) is handled at the export layer.
                 for a in attr.as_ref() {
-                    if a.flags & Attribute::FLAG_TRANSITIVE > 0 {
+                    if a.flags & Attribute::FLAG_TRANSITIVE > 0
+                        || matches!(a.code(), Attribute::ORIGINATOR_ID | Attribute::CLUSTER_LIST)
+                    {
                         attr_len += a.encode_wire(dst);
                     }
                 }

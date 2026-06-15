@@ -4829,14 +4829,18 @@ impl PeerExportContext {
     /// Apply per-peer attribute transformation to outgoing route attributes.
     ///
     /// eBGP: prepend `local_asn` to AS_PATH (adding a synthetic segment for
-    /// locally-originated routes), and strip LOCAL_PREF (not sent to eBGP
-    /// peers per RFC 4271).
-    /// iBGP / iBGP-RR-client: pass through unchanged — no AS_PATH prepend,
-    /// LOCAL_PREF retained.
+    /// locally-originated routes); strip LOCAL_PREF (RFC 4271 §5.1.5) and
+    /// ORIGINATOR_ID / CLUSTER_LIST (RFC 4456 §8, iBGP-only attributes).
+    /// iBGP / iBGP-RR-client: no AS_PATH prepend; LOCAL_PREF injected with
+    /// default value (100) if absent (RFC 4271 §5.1.5 requires LOCAL_PREF in
+    /// all UPDATE messages to internal peers).
     /// RS client: pass through unchanged.
     fn export_attrs(&self, attrs: &Arc<Vec<bgp::Attribute>>) -> Arc<Vec<bgp::Attribute>> {
         match self.role {
-            PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient => attrs.clone(),
+            PeerRole::RsClient => attrs.clone(),
+            PeerRole::Ibgp | PeerRole::IbgpRrClient => {
+                inject_local_pref_if_absent(Arc::clone(attrs))
+            }
             PeerRole::ConfedEbgp => {
                 // Prepend local Member-AS to AS_CONFED_SEQUENCE; retain LOCAL_PREF.
                 let has_as_path = attrs.iter().any(|a| a.code() == bgp::Attribute::AS_PATH);
@@ -4868,7 +4872,14 @@ impl PeerExportContext {
                 let has_as_path = attrs.iter().any(|a| a.code() == bgp::Attribute::AS_PATH);
                 let mut new_attrs: Vec<bgp::Attribute> = attrs
                     .iter()
-                    .filter(|a| a.code() != bgp::Attribute::LOCAL_PREF)
+                    .filter(|a| {
+                        !matches!(
+                            a.code(),
+                            bgp::Attribute::LOCAL_PREF
+                                | bgp::Attribute::ORIGINATOR_ID
+                                | bgp::Attribute::CLUSTER_LIST
+                        )
+                    })
                     .map(|a| {
                         if a.code() == bgp::Attribute::AS_PATH {
                             a.as_path_strip_confed().as_path_prepend(prepend_asn)
@@ -6214,12 +6225,13 @@ fn is_as_loop(attr: &Arc<Vec<bgp::Attribute>>, local_asn: u32, confederation_id:
         && as_path.as_path_count(confederation_id).is_ok_and(|n| n > 0)
 }
 
-/// Inject LOCAL_PREF with the default value when it is absent from `attr`.
+/// Inject LOCAL_PREF with the default value (100) when it is absent from `attr`.
 ///
-/// RFC 4271 §5.1.5 requires LOCAL_PREF on iBGP UPDATE announcements, but
-/// some implementations omit it.  Inject the default (100) so the RIB
-/// always has a LOCAL_PREF for iBGP paths.  Returns the original `Arc`
-/// unchanged when LOCAL_PREF is already present (no allocation).
+/// RFC 4271 §5.1.5 requires LOCAL_PREF in all iBGP UPDATE messages.  Called
+/// on the send path (export_attrs) so eBGP-learned routes gain LOCAL_PREF
+/// before distribution to iBGP peers, and on the receive path as a defensive
+/// fallback for peers that omit it.  Returns the original Arc unchanged when
+/// LOCAL_PREF is already present (no allocation).
 fn inject_local_pref_if_absent(attr: Arc<Vec<packet::Attribute>>) -> Arc<Vec<packet::Attribute>> {
     if attr
         .iter()
@@ -9337,10 +9349,39 @@ mod tests {
             let ctx = ibgp_ctx();
             let original = attr_with_aspath();
             let exported = ctx.export_attrs(&original);
-            // iBGP should return the same Arc (no cloning/modification)
+            let aspath = exported
+                .iter()
+                .find(|a| a.code() == packet::Attribute::AS_PATH)
+                .expect("AS_PATH must be present after iBGP export");
+            assert_eq!(
+                aspath.as_path_origin(),
+                None,
+                "iBGP export must not prepend local ASN to AS_PATH"
+            );
+        }
+
+        #[test]
+        fn ibgp_export_injects_local_pref_when_absent() {
+            let ctx = ibgp_ctx();
+            let exported = ctx.export_attrs(&attr_with_aspath());
+            assert!(
+                exported
+                    .iter()
+                    .any(|a| a.code() == packet::Attribute::LOCAL_PREF
+                        && a.value() == Some(packet::Attribute::DEFAULT_LOCAL_PREF)),
+                "iBGP export must inject LOCAL_PREF=100 when absent"
+            );
+        }
+
+        #[test]
+        fn ibgp_export_preserves_existing_local_pref() {
+            let ctx = ibgp_ctx();
+            let original = attr_with_local_pref();
+            let exported = ctx.export_attrs(&original);
+            // When LOCAL_PREF is already present, no new Arc is created.
             assert!(
                 Arc::ptr_eq(&exported, &original),
-                "iBGP export_attrs should return attrs unchanged"
+                "iBGP export_attrs must not reallocate when LOCAL_PREF is already present"
             );
         }
 
