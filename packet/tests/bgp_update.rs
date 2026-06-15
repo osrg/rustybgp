@@ -752,10 +752,9 @@ fn mp_reach_zero_nexthop_non_flowspec_is_error() {
 #[test]
 fn mp_reach_zero_nexthop_flowspec_is_ok() {
     // nexthop_len=0 is valid for FlowSpec (RFC 8955 §4).
-    let ipv4_flowspec = Family::new((Family::AFI_IP as u32) << 16 | 133);
     let buf = mp_reach_zero_nexthop_update(Family::AFI_IP, 133);
     let mut codec = PeerCodec::new();
-    codec.set_family(ipv4_flowspec, FamilyState::default());
+    codec.set_family(Family::IPV4_FLOWSPEC, FamilyState::default());
     assert!(
         codec.parse_message(&buf).is_ok(),
         "FlowSpec nexthop_len=0 must be accepted"

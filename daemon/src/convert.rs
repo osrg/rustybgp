@@ -1793,7 +1793,7 @@ fn ensure_u16(name: &str, v: u32) -> Result<u16, Error> {
 }
 
 pub(crate) fn family_from_api(f: &api::Family) -> Family {
-    Family::new((f.afi as u32) << 16 | f.safi as u32)
+    Family::new(f.afi as u16, f.safi as u8)
 }
 
 pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Family, ()> {
@@ -2168,8 +2168,7 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
                 .family
                 .ok_or_else(|| Error::InvalidArgument("mp_reach missing family".to_string()))?;
             // RFC 8955 §4: Flowspec carries no nexthop; encode with nexthop_len=0.
-            let pkt_family =
-                rustybgp_packet::Family::new((family.afi as u32) << 16 | family.safi as u32);
+            let pkt_family = rustybgp_packet::Family::new(family.afi as u16, family.safi as u8);
             let is_flowspec = matches!(
                 pkt_family,
                 rustybgp_packet::Family::IPV4_FLOWSPEC
@@ -3144,7 +3143,7 @@ pub(crate) fn conditions_from_api(
         let families: Vec<rustybgp_packet::Family> = conditions
             .afi_safi_in
             .iter()
-            .map(|f| rustybgp_packet::Family::new((f.afi as u32) << 16 | f.safi as u32))
+            .map(|f| rustybgp_packet::Family::new(f.afi as u16, f.safi as u8))
             .collect();
         v.push(ConditionConfig::AfiSafiIn(families));
     }
