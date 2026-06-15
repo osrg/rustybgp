@@ -1602,3 +1602,67 @@ fn flowspec_ipv4_no_nexthop_accepted() {
         "Flowspec MP_REACH with nexthop_len=0 must be accepted, not treated as withdraw"
     );
 }
+
+/// Build a minimal IPv4 UPDATE containing ORIGIN + AS_PATH + NEXTHOP plus two
+/// unknown optional attributes: one transitive (code 200) and one
+/// non-transitive (code 201), followed by a single /24 NLRI.
+fn update_with_unknown_optional_attrs() -> Vec<u8> {
+    let attrs: &[u8] = &[
+        0x40, 0x01, 0x01, 0x00, // ORIGIN IGP (transitive)
+        0x40, 0x02, 0x00, // AS_PATH empty (transitive)
+        0x40, 0x03, 0x04, 0x0a, 0x00, 0x00, 0x01, // NEXTHOP 10.0.0.1
+        // Unknown optional transitive (code=200, flags=0xC0, len=3, data=[1,2,3])
+        0xC0, 0xC8, 0x03, 0x01, 0x02, 0x03,
+        // Unknown optional non-transitive (code=201, flags=0x80, len=3, data=[4,5,6])
+        0x80, 0xC9, 0x03, 0x04, 0x05, 0x06,
+    ];
+    let nlri: &[u8] = &[0x18, 0x0a, 0x01, 0x02]; // 10.1.2.0/24
+    let attr_len = attrs.len() as u16;
+    let total = 19u16 + 2 + 2 + attr_len + nlri.len() as u16;
+    let mut buf = vec![0xffu8; 16];
+    buf.extend_from_slice(&total.to_be_bytes());
+    buf.push(2); // UPDATE
+    buf.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_len = 0
+    buf.extend_from_slice(&attr_len.to_be_bytes());
+    buf.extend_from_slice(attrs);
+    buf.extend_from_slice(nlri);
+    buf
+}
+
+#[test]
+fn unknown_optional_transitive_attr_is_stored() {
+    // RFC 4271 §5.1.4: unknown optional transitive attrs must be stored.
+    let mut codec = ipv4_codec();
+    let buf = update_with_unknown_optional_attrs();
+    let parsed = codec.parse_message(&buf).expect("parse ok");
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+    let attr = match &msgs[0] {
+        Message::Update(Update::Reach { attr, .. }) => attr,
+        _ => panic!("expected Reach message"),
+    };
+    let opaque = attr.iter().find(|a| a.code() == 200);
+    assert!(
+        opaque.is_some(),
+        "unknown optional transitive attr must be stored"
+    );
+    let opaque = opaque.unwrap();
+    assert!(opaque.is_opaque());
+    assert_eq!(opaque.binary().unwrap(), &vec![0x01, 0x02, 0x03]);
+}
+
+#[test]
+fn unknown_optional_non_transitive_attr_is_discarded() {
+    // RFC 4271 §5.1.4: unknown optional non-transitive attrs must be silently discarded.
+    let mut codec = ipv4_codec();
+    let buf = update_with_unknown_optional_attrs();
+    let parsed = codec.parse_message(&buf).expect("parse ok");
+    let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+    let attr = match &msgs[0] {
+        Message::Update(Update::Reach { attr, .. }) => attr,
+        _ => panic!("expected Reach message"),
+    };
+    assert!(
+        attr.iter().all(|a| a.code() != 201),
+        "unknown optional non-transitive attr must not be stored"
+    );
+}

@@ -1181,6 +1181,8 @@ impl<'a> Iterator for AsPathIter<'a> {
 enum AttributeData {
     Val(u32),
     Bin(Vec<u8>),
+    /// Raw bytes for an unknown optional attribute (RFC 4271 §5.1.4).
+    Opaque(Vec<u8>),
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -1193,7 +1195,7 @@ pub struct Attribute {
 impl Attribute {
     pub const ORIGIN_INCOMPLETE: u8 = 2;
     const FLAG_EXTENDED: u8 = 1 << 4;
-    // const FLAG_PARTIAL: u8 = 1 << 5;
+    pub const FLAG_PARTIAL: u8 = 1 << 5;
     const FLAG_TRANSITIVE: u8 = 1 << 6;
     const FLAG_OPTIONAL: u8 = 1 << 7;
 
@@ -1259,14 +1261,45 @@ impl Attribute {
     pub fn value(&self) -> Option<u32> {
         match self.data {
             AttributeData::Val(v) => Some(v),
-            AttributeData::Bin(_) => None,
+            AttributeData::Bin(_) | AttributeData::Opaque(_) => None,
         }
     }
 
     pub fn binary(&self) -> Option<&Vec<u8>> {
         match &self.data {
             AttributeData::Val(_) => None,
-            AttributeData::Bin(v) => Some(v),
+            AttributeData::Bin(v) | AttributeData::Opaque(v) => Some(v),
+        }
+    }
+
+    /// Constructs an opaque attribute from raw wire bytes.
+    /// Used to preserve unknown optional transitive attributes (RFC 4271 §5.1.4).
+    /// Unlike `new_with_bin`, `flags` is stored as-is without consulting `canonical_flags`.
+    pub fn new_opaque(code: u8, flags: u8, data: Vec<u8>) -> Self {
+        Attribute {
+            code,
+            flags,
+            data: AttributeData::Opaque(data),
+        }
+    }
+
+    /// Returns true if this attribute was received as an unknown opaque blob.
+    pub fn is_opaque(&self) -> bool {
+        matches!(self.data, AttributeData::Opaque(_))
+    }
+
+    /// Returns true if the TRANSITIVE flag is set in the wire flags.
+    pub fn is_transitive(&self) -> bool {
+        self.flags & Self::FLAG_TRANSITIVE != 0
+    }
+
+    /// Returns a clone of this attribute with the PARTIAL bit set.
+    /// Used when forwarding an unrecognized optional transitive attribute.
+    pub fn with_partial_bit(&self) -> Self {
+        Attribute {
+            code: self.code,
+            flags: self.flags | Self::FLAG_PARTIAL,
+            data: self.data.clone(),
         }
     }
 
@@ -2607,12 +2640,26 @@ impl PeerCodec {
                         }
                         None => {
                             if flags & Attribute::FLAG_OPTIONAL == 0 {
+                                // Unknown well-known: treat-as-withdraw (RFC 4271 §6.3).
                                 error_attrs.push(AttributeError {
                                     attr_code: code,
                                     attr_flags: flags,
                                 });
+                                c.set_position(c.position() + alen as u64);
+                            } else if flags & Attribute::FLAG_TRANSITIVE != 0 {
+                                // Unknown optional transitive: store as opaque blob (RFC 4271 §5.1.4).
+                                let pos = c.position() as usize;
+                                let end = pos + alen as usize;
+                                if end > c.get_ref().len() {
+                                    return Err(malformed());
+                                }
+                                let raw = (*c.get_ref())[pos..end].to_vec();
+                                c.set_position(end as u64);
+                                attr.push(Attribute::new_opaque(code, flags, raw));
+                            } else {
+                                // Unknown optional non-transitive: silently discard (RFC 4271 §5.1.4).
+                                c.set_position(c.position() + alen as u64);
                             }
-                            c.set_position(c.position() + alen as u64);
                         }
                     }
                 }

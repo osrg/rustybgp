@@ -4836,7 +4836,7 @@ impl PeerExportContext {
     /// all UPDATE messages to internal peers).
     /// RS client: pass through unchanged.
     fn export_attrs(&self, attrs: &Arc<Vec<bgp::Attribute>>) -> Arc<Vec<bgp::Attribute>> {
-        match self.role {
+        let exported = match self.role {
             PeerRole::RsClient => attrs.clone(),
             PeerRole::Ibgp | PeerRole::IbgpRrClient => {
                 inject_local_pref_if_absent(Arc::clone(attrs))
@@ -4894,7 +4894,29 @@ impl PeerExportContext {
                 }
                 Arc::new(new_attrs)
             }
+        };
+
+        // RFC 4271 §5.1.4: apply opaque attr policy uniformly across all roles.
+        // Unknown optional transitive attrs are forwarded with PARTIAL bit set;
+        // unknown optional non-transitive attrs are discarded.
+        // Skip the allocation when no opaque attrs are present (common case).
+        if !exported.iter().any(|a| a.is_opaque()) {
+            return exported;
         }
+        Arc::new(
+            exported
+                .iter()
+                .filter_map(|a| {
+                    if !a.is_opaque() {
+                        Some(a.clone())
+                    } else if a.is_transitive() {
+                        Some(a.with_partial_bit())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// Apply per-peer nexthop transformation to an outgoing route nexthop.
@@ -9495,6 +9517,65 @@ mod tests {
                     .all(|a| a.code() != packet::Attribute::LOCAL_PREF),
                 "RS client must not inject LOCAL_PREF"
             );
+        }
+
+        fn attr_with_opaque_transitive() -> Arc<Vec<packet::Attribute>> {
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                // Unknown optional transitive (code=200, flags=optional|transitive)
+                packet::Attribute::new_opaque(
+                    200,
+                    packet::Attribute::FLAG_PARTIAL
+                        | 0x40 /* transitive */
+                        | 0x80, /* optional */
+                    vec![0x01, 0x02, 0x03],
+                ),
+            ])
+        }
+
+        fn attr_with_opaque_non_transitive() -> Arc<Vec<packet::Attribute>> {
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                // Unknown optional non-transitive (code=201, flags=optional only)
+                packet::Attribute::new_opaque(
+                    201,
+                    0x80, /* optional */
+                    vec![0x04, 0x05, 0x06],
+                ),
+            ])
+        }
+
+        #[test]
+        fn opaque_transitive_attr_forwarded_with_partial_bit() {
+            // RFC 4271 §5.1.4: unknown optional transitive attrs are forwarded
+            // with PARTIAL bit set, for every peer role.
+            for ctx in [ebgp_ctx(), ibgp_ctx(), rs_client_ctx()] {
+                let exported = ctx.export_attrs(&attr_with_opaque_transitive());
+                let opaque = exported.iter().find(|a| a.code() == 200);
+                assert!(
+                    opaque.is_some(),
+                    "unknown optional transitive attr must be forwarded (role: {:?})",
+                    ctx.role
+                );
+                assert!(
+                    opaque.unwrap().flags() & packet::Attribute::FLAG_PARTIAL != 0,
+                    "PARTIAL bit must be set on forwarded unknown transitive attr (role: {:?})",
+                    ctx.role
+                );
+            }
+        }
+
+        #[test]
+        fn opaque_non_transitive_attr_discarded() {
+            // RFC 4271 §5.1.4: unknown optional non-transitive attrs are discarded.
+            for ctx in [ebgp_ctx(), ibgp_ctx(), rs_client_ctx()] {
+                let exported = ctx.export_attrs(&attr_with_opaque_non_transitive());
+                assert!(
+                    exported.iter().all(|a| a.code() != 201),
+                    "unknown optional non-transitive attr must be discarded (role: {:?})",
+                    ctx.role
+                );
+            }
         }
 
         #[test]
