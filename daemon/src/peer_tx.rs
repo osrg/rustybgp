@@ -194,8 +194,7 @@ mod tests {
             1,
             2,
             Ipv4Addr::new(127, 0, 0, 1),
-            false,
-            false,
+            table::PeerRole::Ebgp,
         ))
     }
 

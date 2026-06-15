@@ -1222,8 +1222,7 @@ mod tests {
             remote_asn,
             65001,
             remote.parse().unwrap(),
-            false,
-            false,
+            table::PeerRole::Ebgp,
         ))
     }
 

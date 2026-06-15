@@ -1822,7 +1822,7 @@ impl PolicyTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Source, Table};
+    use crate::{PeerRole, Source, Table};
     use rustybgp_packet::bgp;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -1833,8 +1833,7 @@ mod tests {
             65001,
             65000,
             Ipv4Addr::new(0, 0, 0, 1),
-            false,
-            false,
+            PeerRole::Ebgp,
         ))
     }
 
@@ -3000,8 +2999,7 @@ mod tests {
             65000,
             65000,
             Ipv4Addr::new(0, 0, 0, 1),
-            false,
-            false,
+            PeerRole::Ibgp,
         ));
         let net = nlri();
         let mut attr = Arc::new(vec![]);

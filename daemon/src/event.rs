@@ -520,6 +520,28 @@ impl Peer {
             arb.passive_close_tx = None;
         }
     }
+
+    fn peer_role(&self, global: &Global) -> PeerRole {
+        let confederation = global.confederation.as_ref().map(|c| (c.id, &c.members));
+        if self.config.route_server_client {
+            PeerRole::RsClient
+        } else if self.config.local_asn != 0
+            && self.config.expected_remote_asn == self.config.local_asn
+        {
+            if self.config.route_reflector.route_reflector_client {
+                PeerRole::IbgpRrClient
+            } else {
+                PeerRole::Ibgp
+            }
+        } else if confederation
+            .as_ref()
+            .is_some_and(|(_, members)| members.contains(&self.config.expected_remote_asn))
+        {
+            PeerRole::ConfedEbgp
+        } else {
+            PeerRole::Ebgp
+        }
+    }
 }
 
 /// Plain-struct replacement for the old PeerBuilder.
@@ -2612,12 +2634,12 @@ impl GoBgpService for GrpcService {
                         tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
                     })?;
                     let global = self.global.read().await;
-                    let dest_is_rs_client = global
+                    let dest_role = global
                         .peers
                         .get(&peer_addr)
-                        .map(|p| p.config.route_server_client)
-                        .unwrap_or(false);
-                    table::TableQuery::AdjOut(peer_addr, dest_is_rs_client)
+                        .map(|p| p.peer_role(&global))
+                        .unwrap_or(PeerRole::Ebgp);
+                    table::TableQuery::AdjOut(peer_addr, dest_role)
                 }
             }
         } else {
@@ -4801,21 +4823,7 @@ impl ExportMap {
     }
 }
 
-/// Per-session peer role, used to control attribute export and route filtering.
-///
-/// Determined once from peer configuration at session creation time and stored
-/// in `PeerExportContext`.  Extended to `IbgpRrClient` when Route Reflector
-/// support is added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerRole {
-    Ibgp,
-    IbgpRrClient,
-    Ebgp,
-    /// Session between two different Member-ASes within the same confederation.
-    /// Keeps LOCAL_PREF (unlike regular eBGP) and uses CONFED_SEQUENCE for AS_PATH.
-    ConfedEbgp,
-    RsClient,
-}
+use table::PeerRole;
 
 /// Session-level peer export information.
 ///
@@ -5261,8 +5269,7 @@ impl PeerSession {
                     remote_asn,
                     self.export_ctx.local_asn,
                     router_id,
-                    self.export_ctx.role == PeerRole::RsClient,
-                    self.export_ctx.role == PeerRole::IbgpRrClient,
+                    self.export_ctx.role,
                 )),
             );
         }
@@ -7801,8 +7808,7 @@ mod tests {
                 65002,
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
-                false,
-                false,
+                PeerRole::Ebgp,
             )),
         );
         conn
@@ -7824,8 +7830,7 @@ mod tests {
             65002,
             65001,
             Ipv4Addr::new(10, 0, 0, 2),
-            false,
-            false,
+            PeerRole::Ebgp,
         ))
     }
 
@@ -8257,8 +8262,7 @@ mod tests {
             65002,
             65001,
             Ipv4Addr::new(10, 0, 0, 2),
-            false,
-            false,
+            PeerRole::Ebgp,
         ));
         let ipv4_net: packet::Nlri = "10.1.0.0/24".parse().unwrap();
         let ipv6_net: packet::Nlri = "2001:db8::/32".parse().unwrap();
@@ -8329,8 +8333,7 @@ mod tests {
             65003,
             65001,
             Ipv4Addr::new(10, 0, 0, 3),
-            false,
-            false,
+            PeerRole::Ebgp,
         ));
         let ipv4_net: packet::Nlri = "10.2.0.0/24".parse().unwrap();
         let attrs = Arc::new(Vec::new());
@@ -8709,8 +8712,7 @@ mod tests {
                 65002,
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
-                false,
-                false,
+                PeerRole::Ebgp,
             ))
         }
 
@@ -9225,15 +9227,13 @@ mod tests {
 
         fn ibgp_source(addr: &str) -> Arc<table::Source> {
             let ip: IpAddr = addr.parse().unwrap();
-            // remote_asn == local_asn → iBGP source
             Arc::new(table::Source::new(
                 ip,
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 65001,
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
-                false,
-                false,
+                PeerRole::Ibgp,
             ))
         }
 
@@ -9794,8 +9794,7 @@ mod tests {
                 65001,
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
-                false,
-                true, // rr_client = true
+                PeerRole::IbgpRrClient,
             ))
         }
 
@@ -10136,8 +10135,7 @@ mod tests {
                 65002,
                 65001,
                 Ipv4Addr::new(10, 0, 0, 1),
-                true,
-                false,
+                PeerRole::RsClient,
             ))
         }
 

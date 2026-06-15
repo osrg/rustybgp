@@ -112,9 +112,8 @@ pub enum TableQuery {
     /// Adj-RIB-In for the given peer: all paths received from that peer.
     AdjIn(IpAddr),
     /// Adj-RIB-Out for the given peer: best paths that would be sent to that peer,
-    /// with export attribute transformations applied.  The bool is true when the
-    /// destination peer is an RS client (used to apply RS isolation).
-    AdjOut(IpAddr, bool),
+    /// with export attribute transformations applied.
+    AdjOut(IpAddr, PeerRole),
     /// Route Server local-RIB view for the given RS client: the best path
     /// from all RS-client peers excluding `peer` itself, with pre-import-policy
     /// attributes (equivalent to GoBGP TABLE_TYPE_LOCAL with an RS client address).
@@ -346,12 +345,14 @@ impl Ord for RibEntry {
             })
             // Lower origin is better (IGP=0 < EGP=1 < Incomplete=2)
             .then_with(|| self_pa.attr_origin().cmp(&other_pa.attr_origin()))
-            // eBGP preferred over iBGP
+            // eBGP preferred over iBGP (ConfedEbgp treated as iBGP per RFC 5065 §9)
             .then_with(|| {
-                self.path
+                other
+                    .path
                     .source
-                    .peer_type()
-                    .cmp(&other.path.source.peer_type())
+                    .role
+                    .prefers_over_ibgp()
+                    .cmp(&self.path.source.role.prefers_over_ibgp())
             })
             // Non-stale is better than stale (false < true, and Less = better here)
             .then_with(|| {
@@ -557,7 +558,7 @@ impl NlriChange {
             best_pa.attr_local_preference(),
             best_pa.attr_as_path_length(),
             best_pa.attr_origin(),
-            best.source.peer_type(),
+            best.source.role.prefers_over_ibgp(),
             best.source.is_stale(),
             best_pa.attr_cluster_list_length(),
         );
@@ -569,7 +570,7 @@ impl NlriChange {
                     pa.attr_local_preference(),
                     pa.attr_as_path_length(),
                     pa.attr_origin(),
-                    p.source.peer_type(),
+                    p.source.role.prefers_over_ibgp(),
                     p.source.is_stale(),
                     pa.attr_cluster_list_length(),
                 ) == key
@@ -578,10 +579,37 @@ impl NlriChange {
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum PeerType {
+/// Per-session peer role used for best-path selection, adj-out filtering,
+/// and attribute export decisions.
+///
+/// The ordering (Ebgp < RsClient < Ibgp < IbgpRrClient < ConfedEbgp) is
+/// intentionally NOT the best-path ordering; use `prefers_over_ibgp()`
+/// for the RFC 4271 "prefer eBGP over iBGP" tie-breaker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerRole {
+    /// External BGP peer (different AS, outside any confederation).
     Ebgp,
+    /// Route-server client (eBGP, RS isolation applies).
+    RsClient,
+    /// Internal BGP peer (same AS).
     Ibgp,
+    /// Internal BGP peer that is a route-reflector client.
+    IbgpRrClient,
+    /// eBGP session between two member-ASes within the same confederation.
+    /// Keeps LOCAL_PREF and uses AS_CONFED_SEQUENCE; treated as iBGP for
+    /// the best-path eBGP-over-iBGP preference step (RFC 5065 §9).
+    ConfedEbgp,
+}
+
+impl PeerRole {
+    /// Returns true when this role is preferred over iBGP in the best-path
+    /// eBGP-over-iBGP tie-breaker (RFC 4271 §9.1.2.2 step (e)).
+    ///
+    /// ConfedEbgp returns false: RFC 5065 §9 prohibits confederation eBGP
+    /// from being preferred over iBGP in this step.
+    pub(crate) fn prefers_over_ibgp(self) -> bool {
+        matches!(self, PeerRole::Ebgp | PeerRole::RsClient)
+    }
 }
 
 pub struct Source {
@@ -590,8 +618,7 @@ pub struct Source {
     pub remote_asn: u32,
     pub local_asn: u32,
     pub router_id: u32,
-    rs_client: bool,
-    rr_client: bool,
+    pub role: PeerRole,
     stale: AtomicBool,
 }
 
@@ -611,8 +638,7 @@ static LOCAL_SOURCE: LazyLock<Arc<Source>> = LazyLock::new(|| {
         remote_asn: 0,
         local_asn: 0,
         router_id: 0,
-        rs_client: false,
-        rr_client: false,
+        role: PeerRole::Ibgp,
         stale: AtomicBool::new(false),
     })
 });
@@ -627,8 +653,7 @@ static KERNEL_SOURCE: LazyLock<Arc<Source>> = LazyLock::new(|| {
         remote_asn: 0,
         local_asn: 0,
         router_id: 0,
-        rs_client: false,
-        rr_client: false,
+        role: PeerRole::Ibgp,
         stale: AtomicBool::new(false),
     })
 });
@@ -656,8 +681,7 @@ impl Source {
         remote_asn: u32,
         local_asn: u32,
         router_id: Ipv4Addr,
-        rs_client: bool,
-        rr_client: bool,
+        role: PeerRole,
     ) -> Self {
         Source {
             remote_addr,
@@ -665,18 +689,17 @@ impl Source {
             remote_asn,
             local_asn,
             router_id: router_id.into(),
-            rs_client,
-            rr_client,
+            role,
             stale: AtomicBool::new(false),
         }
     }
 
     pub fn is_rr_client(&self) -> bool {
-        self.rr_client
+        matches!(self.role, PeerRole::IbgpRrClient)
     }
 
     pub fn is_rs_client(&self) -> bool {
-        self.rs_client
+        matches!(self.role, PeerRole::RsClient)
     }
 
     pub fn mark_stale(&self) {
@@ -685,14 +708,6 @@ impl Source {
 
     pub fn is_stale(&self) -> bool {
         self.stale.load(Ordering::Relaxed)
-    }
-
-    fn peer_type(&self) -> PeerType {
-        if self.remote_asn == self.local_asn {
-            PeerType::Ibgp
-        } else {
-            PeerType::Ebgp
-        }
     }
 }
 
@@ -898,7 +913,9 @@ impl Table {
             .entry
             .iter()
             .filter(|e| {
-                e.path.source.rs_client && e.path.source.remote_addr != peer && !e.is_filtered()
+                e.path.source.is_rs_client()
+                    && e.path.source.remote_addr != peer
+                    && !e.is_filtered()
             })
             .max();
         best.into_iter()
@@ -916,12 +933,13 @@ impl Table {
 
     /// Returns the best path(s) that would be sent to `peer` (Adj-RIB-Out view).
     ///
-    /// Excludes paths learned from `peer` itself to prevent readvertisement.
+    /// Excludes paths learned from `peer` itself (echo prevention), applies RS
+    /// isolation, and applies iBGP split-horizon / RR non-client suppression.
     /// Applies per-peer attribute export transformations and outbound policy.
     fn adj_out_paths(
         dst: &Destination,
         peer: IpAddr,
-        dest_is_rs_client: bool,
+        dest_role: PeerRole,
         net: packet::Nlri,
         _family: Family,
         export_policy: Option<&PolicyAssignment>,
@@ -930,9 +948,26 @@ impl Table {
         dst.entry
             .iter()
             .filter(|p| {
-                Some(*p as *const RibEntry) == best
-                    && p.path.source.remote_addr != peer
-                    && p.path.source.is_rs_client() == dest_is_rs_client
+                if Some(*p as *const RibEntry) != best {
+                    return false;
+                }
+                // Echo prevention: never readvertise a path back to its source.
+                if p.path.source.remote_addr == peer {
+                    return false;
+                }
+                // RS isolation: RS-client routes stay within the RS-client group.
+                if p.path.source.is_rs_client() != matches!(dest_role, PeerRole::RsClient) {
+                    return false;
+                }
+                // iBGP split-horizon / RR non-client suppression:
+                // suppress iBGP-learned paths from non-RR-clients to non-RR-client peers.
+                let ibgp_learned = !p.path.source.is_local()
+                    && !p.path.source.is_kernel()
+                    && matches!(p.path.source.role, PeerRole::Ibgp | PeerRole::IbgpRrClient);
+                if ibgp_learned && !p.path.source.is_rr_client() && dest_role == PeerRole::Ibgp {
+                    return false;
+                }
+                true
             })
             .filter_map(|p| {
                 // Apply per-peer AS_PATH transformation for the Adj-RIB-Out view.
@@ -942,7 +977,9 @@ impl Table {
                         .attr
                         .iter()
                         .map(|a| {
-                            if !p.path.source.rs_client && a.code() == packet::Attribute::AS_PATH {
+                            if !p.path.source.is_rs_client()
+                                && a.code() == packet::Attribute::AS_PATH
+                            {
                                 a.as_path_prepend(p.path.source.local_asn)
                             } else {
                                 a.clone()
@@ -1010,10 +1047,10 @@ impl Table {
                 let paths = match query {
                     TableQuery::Global => Self::global_paths(dst, enable_filtered),
                     TableQuery::AdjIn(peer) => Self::adj_in_paths(dst, peer, enable_filtered),
-                    TableQuery::AdjOut(peer, dest_is_rs_client) => Self::adj_out_paths(
+                    TableQuery::AdjOut(peer, dest_role) => Self::adj_out_paths(
                         dst,
                         peer,
-                        dest_is_rs_client,
+                        dest_role,
                         net.clone(),
                         family,
                         export_policy.as_deref(),
@@ -1840,14 +1877,18 @@ mod tests {
     use super::*;
 
     fn source(addr: u8, remote_asn: u32, local_asn: u32, router_id: u8) -> Arc<Source> {
+        let role = if remote_asn == local_asn {
+            PeerRole::Ibgp
+        } else {
+            PeerRole::Ebgp
+        };
         Arc::new(Source::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, addr)),
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
             remote_asn,
             local_asn,
             Ipv4Addr::new(0, 0, 0, router_id),
-            false,
-            false,
+            role,
         ))
     }
 
@@ -1913,8 +1954,7 @@ mod tests {
             1,
             2,
             Ipv4Addr::new(1, 1, 1, 1),
-            false,
-            false,
+            PeerRole::Ebgp,
         ));
         let s2 = Arc::new(Source::new(
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2)),
@@ -1922,8 +1962,7 @@ mod tests {
             1,
             2,
             Ipv4Addr::new(1, 1, 1, 2),
-            false,
-            false,
+            PeerRole::Ebgp,
         ));
 
         let n1 = nlri(1, 0, 0, 0, 24);
@@ -3826,7 +3865,7 @@ mod tests {
         let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
         let dsts: Vec<_> = rt
             .destinations(
-                TableQuery::AdjOut(peer_addr, false),
+                TableQuery::AdjOut(peer_addr, PeerRole::Ebgp),
                 Family::IPV4,
                 vec![],
                 None,
@@ -3861,7 +3900,7 @@ mod tests {
         let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
         let dsts: Vec<_> = rt
             .destinations(
-                TableQuery::AdjOut(peer_addr, false),
+                TableQuery::AdjOut(peer_addr, PeerRole::Ebgp),
                 Family::IPV4,
                 vec![],
                 None,
@@ -3881,8 +3920,7 @@ mod tests {
             remote_asn,
             65000,
             Ipv4Addr::new(0, 0, 0, addr),
-            true, // rs_client
-            false,
+            PeerRole::RsClient,
         ))
     }
 
@@ -3909,7 +3947,7 @@ mod tests {
         // dest_is_rs_client=true → RS isolation must suppress the non-RS-client route
         let dsts: Vec<_> = rt
             .destinations(
-                TableQuery::AdjOut(rs_client_addr, true),
+                TableQuery::AdjOut(rs_client_addr, PeerRole::RsClient),
                 Family::IPV4,
                 vec![],
                 None,
@@ -3945,7 +3983,7 @@ mod tests {
         // dest_is_rs_client=false → RS isolation must suppress the RS-client route
         let dsts: Vec<_> = rt
             .destinations(
-                TableQuery::AdjOut(regular_peer_addr, false),
+                TableQuery::AdjOut(regular_peer_addr, PeerRole::Ebgp),
                 Family::IPV4,
                 vec![],
                 None,
@@ -3981,7 +4019,7 @@ mod tests {
         // dest_is_rs_client=true → same isolation group, route must be visible
         let dsts: Vec<_> = rt
             .destinations(
-                TableQuery::AdjOut(other_rs_client_addr, true),
+                TableQuery::AdjOut(other_rs_client_addr, PeerRole::RsClient),
                 Family::IPV4,
                 vec![],
                 None,
@@ -5148,7 +5186,7 @@ mod tests {
         let peer1 = s1.remote_addr;
         let dests: Vec<_> = rt
             .destinations(
-                TableQuery::AdjOut(peer1, false),
+                TableQuery::AdjOut(peer1, PeerRole::Ebgp),
                 Family::IPV4,
                 vec![],
                 None,
@@ -5172,7 +5210,7 @@ mod tests {
         let peer1 = s1.remote_addr;
         let dests: Vec<_> = rt
             .destinations(
-                TableQuery::AdjOut(peer1, false),
+                TableQuery::AdjOut(peer1, PeerRole::Ebgp),
                 Family::IPV4,
                 vec![],
                 None,
@@ -5577,8 +5615,7 @@ mod tests {
             remote_asn,
             65000,
             Ipv4Addr::new(0, 0, 0, addr),
-            true, // rs_client
-            false,
+            PeerRole::RsClient,
         ))
     }
 

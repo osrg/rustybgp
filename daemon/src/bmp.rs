@@ -428,8 +428,7 @@ mod tests {
             65000,
             65001,
             "192.0.2.1".parse().unwrap(),
-            false,
-            false,
+            table::PeerRole::Ebgp,
         ))
     }
 
