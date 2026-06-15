@@ -449,6 +449,40 @@ fn ls_nlri_to_api(n: &bgp_ls::BgpLsNlri) -> api::LsAddrPrefix {
                 })),
             }),
         ),
+        bgp_ls::BgpLsNlri::Srv6Sid(n) => (
+            api::LsNlriType::Srv6Sid as i32,
+            n.protocol_id as i32,
+            n.identifier,
+            Some(api::ls_addr_prefix::LsNlri {
+                nlri: Some(api::ls_addr_prefix::ls_nlri::Nlri::Srv6Sid(
+                    api::LsSrv6Sidnlri {
+                        local_node: Some(node_desc_to_api(&n.local_node)),
+                        srv6_sid_information: if n.sids.is_empty() {
+                            None
+                        } else {
+                            Some(api::LsSrv6SidInformation {
+                                sids: n
+                                    .sids
+                                    .iter()
+                                    .map(|s| Ipv6Addr::from(*s).to_string())
+                                    .collect(),
+                            })
+                        },
+                        multi_topo_id: if n.multi_topo_ids.is_empty() {
+                            None
+                        } else {
+                            Some(api::LsMultiTopologyIdentifier {
+                                multi_topo_ids: n
+                                    .multi_topo_ids
+                                    .iter()
+                                    .map(|&id| id as u32)
+                                    .collect(),
+                            })
+                        },
+                    },
+                )),
+            }),
+        ),
         bgp_ls::BgpLsNlri::Unknown { .. } => (api::LsNlriType::Unspecified as i32, 0, 0, None),
     };
     api::LsAddrPrefix {
@@ -693,6 +727,35 @@ fn ls_nlri_from_api(a: api::LsAddrPrefix) -> Result<Nlri, Error> {
                     identifier,
                     local_node,
                     prefix_desc,
+                })
+            }
+            Some(LsNlriOneof::Srv6Sid(n)) => {
+                let local_node =
+                    node_desc_from_api(n.local_node.as_ref().ok_or_else(|| {
+                        Error::InvalidArgument("missing local_node".to_string())
+                    })?)?;
+                let (sids, multi_topo_ids) = match &n.srv6_sid_information {
+                    None => (Vec::new(), Vec::new()),
+                    Some(info) => {
+                        let sids: Vec<[u8; 16]> = info
+                            .sids
+                            .iter()
+                            .filter_map(|s| s.parse::<Ipv6Addr>().ok().map(|a| a.octets()))
+                            .collect();
+                        let mt_ids: Vec<u16> = n
+                            .multi_topo_id
+                            .as_ref()
+                            .map(|m| m.multi_topo_ids.iter().map(|&id| id as u16).collect())
+                            .unwrap_or_default();
+                        (sids, mt_ids)
+                    }
+                };
+                bgp_ls::BgpLsNlri::Srv6Sid(bgp_ls::BgpLsSrv6SidNlri {
+                    protocol_id,
+                    identifier,
+                    local_node,
+                    sids,
+                    multi_topo_ids,
                 })
             }
             _ => bgp_ls::BgpLsNlri::Unknown {
@@ -1182,10 +1245,12 @@ fn ls_tlvs_to_api(tlvs: &[bgp_ls::LsTlv]) -> api::LsAttribute {
     let mut link = api::LsAttributeLink::default();
     let mut prefix = api::LsAttributePrefix::default();
     let mut bgp_peer = api::LsAttributeBgpPeerSegment::default();
+    let mut srv6_sid = api::LsAttributeSrv6Sid::default();
     let mut has_node = false;
     let mut has_link = false;
     let mut has_prefix = false;
     let mut has_bgp_peer = false;
+    let mut has_srv6_sid = false;
 
     for tlv in tlvs {
         match tlv {
@@ -1359,6 +1424,48 @@ fn ls_tlvs_to_api(tlvs: &[bgp_ls::LsTlv]) -> api::LsAttribute {
                     sid: *sid,
                 });
             }
+            LsTlv::Srv6EndXSid {
+                endpoint_behavior,
+                flags,
+                algorithm,
+                weight,
+                sids,
+                sid_structure,
+            } => {
+                has_link = true;
+                link.srv6_end_x_sid = Some(api::LsSrv6EndXsid {
+                    endpoint_behavior: *endpoint_behavior as u32,
+                    flags: *flags as u32,
+                    algorithm: *algorithm as u32,
+                    weight: *weight as u32,
+                    reserved: 0,
+                    sids: sids
+                        .iter()
+                        .map(|s| Ipv6Addr::from(*s).to_string())
+                        .collect(),
+                    srv6_sid_structure: sid_structure.as_ref().map(|s| api::LsSrv6SidStructure {
+                        local_block: s.lb_len as u32,
+                        local_node: s.ln_len as u32,
+                        local_func: s.fn_len as u32,
+                        local_arg: s.arg_len as u32,
+                    }),
+                });
+            }
+            LsTlv::Srv6PeerNodeSid {
+                flags,
+                weight,
+                peer_as,
+                peer_bgp_id,
+                sid: _,
+            } => {
+                has_srv6_sid = true;
+                srv6_sid.srv6_bgp_peer_node_sid = Some(api::LsSrv6BgpPeerNodeSid {
+                    flags: *flags as u32,
+                    weight: *weight as u32,
+                    peer_as: *peer_as,
+                    peer_bgp_id: Ipv4Addr::from(*peer_bgp_id).to_string(),
+                });
+            }
             LsTlv::Unknown { .. } => {}
         }
     }
@@ -1368,7 +1475,7 @@ fn ls_tlvs_to_api(tlvs: &[bgp_ls::LsTlv]) -> api::LsAttribute {
         link: if has_link { Some(link) } else { None },
         prefix: if has_prefix { Some(prefix) } else { None },
         bgp_peer_segment: if has_bgp_peer { Some(bgp_peer) } else { None },
-        srv6_sid: None,
+        srv6_sid: if has_srv6_sid { Some(srv6_sid) } else { None },
     }
 }
 
@@ -2246,6 +2353,31 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
                 flags: 0x80,
                 weight: 0,
                 sid: link.sr_adjacency_sid,
+            }
+            .encode(&mut dst);
+        }
+        if let Some(ex) = &link.srv6_end_x_sid {
+            let sids: Vec<[u8; 16]> = ex
+                .sids
+                .iter()
+                .filter_map(|s| s.parse::<Ipv6Addr>().ok().map(|a| a.octets()))
+                .collect();
+            let sid_structure = ex
+                .srv6_sid_structure
+                .as_ref()
+                .map(|s| bgp_ls::SrSidStructure {
+                    lb_len: s.local_block as u8,
+                    ln_len: s.local_node as u8,
+                    fn_len: s.local_func as u8,
+                    arg_len: s.local_arg as u8,
+                });
+            bgp_ls::LsTlv::Srv6EndXSid {
+                endpoint_behavior: ex.endpoint_behavior as u16,
+                flags: ex.flags as u8,
+                algorithm: ex.algorithm as u8,
+                weight: ex.weight as u8,
+                sids,
+                sid_structure,
             }
             .encode(&mut dst);
         }

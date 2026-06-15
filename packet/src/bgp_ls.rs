@@ -73,6 +73,9 @@ const TLV_BGP_CONFEDERATION_MEMBER: u16 = 517; // RFC 9086
 // BGP-LS Attribute TLV type codes (RFC 9552 §3.3, RFC 9085, RFC 9086)
 // ---------------------------------------------------------------------------
 
+// SRv6 SID NLRI descriptor TLV (RFC 9514 §3.1)
+const TLV_SRV6_SID_INFO: u16 = 518;
+
 // Node Attribute TLVs (RFC 9552)
 pub const TLV_NODE_FLAG_BITS: u16 = 1024;
 pub const TLV_OPAQUE_NODE_ATTR: u16 = 1025;
@@ -101,6 +104,11 @@ pub const TLV_ADJ_SID: u16 = 1099;
 pub const TLV_PEER_NODE_SID: u16 = 1101;
 pub const TLV_PEER_ADJ_SID: u16 = 1102;
 pub const TLV_PEER_SET_SID: u16 = 1103;
+// SRv6 Attribute TLVs (RFC 9514, RFC 9086 §5)
+pub const TLV_SRV6_PEER_NODE_SID: u16 = 1104;
+pub const TLV_SRV6_END_X_SID: u16 = 1106;
+// SRv6 SID Structure sub-TLV (RFC 9514 §5.3.2, embedded in SRv6 attribute TLVs)
+pub const TLV_SRV6_SID_STRUCTURE: u16 = 1252;
 // Prefix Attribute TLVs (RFC 9552)
 pub const TLV_IGP_FLAGS: u16 = 1152;
 pub const TLV_OPAQUE_PREFIX_ATTR: u16 = 1157;
@@ -381,9 +389,22 @@ pub struct BgpLsPrefixNlri {
     pub prefix_desc: Vec<PrefixDescTlv>,
 }
 
+/// SRv6 SID NLRI (RFC 9514 §3, NLRI type 6).
+///
+/// Each `sids[i]` pairs with `multi_topo_ids[i]`; the two vecs have the same
+/// length.  A missing Multi-Topology ID field is represented as 0.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BgpLsSrv6SidNlri {
+    pub protocol_id: u8,
+    pub identifier: u64,
+    pub local_node: NodeDescriptor,
+    pub sids: Vec<[u8; 16]>,
+    pub multi_topo_ids: Vec<u16>,
+}
+
 /// BGP-LS NLRI (RFC 9552, AFI=16388, SAFI=71).
 ///
-/// Unknown NLRI types (e.g., SRv6 SID before Phase 3 support) are stored in
+/// Unknown NLRI types are stored in
 /// `Unknown` so the wire bytes are consumed without dropping the peer session.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BgpLsNlri {
@@ -391,6 +412,7 @@ pub enum BgpLsNlri {
     Link(BgpLsLinkNlri),
     PrefixV4(BgpLsPrefixNlri),
     PrefixV6(BgpLsPrefixNlri),
+    Srv6Sid(BgpLsSrv6SidNlri),
     Unknown { nlri_type: u16, body: Vec<u8> },
 }
 
@@ -451,6 +473,39 @@ impl BgpLsNlri {
                     prefix_desc,
                 }))
             }
+            NLRI_TYPE_SRV6_SID => {
+                let (local_node, after_local) = decode_node_desc_and_rest(rest)?;
+                let mut sids: Vec<[u8; 16]> = Vec::new();
+                let mut multi_topo_ids: Vec<u16> = Vec::new();
+                let mut c = Cursor::new(after_local);
+                while (c.position() as usize) < after_local.len() {
+                    let Some((tlv_type, value)) = read_tlv(&mut c) else {
+                        break;
+                    };
+                    match tlv_type {
+                        TLV_SRV6_SID_INFO if value.len() >= 20 => {
+                            // Multi-Topo-ID(2) + Reserved(2) + SID(16)
+                            let mt_id = u16::from_be_bytes([value[0], value[1]]);
+                            let sid: [u8; 16] = value[4..20].try_into().ok()?;
+                            multi_topo_ids.push(mt_id);
+                            sids.push(sid);
+                        }
+                        TLV_MULTI_TOPO_ID => {
+                            for chunk in value.chunks_exact(2) {
+                                multi_topo_ids.push(u16::from_be_bytes(chunk.try_into().unwrap()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some(BgpLsNlri::Srv6Sid(BgpLsSrv6SidNlri {
+                    protocol_id,
+                    identifier,
+                    local_node,
+                    sids,
+                    multi_topo_ids,
+                }))
+            }
             _ => Some(BgpLsNlri::Unknown { nlri_type, body }),
         }
     }
@@ -486,6 +541,20 @@ impl BgpLsNlri {
                 n.local_node.encode(&mut body, TLV_LOCAL_NODE_DESC);
                 encode_prefix_desc_tlvs(&n.prefix_desc, &mut body);
                 write_tlv_header(dst, NLRI_TYPE_PREFIX_V6, &body);
+            }
+            BgpLsNlri::Srv6Sid(n) => {
+                body.push(n.protocol_id);
+                body.extend_from_slice(&n.identifier.to_be_bytes());
+                n.local_node.encode(&mut body, TLV_LOCAL_NODE_DESC);
+                for (i, sid) in n.sids.iter().enumerate() {
+                    let mt_id = n.multi_topo_ids.get(i).copied().unwrap_or(0);
+                    let mut tlv_value = [0u8; 20];
+                    tlv_value[0..2].copy_from_slice(&mt_id.to_be_bytes());
+                    // bytes 2-3: Reserved
+                    tlv_value[4..20].copy_from_slice(sid);
+                    write_tlv(&mut body, TLV_SRV6_SID_INFO, &tlv_value);
+                }
+                write_tlv_header(dst, NLRI_TYPE_SRV6_SID, &body);
             }
             BgpLsNlri::Unknown { nlri_type, body: b } => {
                 write_tlv_header(dst, *nlri_type, b);
@@ -543,6 +612,13 @@ impl fmt::Display for BgpLsNlri {
                 "bgp-ls:prefix-v6:proto={}:id={}",
                 n.protocol_id, n.identifier
             ),
+            BgpLsNlri::Srv6Sid(n) => {
+                write!(
+                    f,
+                    "bgp-ls:srv6-sid:proto={}:id={}",
+                    n.protocol_id, n.identifier
+                )
+            }
             BgpLsNlri::Unknown { nlri_type, .. } => write!(f, "bgp-ls:unknown:{}", nlri_type),
         }
     }
@@ -551,6 +627,15 @@ impl fmt::Display for BgpLsNlri {
 // ---------------------------------------------------------------------------
 // BGP-LS Attribute (Type 29) TLVs
 // ---------------------------------------------------------------------------
+
+/// SRv6 SID Structure (RFC 9514 §5.3.2): bit-lengths of the four SID fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SrSidStructure {
+    pub lb_len: u8,
+    pub ln_len: u8,
+    pub fn_len: u8,
+    pub arg_len: u8,
+}
 
 /// A contiguous SID/label range [begin, end] (inclusive) from SR Capabilities
 /// or SR Local Block TLVs (RFC 9085 §2.1.2).
@@ -625,6 +710,22 @@ pub enum LsTlv {
         flags: u8,
         algorithm: u8,
         sid: u32,
+    },
+    // SRv6 Attribute TLVs (RFC 9514, RFC 9086 §5)
+    Srv6EndXSid {
+        endpoint_behavior: u16,
+        flags: u8,
+        algorithm: u8,
+        weight: u8,
+        sids: Vec<[u8; 16]>,
+        sid_structure: Option<SrSidStructure>,
+    },
+    Srv6PeerNodeSid {
+        flags: u8,
+        weight: u8,
+        peer_as: u32,
+        peer_bgp_id: [u8; 4],
+        sid: [u8; 16],
     },
     // Unknown / future TLVs
     Unknown {
@@ -759,6 +860,47 @@ impl LsTlv {
                 let mut body = vec![*flags, *algorithm, 0, 0];
                 body.extend_from_slice(&sid_bytes(*sid, flags & 0x80 != 0));
                 write_tlv(dst, TLV_PREFIX_SID, &body);
+            }
+            LsTlv::Srv6EndXSid {
+                endpoint_behavior,
+                flags,
+                algorithm,
+                weight,
+                sids,
+                sid_structure,
+            } => {
+                let mut body = Vec::new();
+                body.extend_from_slice(&endpoint_behavior.to_be_bytes());
+                body.push(*flags);
+                body.push(*algorithm);
+                body.push(*weight);
+                body.push(0); // Reserved
+                for sid in sids {
+                    body.extend_from_slice(sid);
+                }
+                if let Some(s) = sid_structure {
+                    // Sub-TLV: type(2) + len(2) + value(4)
+                    body.extend_from_slice(&TLV_SRV6_SID_STRUCTURE.to_be_bytes());
+                    body.extend_from_slice(&4u16.to_be_bytes());
+                    body.extend_from_slice(&[s.lb_len, s.ln_len, s.fn_len, s.arg_len]);
+                }
+                write_tlv(dst, TLV_SRV6_END_X_SID, &body);
+            }
+            LsTlv::Srv6PeerNodeSid {
+                flags,
+                weight,
+                peer_as,
+                peer_bgp_id,
+                sid,
+            } => {
+                let mut body = Vec::new();
+                body.push(*flags);
+                body.push(*weight);
+                body.extend_from_slice(&[0u8; 2]); // Reserved
+                body.extend_from_slice(&peer_as.to_be_bytes());
+                body.extend_from_slice(peer_bgp_id);
+                body.extend_from_slice(sid);
+                write_tlv(dst, TLV_SRV6_PEER_NODE_SID, &body);
             }
             LsTlv::Unknown { tlv_type, value } => write_tlv(dst, *tlv_type, value),
         }
@@ -953,6 +1095,65 @@ pub fn parse_ls_attr(data: &[u8]) -> Vec<LsTlv> {
                 LsTlv::PrefixSid {
                     flags,
                     algorithm,
+                    sid,
+                }
+            }
+            // SRv6 End.X SID (RFC 9514 §5.1): header(6) + SID(s)(16 each) + sub-TLVs
+            TLV_SRV6_END_X_SID if value.len() >= 6 => {
+                let endpoint_behavior = u16::from_be_bytes([value[0], value[1]]);
+                let flags = value[2];
+                let algorithm = value[3];
+                let weight = value[4];
+                // value[5]: Reserved
+                let mut pos = 6;
+                let mut sids: Vec<[u8; 16]> = Vec::new();
+                // Greedily consume 16-byte SIDs; any short tail is sub-TLVs.
+                while pos + 16 <= value.len() {
+                    sids.push(value[pos..pos + 16].try_into().unwrap());
+                    pos += 16;
+                }
+                // Parse remaining bytes as sub-TLVs (type(2)+len(2)+value).
+                let mut sid_structure = None;
+                while pos + 4 <= value.len() {
+                    let sub_type = u16::from_be_bytes([value[pos], value[pos + 1]]);
+                    let sub_len = u16::from_be_bytes([value[pos + 2], value[pos + 3]]) as usize;
+                    pos += 4;
+                    if pos + sub_len > value.len() {
+                        break;
+                    }
+                    let sub_val = &value[pos..pos + sub_len];
+                    pos += sub_len;
+                    if sub_type == TLV_SRV6_SID_STRUCTURE && sub_len >= 4 {
+                        sid_structure = Some(SrSidStructure {
+                            lb_len: sub_val[0],
+                            ln_len: sub_val[1],
+                            fn_len: sub_val[2],
+                            arg_len: sub_val[3],
+                        });
+                    }
+                }
+                LsTlv::Srv6EndXSid {
+                    endpoint_behavior,
+                    flags,
+                    algorithm,
+                    weight,
+                    sids,
+                    sid_structure,
+                }
+            }
+            // SRv6 BGP Peer Node SID (RFC 9086 §5): Flags(1)+Weight(1)+Rsv(2)+PeerAS(4)+PeerID(4)+SID(16)
+            TLV_SRV6_PEER_NODE_SID if value.len() >= 28 => {
+                let flags = value[0];
+                let weight = value[1];
+                // value[2-3]: Reserved
+                let peer_as = u32::from_be_bytes(value[4..8].try_into().unwrap());
+                let peer_bgp_id: [u8; 4] = value[8..12].try_into().unwrap();
+                let sid: [u8; 16] = value[12..28].try_into().unwrap();
+                LsTlv::Srv6PeerNodeSid {
+                    flags,
+                    weight,
+                    peer_as,
+                    peer_bgp_id,
                     sid,
                 }
             }
