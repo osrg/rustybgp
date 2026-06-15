@@ -1,0 +1,26 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.20.1"
+  confederation:
+    config:
+      enabled: true
+      identifier: 65000
+      member-as-list:
+        - 65001
+        - 65002
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.20.2"
+      peer-as: 65002
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+
+  - config:
+      neighbor-address: "172.30.21.2"
+      peer-as: 65100
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast

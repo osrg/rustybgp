@@ -1,0 +1,60 @@
+networks:
+  confed-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.20.0/24
+          gateway: 172.30.20.254
+
+  ext-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.21.0/24
+          gateway: 172.30.21.254
+
+services:
+  rusty-conf:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: rusty-conf
+    privileged: true
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      confed-net:
+        ipv4_address: 172.30.20.1
+      ext-net:
+        ipv4_address: 172.30.21.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+
+  frr-member:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: frr-member
+    privileged: true
+    volumes:
+      - ./frr-member/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      confed-net:
+        ipv4_address: 172.30.20.2
+
+  frr-ext:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: frr-ext
+    privileged: true
+    volumes:
+      - ./frr-ext/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      ext-net:
+        ipv4_address: 172.30.21.2
