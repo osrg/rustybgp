@@ -2080,10 +2080,246 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
             Attribute::new_with_bin(Attribute::PREFIX_SID, sid.to_vec())
                 .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
         }
+        api::attribute::Attr::Ls(ls) => {
+            let bytes = ls_tlvs_from_api(&ls);
+            Attribute::new_with_bin(Attribute::LS, bytes)
+                .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
+        }
         _ => Err(Error::InvalidArgument(
             "attribute conversion not implemented".to_string(),
         )),
     }
+}
+
+fn peer_sid_flags_from_api(flags: Option<&api::LsBgpPeerSegmentSidFlags>) -> u8 {
+    match flags {
+        None => 0,
+        Some(f) => {
+            let mut v = 0u8;
+            if f.value {
+                v |= 0x80;
+            }
+            if f.local {
+                v |= 0x40;
+            }
+            if f.backup {
+                v |= 0x20;
+            }
+            if f.persistent {
+                v |= 0x10;
+            }
+            v
+        }
+    }
+}
+
+fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
+    let mut dst = Vec::new();
+
+    if let Some(node) = &attr.node {
+        if let Some(flags) = &node.flags {
+            let mut f = 0u8;
+            if flags.overload {
+                f |= 0x80;
+            }
+            if flags.attached {
+                f |= 0x40;
+            }
+            if flags.external {
+                f |= 0x20;
+            }
+            if flags.abr {
+                f |= 0x10;
+            }
+            if flags.router {
+                f |= 0x08;
+            }
+            if flags.v6 {
+                f |= 0x04;
+            }
+            bgp_ls::LsTlv::NodeFlagBits(f).encode(&mut dst);
+        }
+        if !node.name.is_empty() {
+            bgp_ls::LsTlv::NodeName(node.name.clone()).encode(&mut dst);
+        }
+        if !node.isis_area.is_empty() {
+            bgp_ls::LsTlv::IsisArea(node.isis_area.clone()).encode(&mut dst);
+        }
+        if !node.local_router_id.is_empty()
+            && let Ok(addr) = node.local_router_id.parse::<Ipv4Addr>()
+        {
+            bgp_ls::LsTlv::Ipv4LocalRouterId(addr).encode(&mut dst);
+        }
+        if !node.local_router_id_v6.is_empty()
+            && let Ok(addr) = node.local_router_id_v6.parse::<Ipv6Addr>()
+        {
+            bgp_ls::LsTlv::Ipv6LocalRouterId(addr).encode(&mut dst);
+        }
+        if !node.opaque.is_empty() {
+            bgp_ls::LsTlv::OpaqueNodeAttr(node.opaque.clone()).encode(&mut dst);
+        }
+        if let Some(caps) = &node.sr_capabilities {
+            bgp_ls::LsTlv::SrCapabilities {
+                ipv4_supported: caps.ipv4_supported,
+                ipv6_supported: caps.ipv6_supported,
+                ranges: caps
+                    .ranges
+                    .iter()
+                    .map(|r| bgp_ls::SrRange {
+                        begin: r.begin,
+                        end: r.end,
+                    })
+                    .collect(),
+            }
+            .encode(&mut dst);
+        }
+        if !node.sr_algorithms.is_empty() {
+            bgp_ls::LsTlv::SrAlgorithms(node.sr_algorithms.clone()).encode(&mut dst);
+        }
+        if let Some(lb) = &node.sr_local_block {
+            bgp_ls::LsTlv::SrLocalBlock {
+                ranges: lb
+                    .ranges
+                    .iter()
+                    .map(|r| bgp_ls::SrRange {
+                        begin: r.begin,
+                        end: r.end,
+                    })
+                    .collect(),
+            }
+            .encode(&mut dst);
+        }
+    }
+
+    if let Some(link) = &attr.link {
+        if !link.local_router_id.is_empty()
+            && let Ok(addr) = link.local_router_id.parse::<Ipv4Addr>()
+        {
+            bgp_ls::LsTlv::Ipv4LocalRouterId(addr).encode(&mut dst);
+        }
+        if !link.local_router_id_v6.is_empty()
+            && let Ok(addr) = link.local_router_id_v6.parse::<Ipv6Addr>()
+        {
+            bgp_ls::LsTlv::Ipv6LocalRouterId(addr).encode(&mut dst);
+        }
+        if !link.remote_router_id.is_empty()
+            && let Ok(addr) = link.remote_router_id.parse::<Ipv4Addr>()
+        {
+            bgp_ls::LsTlv::Ipv4RemoteRouterId(addr).encode(&mut dst);
+        }
+        if !link.remote_router_id_v6.is_empty()
+            && let Ok(addr) = link.remote_router_id_v6.parse::<Ipv6Addr>()
+        {
+            bgp_ls::LsTlv::Ipv6RemoteRouterId(addr).encode(&mut dst);
+        }
+        if link.admin_group != 0 {
+            bgp_ls::LsTlv::AdminGroup(link.admin_group).encode(&mut dst);
+        }
+        if link.bandwidth != 0.0 {
+            bgp_ls::LsTlv::MaxLinkBandwidth(link.bandwidth).encode(&mut dst);
+        }
+        if link.reservable_bandwidth != 0.0 {
+            bgp_ls::LsTlv::MaxReservableBandwidth(link.reservable_bandwidth).encode(&mut dst);
+        }
+        if link.unreserved_bandwidth.len() == 8 {
+            let bits: [u32; 8] = core::array::from_fn(|i| link.unreserved_bandwidth[i].to_bits());
+            bgp_ls::LsTlv::UnreservedBandwidth(bits).encode(&mut dst);
+        }
+        if link.default_te_metric != 0 {
+            bgp_ls::LsTlv::TeDefaultMetric(link.default_te_metric).encode(&mut dst);
+        }
+        if link.igp_metric != 0 {
+            bgp_ls::LsTlv::IgpMetric(link.igp_metric).encode(&mut dst);
+        }
+        if !link.srlgs.is_empty() {
+            bgp_ls::LsTlv::Srlg(link.srlgs.clone()).encode(&mut dst);
+        }
+        if !link.opaque.is_empty() {
+            bgp_ls::LsTlv::OpaqueLinkAttr(link.opaque.clone()).encode(&mut dst);
+        }
+        if !link.name.is_empty() {
+            bgp_ls::LsTlv::LinkName(link.name.clone()).encode(&mut dst);
+        }
+        if link.sr_adjacency_sid != 0 {
+            // The API loses the original flags/weight; use V=1 (label) and weight=0.
+            bgp_ls::LsTlv::AdjSid {
+                flags: 0x80,
+                weight: 0,
+                sid: link.sr_adjacency_sid,
+            }
+            .encode(&mut dst);
+        }
+    }
+
+    if let Some(bps) = &attr.bgp_peer_segment {
+        if let Some(sid) = &bps.bgp_peer_node_sid {
+            bgp_ls::LsTlv::PeerNodeSid {
+                flags: peer_sid_flags_from_api(sid.flags.as_ref()),
+                weight: sid.weight as u8,
+                sid: sid.sid,
+            }
+            .encode(&mut dst);
+        }
+        if let Some(sid) = &bps.bgp_peer_adjacency_sid {
+            bgp_ls::LsTlv::PeerAdjSid {
+                flags: peer_sid_flags_from_api(sid.flags.as_ref()),
+                weight: sid.weight as u8,
+                sid: sid.sid,
+            }
+            .encode(&mut dst);
+        }
+        if let Some(sid) = &bps.bgp_peer_set_sid {
+            bgp_ls::LsTlv::PeerSetSid {
+                flags: peer_sid_flags_from_api(sid.flags.as_ref()),
+                weight: sid.weight as u8,
+                sid: sid.sid,
+            }
+            .encode(&mut dst);
+        }
+    }
+
+    if let Some(prefix) = &attr.prefix {
+        if let Some(igp_flags) = &prefix.igp_flags {
+            let mut f = 0u8;
+            if igp_flags.down {
+                f |= 0x80;
+            }
+            if igp_flags.no_unicast {
+                f |= 0x40;
+            }
+            if igp_flags.local_address {
+                f |= 0x20;
+            }
+            if igp_flags.propagate_nssa {
+                f |= 0x10;
+            }
+            bgp_ls::LsTlv::IgpFlags(f).encode(&mut dst);
+        }
+        if !prefix.opaque.is_empty() {
+            bgp_ls::LsTlv::OpaquePrefixAttr(prefix.opaque.clone()).encode(&mut dst);
+        }
+        // Prefer sr_prefix_sids (carries algorithm + flags); fall back to the
+        // legacy sr_prefix_sid field (algorithm 0 only).
+        if !prefix.sr_prefix_sids.is_empty() {
+            for ps in &prefix.sr_prefix_sids {
+                bgp_ls::LsTlv::PrefixSid {
+                    flags: ps.flags as u8,
+                    algorithm: ps.algorithm as u8,
+                    sid: ps.sid,
+                }
+                .encode(&mut dst);
+            }
+        } else if prefix.sr_prefix_sid != 0 {
+            bgp_ls::LsTlv::PrefixSid {
+                flags: 0x80, // V=1, label encoding
+                algorithm: 0,
+                sid: prefix.sr_prefix_sid,
+            }
+            .encode(&mut dst);
+        }
+    }
+
+    dst
 }
 
 fn prefix_sid_to_api(sid: &prefix_sid::PrefixSid) -> api::PrefixSid {

@@ -638,6 +638,131 @@ impl LsTlv {
     pub fn unreserved_bandwidth_f32(bits: &[u32; 8]) -> [f32; 8] {
         bits.map(f32::from_bits)
     }
+
+    /// Encode this TLV into wire format (type + length + value).
+    pub fn encode(&self, dst: &mut Vec<u8>) {
+        fn sid_bytes(sid: u32, v_flag: bool) -> Vec<u8> {
+            if v_flag {
+                // 3-byte label: 20-bit value in top 20 bits of 24-bit field
+                let raw = sid << 4;
+                vec![(raw >> 16) as u8, (raw >> 8) as u8, raw as u8]
+            } else {
+                sid.to_be_bytes().to_vec()
+            }
+        }
+
+        fn sid_tlv_body(flags: u8, weight: u8, sid: u32) -> Vec<u8> {
+            let mut body = vec![flags, weight, 0, 0];
+            body.extend_from_slice(&sid_bytes(sid, flags & 0x80 != 0));
+            body
+        }
+
+        fn range_bytes(ranges: &[SrRange]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            for r in ranges {
+                let size = r.end.saturating_sub(r.begin) + 1;
+                buf.push((size >> 16) as u8);
+                buf.push((size >> 8) as u8);
+                buf.push(size as u8);
+                // SID/Label sub-TLV: type=1, len=3, 3-byte label encoding
+                let raw = r.begin << 4;
+                buf.extend_from_slice(&[1, 3, (raw >> 16) as u8, (raw >> 8) as u8, raw as u8]);
+            }
+            buf
+        }
+
+        match self {
+            LsTlv::NodeFlagBits(f) => write_tlv(dst, TLV_NODE_FLAG_BITS, &[*f]),
+            LsTlv::OpaqueNodeAttr(v) => write_tlv(dst, TLV_OPAQUE_NODE_ATTR, v),
+            LsTlv::NodeName(s) => write_tlv(dst, TLV_NODE_NAME, s.as_bytes()),
+            LsTlv::IsisArea(v) => write_tlv(dst, TLV_ISIS_AREA, v),
+            LsTlv::Ipv4LocalRouterId(a) => write_tlv(dst, TLV_IPV4_LOCAL_ROUTER_ID, &a.octets()),
+            LsTlv::Ipv6LocalRouterId(a) => write_tlv(dst, TLV_IPV6_LOCAL_ROUTER_ID, &a.octets()),
+            LsTlv::Ipv4RemoteRouterId(a) => write_tlv(dst, TLV_IPV4_REMOTE_ROUTER_ID, &a.octets()),
+            LsTlv::Ipv6RemoteRouterId(a) => write_tlv(dst, TLV_IPV6_REMOTE_ROUTER_ID, &a.octets()),
+            LsTlv::SrCapabilities {
+                ipv4_supported,
+                ipv6_supported,
+                ranges,
+            } => {
+                let mut body = Vec::new();
+                let mut flags = 0u8;
+                if *ipv4_supported {
+                    flags |= 0x80;
+                }
+                if *ipv6_supported {
+                    flags |= 0x40;
+                }
+                body.push(flags);
+                body.push(0); // reserved
+                body.extend_from_slice(&range_bytes(ranges));
+                write_tlv(dst, TLV_SR_CAPABILITIES, &body);
+            }
+            LsTlv::SrAlgorithms(v) => write_tlv(dst, TLV_SR_ALGORITHM, v),
+            LsTlv::SrLocalBlock { ranges } => {
+                let mut body = vec![0u8, 0u8]; // flags + reserved
+                body.extend_from_slice(&range_bytes(ranges));
+                write_tlv(dst, TLV_SR_LOCAL_BLOCK, &body);
+            }
+            LsTlv::AdminGroup(g) => write_tlv(dst, TLV_ADMIN_GROUP, &g.to_be_bytes()),
+            LsTlv::MaxLinkBandwidth(b) => {
+                write_tlv(dst, TLV_MAX_LINK_BANDWIDTH, &b.to_bits().to_be_bytes())
+            }
+            LsTlv::MaxReservableBandwidth(b) => write_tlv(
+                dst,
+                TLV_MAX_RESERVABLE_BANDWIDTH,
+                &b.to_bits().to_be_bytes(),
+            ),
+            LsTlv::UnreservedBandwidth(bits) => {
+                let mut body = [0u8; 32];
+                for (i, &b) in bits.iter().enumerate() {
+                    body[i * 4..(i + 1) * 4].copy_from_slice(&b.to_be_bytes());
+                }
+                write_tlv(dst, TLV_UNRESERVED_BANDWIDTH, &body);
+            }
+            LsTlv::TeDefaultMetric(m) => write_tlv(dst, TLV_TE_DEFAULT_METRIC, &m.to_be_bytes()),
+            LsTlv::IgpMetric(m) => {
+                // Re-encode in the shortest form that round-trips faithfully.
+                if *m <= 0xff {
+                    write_tlv(dst, TLV_IGP_METRIC, &[*m as u8]);
+                } else if *m <= 0xffff {
+                    write_tlv(dst, TLV_IGP_METRIC, &(*m as u16).to_be_bytes());
+                } else {
+                    write_tlv(dst, TLV_IGP_METRIC, &m.to_be_bytes()[1..]);
+                }
+            }
+            LsTlv::Srlg(v) => {
+                let body: Vec<u8> = v.iter().flat_map(|s| s.to_be_bytes()).collect();
+                write_tlv(dst, TLV_SRLG, &body);
+            }
+            LsTlv::OpaqueLinkAttr(v) => write_tlv(dst, TLV_OPAQUE_LINK_ATTR, v),
+            LsTlv::LinkName(s) => write_tlv(dst, TLV_LINK_NAME, s.as_bytes()),
+            LsTlv::AdjSid { flags, weight, sid } => {
+                write_tlv(dst, TLV_ADJ_SID, &sid_tlv_body(*flags, *weight, *sid))
+            }
+            LsTlv::PeerNodeSid { flags, weight, sid } => {
+                write_tlv(dst, TLV_PEER_NODE_SID, &sid_tlv_body(*flags, *weight, *sid))
+            }
+            LsTlv::PeerAdjSid { flags, weight, sid } => {
+                write_tlv(dst, TLV_PEER_ADJ_SID, &sid_tlv_body(*flags, *weight, *sid))
+            }
+            LsTlv::PeerSetSid { flags, weight, sid } => {
+                write_tlv(dst, TLV_PEER_SET_SID, &sid_tlv_body(*flags, *weight, *sid))
+            }
+            LsTlv::IgpFlags(f) => write_tlv(dst, TLV_IGP_FLAGS, &[*f]),
+            LsTlv::OpaquePrefixAttr(v) => write_tlv(dst, TLV_OPAQUE_PREFIX_ATTR, v),
+            LsTlv::PrefixSid {
+                flags,
+                algorithm,
+                sid,
+            } => {
+                let mut body = vec![*flags, *algorithm, 0, 0];
+                body.extend_from_slice(&sid_bytes(*sid, flags & 0x80 != 0));
+                write_tlv(dst, TLV_PREFIX_SID, &body);
+            }
+            LsTlv::Unknown { tlv_type, value } => write_tlv(dst, *tlv_type, value),
+        }
+    }
 }
 
 /// Decode the SID value from a 3-byte (label) or 4-byte (index) field.
