@@ -1,0 +1,63 @@
+networks:
+  rpki-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.30.0/24
+          gateway: 172.30.30.254
+
+services:
+  stayrtr:
+    image: rpki/stayrtr:latest
+    container_name: stayrtr
+    command: ["-bind", "0.0.0.0:3323", "-cache", "/data/roas.json", "-checktime=false"]
+    volumes:
+      - ./roas.json:/data/roas.json:ro
+    networks:
+      rpki-net:
+        ipv4_address: 172.30.30.10
+
+  rusty:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: rusty
+    privileged: true
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      rpki-net:
+        ipv4_address: 172.30.30.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+    depends_on:
+      - stayrtr
+
+  frr-adv:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: frr-adv
+    privileged: true
+    volumes:
+      - ./frr-adv/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      rpki-net:
+        ipv4_address: 172.30.30.2
+
+  frr-recv:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: frr-recv
+    privileged: true
+    volumes:
+      - ./frr-recv/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      rpki-net:
+        ipv4_address: 172.30.30.3
