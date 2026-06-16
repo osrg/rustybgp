@@ -678,11 +678,13 @@ impl PeerParams {
                 local_cap.push(packet::Capability::AddPath(addpath));
             }
             // RFC 8950: advertise ExtendedNexthop when peering over IPv6
-            // with IPv4 address family configured
+            // with IPv4 address family configured.
+            // SR Policy (SAFI 73) is excluded: its nexthop is always the
+            // originator address in the same AFI, not an IPv6-mapped address.
             if matches!(remote_addr, IpAddr::V6(_)) {
                 let enh_families: Vec<(Family, u16)> = families
                     .keys()
-                    .filter(|f| f.afi() == Family::AFI_IP)
+                    .filter(|f| f.afi() == Family::AFI_IP && **f != Family::IPV4_SRPOLICY)
                     .map(|f| (*f, Family::AFI_IP6))
                     .collect();
                 if !enh_families.is_empty() {
@@ -10752,6 +10754,24 @@ mod tests {
         families.insert(Family::IPV4, 0u8);
         let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
         assert!(!has_cap(&caps, CAP_EXTENDED_NEXTHOP));
+    }
+
+    #[test]
+    fn build_local_cap_ipv6_peer_srpolicy_excluded_from_extended_nexthop() {
+        // IPV4_SRPOLICY must not appear in ExtendedNexthop: its nexthop is
+        // always the originator IPv4 address, not an IPv6-mapped address.
+        let remote_addr: IpAddr = "2001:db8::1".parse().unwrap();
+        let mut families = FnvHashMap::default();
+        families.insert(Family::IPV4, 0u8);
+        families.insert(Family::IPV4_SRPOLICY, 0u8);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        // ExtendedNexthop is still advertised for IPV4, but not for IPV4_SRPOLICY.
+        assert!(has_cap(&caps, CAP_EXTENDED_NEXTHOP));
+        assert!(!caps.iter().any(|c| matches!(
+            c,
+            packet::Capability::ExtendedNexthop(fams)
+                if fams.iter().any(|(f, _)| *f == Family::IPV4_SRPOLICY)
+        )));
     }
 
     #[test]
