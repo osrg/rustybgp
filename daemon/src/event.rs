@@ -599,13 +599,22 @@ impl Peer {
 
     /// Effective send-max for `family` for adj-out display.
     ///
-    /// Connection::send_max is trimmed to negotiated families during OPEN
-    /// exchange, so conn_effective_max returns 1 for any family where Add-Path
-    /// TX was not negotiated or no session is currently established.
-    fn adj_out_effective_max(&self, family: Family) -> usize {
+    /// Returns None if no session is currently Established (adj-out should
+    /// show empty in that case).  Returns Some(n) when Established: n > 1
+    /// if Add-Path TX was negotiated, 1 otherwise.
+    fn adj_out_effective_max(&self, family: Family) -> Option<usize> {
         let ctx = self.context.lock().unwrap();
         let arb = ctx.conn_arbiter.lock().unwrap();
-        conn_effective_max(&arb, None, family)
+        use crate::fsm::{Role, State};
+        let role = [Role::Active, Role::Passive]
+            .into_iter()
+            .find(|&r| arb.state(r) == State::Established)?;
+        Some(
+            arb.connection(role)
+                .and_then(|c| c.send_max().get(&family))
+                .copied()
+                .unwrap_or(1),
+        )
     }
 }
 
@@ -2716,6 +2725,13 @@ impl GoBgpService for GrpcService {
                                     format!("neighbor {} not found", peer_addr),
                                 )
                             })?
+                    };
+                    let Some(effective_max) = effective_max else {
+                        let (tx, rx) = mpsc::channel(1);
+                        drop(tx);
+                        return Ok(tonic::Response::new(Box::pin(
+                            tokio_stream::wrappers::ReceiverStream::new(rx),
+                        )));
                     };
                     let export_policy = self.tables.export_policy.load_full();
                     let changes = self.tables.collect_loc_rib_paths(family).await;
