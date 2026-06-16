@@ -351,6 +351,7 @@ impl Family {
     const SAFI_MUP: u8 = 85;
     const SAFI_MPLS_VPN: u8 = 128;
     const SAFI_MPLS_VPN6: u8 = 129;
+    const SAFI_SR_POLICY: u8 = 73;
     const SAFI_FLOWSPEC: u8 = 133;
     const SAFI_FLOWSPEC_VPN: u8 = 134;
 
@@ -370,6 +371,8 @@ impl Family {
     pub const IPV6_FLOWSPEC: Family = Family::new(Family::AFI_IP6, Family::SAFI_FLOWSPEC);
     pub const IPV4_FLOWSPEC_VPN: Family = Family::new(Family::AFI_IP, Family::SAFI_FLOWSPEC_VPN);
     pub const IPV6_FLOWSPEC_VPN: Family = Family::new(Family::AFI_IP6, Family::SAFI_FLOWSPEC_VPN);
+    pub const IPV4_SRPOLICY: Family = Family::new(Family::AFI_IP, Family::SAFI_SR_POLICY);
+    pub const IPV6_SRPOLICY: Family = Family::new(Family::AFI_IP6, Family::SAFI_SR_POLICY);
 
     pub const fn new(afi: u16, safi: u8) -> Self {
         Family((afi as u32) << 16 | safi as u32)
@@ -516,6 +519,7 @@ pub enum Nlri {
     FlowspecVpnV4(crate::flowspec::FlowspecVpnV4Nlri),
     FlowspecVpnV6(crate::flowspec::FlowspecVpnV6Nlri),
     Ls(crate::bgp_ls::BgpLsNlri),
+    SrPolicy(crate::sr_policy::SrPolicyNlri),
 }
 
 impl Nlri {
@@ -545,6 +549,10 @@ impl Nlri {
                 Ok(0)
             }
             Nlri::Ls(n) => {
+                n.encode(dst);
+                Ok(0)
+            }
+            Nlri::SrPolicy(n) => {
                 n.encode(dst);
                 Ok(0)
             }
@@ -599,6 +607,11 @@ impl Nlri {
             Family::LS => crate::bgp_ls::BgpLsNlri::decode(c)
                 .map(Nlri::Ls)
                 .ok_or(Notification::UpdateMalformedAttributeList),
+            Family::IPV4_SRPOLICY | Family::IPV6_SRPOLICY => {
+                crate::sr_policy::SrPolicyNlri::decode(c)
+                    .map(Nlri::SrPolicy)
+                    .map_err(|_| Notification::UpdateMalformedAttributeList)
+            }
             _ => Err(Notification::UpdateMalformedAttributeList),
         }
     }
@@ -633,6 +646,7 @@ impl fmt::Display for Nlri {
             Nlri::FlowspecVpnV4(n) => n.fmt(f),
             Nlri::FlowspecVpnV6(n) => n.fmt(f),
             Nlri::Ls(n) => n.fmt(f),
+            Nlri::SrPolicy(n) => n.fmt(f),
         }
     }
 }
@@ -1218,6 +1232,7 @@ impl Attribute {
     pub const LARGE_COMMUNITY: u8 = 32;
     pub const PREFIX_SID: u8 = 40;
     pub const LS: u8 = 29;
+    pub const TUNNEL_ENCAP: u8 = 23;
 
     pub const AS_PATH_TYPE_SET: u8 = 1;
     pub const AS_PATH_TYPE_SEQ: u8 = 2;
@@ -1325,6 +1340,7 @@ impl Attribute {
             Self::LARGE_COMMUNITY => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             Self::PREFIX_SID => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             Self::LS => Some(Self::FLAG_OPTIONAL),
+            Self::TUNNEL_ENCAP => Some(Self::FLAG_TRANSITIVE | Self::FLAG_OPTIONAL),
             _ => None,
         }
     }
@@ -2130,10 +2146,14 @@ impl PeerCodec {
             dst.put_u8(8 + nh_bytes.len() as u8);
             dst.put_bytes(0, 8); // 8-byte zero RD (RFC 4364 §4.3.2)
             dst.put_slice(&nh_bytes);
-        } else if nh_bytes.len() < 16 {
+        } else if nh_bytes.len() < 16
+            && !matches!(family, &Family::IPV4_SRPOLICY | &Family::IPV6_SRPOLICY)
+        {
+            // Pad IPv4 nexthop to 16 bytes for extended-nexthop families (RFC 8950).
+            // SR Policy uses the nexthop as-is (4 bytes for AFI=1, 16 for AFI=2).
             dst.put_u8(16);
             dst.put_slice(&nh_bytes);
-            dst.put_bytes(0, 16 - nh_bytes.len()); // pad to 16 bytes
+            dst.put_bytes(0, 16 - nh_bytes.len());
         } else {
             dst.put_u8(nh_bytes.len() as u8);
             dst.put_slice(&nh_bytes);

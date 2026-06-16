@@ -380,7 +380,8 @@ impl Condition {
                     | packet::Nlri::FlowspecV6(_)
                     | packet::Nlri::FlowspecVpnV4(_)
                     | packet::Nlri::FlowspecVpnV6(_)
-                    | packet::Nlri::Ls(_) => {}
+                    | packet::Nlri::Ls(_)
+                    | packet::Nlri::SrPolicy(_) => {}
                 };
             }
             Condition::AsPath(_name, opt, set) => {
@@ -559,6 +560,13 @@ fn nlri_family(net: &packet::Nlri) -> bgp::Family {
         packet::Nlri::FlowspecVpnV4(_) => bgp::Family::IPV4_FLOWSPEC_VPN,
         packet::Nlri::FlowspecVpnV6(_) => bgp::Family::IPV6_FLOWSPEC_VPN,
         packet::Nlri::Ls(_) => bgp::Family::LS,
+        packet::Nlri::SrPolicy(n) => {
+            if n.endpoint.is_ipv4() {
+                bgp::Family::IPV4_SRPOLICY
+            } else {
+                bgp::Family::IPV6_SRPOLICY
+            }
+        }
     }
 }
 

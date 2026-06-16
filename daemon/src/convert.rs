@@ -19,8 +19,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use rustybgp_packet::{
-    Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, bgp::Ipv4Net, bgp::Ipv6Net, bgp_ls,
-    flowspec, mup, prefix_sid, rd::RouteDistinguisher,
+    self as packet, Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, bgp::Ipv4Net,
+    bgp::Ipv6Net, bgp_ls, flowspec, mup, prefix_sid, rd::RouteDistinguisher,
 };
 
 use regex::Regex;
@@ -263,6 +263,17 @@ pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
         },
         Nlri::Ls(n) => api::Nlri {
             nlri: Some(api::nlri::Nlri::LsAddrPrefix(ls_nlri_to_api(n))),
+        },
+        Nlri::SrPolicy(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::SrPolicy(api::SrPolicyNlri {
+                length: if n.endpoint.is_ipv4() { 96 } else { 192 },
+                distinguisher: n.distinguisher,
+                color: n.color,
+                endpoint: match n.endpoint {
+                    std::net::IpAddr::V4(a) => a.octets().to_vec(),
+                    std::net::IpAddr::V6(a) => a.octets().to_vec(),
+                },
+            })),
         },
     }
 }
@@ -1202,6 +1213,16 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
                 )),
             }
         }
+        Attribute::TUNNEL_ENCAP => {
+            let tlvs = packet::tunnel_encap::decode(a.binary().unwrap());
+            api::Attribute {
+                attr: Some(api::attribute::Attr::TunnelEncap(
+                    api::TunnelEncapAttribute {
+                        tlvs: tlvs.iter().map(tunnel_encap_tlv_to_api).collect(),
+                    },
+                )),
+            }
+        }
         Attribute::PREFIX_SID => match prefix_sid::PrefixSid::decode(a.binary().unwrap()) {
             Ok(sid) => api::Attribute {
                 attr: Some(api::attribute::Attr::PrefixSid(prefix_sid_to_api(&sid))),
@@ -1810,6 +1831,8 @@ pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Fa
         config::generate::AfiSafiType::Ipv6Flowspec => Ok(Family::IPV6_FLOWSPEC),
         config::generate::AfiSafiType::L3VpnIpv4Flowspec => Ok(Family::IPV4_FLOWSPEC_VPN),
         config::generate::AfiSafiType::L3VpnIpv6Flowspec => Ok(Family::IPV6_FLOWSPEC_VPN),
+        config::generate::AfiSafiType::Ipv4Srpolicy => Ok(Family::IPV4_SRPOLICY),
+        config::generate::AfiSafiType::Ipv6Srpolicy => Ok(Family::IPV6_SRPOLICY),
         _ => Err(()),
     }
 }
@@ -2060,6 +2083,32 @@ pub(crate) fn net_from_api(n: api::Nlri, family: Family) -> Result<Nlri, Error> 
             }
         }
         Some(api::nlri::Nlri::LsAddrPrefix(n)) => ls_nlri_from_api(n),
+        Some(api::nlri::Nlri::SrPolicy(n)) => {
+            let endpoint = match n.endpoint.len() {
+                4 => {
+                    let arr: [u8; 4] = n.endpoint[..4].try_into().map_err(|_| {
+                        Error::InvalidArgument("invalid SR Policy endpoint".to_string())
+                    })?;
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::from(arr))
+                }
+                16 => {
+                    let arr: [u8; 16] = n.endpoint[..16].try_into().map_err(|_| {
+                        Error::InvalidArgument("invalid SR Policy endpoint".to_string())
+                    })?;
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::from(arr))
+                }
+                _ => {
+                    return Err(Error::InvalidArgument(
+                        "SR Policy endpoint must be 4 or 16 bytes".to_string(),
+                    ));
+                }
+            };
+            Ok(Nlri::SrPolicy(packet::sr_policy::SrPolicyNlri {
+                distinguisher: n.distinguisher,
+                color: n.color,
+                endpoint,
+            }))
+        }
         _ => Err(Error::InvalidArgument("invalid NLRI".to_string())),
     }
 }
@@ -2161,6 +2210,13 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
                 c.write_u32::<NetworkEndian>(v.local_data2).unwrap();
             }
             Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, c.into_inner())
+                .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
+        }
+        api::attribute::Attr::TunnelEncap(te) => {
+            let tlvs: Vec<packet::tunnel_encap::TunnelEncapTlv> =
+                te.tlvs.iter().map(tunnel_encap_tlv_from_api).collect();
+            let bytes = packet::tunnel_encap::encode(&tlvs);
+            Attribute::new_with_bin(Attribute::TUNNEL_ENCAP, bytes)
                 .ok_or(Error::InvalidArgument("unsupported attribute".to_string()))
         }
         api::attribute::Attr::MpReach(m) => {
@@ -2514,6 +2570,376 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
     }
 
     dst
+}
+
+fn tunnel_encap_tlv_to_api(tlv: &packet::tunnel_encap::TunnelEncapTlv) -> api::TunnelEncapTlv {
+    use packet::tunnel_encap::{SrPolicyBindingSid, SrSegment, TunnelEncapValue};
+
+    let sub_tlvs: Vec<api::tunnel_encap_tlv::Tlv> = match &tlv.value {
+        TunnelEncapValue::Unknown(_) => vec![],
+        TunnelEncapValue::SrPolicy(cp) => {
+            let mut tlvs = Vec::new();
+
+            if let Some(pref) = &cp.preference {
+                tlvs.push(api::tunnel_encap_tlv::Tlv {
+                    tlv: Some(api::tunnel_encap_tlv::tlv::Tlv::SrPreference(
+                        api::TunnelEncapSubTlvsrPreference {
+                            flags: pref.flags as u32,
+                            preference: pref.preference,
+                        },
+                    )),
+                });
+            }
+            if let Some(bsid) = &cp.binding_sid {
+                let api_bsid = match bsid {
+                    SrPolicyBindingSid::Mpls { flags, label } => {
+                        api::TunnelEncapSubTlvsrBindingSid {
+                            bsid: Some(
+                                api::tunnel_encap_sub_tlvsr_binding_sid::Bsid::SrBindingSid(
+                                    api::SrBindingSid {
+                                        s_flag: flags & 0x80 != 0,
+                                        i_flag: flags & 0x40 != 0,
+                                        sid: (label << 12).to_be_bytes().to_vec(),
+                                    },
+                                ),
+                            ),
+                        }
+                    }
+                    SrPolicyBindingSid::Srv6 { flags, sid } => api::TunnelEncapSubTlvsrBindingSid {
+                        bsid: Some(
+                            api::tunnel_encap_sub_tlvsr_binding_sid::Bsid::Srv6BindingSid(
+                                api::SRv6BindingSid {
+                                    s_flag: flags & 0x80 != 0,
+                                    i_flag: flags & 0x40 != 0,
+                                    b_flag: false,
+                                    sid: sid.octets().to_vec(),
+                                    endpoint_behavior_structure: None,
+                                },
+                            ),
+                        ),
+                    },
+                };
+                tlvs.push(api::tunnel_encap_tlv::Tlv {
+                    tlv: Some(api::tunnel_encap_tlv::tlv::Tlv::SrBindingSid(api_bsid)),
+                });
+            }
+            if let Some(bsid) = &cp.srv6_binding_sid {
+                let eb = &bsid.endpoint_behavior;
+                tlvs.push(api::tunnel_encap_tlv::Tlv {
+                    tlv: Some(api::tunnel_encap_tlv::tlv::Tlv::SrBindingSid(
+                        api::TunnelEncapSubTlvsrBindingSid {
+                            bsid: Some(
+                                api::tunnel_encap_sub_tlvsr_binding_sid::Bsid::Srv6BindingSid(
+                                    api::SRv6BindingSid {
+                                        s_flag: bsid.flags & 0x80 != 0,
+                                        i_flag: bsid.flags & 0x40 != 0,
+                                        b_flag: bsid.flags & 0x20 != 0,
+                                        sid: bsid.sid.octets().to_vec(),
+                                        endpoint_behavior_structure: Some(
+                                            api::SRv6EndPointBehavior {
+                                                behavior: eb.behavior as i32,
+                                                block_len: eb.block_len as u32,
+                                                node_len: eb.node_len as u32,
+                                                func_len: eb.func_len as u32,
+                                                arg_len: eb.arg_len as u32,
+                                            },
+                                        ),
+                                    },
+                                ),
+                            ),
+                        },
+                    )),
+                });
+            }
+            if let Some(enlp) = &cp.enlp {
+                tlvs.push(api::tunnel_encap_tlv::Tlv {
+                    tlv: Some(api::tunnel_encap_tlv::tlv::Tlv::SrEnlp(
+                        api::TunnelEncapSubTlvsrenlp {
+                            flags: enlp.flags as u32,
+                            enlp: enlp.enlp_type as i32,
+                        },
+                    )),
+                });
+            }
+            if let Some(pri) = cp.priority {
+                tlvs.push(api::tunnel_encap_tlv::Tlv {
+                    tlv: Some(api::tunnel_encap_tlv::tlv::Tlv::SrPriority(
+                        api::TunnelEncapSubTlvsrPriority {
+                            priority: pri as u32,
+                        },
+                    )),
+                });
+            }
+            for sl in &cp.segment_lists {
+                let mut segments = Vec::new();
+                for seg in &sl.segments {
+                    let api_seg = match seg {
+                        SrSegment::TypeA { flags, label } => {
+                            api::tunnel_encap_sub_tlvsr_segment_list::Segment {
+                                segment: Some(
+                                    api::tunnel_encap_sub_tlvsr_segment_list::segment::Segment::A(
+                                        api::SegmentTypeA {
+                                            flags: Some(api::SegmentFlags {
+                                                v_flag: flags & 0x80 != 0,
+                                                a_flag: flags & 0x40 != 0,
+                                                s_flag: flags & 0x20 != 0,
+                                                b_flag: flags & 0x10 != 0,
+                                            }),
+                                            label: *label,
+                                        },
+                                    ),
+                                ),
+                            }
+                        }
+                        SrSegment::TypeB {
+                            flags,
+                            sid,
+                            endpoint_behavior,
+                        } => api::tunnel_encap_sub_tlvsr_segment_list::Segment {
+                            segment: Some(
+                                api::tunnel_encap_sub_tlvsr_segment_list::segment::Segment::B(
+                                    api::SegmentTypeB {
+                                        flags: Some(api::SegmentFlags {
+                                            v_flag: flags & 0x80 != 0,
+                                            a_flag: flags & 0x40 != 0,
+                                            s_flag: flags & 0x20 != 0,
+                                            b_flag: flags & 0x10 != 0,
+                                        }),
+                                        sid: sid.octets().to_vec(),
+                                        endpoint_behavior_structure: endpoint_behavior
+                                            .as_ref()
+                                            .map(|eb| api::SRv6EndPointBehavior {
+                                                behavior: eb.behavior as i32,
+                                                block_len: eb.block_len as u32,
+                                                node_len: eb.node_len as u32,
+                                                func_len: eb.func_len as u32,
+                                                arg_len: eb.arg_len as u32,
+                                            }),
+                                    },
+                                ),
+                            ),
+                        },
+                    };
+                    segments.push(api_seg);
+                }
+                let weight = sl.weight.as_ref().map(|w| api::SrWeight {
+                    flags: w.flags as u32,
+                    weight: w.weight,
+                });
+                tlvs.push(api::tunnel_encap_tlv::Tlv {
+                    tlv: Some(api::tunnel_encap_tlv::tlv::Tlv::SrSegmentList(
+                        api::TunnelEncapSubTlvsrSegmentList { weight, segments },
+                    )),
+                });
+            }
+            if let Some(name) = &cp.candidate_path_name {
+                tlvs.push(api::tunnel_encap_tlv::Tlv {
+                    tlv: Some(api::tunnel_encap_tlv::tlv::Tlv::SrCandidatePathName(
+                        api::TunnelEncapSubTlvsrCandidatePathName {
+                            candidate_path_name: name.clone(),
+                        },
+                    )),
+                });
+            }
+            if let Some(name) = &cp.policy_name {
+                // Policy name uses the unknown sub-TLV since proto has no dedicated field.
+                // Encode as unknown type 130 (SUBTLV_POLICY_NAME).
+                let mut body = name.as_bytes().to_vec();
+                let mut raw = vec![130u8, body.len() as u8];
+                raw.append(&mut body);
+                tlvs.push(api::tunnel_encap_tlv::Tlv {
+                    tlv: Some(api::tunnel_encap_tlv::tlv::Tlv::Unknown(
+                        api::TunnelEncapSubTlvUnknown {
+                            r#type: 130,
+                            value: name.as_bytes().to_vec(),
+                        },
+                    )),
+                });
+            }
+            tlvs
+        }
+    };
+
+    api::TunnelEncapTlv {
+        r#type: tlv.tunnel_type as u32,
+        tlvs: sub_tlvs,
+    }
+}
+
+fn tunnel_encap_tlv_from_api(tlv: &api::TunnelEncapTlv) -> packet::tunnel_encap::TunnelEncapTlv {
+    use packet::tunnel_encap::{
+        SRv6EndpointBehavior, SrPolicyBindingSid, SrPolicyCandidatePath, SrPolicyEnlp,
+        SrPolicyPreference, SrPolicySegmentList, SrPolicySrv6BindingSid, SrSegment, SrWeight,
+        TUNNEL_TYPE_SR_POLICY, TunnelEncapValue,
+    };
+
+    let tunnel_type = tlv.r#type as u16;
+
+    if tunnel_type != TUNNEL_TYPE_SR_POLICY {
+        // Collect raw bytes for unknown tunnel types from the sub-TLVs unknown fields.
+        let raw: Vec<u8> = tlv
+            .tlvs
+            .iter()
+            .filter_map(|t| {
+                if let Some(api::tunnel_encap_tlv::tlv::Tlv::Unknown(u)) = &t.tlv {
+                    Some(u.value.clone())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        return packet::tunnel_encap::TunnelEncapTlv {
+            tunnel_type,
+            value: TunnelEncapValue::Unknown(raw),
+        };
+    }
+
+    let mut cp = SrPolicyCandidatePath::default();
+
+    for sub in &tlv.tlvs {
+        match &sub.tlv {
+            Some(api::tunnel_encap_tlv::tlv::Tlv::SrPreference(p)) => {
+                cp.preference = Some(SrPolicyPreference {
+                    flags: p.flags as u8,
+                    preference: p.preference,
+                });
+            }
+            Some(api::tunnel_encap_tlv::tlv::Tlv::SrBindingSid(b)) => match &b.bsid {
+                Some(api::tunnel_encap_sub_tlvsr_binding_sid::Bsid::SrBindingSid(s)) => {
+                    let mut flags = 0u8;
+                    if s.s_flag {
+                        flags |= 0x80;
+                    }
+                    if s.i_flag {
+                        flags |= 0x40;
+                    }
+                    let label = if s.sid.len() >= 4 {
+                        u32::from_be_bytes(s.sid[..4].try_into().unwrap_or([0; 4])) >> 12
+                    } else {
+                        0
+                    };
+                    cp.binding_sid = Some(SrPolicyBindingSid::Mpls { flags, label });
+                }
+                Some(api::tunnel_encap_sub_tlvsr_binding_sid::Bsid::Srv6BindingSid(s)) => {
+                    let mut flags = 0u8;
+                    if s.s_flag {
+                        flags |= 0x80;
+                    }
+                    if s.i_flag {
+                        flags |= 0x40;
+                    }
+                    if s.b_flag {
+                        flags |= 0x20;
+                    }
+                    if s.sid.len() == 16 {
+                        let arr: [u8; 16] = s.sid[..16].try_into().unwrap_or([0; 16]);
+                        let sid = std::net::Ipv6Addr::from(arr);
+                        if let Some(eb) = &s.endpoint_behavior_structure {
+                            cp.srv6_binding_sid = Some(SrPolicySrv6BindingSid {
+                                flags,
+                                sid,
+                                endpoint_behavior: SRv6EndpointBehavior {
+                                    behavior: eb.behavior as u16,
+                                    block_len: eb.block_len as u8,
+                                    node_len: eb.node_len as u8,
+                                    func_len: eb.func_len as u8,
+                                    arg_len: eb.arg_len as u8,
+                                },
+                            });
+                        } else {
+                            cp.binding_sid = Some(SrPolicyBindingSid::Srv6 { flags, sid });
+                        }
+                    }
+                }
+                None => {}
+            },
+            Some(api::tunnel_encap_tlv::tlv::Tlv::SrEnlp(e)) => {
+                cp.enlp = Some(SrPolicyEnlp {
+                    flags: e.flags as u8,
+                    enlp_type: e.enlp as u8,
+                });
+            }
+            Some(api::tunnel_encap_tlv::tlv::Tlv::SrPriority(p)) => {
+                cp.priority = Some(p.priority as u8);
+            }
+            Some(api::tunnel_encap_tlv::tlv::Tlv::SrCandidatePathName(n)) => {
+                cp.candidate_path_name = Some(n.candidate_path_name.clone());
+            }
+            Some(api::tunnel_encap_tlv::tlv::Tlv::SrSegmentList(sl)) => {
+                let weight = sl.weight.as_ref().map(|w| SrWeight {
+                    flags: w.flags as u8,
+                    weight: w.weight,
+                });
+                let mut segments = Vec::new();
+                for seg in &sl.segments {
+                    match &seg.segment {
+                        Some(api::tunnel_encap_sub_tlvsr_segment_list::segment::Segment::A(a)) => {
+                            let flags = a.flags.as_ref().map(flags_from_api).unwrap_or(0);
+                            segments.push(SrSegment::TypeA {
+                                flags,
+                                label: a.label,
+                            });
+                        }
+                        Some(api::tunnel_encap_sub_tlvsr_segment_list::segment::Segment::B(b)) => {
+                            let flags = b.flags.as_ref().map(flags_from_api).unwrap_or(0);
+                            let sid = if b.sid.len() == 16 {
+                                let arr: [u8; 16] = b.sid[..16].try_into().unwrap_or([0; 16]);
+                                std::net::Ipv6Addr::from(arr)
+                            } else {
+                                std::net::Ipv6Addr::UNSPECIFIED
+                            };
+                            let endpoint_behavior =
+                                b.endpoint_behavior_structure.as_ref().map(|eb| {
+                                    SRv6EndpointBehavior {
+                                        behavior: eb.behavior as u16,
+                                        block_len: eb.block_len as u8,
+                                        node_len: eb.node_len as u8,
+                                        func_len: eb.func_len as u8,
+                                        arg_len: eb.arg_len as u8,
+                                    }
+                                });
+                            segments.push(SrSegment::TypeB {
+                                flags,
+                                sid,
+                                endpoint_behavior,
+                            });
+                        }
+                        None => {}
+                    }
+                }
+                cp.segment_lists
+                    .push(SrPolicySegmentList { weight, segments });
+            }
+            // Type 130 = policy name, stored as Unknown since proto has no dedicated field
+            Some(api::tunnel_encap_tlv::tlv::Tlv::Unknown(u)) if u.r#type == 130 => {
+                cp.policy_name = std::str::from_utf8(&u.value).ok().map(str::to_owned);
+            }
+            _ => {}
+        }
+    }
+
+    packet::tunnel_encap::TunnelEncapTlv {
+        tunnel_type,
+        value: TunnelEncapValue::SrPolicy(cp),
+    }
+}
+
+fn flags_from_api(f: &api::SegmentFlags) -> u8 {
+    let mut v = 0u8;
+    if f.v_flag {
+        v |= 0x80;
+    }
+    if f.a_flag {
+        v |= 0x40;
+    }
+    if f.s_flag {
+        v |= 0x20;
+    }
+    if f.b_flag {
+        v |= 0x10;
+    }
+    v
 }
 
 fn prefix_sid_to_api(sid: &prefix_sid::PrefixSid) -> api::PrefixSid {
@@ -5648,5 +6074,115 @@ bgp-actions.set-next-hop = "self"
             attr_from_api(attr).is_ok(),
             "Flowspec VPN MpReach with empty next_hops must succeed"
         );
+    }
+
+    #[test]
+    fn sr_policy_nlri_ipv4_round_trip() {
+        let nlri_api = api::Nlri {
+            nlri: Some(api::nlri::Nlri::SrPolicy(api::SrPolicyNlri {
+                length: 96,
+                distinguisher: 1,
+                color: 100,
+                endpoint: vec![10, 0, 0, 1],
+            })),
+        };
+        let nlri = net_from_api(nlri_api, Family::IPV4_SRPOLICY).unwrap();
+        assert!(matches!(nlri, packet::Nlri::SrPolicy(_)));
+        let back = nlri_to_api(&nlri);
+        if let Some(api::nlri::Nlri::SrPolicy(sp)) = back.nlri {
+            assert_eq!(sp.length, 96);
+            assert_eq!(sp.distinguisher, 1);
+            assert_eq!(sp.color, 100);
+            assert_eq!(sp.endpoint, vec![10, 0, 0, 1]);
+        } else {
+            panic!("expected SrPolicy NLRI");
+        }
+    }
+
+    #[test]
+    fn sr_policy_nlri_ipv6_round_trip() {
+        let nlri_api = api::Nlri {
+            nlri: Some(api::nlri::Nlri::SrPolicy(api::SrPolicyNlri {
+                length: 192,
+                distinguisher: 2,
+                color: 200,
+                endpoint: vec![0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            })),
+        };
+        let nlri = net_from_api(nlri_api, Family::IPV6_SRPOLICY).unwrap();
+        let back = nlri_to_api(&nlri);
+        if let Some(api::nlri::Nlri::SrPolicy(sp)) = back.nlri {
+            assert_eq!(sp.length, 192);
+            assert_eq!(sp.distinguisher, 2);
+            assert_eq!(sp.color, 200);
+        } else {
+            panic!("expected SrPolicy NLRI");
+        }
+    }
+
+    #[test]
+    fn tunnel_encap_attr_round_trip() {
+        use api::tunnel_encap_sub_tlvsr_segment_list::Segment;
+        use api::tunnel_encap_sub_tlvsr_segment_list::segment::Segment as SegVariant;
+
+        let te_attr = api::Attribute {
+            attr: Some(api::attribute::Attr::TunnelEncap(
+                api::TunnelEncapAttribute {
+                    tlvs: vec![api::TunnelEncapTlv {
+                        r#type: 15,
+                        tlvs: vec![
+                            api::tunnel_encap_tlv::Tlv {
+                                tlv: Some(api::tunnel_encap_tlv::tlv::Tlv::SrPreference(
+                                    api::TunnelEncapSubTlvsrPreference {
+                                        flags: 0,
+                                        preference: 100,
+                                    },
+                                )),
+                            },
+                            api::tunnel_encap_tlv::Tlv {
+                                tlv: Some(api::tunnel_encap_tlv::tlv::Tlv::SrSegmentList(
+                                    api::TunnelEncapSubTlvsrSegmentList {
+                                        weight: Some(api::SrWeight {
+                                            flags: 0,
+                                            weight: 1,
+                                        }),
+                                        segments: vec![Segment {
+                                            segment: Some(SegVariant::A(api::SegmentTypeA {
+                                                flags: Some(api::SegmentFlags {
+                                                    v_flag: false,
+                                                    a_flag: false,
+                                                    s_flag: false,
+                                                    b_flag: false,
+                                                }),
+                                                label: 16001,
+                                            })),
+                                        }],
+                                    },
+                                )),
+                            },
+                        ],
+                    }],
+                },
+            )),
+        };
+
+        let attr = attr_from_api(te_attr).unwrap();
+        assert_eq!(attr.code(), packet::Attribute::TUNNEL_ENCAP);
+        let bytes = attr.binary().unwrap();
+        let tlvs = packet::tunnel_encap::decode(bytes);
+        assert_eq!(tlvs.len(), 1);
+        assert_eq!(tlvs[0].tunnel_type, 15);
+
+        if let packet::tunnel_encap::TunnelEncapValue::SrPolicy(cp) = &tlvs[0].value {
+            assert_eq!(cp.preference.as_ref().unwrap().preference, 100);
+            assert_eq!(cp.segment_lists.len(), 1);
+            assert_eq!(cp.segment_lists[0].segments.len(), 1);
+            assert!(matches!(
+                &cp.segment_lists[0].segments[0],
+                packet::tunnel_encap::SrSegment::TypeA { label, .. } if *label == 16001
+            ));
+        } else {
+            panic!("expected SrPolicy tunnel encap");
+        }
     }
 }
