@@ -208,7 +208,6 @@ impl TableManager {
                 table::TableQuery::Global,
                 vpn_family,
                 prefixes.clone(),
-                None,
                 enable_filtered,
             ) {
                 if dest.paths.iter().any(|p| vrf.can_import(&p.attr)) {
@@ -509,22 +508,14 @@ impl TableManager {
         prefixes: Vec<table::PrefixFilter>,
         enable_filtered: bool,
     ) -> Vec<table::DestinationEntry> {
-        let export_policy = if matches!(query, table::TableQuery::AdjOut(..)) {
-            self.export_policy.load_full()
-        } else {
-            None
-        };
         // Phase 1: collect from each shard (validation: None); shard lock released after each.
         let mut out = Vec::new();
         for shard in &self.shards {
             let t = shard.lock().await;
-            out.extend(t.rtable.destinations(
-                query,
-                family,
-                prefixes.clone(),
-                export_policy.clone(),
-                enable_filtered,
-            ));
+            out.extend(
+                t.rtable
+                    .destinations(query, family, prefixes.clone(), enable_filtered),
+            );
         }
         // Phase 2: apply RPKI validation without holding any shard lock.
         let rpki = self.rpki.read().unwrap();

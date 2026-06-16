@@ -111,9 +111,6 @@ pub enum TableQuery {
     Global,
     /// Adj-RIB-In for the given peer: all paths received from that peer.
     AdjIn(IpAddr),
-    /// Adj-RIB-Out for the given peer: best paths that would be sent to that peer,
-    /// with export attribute transformations applied.
-    AdjOut(IpAddr, PeerRole),
     /// Route Server local-RIB view for the given RS client: the best path
     /// from all RS-client peers excluding `peer` itself, with pre-import-policy
     /// attributes (equivalent to GoBGP TABLE_TYPE_LOCAL with an RS client address).
@@ -931,90 +928,6 @@ impl Table {
             .collect()
     }
 
-    /// Returns the best path(s) that would be sent to `peer` (Adj-RIB-Out view).
-    ///
-    /// Excludes paths learned from `peer` itself (echo prevention), applies RS
-    /// isolation, and applies iBGP split-horizon / RR non-client suppression.
-    /// Applies per-peer attribute export transformations and outbound policy.
-    fn adj_out_paths(
-        dst: &Destination,
-        peer: IpAddr,
-        dest_role: PeerRole,
-        net: packet::Nlri,
-        _family: Family,
-        export_policy: Option<&PolicyAssignment>,
-    ) -> Vec<PathEntry> {
-        let best = dst.unfiltered_best().map(|p| p as *const RibEntry);
-        dst.entry
-            .iter()
-            .filter(|p| {
-                if Some(*p as *const RibEntry) != best {
-                    return false;
-                }
-                // Echo prevention: never readvertise a path back to its source.
-                if p.path.source.remote_addr == peer {
-                    return false;
-                }
-                // RS isolation: RS-client routes stay within the RS-client group.
-                if p.path.source.is_rs_client() != matches!(dest_role, PeerRole::RsClient) {
-                    return false;
-                }
-                // iBGP split-horizon / RR non-client suppression:
-                // suppress iBGP-learned paths from non-RR-clients to non-RR-client peers.
-                let ibgp_learned = !p.path.source.is_local()
-                    && !p.path.source.is_kernel()
-                    && matches!(p.path.source.role, PeerRole::Ibgp | PeerRole::IbgpRrClient);
-                if ibgp_learned && !p.path.source.is_rr_client() && dest_role == PeerRole::Ibgp {
-                    return false;
-                }
-                true
-            })
-            .filter_map(|p| {
-                // Apply per-peer AS_PATH transformation for the Adj-RIB-Out view.
-                // RS clients keep the original AS_PATH; other peers get local_asn prepended.
-                let mut attr = Arc::new(
-                    p.path
-                        .attr
-                        .iter()
-                        .map(|a| {
-                            if !p.path.source.is_rs_client()
-                                && a.code() == packet::Attribute::AS_PATH
-                            {
-                                a.as_path_prepend(p.path.source.local_asn)
-                            } else {
-                                a.clone()
-                            }
-                        })
-                        .collect::<Vec<packet::Attribute>>(),
-                );
-                if let Some(pa) = export_policy {
-                    let mut nh = p.path.nexthop;
-                    if Self::apply_policy(
-                        pa,
-                        &p.path.source,
-                        &net,
-                        &mut attr,
-                        &mut nh,
-                        p.path.source.local_addr,
-                        peer,
-                    ) == Disposition::Reject
-                    {
-                        return None;
-                    }
-                }
-                Some(PathEntry {
-                    source: p.path.source.clone(),
-                    remote_path_id: 0,
-                    timestamp: p.timestamp,
-                    attr,
-                    validation: None,
-                    stale: p.path.source.is_stale(),
-                    filtered: false,
-                })
-            })
-            .collect()
-    }
-
     /// Iterates destinations matching `query` and `prefixes` for the given `family`.
     ///
     /// When `prefixes` is empty all destinations are returned; otherwise only
@@ -1027,7 +940,6 @@ impl Table {
         query: TableQuery,
         family: Family,
         prefixes: Vec<PrefixFilter>,
-        export_policy: Option<Arc<PolicyAssignment>>,
         enable_filtered: bool,
     ) -> impl Iterator<Item = DestinationEntry> + '_ {
         self.ribs
@@ -1047,14 +959,6 @@ impl Table {
                 let paths = match query {
                     TableQuery::Global => Self::global_paths(dst, enable_filtered),
                     TableQuery::AdjIn(peer) => Self::adj_in_paths(dst, peer, enable_filtered),
-                    TableQuery::AdjOut(peer, dest_role) => Self::adj_out_paths(
-                        dst,
-                        peer,
-                        dest_role,
-                        net.clone(),
-                        family,
-                        export_policy.as_deref(),
-                    ),
                     TableQuery::RsLocal(peer) => Self::rs_local_paths(dst, peer),
                 };
                 DestinationEntry {
@@ -3824,215 +3728,6 @@ mod tests {
         assert!(changes.is_empty());
     }
 
-    // --- iter_destinations AdjOut with filtered head ---
-
-    #[test]
-    fn adj_out_skips_filtered_head() {
-        let mut rt = Table::new();
-        let net = nlri(10, 0, 0, 0, 24);
-        let attrs = attrs_with_local_pref(100);
-        // filtered path with better router_id → sorts at index 0
-        rt.insert(
-            source(1, 65001, 65000, 1),
-            Family::IPV4,
-            net.clone(),
-            0,
-            nh(),
-            attrs.clone(),
-            None,
-            true,
-            false,
-            None,
-            SystemTime::UNIX_EPOCH,
-        );
-        // unfiltered path → should be the AdjOut best
-        let s2 = source(2, 65002, 65000, 2);
-        rt.insert(
-            s2.clone(),
-            Family::IPV4,
-            net.clone(),
-            0,
-            nh(),
-            attrs.clone(),
-            None,
-            false,
-            false,
-            None,
-            SystemTime::UNIX_EPOCH,
-        );
-
-        // peer_addr=10.0.0.99 (different from both sources)
-        let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
-        let dsts: Vec<_> = rt
-            .destinations(
-                TableQuery::AdjOut(peer_addr, PeerRole::Ebgp),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
-            .collect();
-        assert_eq!(dsts.len(), 1);
-        assert_eq!(dsts[0].paths.len(), 1);
-        // attr should be non-empty (not a withdrawal / not filtered path)
-        assert!(!dsts[0].paths[0].attr.is_empty());
-    }
-
-    #[test]
-    fn adj_out_skips_all_filtered_destination() {
-        let mut rt = Table::new();
-        let net = nlri(10, 0, 0, 0, 24);
-        // only filtered paths
-        rt.insert(
-            source(1, 65001, 65000, 1),
-            Family::IPV4,
-            net.clone(),
-            0,
-            nh(),
-            attrs_with_local_pref(100),
-            None,
-            true,
-            false,
-            None,
-            SystemTime::UNIX_EPOCH,
-        );
-
-        let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
-        let dsts: Vec<_> = rt
-            .destinations(
-                TableQuery::AdjOut(peer_addr, PeerRole::Ebgp),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
-            .collect();
-        // no unfiltered best → destination should be filtered out
-        assert!(dsts.is_empty());
-    }
-
-    // --- adj_out RS isolation ---
-
-    fn rs_source_for_adj_out(addr: u8, remote_asn: u32) -> Arc<Source> {
-        Arc::new(Source::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, addr)),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
-            remote_asn,
-            65000,
-            Ipv4Addr::new(0, 0, 0, addr),
-            PeerRole::RsClient,
-        ))
-    }
-
-    #[test]
-    fn adj_out_rs_client_does_not_receive_non_rs_client_path() {
-        // A route learned from a regular eBGP peer must not be sent to an RS client.
-        let mut rt = Table::new();
-        let net = nlri(10, 0, 1, 0, 24);
-        let regular_peer = source(1, 65100, 65000, 1); // rs_client=false
-        rt.insert(
-            regular_peer.clone(),
-            Family::IPV4,
-            net.clone(),
-            0,
-            nh(),
-            attrs_with_local_pref(100),
-            None,
-            false,
-            false,
-            None,
-            SystemTime::UNIX_EPOCH,
-        );
-        let rs_client_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
-        // dest_is_rs_client=true → RS isolation must suppress the non-RS-client route
-        let dsts: Vec<_> = rt
-            .destinations(
-                TableQuery::AdjOut(rs_client_addr, PeerRole::RsClient),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
-            .collect();
-        assert!(
-            dsts.is_empty(),
-            "non-RS-client route must not reach RS-client peer"
-        );
-    }
-
-    #[test]
-    fn adj_out_non_rs_client_does_not_receive_rs_client_path() {
-        // A route learned from an RS client must not be sent to a regular eBGP peer.
-        let mut rt = Table::new();
-        let net = nlri(10, 0, 1, 0, 24);
-        let rs_peer = rs_source_for_adj_out(1, 65001); // rs_client=true
-        rt.insert(
-            rs_peer.clone(),
-            Family::IPV4,
-            net.clone(),
-            0,
-            nh(),
-            attrs_with_local_pref(100),
-            None,
-            false,
-            false,
-            None,
-            SystemTime::UNIX_EPOCH,
-        );
-        let regular_peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99));
-        // dest_is_rs_client=false → RS isolation must suppress the RS-client route
-        let dsts: Vec<_> = rt
-            .destinations(
-                TableQuery::AdjOut(regular_peer_addr, PeerRole::Ebgp),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
-            .collect();
-        assert!(
-            dsts.is_empty(),
-            "RS-client route must not reach non-RS-client peer"
-        );
-    }
-
-    #[test]
-    fn adj_out_rs_client_receives_rs_client_path() {
-        // A route learned from an RS client must be sent to another RS client (same isolation group).
-        let mut rt = Table::new();
-        let net = nlri(10, 0, 1, 0, 24);
-        let rs_peer = rs_source_for_adj_out(1, 65001); // rs_client=true
-        rt.insert(
-            rs_peer.clone(),
-            Family::IPV4,
-            net.clone(),
-            0,
-            nh(),
-            attrs_with_local_pref(100),
-            None,
-            false,
-            false,
-            None,
-            SystemTime::UNIX_EPOCH,
-        );
-        let other_rs_client_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
-        // dest_is_rs_client=true → same isolation group, route must be visible
-        let dsts: Vec<_> = rt
-            .destinations(
-                TableQuery::AdjOut(other_rs_client_addr, PeerRole::RsClient),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
-            .collect();
-        assert_eq!(
-            dsts.len(),
-            1,
-            "RS-client route must reach other RS-client peer"
-        );
-    }
-
     // --- state() counts ---
 
     #[test]
@@ -5120,7 +4815,7 @@ mod tests {
         insert_path(&mut rt, &s2, &n2);
 
         let dests: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
+            .destinations(TableQuery::Global, Family::IPV4, vec![], false)
             .collect();
         assert_eq!(dests.len(), 2);
         assert!(dests.iter().all(|d| !d.paths.is_empty()));
@@ -5138,88 +4833,12 @@ mod tests {
 
         let peer1 = s1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(TableQuery::AdjIn(peer1), Family::IPV4, vec![], None, false)
+            .destinations(TableQuery::AdjIn(peer1), Family::IPV4, vec![], false)
             .collect();
 
         assert_eq!(dests.len(), 1);
         assert_eq!(dests[0].paths.len(), 1);
         assert_eq!(dests[0].paths[0].source.remote_addr, peer1);
-    }
-
-    #[test]
-    fn destinations_adj_out_excludes_source_peer() {
-        // s2 wins best-path selection via higher local_pref.
-        // AdjOut(peer1) must return s2's path, not s1's.
-        let s1 = source(1, 65001, 65000, 1);
-        let s2 = source(2, 65002, 65000, 2);
-        let n1 = nlri(10, 0, 0, 0, 24);
-
-        let mut rt = Table::new();
-        rt.insert(
-            s1.clone(),
-            Family::IPV4,
-            n1.clone(),
-            0,
-            nh(),
-            attrs_with_local_pref(100),
-            None,
-            false,
-            false,
-            None,
-            SystemTime::UNIX_EPOCH,
-        );
-        rt.insert(
-            s2.clone(),
-            Family::IPV4,
-            n1.clone(),
-            0,
-            nh(),
-            attrs_with_local_pref(200),
-            None,
-            false,
-            false,
-            None,
-            SystemTime::UNIX_EPOCH,
-        );
-
-        // Ask for what would be sent to s1; the best path (from s2) should be returned.
-        let peer1 = s1.remote_addr;
-        let dests: Vec<_> = rt
-            .destinations(
-                TableQuery::AdjOut(peer1, PeerRole::Ebgp),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
-            .collect();
-
-        assert_eq!(dests.len(), 1);
-        assert_eq!(dests[0].paths.len(), 1);
-        assert_ne!(dests[0].paths[0].source.remote_addr, peer1);
-    }
-
-    #[test]
-    fn destinations_adj_out_empty_when_only_path_is_from_peer() {
-        let s1 = source(1, 65001, 65000, 1);
-        let n1 = nlri(10, 0, 0, 0, 24);
-
-        let mut rt = Table::new();
-        insert_path(&mut rt, &s1, &n1);
-
-        let peer1 = s1.remote_addr;
-        let dests: Vec<_> = rt
-            .destinations(
-                TableQuery::AdjOut(peer1, PeerRole::Ebgp),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
-            .collect();
-
-        // The only path came from peer1, so nothing would be sent back to it.
-        assert!(dests.is_empty());
     }
 
     fn exact(net: packet::Nlri) -> PrefixFilter {
@@ -5260,7 +4879,6 @@ mod tests {
                 TableQuery::Global,
                 Family::IPV4,
                 vec![exact(n2.clone())],
-                None,
                 false,
             )
             .collect();
@@ -5280,7 +4898,7 @@ mod tests {
         insert_path(&mut rt, &s1, &n2);
 
         let dests: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
+            .destinations(TableQuery::Global, Family::IPV4, vec![], false)
             .collect();
         assert_eq!(dests.len(), 2);
     }
@@ -5308,7 +4926,6 @@ mod tests {
                 TableQuery::Global,
                 Family::IPV4,
                 vec![longer(super16.clone())],
-                None,
                 false,
             )
             .map(|d| d.net)
@@ -5340,7 +4957,6 @@ mod tests {
                 TableQuery::Global,
                 Family::IPV4,
                 vec![shorter(sub24.clone())],
-                None,
                 false,
             )
             .map(|d| d.net)
@@ -5379,7 +4995,7 @@ mod tests {
 
         // Without enable_filtered the destination has no unfiltered paths and is omitted.
         let dests: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
+            .destinations(TableQuery::Global, Family::IPV4, vec![], false)
             .collect();
         assert!(dests.is_empty());
     }
@@ -5395,7 +5011,7 @@ mod tests {
         insert_filtered_path(&mut rt, &s1, &n2); // filtered
 
         let dests: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![], None, true)
+            .destinations(TableQuery::Global, Family::IPV4, vec![], true)
             .collect();
 
         assert_eq!(dests.len(), 2);
@@ -5435,13 +5051,13 @@ mod tests {
         let peer = s1.remote_addr;
 
         let global: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
+            .destinations(TableQuery::Global, Family::IPV4, vec![], false)
             .collect();
         assert_eq!(global.len(), 1);
         assert_eq!(global[0].paths[0].attr, post_policy);
 
         let adj_in: Vec<_> = rt
-            .destinations(TableQuery::AdjIn(peer), Family::IPV4, vec![], None, false)
+            .destinations(TableQuery::AdjIn(peer), Family::IPV4, vec![], false)
             .collect();
         assert_eq!(adj_in.len(), 1);
         assert_eq!(adj_in[0].paths[0].attr, original);
@@ -5474,10 +5090,10 @@ mod tests {
         let peer = s1.remote_addr;
 
         let global: Vec<_> = rt
-            .destinations(TableQuery::Global, Family::IPV4, vec![], None, false)
+            .destinations(TableQuery::Global, Family::IPV4, vec![], false)
             .collect();
         let adj_in: Vec<_> = rt
-            .destinations(TableQuery::AdjIn(peer), Family::IPV4, vec![], None, false)
+            .destinations(TableQuery::AdjIn(peer), Family::IPV4, vec![], false)
             .collect();
 
         assert_eq!(global[0].paths[0].attr, attr);
@@ -5630,13 +5246,7 @@ mod tests {
 
         let peer1_addr = peer1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(
-                TableQuery::RsLocal(peer1_addr),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
+            .destinations(TableQuery::RsLocal(peer1_addr), Family::IPV4, vec![], false)
             .collect();
         assert_eq!(dests.len(), 1);
         assert_eq!(dests[0].paths.len(), 1);
@@ -5656,13 +5266,7 @@ mod tests {
         // RsLocal(peer1) must not include peer1's own path.
         let peer1_addr = peer1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(
-                TableQuery::RsLocal(peer1_addr),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
+            .destinations(TableQuery::RsLocal(peer1_addr), Family::IPV4, vec![], false)
             .collect();
         assert_eq!(dests.len(), 1);
         assert_eq!(dests[0].paths.len(), 1);
@@ -5682,13 +5286,7 @@ mod tests {
         // RsLocal(peer1) must not include non-RS-client peer2's path.
         let peer1_addr = peer1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(
-                TableQuery::RsLocal(peer1_addr),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
+            .destinations(TableQuery::RsLocal(peer1_addr), Family::IPV4, vec![], false)
             .collect();
         assert_eq!(dests.len(), 0);
     }
@@ -5703,13 +5301,7 @@ mod tests {
 
         let peer1_addr = peer1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(
-                TableQuery::RsLocal(peer1_addr),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
+            .destinations(TableQuery::RsLocal(peer1_addr), Family::IPV4, vec![], false)
             .collect();
         assert_eq!(dests.len(), 0, "no other RS clients -> empty result");
     }
@@ -5740,13 +5332,7 @@ mod tests {
 
         let peer1_addr = peer1.remote_addr;
         let dests: Vec<_> = rt
-            .destinations(
-                TableQuery::RsLocal(peer1_addr),
-                Family::IPV4,
-                vec![],
-                None,
-                false,
-            )
+            .destinations(TableQuery::RsLocal(peer1_addr), Family::IPV4, vec![], false)
             .collect();
         assert_eq!(dests.len(), 1);
         // RsLocal must expose original_attr (pre-import-policy), not post-import.

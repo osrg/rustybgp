@@ -542,6 +542,33 @@ impl Peer {
             PeerRole::Ebgp
         }
     }
+
+    /// Build a `PeerExportContext` for adj-out display (no live session needed).
+    ///
+    /// Uses the router-id as `local_addr` fallback; `export_nexthop` is not
+    /// called for display so the exact local address does not matter.
+    fn adj_out_export_ctx(&self, global: &Global) -> PeerExportContext {
+        PeerExportContext {
+            role: self.peer_role(global),
+            local_asn: self.config.local_asn,
+            local_addr: IpAddr::V4(self.config.local_router_id),
+            link_addr: None,
+            confederation_id: global.confederation.as_ref().map_or(0, |c| c.id),
+        }
+    }
+
+    /// Return the cluster-id used for RR reflection, if applicable.
+    fn adj_out_cluster_id(&self, global: &Global) -> Option<Ipv4Addr> {
+        match self.peer_role(global) {
+            PeerRole::Ibgp | PeerRole::IbgpRrClient => Some(
+                self.config
+                    .route_reflector
+                    .route_reflector_cluster_id
+                    .unwrap_or(self.config.local_router_id),
+            ),
+            _ => None,
+        }
+    }
 }
 
 /// Plain-struct replacement for the old PeerBuilder.
@@ -2633,13 +2660,67 @@ impl GoBgpService for GrpcService {
                     let peer_addr = IpAddr::from_str(&request.name).map_err(|_| {
                         tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
                     })?;
-                    let global = self.global.read().await;
-                    let dest_role = global
-                        .peers
-                        .get(&peer_addr)
-                        .map(|p| p.peer_role(&global))
-                        .unwrap_or(PeerRole::Ebgp);
-                    table::TableQuery::AdjOut(peer_addr, dest_role)
+                    let (export_ctx, cluster_id) = {
+                        let global = self.global.read().await;
+                        global
+                            .peers
+                            .get(&peer_addr)
+                            .map(|p| (p.adj_out_export_ctx(&global), p.adj_out_cluster_id(&global)))
+                            .unwrap_or_else(|| {
+                                (
+                                    PeerExportContext {
+                                        role: PeerRole::Ebgp,
+                                        local_asn: 0,
+                                        local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                                        link_addr: None,
+                                        confederation_id: 0,
+                                    },
+                                    None,
+                                )
+                            })
+                    };
+                    let export_policy = self.tables.export_policy.load_full();
+                    let changes = self.tables.collect_loc_rib_paths(family).await;
+                    let mut sink = AdjOutSink::default();
+                    let mut export_map = ExportMap::new();
+                    for change in changes {
+                        process_nlri_change(
+                            &change,
+                            1,
+                            peer_addr,
+                            &mut export_map,
+                            &mut sink,
+                            &export_ctx,
+                            export_policy.as_deref(),
+                            cluster_id,
+                        );
+                    }
+                    let destinations = sink.destinations;
+                    let mut path_count = 0u64;
+                    let v: Vec<_> = destinations
+                        .into_iter()
+                        .take_while(|d| {
+                            if batch_size == 0 {
+                                return true;
+                            }
+                            path_count += d.paths.len() as u64;
+                            path_count <= batch_size
+                        })
+                        .map(|d| api::ListPathResponse {
+                            destination: Some(convert::destination_to_api(d, family, &binary)),
+                        })
+                        .collect();
+                    let (tx, rx) = mpsc::channel(1024);
+                    tokio::spawn(async move {
+                        for r in v {
+                            if tx.send(Ok(r)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    return Ok(tonic::Response::new(Box::pin(
+                        tokio_stream::wrappers::ReceiverStream::new(rx),
+                    )));
                 }
             }
         } else {
@@ -6331,6 +6412,85 @@ fn ibgp_split_horizon_suppress(
     }
 }
 
+/// Abstraction over the output of `process_nlri_change()`.
+///
+/// `PendingTx` implements this for the normal send path.  `AdjOutSink`
+/// implements it to collect a snapshot for adj-out display without sending.
+pub(crate) trait NlriSink {
+    fn reach(
+        &mut self,
+        nlri: packet::Nlri,
+        path_id: u32,
+        nexthop: Option<bgp::Nexthop>,
+        attr: Arc<Vec<packet::Attribute>>,
+        source: &Arc<table::Source>,
+    );
+    fn unreach(&mut self, nlri: packet::Nlri, path_id: u32);
+}
+
+impl NlriSink for crate::peer_tx::PendingTx {
+    fn reach(
+        &mut self,
+        nlri: packet::Nlri,
+        path_id: u32,
+        nexthop: Option<bgp::Nexthop>,
+        attr: Arc<Vec<packet::Attribute>>,
+        _source: &Arc<table::Source>,
+    ) {
+        crate::peer_tx::PendingTx::reach(self, nlri, path_id, nexthop, attr);
+    }
+    fn unreach(&mut self, nlri: packet::Nlri, path_id: u32) {
+        crate::peer_tx::PendingTx::unreach(self, nlri, path_id);
+    }
+}
+
+/// `NlriSink` that collects adj-out paths for display.
+///
+/// Uses a fresh `ExportMap` (empty = nothing previously sent), so
+/// `process_nlri_change()` treats every visible path as new and calls
+/// `reach()` for each one; `unreach()` is never called.
+#[derive(Default)]
+struct AdjOutSink {
+    destinations: Vec<table::DestinationEntry>,
+    /// net -> index into `destinations` for O(1) lookup on duplicate nets.
+    index: FnvHashMap<packet::Nlri, usize>,
+}
+
+impl NlriSink for AdjOutSink {
+    fn reach(
+        &mut self,
+        nlri: packet::Nlri,
+        _path_id: u32,
+        _nexthop: Option<bgp::Nexthop>,
+        attr: Arc<Vec<packet::Attribute>>,
+        source: &Arc<table::Source>,
+    ) {
+        let entry = table::PathEntry {
+            source: Arc::clone(source),
+            remote_path_id: 0,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            attr,
+            validation: None,
+            stale: source.is_stale(),
+            filtered: false,
+        };
+        if let Some(&i) = self.index.get(&nlri) {
+            self.destinations[i].paths.push(entry);
+        } else {
+            let i = self.destinations.len();
+            self.index.insert(nlri.clone(), i);
+            self.destinations.push(table::DestinationEntry {
+                net: nlri,
+                paths: vec![entry],
+            });
+        }
+    }
+
+    fn unreach(&mut self, _nlri: packet::Nlri, _path_id: u32) {
+        // Snapshot mode: ExportMap is always empty so this is never called.
+    }
+}
+
 /// Core routing-update logic shared by handle_prefix_update() and unit tests.
 ///
 /// Computes which BGP messages to send based on `update` and the peer's
@@ -6341,13 +6501,13 @@ fn ibgp_split_horizon_suppress(
 /// - Add-Path (effective_max > 1): diffs `current_paths[..effective_max]` against
 ///   `export_map` to produce per-path_id UPDATEs and WITHDRAWs, including
 ///   send_max boundary crossings in both directions.
-#[allow(clippy::too_many_arguments)]
-fn process_nlri_change(
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn process_nlri_change<S: NlriSink>(
     update: &table::NlriChange,
     effective_max: usize,
     remote_addr: IpAddr,
     export_map: &mut ExportMap,
-    pending: &mut crate::peer_tx::PendingTx,
+    sink: &mut S,
     export_ctx: &PeerExportContext,
     export_policy: Option<&table::PolicyAssignment>,
     cluster_id: Option<Ipv4Addr>,
@@ -6396,20 +6556,20 @@ fn process_nlri_change(
             {
                 attr = rr_reflect_attrs(&attr, best.source.router_id, cid);
             }
-            Some((attr, nexthop))
+            Some((best, attr, nexthop))
         });
         match policy_result {
             None => {
                 if export_map.was_sent(update.family, &update.net) {
                     export_map.mark_withdrawn(update.family, &update.net, 0);
-                    pending.unreach(update.net.clone(), 0);
+                    sink.unreach(update.net.clone(), 0);
                 }
             }
-            Some((attr, nexthop)) => {
+            Some((best, attr, nexthop)) => {
                 export_map.mark_sent(update.family, update.net.clone(), 0);
                 let attr = export_ctx.export_attrs(&attr);
                 let nexthop = export_ctx.export_nexthop(nexthop);
-                pending.reach(update.net.clone(), 0, nexthop, attr);
+                sink.reach(update.net.clone(), 0, nexthop, attr, &best.source);
             }
         }
     } else {
@@ -6420,7 +6580,12 @@ fn process_nlri_change(
         // Build the effective top-N after echo prevention, split horizon, and
         // export policy.  Store post-policy (attr, nexthop) so that
         // export_attrs/export_nexthop can be applied in one step below.
-        let current_top_n: Vec<(u32, Arc<Vec<packet::Attribute>>, Option<bgp::Nexthop>)> = update
+        let current_top_n: Vec<(
+            u32,
+            Arc<Vec<packet::Attribute>>,
+            Option<bgp::Nexthop>,
+            Arc<table::Source>,
+        )> = update
             .current_paths
             .iter()
             .filter(|p| p.source.remote_addr != remote_addr)
@@ -6449,28 +6614,29 @@ fn process_nlri_change(
                 {
                     attr = rr_reflect_attrs(&attr, path.source.router_id, cid);
                 }
-                Some((path.local_path_id, attr, nexthop))
+                Some((path.local_path_id, attr, nexthop, Arc::clone(&path.source)))
             })
             .collect();
 
         // Withdraw paths that were sent but are no longer in top-N
         // (including paths pushed out by send_max boundary or policy).
         let sent_ids = export_map.sent_path_ids(update.family, &update.net);
-        let current_ids: FnvHashSet<u32> = current_top_n.iter().map(|(pid, _, _)| *pid).collect();
+        let current_ids: FnvHashSet<u32> =
+            current_top_n.iter().map(|(pid, _, _, _)| *pid).collect();
         for &pid in sent_ids.difference(&current_ids) {
             export_map.mark_withdrawn(update.family, &update.net, pid);
-            pending.unreach(update.net.clone(), pid);
+            sink.unreach(update.net.clone(), pid);
         }
 
         // Advertise paths that are new or whose attributes were replaced.
-        for (pid, attr, nexthop) in &current_top_n {
+        for (pid, attr, nexthop, source) in &current_top_n {
             let already_sent = export_map.contains_path(update.family, &update.net, *pid);
             let was_replaced = update.replaced_path_id == Some(*pid);
             if !already_sent || was_replaced {
                 export_map.mark_sent(update.family, update.net.clone(), *pid);
                 let attr = export_ctx.export_attrs(attr);
                 let nexthop = export_ctx.export_nexthop(*nexthop);
-                pending.reach(update.net.clone(), *pid, nexthop, attr);
+                sink.reach(update.net.clone(), *pid, nexthop, attr, source);
             }
         }
     }
