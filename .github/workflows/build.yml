@@ -1,4 +1,4 @@
-name: build
+name: CI
 
 on: [pull_request]
 
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: build
+    name: clippy, test, fmt
     runs-on: ubuntu-22.04
     steps:
       - name: checking out
