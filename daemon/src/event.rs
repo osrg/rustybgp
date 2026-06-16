@@ -4407,6 +4407,34 @@ impl Global {
                 }
             }
         }
+        if let Some(rpki_servers) = bgp.as_ref().and_then(|x| x.rpki_servers.as_ref()) {
+            for s in rpki_servers {
+                let addr = s.config.as_ref().and_then(|c| c.address);
+                let port = s
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.port)
+                    .map(|p| p as u16)
+                    .unwrap_or(323);
+                if let Some(addr) = addr {
+                    let sockaddr = SocketAddr::new(addr, port);
+                    match global.write().await.add_rpki_client(sockaddr) {
+                        Err(()) => {
+                            log::warn!("rpki client {} already exists", sockaddr);
+                        }
+                        Ok((cancel, soft_reset, state)) => {
+                            crate::rpki::RpkiClient::try_connect(
+                                sockaddr,
+                                cancel,
+                                soft_reset,
+                                state,
+                                tables.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // Initialize Restarting Speaker deferral when started with --graceful-restart
         // and a config file (file-based startup only).
         if is_restarting && bgp.is_some() {
