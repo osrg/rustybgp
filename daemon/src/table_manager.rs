@@ -17,7 +17,8 @@ use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 
 use rustybgp_kernel as kernel;
 use rustybgp_packet::{self as packet, Family, bgp};
@@ -130,7 +131,7 @@ impl TableManager {
         )
     }
 
-    pub(crate) async fn add_vrf(
+    pub(crate) fn add_vrf(
         &self,
         name: String,
         rd: packet::rd::RouteDistinguisher,
@@ -164,7 +165,7 @@ impl TableManager {
         Ok(label)
     }
 
-    pub(crate) async fn delete_vrf(&self, name: &str) -> Result<(), table::TableError> {
+    pub(crate) fn delete_vrf(&self, name: &str) -> Result<(), table::TableError> {
         let current = self.vrfs.load_full();
         let id = current.get(name).ok_or(table::TableError::NotFound)?.id;
         let mut new_map = (*current).clone();
@@ -178,7 +179,7 @@ impl TableManager {
         Ok(())
     }
 
-    pub(crate) async fn list_vrfs(&self, name: Option<&str>) -> Vec<table::Vrf> {
+    pub(crate) fn list_vrfs(&self, name: Option<&str>) -> Vec<table::Vrf> {
         let vrfs = self.vrfs.load();
         match name {
             Some(n) => vrfs.get(n).cloned().into_iter().collect(),
@@ -188,7 +189,7 @@ impl TableManager {
 
     /// Collect paths from the global VPN table that can be imported into `vrf`.
     /// Returns destinations with the VPN wrapper stripped (plain V4/V6 NLRI).
-    pub(crate) async fn collect_vrf_paths(
+    pub(crate) fn collect_vrf_paths(
         &self,
         vrf_name: &str,
         family: Family,
@@ -203,7 +204,7 @@ impl TableManager {
         let vrf = self.vrfs.load().get(vrf_name)?.clone();
         let mut out = Vec::new();
         for shard in &self.shards {
-            let t = shard.lock().await;
+            let t = shard.lock().unwrap();
             for mut dest in t.rtable.destinations(
                 table::TableQuery::Global,
                 vpn_family,
@@ -244,7 +245,7 @@ impl TableManager {
     /// Returns `true` if the per-peer prefix limit (RFC 4486 §2) was exceeded.
     /// The caller must send a CEASE NOTIFICATION and close the session.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn insert_route(
+    pub(crate) fn insert_route(
         &self,
         source: Arc<table::Source>,
         family: Family,
@@ -258,7 +259,7 @@ impl TableManager {
         let kernel_handle = self.kernel_handle.load_full();
         let nht_set = self.nexthop_invalid.load();
         let idx = self.dealer(&net.nlri);
-        let mut t = self.shards[idx].lock().await;
+        let mut t = self.shards[idx].lock().unwrap();
         t.notify_adj_rib_in(
             source.clone(),
             family,
@@ -307,7 +308,7 @@ impl TableManager {
     }
 
     /// Remove a route from the appropriate shard and distribute changes to peers.
-    pub(crate) async fn remove_route(
+    pub(crate) fn remove_route(
         &self,
         source: Arc<table::Source>,
         family: Family,
@@ -317,7 +318,7 @@ impl TableManager {
     ) {
         let kernel_handle = self.kernel_handle.load_full();
         let idx = self.dealer(&net.nlri);
-        let mut t = self.shards[idx].lock().await;
+        let mut t = self.shards[idx].lock().unwrap();
         t.notify_adj_rib_in(
             source.clone(),
             family,
@@ -344,12 +345,12 @@ impl TableManager {
 
     /// Re-applies the current import policy to all non-stale paths from `peer`
     /// across every shard and distributes any routing changes to peers.
-    pub(crate) async fn soft_reset_in(&self, peer: IpAddr) {
+    pub(crate) fn soft_reset_in(&self, peer: IpAddr) {
         let import_policy = self.import_policy.load_full();
         let kernel_handle = self.kernel_handle.load_full();
         let nht_set = self.nexthop_invalid.load_full();
         for shard in &self.shards {
-            let mut t = shard.lock().await;
+            let mut t = shard.lock().unwrap();
             t.soft_reset_in(
                 peer,
                 import_policy.as_deref(),
@@ -367,12 +368,12 @@ impl TableManager {
     /// If the peer's session is not Established (e.g., peer is in GR helper
     /// mode and the session is down), the peer session's `do_route_refresh`
     /// exits early, making this a safe no-op.
-    pub(crate) async fn soft_reset_out(&self, peer: IpAddr) {
+    pub(crate) fn soft_reset_out(&self, peer: IpAddr) {
         // All shards register the same sender for each peer; shard 0 suffices
         // for the lookup.
         let tx = self.shards[0]
             .lock()
-            .await
+            .unwrap()
             .peer_event_tx
             .get(&peer)
             .cloned();
@@ -381,60 +382,60 @@ impl TableManager {
         }
     }
 
-    pub(crate) async fn drop_families(&self, addr: IpAddr, families: &[Family]) {
+    pub(crate) fn drop_families(&self, addr: IpAddr, families: &[Family]) {
         let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
-            let mut t = shard.lock().await;
+            let mut t = shard.lock().unwrap();
             for &family in families {
                 t.disconnected(addr, family, kernel_handle.as_deref());
             }
         }
     }
 
-    pub(crate) async fn drop_stale_families(&self, addr: IpAddr, families: &[Family]) {
+    pub(crate) fn drop_stale_families(&self, addr: IpAddr, families: &[Family]) {
         let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
-            let mut t = shard.lock().await;
+            let mut t = shard.lock().unwrap();
             for &family in families {
                 t.drop_stale(addr, family, kernel_handle.as_deref());
             }
         }
     }
 
-    pub(crate) async fn end_deferral_families(&self, families: &[Family]) {
+    pub(crate) fn end_deferral_families(&self, families: &[Family]) {
         let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
-            let mut t = shard.lock().await;
+            let mut t = shard.lock().unwrap();
             for &family in families {
                 t.end_deferral(family, kernel_handle.as_deref());
             }
         }
     }
 
-    pub(crate) async fn start_deferral_families(&self, families: &[Family]) {
+    pub(crate) fn start_deferral_families(&self, families: &[Family]) {
         for shard in &self.shards {
-            let mut t = shard.lock().await;
+            let mut t = shard.lock().unwrap();
             for &family in families {
                 t.rtable.start_deferral(family);
             }
         }
     }
 
-    pub(crate) async fn rpki_insert(&self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
+    pub(crate) fn rpki_insert(&self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
         let mut rpki = self.rpki.write().unwrap();
         for (net, roa) in roas {
             rpki.insert(net, roa);
         }
     }
 
-    pub(crate) async fn rpki_withdraw(&self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
+    pub(crate) fn rpki_withdraw(&self, roas: Vec<(packet::IpNet, Arc<table::Roa>)>) {
         let mut rpki = self.rpki.write().unwrap();
         for (net, roa) in roas {
             rpki.remove(net, &roa);
         }
     }
 
-    pub(crate) async fn rpki_reset(
+    pub(crate) fn rpki_reset(
         &self,
         addr: Arc<IpAddr>,
         roas: Vec<(packet::IpNet, Arc<table::Roa>)>,
@@ -446,27 +447,27 @@ impl TableManager {
         }
     }
 
-    pub(crate) async fn rpki_drop_all(&self, addr: Arc<IpAddr>) {
+    pub(crate) fn rpki_drop_all(&self, addr: Arc<IpAddr>) {
         self.rpki.write().unwrap().drop_source(addr);
     }
 
-    pub(crate) async fn table_state(&self, family: Family) -> table::TableState {
+    pub(crate) fn table_state(&self, family: Family) -> table::TableState {
         let mut state = table::TableState::default();
         for shard in &self.shards {
-            state += shard.lock().await.rtable.state(family);
+            state += shard.lock().unwrap().rtable.state(family);
         }
         state
     }
 
-    pub(crate) async fn collect_loc_rib_paths(&self, family: Family) -> Vec<table::NlriChange> {
+    pub(crate) fn collect_loc_rib_paths(&self, family: Family) -> Vec<table::NlriChange> {
         let mut out = Vec::new();
         for shard in &self.shards {
-            out.extend(shard.lock().await.rtable.collect_loc_rib_paths(&family));
+            out.extend(shard.lock().unwrap().rtable.collect_loc_rib_paths(&family));
         }
         out
     }
 
-    pub(crate) async fn collect_roa(&self, family: Family) -> Vec<(packet::IpNet, table::Roa)> {
+    pub(crate) fn collect_roa(&self, family: Family) -> Vec<(packet::IpNet, table::Roa)> {
         self.rpki
             .read()
             .unwrap()
@@ -475,18 +476,18 @@ impl TableManager {
             .collect()
     }
 
-    pub(crate) async fn rpki_state(&self, addr: &IpAddr) -> table::RpkiTableState {
+    pub(crate) fn rpki_state(&self, addr: &IpAddr) -> table::RpkiTableState {
         self.rpki.read().unwrap().state(addr)
     }
 
-    pub(crate) async fn collect_peer_stats(
+    pub(crate) fn collect_peer_stats(
         &self,
         addrs: &[IpAddr],
     ) -> FnvHashMap<IpAddr, FnvHashMap<Family, table::PrefixStats>> {
         let mut map: FnvHashMap<IpAddr, FnvHashMap<Family, table::PrefixStats>> =
             FnvHashMap::default();
         for shard in &self.shards {
-            let t = shard.lock().await;
+            let t = shard.lock().unwrap();
             for addr in addrs {
                 if let Some(iter) = t.rtable.peer_stats(addr) {
                     let entry = map.entry(*addr).or_default();
@@ -501,7 +502,7 @@ impl TableManager {
         map
     }
 
-    pub(crate) async fn collect_paths(
+    pub(crate) fn collect_paths(
         &self,
         query: table::TableQuery,
         family: Family,
@@ -511,7 +512,7 @@ impl TableManager {
         // Phase 1: collect from each shard (validation: None); shard lock released after each.
         let mut out = Vec::new();
         for shard in &self.shards {
-            let t = shard.lock().await;
+            let t = shard.lock().unwrap();
             out.extend(
                 t.rtable
                     .destinations(query, family, prefixes.clone(), enable_filtered),
@@ -529,7 +530,7 @@ impl TableManager {
 
     /// Subscribe with snapshot: calls `on_change` for each current route (per shard, under lock),
     /// then registers for live AdjRibIn/PeerUp/PeerDown events.
-    pub(crate) async fn subscribe_with<F>(&self, mut on_change: F) -> Subscription
+    pub(crate) fn subscribe_with<F>(&self, mut on_change: F) -> Subscription
     where
         F: FnMut(AdjRibInChange),
     {
@@ -540,12 +541,12 @@ impl TableManager {
         let (tx, rx) = mpsc::unbounded_channel();
         // Register for peer events (PeerUp/PeerDown) first to avoid missing events.
         {
-            let mut subs = self.subscribers.lock().await;
+            let mut subs = self.subscribers.lock().unwrap();
             subs.insert(id, tx.clone());
         }
         // Snapshot each shard atomically while registering for live AdjRibIn events.
         for shard in &self.shards {
-            let mut t = shard.lock().await;
+            let mut t = shard.lock().unwrap();
             for f in t.rtable.families().collect::<Vec<_>>() {
                 for reach in t.rtable.iter_reach(f) {
                     let addpath = t.has_addpath(&reach.source.remote_addr, &f);
@@ -566,43 +567,43 @@ impl TableManager {
     }
 
     /// Subscribe for live events only (no snapshot). Used by watch_event gRPC and MRT.
-    pub(crate) async fn subscribe_live(&self) -> Subscription {
+    pub(crate) fn subscribe_live(&self) -> Subscription {
         let id = SubscriptionId(
             self.next_sub_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         );
         let (tx, rx) = mpsc::unbounded_channel();
         {
-            let mut subs = self.subscribers.lock().await;
+            let mut subs = self.subscribers.lock().unwrap();
             subs.insert(id, tx.clone());
         }
         for shard in &self.shards {
-            let mut shard = shard.lock().await;
+            let mut shard = shard.lock().unwrap();
             shard.subscribers.insert(id, tx.clone());
         }
         Subscription { rx, id }
     }
 
-    pub(crate) async fn unsubscribe(&self, id: SubscriptionId) {
+    pub(crate) fn unsubscribe(&self, id: SubscriptionId) {
         {
-            let mut subs = self.subscribers.lock().await;
+            let mut subs = self.subscribers.lock().unwrap();
             subs.remove(&id);
         }
         for shard in &self.shards {
-            let mut shard = shard.lock().await;
+            let mut shard = shard.lock().unwrap();
             shard.subscribers.remove(&id);
         }
     }
 
-    pub(crate) async fn peer_up(&self, data: PeerUpData) {
-        let subs = self.subscribers.lock().await;
+    pub(crate) fn peer_up(&self, data: PeerUpData) {
+        let subs = self.subscribers.lock().unwrap();
         for tx in subs.values() {
             let _ = tx.send(BgpEvent::PeerUp(data.clone()));
         }
     }
 
-    pub(crate) async fn peer_down(&self, data: PeerDownData) {
-        let subs = self.subscribers.lock().await;
+    pub(crate) fn peer_down(&self, data: PeerDownData) {
+        let subs = self.subscribers.lock().unwrap();
         for tx in subs.values() {
             let _ = tx.send(BgpEvent::PeerDown(data.clone()));
         }
@@ -613,7 +614,7 @@ impl TableManager {
     /// For each shard, while the lock is held, `on_shard` is called with the
     /// shard's routing table so the caller can populate its initial routes.
     /// The returned receiver delivers `ToPeerEvent` messages from all shards.
-    pub(crate) async fn register_peer<F>(
+    pub(crate) fn register_peer<F>(
         &self,
         addr: IpAddr,
         addpath: FnvHashSet<Family>,
@@ -624,7 +625,7 @@ impl TableManager {
     {
         let (tx, rx) = mpsc::unbounded_channel();
         for shard in &self.shards {
-            let mut t = shard.lock().await;
+            let mut t = shard.lock().unwrap();
             on_shard(&t.rtable);
             t.peer_event_tx.insert(addr, tx.clone());
             if !addpath.is_empty() {
@@ -634,7 +635,7 @@ impl TableManager {
         rx
     }
 
-    pub(crate) async fn unregister_peer(
+    pub(crate) fn unregister_peer(
         &self,
         addr: IpAddr,
         drop_families: &[Family],
@@ -642,7 +643,7 @@ impl TableManager {
     ) {
         let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
-            let mut t = shard.lock().await;
+            let mut t = shard.lock().unwrap();
             t.peer_event_tx.remove(&addr);
             t.addpath.remove(&addr);
             for &family in drop_families {
@@ -659,7 +660,7 @@ impl TableManager {
     /// Updates the `nexthop_invalid` ArcSwap set so that newly inserted paths
     /// see the current reachability, then walks all shards to flip
     /// `FLAG_NEXTHOP_INVALID` on affected paths and distribute routing changes.
-    pub(crate) async fn update_nexthop_validity(&self, addr: IpAddr, reachable: bool) {
+    pub(crate) fn update_nexthop_validity(&self, addr: IpAddr, reachable: bool) {
         // Update the ArcSwap set.  Loads/swaps are serialized through the event loop.
         let current = self.nexthop_invalid.load_full();
         let mut new_set = (*current).clone();
@@ -672,7 +673,7 @@ impl TableManager {
 
         let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
-            let mut t = shard.lock().await;
+            let mut t = shard.lock().unwrap();
             for change in t.rtable.update_nexthop_validity(addr, reachable) {
                 t.distribute_update(change, kernel_handle.as_deref());
             }
@@ -680,7 +681,7 @@ impl TableManager {
     }
 
     /// Inject a kernel-redistributed route into the BGP RIB.
-    pub(crate) async fn inject_kernel_route(&self, kr: kernel::KernelRoute) {
+    pub(crate) fn inject_kernel_route(&self, kr: kernel::KernelRoute) {
         let Some((family, net, nexthop, attr)) = kernel_route_to_path(&kr) else {
             return;
         };
@@ -692,12 +693,11 @@ impl TableManager {
             attr,
             None,
             std::time::SystemTime::now(),
-        )
-        .await;
+        );
     }
 
     /// Withdraw a kernel-redistributed route from the BGP RIB.
-    pub(crate) async fn withdraw_kernel_route(&self, dst: std::net::IpAddr, prefix_len: u8) {
+    pub(crate) fn withdraw_kernel_route(&self, dst: std::net::IpAddr, prefix_len: u8) {
         let nlri = ip_to_nlri(dst, prefix_len);
         let family = nlri_family(&nlri);
         self.remove_route(
@@ -706,15 +706,14 @@ impl TableManager {
             packet::PathNlri { nlri, path_id: 0 },
             None,
             std::time::SystemTime::now(),
-        )
-        .await;
+        );
     }
 
     /// Inject or withdraw a Connected route triggered by an interface address event.
     ///
     /// The route destination is the network prefix (interface address masked by
     /// prefix_len); the BGP nexthop is the interface address itself per RFC 4271 §5.1.3.
-    pub(crate) async fn handle_address_event(&self, event: kernel::KernelAddressEvent) {
+    pub(crate) fn handle_address_event(&self, event: kernel::KernelAddressEvent) {
         let (ka, is_add) = match event {
             kernel::KernelAddressEvent::Add(a) => (a, true),
             kernel::KernelAddressEvent::Delete(a) => (a, false),
@@ -728,9 +727,9 @@ impl TableManager {
                 metric: 0,
                 protocol: kernel::Protocol::Kernel,
             };
-            self.inject_kernel_route(kr).await;
+            self.inject_kernel_route(kr);
         } else {
-            self.withdraw_kernel_route(network, ka.prefix_len).await;
+            self.withdraw_kernel_route(network, ka.prefix_len);
         }
     }
 }
@@ -1172,15 +1171,13 @@ mod tests {
     async fn inject_kernel_route_adds_path() {
         let tables = make_tables();
         let kr = kr_v4("10.0.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
-        tables.inject_kernel_route(kr).await;
-        let paths = tables
-            .collect_paths(
-                rustybgp_table::TableQuery::Global,
-                Family::IPV4,
-                vec![],
-                false,
-            )
-            .await;
+        tables.inject_kernel_route(kr);
+        let paths = tables.collect_paths(
+            rustybgp_table::TableQuery::Global,
+            Family::IPV4,
+            vec![],
+            false,
+        );
         assert_eq!(paths.len(), 1);
         assert!(paths[0].paths[0].source.is_kernel());
     }
@@ -1189,18 +1186,14 @@ mod tests {
     async fn withdraw_kernel_route_removes_path() {
         let tables = make_tables();
         let kr = kr_v4("10.0.0.0", 24, "192.168.1.1", 0, kernel::Protocol::Static);
-        tables.inject_kernel_route(kr).await;
-        tables
-            .withdraw_kernel_route("10.0.0.0".parse().unwrap(), 24)
-            .await;
-        let paths = tables
-            .collect_paths(
-                rustybgp_table::TableQuery::Global,
-                Family::IPV4,
-                vec![],
-                false,
-            )
-            .await;
+        tables.inject_kernel_route(kr);
+        tables.withdraw_kernel_route("10.0.0.0".parse().unwrap(), 24);
+        let paths = tables.collect_paths(
+            rustybgp_table::TableQuery::Global,
+            Family::IPV4,
+            vec![],
+            false,
+        );
         assert_eq!(paths.len(), 0);
     }
 
@@ -1217,7 +1210,7 @@ mod tests {
         ))
     }
 
-    async fn insert_v4_route(
+    fn insert_v4_route(
         tables: &TableManager,
         source: Arc<table::Source>,
         prefix: &str,
@@ -1226,17 +1219,15 @@ mod tests {
         let nlri: packet::Nlri = prefix.parse().unwrap();
         let net = packet::PathNlri::new(nlri);
         let nh: std::net::Ipv4Addr = nexthop.parse().unwrap();
-        tables
-            .insert_route(
-                source,
-                Family::IPV4,
-                net,
-                Some(packet::bgp::Nexthop::V4(nh)),
-                Arc::new(vec![]),
-                None,
-                std::time::SystemTime::UNIX_EPOCH,
-            )
-            .await;
+        tables.insert_route(
+            source,
+            Family::IPV4,
+            net,
+            Some(packet::bgp::Nexthop::V4(nh)),
+            Arc::new(vec![]),
+            None,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
     }
 
     fn loc_rib_len(tables: &TableManager, shard: usize, family: Family) -> usize {
@@ -1254,13 +1245,11 @@ mod tests {
     async fn nht_invalid_nexthop_excluded_from_best() {
         let tables = make_tables();
         let src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
-        insert_v4_route(&tables, src, "192.168.1.0/24", "10.0.0.2").await;
+        insert_v4_route(&tables, src, "192.168.1.0/24", "10.0.0.2");
 
         assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 1);
 
-        tables
-            .update_nexthop_validity("10.0.0.2".parse().unwrap(), false)
-            .await;
+        tables.update_nexthop_validity("10.0.0.2".parse().unwrap(), false);
 
         // Nexthop is now invalid: path must be excluded from loc-RIB.
         assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 0);
@@ -1270,17 +1259,13 @@ mod tests {
     async fn nht_valid_nexthop_restored() {
         let tables = make_tables();
         let src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
-        insert_v4_route(&tables, src, "192.168.1.0/24", "10.0.0.2").await;
+        insert_v4_route(&tables, src, "192.168.1.0/24", "10.0.0.2");
 
-        tables
-            .update_nexthop_validity("10.0.0.2".parse().unwrap(), false)
-            .await;
+        tables.update_nexthop_validity("10.0.0.2".parse().unwrap(), false);
         assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 0);
 
         // Nexthop becomes reachable again: path must be restored to loc-RIB.
-        tables
-            .update_nexthop_validity("10.0.0.2".parse().unwrap(), true)
-            .await;
+        tables.update_nexthop_validity("10.0.0.2".parse().unwrap(), true);
         assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 1);
     }
 
@@ -1289,12 +1274,10 @@ mod tests {
         let tables = make_tables();
 
         // Mark the nexthop unreachable BEFORE the path arrives.
-        tables
-            .update_nexthop_validity("10.0.0.2".parse().unwrap(), false)
-            .await;
+        tables.update_nexthop_validity("10.0.0.2".parse().unwrap(), false);
 
         let src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
-        insert_v4_route(&tables, src, "192.168.1.0/24", "10.0.0.2").await;
+        insert_v4_route(&tables, src, "192.168.1.0/24", "10.0.0.2");
 
         // The path must not appear in loc-RIB: the ArcSwap set was checked
         // at insertion time and nexthop_invalid_flag was set.

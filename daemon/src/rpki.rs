@@ -182,20 +182,20 @@ impl RpkiClient {
                                 if end_of_data {
                                     tables
                                         .rpki_insert(vec![(prefix.net.clone(), roa)])
-                                        .await;
+                                        ;
                                 } else {
                                     v.push((prefix.net, roa));
                                 }
                             } else if end_of_data {
                                 tables
                                     .rpki_withdraw(vec![(prefix.net.clone(), roa)])
-                                    .await;
+                                    ;
                             }
                         }
                         rpki::Message::EndOfData { serial_number, .. } => {
                             end_of_data = true;
                             state.serial.store(serial_number, Ordering::Relaxed);
-                            tables.rpki_reset(remote_addr.clone(), v.to_owned()).await;
+                            tables.rpki_reset(remote_addr.clone(), v.to_owned());
                         }
                         _ => {}
                     }
@@ -210,7 +210,7 @@ impl RpkiClient {
                 .as_secs(),
             Ordering::Relaxed,
         );
-        tables.rpki_drop_all(remote_addr.clone()).await;
+        tables.rpki_drop_all(remote_addr.clone());
         Ok(())
     }
 

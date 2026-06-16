@@ -245,9 +245,7 @@ impl BmpClient {
             .await;
 
         let mut snapshot: SnapshotMap = FnvHashMap::default();
-        let subscription = tables
-            .subscribe_with(|change| apply_snapshot(&mut snapshot, change))
-            .await;
+        let subscription = tables.subscribe_with(|change| apply_snapshot(&mut snapshot, change));
         let rx = subscription.rx;
 
         // Send PeerUp for all established peers.
@@ -257,7 +255,7 @@ impl BmpClient {
         for peer in global.read().await.peers.values() {
             if let Some((addr, peer_header, msg)) = peer.bmp_peer_up(local_id) {
                 if !send_peer_up(&mut sent_peer_up, &mut lines, addr, &msg).await {
-                    tables.unsubscribe(subscription.id).await;
+                    tables.unsubscribe(subscription.id);
                     return;
                 }
                 established_peers.push((addr, peer_header));
@@ -268,7 +266,7 @@ impl BmpClient {
         for (addr, peer_header) in &established_peers {
             for msg in flush_peer_snapshot(&mut snapshot, *addr, peer_header) {
                 if lines.send(&msg).await.is_err() {
-                    tables.unsubscribe(subscription.id).await;
+                    tables.unsubscribe(subscription.id);
                     return;
                 }
             }
@@ -354,7 +352,7 @@ impl BmpClient {
                 _ = cancel.cancelled() => break,
             }
         }
-        tables.unsubscribe(subscription.id).await;
+        tables.unsubscribe(subscription.id);
     }
 
     pub(crate) fn try_connect(

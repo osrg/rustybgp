@@ -1879,7 +1879,7 @@ impl GoBgpService for GrpcService {
         };
 
         let addrs: Vec<IpAddr> = peers.keys().copied().collect();
-        let all_stats = self.tables.collect_peer_stats(&addrs).await;
+        let all_stats = self.tables.collect_peer_stats(&addrs);
         for (addr, peer) in &mut peers {
             if let Some(stats) = all_stats.get(addr) {
                 peer.update_stats(stats.clone());
@@ -2103,10 +2103,10 @@ impl GoBgpService for GrpcService {
         }
 
         if do_in {
-            self.tables.soft_reset_in(peer_addr).await;
+            self.tables.soft_reset_in(peer_addr);
         }
         if do_out {
-            self.tables.soft_reset_out(peer_addr).await;
+            self.tables.soft_reset_out(peer_addr);
         }
         Ok(tonic::Response::new(api::ResetPeerResponse {}))
     }
@@ -2199,7 +2199,7 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<Self::WatchEventStream>, tonic::Status> {
         let tables2 = self.tables.clone();
         let global2 = self.global.clone();
-        let subscription = self.tables.subscribe_live().await;
+        let subscription = self.tables.subscribe_live();
         let sub_id = subscription.id;
         let (tx, rx) = mpsc::channel(1024);
         let cancel = CancellationToken::new();
@@ -2286,7 +2286,7 @@ impl GoBgpService for GrpcService {
                     break;
                 }
             }
-            tables2.unsubscribe(sub_id).await;
+            tables2.unsubscribe(sub_id);
             global2.write().await.watch_event_cancels.remove(&sub_id);
         });
         Ok(tonic::Response::new(Box::pin(
@@ -2524,7 +2524,6 @@ impl GoBgpService for GrpcService {
             let vrf = self
                 .tables
                 .list_vrfs(Some(&vrf_id))
-                .await
                 .into_iter()
                 .next()
                 .ok_or_else(|| tonic::Status::not_found(format!("VRF '{}' not found", vrf_id)))?;
@@ -2539,17 +2538,15 @@ impl GoBgpService for GrpcService {
         let source = table::Source::local();
         if let Some(attrs) = insert_attrs {
             for net in insert_nets {
-                self.tables
-                    .insert_route(
-                        source.clone(),
-                        family,
-                        net,
-                        nexthop,
-                        attrs.clone(),
-                        None,
-                        timestamp,
-                    )
-                    .await;
+                self.tables.insert_route(
+                    source.clone(),
+                    family,
+                    net,
+                    nexthop,
+                    attrs.clone(),
+                    None,
+                    timestamp,
+                );
             }
         }
         let id = uuid::Uuid::new_v4();
@@ -2584,8 +2581,7 @@ impl GoBgpService for GrpcService {
         let source = table::Source::local();
         for net in nets {
             self.tables
-                .remove_route(source.clone(), family, net, None, timestamp)
-                .await;
+                .remove_route(source.clone(), family, net, None, timestamp);
         }
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
@@ -2679,7 +2675,6 @@ impl GoBgpService for GrpcService {
                     let entries = self
                         .tables
                         .collect_vrf_paths(&vrf_name, family, prefixes, enable_filtered)
-                        .await
                         .ok_or_else(|| {
                             tonic::Status::not_found(format!("VRF '{}' not found", vrf_name))
                         })?;
@@ -2734,7 +2729,7 @@ impl GoBgpService for GrpcService {
                         )));
                     };
                     let export_policy = self.tables.export_policy.load_full();
-                    let changes = self.tables.collect_loc_rib_paths(family).await;
+                    let changes = self.tables.collect_loc_rib_paths(family);
                     let mut sink = AdjOutSink::default();
                     let mut export_map = ExportMap::new();
                     for change in changes {
@@ -2787,7 +2782,6 @@ impl GoBgpService for GrpcService {
         let v: Vec<_> = self
             .tables
             .collect_paths(query, family, prefixes, enable_filtered)
-            .await
             .into_iter()
             .take_while(|d| {
                 if batch_size == 0 {
@@ -2826,17 +2820,15 @@ impl GoBgpService for GrpcService {
                 {
                     let timestamp = std::time::SystemTime::now();
                     for net in nets {
-                        self.tables
-                            .insert_route(
-                                source.clone(),
-                                family,
-                                net,
-                                nexthop,
-                                attrs.clone(),
-                                None,
-                                timestamp,
-                            )
-                            .await;
+                        self.tables.insert_route(
+                            source.clone(),
+                            family,
+                            net,
+                            nexthop,
+                            attrs.clone(),
+                            None,
+                            timestamp,
+                        );
                     }
                 }
             }
@@ -2852,7 +2844,7 @@ impl GoBgpService for GrpcService {
             Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
-        let info = self.tables.table_state(family).await;
+        let info = self.tables.table_state(family);
         Ok(tonic::Response::new(convert::routing_table_state_to_api(
             info,
         )))
@@ -2884,7 +2876,6 @@ impl GoBgpService for GrpcService {
             .collect::<Result<Vec<_>, _>>()?;
         self.tables
             .add_vrf(name, rd, import_rt, export_rt, vrf.id)
-            .await
             .map_err(Error::Table)?;
         Ok(tonic::Response::new(api::AddVrfResponse {}))
     }
@@ -2898,7 +2889,7 @@ impl GoBgpService for GrpcService {
         if name.is_empty() {
             return Err(Error::InvalidArgument("vrf name is empty".to_string()).into());
         }
-        self.tables.delete_vrf(&name).await.map_err(Error::Table)?;
+        self.tables.delete_vrf(&name).map_err(Error::Table)?;
         Ok(tonic::Response::new(api::DeleteVrfResponse {}))
     }
 
@@ -2917,7 +2908,7 @@ impl GoBgpService for GrpcService {
         } else {
             Some(name_filter.as_str())
         };
-        let vrfs = self.tables.list_vrfs(filter).await;
+        let vrfs = self.tables.list_vrfs(filter);
         let responses: Vec<_> = vrfs
             .iter()
             .map(|v| {
@@ -3346,7 +3337,7 @@ impl GoBgpService for GrpcService {
         }
 
         for (addr, r) in v.iter_mut() {
-            let s = self.tables.rpki_state(addr).await;
+            let s = self.tables.rpki_state(addr);
             r.state.as_mut().unwrap().record_ipv4 = s.num_records_v4;
             r.state.as_mut().unwrap().record_ipv6 = s.num_records_v6;
             r.state.as_mut().unwrap().prefix_ipv4 = s.num_prefixes_v4;
@@ -3472,7 +3463,7 @@ impl GoBgpService for GrpcService {
                 }
             }
         };
-        self.tables.rpki_drop_all(Arc::new(addr)).await;
+        self.tables.rpki_drop_all(Arc::new(addr));
         if !disabled {
             RpkiClient::try_connect(sockaddr, cancel, soft_reset, state, self.tables.clone());
         }
@@ -3498,7 +3489,6 @@ impl GoBgpService for GrpcService {
         let v: Vec<api::ListRpkiTableResponse> = self
             .tables
             .collect_roa(family)
-            .await
             .into_iter()
             .map(|(net, roa)| api::ListRpkiTableResponse {
                 roa: Some(convert::roa_to_api(&net, &roa)),
@@ -4449,7 +4439,7 @@ impl Global {
             if !deferral.is_completed() {
                 for output in &init_outputs {
                     if let crate::gr::RestartingOutput::DeferFamilies(families) = output {
-                        tables.start_deferral_families(families).await;
+                        tables.start_deferral_families(families);
                     }
                 }
                 global.write().await.selection_deferral = Some(deferral);
@@ -4547,16 +4537,16 @@ impl Global {
                     event = kernel_event_rx.recv().fuse() => {
                         match event {
                             Some(kernel::KernelEvent::Route(kernel::KernelRouteEvent::Add(kr))) => {
-                                tables.inject_kernel_route(kr).await;
+                                tables.inject_kernel_route(kr);
                             }
                             Some(kernel::KernelEvent::Route(kernel::KernelRouteEvent::Delete(kr))) => {
-                                tables.withdraw_kernel_route(kr.dst, kr.prefix_len).await;
+                                tables.withdraw_kernel_route(kr.dst, kr.prefix_len);
                             }
                             Some(kernel::KernelEvent::NexthopUpdate { addr, reachable }) => {
-                                tables.update_nexthop_validity(addr, reachable).await;
+                                tables.update_nexthop_validity(addr, reachable);
                             }
                             Some(kernel::KernelEvent::Address(addr_event)) => {
-                                tables.handle_address_event(addr_event).await;
+                                tables.handle_address_event(addr_event);
                             }
                             None => {}
                         }
@@ -4709,12 +4699,12 @@ async fn process_restarting_outputs(
     }
 
     if !complete_families.is_empty() {
-        tables.end_deferral_families(&complete_families).await;
+        tables.end_deferral_families(&complete_families);
     }
 
     if let Some(remaining) = end_remaining {
         if !remaining.is_empty() {
-            tables.end_deferral_families(&remaining).await;
+            tables.end_deferral_families(&remaining);
         }
         let mut server = global.write().await;
         if let Some(h) = server.selection_deferral_timer.take() {
@@ -4857,7 +4847,7 @@ async fn gr_restart_timer_expired(
         collect_delete_families(&outputs)
     };
     if !families.is_empty() {
-        tables.drop_families(addr, &families).await;
+        tables.drop_families(addr, &families);
     }
 }
 
@@ -5443,36 +5433,33 @@ impl PeerSession {
                         );
                     }
                 }
-            })
-            .await;
+            });
         self.peer_event_rx = Some(UnboundedReceiverStream::new(peer_event_rx));
         let remote_holdtime = HoldTime::new(self.state.remote_holdtime.load(Ordering::Relaxed))
             .unwrap_or(HoldTime::DISABLED);
-        self.tables
-            .peer_up(PeerUpData {
-                peer_addr: remote_sockaddr.ip(),
-                peer_asn: remote_asn,
-                peer_id: self.state.remote_id.load(Ordering::Relaxed),
-                uptime,
-                local_addr: self.export_ctx.local_addr,
-                local_port: local_sockaddr.port(),
-                remote_port: remote_sockaddr.port(),
-                sent_open: bgp::Message::Open(bgp::Open {
-                    as_number: remote_asn,
-                    holdtime: remote_holdtime,
-                    router_id: self.state.remote_id.load(Ordering::Relaxed),
-                    capability: self.local_cap.to_owned(),
-                }),
-                received_open: bgp::Message::Open(bgp::Open {
-                    as_number: remote_asn,
-                    holdtime: remote_holdtime,
-                    router_id: self.state.remote_id.load(Ordering::Relaxed),
-                    // Safe to unwrap: called from on_established() where
-                    // remote_cap has just been set by apply_outputs().
-                    capability: self.state.remote_cap.load().as_deref().cloned().unwrap(),
-                }),
-            })
-            .await;
+        self.tables.peer_up(PeerUpData {
+            peer_addr: remote_sockaddr.ip(),
+            peer_asn: remote_asn,
+            peer_id: self.state.remote_id.load(Ordering::Relaxed),
+            uptime,
+            local_addr: self.export_ctx.local_addr,
+            local_port: local_sockaddr.port(),
+            remote_port: remote_sockaddr.port(),
+            sent_open: bgp::Message::Open(bgp::Open {
+                as_number: remote_asn,
+                holdtime: remote_holdtime,
+                router_id: self.state.remote_id.load(Ordering::Relaxed),
+                capability: self.local_cap.to_owned(),
+            }),
+            received_open: bgp::Message::Open(bgp::Open {
+                as_number: remote_asn,
+                holdtime: remote_holdtime,
+                router_id: self.state.remote_id.load(Ordering::Relaxed),
+                // Safe to unwrap: called from on_established() where
+                // remote_cap has just been set by apply_outputs().
+                capability: self.state.remote_cap.load().as_deref().cloned().unwrap(),
+            }),
+        });
     }
 
     async fn do_route_refresh(&mut self, family: Family) {
@@ -5482,7 +5469,7 @@ impl PeerSession {
         let export_policy = self.tables.export_policy.load_full();
         let effective_max =
             conn_effective_max(&self.conn_arbiter.lock().unwrap(), Some(self.role), family);
-        let changes = self.tables.collect_loc_rib_paths(family).await;
+        let changes = self.tables.collect_loc_rib_paths(family);
         self.export_map.clear_family(family);
         for change in changes {
             let Some(pending) = self.pending.get_mut(&change.family) else {
@@ -5654,8 +5641,7 @@ impl PeerSession {
                         };
                         if !delete_families.is_empty() {
                             self.tables
-                                .drop_stale_families(self.remote_addr, &delete_families)
-                                .await;
+                                .drop_stale_families(self.remote_addr, &delete_families);
                         }
                     }
                 }
@@ -5685,8 +5671,7 @@ impl PeerSession {
                     };
                     if !delete_families.is_empty() {
                         self.tables
-                            .drop_stale_families(self.remote_addr, &delete_families)
-                            .await;
+                            .drop_stale_families(self.remote_addr, &delete_families);
                     }
                 }
             }
@@ -5805,19 +5790,15 @@ impl PeerSession {
                 .get(&family)
                 .map(|(max, counter)| (*max, Arc::clone(counter)));
             for net in s.entries {
-                if self
-                    .tables
-                    .insert_route(
-                        source.clone(),
-                        family,
-                        net,
-                        nexthop,
-                        attr.clone(),
-                        prefix_limit.clone(),
-                        timestamp,
-                    )
-                    .await
-                {
+                if self.tables.insert_route(
+                    source.clone(),
+                    family,
+                    net,
+                    nexthop,
+                    attr.clone(),
+                    prefix_limit.clone(),
+                    timestamp,
+                ) {
                     return true;
                 }
             }
@@ -5830,15 +5811,13 @@ impl PeerSession {
                 .get(&family)
                 .map(|(_, counter)| Arc::clone(counter));
             for net in s.entries {
-                self.tables
-                    .remove_route(
-                        source.clone(),
-                        family,
-                        net,
-                        prefix_counter.clone(),
-                        timestamp,
-                    )
-                    .await;
+                self.tables.remove_route(
+                    source.clone(),
+                    family,
+                    net,
+                    prefix_counter.clone(),
+                    timestamp,
+                );
             }
         }
         false
@@ -6167,17 +6146,14 @@ impl PeerSession {
             let bmp_reason = crate::bmp::session_down_to_bmp(self.shutdown.take());
             self.peer_event_rx = None;
             self.tables
-                .unregister_peer(self.remote_addr, &drop_families, &stale_families)
-                .await;
-            self.tables
-                .peer_down(PeerDownData {
-                    peer_addr: any_source.remote_addr,
-                    peer_asn: any_source.remote_asn,
-                    peer_id: any_source.router_id,
-                    uptime: self.state.peer_up_at.load(Ordering::Relaxed),
-                    reason: bmp_reason,
-                })
-                .await;
+                .unregister_peer(self.remote_addr, &drop_families, &stale_families);
+            self.tables.peer_down(PeerDownData {
+                peer_addr: any_source.remote_addr,
+                peer_asn: any_source.remote_asn,
+                peer_id: any_source.router_id,
+                uptime: self.state.peer_up_at.load(Ordering::Relaxed),
+                reason: bmp_reason,
+            });
         }
         disconnect.export_map = std::mem::take(&mut self.export_map);
 
@@ -8478,7 +8454,7 @@ mod tests {
 
         // Insert one IPv4 route and one IPv6 route for the peer.
         {
-            let mut t = tables.shards[0].lock().await;
+            let mut t = tables.shards[0].lock().unwrap();
             let _ = t.rtable.insert(
                 source.clone(),
                 Family::IPV4,
@@ -8516,9 +8492,9 @@ mod tests {
         let session_families = [Family::IPV4, Family::IPV6];
         let drop_families =
             families_to_drop_on_disconnect(session_families.iter(), Some(&negotiated_gr));
-        tables.drop_families(remote_addr, &drop_families).await;
+        tables.drop_families(remote_addr, &drop_families);
 
-        let t = tables.shards[0].lock().await;
+        let t = tables.shards[0].lock().unwrap();
         // IPv4 route (GR family) must still be in the table.
         assert_eq!(t.rtable.collect_loc_rib_paths(&Family::IPV4).len(), 1);
         // IPv6 route (non-GR family) must have been removed.
@@ -8545,7 +8521,7 @@ mod tests {
         let nh4 = packet::bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 3));
 
         {
-            let mut t = tables.shards[0].lock().await;
+            let mut t = tables.shards[0].lock().unwrap();
             t.rtable.insert(
                 source,
                 Family::IPV4,
@@ -8563,7 +8539,7 @@ mod tests {
         assert_eq!(
             tables.shards[0]
                 .lock()
-                .await
+                .unwrap()
                 .rtable
                 .collect_loc_rib_paths(&Family::IPV4)
                 .len(),
@@ -8573,12 +8549,12 @@ mod tests {
         // No GR: all families dropped.
         let session_families = [Family::IPV4];
         let drop_families = families_to_drop_on_disconnect(session_families.iter(), None);
-        tables.drop_families(remote_addr, &drop_families).await;
+        tables.drop_families(remote_addr, &drop_families);
 
         assert!(
             tables.shards[0]
                 .lock()
-                .await
+                .unwrap()
                 .rtable
                 .collect_loc_rib_paths(&Family::IPV4)
                 .is_empty()
@@ -10478,7 +10454,7 @@ mod tests {
             ..Default::default()
         });
         svc.add_path(req).await.unwrap();
-        let t = svc.tables.shards[0].lock().await;
+        let t = svc.tables.shards[0].lock().unwrap();
         assert_eq!(t.rtable.collect_loc_rib_paths(&Family::IPV4).len(), 1);
     }
 
@@ -10492,7 +10468,7 @@ mod tests {
         });
         let uuid = svc.add_path(add_req).await.unwrap().into_inner().uuid;
         {
-            let t = svc.tables.shards[0].lock().await;
+            let t = svc.tables.shards[0].lock().unwrap();
             assert_eq!(t.rtable.collect_loc_rib_paths(&Family::IPV4).len(), 1);
         }
 
@@ -10501,7 +10477,7 @@ mod tests {
             ..Default::default()
         });
         svc.delete_path(del_req).await.unwrap();
-        let t = svc.tables.shards[0].lock().await;
+        let t = svc.tables.shards[0].lock().unwrap();
         assert!(t.rtable.collect_loc_rib_paths(&Family::IPV4).is_empty());
     }
 
@@ -10571,7 +10547,7 @@ mod tests {
             ..Default::default()
         });
         svc.add_path(req).await.unwrap();
-        let t = svc.tables.shards[0].lock().await;
+        let t = svc.tables.shards[0].lock().unwrap();
         assert_eq!(t.rtable.collect_loc_rib_paths(&Family::IPV4).len(), 1);
     }
 
@@ -10592,7 +10568,7 @@ mod tests {
         let uuid2 = svc.add_path(req2).await.unwrap().into_inner().uuid;
 
         {
-            let t = svc.tables.shards[0].lock().await;
+            let t = svc.tables.shards[0].lock().unwrap();
             let entries = t.rtable.collect_loc_rib_paths(&Family::IPV4);
             assert_eq!(entries.len(), 1);
             assert_eq!(
@@ -10609,7 +10585,7 @@ mod tests {
         .await
         .unwrap();
         {
-            let t = svc.tables.shards[0].lock().await;
+            let t = svc.tables.shards[0].lock().unwrap();
             let entries = t.rtable.collect_loc_rib_paths(&Family::IPV4);
             assert_eq!(
                 entries[0].current_paths.len(),
@@ -10624,7 +10600,7 @@ mod tests {
         }))
         .await
         .unwrap();
-        let t = svc.tables.shards[0].lock().await;
+        let t = svc.tables.shards[0].lock().unwrap();
         assert!(t.rtable.collect_loc_rib_paths(&Family::IPV4).is_empty());
     }
 
@@ -11254,7 +11230,7 @@ neighbor-address = "10.0.0.1"
             .await;
 
         assert!(!exceeded, "loop detection must not trigger CEASE");
-        let state = tables.table_state(Family::IPV4).await;
+        let state = tables.table_state(Family::IPV4);
         assert_eq!(state.num_destination, 0, "route must not be inserted");
     }
 
@@ -11281,7 +11257,7 @@ neighbor-address = "10.0.0.1"
             .await;
 
         assert!(!exceeded, "loop detection must not trigger CEASE");
-        let state = tables.table_state(Family::IPV4).await;
+        let state = tables.table_state(Family::IPV4);
         assert_eq!(state.num_destination, 0, "route must not be inserted");
     }
 
@@ -11313,7 +11289,7 @@ neighbor-address = "10.0.0.1"
             .await;
 
         assert!(!exceeded, "loop detection must not trigger CEASE");
-        let state = tables.table_state(Family::IPV4).await;
+        let state = tables.table_state(Family::IPV4);
         assert_eq!(state.num_destination, 0, "route must not be inserted");
     }
 

@@ -81,9 +81,9 @@ impl MrtDumper {
         cancel: CancellationToken,
         tables: TableHandle,
     ) -> Result<(), Error> {
-        let subscription = tables.subscribe_live().await;
+        let subscription = tables.subscribe_live();
         let result = self.run_loop(&mut file, subscription.rx, cancel).await;
-        tables.unsubscribe(subscription.id).await;
+        tables.unsubscribe(subscription.id);
         result
     }
 
