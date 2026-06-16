@@ -117,6 +117,95 @@ func main() {
 		fmt.Printf("pub const V4_DST_PORT_RANGE: &[u8] = %s;\n\n", rustBytes(buf))
 	}
 
+	// --- V4: SrcPrefix=192.168.1.0/24 ---
+	{
+		buf := flowspecV4([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecSourcePrefix(ipPrefix("192.168.1.0/24")),
+		})
+		fmt.Printf("// IPv4 Flowspec: SrcPrefix=192.168.1.0/24\n")
+		fmt.Printf("pub const V4_SRC_PREFIX: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V4: Port=8080 (combined src+dst) ---
+	{
+		buf := flowspecV4([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_PORT, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 8080),
+			}),
+		})
+		fmt.Printf("// IPv4 Flowspec: Port=8080 (src+dst)\n")
+		fmt.Printf("pub const V4_PORT: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V4: SrcPort=443 ---
+	{
+		buf := flowspecV4([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_SRC_PORT, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 443),
+			}),
+		})
+		fmt.Printf("// IPv4 Flowspec: SrcPort=443\n")
+		fmt.Printf("pub const V4_SRC_PORT: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V4: IcmpType=8 (echo request) + IcmpCode=0 ---
+	{
+		buf := flowspecV4([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_ICMP_TYPE, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 8),
+			}),
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_ICMP_CODE, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 0),
+			}),
+		})
+		fmt.Printf("// IPv4 Flowspec: IcmpType=8 (echo request), IcmpCode=0\n")
+		fmt.Printf("pub const V4_ICMP_TYPE_CODE: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V4: TcpFlags MATCH SYN (0x02) ---
+	{
+		buf := flowspecV4([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_TCP_FLAG, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.BITMASK_FLAG_OP_MATCH|bgp.BITMASK_FLAG_OP_END, 0x02),
+			}),
+		})
+		fmt.Printf("// IPv4 Flowspec: TcpFlags MATCH SYN (0x02)\n")
+		fmt.Printf("pub const V4_TCP_FLAGS: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V4: PacketLen <= 1500 ---
+	{
+		buf := flowspecV4([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_PKT_LEN, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_LT_EQ|bgp.DEC_NUM_OP_END, 1500),
+			}),
+		})
+		fmt.Printf("// IPv4 Flowspec: PacketLen <= 1500\n")
+		fmt.Printf("pub const V4_PACKET_LEN: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V4: Dscp=46 (EF) ---
+	{
+		buf := flowspecV4([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_DSCP, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 46),
+			}),
+		})
+		fmt.Printf("// IPv4 Flowspec: Dscp=46 (EF)\n")
+		fmt.Printf("pub const V4_DSCP: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V4: Fragment MATCH IS-FRAGMENT (0x02) ---
+	{
+		buf := flowspecV4([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_FRAGMENT, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.BITMASK_FLAG_OP_MATCH|bgp.BITMASK_FLAG_OP_END, 0x02),
+			}),
+		})
+		fmt.Printf("// IPv4 Flowspec: Fragment MATCH IS-FRAGMENT (0x02)\n")
+		fmt.Printf("pub const V4_FRAGMENT: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
 	// --- V6: DstPrefix, offset=0 ---
 	{
 		buf := flowspecV6([]bgp.FlowSpecComponentInterface{
@@ -149,6 +238,95 @@ func main() {
 		})
 		fmt.Printf("// IPv6 Flowspec: NextHeader=TCP(6), FlowLabel=100\n")
 		fmt.Printf("pub const V6_NEXT_HEADER_TCP_FLOW_LABEL_100: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V6: SrcPrefix=2001:db8:1::/48, offset=0 ---
+	{
+		buf := flowspecV6([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecSourcePrefix6(ipPrefix("2001:db8:1::/48"), 0),
+		})
+		fmt.Printf("// IPv6 Flowspec: SrcPrefix=2001:db8:1::/48, offset=0\n")
+		fmt.Printf("pub const V6_SRC_PREFIX: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V6: Port=8080 ---
+	{
+		buf := flowspecV6([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_PORT, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 8080),
+			}),
+		})
+		fmt.Printf("// IPv6 Flowspec: Port=8080 (src+dst)\n")
+		fmt.Printf("pub const V6_PORT: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V6: SrcPort=443 ---
+	{
+		buf := flowspecV6([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_SRC_PORT, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 443),
+			}),
+		})
+		fmt.Printf("// IPv6 Flowspec: SrcPort=443\n")
+		fmt.Printf("pub const V6_SRC_PORT: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V6: IcmpType=128 (echo request) + IcmpCode=0 ---
+	{
+		buf := flowspecV6([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_ICMP_TYPE, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 128),
+			}),
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_ICMP_CODE, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 0),
+			}),
+		})
+		fmt.Printf("// IPv6 Flowspec: IcmpType=128 (echo request), IcmpCode=0\n")
+		fmt.Printf("pub const V6_ICMP_TYPE_CODE: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V6: TcpFlags MATCH SYN (0x02) ---
+	{
+		buf := flowspecV6([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_TCP_FLAG, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.BITMASK_FLAG_OP_MATCH|bgp.BITMASK_FLAG_OP_END, 0x02),
+			}),
+		})
+		fmt.Printf("// IPv6 Flowspec: TcpFlags MATCH SYN (0x02)\n")
+		fmt.Printf("pub const V6_TCP_FLAGS: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V6: PacketLen <= 1500 ---
+	{
+		buf := flowspecV6([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_PKT_LEN, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_LT_EQ|bgp.DEC_NUM_OP_END, 1500),
+			}),
+		})
+		fmt.Printf("// IPv6 Flowspec: PacketLen <= 1500\n")
+		fmt.Printf("pub const V6_PACKET_LEN: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V6: Dscp=46 (EF) ---
+	{
+		buf := flowspecV6([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_DSCP, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.DEC_NUM_OP_EQ|bgp.DEC_NUM_OP_END, 46),
+			}),
+		})
+		fmt.Printf("// IPv6 Flowspec: Dscp=46 (EF)\n")
+		fmt.Printf("pub const V6_DSCP: &[u8] = %s;\n\n", rustBytes(buf))
+	}
+
+	// --- V6: Fragment MATCH IS-FRAGMENT (0x02) ---
+	{
+		buf := flowspecV6([]bgp.FlowSpecComponentInterface{
+			bgp.NewFlowSpecComponent(bgp.FLOW_SPEC_TYPE_FRAGMENT, []*bgp.FlowSpecComponentItem{
+				bgp.NewFlowSpecComponentItem(bgp.BITMASK_FLAG_OP_MATCH|bgp.BITMASK_FLAG_OP_END, 0x02),
+			}),
+		})
+		fmt.Printf("// IPv6 Flowspec: Fragment MATCH IS-FRAGMENT (0x02)\n")
+		fmt.Printf("pub const V6_FRAGMENT: &[u8] = %s;\n\n", rustBytes(buf))
 	}
 
 	rd := bgp.NewRouteDistinguisherTwoOctetAS(65000, 100)

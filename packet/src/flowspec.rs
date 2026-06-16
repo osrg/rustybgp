@@ -600,6 +600,54 @@ mod tests {
     // IPv4 Flowspec: DstPort >= 1024 AND <= 65535
     const V4_DST_PORT_RANGE: &[u8] = &[0x07, 0x05, 0x13, 0x04, 0x00, 0xd5, 0xff, 0xff];
 
+    // IPv4 Flowspec: SrcPrefix=192.168.1.0/24
+    const V4_SRC_PREFIX: &[u8] = &[0x05, 0x02, 0x18, 0xc0, 0xa8, 0x01];
+
+    // IPv4 Flowspec: Port=8080 (src+dst)
+    const V4_PORT: &[u8] = &[0x04, 0x04, 0x91, 0x1f, 0x90];
+
+    // IPv4 Flowspec: SrcPort=443
+    const V4_SRC_PORT: &[u8] = &[0x04, 0x06, 0x91, 0x01, 0xbb];
+
+    // IPv4 Flowspec: IcmpType=8 (echo request), IcmpCode=0
+    const V4_ICMP_TYPE_CODE: &[u8] = &[0x06, 0x07, 0x81, 0x08, 0x08, 0x81, 0x00];
+
+    // IPv4 Flowspec: TcpFlags MATCH SYN (0x02)
+    const V4_TCP_FLAGS: &[u8] = &[0x03, 0x09, 0x81, 0x02];
+
+    // IPv4 Flowspec: PacketLen <= 1500
+    const V4_PACKET_LEN: &[u8] = &[0x04, 0x0a, 0x95, 0x05, 0xdc];
+
+    // IPv4 Flowspec: Dscp=46 (EF)
+    const V4_DSCP: &[u8] = &[0x03, 0x0b, 0x81, 0x2e];
+
+    // IPv4 Flowspec: Fragment MATCH IS-FRAGMENT (0x02)
+    const V4_FRAGMENT: &[u8] = &[0x03, 0x0c, 0x81, 0x02];
+
+    // IPv6 Flowspec: SrcPrefix=2001:db8:1::/48, offset=0
+    const V6_SRC_PREFIX: &[u8] = &[0x09, 0x02, 0x30, 0x00, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01];
+
+    // IPv6 Flowspec: Port=8080 (src+dst)
+    const V6_PORT: &[u8] = &[0x04, 0x04, 0x91, 0x1f, 0x90];
+
+    // IPv6 Flowspec: SrcPort=443
+    const V6_SRC_PORT: &[u8] = &[0x04, 0x06, 0x91, 0x01, 0xbb];
+
+    // IPv6 Flowspec: IcmpType=128 (echo request), IcmpCode=0
+    const V6_ICMP_TYPE_CODE: &[u8] = &[0x06, 0x07, 0x81, 0x80, 0x08, 0x81, 0x00];
+
+    // IPv6 Flowspec: TcpFlags MATCH SYN (0x02)
+    const V6_TCP_FLAGS: &[u8] = &[0x03, 0x09, 0x81, 0x02];
+
+    // IPv6 Flowspec: PacketLen <= 1500
+    const V6_PACKET_LEN: &[u8] = &[0x04, 0x0a, 0x95, 0x05, 0xdc];
+
+    // IPv6 Flowspec: Dscp=46 (EF)
+    const V6_DSCP: &[u8] = &[0x03, 0x0b, 0x81, 0x2e];
+
+    // IPv6 Flowspec: Fragment MATCH IS-FRAGMENT (0x02)
+    const V6_FRAGMENT: &[u8] = &[0x03, 0x0c, 0x81, 0x02];
+
     // IPv6 Flowspec: DstPrefix=2001:db8::/32, offset=0
     const V6_DST_PREFIX_NO_OFFSET: &[u8] = &[0x07, 0x01, 0x20, 0x00, 0x20, 0x01, 0x0d, 0xb8];
 
@@ -718,6 +766,279 @@ mod tests {
         let mut buf = Vec::new();
         nlri.encode(&mut buf);
         assert_eq!(buf, V6_NEXT_HEADER_TCP_FLOW_LABEL_100);
+    }
+
+    #[test]
+    fn v4_src_prefix_roundtrip() {
+        let mut c = Cursor::new(V4_SRC_PREFIX);
+        let nlri = FlowspecV4Nlri::decode(&mut c, V4_SRC_PREFIX.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV4Component::SrcPrefix(net) = &nlri.components[0] else {
+            panic!("expected SrcPrefix");
+        };
+        assert_eq!(net.addr, "192.168.1.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(net.mask, 24);
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V4_SRC_PREFIX);
+    }
+
+    #[test]
+    fn v4_port_roundtrip() {
+        let mut c = Cursor::new(V4_PORT);
+        let nlri = FlowspecV4Nlri::decode(&mut c, V4_PORT.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV4Component::Port(ops) = &nlri.components[0] else {
+            panic!("expected Port");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, 8080);
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V4_PORT);
+    }
+
+    #[test]
+    fn v4_src_port_roundtrip() {
+        let mut c = Cursor::new(V4_SRC_PORT);
+        let nlri = FlowspecV4Nlri::decode(&mut c, V4_SRC_PORT.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV4Component::SrcPort(ops) = &nlri.components[0] else {
+            panic!("expected SrcPort");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, 443);
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V4_SRC_PORT);
+    }
+
+    #[test]
+    fn v4_icmp_type_code_roundtrip() {
+        let mut c = Cursor::new(V4_ICMP_TYPE_CODE);
+        let nlri = FlowspecV4Nlri::decode(&mut c, V4_ICMP_TYPE_CODE.len()).unwrap();
+        assert_eq!(nlri.components.len(), 2);
+        let FlowspecV4Component::IcmpType(ops) = &nlri.components[0] else {
+            panic!("expected IcmpType");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, 8);
+        assert!(ops[0].is_end());
+        let FlowspecV4Component::IcmpCode(ops) = &nlri.components[1] else {
+            panic!("expected IcmpCode");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, 0);
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V4_ICMP_TYPE_CODE);
+    }
+
+    #[test]
+    fn v4_tcp_flags_roundtrip() {
+        let mut c = Cursor::new(V4_TCP_FLAGS);
+        let nlri = FlowspecV4Nlri::decode(&mut c, V4_TCP_FLAGS.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV4Component::TcpFlags(ops) = &nlri.components[0] else {
+            panic!("expected TcpFlags");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].bits & Op::MATCH, Op::MATCH);
+        assert_eq!(ops[0].value, 0x02); // SYN
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V4_TCP_FLAGS);
+    }
+
+    #[test]
+    fn v4_packet_len_roundtrip() {
+        let mut c = Cursor::new(V4_PACKET_LEN);
+        let nlri = FlowspecV4Nlri::decode(&mut c, V4_PACKET_LEN.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV4Component::PacketLen(ops) = &nlri.components[0] else {
+            panic!("expected PacketLen");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].bits & Op::LT_EQ, Op::LT_EQ);
+        assert_eq!(ops[0].value, 1500);
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V4_PACKET_LEN);
+    }
+
+    #[test]
+    fn v4_dscp_roundtrip() {
+        let mut c = Cursor::new(V4_DSCP);
+        let nlri = FlowspecV4Nlri::decode(&mut c, V4_DSCP.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV4Component::Dscp(ops) = &nlri.components[0] else {
+            panic!("expected Dscp");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, 46);
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V4_DSCP);
+    }
+
+    #[test]
+    fn v4_fragment_roundtrip() {
+        let mut c = Cursor::new(V4_FRAGMENT);
+        let nlri = FlowspecV4Nlri::decode(&mut c, V4_FRAGMENT.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV4Component::Fragment(ops) = &nlri.components[0] else {
+            panic!("expected Fragment");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].bits & Op::MATCH, Op::MATCH);
+        assert_eq!(ops[0].value, 0x02); // IS-FRAGMENT
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V4_FRAGMENT);
+    }
+
+    #[test]
+    fn v6_src_prefix_roundtrip() {
+        let mut c = Cursor::new(V6_SRC_PREFIX);
+        let nlri = FlowspecV6Nlri::decode(&mut c, V6_SRC_PREFIX.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV6Component::SrcPrefix { prefix, offset } = &nlri.components[0] else {
+            panic!("expected SrcPrefix");
+        };
+        assert_eq!(prefix.addr, "2001:db8:1::".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(prefix.mask, 48);
+        assert_eq!(*offset, 0);
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V6_SRC_PREFIX);
+    }
+
+    #[test]
+    fn v6_port_roundtrip() {
+        let mut c = Cursor::new(V6_PORT);
+        let nlri = FlowspecV6Nlri::decode(&mut c, V6_PORT.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV6Component::Port(ops) = &nlri.components[0] else {
+            panic!("expected Port");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, 8080);
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V6_PORT);
+    }
+
+    #[test]
+    fn v6_src_port_roundtrip() {
+        let mut c = Cursor::new(V6_SRC_PORT);
+        let nlri = FlowspecV6Nlri::decode(&mut c, V6_SRC_PORT.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV6Component::SrcPort(ops) = &nlri.components[0] else {
+            panic!("expected SrcPort");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, 443);
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V6_SRC_PORT);
+    }
+
+    #[test]
+    fn v6_icmp_type_code_roundtrip() {
+        let mut c = Cursor::new(V6_ICMP_TYPE_CODE);
+        let nlri = FlowspecV6Nlri::decode(&mut c, V6_ICMP_TYPE_CODE.len()).unwrap();
+        assert_eq!(nlri.components.len(), 2);
+        let FlowspecV6Component::IcmpType(ops) = &nlri.components[0] else {
+            panic!("expected IcmpType");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, 128); // ICMPv6 echo request
+        assert!(ops[0].is_end());
+        let FlowspecV6Component::IcmpCode(ops) = &nlri.components[1] else {
+            panic!("expected IcmpCode");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, 0);
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V6_ICMP_TYPE_CODE);
+    }
+
+    #[test]
+    fn v6_tcp_flags_roundtrip() {
+        let mut c = Cursor::new(V6_TCP_FLAGS);
+        let nlri = FlowspecV6Nlri::decode(&mut c, V6_TCP_FLAGS.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV6Component::TcpFlags(ops) = &nlri.components[0] else {
+            panic!("expected TcpFlags");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].bits & Op::MATCH, Op::MATCH);
+        assert_eq!(ops[0].value, 0x02); // SYN
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V6_TCP_FLAGS);
+    }
+
+    #[test]
+    fn v6_packet_len_roundtrip() {
+        let mut c = Cursor::new(V6_PACKET_LEN);
+        let nlri = FlowspecV6Nlri::decode(&mut c, V6_PACKET_LEN.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV6Component::PacketLen(ops) = &nlri.components[0] else {
+            panic!("expected PacketLen");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].bits & Op::LT_EQ, Op::LT_EQ);
+        assert_eq!(ops[0].value, 1500);
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V6_PACKET_LEN);
+    }
+
+    #[test]
+    fn v6_dscp_roundtrip() {
+        let mut c = Cursor::new(V6_DSCP);
+        let nlri = FlowspecV6Nlri::decode(&mut c, V6_DSCP.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV6Component::Dscp(ops) = &nlri.components[0] else {
+            panic!("expected Dscp");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, 46);
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V6_DSCP);
+    }
+
+    #[test]
+    fn v6_fragment_roundtrip() {
+        let mut c = Cursor::new(V6_FRAGMENT);
+        let nlri = FlowspecV6Nlri::decode(&mut c, V6_FRAGMENT.len()).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+        let FlowspecV6Component::Fragment(ops) = &nlri.components[0] else {
+            panic!("expected Fragment");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].bits & Op::MATCH, Op::MATCH);
+        assert_eq!(ops[0].value, 0x02); // IS-FRAGMENT
+        assert!(ops[0].is_end());
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, V6_FRAGMENT);
     }
 
     // VPNv4 Flowspec: RD=65000:100, DstPrefix=10.0.1.0/24, Protocol=TCP(6)
