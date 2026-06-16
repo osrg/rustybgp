@@ -340,14 +340,15 @@ fn decode_segment_list(data: &[u8]) -> SrPolicySegmentList {
                 let flags = body[0];
                 // body[1] reserved
                 let sid = decode_ipv6(&body[2..18]);
-                // A-flag (0x40) indicates endpoint behavior is present
-                let endpoint_behavior = if flags & 0x40 != 0 && body.len() >= 24 {
+                // A-flag (0x40) indicates endpoint behavior is present.
+                // EBS wire: behavior(2) + reserved(2) + block_len(1) + node_len(1) + func_len(1) + arg_len(1)
+                let endpoint_behavior = if flags & 0x40 != 0 && body.len() >= 26 {
                     Some(SRv6EndpointBehavior {
                         behavior: u16::from_be_bytes(body[18..20].try_into().unwrap()),
-                        block_len: body[20],
-                        node_len: body[21],
-                        func_len: body[22],
-                        arg_len: body[23],
+                        block_len: body[22],
+                        node_len: body[23],
+                        func_len: body[24],
+                        arg_len: body[25],
                     })
                 } else {
                     None
@@ -409,7 +410,7 @@ fn encode_sr_policy(cp: &SrPolicyCandidatePath) -> Vec<u8> {
         push_subtlv(&mut buf, SUBTLV_ENLP, &body);
     }
     if let Some(pri) = cp.priority {
-        push_subtlv(&mut buf, SUBTLV_PRIORITY, &[pri]);
+        push_subtlv(&mut buf, SUBTLV_PRIORITY, &[pri, 0]);
     }
     if let Some(name) = &cp.candidate_path_name {
         // Wire: flags(1) + name bytes
@@ -503,7 +504,10 @@ fn encode_segment_list(sl: &SrPolicySegmentList) -> Vec<u8> {
                 body.push(0); // reserved
                 body.extend_from_slice(&sid.octets());
                 if let Some(eb) = endpoint_behavior {
+                    // EBS wire: behavior(2) + reserved(2) + block_len(1) + node_len(1) + func_len(1) + arg_len(1)
                     body.extend_from_slice(&eb.behavior.to_be_bytes());
+                    body.push(0); // EBS reserved
+                    body.push(0); // EBS reserved
                     body.push(eb.block_len);
                     body.push(eb.node_len);
                     body.push(eb.func_len);
@@ -550,6 +554,26 @@ mod tests {
         0x00, 0x0f, 0x00, 0x24, 0x0c, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc8, 0x0d, 0x06, 0x00,
         0x00, 0x03, 0xe8, 0x10, 0x00, 0x80, 0x00, 0x11, 0x00, 0x09, 0x06, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x01, 0x01, 0x06, 0x00, 0x00, 0x03, 0xe8, 0x10, 0x00,
+    ];
+
+    // TunnelEncap: type=15, preference=10, ENLP type 1, priority=100
+    const GOBGP_ENLP_PRIORITY: &[u8] = &[
+        0x00, 0x0f, 0x00, 0x11, 0x0c, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x0e, 0x03, 0x00,
+        0x00, 0x01, 0x0f, 0x02, 0x64, 0x00,
+    ];
+
+    // TunnelEncap: type=15, preference=200, SRv6 binding SID fd00::1
+    const GOBGP_SRV6_BSID: &[u8] = &[
+        0x00, 0x0f, 0x00, 0x1c, 0x0c, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc8, 0x0d, 0x12, 0x00,
+        0x00, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01,
+    ];
+
+    // TunnelEncap: type=15, preference=100, TypeB SID=2001:db8::1 with EBS (End, 32/16/16/0)
+    const GOBGP_TYPEB_EBS: &[u8] = &[
+        0x00, 0x0f, 0x00, 0x28, 0x0c, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x80, 0x00, 0x1d,
+        0x00, 0x0d, 0x1a, 0x40, 0x00, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x20, 0x10, 0x10, 0x00,
     ];
 
     // TunnelEncap: type=15, preference=50, candidate path name="test-policy", TypeB SID=2001:db8::1
@@ -725,6 +749,148 @@ mod tests {
         };
         let encoded = encode(&[sr_policy_tlv(cp)]);
         assert_eq!(encoded, GOBGP_PREF50_CPNAME_TYPEB);
+    }
+
+    #[test]
+    fn gobgp_decode_enlp_priority() {
+        let tlvs = decode(GOBGP_ENLP_PRIORITY);
+        assert_eq!(tlvs.len(), 1);
+        let TunnelEncapValue::SrPolicy(ref cp) = tlvs[0].value else {
+            panic!("expected SrPolicy");
+        };
+        assert_eq!(
+            cp.preference,
+            Some(SrPolicyPreference {
+                flags: 0,
+                preference: 10
+            })
+        );
+        assert_eq!(
+            cp.enlp,
+            Some(SrPolicyEnlp {
+                flags: 0,
+                enlp_type: 1
+            })
+        );
+        assert_eq!(cp.priority, Some(100));
+    }
+
+    #[test]
+    fn gobgp_encode_enlp_priority() {
+        let cp = SrPolicyCandidatePath {
+            preference: Some(SrPolicyPreference {
+                flags: 0,
+                preference: 10,
+            }),
+            enlp: Some(SrPolicyEnlp {
+                flags: 0,
+                enlp_type: 1,
+            }),
+            priority: Some(100),
+            ..Default::default()
+        };
+        let encoded = encode(&[sr_policy_tlv(cp)]);
+        assert_eq!(encoded, GOBGP_ENLP_PRIORITY);
+    }
+
+    #[test]
+    fn gobgp_decode_srv6_bsid() {
+        let tlvs = decode(GOBGP_SRV6_BSID);
+        assert_eq!(tlvs.len(), 1);
+        let TunnelEncapValue::SrPolicy(ref cp) = tlvs[0].value else {
+            panic!("expected SrPolicy");
+        };
+        assert_eq!(
+            cp.preference,
+            Some(SrPolicyPreference {
+                flags: 0,
+                preference: 200
+            })
+        );
+        assert_eq!(
+            cp.binding_sid,
+            Some(SrPolicyBindingSid::Srv6 {
+                flags: 0,
+                sid: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+            })
+        );
+    }
+
+    #[test]
+    fn gobgp_encode_srv6_bsid() {
+        let cp = SrPolicyCandidatePath {
+            preference: Some(SrPolicyPreference {
+                flags: 0,
+                preference: 200,
+            }),
+            binding_sid: Some(SrPolicyBindingSid::Srv6 {
+                flags: 0,
+                sid: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+            }),
+            ..Default::default()
+        };
+        let encoded = encode(&[sr_policy_tlv(cp)]);
+        assert_eq!(encoded, GOBGP_SRV6_BSID);
+    }
+
+    #[test]
+    fn gobgp_decode_typeb_ebs() {
+        let tlvs = decode(GOBGP_TYPEB_EBS);
+        assert_eq!(tlvs.len(), 1);
+        let TunnelEncapValue::SrPolicy(ref cp) = tlvs[0].value else {
+            panic!("expected SrPolicy");
+        };
+        assert_eq!(
+            cp.preference,
+            Some(SrPolicyPreference {
+                flags: 0,
+                preference: 100
+            })
+        );
+        assert_eq!(cp.segment_lists.len(), 1);
+        let sl = &cp.segment_lists[0];
+        assert_eq!(sl.segments.len(), 1);
+        assert_eq!(
+            sl.segments[0],
+            SrSegment::TypeB {
+                flags: 0x40,
+                sid: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+                endpoint_behavior: Some(SRv6EndpointBehavior {
+                    behavior: 1,
+                    block_len: 32,
+                    node_len: 16,
+                    func_len: 16,
+                    arg_len: 0,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn gobgp_encode_typeb_ebs() {
+        let cp = SrPolicyCandidatePath {
+            preference: Some(SrPolicyPreference {
+                flags: 0,
+                preference: 100,
+            }),
+            segment_lists: vec![SrPolicySegmentList {
+                weight: None,
+                segments: vec![SrSegment::TypeB {
+                    flags: 0x40,
+                    sid: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+                    endpoint_behavior: Some(SRv6EndpointBehavior {
+                        behavior: 1,
+                        block_len: 32,
+                        node_len: 16,
+                        func_len: 16,
+                        arg_len: 0,
+                    }),
+                }],
+            }],
+            ..Default::default()
+        };
+        let encoded = encode(&[sr_policy_tlv(cp)]);
+        assert_eq!(encoded, GOBGP_TYPEB_EBS);
     }
 
     // --- Internal roundtrip tests ---
