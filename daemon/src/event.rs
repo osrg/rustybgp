@@ -11712,6 +11712,128 @@ neighbor-address = "10.0.0.1"
         assert_eq!(dests_vrf1.len(), 1, "vrf1 must see its own route");
         assert_eq!(dests_vrf2.len(), 0, "vrf2 must not see vrf1's route");
     }
+
+    #[tokio::test]
+    async fn adj_out_non_established_returns_empty() {
+        let svc = make_grpc_service();
+        let peer_addr: IpAddr = "10.0.0.2".parse().unwrap();
+
+        svc.add_peer(tonic::Request::new(api::AddPeerRequest {
+            peer: Some(api::Peer {
+                conf: Some(api::PeerConf {
+                    neighbor_address: peer_addr.to_string(),
+                    peer_asn: 65002,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap();
+
+        svc.add_path(tonic::Request::new(api::AddPathRequest {
+            path: Some(ipv4_path("10.1.0.0", 24, "10.0.0.1")),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        // Peer is Idle (never connected): adj-out must be empty.
+        let req = tonic::Request::new(api::ListPathRequest {
+            table_type: api::TableType::AdjOut as i32,
+            name: peer_addr.to_string(),
+            family: Some(api::Family { afi: 1, safi: 1 }),
+            ..Default::default()
+        });
+        let dests: Vec<_> = svc
+            .list_path(req)
+            .await
+            .unwrap()
+            .into_inner()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok()?.destination)
+            .collect();
+        assert!(
+            dests.is_empty(),
+            "adj-out must be empty for a non-Established peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn adj_out_established_returns_paths() {
+        let svc = make_grpc_service();
+        let peer_addr: IpAddr = "10.0.0.2".parse().unwrap();
+
+        svc.add_peer(tonic::Request::new(api::AddPeerRequest {
+            peer: Some(api::Peer {
+                conf: Some(api::PeerConf {
+                    neighbor_address: peer_addr.to_string(),
+                    peer_asn: 65002,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap();
+
+        svc.add_path(tonic::Request::new(api::AddPathRequest {
+            path: Some(ipv4_path("10.1.0.0", 24, "10.0.0.1")),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        // Drive the peer FSM to Established without a real TCP connection.
+        {
+            let global = svc.global.read().await;
+            let peer = global.peers.get(&peer_addr).unwrap();
+            let ctx = peer.context.lock().unwrap();
+            let mut arb = ctx.conn_arbiter.lock().unwrap();
+            let open = bgp::Message::Open(bgp::Open {
+                as_number: 65002,
+                holdtime: HoldTime::new(90).unwrap(),
+                router_id: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+                capability: vec![bgp::Capability::FourOctetAsNumber(65002)],
+            });
+            arb.process(
+                crate::fsm::Role::Active,
+                crate::fsm::Input::Connected(false),
+            );
+            arb.process(
+                crate::fsm::Role::Active,
+                crate::fsm::Input::MessageReceived(open),
+            );
+            arb.process(
+                crate::fsm::Role::Active,
+                crate::fsm::Input::MessageReceived(bgp::Message::Keepalive),
+            );
+        }
+
+        let req = tonic::Request::new(api::ListPathRequest {
+            table_type: api::TableType::AdjOut as i32,
+            name: peer_addr.to_string(),
+            family: Some(api::Family { afi: 1, safi: 1 }),
+            ..Default::default()
+        });
+        let dests: Vec<_> = svc
+            .list_path(req)
+            .await
+            .unwrap()
+            .into_inner()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok()?.destination)
+            .collect();
+        assert_eq!(
+            dests.len(),
+            1,
+            "adj-out must show the injected route for an Established peer"
+        );
+    }
 }
 
 #[cfg(test)]
