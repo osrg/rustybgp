@@ -285,6 +285,29 @@ impl Connection {
         self.remote_holdtime = open.holdtime.seconds();
         self.remote_cap = open.capability.clone();
 
+        // Trim send_max to families where Add-Path TX was actually negotiated:
+        // local must have advertised TX (bit 1) and remote must have advertised
+        // RX (bit 0).  Families not meeting both conditions are removed so that
+        // conn_effective_max() naturally returns 1 for them without needing a
+        // separate addpath_tx gate at every call site.
+        self.send_max.retain(|family, _| {
+            let local_tx = self.local_cap.iter().any(|c| {
+                if let Capability::AddPath(entries) = c {
+                    entries.iter().any(|(f, m)| f == family && m & 0x2 != 0)
+                } else {
+                    false
+                }
+            });
+            let remote_rx = open.capability.iter().any(|c| {
+                if let Capability::AddPath(entries) = c {
+                    entries.iter().any(|(f, m)| f == family && m & 0x1 != 0)
+                } else {
+                    false
+                }
+            });
+            local_tx && remote_rx
+        });
+
         // Send KEEPALIVE in response to OPEN
         out.push(Output::SendMessage(bgp::Message::Keepalive));
 
@@ -457,6 +480,12 @@ pub(crate) struct PeerFsm {
     local_cap: Vec<Capability>,
     local_holdtime: u64,
     expected_remote_asn: u32,
+    /// Configured Add-Path send-max per family, copied from PeerParams at
+    /// construction.  PeerFsm cannot access PeerConfig/PeerParams directly
+    /// (they are event.rs-layer types), so the value is passed in and kept
+    /// here as a template.  It is cloned into each new Connection on TCP
+    /// connect; Connection::send_max is then trimmed to negotiated families
+    /// during on_open().
     send_max: FnvHashMap<Family, usize>,
 }
 

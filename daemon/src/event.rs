@@ -262,6 +262,33 @@ impl ConnArbiter {
     }
 }
 
+/// Return the effective send-max for `family` from the live session.
+///
+/// Connection::send_max is trimmed to negotiated families during OPEN, so
+/// this naturally returns 1 for families where Add-Path TX was not negotiated.
+///
+/// `role = Some(r)` is the fast path used by `PeerSession` (which already
+/// knows its own role).  `role = None` searches both Active and Passive slots
+/// for a connection that has reached Established, so the caller does not need
+/// to know the role.  Returns 1 if no Established connection exists.
+fn conn_effective_max(arb: &ConnArbiter, role: Option<crate::fsm::Role>, family: Family) -> usize {
+    use crate::fsm::{Role, State};
+    let role = match role {
+        Some(r) => r,
+        None => match [Role::Active, Role::Passive]
+            .into_iter()
+            .find(|&r| arb.state(r) == State::Established)
+        {
+            Some(r) => r,
+            None => return 1,
+        },
+    };
+    arb.connection(role)
+        .and_then(|c| c.send_max().get(&family))
+        .copied()
+        .unwrap_or(1)
+}
+
 /// Static GR configuration for a single peer, set at peer creation.
 /// `None` in `PeerConfig::graceful_restart` means GR is disabled for this peer.
 /// Cloned into capability negotiation at each session open.
@@ -568,6 +595,17 @@ impl Peer {
             ),
             _ => None,
         }
+    }
+
+    /// Effective send-max for `family` for adj-out display.
+    ///
+    /// Connection::send_max is trimmed to negotiated families during OPEN
+    /// exchange, so conn_effective_max returns 1 for any family where Add-Path
+    /// TX was not negotiated or no session is currently established.
+    fn adj_out_effective_max(&self, family: Family) -> usize {
+        let ctx = self.context.lock().unwrap();
+        let arb = ctx.conn_arbiter.lock().unwrap();
+        conn_effective_max(&arb, None, family)
     }
 }
 
@@ -2660,24 +2698,24 @@ impl GoBgpService for GrpcService {
                     let peer_addr = IpAddr::from_str(&request.name).map_err(|_| {
                         tonic::Status::new(tonic::Code::InvalidArgument, "invalid neighbor name")
                     })?;
-                    let (export_ctx, cluster_id) = {
+                    let (export_ctx, cluster_id, effective_max) = {
                         let global = self.global.read().await;
                         global
                             .peers
                             .get(&peer_addr)
-                            .map(|p| (p.adj_out_export_ctx(&global), p.adj_out_cluster_id(&global)))
-                            .unwrap_or_else(|| {
+                            .map(|p| {
                                 (
-                                    PeerExportContext {
-                                        role: PeerRole::Ebgp,
-                                        local_asn: 0,
-                                        local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                                        link_addr: None,
-                                        confederation_id: 0,
-                                    },
-                                    None,
+                                    p.adj_out_export_ctx(&global),
+                                    p.adj_out_cluster_id(&global),
+                                    p.adj_out_effective_max(family),
                                 )
                             })
+                            .ok_or_else(|| {
+                                tonic::Status::new(
+                                    tonic::Code::NotFound,
+                                    format!("neighbor {} not found", peer_addr),
+                                )
+                            })?
                     };
                     let export_policy = self.tables.export_policy.load_full();
                     let changes = self.tables.collect_loc_rib_paths(family).await;
@@ -2686,7 +2724,7 @@ impl GoBgpService for GrpcService {
                     for change in changes {
                         process_nlri_change(
                             &change,
-                            1,
+                            effective_max,
                             peer_addr,
                             &mut export_map,
                             &mut sink,
@@ -5371,14 +5409,8 @@ impl PeerSession {
             .tables
             .register_peer(self.remote_addr, addpath, |rtable| {
                 for f in &families {
-                    let effective_max = self
-                        .conn_arbiter
-                        .lock()
-                        .unwrap()
-                        .connection(self.role)
-                        .and_then(|s| s.send_max().get(f))
-                        .copied()
-                        .unwrap_or(1);
+                    let effective_max =
+                        conn_effective_max(&self.conn_arbiter.lock().unwrap(), Some(self.role), *f);
                     for change in rtable.collect_loc_rib_paths(f) {
                         let Some(pending) = self.pending.get_mut(&change.family) else {
                             continue;
@@ -5432,14 +5464,8 @@ impl PeerSession {
             return;
         }
         let export_policy = self.tables.export_policy.load_full();
-        let effective_max = self
-            .conn_arbiter
-            .lock()
-            .unwrap()
-            .connection(self.role)
-            .and_then(|s| s.send_max().get(&family))
-            .copied()
-            .unwrap_or(1);
+        let effective_max =
+            conn_effective_max(&self.conn_arbiter.lock().unwrap(), Some(self.role), family);
         let changes = self.tables.collect_loc_rib_paths(family).await;
         self.export_map.clear_family(family);
         for change in changes {
@@ -5809,14 +5835,11 @@ impl PeerSession {
         if !self.codec.has_family(update.family) {
             return;
         }
-        let effective_max = self
-            .conn_arbiter
-            .lock()
-            .unwrap()
-            .connection(self.role)
-            .and_then(|s| s.send_max().get(&update.family))
-            .copied()
-            .unwrap_or(1);
+        let effective_max = conn_effective_max(
+            &self.conn_arbiter.lock().unwrap(),
+            Some(self.role),
+            update.family,
+        );
         let Some(pending) = self.pending.get_mut(&update.family) else {
             return;
         };
