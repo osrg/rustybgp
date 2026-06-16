@@ -464,3 +464,57 @@ fn decode_rejects_sid_structure_too_short() {
     ];
     assert!(PrefixSid::decode(&bytes).is_err());
 }
+
+// GoBGP-generated wire bytes for Prefix SID attribute TLVs.
+// Regenerate with: go run packet/tests/fixtures/gen/prefix_sid/
+#[cfg(test)]
+#[rustfmt::skip]
+const GOBGP_SRV6_L2_SERVICE: &[u8] = &[
+    // TLV: type=6 (SRv6 L2 Service), length=34
+    0x06, 0x00, 0x22,
+    0x00, // reserved
+    // Sub-TLV: type=1 (SRv6 Information), length=30
+    0x01, 0x00, 0x1e,
+    0x00, // reserved
+    // SID: 2001:0:5:3::
+    0x20, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x03,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, // flags
+    0x00, 0x17, // endpoint behavior 23 (End.DT2U)
+    0x00, // reserved
+    // Sub-Sub-TLV: type=1 (SRv6 SID Structure), length=6
+    0x01, 0x00, 0x06,
+    0x28, 0x18, 0x10, 0x00, 0x10, 0x40,
+];
+
+#[test]
+fn gobgp_srv6_l2_service_decode() {
+    let decoded = PrefixSid::decode(GOBGP_SRV6_L2_SERVICE).unwrap();
+    match &decoded.tlvs[0] {
+        PrefixSidTlv::Srv6L2Service(t) => match &t.sub_tlvs[0] {
+            Srv6ServiceSubTlv::Information(i) => {
+                assert_eq!(i.sid, "2001:0:5:3::".parse::<std::net::Ipv6Addr>().unwrap());
+                assert_eq!(i.endpoint_behavior, 23); // End.DT2U
+                match &i.sub_sub_tlvs[0] {
+                    Srv6ServiceDataSubSubTlv::Structure(s) => {
+                        assert_eq!(s.locator_block_length, 40);
+                        assert_eq!(s.locator_node_length, 24);
+                        assert_eq!(s.function_length, 16);
+                        assert_eq!(s.argument_length, 0);
+                        assert_eq!(s.transposition_length, 16);
+                        assert_eq!(s.transposition_offset, 64);
+                    }
+                    _ => panic!("expected Structure sub-sub-tlv"),
+                }
+            }
+            _ => panic!("expected Information sub-tlv"),
+        },
+        _ => panic!("expected Srv6L2Service"),
+    }
+}
+
+#[test]
+fn gobgp_srv6_l2_service_encode() {
+    let decoded = PrefixSid::decode(GOBGP_SRV6_L2_SERVICE).unwrap();
+    assert_eq!(decoded.to_vec(), GOBGP_SRV6_L2_SERVICE);
+}
