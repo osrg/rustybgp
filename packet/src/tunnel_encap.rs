@@ -16,7 +16,8 @@
 //! BGP Tunnel Encapsulation Attribute (RFC 9012) with SR Policy (RFC 9830).
 //!
 //! TLV format: 2-byte type + 2-byte length + N bytes value.
-//! Sub-TLV format: 1-byte type + 1-byte length + N bytes value (RFC 9012 §3.1).
+//! Sub-TLV header (RFC 9012 §3.1 / GoBGP): type(1) + length(1 or 2) + value.
+//! Types < 128 use a 1-byte length; types >= 128 use a 2-byte length.
 
 use byteorder::{NetworkEndian, ReadBytesExt};
 use std::io::Cursor;
@@ -77,7 +78,7 @@ pub struct SrPolicyCandidatePath {
 
 /// SR Policy Preference (sub-TLV 12, RFC 9830 §2.4.1).
 ///
-/// Wire: flags(1) + preference(4) = 5 bytes.
+/// Wire: flags(1) + reserved(1) + preference(4) = 6 bytes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SrPolicyPreference {
     pub flags: u8,
@@ -119,7 +120,7 @@ pub struct SRv6EndpointBehavior {
 
 /// Explicit NULL Label Policy (sub-TLV 14, RFC 9830 §2.4.5).
 ///
-/// Wire: flags(1) + enlp_type(1) = 2 bytes.
+/// Wire: flags(1) + reserved(1) + enlp_type(1) = 3 bytes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SrPolicyEnlp {
     pub flags: u8,
@@ -135,7 +136,7 @@ pub struct SrPolicySegmentList {
 
 /// Segment List weight (sub-sub-TLV 9).
 ///
-/// Wire: flags(1) + weight(4) = 5 bytes.
+/// Wire: flags(1) + reserved(1) + weight(4) = 6 bytes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SrWeight {
     pub flags: u8,
@@ -199,9 +200,18 @@ fn decode_sr_policy(data: &[u8]) -> SrPolicyCandidatePath {
     let mut c = Cursor::new(data);
     while (c.position() as usize) < data.len() {
         let Ok(sub_type) = c.read_u8() else { break };
-        let Ok(sub_len) = c.read_u8() else { break };
+        // Types >= 128 use a 2-byte length field; types < 128 use 1-byte.
+        let sub_len: usize = if sub_type >= 128 {
+            let Ok(n) = c.read_u16::<NetworkEndian>() else {
+                break;
+            };
+            n as usize
+        } else {
+            let Ok(n) = c.read_u8() else { break };
+            n as usize
+        };
         let pos = c.position() as usize;
-        let end = pos + sub_len as usize;
+        let end = pos + sub_len;
         if end > data.len() {
             break;
         }
@@ -210,10 +220,11 @@ fn decode_sr_policy(data: &[u8]) -> SrPolicyCandidatePath {
 
         match sub_type {
             SUBTLV_PREFERENCE => {
-                if body.len() >= 5 {
+                // Wire: flags(1) + reserved(1) + preference(4) = 6 bytes
+                if body.len() >= 6 {
                     cp.preference = Some(SrPolicyPreference {
                         flags: body[0],
-                        preference: u32::from_be_bytes(body[1..5].try_into().unwrap()),
+                        preference: u32::from_be_bytes(body[2..6].try_into().unwrap()),
                     });
                 }
             }
@@ -252,10 +263,11 @@ fn decode_sr_policy(data: &[u8]) -> SrPolicyCandidatePath {
                 }
             }
             SUBTLV_ENLP => {
-                if body.len() >= 2 {
+                // Wire: flags(1) + reserved(1) + enlp_type(1) = 3 bytes
+                if body.len() >= 3 {
                     cp.enlp = Some(SrPolicyEnlp {
                         flags: body[0],
-                        enlp_type: body[1],
+                        enlp_type: body[2],
                     });
                 }
             }
@@ -265,21 +277,25 @@ fn decode_sr_policy(data: &[u8]) -> SrPolicyCandidatePath {
                 }
             }
             SUBTLV_SEGMENT_LIST => {
-                if body.len() >= 2 {
-                    // body[0] = flags, body[1] = reserved
-                    let sl = decode_segment_list(&body[2..]);
+                if !body.is_empty() {
+                    // body[0] = reserved
+                    let sl = decode_segment_list(&body[1..]);
                     cp.segment_lists.push(sl);
                 }
             }
             SUBTLV_CANDIDATE_PATH_NAME => {
-                if let Ok(s) = std::str::from_utf8(body) {
-                    cp.candidate_path_name = Some(s.to_owned());
-                }
+                // body[0] = flags; body[1..] = name bytes
+                cp.candidate_path_name = body
+                    .get(1..)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(str::to_owned);
             }
             SUBTLV_POLICY_NAME => {
-                if let Ok(s) = std::str::from_utf8(body) {
-                    cp.policy_name = Some(s.to_owned());
-                }
+                // body[0] = flags; body[1..] = name bytes
+                cp.policy_name = body
+                    .get(1..)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(str::to_owned);
             }
             _ => {}
         }
@@ -303,10 +319,11 @@ fn decode_segment_list(data: &[u8]) -> SrPolicySegmentList {
 
         match seg_type {
             SEGSUB_WEIGHT => {
-                if body.len() >= 5 {
+                // Wire: flags(1) + reserved(1) + weight(4) = 6 bytes
+                if body.len() >= 6 {
                     sl.weight = Some(SrWeight {
                         flags: body[0],
-                        weight: u32::from_be_bytes(body[1..5].try_into().unwrap()),
+                        weight: u32::from_be_bytes(body[2..6].try_into().unwrap()),
                     });
                 }
             }
@@ -387,29 +404,38 @@ fn encode_sr_policy(cp: &SrPolicyCandidatePath) -> Vec<u8> {
         push_subtlv(&mut buf, SUBTLV_SRV6_BINDING_SID, &body);
     }
     if let Some(enlp) = &cp.enlp {
-        let body = [enlp.flags, enlp.enlp_type];
+        // Wire: flags(1) + reserved(1) + enlp_type(1) = 3 bytes
+        let body = [enlp.flags, 0, enlp.enlp_type];
         push_subtlv(&mut buf, SUBTLV_ENLP, &body);
     }
     if let Some(pri) = cp.priority {
         push_subtlv(&mut buf, SUBTLV_PRIORITY, &[pri]);
     }
+    if let Some(name) = &cp.candidate_path_name {
+        // Wire: flags(1) + name bytes
+        let mut body = vec![0u8]; // flags
+        body.extend_from_slice(name.as_bytes());
+        push_subtlv(&mut buf, SUBTLV_CANDIDATE_PATH_NAME, &body);
+    }
+    if let Some(name) = &cp.policy_name {
+        // Wire: flags(1) + name bytes
+        let mut body = vec![0u8]; // flags
+        body.extend_from_slice(name.as_bytes());
+        push_subtlv(&mut buf, SUBTLV_POLICY_NAME, &body);
+    }
     for sl in &cp.segment_lists {
         let body = encode_segment_list(sl);
         push_subtlv(&mut buf, SUBTLV_SEGMENT_LIST, &body);
-    }
-    if let Some(name) = &cp.candidate_path_name {
-        push_subtlv(&mut buf, SUBTLV_CANDIDATE_PATH_NAME, name.as_bytes());
-    }
-    if let Some(name) = &cp.policy_name {
-        push_subtlv(&mut buf, SUBTLV_POLICY_NAME, name.as_bytes());
     }
 
     buf
 }
 
 fn encode_preference(pref: &SrPolicyPreference) -> Vec<u8> {
-    let mut b = Vec::with_capacity(5);
+    // Wire: flags(1) + reserved(1) + preference(4) = 6 bytes
+    let mut b = Vec::with_capacity(6);
     b.push(pref.flags);
+    b.push(0); // reserved
     b.extend_from_slice(&pref.preference.to_be_bytes());
     b
 }
@@ -448,12 +474,13 @@ fn encode_srv6_binding_sid(bsid: &SrPolicySrv6BindingSid) -> Vec<u8> {
 
 fn encode_segment_list(sl: &SrPolicySegmentList) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.push(0); // flags
     buf.push(0); // reserved
 
     if let Some(w) = &sl.weight {
-        let mut body = Vec::with_capacity(5);
+        // Wire: flags(1) + reserved(1) + weight(4) = 6 bytes
+        let mut body = Vec::with_capacity(6);
         body.push(w.flags);
+        body.push(0); // reserved
         body.extend_from_slice(&w.weight.to_be_bytes());
         push_subtlv(&mut buf, SEGSUB_WEIGHT, &body);
     }
@@ -491,7 +518,12 @@ fn encode_segment_list(sl: &SrPolicySegmentList) -> Vec<u8> {
 
 fn push_subtlv(buf: &mut Vec<u8>, sub_type: u8, body: &[u8]) {
     buf.push(sub_type);
-    buf.push(body.len() as u8);
+    // Types >= 128 use a 2-byte length field; types < 128 use 1-byte.
+    if sub_type >= 128 {
+        buf.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    } else {
+        buf.push(body.len() as u8);
+    }
     buf.extend_from_slice(body);
 }
 
@@ -504,12 +536,198 @@ mod tests {
     use super::*;
     use std::net::Ipv6Addr;
 
+    // GoBGP-generated test vectors (packet/tests/fixtures/gen/sr_policy_nlri/main.go).
+    // Each constant is the raw attribute value bytes (TLV payload only, no BGP
+    // path attribute header) as serialised by GoBGP v4.6.0.
+
+    // TunnelEncap: type=15 (SR Policy), preference=100
+    const GOBGP_PREF100: &[u8] = &[
+        0x00, 0x0f, 0x00, 0x08, 0x0c, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64,
+    ];
+
+    // TunnelEncap: type=15, preference=200, MPLS BSID=16001, segment list weight=1, TypeA label=16001
+    const GOBGP_PREF200_BSID_SEGLIST_TYPEA: &[u8] = &[
+        0x00, 0x0f, 0x00, 0x24, 0x0c, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc8, 0x0d, 0x06, 0x00,
+        0x00, 0x03, 0xe8, 0x10, 0x00, 0x80, 0x00, 0x11, 0x00, 0x09, 0x06, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x01, 0x06, 0x00, 0x00, 0x03, 0xe8, 0x10, 0x00,
+    ];
+
+    // TunnelEncap: type=15, preference=50, candidate path name="test-policy", TypeB SID=2001:db8::1
+    const GOBGP_PREF50_CPNAME_TYPEB: &[u8] = &[
+        0x00, 0x0f, 0x00, 0x37, 0x0c, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x81, 0x00, 0x0c,
+        0x00, 0x74, 0x65, 0x73, 0x74, 0x2d, 0x70, 0x6f, 0x6c, 0x69, 0x63, 0x79, 0x80, 0x00, 0x1d,
+        0x00, 0x09, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x0d, 0x12, 0x00, 0x00, 0x20, 0x01,
+        0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    ];
+
     fn sr_policy_tlv(cp: SrPolicyCandidatePath) -> TunnelEncapTlv {
         TunnelEncapTlv {
             tunnel_type: TUNNEL_TYPE_SR_POLICY,
             value: TunnelEncapValue::SrPolicy(cp),
         }
     }
+
+    // --- GoBGP wire-format compatibility tests ---
+
+    #[test]
+    fn gobgp_decode_pref100() {
+        let tlvs = decode(GOBGP_PREF100);
+        assert_eq!(tlvs.len(), 1);
+        let TunnelEncapValue::SrPolicy(ref cp) = tlvs[0].value else {
+            panic!("expected SrPolicy");
+        };
+        assert_eq!(
+            cp.preference,
+            Some(SrPolicyPreference {
+                flags: 0,
+                preference: 100
+            })
+        );
+        assert!(cp.binding_sid.is_none());
+        assert!(cp.segment_lists.is_empty());
+    }
+
+    #[test]
+    fn gobgp_encode_pref100() {
+        let cp = SrPolicyCandidatePath {
+            preference: Some(SrPolicyPreference {
+                flags: 0,
+                preference: 100,
+            }),
+            ..Default::default()
+        };
+        let encoded = encode(&[sr_policy_tlv(cp)]);
+        assert_eq!(encoded, GOBGP_PREF100);
+    }
+
+    #[test]
+    fn gobgp_decode_pref200_bsid_seglist_typea() {
+        let tlvs = decode(GOBGP_PREF200_BSID_SEGLIST_TYPEA);
+        assert_eq!(tlvs.len(), 1);
+        let TunnelEncapValue::SrPolicy(ref cp) = tlvs[0].value else {
+            panic!("expected SrPolicy");
+        };
+        assert_eq!(
+            cp.preference,
+            Some(SrPolicyPreference {
+                flags: 0,
+                preference: 200
+            })
+        );
+        assert_eq!(
+            cp.binding_sid,
+            Some(SrPolicyBindingSid::Mpls {
+                flags: 0,
+                label: 16001
+            })
+        );
+        assert_eq!(cp.segment_lists.len(), 1);
+        let sl = &cp.segment_lists[0];
+        assert_eq!(
+            sl.weight,
+            Some(SrWeight {
+                flags: 0,
+                weight: 1
+            })
+        );
+        assert_eq!(sl.segments.len(), 1);
+        assert_eq!(
+            sl.segments[0],
+            SrSegment::TypeA {
+                flags: 0,
+                label: 16001
+            }
+        );
+    }
+
+    #[test]
+    fn gobgp_encode_pref200_bsid_seglist_typea() {
+        let cp = SrPolicyCandidatePath {
+            preference: Some(SrPolicyPreference {
+                flags: 0,
+                preference: 200,
+            }),
+            binding_sid: Some(SrPolicyBindingSid::Mpls {
+                flags: 0,
+                label: 16001,
+            }),
+            segment_lists: vec![SrPolicySegmentList {
+                weight: Some(SrWeight {
+                    flags: 0,
+                    weight: 1,
+                }),
+                segments: vec![SrSegment::TypeA {
+                    flags: 0,
+                    label: 16001,
+                }],
+            }],
+            ..Default::default()
+        };
+        let encoded = encode(&[sr_policy_tlv(cp)]);
+        assert_eq!(encoded, GOBGP_PREF200_BSID_SEGLIST_TYPEA);
+    }
+
+    #[test]
+    fn gobgp_decode_pref50_cpname_typeb() {
+        let tlvs = decode(GOBGP_PREF50_CPNAME_TYPEB);
+        assert_eq!(tlvs.len(), 1);
+        let TunnelEncapValue::SrPolicy(ref cp) = tlvs[0].value else {
+            panic!("expected SrPolicy");
+        };
+        assert_eq!(
+            cp.preference,
+            Some(SrPolicyPreference {
+                flags: 0,
+                preference: 50
+            })
+        );
+        assert_eq!(cp.candidate_path_name, Some("test-policy".to_string()));
+        assert_eq!(cp.segment_lists.len(), 1);
+        let sl = &cp.segment_lists[0];
+        assert_eq!(
+            sl.weight,
+            Some(SrWeight {
+                flags: 0,
+                weight: 1
+            })
+        );
+        assert_eq!(sl.segments.len(), 1);
+        assert_eq!(
+            sl.segments[0],
+            SrSegment::TypeB {
+                flags: 0,
+                sid: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+                endpoint_behavior: None,
+            }
+        );
+    }
+
+    #[test]
+    fn gobgp_encode_pref50_cpname_typeb() {
+        let cp = SrPolicyCandidatePath {
+            preference: Some(SrPolicyPreference {
+                flags: 0,
+                preference: 50,
+            }),
+            candidate_path_name: Some("test-policy".to_string()),
+            segment_lists: vec![SrPolicySegmentList {
+                weight: Some(SrWeight {
+                    flags: 0,
+                    weight: 1,
+                }),
+                segments: vec![SrSegment::TypeB {
+                    flags: 0,
+                    sid: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+                    endpoint_behavior: None,
+                }],
+            }],
+            ..Default::default()
+        };
+        let encoded = encode(&[sr_policy_tlv(cp)]);
+        assert_eq!(encoded, GOBGP_PREF50_CPNAME_TYPEB);
+    }
+
+    // --- Internal roundtrip tests ---
 
     #[test]
     fn roundtrip_preference() {

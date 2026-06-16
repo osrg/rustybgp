@@ -101,6 +101,87 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    // GoBGP-generated test vectors (packet/tests/fixtures/gen/sr_policy_nlri/main.go).
+
+    // IPv4 SR Policy NLRI: distinguisher=1, color=100, endpoint=10.0.0.1
+    const GOBGP_IPV4_D1_C100_EP10: &[u8] = &[
+        0x60, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0x0a, 0x00, 0x00, 0x01,
+    ];
+
+    // IPv4 SR Policy NLRI: distinguisher=0, color=200, endpoint=192.168.1.254
+    const GOBGP_IPV4_D0_C200_EP192: &[u8] = &[
+        0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc8, 0xc0, 0xa8, 0x01, 0xfe,
+    ];
+
+    // IPv6 SR Policy NLRI: distinguisher=2, color=300, endpoint=2001:db8::1
+    const GOBGP_IPV6_D2_C300_EP2001DB8: &[u8] = &[
+        0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01, 0x2c, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    ];
+
+    #[test]
+    fn gobgp_decode_ipv4_d1_c100_ep10() {
+        let nlri = SrPolicyNlri::decode(&mut Cursor::new(GOBGP_IPV4_D1_C100_EP10)).unwrap();
+        assert_eq!(nlri.distinguisher, 1);
+        assert_eq!(nlri.color, 100);
+        assert_eq!(nlri.endpoint, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn gobgp_encode_ipv4_d1_c100_ep10() {
+        let nlri = SrPolicyNlri {
+            distinguisher: 1,
+            color: 100,
+            endpoint: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        };
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, GOBGP_IPV4_D1_C100_EP10);
+    }
+
+    #[test]
+    fn gobgp_decode_ipv4_d0_c200_ep192() {
+        let nlri = SrPolicyNlri::decode(&mut Cursor::new(GOBGP_IPV4_D0_C200_EP192)).unwrap();
+        assert_eq!(nlri.distinguisher, 0);
+        assert_eq!(nlri.color, 200);
+        assert_eq!(nlri.endpoint, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 254)));
+    }
+
+    #[test]
+    fn gobgp_encode_ipv4_d0_c200_ep192() {
+        let nlri = SrPolicyNlri {
+            distinguisher: 0,
+            color: 200,
+            endpoint: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 254)),
+        };
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, GOBGP_IPV4_D0_C200_EP192);
+    }
+
+    #[test]
+    fn gobgp_decode_ipv6_d2_c300_ep2001db8() {
+        let nlri = SrPolicyNlri::decode(&mut Cursor::new(GOBGP_IPV6_D2_C300_EP2001DB8)).unwrap();
+        assert_eq!(nlri.distinguisher, 2);
+        assert_eq!(nlri.color, 300);
+        assert_eq!(
+            nlri.endpoint,
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn gobgp_encode_ipv6_d2_c300_ep2001db8() {
+        let nlri = SrPolicyNlri {
+            distinguisher: 2,
+            color: 300,
+            endpoint: IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
+        };
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, GOBGP_IPV6_D2_C300_EP2001DB8);
+    }
+
     #[test]
     fn roundtrip_ipv4() {
         let nlri = SrPolicyNlri {
