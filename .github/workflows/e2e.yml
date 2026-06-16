@@ -27,8 +27,8 @@ jobs:
           path: target/x86_64-unknown-linux-musl/release/rustybgpd
           retention-days: 1
 
-  e2e-rfc7911:
-    name: RFC 7911 (Add-Path) end-to-end
+  e2e-add-path:
+    name: Add-Path (RFC 7911)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -49,8 +49,8 @@ jobs:
           RUSTYBGP_DOCKERFILE: Dockerfile
         run: ./run-test.sh
 
-  e2e-rfc8950:
-    name: RFC 8950 (Extended Nexthop) end-to-end
+  e2e-ext-nexthop:
+    name: Extended Nexthop (RFC 8950)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -71,8 +71,8 @@ jobs:
           RUSTYBGP_DOCKERFILE: Dockerfile
         run: ./run-test.sh
 
-  e2e-rfc4724-restarting:
-    name: RFC 4724 Graceful Restart (restarting speaker) end-to-end
+  e2e-gr-restarting:
+    name: Graceful Restart - restarting speaker (RFC 4724)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -93,8 +93,8 @@ jobs:
           RUSTYBGP_DOCKERFILE: Dockerfile
         run: ./run-test.sh
 
-  e2e-rfc4724-helper:
-    name: RFC 4724 Graceful Restart (helper side) end-to-end
+  e2e-gr-helper:
+    name: Graceful Restart - helper side (RFC 4724)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -116,7 +116,7 @@ jobs:
         run: ./run-test.sh
 
   e2e-flowspec:
-    name: BGP Flowspec (RFC 8955/8956) end-to-end
+    name: BGP Flowspec (RFC 8955/8956)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -137,8 +137,8 @@ jobs:
           RUSTYBGP_DOCKERFILE: Dockerfile
         run: ./run-test.sh
 
-  e2e-rfc4456:
-    name: RFC 4456 (Route Reflector) end-to-end
+  e2e-route-reflector:
+    name: Route Reflector (RFC 4456)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -159,8 +159,8 @@ jobs:
           RUSTYBGP_DOCKERFILE: Dockerfile
         run: ./run-test.sh
 
-  e2e-rfc5065:
-    name: RFC 5065 (BGP Confederation) end-to-end
+  e2e-confederation:
+    name: BGP Confederation (RFC 5065)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -181,8 +181,8 @@ jobs:
           RUSTYBGP_DOCKERFILE: Dockerfile
         run: ./run-test.sh
 
-  e2e-rfc7947:
-    name: RFC 7947 (BGP Route Server) end-to-end
+  e2e-route-server:
+    name: BGP Route Server (RFC 7947)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -204,7 +204,7 @@ jobs:
         run: ./run-test.sh
 
   e2e-rpki:
-    name: RPKI/ROV end-to-end
+    name: RPKI/ROV (RFC 6811/8210)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
