@@ -65,9 +65,9 @@ impl TryFrom<u8> for State {
 }
 
 /// Events fed into the session FSM.
-// MessageReceived carries ReceivedMessage (216 bytes) while other variants are at most 1 byte.
-// The ReceivedMessage data (NlriSets, Vecs) is already heap-allocated; boxing here would only
-// add an extra allocation per received message.
+// MessageReceived carries bgp::Message which is large due to Update's Vec fields.
+// Those fields are already heap-allocated; boxing here would only add an extra
+// allocation per received message.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Input {
     /// TCP connection established; start the OPEN exchange.
