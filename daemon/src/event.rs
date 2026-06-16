@@ -11282,6 +11282,62 @@ neighbor-address = "10.0.0.1"
         assert!(PeerParams::try_from(&neighbor).is_err());
     }
 
+    // ---- rpki server config ----
+
+    fn rpki_sockaddr_from_config(s: &rustybgp_config::generate::RpkiServer) -> Option<SocketAddr> {
+        let addr = s.config.as_ref().and_then(|c| c.address);
+        let port = s
+            .config
+            .as_ref()
+            .and_then(|c| c.port)
+            .map(|p| p as u16)
+            .unwrap_or(323);
+        addr.map(|a| SocketAddr::new(a, port))
+    }
+
+    #[test]
+    fn rpki_server_config_address_and_explicit_port() {
+        let s: rustybgp_config::generate::RpkiServer = toml::from_str(
+            r#"
+[config]
+address = "192.0.2.1"
+port = 3323
+"#,
+        )
+        .expect("invalid TOML");
+        assert_eq!(
+            rpki_sockaddr_from_config(&s),
+            Some("192.0.2.1:3323".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn rpki_server_config_default_port_is_323() {
+        let s: rustybgp_config::generate::RpkiServer = toml::from_str(
+            r#"
+[config]
+address = "192.0.2.1"
+"#,
+        )
+        .expect("invalid TOML");
+        assert_eq!(
+            rpki_sockaddr_from_config(&s),
+            Some("192.0.2.1:323".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn rpki_server_config_missing_address_yields_none() {
+        let s: rustybgp_config::generate::RpkiServer = toml::from_str(
+            r#"
+[config]
+port = 3323
+"#,
+        )
+        .expect("invalid TOML");
+        assert!(rpki_sockaddr_from_config(&s).is_none());
+    }
+
     // ---- rx_update: RFC 4456 loop detection ----
     //
     // new_for_test sets local_router_id = 1.0.0.1.  Loop detection fires before
