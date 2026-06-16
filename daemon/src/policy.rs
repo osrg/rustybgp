@@ -18,17 +18,13 @@
 //! Pure logic — no async, no I/O.
 
 use rustybgp_packet::bgp::Nexthop;
-use rustybgp_table::{Disposition, PolicyAssignment};
+use rustybgp_table::PolicyAssignment;
 use std::sync::Arc;
 
-/// Apply import policy to a route and return whether it should be filtered
-/// (rejected). Also applies any nexthop rewriting action.
-/// Apply import policy and return `(filtered, post_policy_attr)`.
+/// Apply import policy (without RPKI) and return `(filtered, post_policy_attr)`.
 ///
-/// `post_policy_attr` is the Arc after policy attribute modifications.  When
-/// the policy does not modify attributes it is the same Arc as `attrs` (only
-/// the reference count increases), so callers can store the original Arc
-/// separately for Adj-RIB-In without extra allocation.
+/// Used only for soft-reset-in where the RPKI guard cannot be held across shards.
+/// Primary import path uses [`TableManager::apply_import`] which includes RPKI.
 pub(crate) fn apply_import(
     import_policy: Option<&PolicyAssignment>,
     source: &Arc<rustybgp_table::Source>,
@@ -36,22 +32,10 @@ pub(crate) fn apply_import(
     attrs: &Arc<Vec<rustybgp_packet::Attribute>>,
     nexthop: &mut Option<Nexthop>,
 ) -> (bool, Arc<Vec<rustybgp_packet::Attribute>>) {
-    match import_policy {
-        None => (false, Arc::clone(attrs)),
-        Some(a) => {
-            let mut attr = Arc::clone(attrs);
-            let filtered = rustybgp_table::Table::apply_policy(
-                a,
-                source,
-                nlri,
-                &mut attr,
-                nexthop,
-                source.local_addr,
-                source.remote_addr,
-            ) == Disposition::Reject;
-            (filtered, attr)
-        }
-    }
+    let Some(policy) = import_policy else {
+        return (false, Arc::clone(attrs));
+    };
+    rustybgp_table::apply_import(policy, None, source, nlri, attrs, nexthop)
 }
 
 #[cfg(test)]
@@ -59,7 +43,7 @@ mod tests {
     use super::*;
     use rustybgp_packet::bgp::Nexthop;
     use rustybgp_packet::{self as packet};
-    use rustybgp_table as table;
+    use rustybgp_table::{self as table, Disposition};
     use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
     use std::sync::Arc;

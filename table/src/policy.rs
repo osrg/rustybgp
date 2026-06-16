@@ -24,7 +24,7 @@ use std::sync::{Arc, LazyLock};
 
 use rustybgp_packet::{self as packet, Attribute, bgp};
 
-use crate::{RpkiValidationState, Source, TableError};
+use crate::{RpkiTable, RpkiValidationState, Source, TableError};
 
 #[derive(Clone)]
 pub struct Prefix {
@@ -352,6 +352,7 @@ impl Condition {
         attr: &Arc<Vec<packet::Attribute>>,
         nexthop: Option<&bgp::Nexthop>,
         peer_addr: IpAddr,
+        rpki: Option<&RpkiTable>,
     ) -> bool {
         match self {
             Condition::Prefix(_name, opt, set) => {
@@ -422,8 +423,10 @@ impl Condition {
                 }
                 return false;
             }
-            Condition::Rpki(_) => {
-                return false;
+            Condition::Rpki(expected) => {
+                return rpki
+                    .and_then(|r| r.validate(source, net, attr))
+                    .is_some_and(|v| v.state == *expected);
             }
             Condition::LocalPrefEq(v) => {
                 return attr
@@ -760,6 +763,7 @@ pub struct Statement {
 }
 
 impl Statement {
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         &self,
         source: &Arc<Source>,
@@ -768,11 +772,12 @@ impl Statement {
         nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
         peer_addr: IpAddr,
+        rpki: Option<&RpkiTable>,
     ) -> Disposition {
         let matched = self
             .conditions
             .iter()
-            .all(|c| c.evalute(source, net, attr, nexthop.as_ref(), peer_addr));
+            .all(|c| c.evalute(source, net, attr, nexthop.as_ref(), peer_addr, rpki));
         if !matched {
             return Disposition::Pass;
         }
@@ -1031,6 +1036,7 @@ pub struct Policy {
 }
 
 impl Policy {
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         &self,
         source: &Arc<Source>,
@@ -1039,9 +1045,10 @@ impl Policy {
         nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
         peer_addr: IpAddr,
+        rpki: Option<&RpkiTable>,
     ) -> Disposition {
         for statement in &self.statements {
-            let d = statement.apply(source, net, attr, nexthop, local_addr, peer_addr);
+            let d = statement.apply(source, net, attr, nexthop, local_addr, peer_addr, rpki);
             if d != Disposition::Pass {
                 return d;
             }
@@ -1057,6 +1064,7 @@ pub struct PolicyAssignment {
 }
 
 impl PolicyAssignment {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply(
         &self,
         source: &Arc<Source>,
@@ -1065,15 +1073,61 @@ impl PolicyAssignment {
         nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
         peer_addr: IpAddr,
+        rpki: Option<&RpkiTable>,
     ) -> Disposition {
         for policy in &self.policies {
-            let d = policy.apply(source, net, attr, nexthop, local_addr, peer_addr);
+            let d = policy.apply(source, net, attr, nexthop, local_addr, peer_addr, rpki);
             if d != Disposition::Pass {
                 return d;
             }
         }
         self.disposition
     }
+}
+
+/// Apply import policy to a received route.
+///
+/// Returns `(filtered, post_policy_attr)`.  When not filtered, `post_policy_attr` reflects
+/// any attribute modifications made by the policy; if the policy made no changes it is the
+/// same `Arc` as `attrs` (only the reference count increases).
+/// Pass `rpki: None` to skip RPKI validation (e.g. in tests or when no RTR session is active).
+pub fn apply_import(
+    policy: &PolicyAssignment,
+    rpki: Option<&RpkiTable>,
+    source: &Arc<Source>,
+    net: &packet::Nlri,
+    attrs: &Arc<Vec<packet::Attribute>>,
+    nexthop: &mut Option<bgp::Nexthop>,
+) -> (bool, Arc<Vec<packet::Attribute>>) {
+    let mut attr = Arc::clone(attrs);
+    let filtered = policy.apply(
+        source,
+        net,
+        &mut attr,
+        nexthop,
+        source.local_addr,
+        source.remote_addr,
+        rpki,
+    ) == Disposition::Reject;
+    (filtered, attr)
+}
+
+/// Apply export policy to a route being advertised to a peer.
+///
+/// Returns the `Disposition` from the policy chain.
+/// Pass `rpki: None` to skip RPKI validation (e.g. in tests or when no RTR session is active).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_export(
+    policy: &PolicyAssignment,
+    rpki: Option<&RpkiTable>,
+    source: &Arc<Source>,
+    net: &packet::Nlri,
+    attr: &mut Arc<Vec<packet::Attribute>>,
+    nexthop: &mut Option<bgp::Nexthop>,
+    local_addr: IpAddr,
+    peer_addr: IpAddr,
+) -> Disposition {
+    policy.apply(source, net, attr, nexthop, local_addr, peer_addr, rpki)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1911,6 +1965,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
 
         let result = get_communities(&attr);
@@ -1940,6 +1995,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
 
         let result = get_communities(&attr);
@@ -1965,6 +2021,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
 
         let result = get_communities(&attr);
@@ -1991,6 +2048,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
 
         assert!(
@@ -2020,6 +2078,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
 
         let result = get_communities(&attr);
@@ -2076,6 +2135,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
 
         assert_eq!(get_local_pref(&attr), Some(200));
@@ -2104,6 +2164,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
 
         assert_eq!(get_local_pref(&attr), Some(150));
@@ -2162,6 +2223,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_med(&attr), Some(300));
     }
@@ -2181,6 +2243,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_med(&attr), Some(100));
     }
@@ -2200,6 +2263,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_med(&attr), Some(250));
     }
@@ -2219,6 +2283,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_med(&attr), Some(150));
     }
@@ -2238,6 +2303,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_med(&attr), Some(0));
     }
@@ -2306,6 +2372,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_as_path(&attr), vec![65100, 65001, 65002]);
     }
@@ -2325,6 +2392,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_as_path(&attr), vec![65100, 65100, 65100, 65001]);
     }
@@ -2344,6 +2412,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_as_path(&attr), vec![65001, 65001, 65002]);
     }
@@ -2363,6 +2432,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_as_path(&attr), vec![65100, 65100]);
     }
@@ -2431,6 +2501,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         let result = get_ext_communities(&attr);
         assert!(result.contains(&SOO_65002_100), "original preserved");
@@ -2455,6 +2526,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         let result = get_ext_communities(&attr);
         assert!(!result.contains(&RT_65001_100), "removed");
@@ -2479,6 +2551,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         let result = get_ext_communities(&attr);
         assert_eq!(result, vec![RT_65001_100]);
@@ -2543,6 +2616,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         let result = get_large_communities(&attr);
         assert!(result.contains(&(65000, 1, 200)), "original preserved");
@@ -2567,6 +2641,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         let result = get_large_communities(&attr);
         assert!(!result.contains(&(65000, 1, 100)), "removed");
@@ -2591,6 +2666,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_large_communities(&attr), vec![(65001, 2, 50)]);
     }
@@ -2645,6 +2721,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_origin(&attr), Some(0));
     }
@@ -2666,6 +2743,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(get_origin(&attr), Some(2));
         assert_eq!(
@@ -2716,6 +2794,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -2737,6 +2816,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -2758,6 +2838,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -2779,6 +2860,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -2801,6 +2883,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -2823,6 +2906,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -2843,6 +2927,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -2863,6 +2948,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -2884,6 +2970,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -2904,6 +2991,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -2924,6 +3012,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -2944,6 +3033,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -2964,6 +3054,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -2984,6 +3075,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3012,6 +3104,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3090,6 +3183,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3113,6 +3207,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3185,6 +3280,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3208,6 +3304,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3250,6 +3347,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3270,6 +3368,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3292,6 +3391,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }

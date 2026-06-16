@@ -81,7 +81,7 @@ type SharedVrfs = Arc<ArcSwap<FnvHashMap<String, table::Vrf>>>;
 
 pub(crate) struct TableManager {
     pub(crate) shards: Vec<Mutex<TableShard>>,
-    rpki: std::sync::RwLock<table::RpkiTable>,
+    pub(crate) rpki: std::sync::RwLock<table::RpkiTable>,
     pub(crate) kernel_handle: ArcSwapOption<kernel::KernelHandle>,
     pub(crate) import_policy: ArcSwapOption<table::PolicyAssignment>,
     pub(crate) export_policy: ArcSwapOption<table::PolicyAssignment>,
@@ -273,13 +273,8 @@ impl TableManager {
             .lookup_nexthop(source.remote_addr, family, &net.nlri, net.path_id);
         let mut nh = nexthop;
         let original_attr = Arc::clone(&attr);
-        let (filtered, post_policy_attr) = crate::policy::apply_import(
-            import_policy.as_deref(),
-            &source,
-            &net.nlri,
-            &attr,
-            &mut nh,
-        );
+        let (filtered, post_policy_attr) =
+            self.apply_import(import_policy.as_deref(), &source, &net.nlri, &attr, &mut nh);
         let nexthop_invalid_flag = nh.is_some_and(|n| nht_set.contains(&n.addr()));
         let pl = prefix_limit.as_ref().map(|(max, counter)| (*max, counter));
         match t.rtable.insert(
@@ -480,6 +475,21 @@ impl TableManager {
         self.rpki.read().unwrap().state(addr)
     }
 
+    pub(crate) fn apply_import(
+        &self,
+        policy: Option<&table::PolicyAssignment>,
+        source: &Arc<table::Source>,
+        net: &packet::Nlri,
+        attrs: &Arc<Vec<packet::Attribute>>,
+        nexthop: &mut Option<packet::bgp::Nexthop>,
+    ) -> (bool, Arc<Vec<packet::Attribute>>) {
+        let Some(policy) = policy else {
+            return (false, Arc::clone(attrs));
+        };
+        let rpki = self.rpki.read().unwrap();
+        table::apply_import(policy, Some(&rpki), source, net, attrs, nexthop)
+    }
+
     pub(crate) fn collect_peer_stats(
         &self,
         addrs: &[IpAddr],
@@ -522,7 +532,7 @@ impl TableManager {
         let rpki = self.rpki.read().unwrap();
         for dest in &mut out {
             for path in &mut dest.paths {
-                path.validation = rpki.validate(family, &path.source, &dest.net, &path.attr);
+                path.validation = rpki.validate(&path.source, &dest.net, &path.attr);
             }
         }
         out

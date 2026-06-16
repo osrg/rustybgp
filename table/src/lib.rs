@@ -1512,6 +1512,7 @@ impl Table {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_policy(
         assignment: &PolicyAssignment,
         source: &Arc<Source>,
@@ -1520,8 +1521,9 @@ impl Table {
         nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
         peer_addr: IpAddr,
+        rpki: Option<&RpkiTable>,
     ) -> Disposition {
-        assignment.apply(source, net, attr, nexthop, local_addr, peer_addr)
+        assignment.apply(source, net, attr, nexthop, local_addr, peer_addr, rpki)
     }
 }
 
@@ -1553,7 +1555,7 @@ pub struct RpkiTableState {
     pub num_prefixes_v6: u32,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RpkiTable {
     roas: FnvHashMap<Family, PatriciaMap<Vec<Arc<Roa>>>>,
 }
@@ -1593,81 +1595,64 @@ impl RpkiTable {
 
     pub fn validate(
         &self,
-        family: Family,
         source: &Arc<Source>,
         net: &packet::Nlri,
         attr: &Arc<Vec<packet::Attribute>>,
     ) -> Option<RpkiValidation> {
-        match self.roas.get(&family) {
-            None => None,
-            Some(m) => {
-                if m.is_empty() {
-                    return None;
-                }
-                let mut result = RpkiValidation {
-                    state: RpkiValidationState::NotFound,
-                    reason: RpkiValidationReason::None,
-                    matched: Vec::new(),
-                    unmatched_asn: Vec::new(),
-                    unmatched_length: Vec::new(),
-                };
-                let asn =
-                    if let Some(a) = attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
-                        match a.as_path_origin() {
-                            Some(asn) => asn,
-                            None => source.local_asn,
-                        }
+        let (family, addr_bytes, mask) = match net {
+            packet::Nlri::V4(n) => (Family::IPV4, n.addr.octets().to_vec(), n.mask),
+            packet::Nlri::V6(n) => (Family::IPV6, n.addr.octets().to_vec(), n.mask),
+            _ => return None,
+        };
+        let m = self.roas.get(&family)?;
+        if m.is_empty() {
+            return None;
+        }
+        let mut result = RpkiValidation {
+            state: RpkiValidationState::NotFound,
+            reason: RpkiValidationReason::None,
+            matched: Vec::new(),
+            unmatched_asn: Vec::new(),
+            unmatched_length: Vec::new(),
+        };
+        let asn = if let Some(a) = attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
+            match a.as_path_origin() {
+                Some(asn) => asn,
+                None => source.local_asn,
+            }
+        } else {
+            source.local_asn
+        };
+        let mut addr = addr_bytes;
+        addr.drain((mask.div_ceil(8)) as usize..);
+        for (ipnet, entry) in m.iter_prefix(&addr) {
+            let ipnet = RpkiTable::key_to_addr(ipnet);
+            for roa in entry {
+                if mask <= roa.max_length {
+                    if roa.as_number != 0 && roa.as_number == asn {
+                        result.matched.push((ipnet.clone(), roa.as_ref().clone()));
                     } else {
-                        source.local_asn
-                    };
-                let (mut addr, mask) = match net {
-                    packet::Nlri::V4(net) => (net.addr.octets().to_vec(), net.mask),
-                    packet::Nlri::V6(net) => (net.addr.octets().to_vec(), net.mask),
-                    packet::Nlri::Mup(_)
-                    | packet::Nlri::VpnV4(_)
-                    | packet::Nlri::VpnV6(_)
-                    | packet::Nlri::LabeledV4(_)
-                    | packet::Nlri::LabeledV6(_)
-                    | packet::Nlri::FlowspecV4(_)
-                    | packet::Nlri::FlowspecV6(_)
-                    | packet::Nlri::FlowspecVpnV4(_)
-                    | packet::Nlri::FlowspecVpnV6(_)
-                    | packet::Nlri::Ls(_) => {
-                        return None;
+                        result
+                            .unmatched_asn
+                            .push((ipnet.clone(), roa.as_ref().clone()));
                     }
-                };
-                addr.drain((mask.div_ceil(8)) as usize..);
-                for (ipnet, entry) in m.iter_prefix(&addr) {
-                    let ipnet = RpkiTable::key_to_addr(ipnet);
-                    for roa in entry {
-                        if mask <= roa.max_length {
-                            if roa.as_number != 0 && roa.as_number == asn {
-                                result.matched.push((ipnet.clone(), roa.as_ref().clone()));
-                            } else {
-                                result
-                                    .unmatched_asn
-                                    .push((ipnet.clone(), roa.as_ref().clone()));
-                            }
-                        } else {
-                            result
-                                .unmatched_length
-                                .push((ipnet.clone(), roa.as_ref().clone()));
-                        }
-                    }
+                } else {
+                    result
+                        .unmatched_length
+                        .push((ipnet.clone(), roa.as_ref().clone()));
                 }
-                if !result.matched.is_empty() {
-                    result.state = RpkiValidationState::Valid;
-                } else if !result.unmatched_asn.is_empty() {
-                    result.state = RpkiValidationState::Invalid;
-                    result.reason = RpkiValidationReason::Asn;
-                } else if !result.unmatched_length.is_empty() {
-                    result.state = RpkiValidationState::Invalid;
-                    result.reason = RpkiValidationReason::Length;
-                }
-
-                Some(result)
             }
         }
+        if !result.matched.is_empty() {
+            result.state = RpkiValidationState::Valid;
+        } else if !result.unmatched_asn.is_empty() {
+            result.state = RpkiValidationState::Invalid;
+            result.reason = RpkiValidationReason::Asn;
+        } else if !result.unmatched_length.is_empty() {
+            result.state = RpkiValidationState::Invalid;
+            result.reason = RpkiValidationReason::Length;
+        }
+        Some(result)
     }
 
     pub fn insert(&mut self, net: packet::IpNet, roa: Arc<Roa>) {
@@ -3072,6 +3057,7 @@ mod tests {
             &mut nh(),
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             s.remote_addr,
+            None,
         );
         assert_eq!(result, Disposition::Reject);
     }
@@ -3123,6 +3109,7 @@ mod tests {
             &mut nh(),
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             s.remote_addr,
+            None,
         );
         assert_eq!(result, Disposition::Accept);
     }
@@ -3179,6 +3166,7 @@ mod tests {
             &mut nexthop,
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             s.remote_addr,
+            None,
         );
         assert_eq!(result, Disposition::Accept);
         assert_eq!(
@@ -3238,6 +3226,7 @@ mod tests {
             &mut nexthop,
             local_addr,
             s.remote_addr,
+            None,
         );
         assert_eq!(result, Disposition::Accept);
         assert_eq!(
@@ -3300,6 +3289,7 @@ mod tests {
             &mut nexthop,
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             s.remote_addr,
+            None,
         );
         assert_eq!(nexthop, original);
     }
