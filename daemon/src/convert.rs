@@ -20,7 +20,7 @@ use std::str::FromStr;
 
 use rustybgp_packet::{
     self as packet, Family, IpNet, Nlri, bgp::Attribute, bgp::Capability, bgp::Ipv4Net,
-    bgp::Ipv6Net, bgp_ls, flowspec, mup, prefix_sid, rd::RouteDistinguisher,
+    bgp::Ipv6Net, flowspec, ls, mup, prefix_sid, rd::RouteDistinguisher,
 };
 
 use regex::Regex;
@@ -326,7 +326,7 @@ fn mup_nlri_to_api(m: &mup::MupNlri) -> api::nlri::Nlri {
     }
 }
 
-fn node_desc_to_api(nd: &bgp_ls::NodeDescriptor) -> api::LsNodeDescriptor {
+fn node_desc_to_api(nd: &ls::NodeDescriptor) -> api::LsNodeDescriptor {
     api::LsNodeDescriptor {
         asn: nd.asn.unwrap_or(0),
         bgp_ls_id: nd.bgp_ls_id.unwrap_or(0),
@@ -335,7 +335,7 @@ fn node_desc_to_api(nd: &bgp_ls::NodeDescriptor) -> api::LsNodeDescriptor {
         igp_router_id: nd
             .igp_router_id
             .as_ref()
-            .map_or(String::new(), |r| bgp_ls::format_igp_router_id(r)),
+            .map_or(String::new(), |r| ls::format_igp_router_id(r)),
         bgp_router_id: nd
             .bgp_router_id
             .map_or(String::new(), |r| Ipv4Addr::from(r).to_string()),
@@ -343,7 +343,7 @@ fn node_desc_to_api(nd: &bgp_ls::NodeDescriptor) -> api::LsNodeDescriptor {
     }
 }
 
-fn link_desc_to_api(ld: &[bgp_ls::LinkDescTlv]) -> api::LsLinkDescriptor {
+fn link_desc_to_api(ld: &[ls::LinkDescTlv]) -> api::LsLinkDescriptor {
     let mut link_local_id = 0u32;
     let mut link_remote_id = 0u32;
     let mut interface_addr_ipv4 = String::new();
@@ -352,20 +352,20 @@ fn link_desc_to_api(ld: &[bgp_ls::LinkDescTlv]) -> api::LsLinkDescriptor {
     let mut neighbor_addr_ipv6 = String::new();
     for tlv in ld {
         match tlv {
-            bgp_ls::LinkDescTlv::LinkId { local, remote } => {
+            ls::LinkDescTlv::LinkId { local, remote } => {
                 link_local_id = *local;
                 link_remote_id = *remote;
             }
-            bgp_ls::LinkDescTlv::Ipv4InterfaceAddr(a) => {
+            ls::LinkDescTlv::Ipv4InterfaceAddr(a) => {
                 interface_addr_ipv4 = Ipv4Addr::from(*a).to_string();
             }
-            bgp_ls::LinkDescTlv::Ipv4NeighborAddr(a) => {
+            ls::LinkDescTlv::Ipv4NeighborAddr(a) => {
                 neighbor_addr_ipv4 = Ipv4Addr::from(*a).to_string();
             }
-            bgp_ls::LinkDescTlv::Ipv6InterfaceAddr(a) => {
+            ls::LinkDescTlv::Ipv6InterfaceAddr(a) => {
                 interface_addr_ipv6 = Ipv6Addr::from(*a).to_string();
             }
-            bgp_ls::LinkDescTlv::Ipv6NeighborAddr(a) => {
+            ls::LinkDescTlv::Ipv6NeighborAddr(a) => {
                 neighbor_addr_ipv6 = Ipv6Addr::from(*a).to_string();
             }
             _ => {}
@@ -381,12 +381,12 @@ fn link_desc_to_api(ld: &[bgp_ls::LinkDescTlv]) -> api::LsLinkDescriptor {
     }
 }
 
-fn prefix_desc_to_api(pd: &[bgp_ls::PrefixDescTlv], is_ipv6: bool) -> api::LsPrefixDescriptor {
+fn prefix_desc_to_api(pd: &[ls::PrefixDescTlv], is_ipv6: bool) -> api::LsPrefixDescriptor {
     let mut ip_reachability = Vec::new();
     let mut ospf_route_type = 0i32;
     for tlv in pd {
         match tlv {
-            bgp_ls::PrefixDescTlv::IpReachability { prefix_len, addr } => {
+            ls::PrefixDescTlv::IpReachability { prefix_len, addr } => {
                 let addr_str = if is_ipv6 {
                     let mut bytes = [0u8; 16];
                     let n = addr.len().min(16);
@@ -400,7 +400,7 @@ fn prefix_desc_to_api(pd: &[bgp_ls::PrefixDescTlv], is_ipv6: bool) -> api::LsPre
                 };
                 ip_reachability.push(format!("{}/{}", addr_str, prefix_len));
             }
-            bgp_ls::PrefixDescTlv::OspfRouteType(t) => {
+            ls::PrefixDescTlv::OspfRouteType(t) => {
                 ospf_route_type = *t as i32;
             }
             _ => {}
@@ -412,11 +412,11 @@ fn prefix_desc_to_api(pd: &[bgp_ls::PrefixDescTlv], is_ipv6: bool) -> api::LsPre
     }
 }
 
-fn ls_nlri_to_api(n: &bgp_ls::BgpLsNlri) -> api::LsAddrPrefix {
+fn ls_nlri_to_api(n: &ls::BgpLsNlri) -> api::LsAddrPrefix {
     use api::ls_addr_prefix::LsNlri;
     use api::ls_addr_prefix::ls_nlri::Nlri as LsNlriOneof;
     let (nlri_type, protocol_id, identifier, nlri) = match n {
-        bgp_ls::BgpLsNlri::Node(n) => (
+        ls::BgpLsNlri::Node(n) => (
             api::LsNlriType::Node as i32,
             n.protocol_id as i32,
             n.identifier,
@@ -426,7 +426,7 @@ fn ls_nlri_to_api(n: &bgp_ls::BgpLsNlri) -> api::LsAddrPrefix {
                 })),
             }),
         ),
-        bgp_ls::BgpLsNlri::Link(n) => (
+        ls::BgpLsNlri::Link(n) => (
             api::LsNlriType::Link as i32,
             n.protocol_id as i32,
             n.identifier,
@@ -438,7 +438,7 @@ fn ls_nlri_to_api(n: &bgp_ls::BgpLsNlri) -> api::LsAddrPrefix {
                 })),
             }),
         ),
-        bgp_ls::BgpLsNlri::PrefixV4(n) => (
+        ls::BgpLsNlri::PrefixV4(n) => (
             api::LsNlriType::PrefixV4 as i32,
             n.protocol_id as i32,
             n.identifier,
@@ -449,7 +449,7 @@ fn ls_nlri_to_api(n: &bgp_ls::BgpLsNlri) -> api::LsAddrPrefix {
                 })),
             }),
         ),
-        bgp_ls::BgpLsNlri::PrefixV6(n) => (
+        ls::BgpLsNlri::PrefixV6(n) => (
             api::LsNlriType::PrefixV6 as i32,
             n.protocol_id as i32,
             n.identifier,
@@ -460,7 +460,7 @@ fn ls_nlri_to_api(n: &bgp_ls::BgpLsNlri) -> api::LsAddrPrefix {
                 })),
             }),
         ),
-        bgp_ls::BgpLsNlri::Srv6Sid(n) => (
+        ls::BgpLsNlri::Srv6Sid(n) => (
             api::LsNlriType::Srv6Sid as i32,
             n.protocol_id as i32,
             n.identifier,
@@ -494,7 +494,7 @@ fn ls_nlri_to_api(n: &bgp_ls::BgpLsNlri) -> api::LsAddrPrefix {
                 )),
             }),
         ),
-        bgp_ls::BgpLsNlri::Unknown { .. } => (api::LsNlriType::Unspecified as i32, 0, 0, None),
+        ls::BgpLsNlri::Unknown { .. } => (api::LsNlriType::Unspecified as i32, 0, 0, None),
     };
     api::LsAddrPrefix {
         r#type: nlri_type,
@@ -505,7 +505,7 @@ fn ls_nlri_to_api(n: &bgp_ls::BgpLsNlri) -> api::LsAddrPrefix {
     }
 }
 
-fn node_desc_from_api(nd: &api::LsNodeDescriptor) -> Result<bgp_ls::NodeDescriptor, Error> {
+fn node_desc_from_api(nd: &api::LsNodeDescriptor) -> Result<ls::NodeDescriptor, Error> {
     let igp_router_id = if nd.igp_router_id.is_empty() {
         None
     } else {
@@ -520,7 +520,7 @@ fn node_desc_from_api(nd: &api::LsNodeDescriptor) -> Result<bgp_ls::NodeDescript
             .map_err(|e| Error::InvalidArgument(format!("invalid bgp_router_id: {}", e)))?;
         Some(addr.octets())
     };
-    Ok(bgp_ls::NodeDescriptor {
+    Ok(ls::NodeDescriptor {
         asn: if nd.asn == 0 { None } else { Some(nd.asn) },
         bgp_ls_id: if nd.bgp_ls_id == 0 {
             None
@@ -600,10 +600,10 @@ fn parse_igp_router_id(s: &str) -> Result<Vec<u8>, Error> {
     }
 }
 
-fn link_desc_from_api(ld: &api::LsLinkDescriptor) -> Vec<bgp_ls::LinkDescTlv> {
+fn link_desc_from_api(ld: &api::LsLinkDescriptor) -> Vec<ls::LinkDescTlv> {
     let mut tlvs = Vec::new();
     if ld.link_local_id != 0 || ld.link_remote_id != 0 {
-        tlvs.push(bgp_ls::LinkDescTlv::LinkId {
+        tlvs.push(ls::LinkDescTlv::LinkId {
             local: ld.link_local_id,
             remote: ld.link_remote_id,
         });
@@ -611,32 +611,30 @@ fn link_desc_from_api(ld: &api::LsLinkDescriptor) -> Vec<bgp_ls::LinkDescTlv> {
     if !ld.interface_addr_ipv4.is_empty()
         && let Ok(addr) = ld.interface_addr_ipv4.parse::<Ipv4Addr>()
     {
-        tlvs.push(bgp_ls::LinkDescTlv::Ipv4InterfaceAddr(addr.octets()));
+        tlvs.push(ls::LinkDescTlv::Ipv4InterfaceAddr(addr.octets()));
     }
     if !ld.neighbor_addr_ipv4.is_empty()
         && let Ok(addr) = ld.neighbor_addr_ipv4.parse::<Ipv4Addr>()
     {
-        tlvs.push(bgp_ls::LinkDescTlv::Ipv4NeighborAddr(addr.octets()));
+        tlvs.push(ls::LinkDescTlv::Ipv4NeighborAddr(addr.octets()));
     }
     if !ld.interface_addr_ipv6.is_empty()
         && let Ok(addr) = ld.interface_addr_ipv6.parse::<Ipv6Addr>()
     {
-        tlvs.push(bgp_ls::LinkDescTlv::Ipv6InterfaceAddr(addr.octets()));
+        tlvs.push(ls::LinkDescTlv::Ipv6InterfaceAddr(addr.octets()));
     }
     if !ld.neighbor_addr_ipv6.is_empty()
         && let Ok(addr) = ld.neighbor_addr_ipv6.parse::<Ipv6Addr>()
     {
-        tlvs.push(bgp_ls::LinkDescTlv::Ipv6NeighborAddr(addr.octets()));
+        tlvs.push(ls::LinkDescTlv::Ipv6NeighborAddr(addr.octets()));
     }
     tlvs
 }
 
-fn prefix_desc_from_api(pd: &api::LsPrefixDescriptor, is_ipv6: bool) -> Vec<bgp_ls::PrefixDescTlv> {
+fn prefix_desc_from_api(pd: &api::LsPrefixDescriptor, is_ipv6: bool) -> Vec<ls::PrefixDescTlv> {
     let mut tlvs = Vec::new();
     if pd.ospf_route_type != 0 {
-        tlvs.push(bgp_ls::PrefixDescTlv::OspfRouteType(
-            pd.ospf_route_type as u8,
-        ));
+        tlvs.push(ls::PrefixDescTlv::OspfRouteType(pd.ospf_route_type as u8));
     }
     for s in &pd.ip_reachability {
         let Some((addr_str, len_str)) = s.rsplit_once('/') else {
@@ -661,7 +659,7 @@ fn prefix_desc_from_api(pd: &api::LsPrefixDescriptor, is_ipv6: bool) -> Vec<bgp_
         };
         let byte_len = prefix_len.div_ceil(8) as usize;
         let addr = full_addr[..byte_len.min(full_addr.len())].to_vec();
-        tlvs.push(bgp_ls::PrefixDescTlv::IpReachability { prefix_len, addr });
+        tlvs.push(ls::PrefixDescTlv::IpReachability { prefix_len, addr });
     }
     tlvs
 }
@@ -678,7 +676,7 @@ fn ls_nlri_from_api(a: api::LsAddrPrefix) -> Result<Nlri, Error> {
                     node_desc_from_api(n.local_node.as_ref().ok_or_else(|| {
                         Error::InvalidArgument("missing local_node".to_string())
                     })?)?;
-                bgp_ls::BgpLsNlri::Node(bgp_ls::BgpLsNodeNlri {
+                ls::BgpLsNlri::Node(ls::BgpLsNodeNlri {
                     protocol_id,
                     identifier,
                     local_node,
@@ -698,7 +696,7 @@ fn ls_nlri_from_api(a: api::LsAddrPrefix) -> Result<Nlri, Error> {
                     .as_ref()
                     .map(link_desc_from_api)
                     .unwrap_or_default();
-                bgp_ls::BgpLsNlri::Link(bgp_ls::BgpLsLinkNlri {
+                ls::BgpLsNlri::Link(ls::BgpLsLinkNlri {
                     protocol_id,
                     identifier,
                     local_node,
@@ -716,7 +714,7 @@ fn ls_nlri_from_api(a: api::LsAddrPrefix) -> Result<Nlri, Error> {
                     .as_ref()
                     .map(|pd| prefix_desc_from_api(pd, false))
                     .unwrap_or_default();
-                bgp_ls::BgpLsNlri::PrefixV4(bgp_ls::BgpLsPrefixNlri {
+                ls::BgpLsNlri::PrefixV4(ls::BgpLsPrefixNlri {
                     protocol_id,
                     identifier,
                     local_node,
@@ -733,7 +731,7 @@ fn ls_nlri_from_api(a: api::LsAddrPrefix) -> Result<Nlri, Error> {
                     .as_ref()
                     .map(|pd| prefix_desc_from_api(pd, true))
                     .unwrap_or_default();
-                bgp_ls::BgpLsNlri::PrefixV6(bgp_ls::BgpLsPrefixNlri {
+                ls::BgpLsNlri::PrefixV6(ls::BgpLsPrefixNlri {
                     protocol_id,
                     identifier,
                     local_node,
@@ -761,7 +759,7 @@ fn ls_nlri_from_api(a: api::LsAddrPrefix) -> Result<Nlri, Error> {
                         (sids, mt_ids)
                     }
                 };
-                bgp_ls::BgpLsNlri::Srv6Sid(bgp_ls::BgpLsSrv6SidNlri {
+                ls::BgpLsNlri::Srv6Sid(ls::BgpLsSrv6SidNlri {
                     protocol_id,
                     identifier,
                     local_node,
@@ -769,7 +767,7 @@ fn ls_nlri_from_api(a: api::LsAddrPrefix) -> Result<Nlri, Error> {
                     multi_topo_ids,
                 })
             }
-            _ => bgp_ls::BgpLsNlri::Unknown {
+            _ => ls::BgpLsNlri::Unknown {
                 nlri_type: a.r#type as u16,
                 body: Vec::new(),
             },
@@ -1236,7 +1234,7 @@ pub(crate) fn attr_to_api(a: &Attribute) -> api::Attribute {
             },
         },
         Attribute::LS => {
-            let tlvs = bgp_ls::parse_ls_attr(a.binary().unwrap());
+            let tlvs = ls::parse_ls_attr(a.binary().unwrap());
             api::Attribute {
                 attr: Some(api::attribute::Attr::Ls(ls_tlvs_to_api(&tlvs))),
             }
@@ -1260,8 +1258,8 @@ fn peer_sid_flags_to_api(flags: u8) -> api::LsBgpPeerSegmentSidFlags {
     }
 }
 
-fn ls_tlvs_to_api(tlvs: &[bgp_ls::LsTlv]) -> api::LsAttribute {
-    use bgp_ls::LsTlv;
+fn ls_tlvs_to_api(tlvs: &[ls::LsTlv]) -> api::LsAttribute {
+    use ls::LsTlv;
     let mut node = api::LsAttributeNode::default();
     let mut link = api::LsAttributeLink::default();
     let mut prefix = api::LsAttributePrefix::default();
@@ -1367,7 +1365,7 @@ fn ls_tlvs_to_api(tlvs: &[bgp_ls::LsTlv]) -> api::LsAttribute {
             }
             LsTlv::UnreservedBandwidth(bits) => {
                 has_link = true;
-                link.unreserved_bandwidth = bgp_ls::LsTlv::unreserved_bandwidth_f32(bits).to_vec();
+                link.unreserved_bandwidth = ls::LsTlv::unreserved_bandwidth_f32(bits).to_vec();
             }
             LsTlv::TeDefaultMetric(m) => {
                 has_link = true;
@@ -2340,35 +2338,35 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
             if flags.v6 {
                 f |= 0x04;
             }
-            bgp_ls::LsTlv::NodeFlagBits(f).encode(&mut dst);
+            ls::LsTlv::NodeFlagBits(f).encode(&mut dst);
         }
         if !node.name.is_empty() {
-            bgp_ls::LsTlv::NodeName(node.name.clone()).encode(&mut dst);
+            ls::LsTlv::NodeName(node.name.clone()).encode(&mut dst);
         }
         if !node.isis_area.is_empty() {
-            bgp_ls::LsTlv::IsisArea(node.isis_area.clone()).encode(&mut dst);
+            ls::LsTlv::IsisArea(node.isis_area.clone()).encode(&mut dst);
         }
         if !node.local_router_id.is_empty()
             && let Ok(addr) = node.local_router_id.parse::<Ipv4Addr>()
         {
-            bgp_ls::LsTlv::Ipv4LocalRouterId(addr).encode(&mut dst);
+            ls::LsTlv::Ipv4LocalRouterId(addr).encode(&mut dst);
         }
         if !node.local_router_id_v6.is_empty()
             && let Ok(addr) = node.local_router_id_v6.parse::<Ipv6Addr>()
         {
-            bgp_ls::LsTlv::Ipv6LocalRouterId(addr).encode(&mut dst);
+            ls::LsTlv::Ipv6LocalRouterId(addr).encode(&mut dst);
         }
         if !node.opaque.is_empty() {
-            bgp_ls::LsTlv::OpaqueNodeAttr(node.opaque.clone()).encode(&mut dst);
+            ls::LsTlv::OpaqueNodeAttr(node.opaque.clone()).encode(&mut dst);
         }
         if let Some(caps) = &node.sr_capabilities {
-            bgp_ls::LsTlv::SrCapabilities {
+            ls::LsTlv::SrCapabilities {
                 ipv4_supported: caps.ipv4_supported,
                 ipv6_supported: caps.ipv6_supported,
                 ranges: caps
                     .ranges
                     .iter()
-                    .map(|r| bgp_ls::SrRange {
+                    .map(|r| ls::SrRange {
                         begin: r.begin,
                         end: r.end,
                     })
@@ -2377,14 +2375,14 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
             .encode(&mut dst);
         }
         if !node.sr_algorithms.is_empty() {
-            bgp_ls::LsTlv::SrAlgorithms(node.sr_algorithms.clone()).encode(&mut dst);
+            ls::LsTlv::SrAlgorithms(node.sr_algorithms.clone()).encode(&mut dst);
         }
         if let Some(lb) = &node.sr_local_block {
-            bgp_ls::LsTlv::SrLocalBlock {
+            ls::LsTlv::SrLocalBlock {
                 ranges: lb
                     .ranges
                     .iter()
-                    .map(|r| bgp_ls::SrRange {
+                    .map(|r| ls::SrRange {
                         begin: r.begin,
                         end: r.end,
                     })
@@ -2398,54 +2396,54 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
         if !link.local_router_id.is_empty()
             && let Ok(addr) = link.local_router_id.parse::<Ipv4Addr>()
         {
-            bgp_ls::LsTlv::Ipv4LocalRouterId(addr).encode(&mut dst);
+            ls::LsTlv::Ipv4LocalRouterId(addr).encode(&mut dst);
         }
         if !link.local_router_id_v6.is_empty()
             && let Ok(addr) = link.local_router_id_v6.parse::<Ipv6Addr>()
         {
-            bgp_ls::LsTlv::Ipv6LocalRouterId(addr).encode(&mut dst);
+            ls::LsTlv::Ipv6LocalRouterId(addr).encode(&mut dst);
         }
         if !link.remote_router_id.is_empty()
             && let Ok(addr) = link.remote_router_id.parse::<Ipv4Addr>()
         {
-            bgp_ls::LsTlv::Ipv4RemoteRouterId(addr).encode(&mut dst);
+            ls::LsTlv::Ipv4RemoteRouterId(addr).encode(&mut dst);
         }
         if !link.remote_router_id_v6.is_empty()
             && let Ok(addr) = link.remote_router_id_v6.parse::<Ipv6Addr>()
         {
-            bgp_ls::LsTlv::Ipv6RemoteRouterId(addr).encode(&mut dst);
+            ls::LsTlv::Ipv6RemoteRouterId(addr).encode(&mut dst);
         }
         if link.admin_group != 0 {
-            bgp_ls::LsTlv::AdminGroup(link.admin_group).encode(&mut dst);
+            ls::LsTlv::AdminGroup(link.admin_group).encode(&mut dst);
         }
         if link.bandwidth != 0.0 {
-            bgp_ls::LsTlv::MaxLinkBandwidth(link.bandwidth).encode(&mut dst);
+            ls::LsTlv::MaxLinkBandwidth(link.bandwidth).encode(&mut dst);
         }
         if link.reservable_bandwidth != 0.0 {
-            bgp_ls::LsTlv::MaxReservableBandwidth(link.reservable_bandwidth).encode(&mut dst);
+            ls::LsTlv::MaxReservableBandwidth(link.reservable_bandwidth).encode(&mut dst);
         }
         if link.unreserved_bandwidth.len() == 8 {
             let bits: [u32; 8] = core::array::from_fn(|i| link.unreserved_bandwidth[i].to_bits());
-            bgp_ls::LsTlv::UnreservedBandwidth(bits).encode(&mut dst);
+            ls::LsTlv::UnreservedBandwidth(bits).encode(&mut dst);
         }
         if link.default_te_metric != 0 {
-            bgp_ls::LsTlv::TeDefaultMetric(link.default_te_metric).encode(&mut dst);
+            ls::LsTlv::TeDefaultMetric(link.default_te_metric).encode(&mut dst);
         }
         if link.igp_metric != 0 {
-            bgp_ls::LsTlv::IgpMetric(link.igp_metric).encode(&mut dst);
+            ls::LsTlv::IgpMetric(link.igp_metric).encode(&mut dst);
         }
         if !link.srlgs.is_empty() {
-            bgp_ls::LsTlv::Srlg(link.srlgs.clone()).encode(&mut dst);
+            ls::LsTlv::Srlg(link.srlgs.clone()).encode(&mut dst);
         }
         if !link.opaque.is_empty() {
-            bgp_ls::LsTlv::OpaqueLinkAttr(link.opaque.clone()).encode(&mut dst);
+            ls::LsTlv::OpaqueLinkAttr(link.opaque.clone()).encode(&mut dst);
         }
         if !link.name.is_empty() {
-            bgp_ls::LsTlv::LinkName(link.name.clone()).encode(&mut dst);
+            ls::LsTlv::LinkName(link.name.clone()).encode(&mut dst);
         }
         if link.sr_adjacency_sid != 0 {
             // The API loses the original flags/weight; use V=1 (label) and weight=0.
-            bgp_ls::LsTlv::AdjSid {
+            ls::LsTlv::AdjSid {
                 flags: 0x80,
                 weight: 0,
                 sid: link.sr_adjacency_sid,
@@ -2453,7 +2451,7 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
             .encode(&mut dst);
         }
         if link.unidirectional_link_delay != 0 || link.unidirectional_link_delay_anomalous {
-            bgp_ls::LsTlv::UnidirectionalLinkDelay {
+            ls::LsTlv::UnidirectionalLinkDelay {
                 anomalous: link.unidirectional_link_delay_anomalous,
                 delay_us: link.unidirectional_link_delay,
             }
@@ -2463,7 +2461,7 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
             || link.max_unidirectional_link_delay != 0
             || link.min_max_unidirectional_link_delay_anomalous
         {
-            bgp_ls::LsTlv::MinMaxUnidirectionalLinkDelay {
+            ls::LsTlv::MinMaxUnidirectionalLinkDelay {
                 anomalous: link.min_max_unidirectional_link_delay_anomalous,
                 min_us: link.min_unidirectional_link_delay,
                 max_us: link.max_unidirectional_link_delay,
@@ -2471,7 +2469,7 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
             .encode(&mut dst);
         }
         if link.unidirectional_delay_variation != 0 {
-            bgp_ls::LsTlv::UnidirectionalDelayVariation(link.unidirectional_delay_variation)
+            ls::LsTlv::UnidirectionalDelayVariation(link.unidirectional_delay_variation)
                 .encode(&mut dst);
         }
         if let Some(ex) = &link.srv6_end_x_sid {
@@ -2480,16 +2478,13 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
                 .iter()
                 .filter_map(|s| s.parse::<Ipv6Addr>().ok().map(|a| a.octets()))
                 .collect();
-            let sid_structure = ex
-                .srv6_sid_structure
-                .as_ref()
-                .map(|s| bgp_ls::SrSidStructure {
-                    lb_len: s.local_block as u8,
-                    ln_len: s.local_node as u8,
-                    fn_len: s.local_func as u8,
-                    arg_len: s.local_arg as u8,
-                });
-            bgp_ls::LsTlv::Srv6EndXSid {
+            let sid_structure = ex.srv6_sid_structure.as_ref().map(|s| ls::SrSidStructure {
+                lb_len: s.local_block as u8,
+                ln_len: s.local_node as u8,
+                fn_len: s.local_func as u8,
+                arg_len: s.local_arg as u8,
+            });
+            ls::LsTlv::Srv6EndXSid {
                 endpoint_behavior: ex.endpoint_behavior as u16,
                 flags: ex.flags as u8,
                 algorithm: ex.algorithm as u8,
@@ -2503,7 +2498,7 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
 
     if let Some(bps) = &attr.bgp_peer_segment {
         if let Some(sid) = &bps.bgp_peer_node_sid {
-            bgp_ls::LsTlv::PeerNodeSid {
+            ls::LsTlv::PeerNodeSid {
                 flags: peer_sid_flags_from_api(sid.flags.as_ref()),
                 weight: sid.weight as u8,
                 sid: sid.sid,
@@ -2511,7 +2506,7 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
             .encode(&mut dst);
         }
         if let Some(sid) = &bps.bgp_peer_adjacency_sid {
-            bgp_ls::LsTlv::PeerAdjSid {
+            ls::LsTlv::PeerAdjSid {
                 flags: peer_sid_flags_from_api(sid.flags.as_ref()),
                 weight: sid.weight as u8,
                 sid: sid.sid,
@@ -2519,7 +2514,7 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
             .encode(&mut dst);
         }
         if let Some(sid) = &bps.bgp_peer_set_sid {
-            bgp_ls::LsTlv::PeerSetSid {
+            ls::LsTlv::PeerSetSid {
                 flags: peer_sid_flags_from_api(sid.flags.as_ref()),
                 weight: sid.weight as u8,
                 sid: sid.sid,
@@ -2543,16 +2538,16 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
             if igp_flags.propagate_nssa {
                 f |= 0x10;
             }
-            bgp_ls::LsTlv::IgpFlags(f).encode(&mut dst);
+            ls::LsTlv::IgpFlags(f).encode(&mut dst);
         }
         if !prefix.opaque.is_empty() {
-            bgp_ls::LsTlv::OpaquePrefixAttr(prefix.opaque.clone()).encode(&mut dst);
+            ls::LsTlv::OpaquePrefixAttr(prefix.opaque.clone()).encode(&mut dst);
         }
         // Prefer sr_prefix_sids (carries algorithm + flags); fall back to the
         // legacy sr_prefix_sid field (algorithm 0 only).
         if !prefix.sr_prefix_sids.is_empty() {
             for ps in &prefix.sr_prefix_sids {
-                bgp_ls::LsTlv::PrefixSid {
+                ls::LsTlv::PrefixSid {
                     flags: ps.flags as u8,
                     algorithm: ps.algorithm as u8,
                     sid: ps.sid,
@@ -2560,7 +2555,7 @@ fn ls_tlvs_from_api(attr: &api::LsAttribute) -> Vec<u8> {
                 .encode(&mut dst);
             }
         } else if prefix.sr_prefix_sid != 0 {
-            bgp_ls::LsTlv::PrefixSid {
+            ls::LsTlv::PrefixSid {
                 flags: 0x80, // V=1, label encoding
                 algorithm: 0,
                 sid: prefix.sr_prefix_sid,

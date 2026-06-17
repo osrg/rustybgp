@@ -518,7 +518,7 @@ pub enum Nlri {
     FlowspecV6(crate::flowspec::FlowspecV6Nlri),
     FlowspecVpnV4(crate::flowspec::FlowspecVpnV4Nlri),
     FlowspecVpnV6(crate::flowspec::FlowspecVpnV6Nlri),
-    Ls(crate::bgp_ls::BgpLsNlri),
+    Ls(crate::ls::BgpLsNlri),
     SrPolicy(crate::sr_policy::SrPolicyNlri),
 }
 
@@ -604,7 +604,7 @@ impl Nlri {
             Family::IPV6_FLOWSPEC_VPN => crate::flowspec::FlowspecVpnV6Nlri::decode(c, len)
                 .map(Nlri::FlowspecVpnV6)
                 .map_err(|_| Notification::UpdateMalformedAttributeList),
-            Family::LS => crate::bgp_ls::BgpLsNlri::decode(c)
+            Family::LS => crate::ls::BgpLsNlri::decode(c)
                 .map(Nlri::Ls)
                 .ok_or(Notification::UpdateMalformedAttributeList),
             Family::IPV4_SRPOLICY | Family::IPV6_SRPOLICY => {

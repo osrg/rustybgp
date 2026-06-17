@@ -22,11 +22,11 @@ pub use self::bgp::{
 };
 pub use self::error::Error;
 
-pub mod bgp_ls;
 pub mod bmp;
 pub mod error;
 pub mod flowspec;
 pub mod labeled;
+pub mod ls;
 pub mod mpls;
 pub mod mrt;
 pub mod mup;
