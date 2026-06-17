@@ -714,4 +714,225 @@ mod tests {
         assert_eq!(buf[12], 24); // prefix len bits
         assert_eq!(&buf[13..16], &[10, 0, 0]);
     }
+
+    // GoBGP-generated test vectors (packet/tests/fixtures/gen/mup/main.go).
+
+    // ISD IPv4: RD=100:200, Prefix=10.0.0.0/24
+    const GOBGP_ISD_IPV4: &[u8] = &[
+        0x01, 0x00, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0x18, 0x0a, 0x00,
+        0x00,
+    ];
+
+    // ISD IPv6: RD=100:200, Prefix=2001:db8::/32
+    const GOBGP_ISD_IPV6: &[u8] = &[
+        0x01, 0x00, 0x01, 0x0d, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0x20, 0x20, 0x01,
+        0x0d, 0xb8,
+    ];
+
+    // DSD IPv4: RD=100:200, Address=192.0.2.1
+    const GOBGP_DSD_IPV4: &[u8] = &[
+        0x01, 0x00, 0x02, 0x0c, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0xc0, 0x00, 0x02,
+        0x01,
+    ];
+
+    // DSD IPv6: RD=100:200, Address=2001:db8::1
+    const GOBGP_DSD_IPV6: &[u8] = &[
+        0x01, 0x00, 0x02, 0x18, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0x20, 0x01, 0x0d,
+        0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    ];
+
+    // T1ST IPv4 (no source): RD=100:200, Prefix=192.168.0.0/24, TEID=0x12345678, QFI=9, EA=10.0.0.1
+    const GOBGP_T1ST_IPV4_NO_SRC: &[u8] = &[
+        0x01, 0x00, 0x03, 0x17, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0x18, 0xc0, 0xa8,
+        0x00, 0x12, 0x34, 0x56, 0x78, 0x09, 0x20, 0x0a, 0x00, 0x00, 0x01, 0x00,
+    ];
+
+    // T1ST IPv4 (with source): RD=100:200, Prefix=192.168.0.0/24, TEID=0x12345678, QFI=9, EA=10.0.0.1, Src=10.0.0.2
+    const GOBGP_T1ST_IPV4_WITH_SRC: &[u8] = &[
+        0x01, 0x00, 0x03, 0x1b, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0x18, 0xc0, 0xa8,
+        0x00, 0x12, 0x34, 0x56, 0x78, 0x09, 0x20, 0x0a, 0x00, 0x00, 0x01, 0x20, 0x0a, 0x00, 0x00,
+        0x02,
+    ];
+
+    // T1ST IPv6: RD=100:200, Prefix=2001:db8::/32, TEID=0x12345678, QFI=9, EA=2001:db8::1
+    const GOBGP_T1ST_IPV6: &[u8] = &[
+        0x01, 0x00, 0x03, 0x24, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0x20, 0x20, 0x01,
+        0x0d, 0xb8, 0x12, 0x34, 0x56, 0x78, 0x09, 0x80, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    ];
+
+    // T2ST IPv4 full TEID (ea_len=64): RD=100:200, EA=10.0.0.1, TEID=0xDEADBEEF
+    const GOBGP_T2ST_IPV4_FULL_TEID: &[u8] = &[
+        0x01, 0x00, 0x04, 0x11, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0x40, 0x0a, 0x00,
+        0x00, 0x01, 0xde, 0xad, 0xbe, 0xef,
+    ];
+
+    // T2ST IPv4 truncated TEID (ea_len=48): RD=100:200, EA=10.0.0.1, TEID upper 16 bits=0xDEAD
+    const GOBGP_T2ST_IPV4_TRUNC_TEID: &[u8] = &[
+        0x01, 0x00, 0x04, 0x0f, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0x30, 0x0a, 0x00,
+        0x00, 0x01, 0xde, 0xad,
+    ];
+
+    // T2ST IPv4 no TEID (ea_len=32): RD=100:200, EA=10.0.0.1
+    const GOBGP_T2ST_IPV4_NO_TEID: &[u8] = &[
+        0x01, 0x00, 0x04, 0x0d, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xc8, 0x20, 0x0a, 0x00,
+        0x00, 0x01,
+    ];
+
+    // MUP Extended Community: type=0x0c, sub_type=0x00, sid2=100, sid4=10000
+    const GOBGP_MUP_EXTENDED: &[u8] = &[0x0c, 0x00, 0x00, 0x64, 0x00, 0x00, 0x27, 0x10];
+
+    fn assert_nlri_roundtrip(family: Family, bytes: &[u8]) -> MupNlri {
+        let len = bytes.len();
+        let mut c = Cursor::new(bytes);
+        let nlri = MupNlri::decode(family, &mut c, len).expect("decode failed");
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, bytes);
+        nlri
+    }
+
+    #[test]
+    fn gobgp_isd_ipv4() {
+        let nlri = assert_nlri_roundtrip(Family::IPV4_MUP, GOBGP_ISD_IPV4);
+        if let MupNlri::InterworkSegmentDiscovery(r) = nlri {
+            assert_eq!(
+                r.rd,
+                RouteDistinguisher::TwoOctetAs {
+                    admin: 100,
+                    assigned: 200
+                }
+            );
+            assert_eq!(r.prefix_addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)));
+            assert_eq!(r.prefix_len, 24);
+        } else {
+            panic!("expected ISD");
+        }
+    }
+
+    #[test]
+    fn gobgp_isd_ipv6() {
+        let nlri = assert_nlri_roundtrip(Family::IPV6_MUP, GOBGP_ISD_IPV6);
+        if let MupNlri::InterworkSegmentDiscovery(r) = nlri {
+            assert_eq!(r.prefix_addr, IpAddr::V6("2001:db8::".parse().unwrap()));
+            assert_eq!(r.prefix_len, 32);
+        } else {
+            panic!("expected ISD");
+        }
+    }
+
+    #[test]
+    fn gobgp_dsd_ipv4() {
+        let nlri = assert_nlri_roundtrip(Family::IPV4_MUP, GOBGP_DSD_IPV4);
+        if let MupNlri::DirectSegmentDiscovery(r) = nlri {
+            assert_eq!(r.address, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        } else {
+            panic!("expected DSD");
+        }
+    }
+
+    #[test]
+    fn gobgp_dsd_ipv6() {
+        let nlri = assert_nlri_roundtrip(Family::IPV6_MUP, GOBGP_DSD_IPV6);
+        if let MupNlri::DirectSegmentDiscovery(r) = nlri {
+            assert_eq!(r.address, IpAddr::V6("2001:db8::1".parse().unwrap()));
+        } else {
+            panic!("expected DSD");
+        }
+    }
+
+    #[test]
+    fn gobgp_t1st_ipv4_no_src() {
+        let nlri = assert_nlri_roundtrip(Family::IPV4_MUP, GOBGP_T1ST_IPV4_NO_SRC);
+        if let MupNlri::Type1SessionTransformed(r) = nlri {
+            assert_eq!(r.prefix_addr, IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)));
+            assert_eq!(r.prefix_len, 24);
+            assert_eq!(r.teid, 0x12345678);
+            assert_eq!(r.qfi, 9);
+            assert_eq!(r.endpoint_address, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+            assert_eq!(r.source_address, None);
+        } else {
+            panic!("expected T1ST");
+        }
+    }
+
+    #[test]
+    fn gobgp_t1st_ipv4_with_src() {
+        let nlri = assert_nlri_roundtrip(Family::IPV4_MUP, GOBGP_T1ST_IPV4_WITH_SRC);
+        if let MupNlri::Type1SessionTransformed(r) = nlri {
+            assert_eq!(r.teid, 0x12345678);
+            assert_eq!(r.endpoint_address, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+            assert_eq!(
+                r.source_address,
+                Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
+            );
+        } else {
+            panic!("expected T1ST");
+        }
+    }
+
+    #[test]
+    fn gobgp_t1st_ipv6() {
+        let nlri = assert_nlri_roundtrip(Family::IPV6_MUP, GOBGP_T1ST_IPV6);
+        if let MupNlri::Type1SessionTransformed(r) = nlri {
+            assert_eq!(r.prefix_addr, IpAddr::V6("2001:db8::".parse().unwrap()));
+            assert_eq!(r.prefix_len, 32);
+            assert_eq!(r.teid, 0x12345678);
+            assert_eq!(
+                r.endpoint_address,
+                IpAddr::V6("2001:db8::1".parse().unwrap())
+            );
+            assert_eq!(r.source_address, None);
+        } else {
+            panic!("expected T1ST");
+        }
+    }
+
+    #[test]
+    fn gobgp_t2st_ipv4_full_teid() {
+        let nlri = assert_nlri_roundtrip(Family::IPV4_MUP, GOBGP_T2ST_IPV4_FULL_TEID);
+        if let MupNlri::Type2SessionTransformed(r) = nlri {
+            assert_eq!(r.endpoint_address_length, 64);
+            assert_eq!(r.endpoint_address, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+            assert_eq!(r.teid, 0xDEAD_BEEF);
+        } else {
+            panic!("expected T2ST");
+        }
+    }
+
+    #[test]
+    fn gobgp_t2st_ipv4_trunc_teid() {
+        // GoBGP encodes 2 TEID bytes [0xDE, 0xAD]; RustyBGP stores them in the
+        // upper 16 bits of the u32, so the decoded value is 0xDEAD_0000.
+        let nlri = assert_nlri_roundtrip(Family::IPV4_MUP, GOBGP_T2ST_IPV4_TRUNC_TEID);
+        if let MupNlri::Type2SessionTransformed(r) = nlri {
+            assert_eq!(r.endpoint_address_length, 48);
+            assert_eq!(r.teid, 0xDEAD_0000);
+        } else {
+            panic!("expected T2ST");
+        }
+    }
+
+    #[test]
+    fn gobgp_t2st_ipv4_no_teid() {
+        let nlri = assert_nlri_roundtrip(Family::IPV4_MUP, GOBGP_T2ST_IPV4_NO_TEID);
+        if let MupNlri::Type2SessionTransformed(r) = nlri {
+            assert_eq!(r.endpoint_address_length, 32);
+            assert_eq!(r.endpoint_address, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+            assert_eq!(r.teid, 0);
+        } else {
+            panic!("expected T2ST");
+        }
+    }
+
+    #[test]
+    fn gobgp_mup_extended() {
+        let ec = MupExtended::decode(GOBGP_MUP_EXTENDED).expect("decode failed");
+        assert_eq!(ec.sub_type, EC_SUBTYPE_MUP_DIRECT_SEG);
+        assert_eq!(ec.segment_id2, 100);
+        assert_eq!(ec.segment_id4, 10000);
+        let mut buf = Vec::new();
+        ec.encode(&mut buf);
+        assert_eq!(buf, GOBGP_MUP_EXTENDED);
+    }
 }
