@@ -350,7 +350,6 @@ impl Family {
     const SAFI_LS: u8 = 71;
     const SAFI_MUP: u8 = 85;
     const SAFI_MPLS_VPN: u8 = 128;
-    const SAFI_MPLS_VPN6: u8 = 129;
     const SAFI_SR_POLICY: u8 = 73;
     const SAFI_FLOWSPEC: u8 = 133;
     const SAFI_FLOWSPEC_VPN: u8 = 134;
@@ -366,7 +365,7 @@ impl Family {
     pub const IPV4_MUP: Family = Family::new(Family::AFI_IP, Family::SAFI_MUP);
     pub const IPV6_MUP: Family = Family::new(Family::AFI_IP6, Family::SAFI_MUP);
     pub const IPV4_VPN: Family = Family::new(Family::AFI_IP, Family::SAFI_MPLS_VPN);
-    pub const IPV6_VPN: Family = Family::new(Family::AFI_IP6, Family::SAFI_MPLS_VPN6);
+    pub const IPV6_VPN: Family = Family::new(Family::AFI_IP6, Family::SAFI_MPLS_VPN);
     pub const IPV4_FLOWSPEC: Family = Family::new(Family::AFI_IP, Family::SAFI_FLOWSPEC);
     pub const IPV6_FLOWSPEC: Family = Family::new(Family::AFI_IP6, Family::SAFI_FLOWSPEC);
     pub const IPV4_FLOWSPEC_VPN: Family = Family::new(Family::AFI_IP, Family::SAFI_FLOWSPEC_VPN);
