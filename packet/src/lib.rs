@@ -24,6 +24,7 @@ pub use self::error::Error;
 
 pub mod bmp;
 pub mod error;
+pub mod evpn;
 pub mod flowspec;
 pub mod labeled;
 pub mod ls;

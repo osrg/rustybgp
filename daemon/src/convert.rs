@@ -275,6 +275,52 @@ pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
                 },
             })),
         },
+        Nlri::Evpn(n) => evpn_nlri_to_api(n),
+    }
+}
+
+fn esi_to_api(esi: &packet::evpn::Esi) -> api::EthernetSegmentIdentifier {
+    api::EthernetSegmentIdentifier {
+        r#type: esi.0[0] as u32,
+        value: esi.0[1..].to_vec(),
+    }
+}
+
+fn evpn_nlri_to_api(n: &packet::evpn::EvpnNlri) -> api::Nlri {
+    use packet::evpn::EvpnNlri;
+    match n {
+        EvpnNlri::MacIpAdvertisement(m) => {
+            let mac = m.mac;
+            let mac_str = format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            );
+            let mut labels = vec![m.label1];
+            if let Some(l2) = m.label2 {
+                labels.push(l2);
+            }
+            api::Nlri {
+                nlri: Some(api::nlri::Nlri::EvpnMacadv(
+                    api::EvpnmacipAdvertisementRoute {
+                        rd: Some(rd_to_api(&m.rd)),
+                        esi: Some(esi_to_api(&m.esi)),
+                        ethernet_tag: m.etag,
+                        mac_address: mac_str,
+                        ip_address: m.ip.map(|ip| ip.to_string()).unwrap_or_default(),
+                        labels,
+                    },
+                )),
+            }
+        }
+        EvpnNlri::InclusiveMulticastEthernetTag(t) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnMulticast(
+                api::EvpnInclusiveMulticastEthernetTagRoute {
+                    rd: Some(rd_to_api(&t.rd)),
+                    ethernet_tag: t.etag,
+                    ip_address: t.originating_router_ip.to_string(),
+                },
+            )),
+        },
     }
 }
 

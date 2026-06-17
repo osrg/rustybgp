@@ -342,11 +342,13 @@ pub struct Family(u32);
 impl Family {
     pub const AFI_IP: u16 = 1;
     pub const AFI_IP6: u16 = 2;
+    pub const AFI_L2VPN: u16 = 25;
     pub const AFI_LS: u16 = 16388;
 
     const SAFI_UNICAST: u8 = 1;
     const SAFI_MULTICAST: u8 = 2;
     const SAFI_LABELED_UNICAST: u8 = 4;
+    const SAFI_EVPN: u8 = 70;
     const SAFI_LS: u8 = 71;
     const SAFI_MUP: u8 = 85;
     const SAFI_MPLS_VPN: u8 = 128;
@@ -372,6 +374,7 @@ impl Family {
     pub const IPV6_FLOWSPEC_VPN: Family = Family::new(Family::AFI_IP6, Family::SAFI_FLOWSPEC_VPN);
     pub const IPV4_SRPOLICY: Family = Family::new(Family::AFI_IP, Family::SAFI_SR_POLICY);
     pub const IPV6_SRPOLICY: Family = Family::new(Family::AFI_IP6, Family::SAFI_SR_POLICY);
+    pub const L2VPN_EVPN: Family = Family::new(Family::AFI_L2VPN, Family::SAFI_EVPN);
 
     pub const fn new(afi: u16, safi: u8) -> Self {
         Family((afi as u32) << 16 | safi as u32)
@@ -519,6 +522,7 @@ pub enum Nlri {
     FlowspecVpnV6(crate::flowspec::FlowspecVpnV6Nlri),
     Ls(crate::ls::BgpLsNlri),
     SrPolicy(crate::sr_policy::SrPolicyNlri),
+    Evpn(crate::evpn::EvpnNlri),
 }
 
 impl Nlri {
@@ -552,6 +556,10 @@ impl Nlri {
                 Ok(0)
             }
             Nlri::SrPolicy(n) => {
+                n.encode(dst);
+                Ok(0)
+            }
+            Nlri::Evpn(n) => {
                 n.encode(dst);
                 Ok(0)
             }
@@ -611,6 +619,9 @@ impl Nlri {
                     .map(Nlri::SrPolicy)
                     .map_err(|_| Notification::UpdateMalformedAttributeList)
             }
+            Family::L2VPN_EVPN => crate::evpn::EvpnNlri::decode(c)
+                .map(Nlri::Evpn)
+                .map_err(|_| Notification::UpdateMalformedAttributeList),
             _ => Err(Notification::UpdateMalformedAttributeList),
         }
     }
@@ -646,6 +657,7 @@ impl fmt::Display for Nlri {
             Nlri::FlowspecVpnV6(n) => n.fmt(f),
             Nlri::Ls(n) => n.fmt(f),
             Nlri::SrPolicy(n) => n.fmt(f),
+            Nlri::Evpn(n) => n.fmt(f),
         }
     }
 }
@@ -2152,6 +2164,7 @@ impl PeerCodec {
                     | &Family::IPV6_SRPOLICY
                     | &Family::IPV4_MC
                     | &Family::IPV6_MC
+                    | &Family::L2VPN_EVPN
             )
         {
             // Pad IPv4 nexthop to 16 bytes for RFC 8950 extended-nexthop families.
@@ -2167,7 +2180,12 @@ impl PeerCodec {
         // SNPA padding
         dst.put_u8(0);
         let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
-        let max_len = 1 + 16 + if addpath { 4 } else { 0 };
+        // EVPN NLRIs are up to 54 bytes (Type-2 with IPv6 + 2 labels: 2+52).
+        let max_len = if *family == Family::L2VPN_EVPN {
+            54 + if addpath { 4 } else { 0 }
+        } else {
+            1 + 16 + if addpath { 4 } else { 0 }
+        };
         let mut n_encoded = 0;
         for item in entries {
             if buf_head + self.max_message_length() > dst.as_mut().len() + max_len {
