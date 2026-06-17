@@ -18,7 +18,7 @@ use ip_network_table_deps_treebitmap::IpLookupTable;
 use regex::Regex;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
@@ -372,7 +372,21 @@ impl Condition {
                         }
                         return !(*opt == MatchOption::Any);
                     }
-                    packet::Nlri::V6(_) => {}
+                    packet::Nlri::V6(n) => {
+                        if let Some(zero6) = set.zero6
+                            && zero6.0 <= n.mask
+                            && n.mask <= zero6.1
+                        {
+                            return *opt == MatchOption::Any;
+                        }
+                        if let Some((_, _, p)) = set.v6.longest_match(n.addr)
+                            && p.min_length <= n.mask
+                            && n.mask <= p.max_length
+                        {
+                            return *opt == MatchOption::Any;
+                        }
+                        return !(*opt == MatchOption::Any);
+                    }
                     packet::Nlri::Mup(_) => {}
                     packet::Nlri::VpnV4(_) | packet::Nlri::VpnV6(_) => {}
                     packet::Nlri::LabeledV4(_) | packet::Nlri::LabeledV6(_) => {}
@@ -1035,7 +1049,9 @@ pub enum DefinedSetRef<'a> {
 
 pub struct PrefixSet {
     pub v4: IpLookupTable<Ipv4Addr, Prefix>,
+    pub v6: IpLookupTable<Ipv6Addr, Prefix>,
     pub zero: Option<(u8, u8)>,
+    pub zero6: Option<(u8, u8)>,
 }
 
 pub struct NeighborSet {
@@ -1299,7 +1315,9 @@ impl PolicyTable {
                 let arc_name: Arc<str> = Arc::from(name.as_str());
                 if let Vacant(e) = self.prefix_sets.entry(arc_name.clone()) {
                     let mut zero = None;
-                    let mut v = IpLookupTable::new();
+                    let mut zero6 = None;
+                    let mut v4 = IpLookupTable::new();
+                    let mut v6 = IpLookupTable::new();
                     for p in &prefixes {
                         match packet::IpNet::from_str(&p.ip_prefix) {
                             Ok(n) => {
@@ -1314,10 +1332,16 @@ impl PolicyTable {
                                         if net.addr == Ipv4Addr::new(0, 0, 0, 0) && net.mask == 0 {
                                             zero = Some((prefix.min_length, prefix.max_length));
                                         } else {
-                                            v.insert(net.addr, net.mask as u32, prefix);
+                                            v4.insert(net.addr, net.mask as u32, prefix);
                                         }
                                     }
-                                    packet::IpNet::V6(_) => {}
+                                    packet::IpNet::V6(net) => {
+                                        if net.addr == Ipv6Addr::UNSPECIFIED && net.mask == 0 {
+                                            zero6 = Some((prefix.min_length, prefix.max_length));
+                                        } else {
+                                            v6.insert(net.addr, net.mask as u32, prefix);
+                                        }
+                                    }
                                 }
                             }
                             Err(_) => {
@@ -1328,12 +1352,17 @@ impl PolicyTable {
                             }
                         }
                     }
-                    if v.is_empty() && zero.is_none() {
+                    if v4.is_empty() && v6.is_empty() && zero.is_none() && zero6.is_none() {
                         return Err(TableError::InvalidArgument(
                             "empty prefix defined-type".to_string(),
                         ));
                     } else {
-                        e.insert(Arc::new(PrefixSet { v4: v, zero }));
+                        e.insert(Arc::new(PrefixSet {
+                            v4,
+                            v6,
+                            zero,
+                            zero6,
+                        }));
                         return Ok(());
                     }
                 }
@@ -3598,6 +3627,67 @@ mod tests {
         // Unknown subtype (type 0x03, subtype != 0x0c) -> None
         let c: [u8; 8] = [0x03, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08];
         assert_eq!(ext_community_to_string(&c), None);
+    }
+
+    #[test]
+    fn prefix_set_ipv6_match() {
+        use std::net::Ipv6Addr;
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(DefinedSetConfig::Prefix {
+                name: "ipv6-set".to_string(),
+                prefixes: vec![PrefixConfig {
+                    ip_prefix: "2001:db8::/32".to_string(),
+                    mask_length_min: 32,
+                    mask_length_max: 128,
+                }],
+            })
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::PrefixSet(
+                    "ipv6-set".to_string(),
+                    MatchOption::Any,
+                )],
+                Some(Disposition::Reject),
+                Actions::default(),
+            )
+            .unwrap();
+        ptable.add_policy("p1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Import,
+                Disposition::Accept,
+                vec!["p1".to_string()],
+            )
+            .unwrap();
+
+        let src = import_source(1);
+
+        // 2001:db8::1/48 should match (within 2001:db8::/32)
+        let matched_net = packet::Nlri::V6(bgp::Ipv6Net {
+            addr: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0),
+            mask: 48,
+        });
+        let attr = Arc::new(vec![]);
+        let mut nh = Some(bgp::Nexthop::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+        let (filtered, _) = apply_import(&assignment, None, &src, &matched_net, &attr, &mut nh);
+        assert!(
+            filtered,
+            "2001:db8::/48 should be rejected by ipv6 prefix set"
+        );
+
+        // 2001:db9::/32 should not match
+        let no_match_net = packet::Nlri::V6(bgp::Ipv6Net {
+            addr: Ipv6Addr::new(0x2001, 0x0db9, 0, 0, 0, 0, 0, 0),
+            mask: 32,
+        });
+        let attr2 = Arc::new(vec![]);
+        let mut nh2 = Some(bgp::Nexthop::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+        let (filtered2, _) = apply_import(&assignment, None, &src, &no_match_net, &attr2, &mut nh2);
+        assert!(!filtered2, "2001:db9::/32 should not match ipv6 prefix set");
     }
 
     #[test]
