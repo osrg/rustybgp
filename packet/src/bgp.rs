@@ -2147,10 +2147,17 @@ impl PeerCodec {
             dst.put_bytes(0, 8); // 8-byte zero RD (RFC 4364 §4.3.2)
             dst.put_slice(&nh_bytes);
         } else if nh_bytes.len() < 16
-            && !matches!(family, &Family::IPV4_SRPOLICY | &Family::IPV6_SRPOLICY)
+            && !matches!(
+                family,
+                &Family::IPV4_SRPOLICY
+                    | &Family::IPV6_SRPOLICY
+                    | &Family::IPV4_MC
+                    | &Family::IPV6_MC
+            )
         {
-            // Pad IPv4 nexthop to 16 bytes for extended-nexthop families (RFC 8950).
-            // SR Policy uses the nexthop as-is (4 bytes for AFI=1, 16 for AFI=2).
+            // Pad IPv4 nexthop to 16 bytes for RFC 8950 extended-nexthop families.
+            // SR Policy and multicast use the nexthop as-is (RFC 4760 requires 4-byte
+            // IPv4 nexthop for AFI=1 multicast; SR Policy follows the same rule).
             dst.put_u8(16);
             dst.put_slice(&nh_bytes);
             dst.put_bytes(0, 16 - nh_bytes.len());
