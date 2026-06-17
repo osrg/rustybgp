@@ -366,7 +366,7 @@ impl Condition {
                         }
                         if let Some((_, _, p)) = set.v4.longest_match(n.addr)
                             && p.min_length <= n.mask
-                            && p.max_length <= n.mask
+                            && n.mask <= p.max_length
                         {
                             return *opt == MatchOption::Any;
                         }
