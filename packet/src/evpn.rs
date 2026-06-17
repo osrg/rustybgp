@@ -65,6 +65,8 @@ pub enum EvpnNlri {
     MacIpAdvertisement(MacIpAdvertisement),
     /// Type-3: Inclusive Multicast Ethernet Tag route (RFC 7432 §7.3).
     InclusiveMulticastEthernetTag(InclusiveMulticastEthernetTag),
+    /// Type-4: Ethernet Segment route (RFC 7432 §7.4).
+    EthernetSegment(EthernetSegmentRoute),
     /// Type-5: IP Prefix route (RFC 9136 §5).
     EthernetIpPrefix(EthernetIpPrefixRoute),
 }
@@ -73,6 +75,7 @@ impl EvpnNlri {
     const TYPE_EAD: u8 = 1;
     const TYPE_MAC_IP: u8 = 2;
     const TYPE_IMET: u8 = 3;
+    const TYPE_ES: u8 = 4;
     const TYPE_IP_PREFIX: u8 = 5;
 
     /// Decode one EVPN route from `r`.  Consumes exactly 2 + route_len bytes.
@@ -87,6 +90,9 @@ impl EvpnNlri {
             }
             Self::TYPE_IMET => InclusiveMulticastEthernetTag::decode(r, route_len)
                 .map(EvpnNlri::InclusiveMulticastEthernetTag),
+            Self::TYPE_ES => {
+                EthernetSegmentRoute::decode(r, route_len).map(EvpnNlri::EthernetSegment)
+            }
             Self::TYPE_IP_PREFIX => {
                 EthernetIpPrefixRoute::decode(r, route_len).map(EvpnNlri::EthernetIpPrefix)
             }
@@ -113,6 +119,10 @@ impl EvpnNlri {
                 n.encode(&mut data);
                 dst.put_u8(Self::TYPE_IMET);
             }
+            EvpnNlri::EthernetSegment(n) => {
+                n.encode(&mut data);
+                dst.put_u8(Self::TYPE_ES);
+            }
             EvpnNlri::EthernetIpPrefix(n) => {
                 n.encode(&mut data);
                 dst.put_u8(Self::TYPE_IP_PREFIX);
@@ -129,6 +139,7 @@ impl fmt::Display for EvpnNlri {
             EvpnNlri::EthernetAutoDiscovery(n) => n.fmt(f),
             EvpnNlri::MacIpAdvertisement(n) => n.fmt(f),
             EvpnNlri::InclusiveMulticastEthernetTag(n) => n.fmt(f),
+            EvpnNlri::EthernetSegment(n) => n.fmt(f),
             EvpnNlri::EthernetIpPrefix(n) => n.fmt(f),
         }
     }
@@ -175,15 +186,11 @@ pub struct EthernetAutoDiscoveryRoute {
 impl EthernetAutoDiscoveryRoute {
     const LEN: usize = RouteDistinguisher::LEN + Esi::LEN + 4 + 3;
 
-    fn decode<R: Read>(r: &mut R, route_len: usize) -> io::Result<Self> {
+    pub fn decode<R: Read>(r: &mut R, route_len: usize) -> io::Result<Self> {
         if route_len != Self::LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "EVPN Type-1: expected route_len={}, got {}",
-                    Self::LEN,
-                    route_len
-                ),
+                "malformed EVPN Type-1",
             ));
         }
         let mut rd_buf = [0u8; RouteDistinguisher::LEN];
@@ -195,18 +202,17 @@ impl EthernetAutoDiscoveryRoute {
             r.read_exact(&mut b)?;
             u32::from_be_bytes(b)
         };
-        let mut lb = [0u8; 3];
-        r.read_exact(&mut lb)?;
-        let label = decode_evpn_label(&lb);
-        Ok(Self {
+        let mut l = [0u8; 3];
+        r.read_exact(&mut l)?;
+        Ok(EthernetAutoDiscoveryRoute {
             rd,
             esi,
             etag,
-            label,
+            label: decode_evpn_label(&l),
         })
     }
 
-    pub(crate) fn encode<B: BufMut>(&self, dst: &mut B) {
+    pub fn encode<B: BufMut>(&self, dst: &mut B) {
         self.rd.encode(dst);
         self.esi.encode(dst);
         dst.put_u32(self.etag);
@@ -219,7 +225,7 @@ impl fmt::Display for EthernetAutoDiscoveryRoute {
         write!(
             f,
             "[type-1][rd {}][esi {}][etag {}][label {}]",
-            self.rd, self.esi, self.etag, self.label
+            self.rd, self.esi, self.etag, self.label,
         )
     }
 }
@@ -442,6 +448,78 @@ impl fmt::Display for InclusiveMulticastEthernetTag {
             f,
             "[type-3][rd {}][etag {}][ip {}]",
             self.rd, self.etag, self.originating_router_ip,
+        )
+    }
+}
+
+/// Type-4: Ethernet Segment route (RFC 7432 §7.4).
+///
+/// Wire layout (route_len bytes):
+///   8  RD, 10  ESI, 1  IP Address Length (32 or 128), 4 or 16  Originating Router IP
+///
+/// Used for Designated Forwarder election among PEs on the same Ethernet Segment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EthernetSegmentRoute {
+    pub rd: RouteDistinguisher,
+    pub esi: Esi,
+    pub originating_router_ip: IpAddr,
+}
+
+impl EthernetSegmentRoute {
+    const MIN_LEN: usize = RouteDistinguisher::LEN + Esi::LEN + 1 + 4;
+
+    pub fn decode<R: Read>(r: &mut R, route_len: usize) -> io::Result<Self> {
+        let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed EVPN Type-4");
+        if route_len < Self::MIN_LEN {
+            return Err(malformed());
+        }
+        let mut rd_buf = [0u8; RouteDistinguisher::LEN];
+        r.read_exact(&mut rd_buf)?;
+        let rd = RouteDistinguisher::decode(&rd_buf)?;
+        let esi = Esi::decode(r)?;
+        let ip_len = r.read_u8()?;
+        let originating_router_ip = match ip_len {
+            32 => {
+                let mut b = [0u8; 4];
+                r.read_exact(&mut b)?;
+                IpAddr::V4(Ipv4Addr::from(b))
+            }
+            128 => {
+                let mut b = [0u8; 16];
+                r.read_exact(&mut b)?;
+                IpAddr::V6(Ipv6Addr::from(b))
+            }
+            _ => return Err(malformed()),
+        };
+        Ok(EthernetSegmentRoute {
+            rd,
+            esi,
+            originating_router_ip,
+        })
+    }
+
+    pub fn encode<B: BufMut>(&self, dst: &mut B) {
+        self.rd.encode(dst);
+        self.esi.encode(dst);
+        match self.originating_router_ip {
+            IpAddr::V4(v4) => {
+                dst.put_u8(32);
+                dst.put_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                dst.put_u8(128);
+                dst.put_slice(&v6.octets());
+            }
+        }
+    }
+}
+
+impl fmt::Display for EthernetSegmentRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[type-4][rd {}][esi {}][ip {}]",
+            self.rd, self.esi, self.originating_router_ip,
         )
     }
 }
@@ -1117,6 +1195,124 @@ mod tests {
         let mut buf = Vec::new();
         nlri.encode(&mut buf);
         assert_eq!(buf, GOBGP_TYPE1_WITH_LABEL);
+    }
+
+    // -----------------------------------------------------------------------
+    // Type-4 (Ethernet Segment) roundtrip and wire tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn type4_ipv4_roundtrip() {
+        let nlri = EvpnNlri::EthernetSegment(EthernetSegmentRoute {
+            rd: rd_two_octet(65000, 1),
+            esi: Esi::ZERO,
+            originating_router_ip: "10.0.0.1".parse().unwrap(),
+        });
+        assert_eq!(roundtrip(&nlri), nlri);
+    }
+
+    #[test]
+    fn type4_ipv6_roundtrip() {
+        let nlri = EvpnNlri::EthernetSegment(EthernetSegmentRoute {
+            rd: rd_two_octet(65000, 1),
+            esi: Esi::ZERO,
+            originating_router_ip: "2001:db8::1".parse().unwrap(),
+        });
+        assert_eq!(roundtrip(&nlri), nlri);
+    }
+
+    #[test]
+    fn type4_wire_lengths() {
+        // IPv4: RD(8)+ESI(10)+IPLen(1)+IP(4) = 23 bytes
+        let es_v4 = EthernetSegmentRoute {
+            rd: rd_two_octet(1, 1),
+            esi: Esi::ZERO,
+            originating_router_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        };
+        let mut buf = Vec::new();
+        es_v4.encode(&mut buf);
+        assert_eq!(buf.len(), 23);
+
+        // IPv6: RD(8)+ESI(10)+IPLen(1)+IP(16) = 35 bytes
+        let es_v6 = EthernetSegmentRoute {
+            rd: rd_two_octet(1, 1),
+            esi: Esi::ZERO,
+            originating_router_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        buf.clear();
+        es_v6.encode(&mut buf);
+        assert_eq!(buf.len(), 35);
+    }
+
+    // Type-4: RD=TwoOctetAS(100,100), ESI=zeros, IP=192.2.1.2
+    // route_len = 23 bytes (IPv4)
+    #[rustfmt::skip]
+    const GOBGP_TYPE4_IPV4: &[u8] = &[
+        0x04, 0x17,                                     // type=4, len=23
+        0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x64, // RD TwoOctetAS(100,100)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // ESI zeros (first 6)
+        0x00, 0x00, 0x00, 0x00,                         // ESI zeros (last 4)
+        0x20,                                           // IP len = 32
+        0xc0, 0x02, 0x01, 0x02,                         // IP = 192.2.1.2
+    ];
+
+    // Type-4: RD=FourOctetAS(5,6), ESI=zeros, IP=2001:db8::1
+    // route_len = 35 bytes (IPv6)
+    #[rustfmt::skip]
+    const GOBGP_TYPE4_IPV6: &[u8] = &[
+        0x04, 0x23,                                     // type=4, len=35
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x05, 0x00, 0x06, // RD FourOctetAS(5,6)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // ESI zeros (first 6)
+        0x00, 0x00, 0x00, 0x00,                         // ESI zeros (last 4)
+        0x80,                                           // IP len = 128
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, // IP = 2001:db8::1 (first 8)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // IP (last 8)
+    ];
+
+    #[test]
+    fn gobgp_type4_ipv4_decode() {
+        let nlri = gobgp_decode(GOBGP_TYPE4_IPV4);
+        let r = match &nlri {
+            EvpnNlri::EthernetSegment(r) => r,
+            _ => panic!("expected EthernetSegment"),
+        };
+        assert_eq!(r.rd, rd_two_octet(100, 100));
+        assert_eq!(r.esi, Esi::ZERO);
+        assert_eq!(
+            r.originating_router_ip,
+            "192.2.1.2".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn gobgp_type4_ipv4_roundtrip() {
+        let nlri = gobgp_decode(GOBGP_TYPE4_IPV4);
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, GOBGP_TYPE4_IPV4);
+    }
+
+    #[test]
+    fn gobgp_type4_ipv6_decode() {
+        let nlri = gobgp_decode(GOBGP_TYPE4_IPV6);
+        let r = match &nlri {
+            EvpnNlri::EthernetSegment(r) => r,
+            _ => panic!("expected EthernetSegment"),
+        };
+        assert_eq!(r.rd, rd_four_octet(5, 6));
+        assert_eq!(r.esi, Esi::ZERO);
+        assert_eq!(
+            r.originating_router_ip,
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn gobgp_type4_ipv6_roundtrip() {
+        let nlri = gobgp_decode(GOBGP_TYPE4_IPV6);
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, GOBGP_TYPE4_IPV6);
     }
 
     // -----------------------------------------------------------------------

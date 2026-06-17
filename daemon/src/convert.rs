@@ -327,6 +327,15 @@ fn evpn_nlri_to_api(n: &packet::evpn::EvpnNlri) -> api::Nlri {
                 },
             )),
         },
+        EvpnNlri::EthernetSegment(r) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnEthernetSegment(
+                api::EvpnEthernetSegmentRoute {
+                    rd: Some(rd_to_api(&r.rd)),
+                    esi: Some(esi_to_api(&r.esi)),
+                    ip_address: r.originating_router_ip.to_string(),
+                },
+            )),
+        },
         EvpnNlri::MacIpAdvertisement(m) => {
             let mac = m.mac;
             let mac_str = format!(
@@ -2222,6 +2231,27 @@ pub(crate) fn net_from_api(n: api::Nlri, family: Family) -> Result<Nlri, Error> 
                     esi,
                     etag: r.ethernet_tag,
                     label: r.label,
+                },
+            )))
+        }
+        Some(api::nlri::Nlri::EvpnEthernetSegment(r)) => {
+            use packet::evpn::{EthernetSegmentRoute, EvpnNlri};
+            let rd = rd_from_api(
+                r.rd.as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing RD in EVPN ES".to_string()))?,
+            )?;
+            let esi =
+                esi_from_api(r.esi.as_ref().ok_or_else(|| {
+                    Error::InvalidArgument("missing ESI in EVPN ES".to_string())
+                })?)?;
+            let originating_router_ip = r.ip_address.parse().map_err(|_| {
+                Error::InvalidArgument(format!("invalid IP address: {}", r.ip_address))
+            })?;
+            Ok(Nlri::Evpn(EvpnNlri::EthernetSegment(
+                EthernetSegmentRoute {
+                    rd,
+                    esi,
+                    originating_router_ip,
                 },
             )))
         }
@@ -6636,6 +6666,77 @@ bgp-actions.set-next-hop = "self"
             assert_eq!(r.label, 200);
         } else {
             panic!("expected EthernetAutoDiscovery");
+        }
+    }
+
+    #[test]
+    fn evpn_ethernet_segment_ipv4_roundtrip() {
+        use packet::evpn::EvpnNlri;
+        let nlri_api = api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnEthernetSegment(
+                api::EvpnEthernetSegmentRoute {
+                    rd: Some(api::RouteDistinguisher {
+                        rd: Some(api::route_distinguisher::Rd::TwoOctetAsn(
+                            api::RouteDistinguisherTwoOctetAsn {
+                                admin: 100,
+                                assigned: 100,
+                            },
+                        )),
+                    }),
+                    esi: Some(api::EthernetSegmentIdentifier {
+                        r#type: 0,
+                        value: vec![0u8; 9],
+                    }),
+                    ip_address: "192.2.1.2".to_string(),
+                },
+            )),
+        };
+        let nlri = net_from_api(nlri_api, Family::L2VPN_EVPN).unwrap();
+        let back = nlri_to_api(&nlri);
+        if let packet::Nlri::Evpn(EvpnNlri::EthernetSegment(r)) = &nlri {
+            assert_eq!(
+                r.originating_router_ip,
+                "192.2.1.2".parse::<std::net::IpAddr>().unwrap()
+            );
+        } else {
+            panic!("expected EthernetSegment");
+        }
+        assert!(matches!(
+            back.nlri,
+            Some(api::nlri::Nlri::EvpnEthernetSegment(_))
+        ));
+    }
+
+    #[test]
+    fn evpn_ethernet_segment_ipv6_roundtrip() {
+        use packet::evpn::EvpnNlri;
+        let nlri_api = api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnEthernetSegment(
+                api::EvpnEthernetSegmentRoute {
+                    rd: Some(api::RouteDistinguisher {
+                        rd: Some(api::route_distinguisher::Rd::FourOctetAsn(
+                            api::RouteDistinguisherFourOctetAsn {
+                                admin: 5,
+                                assigned: 6,
+                            },
+                        )),
+                    }),
+                    esi: Some(api::EthernetSegmentIdentifier {
+                        r#type: 0,
+                        value: vec![0u8; 9],
+                    }),
+                    ip_address: "2001:db8::1".to_string(),
+                },
+            )),
+        };
+        let nlri = net_from_api(nlri_api, Family::L2VPN_EVPN).unwrap();
+        if let packet::Nlri::Evpn(EvpnNlri::EthernetSegment(r)) = &nlri {
+            assert_eq!(
+                r.originating_router_ip,
+                "2001:db8::1".parse::<std::net::IpAddr>().unwrap()
+            );
+        } else {
+            panic!("expected EthernetSegment");
         }
     }
 }
