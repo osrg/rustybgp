@@ -59,6 +59,8 @@ impl fmt::Display for Esi {
 /// EVPN NLRI variants (RFC 7432 / RFC 9136).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EvpnNlri {
+    /// Type-1: Ethernet Auto-Discovery route (RFC 7432 §7.1).
+    EthernetAutoDiscovery(EthernetAutoDiscoveryRoute),
     /// Type-2: MAC/IP Advertisement route (RFC 7432 §7.2).
     MacIpAdvertisement(MacIpAdvertisement),
     /// Type-3: Inclusive Multicast Ethernet Tag route (RFC 7432 §7.3).
@@ -68,6 +70,7 @@ pub enum EvpnNlri {
 }
 
 impl EvpnNlri {
+    const TYPE_EAD: u8 = 1;
     const TYPE_MAC_IP: u8 = 2;
     const TYPE_IMET: u8 = 3;
     const TYPE_IP_PREFIX: u8 = 5;
@@ -77,6 +80,8 @@ impl EvpnNlri {
         let route_type = r.read_u8()?;
         let route_len = r.read_u8()? as usize;
         match route_type {
+            Self::TYPE_EAD => EthernetAutoDiscoveryRoute::decode(r, route_len)
+                .map(EvpnNlri::EthernetAutoDiscovery),
             Self::TYPE_MAC_IP => {
                 MacIpAdvertisement::decode(r, route_len).map(EvpnNlri::MacIpAdvertisement)
             }
@@ -96,6 +101,10 @@ impl EvpnNlri {
     pub fn encode<B: BufMut>(&self, dst: &mut B) {
         let mut data = Vec::new();
         match self {
+            EvpnNlri::EthernetAutoDiscovery(n) => {
+                n.encode(&mut data);
+                dst.put_u8(Self::TYPE_EAD);
+            }
             EvpnNlri::MacIpAdvertisement(n) => {
                 n.encode(&mut data);
                 dst.put_u8(Self::TYPE_MAC_IP);
@@ -117,6 +126,7 @@ impl EvpnNlri {
 impl fmt::Display for EvpnNlri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            EvpnNlri::EthernetAutoDiscovery(n) => n.fmt(f),
             EvpnNlri::MacIpAdvertisement(n) => n.fmt(f),
             EvpnNlri::InclusiveMulticastEthernetTag(n) => n.fmt(f),
             EvpnNlri::EthernetIpPrefix(n) => n.fmt(f),
@@ -145,6 +155,73 @@ fn encode_evpn_label<B: BufMut>(label: u32, dst: &mut B) {
     dst.put_u8((label >> 16) as u8);
     dst.put_u8((label >> 8) as u8);
     dst.put_u8(label as u8);
+}
+
+/// Type-1: Ethernet Auto-Discovery route (RFC 7432 §7.1).
+///
+/// Wire layout (route_len bytes):
+///   8  RD, 10  ESI, 4  Ethernet Tag (ETag), 3  Label (24-bit raw big-endian)
+///
+/// Used for mass withdrawal (ETag=0xFFFF_FFFF) and aliasing in multihoming.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EthernetAutoDiscoveryRoute {
+    pub rd: RouteDistinguisher,
+    pub esi: Esi,
+    pub etag: u32,
+    /// VNI or MPLS label (raw 24-bit value, not MPLS-shifted).
+    pub label: u32,
+}
+
+impl EthernetAutoDiscoveryRoute {
+    const LEN: usize = RouteDistinguisher::LEN + Esi::LEN + 4 + 3;
+
+    fn decode<R: Read>(r: &mut R, route_len: usize) -> io::Result<Self> {
+        if route_len != Self::LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "EVPN Type-1: expected route_len={}, got {}",
+                    Self::LEN,
+                    route_len
+                ),
+            ));
+        }
+        let mut rd_buf = [0u8; RouteDistinguisher::LEN];
+        r.read_exact(&mut rd_buf)?;
+        let rd = RouteDistinguisher::decode(&rd_buf)?;
+        let esi = Esi::decode(r)?;
+        let etag = {
+            let mut b = [0u8; 4];
+            r.read_exact(&mut b)?;
+            u32::from_be_bytes(b)
+        };
+        let mut lb = [0u8; 3];
+        r.read_exact(&mut lb)?;
+        let label = decode_evpn_label(&lb);
+        Ok(Self {
+            rd,
+            esi,
+            etag,
+            label,
+        })
+    }
+
+    pub(crate) fn encode<B: BufMut>(&self, dst: &mut B) {
+        self.rd.encode(dst);
+        self.esi.encode(dst);
+        dst.put_u32(self.etag);
+        encode_evpn_label(self.label, dst);
+    }
+}
+
+impl fmt::Display for EthernetAutoDiscoveryRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[type-1][rd {}][esi {}][etag {}][label {}]",
+            self.rd, self.esi, self.etag, self.label
+        )
+    }
 }
 
 /// Type-2: MAC/IP Advertisement route (RFC 7432 §7.2).
@@ -945,6 +1022,101 @@ mod tests {
         let mut buf = Vec::new();
         nlri.encode(&mut buf);
         assert_eq!(buf, GOBGP_TYPE5_IPV6);
+    }
+
+    // -----------------------------------------------------------------------
+    // Type-1 (Ethernet Auto-Discovery) roundtrip and wire tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn type1_roundtrip() {
+        let nlri = EvpnNlri::EthernetAutoDiscovery(EthernetAutoDiscoveryRoute {
+            rd: rd_two_octet(65000, 1),
+            esi: Esi::ZERO,
+            etag: 0xffff_ffff,
+            label: 0,
+        });
+        assert_eq!(roundtrip(&nlri), nlri);
+    }
+
+    #[test]
+    fn type1_wire_length() {
+        // RD(8)+ESI(10)+ETag(4)+Label(3) = 25 bytes
+        let ead = EthernetAutoDiscoveryRoute {
+            rd: rd_two_octet(1, 1),
+            esi: Esi::ZERO,
+            etag: 0,
+            label: 100,
+        };
+        let mut buf = Vec::new();
+        ead.encode(&mut buf);
+        assert_eq!(buf.len(), 25);
+    }
+
+    // Type-1: RD=TwoOctetAS(100,100), ESI=zeros, ETag=0xFFFFFFFF (mass-withdraw), label=0
+    // route_len = 25 bytes
+    #[rustfmt::skip]
+    const GOBGP_TYPE1_MASS_WITHDRAW: &[u8] = &[
+        0x01, 0x19,                                     // type=1, len=25
+        0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x64, // RD TwoOctetAS(100,100)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // ESI zeros (first 6)
+        0x00, 0x00, 0x00, 0x00,                         // ESI zeros (last 4)
+        0xff, 0xff, 0xff, 0xff,                         // ETag = 0xFFFFFFFF (mass withdraw)
+        0x00, 0x00, 0x00,                               // label = 0 (raw)
+    ];
+
+    // Type-1: RD=FourOctetAS(5,6), ESI=zeros, ETag=3, label=200
+    // route_len = 25 bytes
+    #[rustfmt::skip]
+    const GOBGP_TYPE1_WITH_LABEL: &[u8] = &[
+        0x01, 0x19,                                     // type=1, len=25
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x05, 0x00, 0x06, // RD FourOctetAS(5,6)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // ESI zeros (first 6)
+        0x00, 0x00, 0x00, 0x00,                         // ESI zeros (last 4)
+        0x00, 0x00, 0x00, 0x03,                         // ETag = 3
+        0x00, 0x00, 0xc8,                               // label = 200 (raw)
+    ];
+
+    #[test]
+    fn gobgp_type1_mass_withdraw_decode() {
+        let nlri = gobgp_decode(GOBGP_TYPE1_MASS_WITHDRAW);
+        let r = match &nlri {
+            EvpnNlri::EthernetAutoDiscovery(r) => r,
+            _ => panic!("expected EthernetAutoDiscovery"),
+        };
+        assert_eq!(r.rd, rd_two_octet(100, 100));
+        assert_eq!(r.esi, Esi::ZERO);
+        assert_eq!(r.etag, 0xffff_ffff);
+        assert_eq!(r.label, 0);
+    }
+
+    #[test]
+    fn gobgp_type1_mass_withdraw_roundtrip() {
+        let nlri = gobgp_decode(GOBGP_TYPE1_MASS_WITHDRAW);
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, GOBGP_TYPE1_MASS_WITHDRAW);
+    }
+
+    #[test]
+    fn gobgp_type1_with_label_decode() {
+        let nlri = gobgp_decode(GOBGP_TYPE1_WITH_LABEL);
+        let r = match &nlri {
+            EvpnNlri::EthernetAutoDiscovery(r) => r,
+            _ => panic!("expected EthernetAutoDiscovery"),
+        };
+        assert_eq!(r.rd, rd_four_octet(5, 6));
+        assert_eq!(r.esi, Esi::ZERO);
+        assert_eq!(r.etag, 3);
+        assert_eq!(r.label, 200);
+    }
+
+    #[test]
+    fn gobgp_type1_with_label_roundtrip() {
+        let nlri = gobgp_decode(GOBGP_TYPE1_WITH_LABEL);
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, GOBGP_TYPE1_WITH_LABEL);
     }
 
     // -----------------------------------------------------------------------

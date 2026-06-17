@@ -317,6 +317,16 @@ fn parse_mac(s: &str) -> Result<[u8; 6], Error> {
 fn evpn_nlri_to_api(n: &packet::evpn::EvpnNlri) -> api::Nlri {
     use packet::evpn::EvpnNlri;
     match n {
+        EvpnNlri::EthernetAutoDiscovery(r) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnEthernetAd(
+                api::EvpnEthernetAutoDiscoveryRoute {
+                    rd: Some(rd_to_api(&r.rd)),
+                    esi: Some(esi_to_api(&r.esi)),
+                    ethernet_tag: r.etag,
+                    label: r.label,
+                },
+            )),
+        },
         EvpnNlri::MacIpAdvertisement(m) => {
             let mac = m.mac;
             let mac_str = format!(
@@ -2195,6 +2205,25 @@ pub(crate) fn net_from_api(n: api::Nlri, family: Family) -> Result<Nlri, Error> 
                 color: n.color,
                 endpoint,
             }))
+        }
+        Some(api::nlri::Nlri::EvpnEthernetAd(r)) => {
+            use packet::evpn::{EthernetAutoDiscoveryRoute, EvpnNlri};
+            let rd =
+                rd_from_api(r.rd.as_ref().ok_or_else(|| {
+                    Error::InvalidArgument("missing RD in EVPN EAD".to_string())
+                })?)?;
+            let esi =
+                esi_from_api(r.esi.as_ref().ok_or_else(|| {
+                    Error::InvalidArgument("missing ESI in EVPN EAD".to_string())
+                })?)?;
+            Ok(Nlri::Evpn(EvpnNlri::EthernetAutoDiscovery(
+                EthernetAutoDiscoveryRoute {
+                    rd,
+                    esi,
+                    etag: r.ethernet_tag,
+                    label: r.label,
+                },
+            )))
         }
         Some(api::nlri::Nlri::EvpnMacadv(r)) => {
             use packet::evpn::{EvpnNlri, MacIpAdvertisement};
@@ -6539,5 +6568,74 @@ bgp-actions.set-next-hop = "self"
             )),
         };
         assert!(net_from_api(nlri_api, Family::L2VPN_EVPN).is_err());
+    }
+
+    #[test]
+    fn evpn_ead_roundtrip() {
+        use packet::evpn::EvpnNlri;
+        let nlri_api = api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnEthernetAd(
+                api::EvpnEthernetAutoDiscoveryRoute {
+                    rd: Some(api::RouteDistinguisher {
+                        rd: Some(api::route_distinguisher::Rd::TwoOctetAsn(
+                            api::RouteDistinguisherTwoOctetAsn {
+                                admin: 100,
+                                assigned: 100,
+                            },
+                        )),
+                    }),
+                    esi: Some(api::EthernetSegmentIdentifier {
+                        r#type: 0,
+                        value: vec![0u8; 9],
+                    }),
+                    ethernet_tag: 0xffff_ffff,
+                    label: 0,
+                },
+            )),
+        };
+        let nlri = net_from_api(nlri_api, Family::L2VPN_EVPN).unwrap();
+        let back = nlri_to_api(&nlri);
+        if let packet::Nlri::Evpn(EvpnNlri::EthernetAutoDiscovery(r)) = &nlri {
+            assert_eq!(r.etag, 0xffff_ffff);
+            assert_eq!(r.label, 0);
+        } else {
+            panic!("expected EthernetAutoDiscovery");
+        }
+        assert!(matches!(
+            back.nlri,
+            Some(api::nlri::Nlri::EvpnEthernetAd(_))
+        ));
+    }
+
+    #[test]
+    fn evpn_ead_with_label_roundtrip() {
+        use packet::evpn::EvpnNlri;
+        let nlri_api = api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnEthernetAd(
+                api::EvpnEthernetAutoDiscoveryRoute {
+                    rd: Some(api::RouteDistinguisher {
+                        rd: Some(api::route_distinguisher::Rd::FourOctetAsn(
+                            api::RouteDistinguisherFourOctetAsn {
+                                admin: 5,
+                                assigned: 6,
+                            },
+                        )),
+                    }),
+                    esi: Some(api::EthernetSegmentIdentifier {
+                        r#type: 0,
+                        value: vec![0u8; 9],
+                    }),
+                    ethernet_tag: 3,
+                    label: 200,
+                },
+            )),
+        };
+        let nlri = net_from_api(nlri_api, Family::L2VPN_EVPN).unwrap();
+        if let packet::Nlri::Evpn(EvpnNlri::EthernetAutoDiscovery(r)) = &nlri {
+            assert_eq!(r.etag, 3);
+            assert_eq!(r.label, 200);
+        } else {
+            panic!("expected EthernetAutoDiscovery");
+        }
     }
 }
