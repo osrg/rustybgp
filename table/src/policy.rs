@@ -3405,4 +3405,68 @@ mod tests {
         );
         assert_eq!(d, Disposition::Accept);
     }
+
+    // --- apply_import ---
+
+    fn import_source(addr: u8) -> Arc<Source> {
+        Arc::new(Source::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, addr)),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            65001,
+            65000,
+            Ipv4Addr::new(10, 0, 0, addr),
+            PeerRole::Ebgp,
+        ))
+    }
+
+    fn reject_all_import_policy() -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(DefinedSetConfig::Prefix {
+                name: "all".to_string(),
+                prefixes: vec![PrefixConfig {
+                    ip_prefix: "0.0.0.0/0".to_string(),
+                    mask_length_min: 0,
+                    mask_length_max: 32,
+                }],
+            })
+            .unwrap();
+        ptable
+            .add_statement(
+                "reject-all",
+                vec![ConditionConfig::PrefixSet(
+                    "all".to_string(),
+                    MatchOption::Any,
+                )],
+                Some(Disposition::Reject),
+                Actions::default(),
+            )
+            .unwrap();
+        ptable
+            .add_policy("reject-policy", vec!["reject-all".to_string()])
+            .unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Import,
+                Disposition::Accept,
+                vec!["reject-policy".to_string()],
+            )
+            .unwrap();
+        assignment
+    }
+
+    #[test]
+    fn apply_import_rejected_by_policy() {
+        use rustybgp_packet as packet;
+        let policy = reject_all_import_policy();
+        let attrs = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+        ]);
+        let mut nh = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let net = "10.0.0.0/24".parse().unwrap();
+        let src = import_source(1);
+        let (filtered, _) = apply_import(&policy, None, &src, &net, &attrs, &mut nh);
+        assert!(filtered);
+    }
 }

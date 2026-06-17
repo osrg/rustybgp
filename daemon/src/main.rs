@@ -26,7 +26,6 @@ mod fsm;
 mod gr;
 mod mrt;
 mod peer_tx;
-mod policy;
 mod proto;
 mod rpki;
 mod table_manager;

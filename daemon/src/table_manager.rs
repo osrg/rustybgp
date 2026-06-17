@@ -341,6 +341,7 @@ impl TableManager {
     /// Re-applies the current import policy to all non-stale paths from `peer`
     /// across every shard and distributes any routing changes to peers.
     pub(crate) fn soft_reset_in(&self, peer: IpAddr) {
+        let rpki = self.rpki.read().unwrap();
         let import_policy = self.import_policy.load_full();
         let kernel_handle = self.kernel_handle.load_full();
         let nht_set = self.nexthop_invalid.load_full();
@@ -349,6 +350,7 @@ impl TableManager {
             t.soft_reset_in(
                 peer,
                 import_policy.as_deref(),
+                Some(&*rpki),
                 kernel_handle.as_deref(),
                 &nht_set,
             );
@@ -1012,6 +1014,7 @@ impl TableShard {
         &mut self,
         peer: std::net::IpAddr,
         import_policy: Option<&table::PolicyAssignment>,
+        rpki: Option<&table::RpkiTable>,
         kernel_handle: Option<&kernel::KernelHandle>,
         nexthop_invalid: &FnvHashSet<IpAddr>,
     ) {
@@ -1020,8 +1023,11 @@ impl TableShard {
             let old_nh =
                 self.rtable
                     .lookup_nexthop(source.remote_addr, family, &net, remote_path_id);
-            let (filtered, post_policy_attr) =
-                crate::policy::apply_import(import_policy, &source, &net, &original_attr, &mut nh);
+            let (filtered, post_policy_attr) = if let Some(policy) = import_policy {
+                table::apply_import(policy, rpki, &source, &net, &original_attr, &mut nh)
+            } else {
+                (false, Arc::clone(&original_attr))
+            };
             let nexthop_invalid_flag = nh.is_some_and(|n| nexthop_invalid.contains(&n.addr()));
             // Propagate policy-induced nexthop change into NHT tracking.
             if !source.is_kernel()
