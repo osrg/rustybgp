@@ -608,6 +608,8 @@ pub enum NexthopAction {
     Address(IpAddr),
     /// Set nexthop to self (the local router's address).
     PeerSelf,
+    /// Set nexthop to the peer's address.
+    PeerAddress,
     /// Leave nexthop unchanged.
     Unchanged,
 }
@@ -814,6 +816,12 @@ impl Statement {
                 }
                 NexthopAction::PeerSelf => {
                     *nexthop = Some(match local_addr {
+                        IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
+                        IpAddr::V6(v6) => bgp::Nexthop::V6(v6),
+                    });
+                }
+                NexthopAction::PeerAddress => {
+                    *nexthop = Some(match peer_addr {
                         IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
                         IpAddr::V6(v6) => bgp::Nexthop::V6(v6),
                     });
@@ -3466,6 +3474,64 @@ mod tests {
             )
             .unwrap();
         assignment
+    }
+
+    fn make_nexthop_assignment(nh_action: NexthopAction) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![],
+                Some(Disposition::Accept),
+                Actions {
+                    nexthop: Some(nh_action),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        let (_, assignment) = ptable
+            .add_assignment(
+                "ribs",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+        assignment
+    }
+
+    #[test]
+    fn nexthop_peer_address_action() {
+        let peer_addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let assignment = make_nexthop_assignment(NexthopAction::PeerAddress);
+
+        let s = Arc::new(Source::new(
+            peer_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
+            65001,
+            65000,
+            Ipv4Addr::new(0, 0, 0, 1),
+            PeerRole::Ebgp,
+        ));
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = nh(); // original nexthop: 10.0.0.1
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+            None,
+        );
+        assert_eq!(
+            nexthop,
+            Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1))),
+            "nexthop should be set to peer address"
+        );
     }
 
     #[test]

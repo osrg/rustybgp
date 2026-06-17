@@ -3504,6 +3504,12 @@ pub(crate) fn statement_to_api(my: &rustybgp_table::Statement) -> api::Statement
                 unchanged: false,
                 peer_address: false,
             },
+            NexthopAction::PeerAddress => api::NexthopAction {
+                address: String::new(),
+                self_: false,
+                unchanged: false,
+                peer_address: true,
+            },
             NexthopAction::Unchanged => api::NexthopAction {
                 address: String::new(),
                 self_: false,
@@ -4021,6 +4027,8 @@ pub(crate) fn disposition_from_api(
     let nexthop = actions.nexthop.and_then(|nh| {
         if nh.self_ {
             Some(NexthopAction::PeerSelf)
+        } else if nh.peer_address {
+            Some(NexthopAction::PeerAddress)
         } else if nh.unchanged {
             Some(NexthopAction::Unchanged)
         } else if !nh.address.is_empty() {
