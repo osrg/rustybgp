@@ -68,6 +68,7 @@ RUSTYBGP_DOCKERFILE=Dockerfile \
 | `graceful-restart-restarting` | Graceful Restart — restarting speaker | RFC 4724 |
 | `route-reflector` | Route Reflector | RFC 4456 |
 | `route-server` | BGP Route Server | RFC 7947 |
+| `link-state` | BGP-LS (Node, Link, PrefixV4 NLRIs + BGP-LS attribute) | RFC 7752 |
 | `rpki` | RPKI Route Origin Validation | RFC 6811, RFC 8210 |
 | `sr-policy` | SR Policy (IPv4, MPLS binding SID, segment list) | RFC 9830 |
 

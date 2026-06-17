@@ -1,0 +1,73 @@
+networks:
+  left-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.7.0/24
+          gateway: 172.30.7.254
+
+  right-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.8.0/24
+          gateway: 172.30.8.254
+
+services:
+  # GoBGP A (AS 65002): injects BGP-LS NLRIs, peers with rustybgp on left-net
+  gobgp-a:
+    build:
+      context: ../shared
+      dockerfile: Dockerfile.gobgp
+    container_name: gobgp-a
+    privileged: true
+    volumes:
+      - ./gobgp-a/gobgpd.conf:/etc/gobgpd.conf:ro
+    command: ["-f", "/etc/gobgpd.conf"]
+    networks:
+      left-net:
+        ipv4_address: 172.30.7.2
+
+  # rustybgp (AS 65001): relays BGP-LS NLRIs between gobgp-a and gobgp-b
+  router-rusty:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: router-rusty
+    privileged: true
+    networks:
+      left-net:
+        ipv4_address: 172.30.7.1
+      right-net:
+        ipv4_address: 172.30.8.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+
+  # GoBGP B (AS 65003): receives BGP-LS NLRIs from rustybgp on right-net
+  gobgp-b:
+    build:
+      context: ../shared
+      dockerfile: Dockerfile.gobgp
+    container_name: gobgp-b
+    privileged: true
+    volumes:
+      - ./gobgp-b/gobgpd.conf:/etc/gobgpd.conf:ro
+    command: ["-f", "/etc/gobgpd.conf"]
+    networks:
+      right-net:
+        ipv4_address: 172.30.8.2
+
+  # Go gRPC tools: ls-inject and ls-verify binaries for NLRI injection and verification
+  tools:
+    build:
+      context: ./tools
+      dockerfile: Dockerfile
+    container_name: ls-tools
+    networks:
+      left-net:
+        ipv4_address: 172.30.7.4
+      right-net:
+        ipv4_address: 172.30.8.4
