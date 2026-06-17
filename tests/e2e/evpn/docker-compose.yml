@@ -1,0 +1,75 @@
+networks:
+  left-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.5.0/24
+          gateway: 172.30.5.254
+
+  right-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.6.0/24
+          gateway: 172.30.6.254
+
+services:
+  # GoBGP A (AS 65002): injects EVPN Types 1-5, peers with rustybgp
+  gobgp-a:
+    build:
+      context: ../shared
+      dockerfile: Dockerfile.gobgp
+    container_name: gobgp-a
+    privileged: true
+    volumes:
+      - ./gobgp-a/gobgpd.conf:/etc/gobgpd.conf:ro
+    command: ["-f", "/etc/gobgpd.conf"]
+    networks:
+      left-net:
+        ipv4_address: 172.30.5.2
+
+  # GoBGP C (AS 65004): injects same Type-5 NLRI as gobgp-a for AddPath test
+  gobgp-c:
+    build:
+      context: ../shared
+      dockerfile: Dockerfile.gobgp
+    container_name: gobgp-c
+    privileged: true
+    volumes:
+      - ./gobgp-c/gobgpd.conf:/etc/gobgpd.conf:ro
+    command: ["-f", "/etc/gobgpd.conf"]
+    networks:
+      left-net:
+        ipv4_address: 172.30.5.3
+
+  # rustybgp (AS 65001): relays EVPN routes; sends up to 2 paths via AddPath to gobgp-b
+  router-rusty:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: router-rusty
+    privileged: true
+    networks:
+      left-net:
+        ipv4_address: 172.30.5.1
+      right-net:
+        ipv4_address: 172.30.6.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+
+  # GoBGP B (AS 65003): receives EVPN routes from rustybgp via AddPath
+  gobgp-b:
+    build:
+      context: ../shared
+      dockerfile: Dockerfile.gobgp
+    container_name: gobgp-b
+    privileged: true
+    volumes:
+      - ./gobgp-b/gobgpd.conf:/etc/gobgpd.conf:ro
+    command: ["-f", "/etc/gobgpd.conf"]
+    networks:
+      right-net:
+        ipv4_address: 172.30.6.2

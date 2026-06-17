@@ -1,0 +1,38 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.5.1"
+
+neighbors:
+  # gobgp-a (AS 65002): sender 1, enable AddPath receive for EVPN
+  - config:
+      neighbor-address: "172.30.5.2"
+      peer-as: 65002
+    afi-safis:
+      - config:
+          afi-safi-name: l2vpn-evpn
+        add-paths:
+          config:
+            receive: true
+
+  # gobgp-c (AS 65004): sender 2, same Type-5 NLRI for AddPath test
+  - config:
+      neighbor-address: "172.30.5.3"
+      peer-as: 65004
+    afi-safis:
+      - config:
+          afi-safi-name: l2vpn-evpn
+        add-paths:
+          config:
+            receive: true
+
+  # gobgp-b (AS 65003): receiver, sends up to 2 paths via AddPath
+  - config:
+      neighbor-address: "172.30.6.2"
+      peer-as: 65003
+    afi-safis:
+      - config:
+          afi-safi-name: l2vpn-evpn
+        add-paths:
+          config:
+            send-max: 2
