@@ -891,6 +891,69 @@ fn nlri_decode_unsupported_family() {
     assert!(Nlri::decode(Family::IPV4_MUP, &mut c, len, true).is_err());
 }
 
+#[cfg(test)]
+fn build_update_with_attr(attr_type: u8, attr_value: &[u8]) -> Vec<u8> {
+    // flags: 0x80 = optional, non-transitive (correct for both MP_REACH and MP_UNREACH)
+    let mut attr = Vec::new();
+    attr.push(0x80u8);
+    attr.push(attr_type);
+    attr.push(attr_value.len() as u8);
+    attr.extend_from_slice(attr_value);
+
+    let attr_len = attr.len() as u16;
+
+    // BGP message: marker(16) + length(2) + type(1) + withdrawn_len(2) + attr_len(2) + attr(N)
+    let total_len = (16u16 + 2 + 1 + 2 + 2 + attr_len).to_be_bytes();
+
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&[0xFF; 16]);
+    msg.extend_from_slice(&total_len);
+    msg.push(0x02); // UPDATE
+    msg.extend_from_slice(&[0x00, 0x00]); // withdrawn_len=0
+    msg.extend_from_slice(&attr_len.to_be_bytes());
+    msg.extend_from_slice(&attr);
+    msg
+}
+
+#[test]
+fn parse_message_rejects_unnegotiated_family_mp_reach() {
+    // PeerCodec with no negotiated families (empty); receiving MP_REACH_NLRI for
+    // AFI=25/SAFI=70 (L2VPN EVPN) must be rejected with UpdateMalformedAttributeList.
+    let mut codec = PeerCodec::new();
+
+    // MP_REACH_NLRI value: AFI(2) + SAFI(1) + nexthop_len(1) + nexthop(4) + reserved(1)
+    let attr_value = [
+        0x00, 0x19, // AFI=25 (L2VPN)
+        0x46, // SAFI=70 (EVPN)
+        0x04, // nexthop_len=4
+        0xc0, 0xa8, 0x01, 0x01, // nexthop
+        0x00, // reserved
+    ];
+    let msg = build_update_with_attr(0x0E, &attr_value);
+    assert_eq!(
+        codec.parse_message(&msg).err(),
+        Some(Notification::UpdateMalformedAttributeList)
+    );
+}
+
+#[test]
+fn parse_message_rejects_unnegotiated_family_mp_unreach() {
+    // PeerCodec with no negotiated families; receiving MP_UNREACH_NLRI for
+    // AFI=25/SAFI=70 (L2VPN EVPN) must be rejected with UpdateMalformedAttributeList.
+    let mut codec = PeerCodec::new();
+
+    // MP_UNREACH_NLRI value: AFI(2) + SAFI(1)
+    let attr_value = [
+        0x00, 0x19, // AFI=25 (L2VPN)
+        0x46, // SAFI=70 (EVPN)
+    ];
+    let msg = build_update_with_attr(0x0F, &attr_value);
+    assert_eq!(
+        codec.parse_message(&msg).err(),
+        Some(Notification::UpdateMalformedAttributeList)
+    );
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Capability {
     MultiProtocol(Family),
