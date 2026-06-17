@@ -224,3 +224,25 @@ jobs:
           RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
           RUSTYBGP_DOCKERFILE: Dockerfile
         run: ./run-test.sh
+
+  e2e-sr-policy:
+    name: SR Policy (RFC 9830)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run SR Policy e2e test
+        working-directory: tests/e2e/sr-policy
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh

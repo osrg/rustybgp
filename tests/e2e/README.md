@@ -69,6 +69,7 @@ RUSTYBGP_DOCKERFILE=Dockerfile \
 | `route-reflector` | Route Reflector | RFC 4456 |
 | `route-server` | BGP Route Server | RFC 7947 |
 | `rpki` | RPKI Route Origin Validation | RFC 6811, RFC 8210 |
+| `sr-policy` | SR Policy (IPv4, MPLS binding SID, segment list) | RFC 9830 |
 
 ## Shared infrastructure
 
