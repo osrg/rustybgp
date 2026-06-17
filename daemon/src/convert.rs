@@ -3854,6 +3854,19 @@ fn parse_community_value(s: &str) -> Option<u32> {
 }
 
 fn parse_ext_community_value(s: &str) -> Option<[u8; 8]> {
+    if let Some(r) = s.strip_prefix("validation:") {
+        let state: u8 = match r {
+            "valid" => 0,
+            "not-found" => 1,
+            "invalid" => 2,
+            _ => return None,
+        };
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0x43; // Non-Transitive Opaque
+        bytes[1] = 0x00; // BGP Origin Validation State (RFC 8097)
+        bytes[7] = state;
+        return Some(bytes);
+    }
     if let Some(r) = s.strip_prefix("encap:") {
         let tunnel_type: u16 = r.parse().ok()?;
         let mut bytes = [0u8; 8];
@@ -6786,6 +6799,23 @@ bgp-actions.set-next-hop = "self"
     }
 
     // --- ext-community parse ---
+
+    #[test]
+    fn parse_validation_ext_community() {
+        let bytes = parse_ext_community_value("validation:valid").unwrap();
+        assert_eq!(bytes[0], 0x43); // Non-Transitive Opaque
+        assert_eq!(bytes[1], 0x00); // BGP Origin Validation State
+        assert_eq!(bytes[7], 0);
+
+        let bytes = parse_ext_community_value("validation:not-found").unwrap();
+        assert_eq!(bytes[7], 1);
+
+        let bytes = parse_ext_community_value("validation:invalid").unwrap();
+        assert_eq!(bytes[7], 2);
+
+        // Unknown state string
+        assert!(parse_ext_community_value("validation:unknown").is_none());
+    }
 
     #[test]
     fn parse_4octet_as_rt_soo() {

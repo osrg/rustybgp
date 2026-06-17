@@ -556,6 +556,15 @@ fn ext_community_to_string(c: &[u8; 8]) -> Option<String> {
             let bw = f32::from_bits(u32::from_be_bytes([c[4], c[5], c[6], c[7]]));
             Some(format!("lb:{}:{}", asn, bw))
         }
+        (0x43, 0x00) => {
+            let state = match c[7] {
+                0 => "valid",
+                1 => "not-found",
+                2 => "invalid",
+                _ => return None,
+            };
+            Some(format!("validation:{}", state))
+        }
         _ => None,
     }
 }
@@ -3614,6 +3623,31 @@ mod tests {
         let mut bad = make(65001, 100.0);
         bad[1] = 0x05;
         assert_eq!(ext_community_to_string(&bad), None);
+    }
+
+    #[test]
+    fn ext_community_validation_to_string() {
+        let make = |state: u8| -> [u8; 8] {
+            let mut c = [0u8; 8];
+            c[0] = 0x43;
+            c[1] = 0x00;
+            c[7] = state;
+            c
+        };
+        assert_eq!(
+            ext_community_to_string(&make(0)),
+            Some("validation:valid".to_string())
+        );
+        assert_eq!(
+            ext_community_to_string(&make(1)),
+            Some("validation:not-found".to_string())
+        );
+        assert_eq!(
+            ext_community_to_string(&make(2)),
+            Some("validation:invalid".to_string())
+        );
+        // Unknown state value -> None
+        assert_eq!(ext_community_to_string(&make(3)), None);
     }
 
     #[test]
