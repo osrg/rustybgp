@@ -2180,9 +2180,9 @@ impl PeerCodec {
         // SNPA padding
         dst.put_u8(0);
         let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
-        // EVPN NLRIs are up to 54 bytes (Type-2 with IPv6 + 2 labels: 2+52).
+        // EVPN NLRIs are up to 60 bytes (Type-5 with IPv6: 2+58).
         let max_len = if *family == Family::L2VPN_EVPN {
-            54 + if addpath { 4 } else { 0 }
+            60 + if addpath { 4 } else { 0 }
         } else {
             1 + 16 + if addpath { 4 } else { 0 }
         };

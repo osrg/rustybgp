@@ -56,18 +56,21 @@ impl fmt::Display for Esi {
     }
 }
 
-/// EVPN NLRI variants (RFC 7432).
+/// EVPN NLRI variants (RFC 7432 / RFC 9136).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EvpnNlri {
     /// Type-2: MAC/IP Advertisement route (RFC 7432 §7.2).
     MacIpAdvertisement(MacIpAdvertisement),
     /// Type-3: Inclusive Multicast Ethernet Tag route (RFC 7432 §7.3).
     InclusiveMulticastEthernetTag(InclusiveMulticastEthernetTag),
+    /// Type-5: IP Prefix route (RFC 9136 §5).
+    EthernetIpPrefix(EthernetIpPrefixRoute),
 }
 
 impl EvpnNlri {
     const TYPE_MAC_IP: u8 = 2;
     const TYPE_IMET: u8 = 3;
+    const TYPE_IP_PREFIX: u8 = 5;
 
     /// Decode one EVPN route from `r`.  Consumes exactly 2 + route_len bytes.
     pub fn decode<R: Read>(r: &mut R) -> io::Result<Self> {
@@ -79,6 +82,9 @@ impl EvpnNlri {
             }
             Self::TYPE_IMET => InclusiveMulticastEthernetTag::decode(r, route_len)
                 .map(EvpnNlri::InclusiveMulticastEthernetTag),
+            Self::TYPE_IP_PREFIX => {
+                EthernetIpPrefixRoute::decode(r, route_len).map(EvpnNlri::EthernetIpPrefix)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported EVPN route type {route_type}"),
@@ -98,6 +104,10 @@ impl EvpnNlri {
                 n.encode(&mut data);
                 dst.put_u8(Self::TYPE_IMET);
             }
+            EvpnNlri::EthernetIpPrefix(n) => {
+                n.encode(&mut data);
+                dst.put_u8(Self::TYPE_IP_PREFIX);
+            }
         }
         dst.put_u8(data.len() as u8);
         dst.put_slice(&data);
@@ -109,6 +119,7 @@ impl fmt::Display for EvpnNlri {
         match self {
             EvpnNlri::MacIpAdvertisement(n) => n.fmt(f),
             EvpnNlri::InclusiveMulticastEthernetTag(n) => n.fmt(f),
+            EvpnNlri::EthernetIpPrefix(n) => n.fmt(f),
         }
     }
 }
@@ -354,6 +365,120 @@ impl fmt::Display for InclusiveMulticastEthernetTag {
             f,
             "[type-3][rd {}][etag {}][ip {}]",
             self.rd, self.etag, self.originating_router_ip,
+        )
+    }
+}
+
+/// Type-5: IP Prefix route (RFC 9136 §5).
+///
+/// Wire layout (route_len bytes):
+///   8  RD, 10  ESI, 4  Ethernet Tag (ETag)
+///   1  IP Prefix Length (bits), 4 or 16  IP Prefix
+///   4 or 16  Gateway IP (0.0.0.0 / :: means "no gateway")
+///   3  Label (24-bit raw big-endian VNI/label)
+///
+/// IP family (IPv4 vs IPv6) is inferred from route_len:
+///   34 bytes → IPv4 (4-byte prefix + 4-byte GW)
+///   58 bytes → IPv6 (16-byte prefix + 16-byte GW)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EthernetIpPrefixRoute {
+    pub rd: RouteDistinguisher,
+    pub esi: Esi,
+    pub etag: u32,
+    pub ip_prefix: IpAddr,
+    pub prefix_len: u8,
+    /// Gateway IP within the EVPN fabric; use 0.0.0.0 / :: when none.
+    pub gateway_ip: IpAddr,
+    /// VNI or MPLS label (raw 24-bit value, not MPLS-shifted).
+    pub label: u32,
+}
+
+impl EthernetIpPrefixRoute {
+    const LEN_IPV4: usize = RouteDistinguisher::LEN + Esi::LEN + 4 + 1 + 4 + 4 + 3;
+    const LEN_IPV6: usize = RouteDistinguisher::LEN + Esi::LEN + 4 + 1 + 16 + 16 + 3;
+
+    pub fn decode<R: Read>(r: &mut R, route_len: usize) -> io::Result<Self> {
+        let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed EVPN Type-5");
+        let is_ipv6 = match route_len {
+            Self::LEN_IPV4 => false,
+            Self::LEN_IPV6 => true,
+            _ => return Err(malformed()),
+        };
+
+        let mut rd_buf = [0u8; RouteDistinguisher::LEN];
+        r.read_exact(&mut rd_buf)?;
+        let rd = RouteDistinguisher::decode(&rd_buf)?;
+
+        let esi = Esi::decode(r)?;
+
+        let etag = {
+            let mut b = [0u8; 4];
+            r.read_exact(&mut b)?;
+            u32::from_be_bytes(b)
+        };
+
+        let prefix_len = r.read_u8()?;
+
+        let (ip_prefix, gateway_ip) = if is_ipv6 {
+            let mut p = [0u8; 16];
+            r.read_exact(&mut p)?;
+            let mut g = [0u8; 16];
+            r.read_exact(&mut g)?;
+            (IpAddr::V6(Ipv6Addr::from(p)), IpAddr::V6(Ipv6Addr::from(g)))
+        } else {
+            let mut p = [0u8; 4];
+            r.read_exact(&mut p)?;
+            let mut g = [0u8; 4];
+            r.read_exact(&mut g)?;
+            (IpAddr::V4(Ipv4Addr::from(p)), IpAddr::V4(Ipv4Addr::from(g)))
+        };
+
+        let mut l = [0u8; 3];
+        r.read_exact(&mut l)?;
+        let label = decode_evpn_label(&l);
+
+        Ok(EthernetIpPrefixRoute {
+            rd,
+            esi,
+            etag,
+            ip_prefix,
+            prefix_len,
+            gateway_ip,
+            label,
+        })
+    }
+
+    pub fn encode<B: BufMut>(&self, dst: &mut B) {
+        self.rd.encode(dst);
+        self.esi.encode(dst);
+        dst.put_u32(self.etag);
+        dst.put_u8(self.prefix_len);
+        match self.ip_prefix {
+            IpAddr::V4(v4) => {
+                dst.put_slice(&v4.octets());
+                match self.gateway_ip {
+                    IpAddr::V4(gw) => dst.put_slice(&gw.octets()),
+                    IpAddr::V6(_) => dst.put_slice(&[0u8; 4]),
+                }
+            }
+            IpAddr::V6(v6) => {
+                dst.put_slice(&v6.octets());
+                match self.gateway_ip {
+                    IpAddr::V6(gw) => dst.put_slice(&gw.octets()),
+                    IpAddr::V4(_) => dst.put_slice(&[0u8; 16]),
+                }
+            }
+        }
+        encode_evpn_label(self.label, dst);
+    }
+}
+
+impl fmt::Display for EthernetIpPrefixRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[type-5][rd {}][etag {}][prefix {}/{}][gw {}][label {}]",
+            self.rd, self.etag, self.ip_prefix, self.prefix_len, self.gateway_ip, self.label,
         )
     }
 }
@@ -674,6 +799,152 @@ mod tests {
         let mut buf = Vec::new();
         nlri.encode(&mut buf);
         assert_eq!(buf, GOBGP_TYPE3_IPV4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Type-5 (IP Prefix route) roundtrip and wire tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn type5_ipv4_roundtrip() {
+        let nlri = EvpnNlri::EthernetIpPrefix(EthernetIpPrefixRoute {
+            rd: rd_two_octet(65000, 1),
+            esi: Esi::ZERO,
+            etag: 0,
+            ip_prefix: "192.168.0.0".parse().unwrap(),
+            prefix_len: 24,
+            gateway_ip: "192.168.0.1".parse().unwrap(),
+            label: 100,
+        });
+        assert_eq!(roundtrip(&nlri), nlri);
+    }
+
+    #[test]
+    fn type5_ipv6_roundtrip() {
+        let nlri = EvpnNlri::EthernetIpPrefix(EthernetIpPrefixRoute {
+            rd: rd_four_octet(5, 6),
+            esi: Esi::ZERO,
+            etag: 0,
+            ip_prefix: "2001:db8::".parse().unwrap(),
+            prefix_len: 64,
+            gateway_ip: "::".parse().unwrap(),
+            label: 200,
+        });
+        assert_eq!(roundtrip(&nlri), nlri);
+    }
+
+    #[test]
+    fn type5_wire_lengths() {
+        // IPv4: RD(8)+ESI(10)+ETag(4)+IPLen(1)+IPv4(4)+GW(4)+Label(3) = 34
+        let v4 = EthernetIpPrefixRoute {
+            rd: rd_two_octet(1, 1),
+            esi: Esi::ZERO,
+            etag: 0,
+            ip_prefix: "10.0.0.0".parse().unwrap(),
+            prefix_len: 8,
+            gateway_ip: "0.0.0.0".parse().unwrap(),
+            label: 100,
+        };
+        let mut buf = Vec::new();
+        v4.encode(&mut buf);
+        assert_eq!(buf.len(), 34);
+
+        // IPv6: RD(8)+ESI(10)+ETag(4)+IPLen(1)+IPv6(16)+GW(16)+Label(3) = 58
+        let v6 = EthernetIpPrefixRoute {
+            rd: rd_two_octet(1, 1),
+            esi: Esi::ZERO,
+            etag: 0,
+            ip_prefix: "2001:db8::".parse().unwrap(),
+            prefix_len: 48,
+            gateway_ip: "::".parse().unwrap(),
+            label: 100,
+        };
+        buf.clear();
+        v6.encode(&mut buf);
+        assert_eq!(buf.len(), 58);
+    }
+
+    // Type-5: RD=TwoOctetAS(100,100), ESI=zeros, ETag=0,
+    //         prefix=10.10.10.0/24, GW=10.10.10.1, label=200
+    // route_len = 34 bytes (IPv4)
+    // Label uses raw 24-bit big-endian (consistent with Type-2/3).
+    #[rustfmt::skip]
+    const GOBGP_TYPE5_IPV4: &[u8] = &[
+        0x05, 0x22,                                     // type=5, len=34
+        0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x64, // RD TwoOctetAS(100,100)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // ESI zeros (first 6)
+        0x00, 0x00, 0x00, 0x00,                         // ESI zeros (last 4)
+        0x00, 0x00, 0x00, 0x00,                         // ETag = 0
+        0x18,                                           // prefix_len = 24
+        0x0a, 0x0a, 0x0a, 0x00,                         // prefix = 10.10.10.0
+        0x0a, 0x0a, 0x0a, 0x01,                         // GW = 10.10.10.1
+        0x00, 0x00, 0xc8,                               // label = 200 (raw)
+    ];
+
+    // Type-5: RD=FourOctetAS(5,6), ESI=zeros, ETag=3,
+    //         prefix=2001:db8::/64, GW=::, label=3
+    // route_len = 58 bytes (IPv6)
+    #[rustfmt::skip]
+    const GOBGP_TYPE5_IPV6: &[u8] = &[
+        0x05, 0x3a,                                     // type=5, len=58
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x05, 0x00, 0x06, // RD FourOctetAS(5,6)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // ESI zeros (first 6)
+        0x00, 0x00, 0x00, 0x00,                         // ESI zeros (last 4)
+        0x00, 0x00, 0x00, 0x03,                         // ETag = 3
+        0x40,                                           // prefix_len = 64
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, // prefix = 2001:db8:: (first 8)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // prefix (last 8)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // GW = :: (first 8)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // GW (last 8)
+        0x00, 0x00, 0x03,                               // label = 3 (raw)
+    ];
+
+    #[test]
+    fn gobgp_type5_ipv4_decode() {
+        let nlri = gobgp_decode(GOBGP_TYPE5_IPV4);
+        let r = match &nlri {
+            EvpnNlri::EthernetIpPrefix(r) => r,
+            _ => panic!("expected EthernetIpPrefix"),
+        };
+        assert_eq!(r.rd, rd_two_octet(100, 100));
+        assert_eq!(r.esi, Esi::ZERO);
+        assert_eq!(r.etag, 0);
+        assert_eq!(r.ip_prefix, "10.10.10.0".parse::<IpAddr>().unwrap());
+        assert_eq!(r.prefix_len, 24);
+        assert_eq!(r.gateway_ip, "10.10.10.1".parse::<IpAddr>().unwrap());
+        assert_eq!(r.label, 200);
+    }
+
+    #[test]
+    fn gobgp_type5_ipv4_roundtrip() {
+        let nlri = gobgp_decode(GOBGP_TYPE5_IPV4);
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, GOBGP_TYPE5_IPV4);
+    }
+
+    #[test]
+    fn gobgp_type5_ipv6_decode() {
+        let nlri = gobgp_decode(GOBGP_TYPE5_IPV6);
+        let r = match &nlri {
+            EvpnNlri::EthernetIpPrefix(r) => r,
+            _ => panic!("expected EthernetIpPrefix"),
+        };
+        assert_eq!(r.rd, rd_four_octet(5, 6));
+        assert_eq!(r.esi, Esi::ZERO);
+        assert_eq!(r.etag, 3);
+        assert_eq!(r.ip_prefix, "2001:db8::".parse::<IpAddr>().unwrap());
+        assert_eq!(r.prefix_len, 64);
+        assert_eq!(r.gateway_ip, "::".parse::<IpAddr>().unwrap());
+        assert_eq!(r.label, 3);
+    }
+
+    #[test]
+    fn gobgp_type5_ipv6_roundtrip() {
+        let nlri = gobgp_decode(GOBGP_TYPE5_IPV6);
+        let mut buf = Vec::new();
+        nlri.encode(&mut buf);
+        assert_eq!(buf, GOBGP_TYPE5_IPV6);
     }
 
     // -----------------------------------------------------------------------

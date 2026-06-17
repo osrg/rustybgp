@@ -349,6 +349,17 @@ fn evpn_nlri_to_api(n: &packet::evpn::EvpnNlri) -> api::Nlri {
                 },
             )),
         },
+        EvpnNlri::EthernetIpPrefix(r) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnIpPrefix(api::EvpnipPrefixRoute {
+                rd: Some(rd_to_api(&r.rd)),
+                esi: Some(esi_to_api(&r.esi)),
+                ethernet_tag: r.etag,
+                ip_prefix: r.ip_prefix.to_string(),
+                ip_prefix_len: r.prefix_len as u32,
+                gw_address: r.gateway_ip.to_string(),
+                label: r.label,
+            })),
+        },
     }
 }
 
@@ -2238,6 +2249,53 @@ pub(crate) fn net_from_api(n: api::Nlri, family: Family) -> Result<Nlri, Error> 
                     rd,
                     etag: r.ethernet_tag,
                     originating_router_ip,
+                },
+            )))
+        }
+        Some(api::nlri::Nlri::EvpnIpPrefix(r)) => {
+            use packet::evpn::{EthernetIpPrefixRoute, EvpnNlri};
+            let rd = rd_from_api(
+                r.rd.as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing rd".to_string()))?,
+            )?;
+            let esi = esi_from_api(
+                r.esi
+                    .as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing ESI".to_string()))?,
+            )?;
+            let ip_prefix = r
+                .ip_prefix
+                .parse::<std::net::IpAddr>()
+                .map_err(|e| Error::InvalidArgument(format!("invalid prefix: {}", e)))?;
+            if r.ip_prefix_len > 128 {
+                return Err(Error::InvalidArgument(format!(
+                    "prefix_len out of range: {}",
+                    r.ip_prefix_len
+                )));
+            }
+            let gateway_ip = if r.gw_address.is_empty() {
+                match ip_prefix {
+                    std::net::IpAddr::V4(_) => {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                    }
+                    std::net::IpAddr::V6(_) => {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                    }
+                }
+            } else {
+                r.gw_address
+                    .parse::<std::net::IpAddr>()
+                    .map_err(|e| Error::InvalidArgument(format!("invalid GW: {}", e)))?
+            };
+            Ok(Nlri::Evpn(EvpnNlri::EthernetIpPrefix(
+                EthernetIpPrefixRoute {
+                    rd,
+                    esi,
+                    etag: r.ethernet_tag,
+                    ip_prefix,
+                    prefix_len: r.ip_prefix_len as u8,
+                    gateway_ip,
+                    label: r.label,
                 },
             )))
         }
