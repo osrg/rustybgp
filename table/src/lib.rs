@@ -325,6 +325,40 @@ impl RibEntry {
     }
 }
 
+/// Compare two EVPN Type-2 (MAC/IP Advertisement) RibEntries.
+///
+/// MAC Mobility extended community (type=0x06, subtype=0x00) takes priority
+/// over the standard BGP best-path algorithm: the entry with the higher
+/// sequence number wins regardless of other attributes.  When one entry
+/// carries the community and the other does not, the one with mobility wins
+/// (it represents a more recent MAC move).  Equal or absent mobility falls
+/// through to the standard RibEntry ordering.
+/// Compare two EVPN Type-2 (MAC/IP Advertisement) RibEntries.
+///
+/// MAC Mobility extended community (type=0x06, subtype=0x00) takes priority
+/// over the standard BGP best-path algorithm: the entry with the higher
+/// sequence number wins regardless of other attributes.  When one entry
+/// carries the community and the other does not, the one with mobility wins
+/// (it represents a more recent MAC move).  Equal or absent mobility falls
+/// through to the standard RibEntry ordering.
+///
+/// Ordering follows the same convention as RibEntry::Ord: Less means "self
+/// is better" (sorts first in the destination list).
+fn evpn_type2_cmp(a: &RibEntry, b: &RibEntry) -> std::cmp::Ordering {
+    let a_mm = packet::evpn::mac_mobility(a.path.attr.as_ref());
+    let b_mm = packet::evpn::mac_mobility(b.path.attr.as_ref());
+    match (a_mm, b_mm) {
+        (Some((a_seq, _)), Some((b_seq, _))) => {
+            // Higher sequence is better; reverse so that a better entry sorts as Less.
+            a_seq.cmp(&b_seq).reverse().then_with(|| a.cmp(b))
+        }
+        // Entry with MAC Mobility is a more recent advertisement and wins.
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
+}
+
 impl Ord for RibEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let self_pa = PathAttribute::new(self.path.attr.clone());
@@ -1088,7 +1122,15 @@ impl Table {
             }
         }
 
-        let idx = dst.entry.partition_point(|a| entry.cmp(a).is_ge());
+        let idx = if matches!(
+            &net,
+            packet::Nlri::Evpn(packet::evpn::EvpnNlri::MacIpAdvertisement(_))
+        ) {
+            dst.entry
+                .partition_point(|a| evpn_type2_cmp(&entry, a).is_ge())
+        } else {
+            dst.entry.partition_point(|a| entry.cmp(a).is_ge())
+        };
         dst.entry.insert(idx, entry);
 
         // During Restarting Speaker deferral, routes are accumulated but
@@ -5397,5 +5439,125 @@ mod tests {
             path_with_nh(src2, 2, attrs_with_as_path_len(2)),
         ]);
         assert_eq!(change.ecmp_paths().len(), 1);
+    }
+
+    // --- EVPN Type-2 best-path selection ---
+
+    fn evpn_type2_nlri(etag: u32) -> packet::Nlri {
+        use packet::evpn::{Esi, EvpnNlri, MacIpAdvertisement};
+        use packet::rd::RouteDistinguisher;
+        packet::Nlri::Evpn(EvpnNlri::MacIpAdvertisement(MacIpAdvertisement {
+            rd: RouteDistinguisher::TwoOctetAs {
+                admin: 1,
+                assigned: 1,
+            },
+            esi: Esi::ZERO,
+            etag,
+            mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            ip: None,
+            label1: 100,
+            label2: None,
+        }))
+    }
+
+    fn attrs_with_mac_mobility(seq: u32) -> Arc<Vec<packet::Attribute>> {
+        // Extended Community: type=0x06 (EVPN), subtype=0x00 (MAC Mobility),
+        // flags=0x00 (non-sticky), reserved=0x00, seq (4 bytes big-endian).
+        let mut ec = vec![0x06u8, 0x00, 0x00, 0x00];
+        ec.extend_from_slice(&seq.to_be_bytes());
+        Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::EXTENDED_COMMUNITY, ec).unwrap(),
+        ])
+    }
+
+    fn evpn_insert(
+        rt: &mut Table,
+        src: &Arc<Source>,
+        net: &packet::Nlri,
+        attrs: Arc<Vec<packet::Attribute>>,
+    ) {
+        rt.insert(
+            src.clone(),
+            Family::L2VPN_EVPN,
+            net.clone(),
+            0,
+            nh(),
+            attrs,
+            None,
+            false,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+    }
+
+    #[test]
+    fn evpn_type2_higher_mac_mobility_seq_wins() {
+        let src1 = source(1, 65001, 65000, 1);
+        let src2 = source(2, 65002, 65000, 2);
+        let net = evpn_type2_nlri(0);
+        let mut rt = Table::new();
+        // src1 advertises seq=1, src2 advertises seq=5; src2 should win.
+        evpn_insert(&mut rt, &src1, &net, attrs_with_mac_mobility(1));
+        evpn_insert(&mut rt, &src2, &net, attrs_with_mac_mobility(5));
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::L2VPN_EVPN, vec![], false)
+            .collect();
+        assert_eq!(dests.len(), 1);
+        let best_src = dests[0].paths[0].source.remote_addr;
+        assert_eq!(best_src, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+    }
+
+    #[test]
+    fn evpn_type2_with_mobility_beats_without() {
+        let src1 = source(1, 65001, 65000, 1);
+        let src2 = source(2, 65002, 65000, 2);
+        let net = evpn_type2_nlri(0);
+        let mut rt = Table::new();
+        // src1 has no MAC Mobility, src2 has seq=1; src2 wins.
+        evpn_insert(&mut rt, &src1, &net, empty_attrs());
+        evpn_insert(&mut rt, &src2, &net, attrs_with_mac_mobility(1));
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::L2VPN_EVPN, vec![], false)
+            .collect();
+        assert_eq!(dests.len(), 1);
+        let best_src = dests[0].paths[0].source.remote_addr;
+        assert_eq!(best_src, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+    }
+
+    #[test]
+    fn evpn_type2_equal_seq_falls_through_to_standard() {
+        // Both have seq=3; standard BGP best-path (router-id) decides.
+        // Lower router-id wins in iBGP (both are iBGP peers here).
+        let src1 = source(1, 65000, 65000, 1); // router_id = 0.0.0.1
+        let src2 = source(2, 65000, 65000, 2); // router_id = 0.0.0.2
+        let net = evpn_type2_nlri(0);
+        let mut rt = Table::new();
+        evpn_insert(&mut rt, &src1, &net, attrs_with_mac_mobility(3));
+        evpn_insert(&mut rt, &src2, &net, attrs_with_mac_mobility(3));
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::L2VPN_EVPN, vec![], false)
+            .collect();
+        assert_eq!(dests.len(), 1);
+        // src1 has lower router-id, so it should win.
+        let best_src = dests[0].paths[0].source.remote_addr;
+        assert_eq!(best_src, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn evpn_type2_no_mobility_uses_standard_best_path() {
+        // Neither path has MAC Mobility; standard BGP best-path applies.
+        let src1 = source(1, 65000, 65000, 1);
+        let src2 = source(2, 65000, 65000, 2);
+        let net = evpn_type2_nlri(0);
+        let mut rt = Table::new();
+        evpn_insert(&mut rt, &src1, &net, empty_attrs());
+        evpn_insert(&mut rt, &src2, &net, empty_attrs());
+        let dests: Vec<_> = rt
+            .destinations(TableQuery::Global, Family::L2VPN_EVPN, vec![], false)
+            .collect();
+        assert_eq!(dests.len(), 1);
+        let best_src = dests[0].paths[0].source.remote_addr;
+        assert_eq!(best_src, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
     }
 }
