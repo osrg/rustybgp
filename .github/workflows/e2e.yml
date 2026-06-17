@@ -42,8 +42,8 @@ jobs:
         run: |
           chmod +x /tmp/rustybgp-prebuilt/rustybgpd
           cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
-      - name: Run RFC 7911 e2e test
-        working-directory: tests/e2e/rfc7911
+      - name: Run Add-Path e2e test
+        working-directory: tests/e2e/add-path
         env:
           RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
           RUSTYBGP_DOCKERFILE: Dockerfile
@@ -64,8 +64,8 @@ jobs:
         run: |
           chmod +x /tmp/rustybgp-prebuilt/rustybgpd
           cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
-      - name: Run RFC 8950 e2e test
-        working-directory: tests/e2e/rfc8950
+      - name: Run Extended Nexthop e2e test
+        working-directory: tests/e2e/extended-nexthop
         env:
           RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
           RUSTYBGP_DOCKERFILE: Dockerfile
@@ -86,8 +86,8 @@ jobs:
         run: |
           chmod +x /tmp/rustybgp-prebuilt/rustybgpd
           cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
-      - name: Run RFC 4724 restarting speaker e2e test
-        working-directory: tests/e2e/rfc4724-restarting
+      - name: Run Graceful Restart (restarting speaker) e2e test
+        working-directory: tests/e2e/graceful-restart-restarting
         env:
           RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
           RUSTYBGP_DOCKERFILE: Dockerfile
@@ -108,8 +108,8 @@ jobs:
         run: |
           chmod +x /tmp/rustybgp-prebuilt/rustybgpd
           cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
-      - name: Run RFC 4724 helper e2e test
-        working-directory: tests/e2e/rfc4724-helper
+      - name: Run Graceful Restart (helper) e2e test
+        working-directory: tests/e2e/graceful-restart-helper
         env:
           RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
           RUSTYBGP_DOCKERFILE: Dockerfile
@@ -152,8 +152,8 @@ jobs:
         run: |
           chmod +x /tmp/rustybgp-prebuilt/rustybgpd
           cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
-      - name: Run RFC 4456 e2e test
-        working-directory: tests/e2e/rfc4456
+      - name: Run Route Reflector e2e test
+        working-directory: tests/e2e/route-reflector
         env:
           RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
           RUSTYBGP_DOCKERFILE: Dockerfile
@@ -174,8 +174,8 @@ jobs:
         run: |
           chmod +x /tmp/rustybgp-prebuilt/rustybgpd
           cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
-      - name: Run RFC 5065 e2e test
-        working-directory: tests/e2e/rfc5065
+      - name: Run Confederation e2e test
+        working-directory: tests/e2e/confederation
         env:
           RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
           RUSTYBGP_DOCKERFILE: Dockerfile
@@ -196,8 +196,8 @@ jobs:
         run: |
           chmod +x /tmp/rustybgp-prebuilt/rustybgpd
           cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
-      - name: Run RFC 7947 e2e test
-        working-directory: tests/e2e/rfc7947
+      - name: Run Route Server e2e test
+        working-directory: tests/e2e/route-server
         env:
           RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
           RUSTYBGP_DOCKERFILE: Dockerfile
