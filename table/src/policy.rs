@@ -514,21 +514,22 @@ fn match_string_set(strs: &[String], patterns: &[Regex], opt: &MatchOption) -> b
 }
 
 fn ext_community_to_string(c: &[u8; 8]) -> Option<String> {
-    let prefix = match c[1] {
-        0x02 => "rt",
-        0x03 => "soo",
-        _ => return None,
-    };
-    match c[0] {
-        0x00 => {
+    match (c[0], c[1]) {
+        (0x00, 0x02) | (0x00, 0x03) => {
+            let prefix = if c[1] == 0x02 { "rt" } else { "soo" };
             let asn = u16::from_be_bytes([c[2], c[3]]);
             let local = u32::from_be_bytes([c[4], c[5], c[6], c[7]]);
             Some(format!("{}:{}:{}", prefix, asn, local))
         }
-        0x01 => {
+        (0x01, 0x02) | (0x01, 0x03) => {
+            let prefix = if c[1] == 0x02 { "rt" } else { "soo" };
             let addr = Ipv4Addr::new(c[2], c[3], c[4], c[5]);
             let local = u16::from_be_bytes([c[6], c[7]]);
             Some(format!("{}:{}:{}", prefix, addr, local))
+        }
+        (0x03, 0x0c) => {
+            let tunnel_type = u16::from_be_bytes([c[6], c[7]]);
+            Some(format!("encap:{}", tunnel_type))
         }
         _ => None,
     }
@@ -3454,6 +3455,19 @@ mod tests {
             )
             .unwrap();
         assignment
+    }
+
+    #[test]
+    fn ext_community_encap_to_string() {
+        // VXLAN encap (tunnel type 8)
+        let c: [u8; 8] = [0x03, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08];
+        assert_eq!(ext_community_to_string(&c), Some("encap:8".to_string()));
+        // L2TPv3 (tunnel type 1)
+        let c: [u8; 8] = [0x03, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+        assert_eq!(ext_community_to_string(&c), Some("encap:1".to_string()));
+        // Unknown subtype (type 0x03, subtype != 0x0c) -> None
+        let c: [u8; 8] = [0x03, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08];
+        assert_eq!(ext_community_to_string(&c), None);
     }
 
     #[test]

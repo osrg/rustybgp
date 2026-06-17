@@ -3848,6 +3848,15 @@ fn parse_community_value(s: &str) -> Option<u32> {
 }
 
 fn parse_ext_community_value(s: &str) -> Option<[u8; 8]> {
+    if let Some(r) = s.strip_prefix("encap:") {
+        let tunnel_type: u16 = r.parse().ok()?;
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0x03; // Transitive Opaque
+        bytes[1] = 0x0c; // Encapsulation
+        bytes[6] = (tunnel_type >> 8) as u8;
+        bytes[7] = tunnel_type as u8;
+        return Some(bytes);
+    }
     let (sub_type, rest) = if let Some(r) = s.strip_prefix("rt:") {
         (0x02u8, r)
     } else if let Some(r) = s.strip_prefix("soo:") {
@@ -6738,5 +6747,30 @@ bgp-actions.set-next-hop = "self"
         } else {
             panic!("expected EthernetSegment");
         }
+    }
+
+    // --- ext-community parse ---
+
+    #[test]
+    fn parse_encap_ext_community() {
+        // VXLAN (tunnel type 8)
+        let bytes = parse_ext_community_value("encap:8").unwrap();
+        assert_eq!(bytes[0], 0x03); // Transitive Opaque
+        assert_eq!(bytes[1], 0x0c); // Encapsulation
+        assert_eq!(bytes[2..6], [0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 8);
+
+        // L2TPv3 (tunnel type 1)
+        let bytes = parse_ext_community_value("encap:1").unwrap();
+        assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 1);
+
+        // Max tunnel type (65535)
+        let bytes = parse_ext_community_value("encap:65535").unwrap();
+        assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 65535);
+
+        // Invalid: non-numeric
+        assert!(parse_ext_community_value("encap:vxlan").is_none());
+        // Invalid: out of range
+        assert!(parse_ext_community_value("encap:65536").is_none());
     }
 }
