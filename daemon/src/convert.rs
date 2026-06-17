@@ -1823,6 +1823,9 @@ pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Fa
         config::generate::AfiSafiType::Ipv6Multicast => Ok(Family::IPV6_MC),
         config::generate::AfiSafiType::Ipv4LabelledUnicast => Ok(Family::IPV4_MPLS),
         config::generate::AfiSafiType::Ipv6LabelledUnicast => Ok(Family::IPV6_MPLS),
+        config::generate::AfiSafiType::L3VpnIpv4Unicast => Ok(Family::IPV4_VPN),
+        config::generate::AfiSafiType::L3VpnIpv6Unicast => Ok(Family::IPV6_VPN),
+        config::generate::AfiSafiType::Ls => Ok(Family::LS),
         config::generate::AfiSafiType::Ipv4Mup => Ok(Family::IPV4_MUP),
         config::generate::AfiSafiType::Ipv6Mup => Ok(Family::IPV6_MUP),
         config::generate::AfiSafiType::Ipv4Flowspec => Ok(Family::IPV4_FLOWSPEC),
@@ -5837,8 +5840,19 @@ bgp-actions.set-next-hop = "self"
             (AfiSafiType::Ipv6Unicast, Family::IPV6),
             (AfiSafiType::Ipv4Multicast, Family::IPV4_MC),
             (AfiSafiType::Ipv6Multicast, Family::IPV6_MC),
+            (AfiSafiType::Ipv4LabelledUnicast, Family::IPV4_MPLS),
+            (AfiSafiType::Ipv6LabelledUnicast, Family::IPV6_MPLS),
+            (AfiSafiType::L3VpnIpv4Unicast, Family::IPV4_VPN),
+            (AfiSafiType::L3VpnIpv6Unicast, Family::IPV6_VPN),
+            (AfiSafiType::Ls, Family::LS),
             (AfiSafiType::Ipv4Mup, Family::IPV4_MUP),
             (AfiSafiType::Ipv6Mup, Family::IPV6_MUP),
+            (AfiSafiType::Ipv4Flowspec, Family::IPV4_FLOWSPEC),
+            (AfiSafiType::Ipv6Flowspec, Family::IPV6_FLOWSPEC),
+            (AfiSafiType::L3VpnIpv4Flowspec, Family::IPV4_FLOWSPEC_VPN),
+            (AfiSafiType::L3VpnIpv6Flowspec, Family::IPV6_FLOWSPEC_VPN),
+            (AfiSafiType::Ipv4Srpolicy, Family::IPV4_SRPOLICY),
+            (AfiSafiType::Ipv6Srpolicy, Family::IPV6_SRPOLICY),
         ];
         for (input, want) in cases {
             assert_eq!(family_from_config(&input), Ok(want), "{input:?}");
@@ -5848,7 +5862,18 @@ bgp-actions.set-next-hop = "self"
     #[test]
     fn family_from_config_unsupported_returns_err() {
         use config::generate::AfiSafiType;
-        assert!(family_from_config(&AfiSafiType::L3VpnIpv4Unicast).is_err());
+        for t in [
+            AfiSafiType::L3VpnIpv4Multicast,
+            AfiSafiType::L3VpnIpv6Multicast,
+            AfiSafiType::L2VpnVpls,
+            AfiSafiType::L2VpnEvpn,
+            AfiSafiType::Rtc,
+            AfiSafiType::Ipv4Encap,
+            AfiSafiType::Ipv6Encap,
+            AfiSafiType::Opaque,
+        ] {
+            assert!(family_from_config(&t).is_err(), "{t:?} should return Err");
+        }
     }
 
     // --- Flowspec extended community roundtrips ---
