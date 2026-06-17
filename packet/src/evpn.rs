@@ -1358,8 +1358,174 @@ mod tests {
     }
 
     #[test]
+    fn mac_mobility_no_matching_ec() {
+        // Extended Community present but not MAC Mobility type.
+        let attr = crate::bgp::Attribute::new_with_bin(
+            crate::bgp::Attribute::EXTENDED_COMMUNITY,
+            vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        )
+        .unwrap();
+        assert_eq!(mac_mobility(&[attr]), None);
+    }
+
+    #[test]
+    fn mac_mobility_present_non_sticky() {
+        // type=0x06, subtype=0x00, flags=0x00, reserved=0x00, seq=42.
+        let attr = crate::bgp::Attribute::new_with_bin(
+            crate::bgp::Attribute::EXTENDED_COMMUNITY,
+            vec![0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 42],
+        )
+        .unwrap();
+        assert_eq!(mac_mobility(&[attr]), Some((42, false)));
+    }
+
+    #[test]
+    fn mac_mobility_present_sticky() {
+        // sticky bit (bit 0 of flags byte) set, seq=100.
+        let attr = crate::bgp::Attribute::new_with_bin(
+            crate::bgp::Attribute::EXTENDED_COMMUNITY,
+            vec![0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 100],
+        )
+        .unwrap();
+        assert_eq!(mac_mobility(&[attr]), Some((100, true)));
+    }
+
+    #[test]
+    fn mac_mobility_second_in_list() {
+        // MAC Mobility community is the second 8-byte entry.
+        let attr = crate::bgp::Attribute::new_with_bin(
+            crate::bgp::Attribute::EXTENDED_COMMUNITY,
+            vec![
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // other EC
+                0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 99, // MAC Mobility seq=99
+            ],
+        )
+        .unwrap();
+        assert_eq!(mac_mobility(&[attr]), Some((99, false)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Malformed decode error paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn type1_bad_route_len() {
+        // route_len must be exactly 25; 24 should fail.
+        let mut bytes = GOBGP_TYPE1_MASS_WITHDRAW.to_vec();
+        bytes[1] = 24;
+        assert!(EvpnNlri::decode(&mut Cursor::new(&bytes)).is_err());
+    }
+
+    #[test]
+    fn type2_too_short() {
+        // route_len below MIN_LEN (33).
+        let mut bytes = GOBGP_TYPE2_MAC_ONLY.to_vec();
+        bytes[1] = 10;
+        assert!(EvpnNlri::decode(&mut Cursor::new(&bytes)).is_err());
+    }
+
+    #[test]
+    fn type2_bad_mac_len() {
+        // MAC length field must be 48; 32 is invalid.
+        // Byte layout: type(1)+route_len(1)+RD(8)+ESI(10)+ETag(4) = 24 bytes before mac_len.
+        let mut bytes = GOBGP_TYPE2_MAC_ONLY.to_vec();
+        bytes[24] = 32;
+        assert!(EvpnNlri::decode(&mut Cursor::new(&bytes)).is_err());
+    }
+
+    #[test]
+    fn type2_bad_ip_len() {
+        // ip_len must be 0, 32, or 128; 64 is invalid.
+        // Byte layout: type(1)+route_len(1)+RD(8)+ESI(10)+ETag(4)+mac_len(1)+MAC(6) = 31 before ip_len.
+        let mut bytes = GOBGP_TYPE2_MAC_ONLY.to_vec();
+        bytes[31] = 64;
+        assert!(EvpnNlri::decode(&mut Cursor::new(&bytes)).is_err());
+    }
+
+    #[test]
+    fn type3_bad_ip_len() {
+        // ip_len must be 32 or 128; 0 is invalid for Type-3.
+        // Byte layout: type(1)+route_len(1)+RD(8)+ETag(4) = 14 before ip_len.
+        let mut bytes = GOBGP_TYPE3_IPV4.to_vec();
+        bytes[14] = 0;
+        assert!(EvpnNlri::decode(&mut Cursor::new(&bytes)).is_err());
+    }
+
+    #[test]
+    fn type4_bad_ip_len() {
+        // ip_len must be 32 or 128; 64 is invalid.
+        // Byte layout: type(1)+route_len(1)+RD(8)+ESI(10) = 20 before ip_len.
+        let mut bytes = GOBGP_TYPE4_IPV4.to_vec();
+        bytes[20] = 64;
+        assert!(EvpnNlri::decode(&mut Cursor::new(&bytes)).is_err());
+    }
+
+    #[test]
+    fn type5_bad_route_len() {
+        // route_len must be 34 (IPv4) or 58 (IPv6); 20 is invalid.
+        let mut bytes = GOBGP_TYPE5_IPV4.to_vec();
+        bytes[1] = 20;
+        assert!(EvpnNlri::decode(&mut Cursor::new(&bytes)).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Display implementations
+    // -----------------------------------------------------------------------
+
+    #[test]
     fn esi_display() {
         let esi = Esi([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a]);
         assert_eq!(esi.to_string(), "01:02:03:04:05:06:07:08:09:0a");
+    }
+
+    #[test]
+    fn type1_display() {
+        let nlri = gobgp_decode(GOBGP_TYPE1_MASS_WITHDRAW);
+        assert_eq!(
+            nlri.to_string(),
+            "[type-1][rd 100:100][esi 00:00:00:00:00:00:00:00:00:00][etag 4294967295][label 0]"
+        );
+    }
+
+    #[test]
+    fn type2_display_no_ip() {
+        let nlri = gobgp_decode(GOBGP_TYPE2_MAC_ONLY);
+        assert_eq!(
+            nlri.to_string(),
+            "[type-2][rd 100:100][etag 42][mac aa:bb:cc:dd:ee:ff][label 200]"
+        );
+    }
+
+    #[test]
+    fn type2_display_with_ip() {
+        let nlri = gobgp_decode(GOBGP_TYPE2_MAC_IPV4_TWO_LABELS);
+        assert_eq!(
+            nlri.to_string(),
+            "[type-2][rd 5:6][etag 3][mac 01:23:45:67:89:ab/192.2.1.2][label 3]"
+        );
+    }
+
+    #[test]
+    fn type3_display() {
+        let nlri = gobgp_decode(GOBGP_TYPE3_IPV4);
+        assert_eq!(nlri.to_string(), "[type-3][rd 5:6][etag 3][ip 192.2.1.2]");
+    }
+
+    #[test]
+    fn type4_display() {
+        let nlri = gobgp_decode(GOBGP_TYPE4_IPV4);
+        assert_eq!(
+            nlri.to_string(),
+            "[type-4][rd 100:100][esi 00:00:00:00:00:00:00:00:00:00][ip 192.2.1.2]"
+        );
+    }
+
+    #[test]
+    fn type5_display() {
+        let nlri = gobgp_decode(GOBGP_TYPE5_IPV4);
+        assert_eq!(
+            nlri.to_string(),
+            "[type-5][rd 100:100][etag 0][prefix 10.10.10.0/24][gw 10.10.10.1][label 200]"
+        );
     }
 }
