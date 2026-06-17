@@ -2775,10 +2775,6 @@ impl PeerCodec {
                     }
                     let mut c = Cursor::new(buf);
                     let afi = c.read_u16::<NetworkEndian>().unwrap();
-                    match afi {
-                        Family::AFI_IP | Family::AFI_IP6 | Family::AFI_LS => {}
-                        _ => return Err(err),
-                    }
                     let safi = c.read_u8().unwrap();
                     let family = Family((afi as u32) << 16 | safi as u32);
                     let addpath_rx = self.families.get(&family).ok_or_else(malformed)?.addpath_rx;
@@ -2836,10 +2832,6 @@ impl PeerCodec {
                     }
                     let mut c = Cursor::new(buf);
                     let afi = c.read_u16::<NetworkEndian>().unwrap();
-                    match afi {
-                        Family::AFI_IP | Family::AFI_IP6 | Family::AFI_LS => {}
-                        _ => return Err(err),
-                    }
                     let safi = c.read_u8().unwrap();
                     let family = Family((afi as u32) << 16 | safi as u32);
                     let addpath_rx = self.families.get(&family).ok_or_else(malformed)?.addpath_rx;
