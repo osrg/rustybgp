@@ -286,6 +286,34 @@ fn esi_to_api(esi: &packet::evpn::Esi) -> api::EthernetSegmentIdentifier {
     }
 }
 
+fn esi_from_api(e: &api::EthernetSegmentIdentifier) -> Result<packet::evpn::Esi, Error> {
+    if e.value.len() != 9 {
+        return Err(Error::InvalidArgument(
+            "ESI value must be 9 bytes".to_string(),
+        ));
+    }
+    let mut buf = [0u8; 10];
+    buf[0] = e.r#type as u8;
+    buf[1..].copy_from_slice(&e.value);
+    Ok(packet::evpn::Esi(buf))
+}
+
+fn parse_mac(s: &str) -> Result<[u8; 6], Error> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return Err(Error::InvalidArgument(format!(
+            "invalid MAC address: {}",
+            s
+        )));
+    }
+    let mut mac = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(p, 16)
+            .map_err(|_| Error::InvalidArgument(format!("invalid MAC byte: {}", p)))?;
+    }
+    Ok(mac)
+}
+
 fn evpn_nlri_to_api(n: &packet::evpn::EvpnNlri) -> api::Nlri {
     use packet::evpn::EvpnNlri;
     match n {
@@ -1880,6 +1908,7 @@ pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Fa
         config::generate::AfiSafiType::L3VpnIpv6Flowspec => Ok(Family::IPV6_FLOWSPEC_VPN),
         config::generate::AfiSafiType::Ipv4Srpolicy => Ok(Family::IPV4_SRPOLICY),
         config::generate::AfiSafiType::Ipv6Srpolicy => Ok(Family::IPV6_SRPOLICY),
+        config::generate::AfiSafiType::L2VpnEvpn => Ok(Family::L2VPN_EVPN),
         _ => Err(()),
     }
 }
@@ -2155,6 +2184,62 @@ pub(crate) fn net_from_api(n: api::Nlri, family: Family) -> Result<Nlri, Error> 
                 color: n.color,
                 endpoint,
             }))
+        }
+        Some(api::nlri::Nlri::EvpnMacadv(r)) => {
+            use packet::evpn::{EvpnNlri, MacIpAdvertisement};
+            let rd = rd_from_api(
+                r.rd.as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing rd".to_string()))?,
+            )?;
+            let esi = esi_from_api(
+                r.esi
+                    .as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing ESI".to_string()))?,
+            )?;
+            let mac = parse_mac(&r.mac_address)?;
+            let ip = if r.ip_address.is_empty() {
+                None
+            } else {
+                Some(
+                    r.ip_address
+                        .parse::<std::net::IpAddr>()
+                        .map_err(|e| Error::InvalidArgument(format!("invalid IP: {}", e)))?,
+                )
+            };
+            let label1 = *r
+                .labels
+                .first()
+                .ok_or_else(|| Error::InvalidArgument("at least one label required".to_string()))?;
+            let label2 = r.labels.get(1).copied();
+            Ok(Nlri::Evpn(EvpnNlri::MacIpAdvertisement(
+                MacIpAdvertisement {
+                    rd,
+                    esi,
+                    etag: r.ethernet_tag,
+                    mac,
+                    ip,
+                    label1,
+                    label2,
+                },
+            )))
+        }
+        Some(api::nlri::Nlri::EvpnMulticast(r)) => {
+            use packet::evpn::{EvpnNlri, InclusiveMulticastEthernetTag};
+            let rd = rd_from_api(
+                r.rd.as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing rd".to_string()))?,
+            )?;
+            let originating_router_ip = r
+                .ip_address
+                .parse::<std::net::IpAddr>()
+                .map_err(|e| Error::InvalidArgument(format!("invalid IP: {}", e)))?;
+            Ok(Nlri::Evpn(EvpnNlri::InclusiveMulticastEthernetTag(
+                InclusiveMulticastEthernetTag {
+                    rd,
+                    etag: r.ethernet_tag,
+                    originating_router_ip,
+                },
+            )))
         }
         _ => Err(Error::InvalidArgument("invalid NLRI".to_string())),
     }
@@ -5899,6 +5984,7 @@ bgp-actions.set-next-hop = "self"
             (AfiSafiType::L3VpnIpv6Flowspec, Family::IPV6_FLOWSPEC_VPN),
             (AfiSafiType::Ipv4Srpolicy, Family::IPV4_SRPOLICY),
             (AfiSafiType::Ipv6Srpolicy, Family::IPV6_SRPOLICY),
+            (AfiSafiType::L2VpnEvpn, Family::L2VPN_EVPN),
         ];
         for (input, want) in cases {
             assert_eq!(family_from_config(&input), Ok(want), "{input:?}");
@@ -5912,7 +5998,6 @@ bgp-actions.set-next-hop = "self"
             AfiSafiType::L3VpnIpv4Multicast,
             AfiSafiType::L3VpnIpv6Multicast,
             AfiSafiType::L2VpnVpls,
-            AfiSafiType::L2VpnEvpn,
             AfiSafiType::Rtc,
             AfiSafiType::Ipv4Encap,
             AfiSafiType::Ipv6Encap,
@@ -6250,5 +6335,151 @@ bgp-actions.set-next-hop = "self"
         } else {
             panic!("expected SrPolicy tunnel encap");
         }
+    }
+
+    // --- EVPN net_from_api roundtrips ---
+
+    #[test]
+    fn evpn_macadv_mac_only_roundtrip() {
+        use packet::evpn::{Esi, EvpnNlri};
+        let nlri_api = api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnMacadv(
+                api::EvpnmacipAdvertisementRoute {
+                    rd: Some(api::RouteDistinguisher {
+                        rd: Some(api::route_distinguisher::Rd::TwoOctetAsn(
+                            api::RouteDistinguisherTwoOctetAsn {
+                                admin: 100,
+                                assigned: 100,
+                            },
+                        )),
+                    }),
+                    esi: Some(api::EthernetSegmentIdentifier {
+                        r#type: 0,
+                        value: vec![0u8; 9],
+                    }),
+                    ethernet_tag: 42,
+                    mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                    ip_address: String::new(),
+                    labels: vec![200],
+                },
+            )),
+        };
+        let nlri = net_from_api(nlri_api, Family::L2VPN_EVPN).unwrap();
+        let back = nlri_to_api(&nlri);
+        if let Some(api::nlri::Nlri::EvpnMacadv(m)) = back.nlri {
+            assert_eq!(m.ethernet_tag, 42);
+            assert_eq!(m.mac_address, "aa:bb:cc:dd:ee:ff");
+            assert!(m.ip_address.is_empty());
+            assert_eq!(m.labels, vec![200u32]);
+        } else {
+            panic!("expected EvpnMacadv NLRI");
+        }
+        if let packet::Nlri::Evpn(EvpnNlri::MacIpAdvertisement(m)) = &nlri {
+            assert_eq!(m.esi, Esi::ZERO);
+            assert_eq!(m.etag, 42);
+            assert_eq!(m.mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+            assert!(m.ip.is_none());
+            assert_eq!(m.label1, 200);
+            assert!(m.label2.is_none());
+        } else {
+            panic!("expected MacIpAdvertisement");
+        }
+    }
+
+    #[test]
+    fn evpn_macadv_with_ipv4_and_two_labels_roundtrip() {
+        use packet::evpn::EvpnNlri;
+        let nlri_api = api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnMacadv(
+                api::EvpnmacipAdvertisementRoute {
+                    rd: Some(api::RouteDistinguisher {
+                        rd: Some(api::route_distinguisher::Rd::FourOctetAsn(
+                            api::RouteDistinguisherFourOctetAsn {
+                                admin: 5,
+                                assigned: 6,
+                            },
+                        )),
+                    }),
+                    esi: Some(api::EthernetSegmentIdentifier {
+                        r#type: 0,
+                        value: vec![0u8; 9],
+                    }),
+                    ethernet_tag: 3,
+                    mac_address: "01:23:45:67:89:ab".to_string(),
+                    ip_address: "192.2.1.2".to_string(),
+                    labels: vec![3, 4],
+                },
+            )),
+        };
+        let nlri = net_from_api(nlri_api, Family::L2VPN_EVPN).unwrap();
+        if let packet::Nlri::Evpn(EvpnNlri::MacIpAdvertisement(m)) = &nlri {
+            assert_eq!(m.etag, 3);
+            assert_eq!(m.mac, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab]);
+            assert_eq!(m.ip, Some("192.2.1.2".parse().unwrap()));
+            assert_eq!(m.label1, 3);
+            assert_eq!(m.label2, Some(4));
+        } else {
+            panic!("expected MacIpAdvertisement");
+        }
+    }
+
+    #[test]
+    fn evpn_multicast_ipv4_roundtrip() {
+        use packet::evpn::EvpnNlri;
+        let nlri_api = api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnMulticast(
+                api::EvpnInclusiveMulticastEthernetTagRoute {
+                    rd: Some(api::RouteDistinguisher {
+                        rd: Some(api::route_distinguisher::Rd::FourOctetAsn(
+                            api::RouteDistinguisherFourOctetAsn {
+                                admin: 5,
+                                assigned: 6,
+                            },
+                        )),
+                    }),
+                    ethernet_tag: 3,
+                    ip_address: "192.2.1.2".to_string(),
+                },
+            )),
+        };
+        let nlri = net_from_api(nlri_api, Family::L2VPN_EVPN).unwrap();
+        let back = nlri_to_api(&nlri);
+        if let packet::Nlri::Evpn(EvpnNlri::InclusiveMulticastEthernetTag(t)) = &nlri {
+            assert_eq!(t.etag, 3);
+            assert_eq!(
+                t.originating_router_ip,
+                "192.2.1.2".parse::<std::net::IpAddr>().unwrap()
+            );
+        } else {
+            panic!("expected InclusiveMulticastEthernetTag");
+        }
+        assert!(matches!(back.nlri, Some(api::nlri::Nlri::EvpnMulticast(_))));
+    }
+
+    #[test]
+    fn evpn_macadv_missing_label_returns_err() {
+        let nlri_api = api::Nlri {
+            nlri: Some(api::nlri::Nlri::EvpnMacadv(
+                api::EvpnmacipAdvertisementRoute {
+                    rd: Some(api::RouteDistinguisher {
+                        rd: Some(api::route_distinguisher::Rd::TwoOctetAsn(
+                            api::RouteDistinguisherTwoOctetAsn {
+                                admin: 1,
+                                assigned: 1,
+                            },
+                        )),
+                    }),
+                    esi: Some(api::EthernetSegmentIdentifier {
+                        r#type: 0,
+                        value: vec![0u8; 9],
+                    }),
+                    ethernet_tag: 0,
+                    mac_address: "00:11:22:33:44:55".to_string(),
+                    ip_address: String::new(),
+                    labels: vec![],
+                },
+            )),
+        };
+        assert!(net_from_api(nlri_api, Family::L2VPN_EVPN).is_err());
     }
 }
