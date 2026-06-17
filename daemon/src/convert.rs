@@ -3879,15 +3879,28 @@ fn parse_ext_community_value(s: &str) -> Option<[u8; 8]> {
     } else {
         return None;
     };
-    // Try "ASN:local-admin" with 2-octet ASN
+    // Try "ASN:local-admin" — 4-octet AS when ASN > 65535, 2-octet otherwise
     let parts: Vec<&str> = rest.splitn(2, ':').collect();
     if parts.len() != 2 {
         return None;
     }
-    if let Ok(asn) = parts[0].parse::<u16>() {
+    if let Ok(asn) = parts[0].parse::<u32>() {
+        if asn > u16::MAX as u32 {
+            // Transitive Four-Octet AS-Specific (type 0x02): 4-byte ASN, 2-byte local admin
+            let local: u16 = parts[1].parse().ok()?;
+            let mut bytes = [0u8; 8];
+            bytes[0] = 0x02;
+            bytes[1] = sub_type;
+            bytes[2..6].copy_from_slice(&asn.to_be_bytes());
+            bytes[6] = (local >> 8) as u8;
+            bytes[7] = local as u8;
+            return Some(bytes);
+        }
+        // Transitive Two-Octet AS-Specific (type 0x00): 2-byte ASN, 4-byte local admin
+        let asn = asn as u16;
         let local: u32 = parts[1].parse().ok()?;
         let mut bytes = [0u8; 8];
-        bytes[0] = 0x00; // Transitive Two-Octet AS Specific
+        bytes[0] = 0x00;
         bytes[1] = sub_type;
         bytes[2] = (asn >> 8) as u8;
         bytes[3] = asn as u8;
@@ -6765,6 +6778,37 @@ bgp-actions.set-next-hop = "self"
     }
 
     // --- ext-community parse ---
+
+    #[test]
+    fn parse_4octet_as_rt_soo() {
+        // ASN > 65535: should produce type 0x02 (Four-Octet AS-Specific)
+        let bytes = parse_ext_community_value("rt:131072:100").unwrap();
+        assert_eq!(bytes[0], 0x02); // Transitive Four-Octet AS-Specific
+        assert_eq!(bytes[1], 0x02); // RT
+        assert_eq!(
+            u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]),
+            131072
+        );
+        assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 100);
+
+        // soo with 4-octet ASN
+        let bytes = parse_ext_community_value("soo:65536:200").unwrap();
+        assert_eq!(bytes[0], 0x02);
+        assert_eq!(bytes[1], 0x03); // SoO
+        assert_eq!(
+            u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]),
+            65536
+        );
+        assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 200);
+
+        // ASN exactly at boundary: 65535 -> 2-octet (type 0x00)
+        let bytes = parse_ext_community_value("rt:65535:100").unwrap();
+        assert_eq!(bytes[0], 0x00);
+
+        // ASN one above boundary: 65536 -> 4-octet (type 0x02)
+        let bytes = parse_ext_community_value("rt:65536:100").unwrap();
+        assert_eq!(bytes[0], 0x02);
+    }
 
     #[test]
     fn parse_lb_ext_community() {

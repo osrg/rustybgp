@@ -521,6 +521,12 @@ fn ext_community_to_string(c: &[u8; 8]) -> Option<String> {
             let local = u32::from_be_bytes([c[4], c[5], c[6], c[7]]);
             Some(format!("{}:{}:{}", prefix, asn, local))
         }
+        (0x02, 0x02) | (0x02, 0x03) => {
+            let prefix = if c[1] == 0x02 { "rt" } else { "soo" };
+            let asn = u32::from_be_bytes([c[2], c[3], c[4], c[5]]);
+            let local = u16::from_be_bytes([c[6], c[7]]);
+            Some(format!("{}:{}:{}", prefix, asn, local))
+        }
         (0x01, 0x02) | (0x01, 0x03) => {
             let prefix = if c[1] == 0x02 { "rt" } else { "soo" };
             let addr = Ipv4Addr::new(c[2], c[3], c[4], c[5]);
@@ -3460,6 +3466,34 @@ mod tests {
             )
             .unwrap();
         assignment
+    }
+
+    #[test]
+    fn ext_community_4octet_as_rt_soo_to_string() {
+        let make = |asn: u32, local: u16, subtype: u8| -> [u8; 8] {
+            let mut c = [0u8; 8];
+            c[0] = 0x02;
+            c[1] = subtype;
+            c[2..6].copy_from_slice(&asn.to_be_bytes());
+            c[6] = (local >> 8) as u8;
+            c[7] = local as u8;
+            c
+        };
+        // rt with 4-octet ASN
+        assert_eq!(
+            ext_community_to_string(&make(131072, 100, 0x02)),
+            Some("rt:131072:100".to_string())
+        );
+        // soo with 4-octet ASN
+        assert_eq!(
+            ext_community_to_string(&make(131072, 200, 0x03)),
+            Some("soo:131072:200".to_string())
+        );
+        // ASN at boundary (65536 = just above u16::MAX)
+        assert_eq!(
+            ext_community_to_string(&make(65536, 1, 0x02)),
+            Some("rt:65536:1".to_string())
+        );
     }
 
     #[test]
