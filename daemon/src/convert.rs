@@ -3857,6 +3857,21 @@ fn parse_ext_community_value(s: &str) -> Option<[u8; 8]> {
         bytes[7] = tunnel_type as u8;
         return Some(bytes);
     }
+    if let Some(r) = s.strip_prefix("lb:") {
+        let parts: Vec<&str> = r.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let asn: u16 = parts[0].parse().ok()?;
+        let bw: f32 = parts[1].parse().ok()?;
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0x40; // Non-Transitive Two-Octet AS-Specific
+        bytes[1] = 0x04; // Link Bandwidth
+        bytes[2] = (asn >> 8) as u8;
+        bytes[3] = asn as u8;
+        bytes[4..8].copy_from_slice(&bw.to_bits().to_be_bytes());
+        return Some(bytes);
+    }
     let (sub_type, rest) = if let Some(r) = s.strip_prefix("rt:") {
         (0x02u8, r)
     } else if let Some(r) = s.strip_prefix("soo:") {
@@ -6750,6 +6765,34 @@ bgp-actions.set-next-hop = "self"
     }
 
     // --- ext-community parse ---
+
+    #[test]
+    fn parse_lb_ext_community() {
+        // Normal: integer bandwidth
+        let bytes = parse_ext_community_value("lb:65001:100").unwrap();
+        assert_eq!(bytes[0], 0x40); // Non-Transitive Two-Octet AS-Specific
+        assert_eq!(bytes[1], 0x04); // Link Bandwidth
+        assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 65001);
+        let bw = f32::from_bits(u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]));
+        assert!((bw - 100.0f32).abs() < 1e-6);
+
+        // Fractional bandwidth
+        let bytes2 = parse_ext_community_value("lb:100:1.5").unwrap();
+        let bw2 = f32::from_bits(u32::from_be_bytes([
+            bytes2[4], bytes2[5], bytes2[6], bytes2[7],
+        ]));
+        assert!((bw2 - 1.5f32).abs() < 1e-6);
+        assert_eq!(u16::from_be_bytes([bytes2[2], bytes2[3]]), 100);
+
+        // Invalid: missing bandwidth part
+        assert!(parse_ext_community_value("lb:100").is_none());
+        // Invalid: non-numeric ASN
+        assert!(parse_ext_community_value("lb:foo:100").is_none());
+        // Invalid: non-numeric bandwidth
+        assert!(parse_ext_community_value("lb:65001:bar").is_none());
+        // Invalid: ASN out of 2-octet range
+        assert!(parse_ext_community_value("lb:65536:100").is_none());
+    }
 
     #[test]
     fn parse_encap_ext_community() {

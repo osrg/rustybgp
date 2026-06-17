@@ -531,6 +531,11 @@ fn ext_community_to_string(c: &[u8; 8]) -> Option<String> {
             let tunnel_type = u16::from_be_bytes([c[6], c[7]]);
             Some(format!("encap:{}", tunnel_type))
         }
+        (0x40, 0x04) => {
+            let asn = u16::from_be_bytes([c[2], c[3]]);
+            let bw = f32::from_bits(u32::from_be_bytes([c[4], c[5], c[6], c[7]]));
+            Some(format!("lb:{}:{}", asn, bw))
+        }
         _ => None,
     }
 }
@@ -3455,6 +3460,31 @@ mod tests {
             )
             .unwrap();
         assignment
+    }
+
+    #[test]
+    fn ext_community_lb_to_string() {
+        let make = |asn: u16, bw: f32| -> [u8; 8] {
+            let mut c = [0u8; 8];
+            c[0] = 0x40;
+            c[1] = 0x04;
+            c[2] = (asn >> 8) as u8;
+            c[3] = asn as u8;
+            c[4..8].copy_from_slice(&bw.to_bits().to_be_bytes());
+            c
+        };
+        assert_eq!(
+            ext_community_to_string(&make(65001, 100.0)),
+            Some("lb:65001:100".to_string())
+        );
+        assert_eq!(
+            ext_community_to_string(&make(100, 1.5)),
+            Some("lb:100:1.5".to_string())
+        );
+        // Unknown subtype (0x40, 0x05) -> None
+        let mut bad = make(65001, 100.0);
+        bad[1] = 0x05;
+        assert_eq!(ext_community_to_string(&bad), None);
     }
 
     #[test]
