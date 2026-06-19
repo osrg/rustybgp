@@ -3281,7 +3281,7 @@ mod tests {
     }
 
     #[test]
-    fn confederation_yaml_parses_id_and_members() {
+    fn confederation_config_parses_id_and_members() {
         let conf_config = config::generate::ConfederationConfig {
             enabled: Some(true),
             identifier: Some(65000),
@@ -3664,15 +3664,15 @@ mod tests {
         assert_eq!(mh.multihop_ttl, 10);
     }
 
-    // --- PeerGroup YAML parsing tests ---
+    // --- PeerGroup config parsing tests ---
 
     fn make_config_peer_group() -> config::PeerGroup {
         config::PeerGroup {
             config: Some(config::PeerGroupConfig {
-                peer_group_name: Some("yaml-grp".to_string()),
+                peer_group_name: Some("test-grp".to_string()),
                 peer_as: Some(65002),
                 local_as: Some(65001),
-                auth_password: Some("yaml-secret".to_string()),
+                auth_password: Some("test-secret".to_string()),
                 ..Default::default()
             }),
             timers: Some(config::Timers {
@@ -3716,11 +3716,11 @@ mod tests {
     }
 
     #[test]
-    fn peer_group_yaml_parses_all_fields() {
+    fn peer_group_config_parses_all_fields() {
         let pg = PeerGroup::from(&make_config_peer_group());
         assert_eq!(pg.as_number, 65002);
         assert_eq!(pg.local_asn, 65001);
-        assert_eq!(pg.auth_password, Some("yaml-secret".to_string()));
+        assert_eq!(pg.auth_password, Some("test-secret".to_string()));
         assert_eq!(pg.holdtime, Some(90));
         assert_eq!(pg.connect_retry_time, Some(30));
         assert!(pg.passive);
@@ -3733,7 +3733,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_group_yaml_empty_password_becomes_none() {
+    fn peer_group_config_empty_password_becomes_none() {
         let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
@@ -3747,7 +3747,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_group_yaml_multihop_disabled_yields_none() {
+    fn peer_group_config_multihop_disabled_yields_none() {
         let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
@@ -3837,7 +3837,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_group_yaml_families_parsed() {
+    fn peer_group_config_families_parsed() {
         let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
@@ -3869,7 +3869,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_group_yaml_addpath_send_max_parsed() {
+    fn peer_group_config_addpath_send_max_parsed() {
         let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
@@ -3901,7 +3901,7 @@ mod tests {
     // --- PeerGroup graceful_restart tests ---
 
     #[test]
-    fn peer_group_yaml_gr_parsed() {
+    fn peer_group_config_gr_parsed() {
         let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
@@ -3939,7 +3939,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_group_yaml_gr_disabled_yields_none() {
+    fn peer_group_config_gr_disabled_yields_none() {
         let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
@@ -3959,7 +3959,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_group_yaml_gr_no_families_yields_none() {
+    fn peer_group_config_gr_no_families_yields_none() {
         // GR enabled but no afi-safi has mp-graceful-restart -> None
         let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
@@ -4202,7 +4202,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_group_yaml_ttl_security_parsed() {
+    fn peer_group_config_ttl_security_parsed() {
         let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
@@ -4222,7 +4222,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_group_yaml_ttl_security_default_min() {
+    fn peer_group_config_ttl_security_default_min() {
         let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
