@@ -1,6 +1,17 @@
 #!/bin/bash
 # Shared test helper functions for e2e tests.
 
+# Auto-detect RUST_TARGET from host architecture if the caller did not set it.
+# All docker-compose.yml files reference ${RUST_TARGET} when building the
+# rustybgpd container, so this must be set before "docker compose up --build".
+if [ -z "${RUST_TARGET:-}" ]; then
+    case "$(uname -m)" in
+        x86_64)  export RUST_TARGET=x86_64-unknown-linux-musl ;;
+        aarch64) export RUST_TARGET=aarch64-unknown-linux-musl ;;
+        *) echo "helpers.sh: unsupported host arch: $(uname -m)" >&2; exit 1 ;;
+    esac
+fi
+
 # Query FRR BGP neighbor state via vtysh JSON output.
 frr_bgp_state() {
     local container=$1 neighbor=$2

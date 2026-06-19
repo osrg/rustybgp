@@ -99,16 +99,6 @@ restart_bfd_stub() {
 echo "=== BFD (RFC 5880/5881/5882) End-to-End Test ==="
 echo ""
 
-# Auto-detect the musl target triple for the host architecture unless the
-# caller already exported RUST_TARGET.
-if [ -z "${RUST_TARGET:-}" ]; then
-    ARCH=$(uname -m)
-    if [ "$ARCH" = "x86_64" ]; then
-        export RUST_TARGET=x86_64-unknown-linux-musl
-    else
-        export RUST_TARGET=aarch64-unknown-linux-musl
-    fi
-fi
 echo "RUST_TARGET=$RUST_TARGET"
 
 echo "Building and starting containers..."
