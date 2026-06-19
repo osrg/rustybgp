@@ -536,7 +536,11 @@ fn create_listen_socket() -> std::io::Result<UdpSocket> {
             )
         };
         if ret != 0 {
-            return Err(std::io::Error::last_os_error());
+            // Non-fatal: GTSM protection disabled (e.g. under QEMU emulation).
+            log::warn!(
+                "BFD: IP_MINTTL setsockopt failed: {} (GTSM disabled)",
+                std::io::Error::last_os_error()
+            );
         }
     }
 

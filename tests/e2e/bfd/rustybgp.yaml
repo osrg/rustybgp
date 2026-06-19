@@ -10,7 +10,8 @@ neighbors:
       - config:
           afi-safi-name: ipv4-unicast
     bfd:
-      enabled: true
-      desired-minimum-tx-interval: 300000
-      required-minimum-receive: 300000
-      detection-multiplier: 3
+      config:
+        enabled: true
+        desired-minimum-tx-interval: 300000
+        required-minimum-receive: 300000
+        detection-multiplier: 3

@@ -99,6 +99,18 @@ restart_bfd_stub() {
 echo "=== BFD (RFC 5880/5881/5882) End-to-End Test ==="
 echo ""
 
+# Auto-detect the musl target triple for the host architecture unless the
+# caller already exported RUST_TARGET.
+if [ -z "${RUST_TARGET:-}" ]; then
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "x86_64" ]; then
+        export RUST_TARGET=x86_64-unknown-linux-musl
+    else
+        export RUST_TARGET=aarch64-unknown-linux-musl
+    fi
+fi
+echo "RUST_TARGET=$RUST_TARGET"
+
 echo "Building and starting containers..."
 docker compose up -d --build 2>&1
 
@@ -163,10 +175,11 @@ echo "Restarting bfd-stub..."
 restart_bfd_stub
 
 echo "Waiting for BFD Up after restart..."
+# Check router-rusty's BFD log: the restarted stub runs via docker exec -d
+# so its stdout is not captured by docker logs bfd-peer.
 BFD_RECOVERED=false
 for i in $(seq 1 20); do
-    # docker logs shows cumulative output; count occurrences of "Up".
-    UP_COUNT=$(docker logs bfd-peer 2>&1 | grep -c "BFD STATE:.*-> Up" || true)
+    UP_COUNT=$(docker logs router-rusty 2>&1 | grep -c "BFD:.*-> Up" || true)
     if [ "$UP_COUNT" -ge 2 ]; then
         BFD_RECOVERED=true
         break

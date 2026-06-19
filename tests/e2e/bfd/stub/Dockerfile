@@ -9,9 +9,9 @@ RUN apk add --no-cache musl-dev
 
 WORKDIR /build
 COPY packet/ packet/
-COPY tests/e2e/bfd/stub/ stub/
+COPY tests/e2e/bfd/stub/ tests/e2e/bfd/stub/
 
-WORKDIR /build/stub
+WORKDIR /build/tests/e2e/bfd/stub
 RUN cargo build --release
 
 # ---- runtime ----
@@ -34,4 +34,4 @@ RUN apk add --no-cache bash ca-certificates && \
     tar xz -C /usr/local/bin gobgpd gobgp < /tmp/gobgp.tar.gz && \
     rm /tmp/gobgp.tar.gz
 
-COPY --from=builder /build/stub/target/release/bfd-stub /usr/local/bin/bfd-stub
+COPY --from=builder /build/tests/e2e/bfd/stub/target/release/bfd-stub /usr/local/bin/bfd-stub
