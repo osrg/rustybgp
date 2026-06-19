@@ -5152,6 +5152,18 @@ struct PeerResources {
     confederation_id: u32,
 }
 
+type CloseRxFuture = futures::future::OptionFuture<
+    futures::future::Fuse<tokio::sync::oneshot::Receiver<CloseReason>>,
+>;
+
+enum Step {
+    Continue,
+    Terminate {
+        reason: crate::fsm::SessionDownReason,
+        notification: Option<bgp::Message>,
+    },
+}
+
 /// I/O driver for one TCP connection (one BGP session).
 ///
 /// Lifetime: a single BGP session — from `accept_connection` until the TCP
@@ -5184,7 +5196,6 @@ struct PeerSession {
     stream: Option<TcpStream>,
     source: FnvHashMap<Family, Arc<table::Source>>,
     peer_event_rx: Option<UnboundedReceiverStream<ToPeerEvent>>,
-    shutdown: Option<crate::fsm::SessionDownReason>,
     tables: TableHandle,
     export_map: ExportMap,
     /// Per-family prefix counters: (max_prefixes, current_count).
@@ -5204,7 +5215,7 @@ struct PeerSession {
     cluster_id: Option<Ipv4Addr>,
 
     // --- session I/O state ---
-    urgent: Vec<bgp::Message>,
+    ctrl_msgs: Vec<bgp::Message>,
     codec: bgp::PeerCodec,
     keepalive_futures: FuturesUnordered<tokio::time::Sleep>,
     holdtime_futures: FuturesUnordered<tokio::time::Sleep>,
@@ -5267,7 +5278,6 @@ impl PeerSession {
             stream: Some(stream),
             source: FnvHashMap::default(),
             peer_event_rx: None,
-            shutdown: None,
             tables: res.tables,
             export_map: ExportMap::new(),
             prefix_counters,
@@ -5275,7 +5285,7 @@ impl PeerSession {
             context: res.context,
             local_router_id: res.local_router_id,
             cluster_id: res.cluster_id,
-            urgent: Vec::new(),
+            ctrl_msgs: Vec::new(),
             codec,
             keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
                 .into_iter()
@@ -5342,7 +5352,6 @@ impl PeerSession {
             stream: None,
             source: FnvHashMap::default(),
             peer_event_rx: None,
-            shutdown: None,
             tables,
             export_map: ExportMap::new(),
             prefix_counters: FnvHashMap::default(),
@@ -5350,7 +5359,7 @@ impl PeerSession {
             context,
             local_router_id: Ipv4Addr::new(1, 0, 0, 1),
             cluster_id: None,
-            urgent: vec![],
+            ctrl_msgs: Vec::new(),
             codec,
             keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
                 .into_iter()
@@ -5530,12 +5539,19 @@ impl PeerSession {
         outputs: Vec<crate::fsm::PeerFsmOutput>,
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
-    ) -> Vec<GlobalEffect> {
+    ) -> (Step, Vec<GlobalEffect>) {
         let mut effects = Vec::new();
+        let mut down_reason = None;
+        let mut notification: Option<bgp::Message> = None;
         for output in outputs {
             match output {
                 crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::SendMessage(m)) => {
-                    self.urgent.push(m);
+                    match &m {
+                        bgp::Message::Notification(_) => {
+                            notification = Some(m);
+                        }
+                        _ => self.ctrl_msgs.push(m),
+                    }
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -5595,7 +5611,7 @@ impl PeerSession {
                     crate::fsm::Output::SessionDown(reason),
                 ) => {
                     self.state.session_addrs.store(None);
-                    self.shutdown = Some(reason);
+                    down_reason = Some(reason);
                 }
                 crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::StateChanged(s)) => {
                     self.state.fsm.store(u8::from(s), Ordering::Relaxed);
@@ -5607,14 +5623,24 @@ impl PeerSession {
                     self.do_route_refresh(family).await;
                 }
                 crate::fsm::PeerFsmOutput::CloseConnection => {
-                    self.shutdown = Some(crate::fsm::SessionDownReason::FsmError);
+                    down_reason = Some(crate::fsm::SessionDownReason::FsmError);
                 }
                 crate::fsm::PeerFsmOutput::StopActiveConnect => {
                     effects.push(GlobalEffect::StopActiveConnect);
                 }
             }
         }
-        effects
+        if let Some(reason) = down_reason {
+            (
+                Step::Terminate {
+                    reason,
+                    notification,
+                },
+                effects,
+            )
+        } else {
+            (Step::Continue, effects)
+        }
     }
 
     async fn process_effects(&mut self, effects: Vec<GlobalEffect>, global: &GlobalHandle) {
@@ -5717,10 +5743,10 @@ impl PeerSession {
     // Returns false if a write error occurred; the caller must route
     // Input::Disconnected through the FSM in that case.
     async fn flush_tx(&mut self, stream: &mut TcpStream) -> bool {
-        // 1. Flush urgent (open, keepalive, notification) messages.
+        // 1. Flush control (open and keepalive) messages.
         let mut txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
-        for _ in 0..self.urgent.len() {
-            let msg = self.urgent.remove(0);
+        for _ in 0..self.ctrl_msgs.len() {
+            let msg = self.ctrl_msgs.remove(0);
             let wire_count = self.codec.encode_to(&msg, &mut txbuf).unwrap_or(1);
             (*self.counter_tx).sync_tx(&msg, wire_count);
 
@@ -5895,7 +5921,7 @@ impl PeerSession {
         local_sockaddr: SocketAddr,
         remote_sockaddr: SocketAddr,
         msg: bgp::Message,
-    ) -> std::result::Result<(), Error> {
+    ) -> Step {
         // Extract UPDATE fields before consuming msg into the FSM.
         let route_fields = match &msg {
             bgp::Message::Update(bgp::Update::Reach {
@@ -5933,46 +5959,233 @@ impl PeerSession {
             .lock()
             .unwrap()
             .process(self.role, crate::fsm::Input::MessageReceived(msg));
-        let has_session_down = outputs.iter().any(|o| {
-            matches!(
-                o,
-                crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::SessionDown(_))
-            )
-        });
-        let effects = self
+        let (step, effects) = self
             .apply_outputs(outputs, local_sockaddr, remote_sockaddr)
             .await;
         self.process_effects(effects, global).await;
 
+        if matches!(step, Step::Terminate { .. }) {
+            return step;
+        }
+
         // For UPDATE Routes: if FSM didn't reject (no SessionDown), process routes.
         if let Some((reach, unreach, attr)) = route_fields {
-            if has_session_down {
-                return Err(Error::Notification(
-                    rustybgp_packet::Notification::FsmUnexpectedState {
-                        state: u8::from(self.conn_arbiter.lock().unwrap().state(self.role)),
-                    },
-                ));
-            }
             let rx_timestamp = std::time::SystemTime::now();
             if self.rx_update(reach, unreach, attr, rx_timestamp).await {
                 let cease = bgp::Message::Notification(
                     rustybgp_packet::Notification::CeaseMaxPrefixReached,
                 );
-                self.urgent.insert(0, cease.clone());
-                self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(cease));
-                return Ok(());
+                return Step::Terminate {
+                    reason: crate::fsm::SessionDownReason::LocalNotification(cease.clone()),
+                    notification: Some(cease),
+                };
             }
         }
 
         // For UPDATE EndOfRib: signal GR if negotiated.
         if let Some(family) = eor_family
-            && !has_session_down
             && self.negotiated_gr.is_some()
         {
             self.process_effects(vec![GlobalEffect::GrEorReceived { family }], global)
                 .await;
         }
-        Ok(())
+        Step::Continue
+    }
+
+    const RXBUF_SIZE: usize = 1 << 17;
+
+    async fn run_select(
+        &mut self,
+        global: &GlobalHandle,
+        stream: &mut TcpStream,
+        rxbuf: &mut bytes::BytesMut,
+        remote_sockaddr: SocketAddr,
+        local_sockaddr: SocketAddr,
+        mut close_rx: &mut CloseRxFuture,
+    ) -> Step {
+        let mut peer_event_next: futures::future::OptionFuture<_> = self
+            .peer_event_rx
+            .as_mut()
+            .map(|rx| rx.next().fuse())
+            .into();
+
+        let interest = if self.ctrl_msgs.is_empty() {
+            let mut interest = tokio::io::Interest::READABLE;
+            for p in self.pending.values_mut() {
+                if !p.is_empty() {
+                    interest |= tokio::io::Interest::WRITABLE;
+                    break;
+                }
+            }
+            interest
+        } else {
+            tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE
+        };
+
+        futures::select_biased! {
+            cease = close_rx => {
+                match cease {
+                    Some(Ok(CloseReason::AdminShutdown)) => {
+                        let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::AdminShutdown);
+                        let (step, effects) = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
+                        self.process_effects(effects, global).await;
+                        if matches!(step, Step::Terminate { .. }) {
+                            return step;
+                        }
+                    }
+                    Some(Ok(CloseReason::SendMessage(msg))) => {
+                        // Bypass FSM: NOTIFICATION content is pre-determined by
+                        // the caller (collision subcode 7, peer delete subcode 3);
+                        // Input::AdminShutdown would overwrite it with subcode 2.
+                        return Step::Terminate { reason: crate::fsm::SessionDownReason::AdminShutdown, notification: Some(msg) };
+                    }
+                    Some(Ok(CloseReason::Silent)) => {
+                        // Close TCP without sending a NOTIFICATION so the remote
+                        // peer treats this as a GR restart event.
+                        return Step::Terminate { reason: crate::fsm::SessionDownReason::AdminShutdown, notification: None };
+                    }
+                    _ => {}
+                }
+            }
+            _ = self.holdtime_futures.next() => {
+                log::warn!("{}: holdtime expired", self.remote_addr);
+                let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
+                let (step, effects) = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
+                self.process_effects(effects, global).await;
+                if matches!(step, Step::Terminate { .. }) {
+                    return step;
+                }
+            }
+            _ = self.keepalive_futures.next() => {
+                let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
+                let (step, effects) = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
+                self.process_effects(effects, global).await;
+                if matches!(step, Step::Terminate { .. }) {
+                    return step;
+                }
+            }
+            msg = peer_event_next => {
+                match msg {
+                    Some(Some(ToPeerEvent::NlriChange(update))) => {
+                        self.handle_prefix_update(update);
+                    }
+                    Some(Some(ToPeerEvent::SoftResetOut)) => {
+                        // Re-advertise all current best paths to this peer.
+                        // do_route_refresh() checks SessionState::Established
+                        // internally, so if the session is down (e.g. GR
+                        // helper mode) this is a safe no-op.
+                        for family in self.pending.keys().cloned().collect::<Vec<_>>() {
+                            self.do_route_refresh(family).await;
+                        }
+                    }
+                    Some(None) => {
+                        self.peer_event_rx = None;
+                    }
+                    _ => {}
+                }
+            }
+            ready = stream.ready(interest).fuse() => {
+                let ready = match ready {
+                    Ok(ready) => ready,
+                    Err(_) => return Step::Continue,
+                };
+
+                if ready.is_readable() {
+                    rxbuf.reserve(PeerSession::RXBUF_SIZE);
+                    match stream.try_read_buf(rxbuf) {
+                        Ok(0) => {
+                            let outputs = self.conn_arbiter.lock().unwrap().process(
+                                self.role,
+                                crate::fsm::Input::Disconnected,
+                            );
+                            let (step, effects) = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
+                            self.process_effects(effects, global).await;
+                            if matches!(step, Step::Terminate { .. }) {
+                                return step;
+                            }
+                        }
+                        Ok(_) => loop {
+                                match self.codec.try_parse(rxbuf) {
+                                Ok(msg) => match msg {
+                                    Some(parsed) => {
+                                        // Count one wire frame before validate_message moves `parsed`.
+                                        (*self.counter_rx).sync_rx(&parsed);
+                                        let is_ebgp = matches!(self.export_ctx.role, PeerRole::Ebgp);
+                                        match bgp::validate_message(parsed, is_ebgp) {
+                                            Err(notif) => {
+                                                return Step::Terminate {
+                                                    reason: crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(notif.clone())),
+                                                    notification: Some(bgp::Message::Notification(notif)),
+                                                };
+                                            }
+                                            Ok(iter) => {
+                                                for msg in iter {
+                                                    if let bgp::Message::Update(bgp::Update::Reach { attr, .. }) = &msg
+                                                        && is_as_loop(
+                                                            attr,
+                                                            self.export_ctx.local_asn,
+                                                            self.export_ctx.confederation_id,
+                                                        )
+                                                    {
+                                                        continue;
+                                                    }
+                                                    let step = self.rx_msg(global, local_sockaddr, remote_sockaddr, msg).await;
+                                                    if matches!(step, Step::Terminate { .. }) {
+                                                        return step;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        // partial read
+                                        break;
+                                    },
+                                }
+                                Err(e) => {
+                                    // Bypass FSM: Notification already encodes the
+                                    // correct NOTIFICATION; the FSM has no
+                                    // decision to make here.
+                                    return Step::Terminate {
+                                        reason: crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(e.clone())),
+                                        notification: Some(bgp::Message::Notification(e)),
+                                    };
+                                },
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+                        Err(_e) => {
+                            let outputs = self.conn_arbiter.lock().unwrap().process(
+                                self.role,
+                                crate::fsm::Input::Disconnected,
+                            );
+                            let (step, effects) = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
+                            self.process_effects(effects, global).await;
+                            if matches!(step, Step::Terminate { .. }) {
+                                return step;
+                            }
+                        }
+                    }
+                }
+
+                if ready.is_writable()
+                    && !self.flush_tx(stream).await
+                {
+                    let outputs = self.conn_arbiter.lock().unwrap().process(
+                        self.role,
+                        crate::fsm::Input::Disconnected,
+                    );
+                    let (step, effects) = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
+                    self.process_effects(effects, global).await;
+                    if matches!(step, Step::Terminate { .. }) {
+                        return step;
+                    }
+                }
+
+            }
+        }
+
+        Step::Continue
     }
 
     async fn session_loop(&mut self, global: &GlobalHandle) -> DisconnectInfo {
@@ -5989,7 +6202,6 @@ impl PeerSession {
         let Ok(local_sockaddr) = stream.local_addr() else {
             return disconnect;
         };
-        let rxbuf_size = 1 << 16;
 
         // Kick off the OPEN exchange via the FSM.
         let outputs = self
@@ -5997,179 +6209,46 @@ impl PeerSession {
             .lock()
             .unwrap()
             .process(self.role, crate::fsm::Input::Connected(self.is_restarting));
-        let effects = self
+        let (_, effects) = self
             .apply_outputs(outputs, local_sockaddr, remote_sockaddr)
             .await;
         self.process_effects(effects, global).await;
 
+        let mut rxbuf = bytes::BytesMut::with_capacity(PeerSession::RXBUF_SIZE);
         let mut close_rx: futures::future::OptionFuture<_> =
             self.close_rx.take().map(|rx| rx.fuse()).into();
-        let mut rxbuf = bytes::BytesMut::with_capacity(rxbuf_size);
-        while self.shutdown.is_none() {
-            let mut peer_event_next: futures::future::OptionFuture<_> = self
-                .peer_event_rx
-                .as_mut()
-                .map(|rx| rx.next().fuse())
-                .into();
 
-            let interest = if self.urgent.is_empty() {
-                let mut interest = tokio::io::Interest::READABLE;
-                for p in self.pending.values_mut() {
-                    if !p.is_empty() {
-                        interest |= tokio::io::Interest::WRITABLE;
-                        break;
-                    }
-                }
-                interest
-            } else {
-                tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE
-            };
-
-            futures::select_biased! {
-                cease = &mut close_rx => {
-                    match cease {
-                        Some(Ok(CloseReason::AdminShutdown)) => {
-                            let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::AdminShutdown);
-                            let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
-                            self.process_effects(effects, global).await;
-                        }
-                        Some(Ok(CloseReason::SendMessage(msg))) => {
-                            // Bypass FSM: NOTIFICATION content is pre-determined by
-                            // the caller (collision subcode 7, peer delete subcode 3);
-                            // Input::AdminShutdown would overwrite it with subcode 2.
-                            self.urgent.insert(0, msg);
-                            self.shutdown = Some(crate::fsm::SessionDownReason::AdminShutdown);
-                        }
-                        Some(Ok(CloseReason::Silent)) => {
-                            // Close TCP without sending a NOTIFICATION so the remote
-                            // peer treats this as a GR restart event.
-                            self.shutdown = Some(crate::fsm::SessionDownReason::AdminShutdown);
-                        }
-                        _ => {}
-                    }
-                }
-                _ = self.holdtime_futures.next() => {
-                    log::warn!("{}: holdtime expired", self.remote_addr);
-                    let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::HoldTimerExpired);
-                    let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
-                    self.process_effects(effects, global).await;
-                }
-                _ = self.keepalive_futures.next() => {
-                    let outputs = self.conn_arbiter.lock().unwrap().process(self.role, crate::fsm::Input::KeepaliveTimerExpired);
-                    let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
-                    self.process_effects(effects, global).await;
-                }
-                msg = peer_event_next => {
-                    match msg {
-                        Some(Some(ToPeerEvent::NlriChange(update))) => {
-                            self.handle_prefix_update(update);
-                        }
-                        Some(Some(ToPeerEvent::SoftResetOut)) => {
-                            // Re-advertise all current best paths to this peer.
-                            // do_route_refresh() checks SessionState::Established
-                            // internally, so if the session is down (e.g. GR
-                            // helper mode) this is a safe no-op.
-                            for family in self.pending.keys().cloned().collect::<Vec<_>>() {
-                                self.do_route_refresh(family).await;
-                            }
-                        }
-                        Some(None) => {
-                            self.peer_event_rx = None;
-                        }
-                        _ => {}
-                    }
-                }
-                ready = stream.ready(interest).fuse() => {
-                    let ready = match ready {
-                        Ok(ready) => ready,
-                        Err(_) => continue,
-                    };
-
-                    if ready.is_readable() {
-                        rxbuf.reserve(rxbuf_size);
-                        match stream.try_read_buf(&mut rxbuf) {
-                            Ok(0) => {
-                                let outputs = self.conn_arbiter.lock().unwrap().process(
-                                    self.role,
-                                    crate::fsm::Input::Disconnected,
-                                );
-                                let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
-                                self.process_effects(effects, global).await;
-                            }
-                            Ok(_) => loop {
-                                    match self.codec.try_parse(&mut rxbuf) {
-                                    Ok(msg) => match msg {
-                                        Some(parsed) => {
-                                            // Count one wire frame before validate_message moves `parsed`.
-                                            (*self.counter_rx).sync_rx(&parsed);
-                                            let is_ebgp = matches!(self.export_ctx.role, PeerRole::Ebgp);
-                                            match bgp::validate_message(parsed, is_ebgp) {
-                                                Err(notif) => {
-                                                    self.urgent.insert(0, bgp::Message::Notification(notif.clone()));
-                                                    self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(notif)));
-                                                    break;
-                                                }
-                                                Ok(iter) => {
-                                                    for msg in iter {
-                                                        if let bgp::Message::Update(bgp::Update::Reach { attr, .. }) = &msg
-                                                            && is_as_loop(
-                                                                attr,
-                                                                self.export_ctx.local_asn,
-                                                                self.export_ctx.confederation_id,
-                                                            )
-                                                        {
-                                                            continue;
-                                                        }
-                                                        let _ = self.rx_msg(global, local_sockaddr, remote_sockaddr, msg).await;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            // partial read
-                                            break;
-                                        },
-                                    }
-                                    Err(e) => {
-                                        // Bypass FSM: Notification already encodes the
-                                        // correct NOTIFICATION; the FSM has no
-                                        // decision to make here.
-                                        self.urgent.insert(0, bgp::Message::Notification(e.clone()));
-                                        self.shutdown = Some(crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(e)));
-                                        break;
-                                    },
-                                }
-                            }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
-                            Err(_e) => {
-                                let outputs = self.conn_arbiter.lock().unwrap().process(
-                                    self.role,
-                                    crate::fsm::Input::Disconnected,
-                                );
-                                let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
-                                self.process_effects(effects, global).await;
-                            }
+        let reason = loop {
+            match self
+                .run_select(
+                    global,
+                    &mut stream,
+                    &mut rxbuf,
+                    remote_sockaddr,
+                    local_sockaddr,
+                    &mut close_rx,
+                )
+                .await
+            {
+                Step::Continue => {}
+                Step::Terminate {
+                    reason,
+                    notification,
+                } => {
+                    if let Some(msg) = notification {
+                        let mut txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
+                        if self.codec.encode_to(&msg, &mut txbuf).is_ok()
+                            && stream.write_all(&txbuf.freeze()).await.is_ok()
+                        {
+                            self.counter_tx.sync_tx(&msg, 1);
                         }
                     }
-
-                    if ready.is_writable()
-                        && !self.flush_tx(&mut stream).await
-                    {
-                        let outputs = self.conn_arbiter.lock().unwrap().process(
-                            self.role,
-                            crate::fsm::Input::Disconnected,
-                        );
-                        let effects = self.apply_outputs(outputs, local_sockaddr, remote_sockaddr).await;
-                        self.process_effects(effects, global).await;
-                    }
+                    break reason;
                 }
             }
+        };
 
-            // Hold timer setup is now handled by apply_outputs (SetHoldTimer).
-        }
-        // Capture shutdown reason before the shard loop consumes it.
-        // Used below to decide whether N-bit GR applies to this disconnect.
-        let shutdown_reason = self.shutdown.clone();
+        let shutdown_reason = Some(reason);
 
         if !self.source.is_empty() {
             let drop_families =
@@ -6181,7 +6260,7 @@ impl PeerSession {
                 .unwrap_or_default();
             // All per-family Sources share the same peer-level fields; use any for BMP.
             let any_source = self.source.values().next().unwrap().clone();
-            let bmp_reason = crate::bmp::session_down_to_bmp(self.shutdown.take());
+            let bmp_reason = crate::bmp::session_down_to_bmp(shutdown_reason.clone());
             self.peer_event_rx = None;
             self.tables
                 .unregister_peer(self.remote_addr, &drop_families, &stale_families);
@@ -8189,29 +8268,45 @@ mod tests {
         assert!(conn.pending[&Family::IPV4].is_empty());
     }
 
-    /// `apply_outputs` places any `SendMessage` output into `rs.urgent`.
-    /// Cross-role CEASE delivery is now handled atomically by `ConnArbiter::process`
-    /// before outputs reach `apply_outputs`, so `apply_outputs` just queues them.
+    /// `apply_outputs` returns `SendMessage(Notification(_))` outputs as `Step::Terminate`
+    /// with the notification field set. Cross-role CEASE delivery is handled atomically by
+    /// `ConnArbiter::process` before outputs reach `apply_outputs`, so non-Notification
+    /// `SendMessage` outputs are queued into `ctrl_msgs`.
     #[tokio::test]
-    async fn apply_outputs_send_message_goes_to_urgent() {
+    async fn apply_outputs_send_message_goes_to_ctrl() {
         let global = make_global();
         let tables = make_tables();
         let (client, server) = loopback_pair().await;
         let remote_addr = client.local_addr().unwrap().ip();
 
         let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
+        let cease = cease_notification();
 
-        let outputs = vec![crate::fsm::PeerFsmOutput::Connection(
-            crate::fsm::Role::Passive,
-            crate::fsm::Output::SendMessage(cease_notification()),
-        )];
+        let outputs = vec![
+            crate::fsm::PeerFsmOutput::Connection(
+                crate::fsm::Role::Passive,
+                crate::fsm::Output::SendMessage(cease.clone()),
+            ),
+            crate::fsm::PeerFsmOutput::Connection(
+                crate::fsm::Role::Passive,
+                crate::fsm::Output::SessionDown(crate::fsm::SessionDownReason::LocalNotification(
+                    cease.clone(),
+                )),
+            ),
+        ];
         let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
-        let effects = conn.apply_outputs(outputs, dummy, dummy).await;
+        let (step, effects) = conn.apply_outputs(outputs, dummy, dummy).await;
 
-        // No GlobalEffect::SendCease — CEASE goes into conn.urgent directly.
         assert!(effects.is_empty());
-        assert_eq!(conn.urgent.len(), 1);
-        assert!(matches!(conn.urgent[0], bgp::Message::Notification(_)));
+        let Step::Terminate { notification, .. } = step else {
+            panic!("expected Terminate");
+        };
+        assert!(matches!(
+            notification,
+            Some(bgp::Message::Notification(
+                packet::Notification::CeaseConnectionCollision
+            ))
+        ));
         let _ = tables;
     }
 
