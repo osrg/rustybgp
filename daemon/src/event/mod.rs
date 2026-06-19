@@ -2145,12 +2145,7 @@ impl PeerSession {
         for output in outputs {
             match output {
                 crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::SendMessage(m)) => {
-                    match &m {
-                        bgp::Message::Notification(_) => {
-                            notification = Some(m);
-                        }
-                        _ => self.ctrl_msgs.push(m),
-                    }
+                    self.ctrl_msgs.push(m);
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -2207,10 +2202,11 @@ impl PeerSession {
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
-                    crate::fsm::Output::SessionDown(reason),
+                    crate::fsm::Output::SessionDown(reason, notif),
                 ) => {
                     self.state.session_addrs.store(None);
                     down_reason = Some(reason);
+                    notification = notif;
                 }
                 crate::fsm::PeerFsmOutput::Connection(_, crate::fsm::Output::StateChanged(s)) => {
                     self.state.fsm.store(u8::from(s), Ordering::Relaxed);
@@ -4511,12 +4507,11 @@ mod tests {
         assert!(conn.pending[&Family::IPV4].is_empty());
     }
 
-    /// `apply_outputs` returns `SendMessage(Notification(_))` outputs as `Step::Terminate`
-    /// with the notification field set. Cross-role CEASE delivery is handled atomically by
-    /// `ConnArbiter::process` before outputs reach `apply_outputs`, so non-Notification
-    /// `SendMessage` outputs are queued into `ctrl_msgs`.
+    /// `apply_outputs` with `SessionDown(reason, Some(notif))` returns `Step::Terminate`
+    /// with the notification field set. `SendMessage` outputs (non-notification BGP messages
+    /// such as OPEN or KEEPALIVE) are still queued into `ctrl_msgs`.
     #[tokio::test]
-    async fn apply_outputs_send_message_goes_to_ctrl() {
+    async fn apply_outputs_session_down_carries_notification() {
         let global = make_global();
         let tables = make_tables();
         let (client, server) = loopback_pair().await;
@@ -4525,18 +4520,13 @@ mod tests {
         let mut conn = passive_connection(&global, &tables, remote_addr, server).await;
         let cease = cease_notification();
 
-        let outputs = vec![
-            crate::fsm::PeerFsmOutput::Connection(
-                crate::fsm::Role::Passive,
-                crate::fsm::Output::SendMessage(cease.clone()),
+        let outputs = vec![crate::fsm::PeerFsmOutput::Connection(
+            crate::fsm::Role::Passive,
+            crate::fsm::Output::SessionDown(
+                crate::fsm::SessionDownReason::LocalNotification(cease.clone()),
+                Some(cease),
             ),
-            crate::fsm::PeerFsmOutput::Connection(
-                crate::fsm::Role::Passive,
-                crate::fsm::Output::SessionDown(crate::fsm::SessionDownReason::LocalNotification(
-                    cease.clone(),
-                )),
-            ),
-        ];
+        )];
         let dummy: SocketAddr = "127.0.0.1:179".parse().unwrap();
         let (step, effects) = conn.apply_outputs(outputs, dummy, dummy).await;
 
@@ -4615,6 +4605,142 @@ mod tests {
             CloseReason::SendMessage(bgp::Message::Notification(_))
         ));
         let _ = tables; // suppress unused warning
+    }
+
+    /// When the calling task's own connection loses the collision (out_role == role),
+    /// ConnArbiter::process must return SessionDown in the outputs so the driver
+    /// can terminate via apply_outputs rather than being stuck with a dead FSM slot.
+    ///
+    /// make_global() sets local router_id = 1.0.0.1.
+    /// Remote router_id = 10.0.0.1 (higher) → passive wins → active is the loser.
+    /// Here Active enters OpenConfirm second, so Active is the calling task.
+    #[tokio::test]
+    async fn collision_calling_task_loses_returns_session_down() {
+        let global = make_global(); // local router_id = 1.0.0.1
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        passive_connection(&global, &tables, remote_addr, server).await;
+
+        let conn_arbiter = {
+            let g = global.read().await;
+            Arc::clone(&g.peers[&remote_addr].context.lock().unwrap().conn_arbiter)
+        };
+
+        // remote router_id 10.0.0.1 > local 1.0.0.1 → passive wins → active is loser
+        let open_msg = bgp::Message::Open(bgp::Open {
+            as_number: 65001,
+            holdtime: HoldTime::new(90).unwrap(),
+            router_id: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+            capability: vec![bgp::Capability::FourOctetAsNumber(65001)],
+        });
+
+        // Passive → OpenConfirm first (no collision yet)
+        {
+            let mut arb = conn_arbiter.lock().unwrap();
+            arb.process(
+                crate::fsm::Role::Passive,
+                crate::fsm::Input::Connected(false),
+            );
+            arb.process(
+                crate::fsm::Role::Passive,
+                crate::fsm::Input::MessageReceived(open_msg.clone()),
+            );
+        }
+
+        // Active → OpenConfirm second → collision, Active is the caller and the loser
+        // SessionDown must appear in outputs (not in close_tx)
+        let outputs = {
+            let mut arb = conn_arbiter.lock().unwrap();
+            arb.process(
+                crate::fsm::Role::Active,
+                crate::fsm::Input::Connected(false),
+            );
+            arb.process(
+                crate::fsm::Role::Active,
+                crate::fsm::Input::MessageReceived(open_msg),
+            )
+        };
+
+        assert!(
+            outputs.iter().any(|o| matches!(
+                o,
+                crate::fsm::PeerFsmOutput::Connection(
+                    crate::fsm::Role::Active,
+                    crate::fsm::Output::SessionDown(..)
+                )
+            )),
+            "expected SessionDown in Active outputs when Active is the collision loser"
+        );
+        let _ = tables;
+    }
+
+    /// When the calling task's connection wins the collision, the CEASE is delivered
+    /// to the losing connection's close channel (not returned in outputs).
+    ///
+    /// make_global() sets local router_id = 1.0.0.1.
+    /// Remote router_id = 0.0.0.1 (lower) → active wins → passive is the loser.
+    /// Active enters OpenConfirm second, so Active is the calling task.
+    #[tokio::test]
+    async fn collision_calling_task_wins_delivers_cease_to_close_tx() {
+        let global = make_global(); // local router_id = 1.0.0.1
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        passive_connection(&global, &tables, remote_addr, server).await;
+
+        let (passive_close_tx, mut passive_close_rx) =
+            tokio::sync::oneshot::channel::<CloseReason>();
+        let conn_arbiter = {
+            let g = global.read().await;
+            Arc::clone(&g.peers[&remote_addr].context.lock().unwrap().conn_arbiter)
+        };
+        conn_arbiter.lock().unwrap().passive_close_tx = Some(passive_close_tx);
+
+        // remote router_id 0.0.0.1 < local 1.0.0.1 → active wins → passive is loser
+        let open_msg = bgp::Message::Open(bgp::Open {
+            as_number: 65001,
+            holdtime: HoldTime::new(90).unwrap(),
+            router_id: u32::from(Ipv4Addr::new(0, 0, 0, 1)),
+            capability: vec![bgp::Capability::FourOctetAsNumber(65001)],
+        });
+
+        // Passive → OpenConfirm first (no collision yet)
+        {
+            let mut arb = conn_arbiter.lock().unwrap();
+            arb.process(
+                crate::fsm::Role::Passive,
+                crate::fsm::Input::Connected(false),
+            );
+            arb.process(
+                crate::fsm::Role::Passive,
+                crate::fsm::Input::MessageReceived(open_msg.clone()),
+            );
+        }
+
+        // Active → OpenConfirm second → collision, Active wins → CEASE to passive_close_tx
+        {
+            let mut arb = conn_arbiter.lock().unwrap();
+            arb.process(
+                crate::fsm::Role::Active,
+                crate::fsm::Input::Connected(false),
+            );
+            arb.process(
+                crate::fsm::Role::Active,
+                crate::fsm::Input::MessageReceived(open_msg),
+            );
+        }
+
+        let received = passive_close_rx
+            .try_recv()
+            .expect("CEASE not delivered to passive (loser)");
+        assert!(matches!(
+            received,
+            CloseReason::SendMessage(bgp::Message::Notification(_))
+        ));
+        let _ = tables;
     }
 
     #[test]

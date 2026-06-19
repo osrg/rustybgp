@@ -107,8 +107,9 @@ pub(crate) enum Output {
         remote_holdtime: u16,
         remote_capabilities: Vec<Capability>,
     },
-    /// The session is shutting down.
-    SessionDown(SessionDownReason),
+    /// The session is shutting down. If a NOTIFICATION should be sent before
+    /// closing the connection, it is provided as the second field.
+    SessionDown(SessionDownReason, Option<bgp::Message>),
     /// The FSM state changed. The driver should update any shared state
     /// (e.g., `Arc<PeerState>`).
     StateChanged(State),
@@ -245,10 +246,10 @@ impl Connection {
                 bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
                     state: u8::from(self.state),
                 });
-            return vec![
-                Output::SendMessage(notif.clone()),
-                Output::SessionDown(SessionDownReason::LocalNotification(notif)),
-            ];
+            return vec![Output::SessionDown(
+                SessionDownReason::LocalNotification(notif.clone()),
+                Some(notif),
+            )];
         }
 
         let mut out = Vec::new();
@@ -256,10 +257,10 @@ impl Connection {
         // Validate ASN if pre-configured
         if self.expected_remote_asn != 0 && self.expected_remote_asn != open.as_number {
             let notif = bgp::Message::Notification(rustybgp_packet::Notification::OpenBadPeerAs);
-            out.push(Output::SendMessage(notif.clone()));
-            out.push(Output::SessionDown(SessionDownReason::LocalNotification(
-                notif,
-            )));
+            out.push(Output::SessionDown(
+                SessionDownReason::LocalNotification(notif.clone()),
+                Some(notif),
+            ));
             return out;
         }
 
@@ -276,10 +277,10 @@ impl Connection {
             let notif = bgp::Message::Notification(
                 rustybgp_packet::Notification::OpenUnsupportedCapability { data: cap_data },
             );
-            out.push(Output::SendMessage(notif.clone()));
-            out.push(Output::SessionDown(SessionDownReason::LocalNotification(
-                notif,
-            )));
+            out.push(Output::SessionDown(
+                SessionDownReason::LocalNotification(notif.clone()),
+                Some(notif),
+            ));
             return out;
         }
 
@@ -358,10 +359,10 @@ impl Connection {
                     bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
                         state: u8::from(self.state),
                     });
-                vec![
-                    Output::SendMessage(notif.clone()),
-                    Output::SessionDown(SessionDownReason::LocalNotification(notif)),
-                ]
+                vec![Output::SessionDown(
+                    SessionDownReason::LocalNotification(notif.clone()),
+                    Some(notif),
+                )]
             }
         }
     }
@@ -372,18 +373,19 @@ impl Connection {
                 bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
                     state: u8::from(self.state),
                 });
-            return vec![
-                Output::SendMessage(notif.clone()),
-                Output::SessionDown(SessionDownReason::LocalNotification(notif)),
-            ];
+            return vec![Output::SessionDown(
+                SessionDownReason::LocalNotification(notif.clone()),
+                Some(notif),
+            )];
         }
         vec![Output::SetHoldTimer(self.negotiated_holdtime)]
     }
 
     fn on_notification(&mut self, err: rustybgp_packet::Notification) -> Vec<Output> {
-        vec![Output::SessionDown(SessionDownReason::RemoteNotification(
-            bgp::Message::Notification(err),
-        ))]
+        vec![Output::SessionDown(
+            SessionDownReason::RemoteNotification(bgp::Message::Notification(err)),
+            None,
+        )]
     }
 
     fn on_route_refresh(&mut self, family: Family) -> Vec<Output> {
@@ -392,10 +394,10 @@ impl Connection {
                 bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
                     state: u8::from(self.state),
                 });
-            return vec![
-                Output::SendMessage(notif.clone()),
-                Output::SessionDown(SessionDownReason::LocalNotification(notif)),
-            ];
+            return vec![Output::SessionDown(
+                SessionDownReason::LocalNotification(notif.clone()),
+                Some(notif),
+            )];
         }
         vec![Output::RouteRefresh(family)]
     }
@@ -415,10 +417,10 @@ impl Connection {
             State::OpenSent | State::OpenConfirm | State::Established => {
                 let notif =
                     bgp::Message::Notification(rustybgp_packet::Notification::HoldTimerExpired);
-                vec![
-                    Output::SendMessage(notif),
-                    Output::SessionDown(SessionDownReason::HoldTimerExpired),
-                ]
+                vec![Output::SessionDown(
+                    SessionDownReason::HoldTimerExpired,
+                    Some(notif),
+                )]
             }
             _ => Vec::new(),
         }
@@ -433,16 +435,16 @@ impl Connection {
     }
 
     fn on_disconnected(&mut self) -> Vec<Output> {
-        vec![Output::SessionDown(SessionDownReason::IoError)]
+        vec![Output::SessionDown(SessionDownReason::IoError, None)]
     }
 
     fn on_admin_shutdown(&mut self) -> Vec<Output> {
-        vec![
-            Output::SendMessage(bgp::Message::Notification(
+        vec![Output::SessionDown(
+            SessionDownReason::AdminShutdown,
+            Some(bgp::Message::Notification(
                 rustybgp_packet::Notification::CeaseAdminShutdown,
             )),
-            Output::SessionDown(SessionDownReason::AdminShutdown),
-        ]
+        )]
     }
 }
 
@@ -564,7 +566,7 @@ impl PeerFsm {
         let entered_open_confirm = outputs
             .iter()
             .any(|o| matches!(o, Output::StateChanged(State::OpenConfirm)));
-        let session_down = outputs.iter().any(|o| matches!(o, Output::SessionDown(_)));
+        let session_down = outputs.iter().any(|o| matches!(o, Output::SessionDown(..)));
 
         let mut result: Vec<PeerFsmOutput> = outputs
             .into_iter()
@@ -575,8 +577,25 @@ impl PeerFsm {
             if role == Role::Passive {
                 result.push(PeerFsmOutput::StopActiveConnect);
             }
-            if let Some(collision_outputs) = self.check_collision(role) {
-                result.extend(collision_outputs);
+            if let Some(loser) = self.check_collision(role) {
+                let cease = bgp::Message::Notification(
+                    rustybgp_packet::Notification::CeaseConnectionCollision,
+                );
+                if loser == role {
+                    // Calling task's own connection lost: emit SessionDown so the
+                    // driver terminates this task and sends the CEASE notification.
+                    result.push(PeerFsmOutput::Connection(
+                        role,
+                        Output::SessionDown(
+                            SessionDownReason::LocalNotification(cease.clone()),
+                            Some(cease),
+                        ),
+                    ));
+                } else {
+                    // Other connection lost: ConnArbiter intercepts via out_role != role
+                    // and delivers the CEASE to the losing connection's close channel.
+                    result.push(PeerFsmOutput::Connection(loser, Output::SendMessage(cease)));
+                }
             }
         }
 
@@ -659,8 +678,8 @@ impl PeerFsm {
     }
 
     /// Check for collision when a Connection enters OpenConfirm.
-    /// Returns outputs to close the losing connection, or None if no collision.
-    fn check_collision(&mut self, role: Role) -> Option<Vec<PeerFsmOutput>> {
+    /// Returns the losing Role, or None if no collision exists.
+    fn check_collision(&mut self, role: Role) -> Option<Role> {
         let other_role = role.other();
         let other_state = self.connection(other_role)?.state();
 
@@ -672,20 +691,10 @@ impl PeerFsm {
         let winner = self.collision_winner(role);
         let loser = winner.other();
 
-        // Send CEASE to the loser via its close channel.
-        // CloseConnection is intentionally omitted: the loser shuts itself down
-        // upon receiving the CEASE; only the losing role's SendMessage is needed.
-        let outputs = vec![PeerFsmOutput::Connection(
-            loser,
-            Output::SendMessage(bgp::Message::Notification(
-                rustybgp_packet::Notification::CeaseConnectionCollision,
-            )),
-        )];
-
         // Remove the loser's Connection
         self.close_connection(loser);
 
-        Some(outputs)
+        Some(loser)
     }
 }
 
@@ -831,7 +840,7 @@ mod tests {
         let out = s.process(Input::HoldTimerExpired);
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::HoldTimerExpired)
+            Output::SessionDown(SessionDownReason::HoldTimerExpired, _)
         )));
         assert!(!has_output(&out, |o| matches!(o, Output::StateChanged(_))));
     }
@@ -851,11 +860,7 @@ mod tests {
         let out = s.process(Input::AdminShutdown);
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SendMessage(bgp::Message::Notification(_))
-        )));
-        assert!(has_output(&out, |o| matches!(
-            o,
-            Output::SessionDown(SessionDownReason::AdminShutdown)
+            Output::SessionDown(SessionDownReason::AdminShutdown, Some(_))
         )));
         assert!(!has_output(&out, |o| matches!(o, Output::StateChanged(_))));
     }
@@ -875,7 +880,7 @@ mod tests {
         let out = s.process(Input::Disconnected);
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::IoError)
+            Output::SessionDown(SessionDownReason::IoError, _)
         )));
         assert!(!has_output(&out, |o| matches!(o, Output::StateChanged(_))));
     }
@@ -892,9 +897,8 @@ mod tests {
         )));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SendMessage(bgp::Message::Notification(_))
+            Output::SessionDown(SessionDownReason::LocalNotification(_), Some(_))
         )));
-        assert!(has_output(&out, |o| matches!(o, Output::SessionDown(_))));
     }
 
     #[test]
@@ -917,11 +921,7 @@ mod tests {
         )));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SendMessage(bgp::Message::Notification(_))
-        )));
-        assert!(has_output(&out, |o| matches!(
-            o,
-            Output::SessionDown(SessionDownReason::LocalNotification(_))
+            Output::SessionDown(SessionDownReason::LocalNotification(_), Some(_))
         )));
     }
 
@@ -943,7 +943,7 @@ mod tests {
             60,
         )));
         assert_eq!(s.state(), State::OpenConfirm);
-        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
+        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(..))));
     }
 
     #[test]
@@ -974,7 +974,7 @@ mod tests {
         let out = s.process(Input::HoldTimerExpired);
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::HoldTimerExpired)
+            Output::SessionDown(SessionDownReason::HoldTimerExpired, _)
         )));
     }
 
@@ -995,7 +995,7 @@ mod tests {
         let out = s.process(Input::HoldTimerExpired);
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::HoldTimerExpired)
+            Output::SessionDown(SessionDownReason::HoldTimerExpired, _)
         )));
     }
 
@@ -1044,7 +1044,7 @@ mod tests {
             o,
             Output::SetKeepaliveTimer(20)
         )));
-        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
+        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(..))));
     }
 
     #[test]
@@ -1072,7 +1072,7 @@ mod tests {
         // KEEPALIVE received → reset hold timer to full negotiated_holdtime
         let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
         assert!(has_output(&out, |o| matches!(o, Output::SetHoldTimer(60))));
-        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
+        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(..))));
     }
 
     #[test]
@@ -1091,7 +1091,7 @@ mod tests {
         let update = bgp::Message::eor(rustybgp_packet::Family::IPV4);
         let out = s.process(Input::MessageReceived(update));
         assert!(has_output(&out, |o| matches!(o, Output::SetHoldTimer(60))));
-        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
+        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(..))));
     }
 
     #[test]
@@ -1112,11 +1112,7 @@ mod tests {
         let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SendMessage(bgp::Message::Notification(_))
-        )));
-        assert!(has_output(&out, |o| matches!(
-            o,
-            Output::SessionDown(SessionDownReason::LocalNotification(_))
+            Output::SessionDown(SessionDownReason::LocalNotification(_), Some(_))
         )));
     }
 
@@ -1139,7 +1135,7 @@ mod tests {
             o,
             Output::RouteRefresh(Family::IPV4)
         )));
-        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(_))));
+        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(..))));
     }
 
     #[test]
@@ -1152,11 +1148,7 @@ mod tests {
         }));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SendMessage(bgp::Message::Notification(_))
-        )));
-        assert!(has_output(&out, |o| matches!(
-            o,
-            Output::SessionDown(SessionDownReason::LocalNotification(_))
+            Output::SessionDown(SessionDownReason::LocalNotification(_), Some(_))
         )));
     }
 
@@ -1170,7 +1162,7 @@ mod tests {
         let out = s.process(Input::MessageReceived(notif));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::RemoteNotification(_))
+            Output::SessionDown(SessionDownReason::RemoteNotification(_), _)
         )));
     }
 
@@ -1182,7 +1174,7 @@ mod tests {
 
         let update = bgp::Message::eor(rustybgp_packet::Family::IPV4);
         let out = s.process(Input::MessageReceived(update));
-        assert!(has_output(&out, |o| matches!(o, Output::SessionDown(_))));
+        assert!(has_output(&out, |o| matches!(o, Output::SessionDown(..))));
     }
 
     #[test]
@@ -1222,11 +1214,7 @@ mod tests {
         let out = s.process(Input::AdminShutdown);
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SendMessage(bgp::Message::Notification(_))
-        )));
-        assert!(has_output(&out, |o| matches!(
-            o,
-            Output::SessionDown(SessionDownReason::AdminShutdown)
+            Output::SessionDown(SessionDownReason::AdminShutdown, Some(_))
         )));
     }
 
@@ -1422,10 +1410,10 @@ mod tests {
             Input::MessageReceived(remote_open_msg(65001, low_id)),
         );
 
-        // local_id > remote_id → active wins → passive gets CEASE and is removed
+        // local_id > remote_id → active wins → passive (caller) gets SessionDown with CEASE
         assert!(has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::Connection(Role::Passive, Output::SendMessage(_))
+            PeerFsmOutput::Connection(Role::Passive, Output::SessionDown(..))
         )));
         assert!(peer.connection(Role::Active).is_some());
         assert!(peer.connection(Role::Passive).is_none());
@@ -1490,10 +1478,10 @@ mod tests {
             Input::MessageReceived(remote_open_msg(65001, low_id)),
         );
 
-        // local_id > remote_id, active wins → passive gets CEASE and is removed
+        // local_id > remote_id, active wins → passive (caller) gets SessionDown with CEASE
         assert!(has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::Connection(Role::Passive, Output::SendMessage(_))
+            PeerFsmOutput::Connection(Role::Passive, Output::SessionDown(..))
         )));
         assert!(peer.connection(Role::Active).is_some());
         assert!(peer.connection(Role::Passive).is_none());
@@ -1573,6 +1561,67 @@ mod tests {
     }
 
     #[test]
+    fn peer_fsm_collision_active_loses_when_active_enters_open_confirm_second() {
+        // Active enters OpenConfirm second and loses. The SessionDown must appear in
+        // the Active outputs so the caller can terminate without a separate close_tx.
+        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+
+        // local_id = low_id < remote_id = high_id → passive wins → active loses
+        let mut peer = make_peer_fsm(low_id, 65001);
+        connect(&mut peer, Role::Active);
+        connect(&mut peer, Role::Passive);
+
+        // Passive → OpenConfirm first; no collision yet
+        peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65001, high_id)),
+        );
+
+        // Active → OpenConfirm second → collision, active loses → SessionDown in Active outputs
+        let out = peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65001, high_id)),
+        );
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::Connection(Role::Active, Output::SessionDown(..))
+        )));
+        assert!(peer.connection(Role::Active).is_none());
+        assert!(peer.connection(Role::Passive).is_some());
+    }
+
+    #[test]
+    fn peer_fsm_collision_passive_loses_when_passive_enters_open_confirm_second() {
+        // Passive enters OpenConfirm second and loses (same-role loser case for Passive).
+        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+
+        // local_id = high_id > remote_id = low_id → active wins → passive loses
+        let mut peer = make_peer_fsm(high_id, 65001);
+        connect(&mut peer, Role::Active);
+        connect(&mut peer, Role::Passive);
+
+        // Active → OpenConfirm first; no collision yet
+        peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+
+        // Passive → OpenConfirm second → collision, passive loses → SessionDown in Passive outputs
+        let out = peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(65001, low_id)),
+        );
+        assert!(has_peer_output(&out, |o| matches!(
+            o,
+            PeerFsmOutput::Connection(Role::Passive, Output::SessionDown(..))
+        )));
+        assert!(peer.connection(Role::Active).is_some());
+        assert!(peer.connection(Role::Passive).is_none());
+    }
+
+    #[test]
     fn peer_fsm_duplicate_role_rejected() {
         let mut peer = make_peer_fsm(local_router_id(), 65002);
         let out = connect(&mut peer, Role::Active);
@@ -1606,13 +1655,10 @@ mod tests {
             Input::MessageReceived(remote_open_msg(65001, low_id)),
         );
 
-        // CEASE notification (code 6, subcode 7) sent to the loser (passive)
+        // Passive is the caller and the loser: SessionDown with CEASE in outputs
         assert!(has_peer_output(&out, |o| matches!(
             o,
-            PeerFsmOutput::Connection(
-                Role::Passive,
-                Output::SendMessage(bgp::Message::Notification(_))
-            )
+            PeerFsmOutput::Connection(Role::Passive, Output::SessionDown(..))
         )));
     }
 
@@ -1637,7 +1683,7 @@ mod tests {
             o,
             PeerFsmOutput::Connection(
                 Role::Active,
-                Output::SessionDown(SessionDownReason::IoError)
+                Output::SessionDown(SessionDownReason::IoError, _)
             )
         )));
         assert!(peer.connection(Role::Active).is_none());
@@ -1666,7 +1712,7 @@ mod tests {
             o,
             PeerFsmOutput::Connection(
                 Role::Active,
-                Output::SessionDown(SessionDownReason::IoError)
+                Output::SessionDown(SessionDownReason::IoError, _)
             )
         )));
         assert!(has_peer_output(&out, |o| matches!(
@@ -1680,7 +1726,7 @@ mod tests {
                 o,
                 PeerFsmOutput::Connection(
                     Role::Active,
-                    Output::SessionDown(SessionDownReason::IoError)
+                    Output::SessionDown(SessionDownReason::IoError, _)
                 )
             )
         });
@@ -1703,7 +1749,7 @@ mod tests {
             o,
             PeerFsmOutput::Connection(
                 Role::Active,
-                Output::SessionDown(SessionDownReason::AdminShutdown)
+                Output::SessionDown(SessionDownReason::AdminShutdown, _)
             )
         )));
         assert!(has_peer_output(&out, |o| matches!(
