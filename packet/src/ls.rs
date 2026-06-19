@@ -1928,4 +1928,52 @@ mod tests {
             }
         );
     }
+
+    // RFC 7752 §3.2.3.2 permits prefix-length 0 (default route 0.0.0.0/0 or
+    // ::/0).  GoBGP rejected it until PR #3458 fixed two guards that treated
+    // prefix-length 0 as invalid; these tests confirm RustyBGP handles it
+    // correctly by exercising encode -> decode roundtrips for both AFIs.
+    #[test]
+    fn ip_reachability_prefix_len_zero_v4() {
+        let original = BgpLsNlri::PrefixV4(BgpLsPrefixNlri {
+            protocol_id: PROTOCOL_OSPF_V2,
+            identifier: 0,
+            local_node: NodeDescriptor {
+                asn: Some(65001),
+                igp_router_id: Some(vec![10, 0, 0, 1]),
+                ..Default::default()
+            },
+            prefix_desc: vec![PrefixDescTlv::IpReachability {
+                prefix_len: 0,
+                addr: vec![],
+            }],
+        });
+        let mut buf = Vec::new();
+        original.encode(&mut buf);
+        let mut c = Cursor::new(buf.as_slice());
+        let decoded = BgpLsNlri::decode(&mut c).expect("decode failed");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn ip_reachability_prefix_len_zero_v6() {
+        let original = BgpLsNlri::PrefixV6(BgpLsPrefixNlri {
+            protocol_id: PROTOCOL_ISIS_L2,
+            identifier: 0,
+            local_node: NodeDescriptor {
+                asn: Some(65001),
+                igp_router_id: Some(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06]),
+                ..Default::default()
+            },
+            prefix_desc: vec![PrefixDescTlv::IpReachability {
+                prefix_len: 0,
+                addr: vec![],
+            }],
+        });
+        let mut buf = Vec::new();
+        original.encode(&mut buf);
+        let mut c = Cursor::new(buf.as_slice());
+        let decoded = BgpLsNlri::decode(&mut c).expect("decode failed");
+        assert_eq!(original, decoded);
+    }
 }
