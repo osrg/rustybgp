@@ -1,0 +1,16 @@
+global:
+  config:
+    as: 65001
+    router-id: 172.30.9.1
+neighbors:
+  - config:
+      neighbor-address: 172.30.9.2
+      peer-as: 65002
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+    bfd:
+      enabled: true
+      desired-minimum-tx-interval: 300000
+      required-minimum-receive: 300000
+      detection-multiplier: 3

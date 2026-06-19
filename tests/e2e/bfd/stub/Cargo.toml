@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "bfd-stub"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bfd-stub"
+path = "src/main.rs"
+
+[dependencies]
+rustybgp-packet = { path = "../../../../packet" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
