@@ -355,6 +355,7 @@ impl Family {
     const SAFI_SR_POLICY: u8 = 73;
     const SAFI_FLOWSPEC: u8 = 133;
     const SAFI_FLOWSPEC_VPN: u8 = 134;
+    const SAFI_RTC: u8 = 132;
 
     pub const EMPTY: Family = Family::new(0, 0);
     pub const IPV4: Family = Family::new(Family::AFI_IP, Family::SAFI_UNICAST);
@@ -375,6 +376,7 @@ impl Family {
     pub const IPV4_SRPOLICY: Family = Family::new(Family::AFI_IP, Family::SAFI_SR_POLICY);
     pub const IPV6_SRPOLICY: Family = Family::new(Family::AFI_IP6, Family::SAFI_SR_POLICY);
     pub const L2VPN_EVPN: Family = Family::new(Family::AFI_L2VPN, Family::SAFI_EVPN);
+    pub const RTC: Family = Family::new(Family::AFI_IP, Family::SAFI_RTC);
 
     pub const fn new(afi: u16, safi: u8) -> Self {
         Family((afi as u32) << 16 | safi as u32)
@@ -523,6 +525,7 @@ pub enum Nlri {
     Ls(crate::ls::BgpLsNlri),
     SrPolicy(crate::sr_policy::SrPolicyNlri),
     Evpn(crate::evpn::EvpnNlri),
+    Rtc(crate::rtc::RtcNlri),
 }
 
 impl Nlri {
@@ -560,6 +563,10 @@ impl Nlri {
                 Ok(0)
             }
             Nlri::Evpn(n) => {
+                n.encode(dst);
+                Ok(0)
+            }
+            Nlri::Rtc(n) => {
                 n.encode(dst);
                 Ok(0)
             }
@@ -622,6 +629,9 @@ impl Nlri {
             Family::L2VPN_EVPN => crate::evpn::EvpnNlri::decode(c)
                 .map(Nlri::Evpn)
                 .map_err(|_| Notification::UpdateMalformedAttributeList),
+            Family::RTC => crate::rtc::RtcNlri::decode(c)
+                .map(Nlri::Rtc)
+                .map_err(|_| Notification::UpdateMalformedAttributeList),
             _ => Err(Notification::UpdateMalformedAttributeList),
         }
     }
@@ -658,6 +668,7 @@ impl fmt::Display for Nlri {
             Nlri::Ls(n) => n.fmt(f),
             Nlri::SrPolicy(n) => n.fmt(f),
             Nlri::Evpn(n) => n.fmt(f),
+            Nlri::Rtc(n) => n.fmt(f),
         }
     }
 }

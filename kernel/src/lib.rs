@@ -206,7 +206,8 @@ impl Handle {
             | packet::Nlri::FlowspecVpnV6(_)
             | packet::Nlri::Ls(_)
             | packet::Nlri::SrPolicy(_)
-            | packet::Nlri::Evpn(_) => {
+            | packet::Nlri::Evpn(_)
+            | packet::Nlri::Rtc(_) => {
                 return Ok(());
             }
         };

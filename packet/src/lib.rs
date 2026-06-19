@@ -35,6 +35,7 @@ pub mod mup;
 pub mod prefix_sid;
 pub mod rd;
 pub mod rpki;
+pub mod rtc;
 pub mod sr_policy;
 pub mod tunnel_encap;
 pub mod vpn;

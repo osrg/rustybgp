@@ -276,6 +276,12 @@ pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
             })),
         },
         Nlri::Evpn(n) => evpn_nlri_to_api(n),
+        Nlri::Rtc(n) => api::Nlri {
+            nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
+                prefix: n.to_string(),
+                prefix_len: 0,
+            })),
+        },
     }
 }
 
