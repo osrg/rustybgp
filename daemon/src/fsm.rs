@@ -241,13 +241,13 @@ impl Connection {
 
     fn on_open(&mut self, open: bgp::Open) -> Vec<Output> {
         if self.state != State::OpenSent {
+            let notif =
+                bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
+                    state: u8::from(self.state),
+                });
             return vec![
-                Output::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::Notification::FsmUnexpectedState {
-                        state: u8::from(self.state),
-                    },
-                )),
-                Output::SessionDown(SessionDownReason::FsmError),
+                Output::SendMessage(notif.clone()),
+                Output::SessionDown(SessionDownReason::LocalNotification(notif)),
             ];
         }
 
@@ -255,10 +255,11 @@ impl Connection {
 
         // Validate ASN if pre-configured
         if self.expected_remote_asn != 0 && self.expected_remote_asn != open.as_number {
-            out.push(Output::SendMessage(bgp::Message::Notification(
-                rustybgp_packet::Notification::OpenBadPeerAs,
+            let notif = bgp::Message::Notification(rustybgp_packet::Notification::OpenBadPeerAs);
+            out.push(Output::SendMessage(notif.clone()));
+            out.push(Output::SessionDown(SessionDownReason::LocalNotification(
+                notif,
             )));
-            out.push(Output::SessionDown(SessionDownReason::AdminShutdown));
             return out;
         }
 
@@ -272,10 +273,13 @@ impl Connection {
             // RFC 5492 §4: data contains the capability TLV we require.
             let mut cap_data = vec![Capability::FOUR_OCTET_AS_NUMBER, 4];
             cap_data.extend_from_slice(&self.local_asn.to_be_bytes());
-            out.push(Output::SendMessage(bgp::Message::Notification(
+            let notif = bgp::Message::Notification(
                 rustybgp_packet::Notification::OpenUnsupportedCapability { data: cap_data },
+            );
+            out.push(Output::SendMessage(notif.clone()));
+            out.push(Output::SessionDown(SessionDownReason::LocalNotification(
+                notif,
             )));
-            out.push(Output::SessionDown(SessionDownReason::AdminShutdown));
             return out;
         }
 
@@ -349,26 +353,28 @@ impl Connection {
             State::Established => {
                 vec![Output::SetHoldTimer(self.negotiated_holdtime)]
             }
-            _ => vec![
-                Output::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::Notification::FsmUnexpectedState {
+            _ => {
+                let notif =
+                    bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
                         state: u8::from(self.state),
-                    },
-                )),
-                Output::SessionDown(SessionDownReason::FsmError),
-            ],
+                    });
+                vec![
+                    Output::SendMessage(notif.clone()),
+                    Output::SessionDown(SessionDownReason::LocalNotification(notif)),
+                ]
+            }
         }
     }
 
     fn on_update(&mut self) -> Vec<Output> {
         if self.state != State::Established {
+            let notif =
+                bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
+                    state: u8::from(self.state),
+                });
             return vec![
-                Output::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::Notification::FsmUnexpectedState {
-                        state: u8::from(self.state),
-                    },
-                )),
-                Output::SessionDown(SessionDownReason::FsmError),
+                Output::SendMessage(notif.clone()),
+                Output::SessionDown(SessionDownReason::LocalNotification(notif)),
             ];
         }
         vec![Output::SetHoldTimer(self.negotiated_holdtime)]
@@ -382,13 +388,13 @@ impl Connection {
 
     fn on_route_refresh(&mut self, family: Family) -> Vec<Output> {
         if self.state != State::Established {
+            let notif =
+                bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
+                    state: u8::from(self.state),
+                });
             return vec![
-                Output::SendMessage(bgp::Message::Notification(
-                    rustybgp_packet::Notification::FsmUnexpectedState {
-                        state: u8::from(self.state),
-                    },
-                )),
-                Output::SessionDown(SessionDownReason::FsmError),
+                Output::SendMessage(notif.clone()),
+                Output::SessionDown(SessionDownReason::LocalNotification(notif)),
             ];
         }
         vec![Output::RouteRefresh(family)]
@@ -915,7 +921,7 @@ mod tests {
         )));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::FsmError)
+            Output::SessionDown(SessionDownReason::LocalNotification(_))
         )));
     }
 
@@ -1110,7 +1116,7 @@ mod tests {
         )));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::FsmError)
+            Output::SessionDown(SessionDownReason::LocalNotification(_))
         )));
     }
 
@@ -1150,7 +1156,7 @@ mod tests {
         )));
         assert!(has_output(&out, |o| matches!(
             o,
-            Output::SessionDown(SessionDownReason::FsmError)
+            Output::SessionDown(SessionDownReason::LocalNotification(_))
         )));
     }
 

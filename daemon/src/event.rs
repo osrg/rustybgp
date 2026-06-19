@@ -4680,7 +4680,7 @@ struct DisconnectInfo {
 /// RFC 4724: GR applies to unexpected TCP/IO drops.
 /// RFC 8538: when the N-bit is negotiated, GR also applies to
 /// NOTIFICATION (sent or received, unless Hard Reset) and Hold Timer expiry.
-/// AdminShutdown and FsmError never trigger GR.
+/// Only CEASE notifications are GR-eligible; OPEN/FSM/UPDATE errors are not.
 fn gr_on_disconnect(
     shutdown: &Option<crate::fsm::SessionDownReason>,
     gr: NegotiatedGr,
@@ -4691,7 +4691,21 @@ fn gr_on_disconnect(
             err,
         ))) => gr.notification_enabled && !err.is_hard_reset(),
         Some(crate::fsm::SessionDownReason::LocalNotification(bgp::Message::Notification(err))) => {
-            gr.notification_enabled && !err.is_hard_reset()
+            gr.notification_enabled
+                && matches!(
+                    err,
+                    rustybgp_packet::Notification::CeaseMaxPrefixReached
+                        | rustybgp_packet::Notification::CeaseAdminShutdown
+                        | rustybgp_packet::Notification::CeasePeerDeconfigured
+                        | rustybgp_packet::Notification::CeaseAdministrativeReset
+                        | rustybgp_packet::Notification::CeaseConnectionRejected
+                        | rustybgp_packet::Notification::CeaseOtherConfigurationChange
+                        | rustybgp_packet::Notification::CeaseConnectionCollision
+                        | rustybgp_packet::Notification::CeaseOutOfResources
+                        | rustybgp_packet::Notification::CeaseHardReset
+                        | rustybgp_packet::Notification::Other { code: 6, .. }
+                )
+                && !err.is_hard_reset()
         }
         Some(crate::fsm::SessionDownReason::HoldTimerExpired) => gr.notification_enabled,
         _ => false,
