@@ -1122,7 +1122,7 @@ impl Global {
             let mut server = global.write().await;
             for pg in groups {
                 if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {
-                    server.peer_group.insert(name, PeerGroup::from_yaml(pg));
+                    server.peer_group.insert(name, PeerGroup::from(pg));
                 }
             }
         }
@@ -3666,7 +3666,7 @@ mod tests {
 
     // --- PeerGroup YAML parsing tests ---
 
-    fn make_yaml_peer_group() -> config::PeerGroup {
+    fn make_config_peer_group() -> config::PeerGroup {
         config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("yaml-grp".to_string()),
@@ -3717,7 +3717,7 @@ mod tests {
 
     #[test]
     fn peer_group_yaml_parses_all_fields() {
-        let pg = PeerGroup::from_yaml(&make_yaml_peer_group());
+        let pg = PeerGroup::from(&make_config_peer_group());
         assert_eq!(pg.as_number, 65002);
         assert_eq!(pg.local_asn, 65001);
         assert_eq!(pg.auth_password, Some("yaml-secret".to_string()));
@@ -3734,7 +3734,7 @@ mod tests {
 
     #[test]
     fn peer_group_yaml_empty_password_becomes_none() {
-        let yaml_pg = config::PeerGroup {
+        let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
                 auth_password: Some(String::new()),
@@ -3742,13 +3742,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let pg = PeerGroup::from_yaml(&yaml_pg);
+        let pg = PeerGroup::from(&cfg_pg);
         assert!(pg.auth_password.is_none());
     }
 
     #[test]
     fn peer_group_yaml_multihop_disabled_yields_none() {
-        let yaml_pg = config::PeerGroup {
+        let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
                 ..Default::default()
@@ -3762,7 +3762,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let pg = PeerGroup::from_yaml(&yaml_pg);
+        let pg = PeerGroup::from(&cfg_pg);
         assert!(pg.multihop_ttl.is_none());
     }
 
@@ -3838,7 +3838,7 @@ mod tests {
 
     #[test]
     fn peer_group_yaml_families_parsed() {
-        let yaml_pg = config::PeerGroup {
+        let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
                 ..Default::default()
@@ -3861,7 +3861,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let pg = PeerGroup::from_yaml(&yaml_pg);
+        let pg = PeerGroup::from(&cfg_pg);
         assert_eq!(pg.families.len(), 2);
         assert!(pg.families.contains_key(&Family::IPV4));
         assert!(pg.families.contains_key(&Family::IPV6));
@@ -3870,7 +3870,7 @@ mod tests {
 
     #[test]
     fn peer_group_yaml_addpath_send_max_parsed() {
-        let yaml_pg = config::PeerGroup {
+        let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
                 ..Default::default()
@@ -3891,7 +3891,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let pg = PeerGroup::from_yaml(&yaml_pg);
+        let pg = PeerGroup::from(&cfg_pg);
         assert_eq!(pg.families.len(), 1);
         // mode: bit0=RX(1), bit1=TX(1) -> 3
         assert_eq!(*pg.families.get(&Family::IPV4).unwrap(), 3u8);
@@ -3902,7 +3902,7 @@ mod tests {
 
     #[test]
     fn peer_group_yaml_gr_parsed() {
-        let yaml_pg = config::PeerGroup {
+        let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
                 ..Default::default()
@@ -3931,7 +3931,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let pg = PeerGroup::from_yaml(&yaml_pg);
+        let pg = PeerGroup::from(&cfg_pg);
         let gr = pg.graceful_restart.as_ref().expect("GR should be Some");
         assert_eq!(gr.restart_time, 90);
         assert!(gr.notification_enabled);
@@ -3940,7 +3940,7 @@ mod tests {
 
     #[test]
     fn peer_group_yaml_gr_disabled_yields_none() {
-        let yaml_pg = config::PeerGroup {
+        let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
                 ..Default::default()
@@ -3954,14 +3954,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        let pg = PeerGroup::from_yaml(&yaml_pg);
+        let pg = PeerGroup::from(&cfg_pg);
         assert!(pg.graceful_restart.is_none());
     }
 
     #[test]
     fn peer_group_yaml_gr_no_families_yields_none() {
         // GR enabled but no afi-safi has mp-graceful-restart -> None
-        let yaml_pg = config::PeerGroup {
+        let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
                 ..Default::default()
@@ -3982,7 +3982,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let pg = PeerGroup::from_yaml(&yaml_pg);
+        let pg = PeerGroup::from(&cfg_pg);
         assert!(pg.graceful_restart.is_none());
     }
 
@@ -4203,7 +4203,7 @@ mod tests {
 
     #[test]
     fn peer_group_yaml_ttl_security_parsed() {
-        let yaml_pg = config::PeerGroup {
+        let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
                 ..Default::default()
@@ -4217,13 +4217,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let pg = PeerGroup::from_yaml(&yaml_pg);
+        let pg = PeerGroup::from(&cfg_pg);
         assert_eq!(pg.ttl_security, Some(200u8));
     }
 
     #[test]
     fn peer_group_yaml_ttl_security_default_min() {
-        let yaml_pg = config::PeerGroup {
+        let cfg_pg = config::PeerGroup {
             config: Some(config::PeerGroupConfig {
                 peer_group_name: Some("g".to_string()),
                 ..Default::default()
@@ -4237,7 +4237,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let pg = PeerGroup::from_yaml(&yaml_pg);
+        let pg = PeerGroup::from(&cfg_pg);
         assert_eq!(pg.ttl_security, Some(255u8));
     }
 

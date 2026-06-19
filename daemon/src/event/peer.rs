@@ -263,7 +263,7 @@ impl PeerParams {
 ///
 /// Returns a map of Family -> add-path mode (RFC 7911 2-bit: bit0=RX, bit1=TX)
 /// and a separate send_max map for families where add-path TX is configured.
-pub(crate) fn parse_afi_safis_yaml(
+pub(crate) fn parse_afi_safis(
     afi_safis: &[config::AfiSafi],
 ) -> (FnvHashMap<Family, u8>, FnvHashMap<Family, usize>) {
     let mut base_families: Vec<Family> = Vec::new();
@@ -304,8 +304,7 @@ pub(crate) fn parse_afi_safis_yaml(
     (families, send_max)
 }
 
-/// Build GrPeerConfig from YAML GracefulRestartConfig + per-family mp-graceful-restart flags.
-pub(crate) fn parse_gr_yaml(
+pub(crate) fn parse_gr_config(
     afi_safis: &[config::AfiSafi],
     gr_config: Option<&config::GracefulRestartConfig>,
 ) -> Option<GrPeerConfig> {
@@ -356,8 +355,8 @@ impl TryFrom<&config::Neighbor> for PeerParams {
         let transport_config = n.transport.as_ref().and_then(|t| t.config.as_ref());
         let timer_config = n.timers.as_ref().and_then(|t| t.config.as_ref());
 
-        let (families, send_max) = parse_afi_safis_yaml(afi_safis);
-        let graceful_restart = parse_gr_yaml(
+        let (families, send_max) = parse_afi_safis(afi_safis);
+        let graceful_restart = parse_gr_config(
             afi_safis,
             n.graceful_restart
                 .as_ref()
@@ -492,11 +491,10 @@ pub(crate) struct PeerGroup {
     pub(crate) graceful_restart: Option<GrPeerConfig>,
 }
 
-impl PeerGroup {
-    pub(crate) fn from_yaml(pg: &config::PeerGroup) -> Self {
+impl From<&config::PeerGroup> for PeerGroup {
+    fn from(pg: &config::PeerGroup) -> Self {
         let timer_config = pg.timers.as_ref().and_then(|t| t.config.as_ref());
-        let (families, send_max) =
-            parse_afi_safis_yaml(pg.afi_safis.as_deref().unwrap_or_default());
+        let (families, send_max) = parse_afi_safis(pg.afi_safis.as_deref().unwrap_or_default());
         PeerGroup {
             as_number: pg.config.as_ref().and_then(|c| c.peer_as).unwrap_or(0),
             dynamic_peers: Vec::new(),
@@ -567,7 +565,7 @@ impl PeerGroup {
                 .filter(|&t| t != 0),
             families,
             send_max,
-            graceful_restart: parse_gr_yaml(
+            graceful_restart: parse_gr_config(
                 pg.afi_safis.as_deref().unwrap_or_default(),
                 pg.graceful_restart
                     .as_ref()
