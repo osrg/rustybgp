@@ -688,12 +688,15 @@ impl PeerFsm {
             return None;
         }
 
-        let winner = self.collision_winner(role);
-        let loser = winner.other();
+        // Established always wins over a new OpenConfirm connection (BIRD/FRR behavior).
+        // RFC 4271 §6.8 BGP ID comparison applies only when both are in OpenConfirm.
+        let loser = if other_state == State::Established {
+            role
+        } else {
+            self.collision_winner(role).other()
+        };
 
-        // Remove the loser's Connection
         self.close_connection(loser);
-
         Some(loser)
     }
 }
@@ -1450,41 +1453,79 @@ mod tests {
     }
 
     #[test]
-    fn peer_fsm_collision_when_one_already_established() {
-        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
-        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+    fn peer_fsm_collision_established_wins_regardless_of_router_id() {
+        // Case 1: local_id > remote_id (Active would also win by BGP ID comparison)
+        {
+            let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+            let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
 
-        let mut peer = make_peer_fsm(high_id, 65001);
-        connect(&mut peer, Role::Active);
+            let mut peer = make_peer_fsm(high_id, 65001);
+            connect(&mut peer, Role::Active);
 
-        // Active reaches Established
-        peer.process(
-            Role::Active,
-            Input::MessageReceived(remote_open_msg(65001, low_id)),
-        );
-        peer.process(
-            Role::Active,
-            Input::MessageReceived(bgp::Message::Keepalive),
-        );
-        assert_eq!(
-            peer.connection(Role::Active).unwrap().state(),
-            State::Established
-        );
+            peer.process(
+                Role::Active,
+                Input::MessageReceived(remote_open_msg(65001, low_id)),
+            );
+            peer.process(
+                Role::Active,
+                Input::MessageReceived(bgp::Message::Keepalive),
+            );
+            assert_eq!(
+                peer.connection(Role::Active).unwrap().state(),
+                State::Established
+            );
 
-        // Passive connects and receives OPEN → OpenConfirm → collision with Established
-        connect(&mut peer, Role::Passive);
-        let out = peer.process(
-            Role::Passive,
-            Input::MessageReceived(remote_open_msg(65001, low_id)),
-        );
+            connect(&mut peer, Role::Passive);
+            let out = peer.process(
+                Role::Passive,
+                Input::MessageReceived(remote_open_msg(65001, low_id)),
+            );
 
-        // local_id > remote_id, active wins → passive (caller) gets SessionDown with CEASE
-        assert!(has_peer_output(&out, |o| matches!(
-            o,
-            PeerFsmOutput::Connection(Role::Passive, Output::SessionDown(..))
-        )));
-        assert!(peer.connection(Role::Active).is_some());
-        assert!(peer.connection(Role::Passive).is_none());
+            // Established Active wins → Passive (caller) gets SessionDown with CEASE
+            assert!(has_peer_output(&out, |o| matches!(
+                o,
+                PeerFsmOutput::Connection(Role::Passive, Output::SessionDown(..))
+            )));
+            assert!(peer.connection(Role::Active).is_some());
+            assert!(peer.connection(Role::Passive).is_none());
+        }
+
+        // Case 2: local_id < remote_id (BGP ID comparison alone would let Passive win,
+        // but Established must still win)
+        {
+            let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+            let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+
+            let mut peer = make_peer_fsm(low_id, 65001);
+            connect(&mut peer, Role::Active);
+
+            peer.process(
+                Role::Active,
+                Input::MessageReceived(remote_open_msg(65001, high_id)),
+            );
+            peer.process(
+                Role::Active,
+                Input::MessageReceived(bgp::Message::Keepalive),
+            );
+            assert_eq!(
+                peer.connection(Role::Active).unwrap().state(),
+                State::Established
+            );
+
+            connect(&mut peer, Role::Passive);
+            let out = peer.process(
+                Role::Passive,
+                Input::MessageReceived(remote_open_msg(65001, high_id)),
+            );
+
+            // Established Active still wins even though local_id < remote_id
+            assert!(has_peer_output(&out, |o| matches!(
+                o,
+                PeerFsmOutput::Connection(Role::Passive, Output::SessionDown(..))
+            )));
+            assert!(peer.connection(Role::Active).is_some());
+            assert!(peer.connection(Role::Passive).is_none());
+        }
     }
 
     #[test]
