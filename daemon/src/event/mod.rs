@@ -699,6 +699,11 @@ pub(crate) struct Global {
     /// Sender end of the kernel event channel; cloned into KernelService::start.
     kernel_event_tx: mpsc::UnboundedSender<kernel::KernelEvent>,
 
+    /// BFD server handle.  None until at least one BFD-enabled peer exists.
+    pub(crate) bfd_handle: Option<crate::bfd::BfdHandle>,
+    /// Sender end of the BFD event channel; shared with bfd_handle.
+    bfd_event_tx: mpsc::UnboundedSender<crate::bfd::BfdEvent>,
+
     /// Sending on this channel causes the BGP listener loop to stop, enabling
     /// a subsequent start_bgp call to restart it.  None when BGP is not running.
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -707,7 +712,10 @@ pub(crate) struct Global {
 impl Global {
     const BGP_PORT: u16 = 179;
 
-    fn new(kernel_event_tx: mpsc::UnboundedSender<kernel::KernelEvent>) -> Global {
+    fn new(
+        kernel_event_tx: mpsc::UnboundedSender<kernel::KernelEvent>,
+        bfd_event_tx: mpsc::UnboundedSender<crate::bfd::BfdEvent>,
+    ) -> Global {
         Global {
             asn: 0,
             router_id: Ipv4Addr::new(0, 0, 0, 0),
@@ -731,6 +739,9 @@ impl Global {
 
             kernel_service: None,
             kernel_event_tx,
+
+            bfd_handle: None,
+            bfd_event_tx,
 
             stop_tx: None,
         }
@@ -814,6 +825,8 @@ impl Global {
         {
             params.local_asn = conf.id;
         }
+        // Extract bfd_config before params.build() consumes params.
+        let bfd_config = params.bfd_config.take();
         let mut peer = params.build(u32::from(self.router_id), self.asn);
         if peer.admin_down {
             peer.state
@@ -823,7 +836,17 @@ impl Global {
         if let Some(tx) = tx {
             enable_active_connect(&mut peer, tx);
         }
-        self.peers.insert(peer.config.remote_addr, peer);
+        let addr = peer.config.remote_addr;
+        self.peers.insert(addr, peer);
+
+        // Register with BFD server if the peer has BFD enabled.
+        if let Some(bfd_cfg) = bfd_config {
+            let handle = self
+                .bfd_handle
+                .get_or_insert_with(|| crate::bfd::BfdHandle::start(self.bfd_event_tx.clone()));
+            handle.add_peer(addr, bfd_cfg);
+        }
+
         Ok(())
     }
 }
@@ -900,6 +923,7 @@ async fn accept_connection(
                 send_max: group.send_max.clone(),
                 prefix_limits: FnvHashMap::default(),
                 graceful_restart: group.graceful_restart.clone(),
+                bfd_config: None,
             };
             let _ = g.add_peer(params, None);
             g.peers.get_mut(&remote_addr).unwrap()
@@ -980,7 +1004,11 @@ impl Global {
     ) {
         let (kernel_event_tx, mut kernel_event_rx) =
             mpsc::unbounded_channel::<kernel::KernelEvent>();
-        let global: GlobalHandle = Arc::new(tokio::sync::RwLock::new(Global::new(kernel_event_tx)));
+        let (bfd_event_tx, mut bfd_event_rx) = mpsc::unbounded_channel::<crate::bfd::BfdEvent>();
+        let global: GlobalHandle = Arc::new(tokio::sync::RwLock::new(Global::new(
+            kernel_event_tx,
+            bfd_event_tx,
+        )));
         let tables: TableHandle = Arc::new(TableManager::new(num_cpus::get()));
         let global_config = bgp
             .as_ref()
@@ -1377,6 +1405,20 @@ impl Global {
                                 tables.handle_address_event(addr_event);
                             }
                             None => {}
+                        }
+                    }
+                    event = bfd_event_rx.recv().fuse() => {
+                        if let Some(crate::bfd::BfdEvent::SessionDown { peer_addr }) = event {
+                            let mut g = global.write().await;
+                            if let Some(peer) = g.peers.get_mut(&peer_addr) {
+                                // RFC 5882 §4.2: tear down BGP without NOTIFICATION.
+                                // CloseReason::Silent closes TCP silently and suppresses GR.
+                                peer.context.lock().unwrap().force_down(
+                                    CloseReason::Silent,
+                                    false,
+                                );
+                                log::info!("BFD: session down for {peer_addr}, BGP peer reset");
+                            }
                         }
                     }
                     stream = bgp_listen_futures.next() => {
@@ -3023,7 +3065,8 @@ mod tests {
 
     fn make_global() -> GlobalHandle {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut g = Global::new(tx);
+        let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx, bfd_tx);
         g.asn = 65001;
         g.router_id = Ipv4Addr::new(1, 0, 0, 1);
         Arc::new(tokio::sync::RwLock::new(g))
@@ -3054,6 +3097,7 @@ mod tests {
             send_max: FnvHashMap::default(),
             prefix_limits: FnvHashMap::default(),
             graceful_restart: None,
+            bfd_config: None,
         }
     }
 
@@ -3195,7 +3239,8 @@ mod tests {
     #[test]
     fn confederation_api_parses_id_and_members() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut g = Global::new(tx);
+        let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx, bfd_tx);
         g.asn = 65001;
         let conf = api::Confederation {
             enabled: true,
@@ -3218,7 +3263,8 @@ mod tests {
     #[test]
     fn confederation_api_disabled_flag_ignored() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut g = Global::new(tx);
+        let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx, bfd_tx);
         g.asn = 65001;
         let conf = api::Confederation {
             enabled: false,
@@ -3242,7 +3288,8 @@ mod tests {
             member_as_list: Some(vec![65001, 65002]),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut g = Global::new(tx);
+        let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx, bfd_tx);
         g.asn = 65001;
         if let Some((id, c)) = conf_config
             .enabled
@@ -3337,7 +3384,8 @@ mod tests {
     fn external_peer_gets_confederation_id_as_local_asn() {
         // RFC 5065 §4: OPEN my_as for non-member peers must be confederation id.
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut g = Global::new(tx);
+        let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx, bfd_tx);
         g.asn = 65001;
         g.router_id = Ipv4Addr::new(1, 0, 0, 1);
         g.confederation = Some(ConfederationConfig {

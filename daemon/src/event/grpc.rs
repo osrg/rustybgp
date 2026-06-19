@@ -270,6 +270,18 @@ impl TryFrom<&api::Peer> for PeerParams {
             send_max: FnvHashMap::default(),
             prefix_limits: FnvHashMap::default(),
             graceful_restart,
+            bfd_config: p.bfd.as_ref().and_then(|b| {
+                if b.enabled {
+                    Some(crate::bfd::BfdPeerConfig {
+                        desired_min_tx_interval_us: b.desired_minimum_tx_interval,
+                        required_min_rx_interval_us: b.required_minimum_receive,
+                        detect_multiplier: b.detection_multiplier as u8,
+                        port: b.port as u16,
+                    })
+                } else {
+                    None
+                }
+            }),
         })
     }
 }
@@ -776,6 +788,9 @@ impl GoBgpService for GrpcService {
                     for fd in &global.listen_sockets {
                         auth::set_md5sig(*fd, &peer_addr, "");
                     }
+                }
+                if let Some(bfd) = &global.bfd_handle {
+                    bfd.remove_peer(peer_addr);
                 }
                 return Ok(tonic::Response::new(api::DeletePeerResponse {}));
             } else {

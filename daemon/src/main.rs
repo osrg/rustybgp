@@ -18,6 +18,7 @@
 pub(crate) use rustybgp_api as api;
 pub(crate) use rustybgp_config as config;
 mod auth;
+mod bfd;
 mod bmp;
 mod convert;
 mod error;

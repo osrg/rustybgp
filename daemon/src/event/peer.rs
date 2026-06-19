@@ -108,6 +108,7 @@ pub(crate) struct PeerParams {
     pub(crate) send_max: FnvHashMap<Family, usize>,
     pub(crate) prefix_limits: FnvHashMap<Family, u32>,
     pub(crate) graceful_restart: Option<GrPeerConfig>,
+    pub(crate) bfd_config: Option<crate::bfd::BfdPeerConfig>,
 }
 
 impl PeerParams {
@@ -450,6 +451,22 @@ impl TryFrom<&config::Neighbor> for PeerParams {
             send_max,
             prefix_limits,
             graceful_restart,
+            bfd_config: n
+                .bfd
+                .as_ref()
+                .and_then(|b| b.config.as_ref())
+                .and_then(|bc| {
+                    if bc.enabled.unwrap_or(false) {
+                        Some(crate::bfd::BfdPeerConfig {
+                            desired_min_tx_interval_us: bc.desired_minimum_tx_interval.unwrap_or(0),
+                            required_min_rx_interval_us: bc.required_minimum_receive.unwrap_or(0),
+                            detect_multiplier: bc.detection_multiplier.unwrap_or(0),
+                            port: 0,
+                        })
+                    } else {
+                        None
+                    }
+                }),
         })
     }
 }
