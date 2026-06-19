@@ -22,6 +22,7 @@ pub use self::bgp::{
 };
 pub use self::error::Error;
 
+pub mod bfd;
 pub mod bmp;
 pub mod error;
 pub mod evpn;
