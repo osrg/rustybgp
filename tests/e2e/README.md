@@ -22,6 +22,34 @@ On aarch64 (Apple Silicon, ARM servers):
 rustup target add aarch64-unknown-linux-musl
 ```
 
+## Running all tests locally
+
+```
+tests/e2e/run-all.sh
+```
+
+The script builds `rustybgpd` once with the musl target, then runs every test
+in sequence and prints a pass/fail summary.  Docker layer caching makes
+repeated runs fast.
+
+To run a subset of tests, pass their directory names as arguments:
+
+```
+tests/e2e/run-all.sh evpn sr-policy
+```
+
+To skip the build and reuse the binary from a previous run:
+
+```
+SKIP_BUILD=1 tests/e2e/run-all.sh
+```
+
+To override the target triple:
+
+```
+RUST_TARGET=x86_64-unknown-linux-musl tests/e2e/run-all.sh
+```
+
 ## Running a single test locally
 
 ```
