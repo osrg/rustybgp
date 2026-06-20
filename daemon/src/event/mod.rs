@@ -564,26 +564,6 @@ impl Peer {
     }
 }
 
-pub(super) async fn add_policy_assignment(
-    req: api::PolicyAssignment,
-    global: GlobalHandle,
-    tables: TableHandle,
-) -> Result<(), Error> {
-    let (name, direction, default_action, policy_names) = convert::policy_assignment_from_api(req)?;
-    let (dir, assignment) = global.write().await.ptable.add_assignment(
-        &name,
-        direction,
-        default_action,
-        policy_names,
-    )?;
-    if dir == table::PolicyDirection::Import {
-        tables.import_policy.store(Some(Arc::clone(&assignment)));
-    } else {
-        tables.export_policy.store(Some(Arc::clone(&assignment)));
-    }
-    Ok(())
-}
-
 pub(crate) enum ToPeerEvent {
     NlriChange(table::NlriChange),
     /// Trigger a soft reset OUT: re-advertise all current best paths.
@@ -747,6 +727,103 @@ impl Global {
         }
     }
 
+    fn apply_config(
+        &mut self,
+        tables: Arc<TableManager>,
+        config: &rustybgp_config::BgpConfig,
+    ) -> Result<bool, Error> {
+        if let Some(global_config) = config.global.as_ref().and_then(|g| g.config.as_ref()) {
+            if let Some(asn) = global_config.r#as {
+                self.asn = asn;
+            }
+            if let Some(router_id) = global_config.router_id {
+                self.router_id = router_id;
+            }
+            if let Some(port) = global_config.port {
+                self.listen_port = match port {
+                    i32::MIN..=-1 => 0,
+                    0 => Global::BGP_PORT,
+                    1..=65535 => port as u16,
+                    _ => return Err(Error::InvalidArgument("invalid listen port".to_string())),
+                };
+            }
+        }
+
+        if let Some((id, c)) = config
+            .global
+            .as_ref()
+            .and_then(|x| x.confederation.as_ref())
+            .and_then(|x| x.config.as_ref())
+            .filter(|c| c.enabled.unwrap_or(false))
+            .and_then(|c| c.identifier.filter(|&id| id != 0).map(|id| (id, c)))
+        {
+            self.confederation = Some(ConfederationConfig {
+                id,
+                members: c
+                    .member_as_list
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .copied()
+                    .collect(),
+            });
+        }
+
+        if let Some(groups) = &config.peer_groups {
+            for pg in groups {
+                if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {
+                    self.peer_group.insert(name, PeerGroup::from(pg));
+                }
+            }
+        }
+
+        if config.defined_sets.is_some() || config.policy_definitions.is_some() {
+            convert::load_policy_from_config(&mut self.ptable, config)?;
+        }
+
+        if let Some(g) = config.global.as_ref() {
+            let f = |direction: i32,
+                     policy_list: Option<&Vec<String>>,
+                     action: Option<&config::generate::DefaultPolicyType>|
+             -> api::PolicyAssignment {
+                api::PolicyAssignment {
+                    name: "".to_string(),
+                    direction,
+                    policies: policy_list.map_or(Vec::new(), |x| {
+                        x.iter()
+                            .map(|x| api::Policy {
+                                name: x.to_string(),
+                                statements: Vec::new(),
+                            })
+                            .collect()
+                    }),
+                    default_action: action.map_or(1, convert::default_policy_type_to_i32),
+                }
+            };
+            if let Some(Some(config)) = g.apply_policy.as_ref().map(|x| x.config.as_ref()) {
+                self.add_policy_assignment(
+                    tables.clone(),
+                    f(
+                        1,
+                        config.import_policy_list.as_ref(),
+                        config.default_import_policy.as_ref(),
+                    ),
+                )?;
+
+                self.add_policy_assignment(
+                    tables.clone(),
+                    f(
+                        2,
+                        config.export_policy_list.as_ref(),
+                        config.default_export_policy.as_ref(),
+                    ),
+                )?;
+            }
+        }
+
+        Ok(self.asn != 0)
+    }
+
     fn add_bmp_client(
         &mut self,
         sockaddr: SocketAddr,
@@ -847,6 +924,24 @@ impl Global {
             handle.add_peer(addr, bfd_cfg);
         }
 
+        Ok(())
+    }
+
+    pub(super) fn add_policy_assignment(
+        &mut self,
+        tables: Arc<TableManager>,
+        req: api::PolicyAssignment,
+    ) -> Result<(), Error> {
+        let (name, direction, default_action, policy_names) =
+            convert::policy_assignment_from_api(req)?;
+        let (dir, assignment) =
+            self.ptable
+                .add_assignment(&name, direction, default_action, policy_names)?;
+        if dir == table::PolicyDirection::Import {
+            tables.import_policy.store(Some(Arc::clone(&assignment)));
+        } else {
+            tables.export_policy.store(Some(Arc::clone(&assignment)));
+        }
         Ok(())
     }
 }
@@ -1010,48 +1105,20 @@ impl Global {
             bfd_event_tx,
         )));
         let tables: TableHandle = Arc::new(TableManager::new(num_cpus::get()));
-        let global_config = bgp
-            .as_ref()
-            .and_then(|x| x.global.as_ref())
-            .and_then(|x| x.config.as_ref());
-        let as_number = global_config
-            .as_ref()
-            .and_then(|x| x.r#as)
-            .unwrap_or_default();
-        let router_id =
-            if let Some(router_id) = global_config.as_ref().and_then(|x| x.router_id.as_ref()) {
-                *router_id
-            } else {
-                Ipv4Addr::new(0, 0, 0, 0)
-            };
+
         let notify = Arc::new(tokio::sync::Notify::new());
-        if as_number != 0 {
-            let g = &mut global.write().await;
-            if as_number != 0 {
-                notify.clone().notify_one();
-                g.asn = as_number;
-                g.router_id = router_id;
-            }
-            if let Some((id, c)) = bgp
-                .as_ref()
-                .and_then(|x| x.global.as_ref())
-                .and_then(|x| x.confederation.as_ref())
-                .and_then(|x| x.config.as_ref())
-                .filter(|c| c.enabled.unwrap_or(false))
-                .and_then(|c| c.identifier.filter(|&id| id != 0).map(|id| (id, c)))
-            {
-                g.confederation = Some(ConfederationConfig {
-                    id,
-                    members: c
-                        .member_as_list
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .copied()
-                        .collect(),
-                });
+
+        if let Some(bgp) = bgp.as_ref() {
+            match global.write().await.apply_config(tables.clone(), bgp) {
+                Ok(ready) => {
+                    if ready {
+                        notify.notify_one();
+                    }
+                }
+                Err(e) => panic!("{:?}", e),
             }
         }
+
         if let Some(mrt) = bgp.as_ref().and_then(|x| x.mrt_dump.as_ref()) {
             for m in mrt {
                 if let Some(config) = m.config.as_ref()
@@ -1118,14 +1185,6 @@ impl Global {
                 }
             }
         }
-        if let Some(groups) = bgp.as_ref().and_then(|x| x.peer_groups.as_ref()) {
-            let mut server = global.write().await;
-            for pg in groups {
-                if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {
-                    server.peer_group.insert(name, PeerGroup::from(pg));
-                }
-            }
-        }
         if let Some(neighbors) = bgp.as_ref().and_then(|x| x.dynamic_neighbors.as_ref()) {
             let mut server = global.write().await;
             for n in neighbors {
@@ -1157,62 +1216,6 @@ impl Global {
                             tables.clone(),
                         );
                     }
-                }
-            }
-        }
-        if let Some(bgp_conf) = bgp.as_ref()
-            && (bgp_conf.defined_sets.is_some() || bgp_conf.policy_definitions.is_some())
-        {
-            let mut server = global.write().await;
-            if let Err(e) = convert::load_policy_from_config(&mut server.ptable, bgp_conf) {
-                panic!("{:?}", e);
-            }
-        }
-        if let Some(g) = bgp.as_ref().and_then(|x| x.global.as_ref()) {
-            let f = |direction: i32,
-                     policy_list: Option<&Vec<String>>,
-                     action: Option<&config::generate::DefaultPolicyType>|
-             -> api::PolicyAssignment {
-                api::PolicyAssignment {
-                    name: "".to_string(),
-                    direction,
-                    policies: policy_list.map_or(Vec::new(), |x| {
-                        x.iter()
-                            .map(|x| api::Policy {
-                                name: x.to_string(),
-                                statements: Vec::new(),
-                            })
-                            .collect()
-                    }),
-                    default_action: action.map_or(1, convert::default_policy_type_to_i32),
-                }
-            };
-            if let Some(Some(config)) = g.apply_policy.as_ref().map(|x| x.config.as_ref()) {
-                if let Err(e) = add_policy_assignment(
-                    f(
-                        1,
-                        config.import_policy_list.as_ref(),
-                        config.default_import_policy.as_ref(),
-                    ),
-                    global.clone(),
-                    tables.clone(),
-                )
-                .await
-                {
-                    panic!("{:?}", e);
-                }
-                if let Err(e) = add_policy_assignment(
-                    f(
-                        2,
-                        config.export_policy_list.as_ref(),
-                        config.default_export_policy.as_ref(),
-                    ),
-                    global.clone(),
-                    tables.clone(),
-                )
-                .await
-                {
-                    panic!("{:?}", e);
                 }
             }
         }

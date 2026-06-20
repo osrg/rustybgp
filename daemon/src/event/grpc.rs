@@ -2137,7 +2137,10 @@ impl GoBgpService for GrpcService {
             .into_inner()
             .assignment
             .ok_or(Error::EmptyArgument)?;
-        add_policy_assignment(request, self.global.clone(), self.tables.clone()).await?;
+        self.global
+            .write()
+            .await
+            .add_policy_assignment(self.tables.clone(), request)?;
         Ok(tonic::Response::new(api::AddPolicyAssignmentResponse {}))
     }
     async fn delete_policy_assignment(
