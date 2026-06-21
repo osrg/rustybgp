@@ -611,12 +611,7 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
     ctx.active_connect_join_handle = Some(join_handle);
 }
 
-pub(super) fn create_listen_socket(
-    addr: String,
-    port: u16,
-) -> std::io::Result<std::net::TcpListener> {
-    let addr: std::net::SocketAddr = format!("{}:{}", addr, port).parse().unwrap();
-
+fn create_listen_socket(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     let sock = socket2::Socket::new(
         match addr {
             SocketAddr::V4(_) => socket2::Domain::IPV4,
@@ -701,7 +696,6 @@ impl Global {
             router_id: Ipv4Addr::new(0, 0, 0, 0),
             listen_port: None,
             listen_sockets: Vec::new(),
-
             peers: FnvHashMap::default(),
             peer_group: FnvHashMap::default(),
 
@@ -745,7 +739,7 @@ impl Global {
                     0 => Some(Global::BGP_PORT),
                     1..=65535 => Some(port as u16),
                     _ => return Err(Error::InvalidArgument("invalid listen port".to_string())),
-                };
+                }
             }
         }
 
@@ -1366,13 +1360,27 @@ impl Global {
         loop {
             notify.notified().await;
             let listen_sockets = if let Some(listen_port) = global.read().await.listen_port {
-                vec![
-                    create_listen_socket("0.0.0.0".to_string(), listen_port),
-                    create_listen_socket("[::]".to_string(), listen_port),
-                ]
-                .into_iter()
-                .filter_map(|x| x.ok())
-                .collect()
+                let addrs = if let Some(b) = bgp
+                    .as_ref()
+                    .and_then(|x| x.global.as_ref())
+                    .and_then(|g| g.config.as_ref())
+                    .and_then(|c| c.local_address_list.as_ref())
+                {
+                    b.iter()
+                        .map(|x| SocketAddr::new(*x, listen_port))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port),
+                    ]
+                };
+
+                addrs
+                    .into_iter()
+                    .map(create_listen_socket)
+                    .filter_map(|x| x.ok())
+                    .collect()
             } else {
                 Vec::new()
             };

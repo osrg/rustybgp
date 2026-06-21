@@ -655,6 +655,42 @@ impl GoBgpService for GrpcService {
                 ));
             }
         };
+
+        if let Some(listen_port) = global.listen_port {
+            let listen_addresses = if g.listen_addresses.is_empty() {
+                vec![
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port),
+                ]
+            } else {
+                g.listen_addresses
+                    .iter()
+                    .map(|addr| {
+                        let addr = IpAddr::from_str(addr).map_err(|_| {
+                            tonic::Status::new(
+                                tonic::Code::InvalidArgument,
+                                format!("invalid listen address: {}", addr),
+                            )
+                        })?;
+
+                        Ok::<std::net::SocketAddr, tonic::Status>(SocketAddr::new(
+                            addr,
+                            listen_port,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+
+            global.listen_sockets.append(
+                &mut listen_addresses
+                    .into_iter()
+                    .map(create_listen_socket)
+                    .filter_map(|x| x.ok())
+                    .map(|x| x.as_raw_fd())
+                    .collect(),
+            );
+        }
+
         global.router_id = Ipv4Addr::from_str(&g.router_id).map_err(|_| {
             tonic::Status::new(
                 tonic::Code::InvalidArgument,
