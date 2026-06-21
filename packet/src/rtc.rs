@@ -65,29 +65,37 @@ fn fmt_rt(rt: &[u8; 8], f: &mut fmt::Formatter<'_>) -> fmt::Result {
     }
 }
 
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+pub enum MatchType {
+    Wildcard,
+    AsWildcard {
+        origin_as: u32,
+    },
+    ExactMatch {
+        origin_as: u32,
+        route_target: [u8; 8],
+    },
+}
+
 /// RTC NLRI (AFI=1, SAFI=132, RFC 4684).
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct RtcNlri {
-    /// Origin AS. `None` when length=0 (full wildcard).
-    pub origin_as: Option<u32>,
-    /// Route Target extended community. `None` when length <= 32.
-    pub route_target: Option<[u8; 8]>,
+    pub match_type: MatchType,
 }
 
 impl RtcNlri {
     /// Full wildcard: matches any RT from any AS.
     pub fn wildcard() -> Self {
         Self {
-            origin_as: None,
-            route_target: None,
+            match_type: MatchType::Wildcard,
         }
     }
 
     fn length_bits(&self) -> u8 {
-        match (&self.origin_as, &self.route_target) {
-            (None, _) => 0,
-            (Some(_), None) => 32,
-            (Some(_), Some(_)) => 96,
+        match &self.match_type {
+            MatchType::Wildcard => 0,
+            MatchType::AsWildcard { .. } => 32,
+            MatchType::ExactMatch { .. } => 96,
         }
     }
 
@@ -95,14 +103,12 @@ impl RtcNlri {
         let length_bits = c.read_u8()?;
         match length_bits {
             0 => Ok(Self {
-                origin_as: None,
-                route_target: None,
+                match_type: MatchType::Wildcard,
             }),
             32 => {
                 let origin_as = c.read_u32::<NetworkEndian>()?;
                 Ok(Self {
-                    origin_as: Some(origin_as),
-                    route_target: None,
+                    match_type: MatchType::AsWildcard { origin_as },
                 })
             }
             96 => {
@@ -110,8 +116,10 @@ impl RtcNlri {
                 let mut rt = [0u8; 8];
                 c.read_exact(&mut rt)?;
                 Ok(Self {
-                    origin_as: Some(origin_as),
-                    route_target: Some(rt),
+                    match_type: MatchType::ExactMatch {
+                        origin_as,
+                        route_target: rt,
+                    },
                 })
             }
             _ => Err(malformed()),
@@ -120,32 +128,38 @@ impl RtcNlri {
 
     pub fn encode<B: BufMut>(&self, dst: &mut B) {
         dst.put_u8(self.length_bits());
-        if let Some(asn) = self.origin_as {
-            dst.put_u32(asn);
+        if let MatchType::AsWildcard { origin_as } | MatchType::ExactMatch { origin_as, .. } =
+            self.match_type
+        {
+            dst.put_u32(origin_as);
         }
-        if let Some(rt) = &self.route_target {
-            dst.put_slice(rt);
+        if let MatchType::ExactMatch { route_target, .. } = self.match_type {
+            dst.put_slice(&route_target);
         }
     }
 
     /// Encoded byte length of this NLRI (including the length-in-bits byte).
-    pub fn encoded_len(&self) -> usize {
-        match (&self.origin_as, &self.route_target) {
-            (None, _) => 1,
-            (Some(_), None) => 5,
-            (Some(_), Some(_)) => 13,
+    #[cfg(test)]
+    fn encoded_len(&self) -> usize {
+        match &self.match_type {
+            MatchType::Wildcard => 1,
+            MatchType::AsWildcard { .. } => 5,
+            MatchType::ExactMatch { .. } => 13,
         }
     }
 }
 
 impl fmt::Display for RtcNlri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (&self.origin_as, &self.route_target) {
-            (None, _) => write!(f, "*:*"),
-            (Some(asn), None) => write!(f, "{}:*", asn),
-            (Some(asn), Some(rt)) => {
-                write!(f, "{}:", asn)?;
-                fmt_rt(rt, f)
+        match &self.match_type {
+            MatchType::Wildcard => write!(f, "*:*"),
+            MatchType::AsWildcard { origin_as } => write!(f, "{}:*", origin_as),
+            MatchType::ExactMatch {
+                origin_as,
+                route_target,
+            } => {
+                write!(f, "{}:", origin_as)?;
+                fmt_rt(route_target, f)
             }
         }
     }
@@ -178,8 +192,7 @@ mod tests {
     fn gobgp_wire_wildcard() {
         let wire: &[u8] = &[0x00];
         let nlri = RtcNlri::decode(&mut std::io::Cursor::new(wire)).unwrap();
-        assert_eq!(nlri.origin_as, None);
-        assert_eq!(nlri.route_target, None);
+        assert_eq!(nlri.match_type, MatchType::Wildcard);
         assert_eq!(nlri.to_string(), "*:*");
 
         let mut enc = Vec::new();
@@ -191,8 +204,7 @@ mod tests {
     fn gobgp_wire_as_only() {
         let wire: &[u8] = &[0x20, 0x00, 0x00, 0xfd, 0xe9];
         let nlri = RtcNlri::decode(&mut std::io::Cursor::new(wire)).unwrap();
-        assert_eq!(nlri.origin_as, Some(65001));
-        assert_eq!(nlri.route_target, None);
+        assert_eq!(nlri.match_type, MatchType::AsWildcard { origin_as: 65001 });
         assert_eq!(nlri.to_string(), "65001:*");
 
         let mut enc = Vec::new();
@@ -210,10 +222,12 @@ mod tests {
             0x00, 0x00, 0x00, 0x64,             // local admin 100
         ];
         let nlri = RtcNlri::decode(&mut std::io::Cursor::new(wire)).unwrap();
-        assert_eq!(nlri.origin_as, Some(65001));
         assert_eq!(
-            nlri.route_target,
-            Some([0x00, 0x02, 0xfd, 0xea, 0x00, 0x00, 0x00, 0x64])
+            nlri.match_type,
+            MatchType::ExactMatch {
+                origin_as: 65001,
+                route_target: [0x00, 0x02, 0xfd, 0xea, 0x00, 0x00, 0x00, 0x64]
+            }
         );
         assert_eq!(nlri.to_string(), "65001:rt:65002:100");
 
@@ -226,8 +240,10 @@ mod tests {
     fn display_four_octet_as_rt() {
         // type 0x02 (four-octet AS), subtype 0x02 (rt), AS=131073, local=1
         let nlri = RtcNlri {
-            origin_as: Some(65001),
-            route_target: Some([0x02, 0x02, 0x00, 0x02, 0x00, 0x01, 0x00, 0x01]),
+            match_type: MatchType::ExactMatch {
+                origin_as: 65001,
+                route_target: [0x02, 0x02, 0x00, 0x02, 0x00, 0x01, 0x00, 0x01],
+            },
         };
         assert_eq!(nlri.to_string(), "65001:rt:131073:1");
     }
@@ -236,8 +252,10 @@ mod tests {
     fn display_ipv4_rt() {
         // type 0x01 (IPv4), subtype 0x02 (rt), addr=10.0.0.1, local=100
         let nlri = RtcNlri {
-            origin_as: Some(65001),
-            route_target: Some([0x01, 0x02, 0x0a, 0x00, 0x00, 0x01, 0x00, 0x64]),
+            match_type: MatchType::ExactMatch {
+                origin_as: 65001,
+                route_target: [0x01, 0x02, 0x0a, 0x00, 0x00, 0x01, 0x00, 0x64],
+            },
         };
         assert_eq!(nlri.to_string(), "65001:rt:10.0.0.1:100");
     }
@@ -245,8 +263,10 @@ mod tests {
     #[test]
     fn display_unknown_rt_hex() {
         let nlri = RtcNlri {
-            origin_as: Some(1),
-            route_target: Some([0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            match_type: MatchType::ExactMatch {
+                origin_as: 1,
+                route_target: [0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+            },
         };
         assert_eq!(nlri.to_string(), "1:ffff000000000001");
     }
@@ -263,16 +283,17 @@ mod tests {
         assert_eq!(RtcNlri::wildcard().encoded_len(), 1);
         assert_eq!(
             RtcNlri {
-                origin_as: Some(1),
-                route_target: None
+                match_type: MatchType::AsWildcard { origin_as: 1 }
             }
             .encoded_len(),
             5
         );
         assert_eq!(
             RtcNlri {
-                origin_as: Some(1),
-                route_target: Some([0u8; 8])
+                match_type: MatchType::ExactMatch {
+                    origin_as: 1,
+                    route_target: [0u8; 8],
+                }
             }
             .encoded_len(),
             13
