@@ -165,18 +165,22 @@ impl TableManager {
         Ok(label)
     }
 
-    pub(crate) fn delete_vrf(&self, name: &str) -> Result<(), table::TableError> {
+    pub(crate) fn delete_vrf(&self, name: &str) -> Result<table::Vrf, table::TableError> {
         let current = self.vrfs.load_full();
         let id = current.get(name).ok_or(table::TableError::NotFound)?.id;
         let mut new_map = (*current).clone();
-        new_map.remove(name);
-        self.vrfs.store(Arc::new(new_map));
-        if id > 0
-            && let Some(handle) = self.kernel_handle.load_full().as_deref()
-        {
-            handle.delete_vrf(name);
+        match new_map.remove(name) {
+            Some(vrf) => {
+                self.vrfs.store(Arc::new(new_map));
+                if id > 0
+                    && let Some(handle) = self.kernel_handle.load_full().as_deref()
+                {
+                    handle.delete_vrf(name);
+                }
+                Ok(vrf)
+            }
+            None => Err(table::TableError::NotFound),
         }
-        Ok(())
     }
 
     pub(crate) fn list_vrfs(&self, name: Option<&str>) -> Vec<table::Vrf> {

@@ -1845,6 +1845,7 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddVrfRequest>,
     ) -> Result<tonic::Response<api::AddVrfResponse>, tonic::Status> {
         self.is_available(true).await?;
+        let asn = self.global.read().await.asn;
         let vrf = request.into_inner().vrf.ok_or(Error::EmptyArgument)?;
         let name = vrf.name.clone();
         if name.is_empty() {
@@ -1865,9 +1866,35 @@ impl GoBgpService for GrpcService {
             .iter()
             .map(convert::rt_from_api)
             .collect::<Result<Vec<_>, _>>()?;
+        let nlris = export_rt
+            .iter()
+            .map(|rt| packet::PathNlri {
+                path_id: 0,
+                nlri: packet::Nlri::Rtc(packet::rtc::RtcNlri {
+                    match_type: packet::rtc::MatchType::ExactMatch {
+                        origin_as: asn,
+                        route_target: *rt,
+                    },
+                }),
+            })
+            .collect::<Vec<_>>();
         self.tables
             .add_vrf(name, rd, import_rt, export_rt, vrf.id)
             .map_err(Error::Table)?;
+        let now = std::time::SystemTime::now();
+        for nlri in nlris.into_iter() {
+            self.tables.insert_route(
+                table::Source::local(),
+                Family::RTC,
+                nlri,
+                None,
+                Arc::new(vec![
+                    packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                ]),
+                None,
+                now,
+            );
+        }
         Ok(tonic::Response::new(api::AddVrfResponse {}))
     }
 
@@ -1876,11 +1903,30 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::DeleteVrfRequest>,
     ) -> Result<tonic::Response<api::DeleteVrfResponse>, tonic::Status> {
         self.is_available(true).await?;
+        let asn = self.global.read().await.asn;
         let name = request.into_inner().name;
         if name.is_empty() {
             return Err(Error::InvalidArgument("vrf name is empty".to_string()).into());
         }
-        self.tables.delete_vrf(&name).map_err(Error::Table)?;
+        let vrf = self.tables.delete_vrf(&name).map_err(Error::Table)?;
+        let nlris = vrf
+            .export_rt
+            .iter()
+            .map(|rt| packet::PathNlri {
+                path_id: 0,
+                nlri: packet::Nlri::Rtc(packet::rtc::RtcNlri {
+                    match_type: packet::rtc::MatchType::ExactMatch {
+                        origin_as: asn,
+                        route_target: *rt,
+                    },
+                }),
+            })
+            .collect::<Vec<_>>();
+        let now = std::time::SystemTime::now();
+        for nlri in nlris.into_iter() {
+            self.tables
+                .remove_route(table::Source::local(), Family::RTC, nlri, None, now);
+        }
         Ok(tonic::Response::new(api::DeleteVrfResponse {}))
     }
 
