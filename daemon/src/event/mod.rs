@@ -1089,6 +1089,26 @@ async fn accept_connection(
     PeerSession::new(stream, remote_addr, role, Some(close_rx), res)
 }
 
+fn start_grpc_server(
+    global: GlobalHandle,
+    tables: TableHandle,
+    notify: Arc<tokio::sync::Notify>,
+    active_tx: mpsc::UnboundedSender<TcpStream>,
+    addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = tonic::transport::Server::builder()
+            .add_service(GoBgpServiceServer::new(GrpcService::new(
+                notify, active_tx, global, tables,
+            )))
+            .serve(addr)
+            .await
+        {
+            panic!("failed to listen on grpc {}", err);
+        }
+    });
+}
+
 impl Global {
     async fn serve(
         bgp: Option<config::BgpConfig>,
@@ -1334,22 +1354,15 @@ impl Global {
                 },
             );
         }
-        let addr = "0.0.0.0:50051".parse().unwrap();
-        let notify2 = notify.clone();
-        let active_tx2 = active_tx.clone();
-        let global2 = global.clone();
-        let tables2 = tables.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tonic::transport::Server::builder()
-                .add_service(GoBgpServiceServer::new(GrpcService::new(
-                    notify2, active_tx2, global2, tables2,
-                )))
-                .serve(addr)
-                .await
-            {
-                panic!("failed to listen on grpc {}", e);
-            }
-        });
+
+        start_grpc_server(
+            global.clone(),
+            tables.clone(),
+            notify.clone(),
+            active_tx.clone(),
+            "0.0.0.0:50051".parse().unwrap(),
+        );
+
         loop {
             notify.notified().await;
             let listen_sockets = if let Some(listen_port) = global.read().await.listen_port {
