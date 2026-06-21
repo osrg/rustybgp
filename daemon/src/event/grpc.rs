@@ -644,10 +644,16 @@ impl GoBgpService for GrpcService {
             ));
         }
         global.asn = g.asn;
-        global.listen_port = if g.listen_port > 0 {
-            g.listen_port as u16
-        } else {
-            Global::BGP_PORT
+        global.listen_port = match g.listen_port {
+            1..=65535 => Some(g.listen_port as u16),
+            0 => Some(Global::BGP_PORT),
+            i32::MIN..=-1 => None,
+            _ => {
+                return Err(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "invalid listen port",
+                ));
+            }
         };
         global.router_id = Ipv4Addr::from_str(&g.router_id).map_err(|_| {
             tonic::Status::new(
@@ -730,7 +736,7 @@ impl GoBgpService for GrpcService {
         global.watch_event_cancels.clear();
         global.asn = 0;
         global.router_id = Ipv4Addr::new(0, 0, 0, 0);
-        global.listen_port = Global::BGP_PORT;
+        global.listen_port = None;
         global.kernel_service.take();
         self.tables.kernel_handle.store(None);
         if let Some(tx) = global.stop_tx.take() {
@@ -2702,7 +2708,11 @@ impl From<&Global> for api::Global {
         api::Global {
             asn: g.asn,
             router_id: g.router_id.to_string(),
-            listen_port: g.listen_port as i32,
+            listen_port: if let Some(port) = g.listen_port {
+                port as i32
+            } else {
+                -1
+            },
             listen_addresses: Vec::new(),
             families: Vec::new(),
             use_multiple_paths: false,

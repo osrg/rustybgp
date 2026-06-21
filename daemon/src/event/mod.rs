@@ -654,7 +654,7 @@ pub(super) struct ConfederationConfig {
 pub(crate) struct Global {
     asn: u32,
     pub(crate) router_id: Ipv4Addr,
-    listen_port: u16,
+    listen_port: Option<u16>,
     listen_sockets: Vec<RawFd>,
     pub(crate) peers: FnvHashMap<IpAddr, Peer>,
     peer_group: FnvHashMap<String, PeerGroup>,
@@ -699,7 +699,7 @@ impl Global {
         Global {
             asn: 0,
             router_id: Ipv4Addr::new(0, 0, 0, 0),
-            listen_port: Global::BGP_PORT,
+            listen_port: None,
             listen_sockets: Vec::new(),
 
             peers: FnvHashMap::default(),
@@ -741,9 +741,9 @@ impl Global {
             }
             if let Some(port) = global_config.port {
                 self.listen_port = match port {
-                    i32::MIN..=-1 => 0,
-                    0 => Global::BGP_PORT,
-                    1..=65535 => port as u16,
+                    i32::MIN..=-1 => None,
+                    0 => Some(Global::BGP_PORT),
+                    1..=65535 => Some(port as u16),
                     _ => return Err(Error::InvalidArgument("invalid listen port".to_string())),
                 };
             }
@@ -1352,14 +1352,18 @@ impl Global {
         });
         loop {
             notify.notified().await;
-            let listen_port = global.read().await.listen_port;
-            let listen_sockets: Vec<std::net::TcpListener> = vec![
-                create_listen_socket("0.0.0.0".to_string(), listen_port),
-                create_listen_socket("[::]".to_string(), listen_port),
-            ]
-            .into_iter()
-            .filter_map(|x| x.ok())
-            .collect();
+            let listen_sockets = if let Some(listen_port) = global.read().await.listen_port {
+                vec![
+                    create_listen_socket("0.0.0.0".to_string(), listen_port),
+                    create_listen_socket("[::]".to_string(), listen_port),
+                ]
+                .into_iter()
+                .filter_map(|x| x.ok())
+                .collect()
+            } else {
+                Vec::new()
+            };
+
             global
                 .write()
                 .await
@@ -1382,16 +1386,21 @@ impl Global {
                     )
                 })
                 .collect::<Vec<tokio_stream::wrappers::TcpListenerStream>>();
-            assert_ne!(incomings.len(), 0);
 
             let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
             global.write().await.stop_tx = Some(stop_tx);
 
             loop {
-                let mut bgp_listen_futures = FuturesUnordered::new();
+                let mut fu = FuturesUnordered::new();
                 for incoming in &mut incomings {
-                    bgp_listen_futures.push(incoming.next());
+                    fu.push(incoming.next());
                 }
+                let bgp_listen_futures = if fu.is_empty() {
+                    futures::future::Either::Left(futures::future::pending())
+                } else {
+                    futures::future::Either::Right(fu.next())
+                };
+
                 futures::select_biased! {
                     event = kernel_event_rx.recv().fuse() => {
                         match event {
@@ -1424,7 +1433,7 @@ impl Global {
                             }
                         }
                     }
-                    stream = bgp_listen_futures.next() => {
+                    stream = bgp_listen_futures.fuse() => {
                         if let Some(Some(Ok(stream))) = stream
                             && let Some(h) = accept_connection(&global, &tables, stream, crate::fsm::Role::Passive).await
                         {
