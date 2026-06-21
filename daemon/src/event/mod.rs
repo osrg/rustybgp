@@ -938,172 +938,7 @@ impl Global {
         }
         Ok(())
     }
-}
 
-async fn accept_connection(
-    global: &GlobalHandle,
-    tables: &TableHandle,
-    stream: TcpStream,
-    role: crate::fsm::Role,
-) -> Option<PeerSession> {
-    let remote_sockaddr = stream.peer_addr().ok()?;
-    let remote_addr = remote_sockaddr.ip();
-    let mut g = global.write().await;
-    let is_restarting = g.selection_deferral.is_some();
-    let confederation = g.confederation.as_ref().map(|c| (c.id, c.members.clone()));
-    let peer = match g.peers.get_mut(&remote_addr) {
-        Some(peer) => {
-            if peer.admin_down {
-                log::warn!(
-                    "admin down; ignore a new passive connection from {}",
-                    remote_addr
-                );
-                return None;
-            }
-            let already_connected = {
-                let arb = peer.context.lock().unwrap();
-                let arb = arb.conn_arbiter.lock().unwrap();
-                match role {
-                    crate::fsm::Role::Active => arb.active_close_tx.is_some(),
-                    crate::fsm::Role::Passive => arb.passive_close_tx.is_some(),
-                }
-            };
-            if already_connected {
-                log::warn!("already has {:?} connection {}", role, remote_addr);
-                return None;
-            }
-            peer.state
-                .fsm
-                .store(SessionState::Active as u8, Ordering::Relaxed);
-            peer
-        }
-        None => {
-            let group = g.peer_group.values().find(|pg| {
-                pg.dynamic_peers
-                    .iter()
-                    .any(|d| d.prefix.contains(&remote_addr))
-            });
-            let Some(group) = group else {
-                log::warn!(
-                    "can't find configuration a new passive connection {}",
-                    remote_addr
-                );
-                return None;
-            };
-            let params = PeerParams {
-                remote_addr,
-                remote_port: Global::BGP_PORT,
-                expected_remote_asn: group.as_number,
-                local_asn: group.local_asn,
-                passive: group.passive,
-                rs_client: group.route_server_client,
-                route_reflector: group.route_reflector.clone(),
-                delete_on_disconnected: true,
-                admin_down: false,
-                state: SessionState::Active,
-                holdtime: group.holdtime.unwrap_or(PeerParams::DEFAULT_HOLD_TIME),
-                connect_retry_time: group
-                    .connect_retry_time
-                    .unwrap_or(PeerParams::DEFAULT_CONNECT_RETRY_TIME),
-                multihop_ttl: group.multihop_ttl,
-                ttl_security: group.ttl_security,
-                password: group.auth_password.clone(),
-                families: group.families.clone(),
-                send_max: group.send_max.clone(),
-                prefix_limits: FnvHashMap::default(),
-                graceful_restart: group.graceful_restart.clone(),
-                bfd_config: None,
-            };
-            let _ = g.add_peer(params, None);
-            g.peers.get_mut(&remote_addr).unwrap()
-        }
-    };
-    if let Some(ttl_min) = peer.config.ttl_security {
-        // GTSM (RFC 5082): send with TTL=255, drop incoming below ttl_min.
-        let _ = stream.set_ttl(255);
-        auth::set_min_ttl(stream.as_raw_fd(), &remote_addr, ttl_min);
-    } else if let Some(ttl) = peer.config.multihop_ttl {
-        if peer.config.expected_remote_asn != peer.config.local_asn {
-            let _ = stream.set_ttl(ttl.into());
-        }
-    } else {
-        let _ = stream.set_ttl(1);
-    }
-    let context = Arc::clone(&peer.context);
-    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<CloseReason>();
-    {
-        let ctx = context.lock().unwrap();
-        let mut arb = ctx.conn_arbiter.lock().unwrap();
-        match role {
-            crate::fsm::Role::Active => arb.active_close_tx = Some(close_tx),
-            crate::fsm::Role::Passive => arb.passive_close_tx = Some(close_tx),
-        }
-    }
-    let peer_role = if peer.config.route_server_client {
-        PeerRole::RsClient
-    } else if peer.config.local_asn != 0 && peer.config.expected_remote_asn == peer.config.local_asn
-    {
-        if peer.config.route_reflector.route_reflector_client {
-            PeerRole::IbgpRrClient
-        } else {
-            PeerRole::Ibgp
-        }
-    } else if confederation
-        .as_ref()
-        .is_some_and(|(_, members)| members.contains(&peer.config.expected_remote_asn))
-    {
-        PeerRole::ConfedEbgp
-    } else {
-        PeerRole::Ebgp
-    };
-    let cluster_id = match peer_role {
-        PeerRole::Ibgp | PeerRole::IbgpRrClient => Some(
-            peer.config
-                .route_reflector
-                .route_reflector_cluster_id
-                .unwrap_or(peer.config.local_router_id),
-        ),
-        _ => None,
-    };
-    let res = PeerResources {
-        local_asn: peer.config.local_asn,
-        local_cap: peer.config.local_cap.to_owned(),
-        is_restarting,
-        role: peer_role,
-        prefix_limits: peer.config.prefix_limits.clone(),
-        state: peer.state.clone(),
-        counter_tx: peer.counter_tx.clone(),
-        counter_rx: peer.counter_rx.clone(),
-        tables: tables.clone(),
-        context,
-        local_router_id: peer.config.local_router_id,
-        cluster_id,
-        confederation_id: confederation.as_ref().map_or(0, |(id, _)| *id),
-    };
-    PeerSession::new(stream, remote_addr, role, Some(close_rx), res)
-}
-
-fn start_grpc_server(
-    global: GlobalHandle,
-    tables: TableHandle,
-    notify: Arc<tokio::sync::Notify>,
-    active_tx: mpsc::UnboundedSender<TcpStream>,
-    addr: SocketAddr,
-) {
-    tokio::spawn(async move {
-        if let Err(err) = tonic::transport::Server::builder()
-            .add_service(GoBgpServiceServer::new(GrpcService::new(
-                notify, active_tx, global, tables,
-            )))
-            .serve(addr)
-            .await
-        {
-            panic!("failed to listen on grpc {}", err);
-        }
-    });
-}
-
-impl Global {
     async fn serve(
         bgp: Option<config::BgpConfig>,
         any_peer: bool,
@@ -1481,6 +1316,169 @@ impl Global {
             global.write().await.listen_sockets.clear();
         }
     }
+}
+
+async fn accept_connection(
+    global: &GlobalHandle,
+    tables: &TableHandle,
+    stream: TcpStream,
+    role: crate::fsm::Role,
+) -> Option<PeerSession> {
+    let remote_sockaddr = stream.peer_addr().ok()?;
+    let remote_addr = remote_sockaddr.ip();
+    let mut g = global.write().await;
+    let is_restarting = g.selection_deferral.is_some();
+    let confederation = g.confederation.as_ref().map(|c| (c.id, c.members.clone()));
+    let peer = match g.peers.get_mut(&remote_addr) {
+        Some(peer) => {
+            if peer.admin_down {
+                log::warn!(
+                    "admin down; ignore a new passive connection from {}",
+                    remote_addr
+                );
+                return None;
+            }
+            let already_connected = {
+                let arb = peer.context.lock().unwrap();
+                let arb = arb.conn_arbiter.lock().unwrap();
+                match role {
+                    crate::fsm::Role::Active => arb.active_close_tx.is_some(),
+                    crate::fsm::Role::Passive => arb.passive_close_tx.is_some(),
+                }
+            };
+            if already_connected {
+                log::warn!("already has {:?} connection {}", role, remote_addr);
+                return None;
+            }
+            peer.state
+                .fsm
+                .store(SessionState::Active as u8, Ordering::Relaxed);
+            peer
+        }
+        None => {
+            let group = g.peer_group.values().find(|pg| {
+                pg.dynamic_peers
+                    .iter()
+                    .any(|d| d.prefix.contains(&remote_addr))
+            });
+            let Some(group) = group else {
+                log::warn!(
+                    "can't find configuration a new passive connection {}",
+                    remote_addr
+                );
+                return None;
+            };
+            let params = PeerParams {
+                remote_addr,
+                remote_port: Global::BGP_PORT,
+                expected_remote_asn: group.as_number,
+                local_asn: group.local_asn,
+                passive: group.passive,
+                rs_client: group.route_server_client,
+                route_reflector: group.route_reflector.clone(),
+                delete_on_disconnected: true,
+                admin_down: false,
+                state: SessionState::Active,
+                holdtime: group.holdtime.unwrap_or(PeerParams::DEFAULT_HOLD_TIME),
+                connect_retry_time: group
+                    .connect_retry_time
+                    .unwrap_or(PeerParams::DEFAULT_CONNECT_RETRY_TIME),
+                multihop_ttl: group.multihop_ttl,
+                ttl_security: group.ttl_security,
+                password: group.auth_password.clone(),
+                families: group.families.clone(),
+                send_max: group.send_max.clone(),
+                prefix_limits: FnvHashMap::default(),
+                graceful_restart: group.graceful_restart.clone(),
+                bfd_config: None,
+            };
+            let _ = g.add_peer(params, None);
+            g.peers.get_mut(&remote_addr).unwrap()
+        }
+    };
+    if let Some(ttl_min) = peer.config.ttl_security {
+        // GTSM (RFC 5082): send with TTL=255, drop incoming below ttl_min.
+        let _ = stream.set_ttl(255);
+        auth::set_min_ttl(stream.as_raw_fd(), &remote_addr, ttl_min);
+    } else if let Some(ttl) = peer.config.multihop_ttl {
+        if peer.config.expected_remote_asn != peer.config.local_asn {
+            let _ = stream.set_ttl(ttl.into());
+        }
+    } else {
+        let _ = stream.set_ttl(1);
+    }
+    let context = Arc::clone(&peer.context);
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<CloseReason>();
+    {
+        let ctx = context.lock().unwrap();
+        let mut arb = ctx.conn_arbiter.lock().unwrap();
+        match role {
+            crate::fsm::Role::Active => arb.active_close_tx = Some(close_tx),
+            crate::fsm::Role::Passive => arb.passive_close_tx = Some(close_tx),
+        }
+    }
+    let peer_role = if peer.config.route_server_client {
+        PeerRole::RsClient
+    } else if peer.config.local_asn != 0 && peer.config.expected_remote_asn == peer.config.local_asn
+    {
+        if peer.config.route_reflector.route_reflector_client {
+            PeerRole::IbgpRrClient
+        } else {
+            PeerRole::Ibgp
+        }
+    } else if confederation
+        .as_ref()
+        .is_some_and(|(_, members)| members.contains(&peer.config.expected_remote_asn))
+    {
+        PeerRole::ConfedEbgp
+    } else {
+        PeerRole::Ebgp
+    };
+    let cluster_id = match peer_role {
+        PeerRole::Ibgp | PeerRole::IbgpRrClient => Some(
+            peer.config
+                .route_reflector
+                .route_reflector_cluster_id
+                .unwrap_or(peer.config.local_router_id),
+        ),
+        _ => None,
+    };
+    let res = PeerResources {
+        local_asn: peer.config.local_asn,
+        local_cap: peer.config.local_cap.to_owned(),
+        is_restarting,
+        role: peer_role,
+        prefix_limits: peer.config.prefix_limits.clone(),
+        state: peer.state.clone(),
+        counter_tx: peer.counter_tx.clone(),
+        counter_rx: peer.counter_rx.clone(),
+        tables: tables.clone(),
+        context,
+        local_router_id: peer.config.local_router_id,
+        cluster_id,
+        confederation_id: confederation.as_ref().map_or(0, |(id, _)| *id),
+    };
+    PeerSession::new(stream, remote_addr, role, Some(close_rx), res)
+}
+
+fn start_grpc_server(
+    global: GlobalHandle,
+    tables: TableHandle,
+    notify: Arc<tokio::sync::Notify>,
+    active_tx: mpsc::UnboundedSender<TcpStream>,
+    addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = tonic::transport::Server::builder()
+            .add_service(GoBgpServiceServer::new(GrpcService::new(
+                notify, active_tx, global, tables,
+            )))
+            .serve(addr)
+            .await
+        {
+            panic!("failed to listen on grpc {}", err);
+        }
+    });
 }
 
 use crate::table_manager::{PeerDownData, PeerUpData, SubscriptionId, TableManager};
