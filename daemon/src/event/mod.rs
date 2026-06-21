@@ -168,7 +168,7 @@ use crate::fsm::State as SessionState;
 /// `PeerSession` via `Arc`.  All fields are atomics so they can be updated by
 /// the session task without taking the global lock.  Reset at the start of each
 /// new BGP session; the `Arc` itself lives as long as either side holds a clone.
-pub(super) struct SessionAddrs {
+struct SessionAddrs {
     local: SocketAddr,
     remote_port: u16,
 }
@@ -1542,7 +1542,7 @@ fn find_link_local(local: &SocketAddr) -> Option<Ipv6Addr> {
 /// GR state negotiated during the last OPEN exchange.
 /// Stored in DisconnectInfo so PeerSession::run can drive GrState on session drop.
 #[derive(Clone)]
-pub(super) struct NegotiatedGr {
+struct NegotiatedGr {
     /// Intersection of local and remote GR families.
     families: Vec<Family>,
     /// Restart Time from the peer's OPEN GR capability.
