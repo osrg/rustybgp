@@ -1110,6 +1110,7 @@ impl Global {
         is_restarting: bool,
         active_tx: mpsc::UnboundedSender<TcpStream>,
         mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
+        api_sockaddr: SocketAddr,
     ) {
         let (kernel_event_tx, mut kernel_event_rx) =
             mpsc::unbounded_channel::<kernel::KernelEvent>();
@@ -1354,7 +1355,7 @@ impl Global {
             tables.clone(),
             notify.clone(),
             active_tx.clone(),
-            "0.0.0.0:50051".parse().unwrap(),
+            api_sockaddr,
         );
 
         loop {
@@ -1486,9 +1487,22 @@ use crate::table_manager::{PeerDownData, PeerUpData, SubscriptionId, TableManage
 // Re-export for mrt.rs and bmp.rs which import from crate::event.
 pub(crate) use crate::table_manager::{AdjRibInChange, BgpEvent, TableHandle};
 
-pub(crate) async fn main(bgp: Option<config::BgpConfig>, any_peer: bool, is_restarting: bool) {
+pub(crate) async fn main(
+    bgp: Option<config::BgpConfig>,
+    any_peer: bool,
+    is_restarting: bool,
+    api_sockaddr: SocketAddr,
+) {
     let (active_tx, active_rx) = mpsc::unbounded_channel();
-    Global::serve(bgp, any_peer, is_restarting, active_tx, active_rx).await;
+    Global::serve(
+        bgp,
+        any_peer,
+        is_restarting,
+        active_tx,
+        active_rx,
+        api_sockaddr,
+    )
+    .await;
 }
 
 /// For an IPv6 socket, find the link-local address of the same interface.

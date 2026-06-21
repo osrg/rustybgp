@@ -30,9 +30,10 @@ mod peer_tx;
 mod proto;
 mod rpki;
 mod table_manager;
+use std::str::FromStr;
 
 use clap::{Arg, Command};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
@@ -70,6 +71,12 @@ async fn main() -> Result<(), std::io::Error> {
                 .long("graceful-restart")
                 .action(clap::ArgAction::SetTrue)
                 .help("set Restart State bit (R) in GR capability; clear after all peers send EOR"),
+        )
+        .arg(
+            Arg::new("api-hosts")
+                .long("api-hosts")
+                .num_args(1)
+                .help("specify the host that the API server listens on (default: 0.0.0.0:50051)"),
         )
         .get_matches();
 
@@ -110,10 +117,17 @@ async fn main() -> Result<(), std::io::Error> {
 
     log::info!("Hello, RustyBGPd ({} cpus)!", num_cpus::get());
 
+    let api_sockaddr = if let Some(api_hosts) = args.get_one::<String>("api-hosts") {
+        SocketAddr::from_str(api_hosts).expect("invalid API host address")
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 50051)
+    };
+
     event::main(
         conf,
         args.get_flag("any"),
         args.get_flag("graceful-restart"),
+        api_sockaddr,
     )
     .await;
     Ok(())
