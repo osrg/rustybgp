@@ -2296,7 +2296,10 @@ impl PeerSession {
             conn_effective_max(&self.conn_arbiter.lock().unwrap(), Some(self.role), family);
         let changes = self.tables.collect_loc_rib_paths(family);
         let rpki = self.tables.rpki.read().unwrap();
-        self.export_map.clear_family(family);
+        // Snapshot and clear the export_map before re-walking the RIB; without
+        // this we have no record of what was sent under the old filter and cannot
+        // generate explicit withdrawals for routes that the new filter rejects.
+        let old_sent = self.export_map.take_family(family);
         for change in changes {
             if let (Some(filter), Some(best)) = (&rtc_filter, change.new_best())
                 && !filter.allows(&best.attr)
@@ -2317,6 +2320,15 @@ impl PeerSession {
                 self.cluster_id,
                 Some(&rpki),
             );
+        }
+        for (nlri, path_ids) in old_sent {
+            if !self.export_map.was_sent(family, &nlri)
+                && let Some(pending) = self.pending.get_mut(&family)
+            {
+                for path_id in path_ids {
+                    pending.unreach(nlri.clone(), path_id);
+                }
+            }
         }
         self.pending.get_mut(&family).unwrap().schedule_eor();
     }
@@ -2707,6 +2719,23 @@ impl PeerSession {
         false
     }
 
+    /// Returns VPN families that need a full re-export after an RTC NLRI change.
+    /// Returns the VPN families that need a full re-export when an RTC NLRI
+    /// changes. Empty when RTC is not negotiated or the state machine is not yet
+    /// active (AwaitingEor: the EOR handler will trigger the export instead).
+    fn rtc_vpn_refresh_families(&self) -> Vec<Family> {
+        if !self.codec.has_family(Family::RTC) {
+            return vec![];
+        }
+        if !self.context.lock().unwrap().rtc_state.is_active() {
+            return vec![];
+        }
+        self.codec
+            .families_iter()
+            .filter(|f| crate::rtc::is_vpn_family(*f))
+            .collect()
+    }
+
     fn handle_prefix_update(&mut self, update: table::NlriChange) {
         if self.conn_arbiter.lock().unwrap().state(self.role) != SessionState::Established {
             return;
@@ -2930,7 +2959,13 @@ impl PeerSession {
             msg = peer_event_next => {
                 match msg {
                     Some(Some(ToPeerEvent::NlriChange(update))) => {
+                        let is_rtc = update.family == Family::RTC;
                         self.handle_prefix_update(update);
+                        if is_rtc {
+                            for family in self.rtc_vpn_refresh_families() {
+                                self.do_route_refresh(family).await;
+                            }
+                        }
                     }
                     Some(Some(ToPeerEvent::SoftResetOut)) => {
                         // Re-advertise all current best paths to this peer.
@@ -4858,6 +4893,67 @@ mod tests {
 
         assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
         assert!(conn.pending[&Family::IPV4].is_empty());
+    }
+
+    // ---- do_route_refresh tests ----
+
+    // Insert a route from other_source() into the IPv4 loc-RIB via the table.
+    fn insert_ipv4_route(tables: &TableManager, nlri: &packet::Nlri) {
+        let net = packet::PathNlri::new(nlri.clone());
+        tables.insert_route(
+            other_source(),
+            Family::IPV4,
+            net,
+            Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0u32).unwrap(),
+            ]),
+            None,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+    }
+
+    #[tokio::test]
+    async fn do_route_refresh_withdraws_route_absent_from_rib() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        setup_ipv4_session(&mut conn);
+
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        // Simulate a route previously sent to this peer with no corresponding RIB entry.
+        conn.export_map.mark_sent(Family::IPV4, nlri.clone(), 0);
+
+        conn.do_route_refresh(Family::IPV4).await;
+
+        // The route must be withdrawn because it is absent from the loc-RIB.
+        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(!conn.pending[&Family::IPV4].is_empty());
+    }
+
+    #[tokio::test]
+    async fn do_route_refresh_does_not_withdraw_route_still_in_rib() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        setup_ipv4_session(&mut conn);
+
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        insert_ipv4_route(&tables, &nlri);
+        // Simulate the route having been sent in a previous advertisement.
+        conn.export_map.mark_sent(Family::IPV4, nlri.clone(), 0);
+
+        conn.do_route_refresh(Family::IPV4).await;
+
+        // The route is still in the RIB: it must be re-advertised, not withdrawn.
+        assert!(conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(!conn.pending[&Family::IPV4].is_empty());
     }
 
     /// `apply_outputs` with `SessionDown(reason, Some(notif))` returns `Step::Terminate`

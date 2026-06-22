@@ -86,8 +86,12 @@ impl ExportMap {
             .unwrap_or_default()
     }
 
-    pub(super) fn clear_family(&mut self, family: Family) {
-        self.advertised.remove(&family);
+    /// Remove and return all previously-sent (nlri → path_id set) entries for `family`.
+    pub(super) fn take_family(
+        &mut self,
+        family: Family,
+    ) -> FnvHashMap<packet::Nlri, FnvHashSet<u32>> {
+        self.advertised.remove(&family).unwrap_or_default()
     }
 }
 
