@@ -66,10 +66,16 @@ pub(crate) enum RtcInput {
     EorReceived,
     /// The 60-second EOR timer fired before EOR was received.
     TimerExpired,
-    /// Complete session drop: no GR active, or GR timed out for this peer.
-    /// When GR is active for RTC the caller must NOT send this input.
+    /// Complete session drop: no GR active, or GR recovery timed out.
     #[allow(dead_code)]
     SessionDropped,
+    /// Session dropped and GR helper mode has started for this peer.
+    /// The machine keeps the RT filter active (if any) so stale RTC routes
+    /// in the RIB can continue to gate VPN advertisement during recovery.
+    /// If EOR had not yet arrived the machine resets to Inactive instead,
+    /// since no confirmed RT interests are available to form a filter.
+    #[allow(dead_code)]
+    GrHelperStarted,
 }
 
 /// Actions the driver should perform in response to an RTC input.
@@ -169,6 +175,16 @@ impl RtcState {
 
             // Complete drop while filter was active: reset silently.
             (Inner::Active, RtcInput::SessionDropped) => (Inner::Inactive, vec![]),
+
+            // GR helper started while filter was active: keep Active so stale
+            // RTC routes continue to gate VPN advertisement during recovery.
+            (Inner::Active, RtcInput::GrHelperStarted) => (Inner::Active, vec![]),
+
+            // GR helper started while still waiting for EOR: no confirmed RT
+            // interests exist, so reset to Inactive and cancel the timer.
+            (Inner::AwaitingEor { .. }, RtcInput::GrHelperStarted) => {
+                (Inner::Inactive, vec![RtcOutput::StopTimer])
+            }
 
             // All other (state, input) combinations are no-ops.
             (state, _) => (state, vec![]),
@@ -369,6 +385,42 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], RtcOutput::StartTimer(_)));
         assert!(rtc.is_awaiting_eor());
+    }
+
+    // -------------------------------------------------------------------------
+    // GrHelperStarted
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn gr_helper_started_in_active_keeps_active() {
+        let mut rtc = RtcState::new();
+        establish(&mut rtc, rtc_with_vpn());
+        rtc.process(RtcInput::EorReceived);
+        assert!(rtc.is_active());
+
+        let out = rtc.process(RtcInput::GrHelperStarted);
+        assert!(out.is_empty());
+        assert!(rtc.is_active());
+    }
+
+    #[test]
+    fn gr_helper_started_during_awaiting_eor_resets_to_inactive() {
+        let mut rtc = RtcState::new();
+        establish(&mut rtc, rtc_with_vpn());
+        assert!(rtc.is_awaiting_eor());
+
+        let out = rtc.process(RtcInput::GrHelperStarted);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], RtcOutput::StopTimer));
+        assert!(!rtc.is_awaiting_eor());
+        assert!(!rtc.is_active());
+    }
+
+    #[test]
+    fn gr_helper_started_in_inactive_is_noop() {
+        let mut rtc = RtcState::new();
+        let out = rtc.process(RtcInput::GrHelperStarted);
+        assert!(out.is_empty());
     }
 
     // -------------------------------------------------------------------------

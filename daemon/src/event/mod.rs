@@ -3168,10 +3168,15 @@ async fn apply_disconnect(
         // session_loop() under the same shard locks as peer_event_tx.remove(),
         // so no second pass over the table is needed here.
         ctx.cancel_gr_timer();
-        // RTC: cancel the EOR wait timer but leave rtc_state Active.  The
-        // stale RTC routes in the RIB continue to gate VPN advertisement
-        // during recovery; SessionDropped is deferred until GR fully fails.
-        ctx.cancel_rtc_timer();
+        // RTC: GrHelperStarted keeps Active state (stale filter remains) or
+        // resets AwaitingEor to Inactive (no confirmed RT interests).
+        let rtc_outputs = ctx.rtc_state.process(crate::rtc::RtcInput::GrHelperStarted);
+        if rtc_outputs
+            .iter()
+            .any(|o| matches!(o, crate::rtc::RtcOutput::StopTimer))
+        {
+            ctx.cancel_rtc_timer();
+        }
 
         let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
             families: gr.families.clone(),
