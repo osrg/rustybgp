@@ -73,6 +73,7 @@ ALL_TESTS=(
     route-reflector
     route-server
     rpki
+    rtc
     sr-policy
 )
 

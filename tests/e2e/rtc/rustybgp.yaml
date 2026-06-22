@@ -1,0 +1,33 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.5.1"
+
+neighbors:
+  # gobgp-src (AS 65002): VPN route source; no RTC on this peering.
+  - config:
+      neighbor-address: "172.30.5.2"
+      peer-as: 65002
+    afi-safis:
+      - config:
+          afi-safi-name: l3vpn-ipv4-unicast
+
+  # gobgp-a (AS 65003): RTC peer; rustybgp filters VPN export by gobgp-a's RT interests.
+  - config:
+      neighbor-address: "172.30.6.2"
+      peer-as: 65003
+    afi-safis:
+      - config:
+          afi-safi-name: l3vpn-ipv4-unicast
+      - config:
+          afi-safi-name: rtc
+
+  # gobgp-b (AS 65004): RTC peer; rustybgp filters VPN export by gobgp-b's RT interests.
+  - config:
+      neighbor-address: "172.30.6.3"
+      peer-as: 65004
+    afi-safis:
+      - config:
+          afi-safi-name: l3vpn-ipv4-unicast
+      - config:
+          afi-safi-name: rtc
