@@ -63,7 +63,6 @@ pub(crate) enum RtcInput {
     /// The machine activates only when RTC (AFI=1/SAFI=132) is present.
     SessionEstablished { negotiated_families: Vec<Family> },
     /// End-of-RIB received for the RTC address family (AFI=1/SAFI=132).
-    #[allow(dead_code)]
     EorReceived,
     /// The 60-second EOR timer fired before EOR was received.
     TimerExpired,

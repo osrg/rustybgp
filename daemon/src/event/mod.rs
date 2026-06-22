@@ -2744,6 +2744,27 @@ impl PeerSession {
             self.process_effects(vec![GlobalEffect::GrEorReceived { family }], global)
                 .await;
         }
+
+        // For RTC EOR: advance state and export VPN routes if suspended.
+        if eor_family == Some(Family::RTC) {
+            let rtc_outputs = {
+                let mut ctx = self.context.lock().unwrap();
+                let outputs = ctx.rtc_state.process(crate::rtc::RtcInput::EorReceived);
+                if outputs
+                    .iter()
+                    .any(|o| matches!(o, crate::rtc::RtcOutput::StopTimer))
+                {
+                    ctx.cancel_rtc_timer();
+                }
+                outputs
+            };
+            for output in rtc_outputs {
+                if let crate::rtc::RtcOutput::ExportFamilies(families) = output {
+                    self.tables.trigger_rtc_export(self.remote_addr, families);
+                }
+            }
+        }
+
         Step::Continue
     }
 
