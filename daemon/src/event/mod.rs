@@ -2232,6 +2232,15 @@ impl PeerSession {
                 }
             });
         self.peer_event_rx = Some(UnboundedReceiverStream::new(peer_event_rx));
+        // Schedule EOR for each family included in the initial dump (RFC 4724 §2).
+        // VPN families suppressed during RTC AwaitingEor get their EOR later from
+        // do_route_refresh when the peer's RTC EOR arrives.
+        for f in &families {
+            if rtc_awaiting_eor && crate::rtc::is_vpn_family(*f) {
+                continue;
+            }
+            self.pending.get_mut(f).unwrap().schedule_eor();
+        }
         let remote_holdtime = HoldTime::new(self.state.remote_holdtime.load(Ordering::Relaxed))
             .unwrap_or(HoldTime::DISABLED);
         self.tables.peer_up(PeerUpData {
