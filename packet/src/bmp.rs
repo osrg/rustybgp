@@ -35,6 +35,8 @@ impl Message {
     pub const PEER_FLAG_IPV6: u8 = 0x80;
     /// Per-peer header flag: Adj-RIB-In post-policy (RFC 7854 §4.2, L flag).
     pub const PEER_FLAG_POST_POLICY: u8 = 0x40;
+    /// Per-peer header flag: Adj-RIB-Out direction (RFC 8671 §4.1, O flag).
+    pub const PEER_FLAG_ADJ_RIB_OUT: u8 = 0x10;
 }
 
 #[derive(Clone)]

@@ -1281,6 +1281,8 @@ impl GoBgpService for GrpcService {
                         }
                     }
                     BgpEvent::AdjRibInPost(_) => continue,
+                    BgpEvent::AdjRibOutPre(_) => continue,
+                    BgpEvent::AdjRibOutPost(_) => continue,
                 };
                 if tx.send(Ok(r)).await.is_err() {
                     break;
@@ -1744,6 +1746,7 @@ impl GoBgpService for GrpcService {
                             export_policy.as_deref(),
                             cluster_id,
                             Some(&rpki),
+                            None,
                         );
                     }
                     let destinations = sink.destinations;
