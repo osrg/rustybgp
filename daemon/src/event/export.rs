@@ -216,7 +216,11 @@ impl PeerExportContext {
     /// eBGP: replace with local_addr (with link-local for IPv6 when available).
     /// iBGP / iBGP-RR-client / RS client: pass through unchanged (next-hop
     /// unchanged).
-    pub(super) fn export_nexthop(&self, nexthop: Option<bgp::Nexthop>) -> Option<bgp::Nexthop> {
+    pub(super) fn export_nexthop(
+        &self,
+        nexthop: Option<bgp::Nexthop>,
+        family: Family,
+    ) -> Option<bgp::Nexthop> {
         let local = || match self.local_addr {
             IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
             IpAddr::V6(v6) => {
@@ -227,9 +231,19 @@ impl PeerExportContext {
                 }
             }
         };
+        let is_flowspec = matches!(
+            family,
+            Family::IPV4_FLOWSPEC
+                | Family::IPV6_FLOWSPEC
+                | Family::IPV4_FLOWSPEC_VPN
+                | Family::IPV6_FLOWSPEC_VPN
+        );
         match (self.role, nexthop) {
             // Flowspec carries no nexthop (RFC 8955 §4): preserve None.
-            (_, None) => None,
+            (_, None) if is_flowspec => None,
+            // No stored nexthop for non-Flowspec (e.g. locally originated RTC):
+            // use per-peer local address.
+            (_, None) => Some(local()),
             (PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient, Some(nh)) => Some(nh),
             (PeerRole::ConfedEbgp | PeerRole::Ebgp, Some(_)) => Some(local()),
         }
@@ -394,7 +408,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             Some((best, attr, nexthop)) => {
                 export_map.mark_sent(update.family, update.net.clone(), 0);
                 let attr = export_ctx.export_attrs(&attr);
-                let nexthop = export_ctx.export_nexthop(nexthop);
+                let nexthop = export_ctx.export_nexthop(nexthop, update.family);
                 sink.reach(update.net.clone(), 0, nexthop, attr, &best.source);
             }
         }
@@ -462,7 +476,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             if !already_sent || was_replaced {
                 export_map.mark_sent(update.family, update.net.clone(), *pid);
                 let attr = export_ctx.export_attrs(attr);
-                let nexthop = export_ctx.export_nexthop(*nexthop);
+                let nexthop = export_ctx.export_nexthop(*nexthop, update.family);
                 sink.reach(update.net.clone(), *pid, nexthop, attr, source);
             }
         }

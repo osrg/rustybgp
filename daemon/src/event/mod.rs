@@ -6451,7 +6451,7 @@ mod tests {
         fn ebgp_export_rewrites_nexthop() {
             let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-            let exported = ctx.export_nexthop(Some(original));
+            let exported = ctx.export_nexthop(Some(original), Family::IPV4);
             assert_eq!(
                 exported,
                 Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
@@ -6463,7 +6463,7 @@ mod tests {
         fn ibgp_export_keeps_nexthop() {
             let ctx = ibgp_ctx();
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-            let exported = ctx.export_nexthop(Some(original));
+            let exported = ctx.export_nexthop(Some(original), Family::IPV4);
             assert_eq!(exported, Some(original), "iBGP nexthop must be unchanged");
         }
 
@@ -6575,7 +6575,7 @@ mod tests {
         fn confed_ebgp_export_nexthop_rewrites_to_local() {
             let ctx = confed_ebgp_ctx(); // local_addr = 127.0.0.1
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-            let exported = ctx.export_nexthop(Some(original));
+            let exported = ctx.export_nexthop(Some(original), Family::IPV4);
             assert_eq!(
                 exported,
                 Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
