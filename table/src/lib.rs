@@ -734,6 +734,7 @@ impl Source {
     }
 
     pub fn mark_stale(&self) {
+        debug_assert!(!self.is_local() && !self.is_kernel());
         self.stale.store(true, Ordering::Relaxed);
     }
 
