@@ -577,6 +577,9 @@ pub(crate) enum ToPeerEvent {
     NlriChange(table::NlriChange),
     /// Trigger a soft reset OUT: re-advertise all current best paths.
     SoftResetOut,
+    /// Re-advertise all current best paths for the specified families.
+    /// Used by RTC to export VPN routes after the EOR marker (or timer) arrives.
+    RouteRefreshFamilies(Vec<Family>),
 }
 
 pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) {
@@ -1795,7 +1798,7 @@ async fn gr_restart_timer_expired(
 
 async fn rtc_eor_timer_expired(
     context: Arc<std::sync::Mutex<PeerContext>>,
-    _tables: TableHandle,
+    tables: TableHandle,
     addr: IpAddr,
 ) {
     let outputs = {
@@ -1804,8 +1807,7 @@ async fn rtc_eor_timer_expired(
     };
     for output in outputs {
         if let crate::rtc::RtcOutput::ExportFamilies(families) = output {
-            log::debug!("RTC EOR timer expired for {addr}, pending export for {families:?}");
-            // TODO: trigger bulk VPN export (subsequent step).
+            tables.trigger_rtc_export(addr, families);
         }
     }
 }
@@ -2828,6 +2830,11 @@ impl PeerSession {
                         // internally, so if the session is down (e.g. GR
                         // helper mode) this is a safe no-op.
                         for family in self.pending.keys().cloned().collect::<Vec<_>>() {
+                            self.do_route_refresh(family).await;
+                        }
+                    }
+                    Some(Some(ToPeerEvent::RouteRefreshFamilies(families))) => {
+                        for family in families {
                             self.do_route_refresh(family).await;
                         }
                     }

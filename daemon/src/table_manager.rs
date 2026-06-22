@@ -383,6 +383,21 @@ impl TableManager {
         }
     }
 
+    /// Notify `peer` to export all current best paths for the given families.
+    /// Used by the RTC EOR timer to deliver VPN routes whose advertisement was
+    /// suspended while waiting for the peer's RT interests (RFC 4684 s6).
+    pub(crate) fn trigger_rtc_export(&self, peer: IpAddr, families: Vec<Family>) {
+        let tx = self.shards[0]
+            .lock()
+            .unwrap()
+            .peer_event_tx
+            .get(&peer)
+            .cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(ToPeerEvent::RouteRefreshFamilies(families));
+        }
+    }
+
     pub(crate) fn drop_families(&self, addr: IpAddr, families: &[Family]) {
         let kernel_handle = self.kernel_handle.load_full();
         for shard in &self.shards {
