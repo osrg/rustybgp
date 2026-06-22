@@ -1794,6 +1794,11 @@ async fn gr_restart_timer_expired(
     if !families.is_empty() {
         tables.drop_families(addr, &families);
     }
+    // GR failed: peer never reconnected, so RTC state is no longer useful.
+    // Reset to Inactive so the next session restarts the EOR handshake.
+    let mut ctx = context.lock().unwrap();
+    ctx.rtc_state.process(crate::rtc::RtcInput::SessionDropped);
+    ctx.cancel_rtc_timer();
 }
 
 async fn rtc_eor_timer_expired(
@@ -3163,6 +3168,10 @@ async fn apply_disconnect(
         // session_loop() under the same shard locks as peer_event_tx.remove(),
         // so no second pass over the table is needed here.
         ctx.cancel_gr_timer();
+        // RTC: cancel the EOR wait timer but leave rtc_state Active.  The
+        // stale RTC routes in the RIB continue to gate VPN advertisement
+        // during recovery; SessionDropped is deferred until GR fully fails.
+        ctx.cancel_rtc_timer();
 
         let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
             families: gr.families.clone(),
@@ -3194,6 +3203,9 @@ async fn apply_disconnect(
         // session starts with an empty one.  Clean up any leftover GR state
         // from a previous cycle that never recovered.
         ctx.cancel_gr_timer();
+        // RTC: complete drop -- reset state to Inactive and cancel timer.
+        ctx.rtc_state.process(crate::rtc::RtcInput::SessionDropped);
+        ctx.cancel_rtc_timer();
         drop(info.export_map);
     }
 
