@@ -1955,6 +1955,7 @@ pub(crate) fn family_from_config(f: &config::generate::AfiSafiType) -> Result<Fa
         config::generate::AfiSafiType::Ipv4Srpolicy => Ok(Family::IPV4_SRPOLICY),
         config::generate::AfiSafiType::Ipv6Srpolicy => Ok(Family::IPV6_SRPOLICY),
         config::generate::AfiSafiType::L2VpnEvpn => Ok(Family::L2VPN_EVPN),
+        config::generate::AfiSafiType::Rtc => Ok(Family::RTC),
         _ => Err(()),
     }
 }
@@ -6233,6 +6234,7 @@ bgp-actions.set-next-hop = "self"
             (AfiSafiType::Ipv4Srpolicy, Family::IPV4_SRPOLICY),
             (AfiSafiType::Ipv6Srpolicy, Family::IPV6_SRPOLICY),
             (AfiSafiType::L2VpnEvpn, Family::L2VPN_EVPN),
+            (AfiSafiType::Rtc, Family::RTC),
         ];
         for (input, want) in cases {
             assert_eq!(family_from_config(&input), Ok(want), "{input:?}");
@@ -6246,7 +6248,6 @@ bgp-actions.set-next-hop = "self"
             AfiSafiType::L3VpnIpv4Multicast,
             AfiSafiType::L3VpnIpv6Multicast,
             AfiSafiType::L2VpnVpls,
-            AfiSafiType::Rtc,
             AfiSafiType::Ipv4Encap,
             AfiSafiType::Ipv6Encap,
             AfiSafiType::Opaque,
