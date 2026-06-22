@@ -2374,6 +2374,63 @@ pub(crate) fn net_from_api(n: api::Nlri, family: Family) -> Result<Nlri, Error> 
                 },
             )))
         }
+        Some(api::nlri::Nlri::LabeledPrefix(p)) => {
+            use packet::labeled::{LabeledV4Nlri, LabeledV6Nlri};
+            use packet::mpls::{MplsLabel, MplsLabelStack};
+            let labels = MplsLabelStack::new(p.labels.iter().map(|v| MplsLabel::new(*v)).collect());
+            let addr = p
+                .prefix
+                .parse::<std::net::IpAddr>()
+                .map_err(|e| Error::InvalidArgument(format!("invalid labeled prefix: {}", e)))?;
+            let mask = p.prefix_len as u8;
+            match addr {
+                std::net::IpAddr::V4(a) => Ok(Nlri::LabeledV4(LabeledV4Nlri {
+                    labels,
+                    prefix: packet::bgp::Ipv4Net { addr: a, mask },
+                })),
+                std::net::IpAddr::V6(a) => Ok(Nlri::LabeledV6(LabeledV6Nlri {
+                    labels,
+                    prefix: packet::bgp::Ipv6Net { addr: a, mask },
+                })),
+            }
+        }
+        Some(api::nlri::Nlri::LabeledVpnIpPrefix(p)) => {
+            use packet::mpls::{MplsLabel, MplsLabelStack};
+            let labels = MplsLabelStack::new(p.labels.iter().map(|v| MplsLabel::new(*v)).collect());
+            let rd = rd_from_api(
+                p.rd.as_ref()
+                    .ok_or_else(|| Error::InvalidArgument("missing rd".to_string()))?,
+            )?;
+            let addr = p
+                .prefix
+                .parse::<std::net::IpAddr>()
+                .map_err(|e| Error::InvalidArgument(format!("invalid vpn prefix: {}", e)))?;
+            let mask = p.prefix_len as u8;
+            match addr {
+                std::net::IpAddr::V4(a) => Ok(Nlri::VpnV4(packet::vpn::VpnV4Nlri {
+                    labels,
+                    rd,
+                    prefix: packet::bgp::Ipv4Net { addr: a, mask },
+                })),
+                std::net::IpAddr::V6(a) => Ok(Nlri::VpnV6(packet::vpn::VpnV6Nlri {
+                    labels,
+                    rd,
+                    prefix: packet::bgp::Ipv6Net { addr: a, mask },
+                })),
+            }
+        }
+        Some(api::nlri::Nlri::RouteTargetMembership(r)) => {
+            use packet::rtc::{MatchType, RtcNlri};
+            let match_type = match r.rt {
+                None if r.asn == 0 => MatchType::Wildcard,
+                None => MatchType::AsWildcard { origin_as: r.asn },
+                Some(ref rt) => MatchType::ExactMatch {
+                    origin_as: r.asn,
+                    route_target: rt_from_api(rt)?,
+                },
+            };
+            Ok(Nlri::Rtc(RtcNlri { match_type }))
+        }
         _ => Err(Error::InvalidArgument("invalid NLRI".to_string())),
     }
 }
