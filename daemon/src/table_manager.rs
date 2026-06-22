@@ -64,9 +64,27 @@ pub(crate) struct PeerDownData {
     pub(crate) reason: rustybgp_packet::bmp::PeerDownReason,
 }
 
+/// An Adj-RIB-Out update for one neighbor (RFC 8671).
+/// `attrs` is `None` for withdrawals; `Some` for route announcements.
+#[derive(Clone)]
+pub(crate) struct AdjRibOutChange {
+    /// The neighbor this Adj-RIB-Out entry belongs to.
+    pub(crate) peer_addr: IpAddr,
+    pub(crate) peer_asn: u32,
+    pub(crate) peer_id: u32,
+    pub(crate) family: Family,
+    pub(crate) addpath: bool,
+    pub(crate) nlri: packet::PathNlri,
+    pub(crate) attrs: Option<Arc<Vec<packet::Attribute>>>,
+    pub(crate) nexthop: Option<bgp::Nexthop>,
+    pub(crate) timestamp: std::time::SystemTime,
+}
+
 pub(crate) enum BgpEvent {
     AdjRibIn(AdjRibInChange),
     AdjRibInPost(AdjRibInChange),
+    AdjRibOutPre(AdjRibOutChange),
+    AdjRibOutPost(AdjRibOutChange),
     PeerUp(PeerUpData),
     PeerDown(PeerDownData),
 }
@@ -695,6 +713,14 @@ impl TableManager {
         for tx in subs.values() {
             let _ = tx.send(BgpEvent::PeerDown(data.clone()));
         }
+    }
+
+    /// Collect the current set of BMP/MRT subscriber senders.
+    ///
+    /// Returns an empty Vec when no subscribers are registered, letting callers
+    /// skip Adj-RIB-Out notification cheaply in the common (no-BMP) case.
+    pub(crate) fn bmp_senders(&self) -> Vec<mpsc::UnboundedSender<BgpEvent>> {
+        self.subscribers.lock().unwrap().values().cloned().collect()
     }
 
     /// Register a peer's event channel with every shard atomically.

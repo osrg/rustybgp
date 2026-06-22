@@ -139,6 +139,8 @@ impl MrtDumper {
                             file.write_all(&buf).await?;
                         }
                         Some(BgpEvent::AdjRibInPost(_))
+                        | Some(BgpEvent::AdjRibOutPre(_))
+                        | Some(BgpEvent::AdjRibOutPost(_))
                         | Some(BgpEvent::PeerUp(_))
                         | Some(BgpEvent::PeerDown(_)) => {}
                         None => return Ok(()),

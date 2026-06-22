@@ -15,14 +15,113 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use fnv::{FnvHashMap, FnvHashSet};
+use tokio::sync::mpsc;
 
 use rustybgp_packet::{self as packet, Family, bgp};
 use rustybgp_table as table;
 use table::PeerRole;
 
 use super::*;
+
+/// Carries pre-collected BMP subscriber senders for one export invocation.
+///
+/// Build once per `handle_prefix_update()` call when subscribers exist, then
+/// pass as `Option<&BmpAdjOut>` into `process_nlri_change()`.  Routes that are
+/// skipped (same best, filtered by RTC, etc.) never reach this struct.
+pub(super) struct BmpAdjOut {
+    senders: Vec<mpsc::UnboundedSender<crate::table_manager::BgpEvent>>,
+    peer_addr: IpAddr,
+    peer_asn: u32,
+    peer_id: u32,
+    addpath: bool,
+    timestamp: SystemTime,
+}
+
+impl BmpAdjOut {
+    pub(super) fn new(
+        senders: Vec<mpsc::UnboundedSender<crate::table_manager::BgpEvent>>,
+        peer_addr: IpAddr,
+        peer_asn: u32,
+        peer_id: u32,
+        addpath: bool,
+    ) -> Self {
+        BmpAdjOut {
+            senders,
+            peer_addr,
+            peer_asn,
+            peer_id,
+            addpath,
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    fn send(
+        &self,
+        post: bool,
+        family: Family,
+        nlri: packet::Nlri,
+        path_id: u32,
+        attrs: Option<Arc<Vec<packet::Attribute>>>,
+        nexthop: Option<bgp::Nexthop>,
+    ) {
+        use crate::table_manager::{AdjRibOutChange, BgpEvent};
+        let change = AdjRibOutChange {
+            peer_addr: self.peer_addr,
+            peer_asn: self.peer_asn,
+            peer_id: self.peer_id,
+            family,
+            addpath: self.addpath,
+            nlri: packet::PathNlri { path_id, nlri },
+            attrs,
+            nexthop,
+            timestamp: self.timestamp,
+        };
+        if post {
+            for tx in &self.senders {
+                let _ = tx.send(BgpEvent::AdjRibOutPost(change.clone()));
+            }
+        } else {
+            for tx in &self.senders {
+                let _ = tx.send(BgpEvent::AdjRibOutPre(change.clone()));
+            }
+        }
+    }
+
+    /// Notify pre-policy (after echo-prevention / split-horizon, before export policy).
+    /// `route` is None for withdrawals.
+    pub(super) fn pre(
+        &self,
+        family: Family,
+        nlri: packet::Nlri,
+        path_id: u32,
+        route: Option<(Arc<Vec<packet::Attribute>>, Option<bgp::Nexthop>)>,
+    ) {
+        let (attrs, nh) = match route {
+            Some((a, nh)) => (Some(a), nh),
+            None => (None, None),
+        };
+        self.send(false, family, nlri, path_id, attrs, nh);
+    }
+
+    /// Notify post-policy (after export policy and nexthop/attr rewrite).
+    /// `route` is None for withdrawals.
+    pub(super) fn post(
+        &self,
+        family: Family,
+        nlri: packet::Nlri,
+        path_id: u32,
+        route: Option<(Arc<Vec<packet::Attribute>>, Option<bgp::Nexthop>)>,
+    ) {
+        let (attrs, nh) = match route {
+            Some((a, nh)) => (Some(a), nh),
+            None => (None, None),
+        };
+        self.send(true, family, nlri, path_id, attrs, nh);
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct ExportMap {
@@ -354,6 +453,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
     export_policy: Option<&table::PolicyAssignment>,
     cluster_id: Option<Ipv4Addr>,
     rpki: Option<&table::RpkiTable>,
+    bmp: Option<&BmpAdjOut>,
 ) {
     if effective_max == 1 {
         // Non-Add-Path fast path: O(1) skip when best unchanged.
@@ -375,6 +475,15 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             }
             Some(best)
         });
+        // BMP Adj-RIB-Out pre-policy: what would be exported before per-peer policy.
+        if let Some(bmp) = bmp {
+            bmp.pre(
+                update.family,
+                update.net.clone(),
+                0,
+                visible_best.map(|b| (Arc::clone(&b.attr), b.nexthop)),
+            );
+        }
         // Apply export policy to the visible best; a rejected best is treated
         // as if no best exists (withdraw if previously advertised).
         let policy_result = visible_best.and_then(|best| {
@@ -404,6 +513,11 @@ pub(super) fn process_nlri_change<S: NlriSink>(
         });
         match policy_result {
             None => {
+                // BMP post-policy Withdraw: always emit so the receiver can track
+                // routes blocked by export policy (not gated by was_sent).
+                if let Some(bmp) = bmp {
+                    bmp.post(update.family, update.net.clone(), 0, None);
+                }
                 if export_map.was_sent(update.family, &update.net) {
                     export_map.mark_withdrawn(update.family, &update.net, 0);
                     sink.unreach(update.net.clone(), 0);
@@ -413,6 +527,15 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                 export_map.mark_sent(update.family, update.net.clone(), 0);
                 let attr = export_ctx.export_attrs(&attr);
                 let nexthop = export_ctx.export_nexthop(nexthop, update.family);
+                // BMP post-policy Reach: use the fully-rewritten attr/nexthop.
+                if let Some(bmp) = bmp {
+                    bmp.post(
+                        update.family,
+                        update.net.clone(),
+                        0,
+                        Some((Arc::clone(&attr), nexthop)),
+                    );
+                }
                 sink.reach(update.net.clone(), 0, nexthop, attr, &best.source);
             }
         }
@@ -470,6 +593,9 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             current_top_n.iter().map(|(pid, _, _, _)| *pid).collect();
         for &pid in sent_ids.difference(&current_ids) {
             export_map.mark_withdrawn(update.family, &update.net, pid);
+            if let Some(bmp) = bmp {
+                bmp.post(update.family, update.net.clone(), pid, None);
+            }
             sink.unreach(update.net.clone(), pid);
         }
 
@@ -481,6 +607,14 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                 export_map.mark_sent(update.family, update.net.clone(), *pid);
                 let attr = export_ctx.export_attrs(attr);
                 let nexthop = export_ctx.export_nexthop(*nexthop, update.family);
+                if let Some(bmp) = bmp {
+                    bmp.post(
+                        update.family,
+                        update.net.clone(),
+                        *pid,
+                        Some((Arc::clone(&attr), nexthop)),
+                    );
+                }
                 sink.reach(update.net.clone(), *pid, nexthop, attr, source);
             }
         }

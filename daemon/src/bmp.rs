@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use rustybgp_packet::{self as packet, Family, bgp, bmp};
 
-use crate::event::{AdjRibInChange, BgpEvent, GlobalHandle, TableHandle};
+use crate::event::{AdjRibInChange, AdjRibOutChange, BgpEvent, GlobalHandle, TableHandle};
 
 /// Net-state snapshot: (family, nlri) -> single-nlri AdjRibInChange per peer.
 type SnapshotMap = FnvHashMap<IpAddr, FnvHashMap<(Family, packet::PathNlri), AdjRibInChange>>;
@@ -121,6 +121,23 @@ fn adj_rib_in_to_bmp_update(change: &AdjRibInChange) -> bgp::Message {
         bgp::Message::Update(bgp::Update::Unreach {
             family: change.family,
             entries: change.nlris.clone(),
+        })
+    }
+}
+
+/// Convert a live `AdjRibOutChange` to the BGP UPDATE used in RouteMonitoring.
+fn adj_rib_out_to_bmp_update(change: &AdjRibOutChange) -> bgp::Message {
+    if let Some(ref attrs) = change.attrs {
+        bgp::Message::Update(bgp::Update::Reach {
+            family: change.family,
+            entries: vec![change.nlri.clone()],
+            nexthop: change.nexthop,
+            attr: attrs.clone(),
+        })
+    } else {
+        bgp::Message::Update(bgp::Update::Unreach {
+            family: change.family,
+            entries: vec![change.nlri.clone()],
         })
     }
 }
@@ -320,6 +337,57 @@ impl BmpClient {
                                         0,
                                         change.source.remote_addr,
                                         change.timestamp
+                                            .duration_since(SystemTime::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs() as u32,
+                                    ),
+                                    update,
+                                    addpath: change.addpath,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Some(BgpEvent::AdjRibOutPre(change)) => {
+                            let update = adj_rib_out_to_bmp_update(&change);
+                            if lines
+                                .send(&bmp::Message::RouteMonitoring {
+                                    header: bmp::PerPeerHeader::new(
+                                        bmp::Message::PEER_FLAG_ADJ_RIB_OUT,
+                                        change.peer_asn,
+                                        Ipv4Addr::from(change.peer_id),
+                                        0,
+                                        change.peer_addr,
+                                        change
+                                            .timestamp
+                                            .duration_since(SystemTime::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs() as u32,
+                                    ),
+                                    update,
+                                    addpath: change.addpath,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Some(BgpEvent::AdjRibOutPost(change)) => {
+                            let update = adj_rib_out_to_bmp_update(&change);
+                            if lines
+                                .send(&bmp::Message::RouteMonitoring {
+                                    header: bmp::PerPeerHeader::new(
+                                        bmp::Message::PEER_FLAG_ADJ_RIB_OUT
+                                            | bmp::Message::PEER_FLAG_POST_POLICY,
+                                        change.peer_asn,
+                                        Ipv4Addr::from(change.peer_id),
+                                        0,
+                                        change.peer_addr,
+                                        change
+                                            .timestamp
                                             .duration_since(SystemTime::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_secs() as u32,

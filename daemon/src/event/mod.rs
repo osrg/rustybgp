@@ -159,7 +159,7 @@ pub(super) use peer::{
 };
 
 mod export;
-use export::{AdjOutSink, ExportMap, PeerExportContext};
+use export::{AdjOutSink, BmpAdjOut, ExportMap, PeerExportContext};
 use export::{inject_local_pref_if_absent, is_as_loop, process_nlri_change};
 
 use crate::fsm::State as SessionState;
@@ -1511,7 +1511,7 @@ fn start_grpc_server(
 
 use crate::table_manager::{PeerDownData, PeerUpData, SubscriptionId, TableManager};
 // Re-export for mrt.rs and bmp.rs which import from crate::event.
-pub(crate) use crate::table_manager::{AdjRibInChange, BgpEvent, TableHandle};
+pub(crate) use crate::table_manager::{AdjRibInChange, AdjRibOutChange, BgpEvent, TableHandle};
 
 pub(crate) async fn main(
     bgp: Option<config::BgpConfig>,
@@ -2239,6 +2239,7 @@ impl PeerSession {
                             export_policy.as_deref(),
                             self.cluster_id,
                             Some(&rpki),
+                            None,
                         );
                     }
                 }
@@ -2330,6 +2331,7 @@ impl PeerSession {
                 export_policy.as_deref(),
                 self.cluster_id,
                 Some(&rpki),
+                None,
             );
         }
         for (nlri, path_ids) in old_sent {
@@ -2784,6 +2786,17 @@ impl PeerSession {
         };
         let export_policy = self.tables.export_policy.load_full();
         let rpki = self.tables.rpki.read().unwrap();
+        // Build BMP Adj-RIB-Out context only when subscribers are present.
+        let bmp_senders = self.tables.bmp_senders();
+        let bmp = (!bmp_senders.is_empty()).then(|| {
+            BmpAdjOut::new(
+                bmp_senders,
+                self.remote_addr,
+                self.state.remote_asn.load(Ordering::Relaxed),
+                self.state.remote_id.load(Ordering::Relaxed),
+                effective_max > 1,
+            )
+        });
         process_nlri_change(
             &update,
             effective_max,
@@ -2794,6 +2807,7 @@ impl PeerSession {
             export_policy.as_deref(),
             self.cluster_id,
             Some(&rpki),
+            bmp.as_ref(),
         );
     }
 
@@ -5950,6 +5964,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             assert!(pending.is_empty());
@@ -5971,6 +5986,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
                 None,
                 None,
@@ -6003,6 +6019,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -6026,6 +6043,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
                 None,
                 None,
@@ -6054,6 +6072,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             assert!(pending.is_empty());
@@ -6079,6 +6098,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
             assert!(em.was_sent(Family::IPV4, &net));
             pending.drain_messages(Family::IPV4); // flush
@@ -6091,6 +6111,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
                 None,
                 None,
@@ -6120,6 +6141,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             assert!(pending.is_empty());
@@ -6141,6 +6163,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
                 None,
                 None,
@@ -6177,6 +6200,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             assert!(em.contains_path(Family::IPV4, &net, 1));
@@ -6206,6 +6230,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
                 None,
                 None,
@@ -6240,6 +6265,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
                 None,
                 None,
@@ -6282,6 +6308,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             assert!(!em.contains_path(Family::IPV4, &net, 1)); // withdrawn
@@ -6311,6 +6338,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
                 None,
                 None,
@@ -6344,6 +6372,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             assert!(pending.is_empty());
@@ -6373,6 +6402,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ebgp_ctx(),
+                None,
                 None,
                 None,
                 None,
@@ -6430,6 +6460,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             // Split horizon: iBGP-learned route must not be forwarded to iBGP peer
@@ -6455,6 +6486,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ibgp_ctx(),
+                None,
                 None,
                 None,
                 None,
@@ -6485,6 +6517,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             // eBGP-learned route CAN be forwarded to iBGP peer
@@ -6511,6 +6544,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &ibgp_ctx(),
+                None,
                 None,
                 None,
                 None,
@@ -6997,6 +7031,7 @@ mod tests {
                 None,
                 Some(CLUSTER_ID),
                 None,
+                None,
             );
 
             assert!(pending.is_empty());
@@ -7021,6 +7056,7 @@ mod tests {
                 &ibgp_ctx(),
                 None,
                 Some(CLUSTER_ID),
+                None,
                 None,
             );
 
@@ -7049,6 +7085,7 @@ mod tests {
                 &ibgp_rr_client_ctx(),
                 None,
                 Some(CLUSTER_ID),
+                None,
                 None,
             );
 
@@ -7108,6 +7145,7 @@ mod tests {
                 None,
                 Some(CLUSTER_ID),
                 None,
+                None,
             );
 
             let attrs = drain_first_reach_attrs(&mut pending);
@@ -7147,6 +7185,7 @@ mod tests {
                 &ibgp_rr_client_ctx(),
                 None,
                 Some(CLUSTER_ID),
+                None,
                 None,
             );
 
@@ -7189,6 +7228,7 @@ mod tests {
                 None,
                 Some(CLUSTER_ID),
                 None,
+                None,
             );
 
             let attrs = drain_first_reach_attrs(&mut pending);
@@ -7224,6 +7264,7 @@ mod tests {
                 None,
                 Some(CLUSTER_ID),
                 None,
+                None,
             );
 
             let attrs = drain_first_reach_attrs(&mut pending);
@@ -7256,6 +7297,7 @@ mod tests {
                 &ibgp_rr_client_ctx(),
                 None,
                 Some(CLUSTER_ID),
+                None,
                 None,
             );
 
@@ -7292,6 +7334,7 @@ mod tests {
                 &ibgp_rr_client_ctx(),
                 None,
                 Some(CLUSTER_ID),
+                None,
                 None,
             );
 
@@ -7345,6 +7388,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -7373,6 +7417,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
 
             assert!(!em.was_sent(Family::IPV4, &net));
@@ -7398,6 +7443,7 @@ mod tests {
                 &mut em,
                 &mut pending,
                 &rs_client_ctx(),
+                None,
                 None,
                 None,
                 None,
