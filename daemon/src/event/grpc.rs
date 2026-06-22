@@ -1866,7 +1866,7 @@ impl GoBgpService for GrpcService {
             .iter()
             .map(convert::rt_from_api)
             .collect::<Result<Vec<_>, _>>()?;
-        let nlris = export_rt
+        let nlris = import_rt
             .iter()
             .map(|rt| packet::PathNlri {
                 path_id: 0,
@@ -1910,7 +1910,7 @@ impl GoBgpService for GrpcService {
         }
         let vrf = self.tables.delete_vrf(&name).map_err(Error::Table)?;
         let nlris = vrf
-            .export_rt
+            .import_rt
             .iter()
             .map(|rt| packet::PathNlri {
                 path_id: 0,
