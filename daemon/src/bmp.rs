@@ -80,6 +80,7 @@ fn flush_peer_snapshot(
             });
             messages.push(bmp::Message::RouteMonitoring {
                 header: bmp::PerPeerHeader::new(
+                    0,
                     change.source.remote_asn,
                     Ipv4Addr::from(change.source.router_id),
                     0,
@@ -289,6 +290,31 @@ impl BmpClient {
                             if lines
                                 .send(&bmp::Message::RouteMonitoring {
                                     header: bmp::PerPeerHeader::new(
+                                        0,
+                                        change.source.remote_asn,
+                                        Ipv4Addr::from(change.source.router_id),
+                                        0,
+                                        change.source.remote_addr,
+                                        change.timestamp
+                                            .duration_since(SystemTime::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs() as u32,
+                                    ),
+                                    update,
+                                    addpath: change.addpath,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Some(BgpEvent::AdjRibInPost(change)) => {
+                            let update = adj_rib_in_to_bmp_update(&change);
+                            if lines
+                                .send(&bmp::Message::RouteMonitoring {
+                                    header: bmp::PerPeerHeader::new(
+                                        bmp::Message::PEER_FLAG_POST_POLICY,
                                         change.source.remote_asn,
                                         Ipv4Addr::from(change.source.router_id),
                                         0,
@@ -311,6 +337,7 @@ impl BmpClient {
                             let remote_id = Ipv4Addr::from(data.peer_id);
                             let m = bmp::Message::PeerUp {
                                 header: bmp::PerPeerHeader::new(
+                                    0,
                                     data.peer_asn,
                                     remote_id,
                                     0,
@@ -332,6 +359,7 @@ impl BmpClient {
                         Some(BgpEvent::PeerDown(data)) => {
                             let m = bmp::Message::PeerDown {
                                 header: bmp::PerPeerHeader::new(
+                                    0,
                                     data.peer_asn,
                                     Ipv4Addr::from(data.peer_id),
                                     0,
@@ -469,6 +497,7 @@ mod tests {
 
     fn dummy_header(addr: &str) -> bmp::PerPeerHeader {
         bmp::PerPeerHeader::new(
+            0,
             65000,
             "192.0.2.1".parse().unwrap(),
             0,

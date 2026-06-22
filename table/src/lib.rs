@@ -847,6 +847,32 @@ impl Table {
             })
     }
 
+    /// Post-import-policy Adj-RIB-In snapshot: filtered entries are excluded
+    /// and `path.attr` (post-policy attributes) is returned.
+    pub fn iter_reach_post(&self, family: Family) -> impl Iterator<Item = Reach> + '_ {
+        self.ribs
+            .get(&family)
+            .unwrap_or_else(|| self.ribs.get(&Family::EMPTY).unwrap())
+            .destinations
+            .iter()
+            .flat_map(move |(net, dst)| {
+                dst.entry
+                    .iter()
+                    .filter(|e| !e.is_filtered())
+                    .map(move |e| Reach {
+                        source: e.path.source.clone(),
+                        family,
+                        net: packet::bgp::PathNlri {
+                            nlri: net.clone(),
+                            path_id: e.remote_path_id,
+                        },
+                        attr: e.path.attr.clone(),
+                        nexthop: e.path.nexthop,
+                        timestamp: e.timestamp,
+                    })
+            })
+    }
+
     pub fn families(&self) -> impl Iterator<Item = Family> + '_ {
         self.ribs.keys().filter(|f| **f != Family::EMPTY).copied()
     }

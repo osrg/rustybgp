@@ -1280,6 +1280,7 @@ impl GoBgpService for GrpcService {
                             )),
                         }
                     }
+                    BgpEvent::AdjRibInPost(_) => continue,
                 };
                 if tx.send(Ok(r)).await.is_err() {
                     break;

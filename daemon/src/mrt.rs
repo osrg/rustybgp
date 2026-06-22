@@ -112,7 +112,9 @@ impl MrtDumper {
                             codec.encode(&msg, &mut buf)?;
                             file.write_all(&buf).await?;
                         }
-                        Some(BgpEvent::PeerUp(_)) | Some(BgpEvent::PeerDown(_)) => {}
+                        Some(BgpEvent::AdjRibInPost(_))
+                        | Some(BgpEvent::PeerUp(_))
+                        | Some(BgpEvent::PeerDown(_)) => {}
                         None => return Ok(()),
                     }
                 }

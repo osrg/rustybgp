@@ -30,10 +30,18 @@ impl Message {
     pub const INITIATION: u8 = 4;
     pub const TERMINATION: u8 = 5;
     pub const ROUTE_MIRRORING: u8 = 6;
+
+    /// Per-peer header flag: peer address is IPv6 (RFC 7854 §4.2, V flag).
+    pub const PEER_FLAG_IPV6: u8 = 0x80;
+    /// Per-peer header flag: Adj-RIB-In post-policy (RFC 7854 §4.2, L flag).
+    pub const PEER_FLAG_POST_POLICY: u8 = 0x40;
 }
 
 #[derive(Clone)]
 pub struct PerPeerHeader {
+    /// Caller-supplied per-peer flags (L, O, A, …).
+    /// The V (IPv6) flag is computed from `remote_addr` at encode time.
+    flags: u8,
     pub asn: u32,
     id: Ipv4Addr,
     distinguisher: u64,
@@ -43,6 +51,7 @@ pub struct PerPeerHeader {
 
 impl PerPeerHeader {
     pub fn new(
+        flags: u8,
         asn: u32,
         id: Ipv4Addr,
         distinguisher: u64,
@@ -50,6 +59,7 @@ impl PerPeerHeader {
         timestamp: u32,
     ) -> Self {
         PerPeerHeader {
+            flags,
             asn,
             id,
             distinguisher,
@@ -59,14 +69,15 @@ impl PerPeerHeader {
     }
 
     fn encode(&self, c: &mut BytesMut) -> Result<(), Error> {
-        // type
+        // peer type: 0 = Global Instance Peer
         c.put_u8(0);
-        // only adj-in is supported
-        let mut flags = 0;
-        if self.remote_addr.is_ipv6() {
-            flags |= 1;
-        }
-        c.put_u8(flags);
+        let wire_flags = self.flags
+            | if self.remote_addr.is_ipv6() {
+                Message::PEER_FLAG_IPV6
+            } else {
+                0
+            };
+        c.put_u8(wire_flags);
         c.put_u64(self.distinguisher);
         Message::encode_ip(c, &self.remote_addr);
         c.put_u32(self.asn);

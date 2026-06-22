@@ -423,6 +423,7 @@ impl Peer {
         let remote_asn = self.state.remote_asn.load(Ordering::Relaxed);
         let remote_id = Ipv4Addr::from(self.state.remote_id.load(Ordering::Relaxed));
         let peer_header = bmp::PerPeerHeader::new(
+            0,
             remote_asn,
             remote_id,
             0,

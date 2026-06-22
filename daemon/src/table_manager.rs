@@ -66,6 +66,7 @@ pub(crate) struct PeerDownData {
 
 pub(crate) enum BgpEvent {
     AdjRibIn(AdjRibInChange),
+    AdjRibInPost(AdjRibInChange),
     PeerUp(PeerUpData),
     PeerDown(PeerDownData),
 }
@@ -279,6 +280,25 @@ impl TableManager {
         let original_attr = Arc::clone(&attr);
         let (filtered, post_policy_attr) =
             self.apply_import(import_policy.as_deref(), &source, &net.nlri, &attr, &mut nh);
+        if filtered {
+            t.notify_adj_rib_in_post(
+                source.clone(),
+                family,
+                std::slice::from_ref(&net),
+                None,
+                None,
+                timestamp,
+            );
+        } else {
+            t.notify_adj_rib_in_post(
+                source.clone(),
+                family,
+                std::slice::from_ref(&net),
+                Some(&post_policy_attr),
+                nh,
+                timestamp,
+            );
+        }
         let nexthop_invalid_flag = nh.is_some_and(|n| nht_set.contains(&n.addr()));
         let pl = prefix_limit.as_ref().map(|(max, counter)| (*max, counter));
         match t.rtable.insert(
@@ -319,6 +339,14 @@ impl TableManager {
         let idx = self.dealer(&net.nlri);
         let mut t = self.shards[idx].lock().unwrap();
         t.notify_adj_rib_in(
+            source.clone(),
+            family,
+            std::slice::from_ref(&net),
+            None,
+            None,
+            timestamp,
+        );
+        t.notify_adj_rib_in_post(
             source.clone(),
             family,
             std::slice::from_ref(&net),
@@ -605,6 +633,20 @@ impl TableManager {
                         nexthop: reach.nexthop,
                         timestamp: reach.timestamp,
                     });
+                }
+                // Post-policy snapshot sent via channel; arrives before any live events
+                // for this shard because t.subscribers.insert() follows below.
+                for reach in t.rtable.iter_reach_post(f) {
+                    let addpath = t.has_addpath(&reach.source.remote_addr, &f);
+                    let _ = tx.send(BgpEvent::AdjRibInPost(AdjRibInChange {
+                        source: reach.source,
+                        family: f,
+                        addpath,
+                        nlris: vec![reach.net],
+                        attrs: Some(reach.attr),
+                        nexthop: reach.nexthop,
+                        timestamp: reach.timestamp,
+                    }));
                 }
             }
             t.subscribers.insert(id, tx.clone());
@@ -966,6 +1008,29 @@ impl TableShard {
         }
     }
 
+    fn notify_adj_rib_in_post(
+        &self,
+        source: Arc<table::Source>,
+        family: Family,
+        nets: &[packet::PathNlri],
+        attrs: Option<&Arc<Vec<packet::Attribute>>>,
+        nexthop: Option<bgp::Nexthop>,
+        timestamp: std::time::SystemTime,
+    ) {
+        let addpath = self.has_addpath(&source.remote_addr, &family);
+        for tx in self.subscribers.values() {
+            let _ = tx.send(BgpEvent::AdjRibInPost(AdjRibInChange {
+                source: source.clone(),
+                family,
+                addpath,
+                nlris: nets.to_owned(),
+                attrs: attrs.cloned(),
+                nexthop,
+                timestamp,
+            }));
+        }
+    }
+
     fn distribute_update(
         &self,
         update: table::NlriChange,
@@ -1062,6 +1127,29 @@ impl TableShard {
             } else {
                 (false, Arc::clone(&original_attr))
             };
+            let path_nlri = packet::PathNlri {
+                nlri: net.clone(),
+                path_id: remote_path_id,
+            };
+            if filtered {
+                self.notify_adj_rib_in_post(
+                    source.clone(),
+                    family,
+                    &[path_nlri],
+                    None,
+                    None,
+                    timestamp,
+                );
+            } else {
+                self.notify_adj_rib_in_post(
+                    source.clone(),
+                    family,
+                    &[path_nlri],
+                    Some(&post_policy_attr),
+                    nh,
+                    timestamp,
+                );
+            }
             let nexthop_invalid_flag = nh.is_some_and(|n| nexthop_invalid.contains(&n.addr()));
             // Propagate policy-induced nexthop change into NHT tracking.
             if !source.is_kernel()
