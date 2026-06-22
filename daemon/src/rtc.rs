@@ -423,6 +423,40 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    #[test]
+    fn reconnect_after_gr_helper_from_awaiting_eor_restarts_eor_wait() {
+        // AwaitingEor -> GrHelperStarted -> Inactive -> reconnect -> AwaitingEor
+        let mut rtc = RtcState::new();
+        establish(&mut rtc, rtc_with_vpn());
+        assert!(rtc.is_awaiting_eor());
+
+        rtc.process(RtcInput::GrHelperStarted);
+        assert!(!rtc.is_awaiting_eor());
+        assert!(!rtc.is_active());
+
+        let out = establish(&mut rtc, rtc_with_vpn());
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], RtcOutput::StartTimer(_)));
+        assert!(rtc.is_awaiting_eor());
+    }
+
+    #[test]
+    fn reconnect_after_gr_helper_from_active_stays_active() {
+        // Active -> GrHelperStarted -> Active -> reconnect -> still Active (no-op)
+        let mut rtc = RtcState::new();
+        establish(&mut rtc, rtc_with_vpn());
+        rtc.process(RtcInput::EorReceived);
+        assert!(rtc.is_active());
+
+        rtc.process(RtcInput::GrHelperStarted);
+        assert!(rtc.is_active());
+
+        // SessionEstablished in Active is a no-op: stale filter stays in effect.
+        let out = establish(&mut rtc, rtc_with_vpn());
+        assert!(out.is_empty());
+        assert!(rtc.is_active());
+    }
+
     // -------------------------------------------------------------------------
     // VPN family filtering
     // -------------------------------------------------------------------------
