@@ -1073,7 +1073,11 @@ impl Global {
             let mut server = global.write().await;
             for p in peers {
                 match PeerParams::try_from(p) {
-                    Ok(params) => {
+                    Ok(mut params) => {
+                        let pg_name = p.config.as_ref().and_then(|c| c.peer_group.as_deref());
+                        if let Some(pg) = pg_name.and_then(|name| server.peer_group.get(name)) {
+                            params.apply_peer_group(pg);
+                        }
                         if let Err(e) = server.add_peer(params, Some(active_tx.clone())) {
                             log::error!("failed to add peer from config: {}", e);
                         }
@@ -4284,6 +4288,69 @@ mod tests {
         };
         let pg = PeerGroup::from(&cfg_pg);
         assert_eq!(pg.ttl_security, Some(255u8));
+    }
+
+    // --- PeerParams::apply_peer_group tests ---
+
+    fn make_pg_for_apply() -> PeerGroup {
+        PeerGroup::from(&make_config_peer_group())
+    }
+
+    fn make_minimal_neighbor_config(addr: &str) -> config::Neighbor {
+        config::Neighbor {
+            config: Some(config::NeighborConfig {
+                neighbor_address: Some(addr.parse().unwrap()),
+                peer_as: Some(0),
+                peer_group: Some("test-grp".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_peer_group_fills_password() {
+        let n = make_minimal_neighbor_config("10.0.0.1");
+        let mut params = PeerParams::try_from(&n).unwrap();
+        assert!(params.password.is_none());
+        params.apply_peer_group(&make_pg_for_apply());
+        assert_eq!(params.password, Some("test-secret".to_string()));
+    }
+
+    #[test]
+    fn apply_peer_group_does_not_override_existing_password() {
+        let mut n = make_minimal_neighbor_config("10.0.0.1");
+        n.config.as_mut().unwrap().auth_password = Some("peer-secret".to_string());
+        let mut params = PeerParams::try_from(&n).unwrap();
+        params.apply_peer_group(&make_pg_for_apply());
+        assert_eq!(params.password, Some("peer-secret".to_string()));
+    }
+
+    #[test]
+    fn apply_peer_group_fills_holdtime() {
+        let n = make_minimal_neighbor_config("10.0.0.1");
+        let mut params = PeerParams::try_from(&n).unwrap();
+        assert_eq!(params.holdtime, PeerParams::DEFAULT_HOLD_TIME);
+        params.apply_peer_group(&make_pg_for_apply());
+        assert_eq!(params.holdtime, 90);
+    }
+
+    #[test]
+    fn apply_peer_group_fills_as_number() {
+        let n = make_minimal_neighbor_config("10.0.0.1");
+        let mut params = PeerParams::try_from(&n).unwrap();
+        assert_eq!(params.expected_remote_asn, 0);
+        params.apply_peer_group(&make_pg_for_apply());
+        assert_eq!(params.expected_remote_asn, 65002);
+    }
+
+    #[test]
+    fn apply_peer_group_does_not_override_existing_as_number() {
+        let mut n = make_minimal_neighbor_config("10.0.0.1");
+        n.config.as_mut().unwrap().peer_as = Some(65100);
+        let mut params = PeerParams::try_from(&n).unwrap();
+        params.apply_peer_group(&make_pg_for_apply());
+        assert_eq!(params.expected_remote_asn, 65100);
     }
 
     #[tokio::test]

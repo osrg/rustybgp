@@ -183,6 +183,54 @@ impl PeerParams {
         local_cap
     }
 
+    /// Apply peer group settings as fallback for fields not explicitly set on
+    /// this peer.  Called after constructing `PeerParams` from a config or API
+    /// request when the peer belongs to a named peer group.
+    pub(crate) fn apply_peer_group(&mut self, pg: &PeerGroup) {
+        if self.expected_remote_asn == 0 && pg.as_number != 0 {
+            self.expected_remote_asn = pg.as_number;
+        }
+        if self.local_asn == 0 && pg.local_asn != 0 {
+            self.local_asn = pg.local_asn;
+        }
+        if self.holdtime == Self::DEFAULT_HOLD_TIME
+            && let Some(h) = pg.holdtime
+        {
+            self.holdtime = h;
+        }
+        if self.connect_retry_time == Self::DEFAULT_CONNECT_RETRY_TIME
+            && let Some(t) = pg.connect_retry_time
+        {
+            self.connect_retry_time = t;
+        }
+        if self.password.is_none() {
+            self.password = pg.auth_password.clone();
+        }
+        if self.multihop_ttl.is_none() {
+            self.multihop_ttl = pg.multihop_ttl;
+        }
+        if self.ttl_security.is_none() {
+            self.ttl_security = pg.ttl_security;
+        }
+        if self.families.is_empty() {
+            self.families = pg.families.clone();
+            self.send_max = pg.send_max.clone();
+        }
+        if self.graceful_restart.is_none() {
+            self.graceful_restart = pg.graceful_restart.clone();
+        }
+        if !self.passive && pg.passive {
+            self.passive = true;
+        }
+        if !self.rs_client && pg.route_server_client {
+            self.rs_client = true;
+        }
+        if !self.route_reflector.route_reflector_client && pg.route_reflector.route_reflector_client
+        {
+            self.route_reflector = pg.route_reflector.clone();
+        }
+    }
+
     /// Build a `Peer` from these params.
     ///
     /// `local_router_id` is needed to construct `PeerFsm` for collision

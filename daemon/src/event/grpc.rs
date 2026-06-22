@@ -800,8 +800,18 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddPeerRequest>,
     ) -> Result<tonic::Response<api::AddPeerResponse>, tonic::Status> {
         let api_peer = request.into_inner().peer.ok_or(Error::EmptyArgument)?;
-        let params = PeerParams::try_from(&api_peer)?;
+        let mut params = PeerParams::try_from(&api_peer)?;
         let mut global = self.global.write().await;
+        let pg_name = api_peer
+            .conf
+            .as_ref()
+            .map(|c| c.peer_group.as_str())
+            .unwrap_or_default();
+        if !pg_name.is_empty()
+            && let Some(pg) = global.peer_group.get(pg_name)
+        {
+            params.apply_peer_group(pg);
+        }
         if let Some(password) = params.password.as_ref() {
             for fd in &global.listen_sockets {
                 auth::set_md5sig(*fd, &params.remote_addr, password);
