@@ -2178,10 +2178,14 @@ impl PeerSession {
 
         let export_policy = self.tables.export_policy.load_full();
         let rpki = self.tables.rpki.read().unwrap();
+        let rtc_awaiting_eor = self.context.lock().unwrap().rtc_state.is_awaiting_eor();
         let peer_event_rx = self
             .tables
             .register_peer(self.remote_addr, addpath, |rtable| {
                 for f in &families {
+                    if rtc_awaiting_eor && crate::rtc::is_vpn_family(*f) {
+                        continue;
+                    }
                     let effective_max =
                         conn_effective_max(&self.conn_arbiter.lock().unwrap(), Some(self.role), *f);
                     for change in rtable.collect_loc_rib_paths(f) {
@@ -2650,6 +2654,11 @@ impl PeerSession {
             return;
         }
         if !self.codec.has_family(update.family) {
+            return;
+        }
+        if crate::rtc::is_vpn_family(update.family)
+            && self.context.lock().unwrap().rtc_state.is_awaiting_eor()
+        {
             return;
         }
         let effective_max = conn_effective_max(

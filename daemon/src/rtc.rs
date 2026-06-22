@@ -91,20 +91,22 @@ pub(crate) enum RtcOutput {
     ExportFamilies(Vec<Family>),
 }
 
+pub(crate) fn is_vpn_family(f: Family) -> bool {
+    matches!(
+        f,
+        Family::IPV4_VPN
+            | Family::IPV6_VPN
+            | Family::L2VPN_EVPN
+            | Family::IPV4_FLOWSPEC_VPN
+            | Family::IPV6_FLOWSPEC_VPN
+    )
+}
+
 fn vpn_families(families: &[Family]) -> Vec<Family> {
     families
         .iter()
-        .filter(|f| {
-            matches!(
-                **f,
-                Family::IPV4_VPN
-                    | Family::IPV6_VPN
-                    | Family::L2VPN_EVPN
-                    | Family::IPV4_FLOWSPEC_VPN
-                    | Family::IPV6_FLOWSPEC_VPN
-            )
-        })
         .copied()
+        .filter(|f| is_vpn_family(*f))
         .collect()
 }
 
@@ -126,7 +128,6 @@ impl RtcState {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_awaiting_eor(&self) -> bool {
         matches!(self.state, Inner::AwaitingEor { .. })
     }
