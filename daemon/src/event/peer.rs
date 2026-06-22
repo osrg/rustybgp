@@ -302,6 +302,8 @@ impl PeerParams {
                 active_connect_join_handle: None,
                 gr_state: crate::gr::GrState::new(),
                 gr_restart_timer: None,
+                rtc_state: crate::rtc::RtcState::new(),
+                rtc_eor_timer: None,
             })),
         }
     }

@@ -314,6 +314,10 @@ struct PeerContext {
     /// Command channel for the GR restart timer task.
     /// Send `()` to fire the timer immediately (RunNow); drop the sender to cancel silently.
     gr_restart_timer: Option<tokio::sync::oneshot::Sender<()>>,
+    /// RTC per-peer state machine; persists across sessions when GR is active.
+    rtc_state: crate::rtc::RtcState,
+    /// Drop to cancel the 60-second RTC EOR timer task silently.
+    rtc_eor_timer: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl PeerContext {
@@ -321,6 +325,11 @@ impl PeerContext {
     /// Used when a new session is established and GR recovery proceeds normally.
     fn cancel_gr_timer(&mut self) {
         self.gr_restart_timer.take(); // drop sender = cancel
+    }
+
+    /// Cancel the RTC EOR timer silently (e.g. when EOR arrives or session drops).
+    fn cancel_rtc_timer(&mut self) {
+        self.rtc_eor_timer.take();
     }
 
     /// Fire the GR restart timer immediately, triggering stale route purge.
@@ -1784,6 +1793,23 @@ async fn gr_restart_timer_expired(
     }
 }
 
+async fn rtc_eor_timer_expired(
+    context: Arc<std::sync::Mutex<PeerContext>>,
+    _tables: TableHandle,
+    addr: IpAddr,
+) {
+    let outputs = {
+        let mut ctx = context.lock().unwrap();
+        ctx.rtc_state.process(crate::rtc::RtcInput::TimerExpired)
+    };
+    for output in outputs {
+        if let crate::rtc::RtcOutput::ExportFamilies(families) = output {
+            log::debug!("RTC EOR timer expired for {addr}, pending export for {families:?}");
+            // TODO: trigger bulk VPN export (subsequent step).
+        }
+    }
+}
+
 /// Side effects from `apply_outputs` that require mutating global peer state.
 /// Returned by `apply_outputs` and processed by `process_effects` so that
 /// `apply_outputs` itself has no async global dependency and is unit-testable.
@@ -1794,6 +1820,8 @@ enum GlobalEffect {
     GrSessionEstablished { negotiated_gr: Option<NegotiatedGr> },
     /// EOR received for a family while GR deferral timer is running.
     GrEorReceived { family: Family },
+    /// RTC and VPN families were negotiated; start the 60-second EOR timer.
+    RtcSessionEstablished { duration: Duration },
 }
 
 /// Returns the families whose routes must be dropped immediately on disconnect.
@@ -2282,6 +2310,22 @@ impl PeerSession {
                         negotiated_gr: self.negotiated_gr.clone(),
                     });
 
+                    // Advance RTC state machine.  codec already reflects the
+                    // negotiated families after SessionNegotiated.
+                    let rtc_families: Vec<Family> = self.codec.families_iter().collect();
+                    let rtc_outputs = {
+                        let mut ctx = self.context.lock().unwrap();
+                        ctx.rtc_state
+                            .process(crate::rtc::RtcInput::SessionEstablished {
+                                negotiated_families: rtc_families,
+                            })
+                    };
+                    for output in rtc_outputs {
+                        if let crate::rtc::RtcOutput::StartTimer(dur) = output {
+                            effects.push(GlobalEffect::RtcSessionEstablished { duration: dur });
+                        }
+                    }
+
                     self.state
                         .remote_cap
                         .store(Some(Arc::new(remote_capabilities)));
@@ -2421,6 +2465,29 @@ impl PeerSession {
                         self.tables
                             .drop_stale_families(self.remote_addr, &delete_families);
                     }
+                }
+                GlobalEffect::RtcSessionEstablished { duration } => {
+                    // Cancel any leftover timer from a previous session.
+                    {
+                        let mut ctx = self.context.lock().unwrap();
+                        ctx.cancel_rtc_timer();
+                    }
+                    let context_c = Arc::clone(&self.context);
+                    let tables_c = self.tables.clone();
+                    let remote_addr = self.remote_addr;
+                    let (timer_tx, timer_rx) = tokio::sync::oneshot::channel::<()>();
+                    tokio::spawn(async move {
+                        // Err(_) = timeout elapsed -> fire; Ok(Err(_)) = sender dropped -> cancel.
+                        let fired = match tokio::time::timeout(duration, timer_rx).await {
+                            Err(_) | Ok(Ok(())) => true,
+                            Ok(Err(_)) => false,
+                        };
+                        if fired {
+                            rtc_eor_timer_expired(context_c, tables_c, remote_addr).await;
+                        }
+                    });
+                    let mut ctx = self.context.lock().unwrap();
+                    ctx.rtc_eor_timer = Some(timer_tx);
                 }
             }
         }
@@ -4959,6 +5026,8 @@ mod tests {
             active_connect_join_handle: None,
             gr_state: crate::gr::GrState::new(),
             gr_restart_timer: None,
+            rtc_state: crate::rtc::RtcState::new(),
+            rtc_eor_timer: None,
         }))
     }
 
