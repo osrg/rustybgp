@@ -50,7 +50,10 @@
 //! RTC routes retained in the RIB (via GrState) as the outbound VPN filter.
 //! SessionDropped is only sent on a complete drop (no GR, or GR timed out).
 
-use rustybgp_packet::bgp::Family;
+use rustybgp_packet::bgp::{Attribute, Family, Nlri};
+use rustybgp_packet::rtc::MatchType;
+use rustybgp_table::SoftResetPath;
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// Upper bound on how long VPN advertisement may be delayed waiting for
@@ -67,19 +70,16 @@ pub(crate) enum RtcInput {
     /// The 60-second EOR timer fired before EOR was received.
     TimerExpired,
     /// Complete session drop: no GR active, or GR recovery timed out.
-    #[allow(dead_code)]
     SessionDropped,
     /// Session dropped and GR helper mode has started for this peer.
     /// The machine keeps the RT filter active (if any) so stale RTC routes
     /// in the RIB can continue to gate VPN advertisement during recovery.
     /// If EOR had not yet arrived the machine resets to Inactive instead,
     /// since no confirmed RT interests are available to form a filter.
-    #[allow(dead_code)]
     GrHelperStarted,
 }
 
 /// Actions the driver should perform in response to an RTC input.
-#[allow(dead_code)]
 pub(crate) enum RtcOutput {
     /// Start the EOR timer with the given duration.
     StartTimer(Duration),
@@ -100,6 +100,71 @@ pub(crate) fn is_vpn_family(f: Family) -> bool {
             | Family::IPV4_FLOWSPEC_VPN
             | Family::IPV6_FLOWSPEC_VPN
     )
+}
+
+/// RT filter built from a peer's adj-in RTC paths (RFC 4684 §5).
+/// Used to gate VPN route export once the peer's RT interests are known.
+pub(crate) struct RtcFilter {
+    accept_all: bool,
+    rts: HashSet<[u8; 8]>,
+}
+
+impl RtcFilter {
+    /// Build a filter from the peer's current adj-in RTC paths.
+    ///
+    /// Stale-aware: `paths` must include both stale and fresh entries so that
+    /// GR-reconnect state can be detected.  If any stale path is present, the
+    /// peer has reconnected under GR but has not yet sent an RTC EOR in the new
+    /// session.  In that case only the stale (pre-disconnect) RT interests are
+    /// used: fresh paths that have arrived before EOR represent partial,
+    /// unconfirmed interests and must not yet gate VPN export.  Once the GR
+    /// helper deletes the stale entries on RTC EOR reception, all remaining
+    /// paths are fresh and this branch is not taken.
+    pub(crate) fn from_paths(paths: &[SoftResetPath]) -> Self {
+        let has_stale = paths.iter().any(|(_, _, _, _, src, _, _)| src.is_stale());
+        let mut accept_all = false;
+        let mut rts = HashSet::new();
+        for (_, nlri, _, _, src, _, _) in paths {
+            // Skip fresh paths during GR reconnect (before RTC EOR).
+            if has_stale && !src.is_stale() {
+                continue;
+            }
+            if let Nlri::Rtc(rtc) = nlri {
+                match &rtc.match_type {
+                    MatchType::Wildcard | MatchType::AsWildcard { .. } => {
+                        accept_all = true;
+                    }
+                    MatchType::ExactMatch { route_target, .. } => {
+                        rts.insert(*route_target);
+                    }
+                }
+            }
+        }
+        Self { accept_all, rts }
+    }
+
+    /// Returns true when a VPN route with these attributes should be forwarded
+    /// to the peer. A route is forwarded when any of its RT extended communities
+    /// matches one of the peer's advertised RTs (or the peer sent a wildcard).
+    pub(crate) fn allows(&self, attrs: &[Attribute]) -> bool {
+        if self.accept_all {
+            return true;
+        }
+        for attr in attrs {
+            if attr.code() == Attribute::EXTENDED_COMMUNITY {
+                let Some(data) = attr.binary() else {
+                    continue;
+                };
+                for chunk in data.chunks_exact(8) {
+                    let bytes: [u8; 8] = chunk.try_into().unwrap();
+                    if self.rts.contains(&bytes) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 fn vpn_families(families: &[Family]) -> Vec<Family> {
@@ -132,7 +197,6 @@ impl RtcState {
         matches!(self.state, Inner::AwaitingEor { .. })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_active(&self) -> bool {
         matches!(self.state, Inner::Active)
     }
@@ -484,5 +548,164 @@ mod tests {
         assert!(!exported.contains(&Family::IPV4));
         assert!(!exported.contains(&Family::IPV6));
         assert!(!exported.contains(&Family::RTC));
+    }
+
+    // --- RtcFilter tests ---
+
+    use rustybgp_packet::bgp::Attribute;
+    use rustybgp_table::SoftResetPath;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    fn make_rtc_path(match_type: MatchType) -> SoftResetPath {
+        let nlri = Nlri::Rtc(rustybgp_packet::rtc::RtcNlri { match_type });
+        (
+            Family::RTC,
+            nlri,
+            0,
+            None,
+            rustybgp_table::Source::local(),
+            Arc::new(vec![]),
+            SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    fn ext_community_attr(rts: &[[u8; 8]]) -> Attribute {
+        let mut data = Vec::with_capacity(rts.len() * 8);
+        for rt in rts {
+            data.extend_from_slice(rt);
+        }
+        Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, data).unwrap()
+    }
+
+    #[test]
+    fn filter_empty_paths_allows_nothing() {
+        let filter = RtcFilter::from_paths(&[]);
+        let rt: [u8; 8] = [0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64];
+        let attrs = [ext_community_attr(&[rt])];
+        assert!(!filter.allows(&attrs));
+    }
+
+    #[test]
+    fn filter_wildcard_allows_any_rt() {
+        let path = make_rtc_path(MatchType::Wildcard);
+        let filter = RtcFilter::from_paths(&[path]);
+        let rt: [u8; 8] = [0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64];
+        let attrs = [ext_community_attr(&[rt])];
+        assert!(filter.allows(&attrs));
+    }
+
+    #[test]
+    fn filter_as_wildcard_allows_any_rt() {
+        let path = make_rtc_path(MatchType::AsWildcard { origin_as: 65001 });
+        let filter = RtcFilter::from_paths(&[path]);
+        let rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xea, 0x00, 0x00, 0x00, 0x64];
+        let attrs = [ext_community_attr(&[rt])];
+        assert!(filter.allows(&attrs));
+    }
+
+    #[test]
+    fn filter_exact_match_allows_matching_rt() {
+        let rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xe9, 0x00, 0x00, 0x00, 0x64];
+        let path = make_rtc_path(MatchType::ExactMatch {
+            origin_as: 65001,
+            route_target: rt,
+        });
+        let filter = RtcFilter::from_paths(&[path]);
+        let attrs = [ext_community_attr(&[rt])];
+        assert!(filter.allows(&attrs));
+    }
+
+    #[test]
+    fn filter_exact_match_rejects_different_rt() {
+        let rt1: [u8; 8] = [0x00, 0x02, 0xfd, 0xe9, 0x00, 0x00, 0x00, 0x64];
+        let rt2: [u8; 8] = [0x00, 0x02, 0xfd, 0xea, 0x00, 0x00, 0x00, 0x65];
+        let path = make_rtc_path(MatchType::ExactMatch {
+            origin_as: 65001,
+            route_target: rt1,
+        });
+        let filter = RtcFilter::from_paths(&[path]);
+        let attrs = [ext_community_attr(&[rt2])];
+        assert!(!filter.allows(&attrs));
+    }
+
+    #[test]
+    fn filter_no_ext_community_attr_is_rejected() {
+        let rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xe9, 0x00, 0x00, 0x00, 0x64];
+        let path = make_rtc_path(MatchType::ExactMatch {
+            origin_as: 65001,
+            route_target: rt,
+        });
+        let filter = RtcFilter::from_paths(&[path]);
+        assert!(!filter.allows(&[]));
+    }
+
+    fn make_stale_rtc_path(match_type: MatchType) -> SoftResetPath {
+        use std::net::{IpAddr, Ipv4Addr};
+        let nlri = Nlri::Rtc(rustybgp_packet::rtc::RtcNlri { match_type });
+        // Use Source::new (not Source::local) to avoid mutating the global static.
+        let src = Arc::new(rustybgp_table::Source::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            65001,
+            65000,
+            Ipv4Addr::new(192, 168, 1, 1),
+            rustybgp_table::PeerRole::Ebgp,
+        ));
+        src.mark_stale();
+        (
+            Family::RTC,
+            nlri,
+            0,
+            None,
+            src,
+            Arc::new(vec![]),
+            SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    #[test]
+    fn filter_uses_stale_paths_when_stale_present() {
+        // GR reconnect: stale path (pre-disconnect RT) + fresh path (new RT, before EOR).
+        // The filter must use only the stale path so that fresh RT interests, which have
+        // not yet been confirmed by RTC EOR, do not prematurely gate VPN export.
+        let stale_rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xe9, 0x00, 0x00, 0x00, 0x64];
+        let fresh_rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xea, 0x00, 0x00, 0x00, 0x65];
+
+        let stale_path = make_stale_rtc_path(MatchType::ExactMatch {
+            origin_as: 65001,
+            route_target: stale_rt,
+        });
+        let fresh_path = make_rtc_path(MatchType::ExactMatch {
+            origin_as: 65002,
+            route_target: fresh_rt,
+        });
+
+        let filter = RtcFilter::from_paths(&[stale_path, fresh_path]);
+        // Pre-disconnect RT: allowed (stale path is the confirmed interest).
+        assert!(filter.allows(&[ext_community_attr(&[stale_rt])]));
+        // New RT from new session, before EOR: must be blocked.
+        assert!(!filter.allows(&[ext_community_attr(&[fresh_rt])]));
+    }
+
+    #[test]
+    fn filter_uses_all_paths_when_no_stale() {
+        // Normal Active state or after GR stale deletion: all paths are fresh and
+        // all are used for the filter.
+        let rt1: [u8; 8] = [0x00, 0x02, 0xfd, 0xe9, 0x00, 0x00, 0x00, 0x64];
+        let rt2: [u8; 8] = [0x00, 0x02, 0xfd, 0xea, 0x00, 0x00, 0x00, 0x65];
+
+        let path1 = make_rtc_path(MatchType::ExactMatch {
+            origin_as: 65001,
+            route_target: rt1,
+        });
+        let path2 = make_rtc_path(MatchType::ExactMatch {
+            origin_as: 65002,
+            route_target: rt2,
+        });
+
+        let filter = RtcFilter::from_paths(&[path1, path2]);
+        assert!(filter.allows(&[ext_community_attr(&[rt1])]));
+        assert!(filter.allows(&[ext_community_attr(&[rt2])]));
     }
 }

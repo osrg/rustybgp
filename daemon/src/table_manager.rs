@@ -483,6 +483,21 @@ impl TableManager {
         out
     }
 
+    /// Collect all adj-in RTC paths for `peer` across all shards (stale and fresh).
+    /// Always includes stale paths so that RtcFilter::from_paths can distinguish
+    /// GR-reconnect state (stale present) from normal Active state (no stale).
+    pub(crate) fn collect_rtc_paths(&self, peer: std::net::IpAddr) -> Vec<table::SoftResetPath> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(shard.lock().unwrap().rtable.collect_adj_in_paths(
+                peer,
+                Some(Family::RTC),
+                true,
+            ));
+        }
+        out
+    }
+
     pub(crate) fn collect_roa(&self, family: Family) -> Vec<(packet::IpNet, table::Roa)> {
         self.rpki
             .read()

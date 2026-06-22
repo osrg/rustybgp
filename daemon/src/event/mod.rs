@@ -2178,7 +2178,26 @@ impl PeerSession {
 
         let export_policy = self.tables.export_policy.load_full();
         let rpki = self.tables.rpki.read().unwrap();
-        let rtc_awaiting_eor = self.context.lock().unwrap().rtc_state.is_awaiting_eor();
+        let (rtc_awaiting_eor, rtc_active) = if self.codec.has_family(Family::RTC) {
+            let ctx = self.context.lock().unwrap();
+            (ctx.rtc_state.is_awaiting_eor(), ctx.rtc_state.is_active())
+        } else {
+            (false, false)
+        };
+        // RtcState can only be Active at on_established time when the peer is
+        // reconnecting under GR: a normal session drop sends SessionDropped which
+        // resets the state to Inactive, so Active survives only when GrHelperStarted
+        // was sent instead (RFC 4684 §6 -- stale RTC routes gate the initial dump).
+        // An empty filter (paths=[]) would block all VPN routes, so we only build
+        // when Active.  RtcFilter::from_paths detects GR reconnect by the presence
+        // of stale paths and uses only those, excluding any fresh paths the peer
+        // may have sent before the new RTC EOR.
+        let rtc_filter = if rtc_active {
+            let paths = self.tables.collect_rtc_paths(self.remote_addr);
+            Some(crate::rtc::RtcFilter::from_paths(&paths))
+        } else {
+            None
+        };
         let peer_event_rx = self
             .tables
             .register_peer(self.remote_addr, addpath, |rtable| {
@@ -2189,6 +2208,12 @@ impl PeerSession {
                     let effective_max =
                         conn_effective_max(&self.conn_arbiter.lock().unwrap(), Some(self.role), *f);
                     for change in rtable.collect_loc_rib_paths(f) {
+                        if crate::rtc::is_vpn_family(change.family)
+                            && let (Some(filter), Some(best)) = (&rtc_filter, change.new_best())
+                            && !filter.allows(&best.attr)
+                        {
+                            continue;
+                        }
                         let Some(pending) = self.pending.get_mut(&change.family) else {
                             continue;
                         };
@@ -2238,6 +2263,24 @@ impl PeerSession {
         if !self.pending.contains_key(&family) {
             return;
         }
+        // For VPN families in Active state, build the RT filter from current adj-in RTC paths.
+        // RtcFilter::from_paths uses stale-aware logic: if stale paths exist (GR reconnect
+        // before new RTC EOR) it uses only those; after stale deletion it uses fresh paths.
+        let rtc_filter = if crate::rtc::is_vpn_family(family) && self.codec.has_family(Family::RTC)
+        {
+            let is_active = {
+                let ctx = self.context.lock().unwrap();
+                ctx.rtc_state.is_active()
+            };
+            if is_active {
+                let paths = self.tables.collect_rtc_paths(self.remote_addr);
+                Some(crate::rtc::RtcFilter::from_paths(&paths))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let export_policy = self.tables.export_policy.load_full();
         let effective_max =
             conn_effective_max(&self.conn_arbiter.lock().unwrap(), Some(self.role), family);
@@ -2245,6 +2288,11 @@ impl PeerSession {
         let rpki = self.tables.rpki.read().unwrap();
         self.export_map.clear_family(family);
         for change in changes {
+            if let (Some(filter), Some(best)) = (&rtc_filter, change.new_best())
+                && !filter.allows(&best.attr)
+            {
+                continue;
+            }
             let Some(pending) = self.pending.get_mut(&change.family) else {
                 continue;
             };
@@ -2656,10 +2704,25 @@ impl PeerSession {
         if !self.codec.has_family(update.family) {
             return;
         }
-        if crate::rtc::is_vpn_family(update.family)
-            && self.context.lock().unwrap().rtc_state.is_awaiting_eor()
-        {
-            return;
+        if crate::rtc::is_vpn_family(update.family) && self.codec.has_family(Family::RTC) {
+            let (awaiting_eor, is_active) = {
+                let ctx = self.context.lock().unwrap();
+                (ctx.rtc_state.is_awaiting_eor(), ctx.rtc_state.is_active())
+            };
+            if awaiting_eor {
+                return;
+            }
+            // Build the RT filter dynamically.  RtcFilter::from_paths uses stale-aware
+            // logic: during GR reconnect (stale paths present, new RTC EOR not yet received)
+            // it uses only the pre-disconnect stale interests, excluding fresh paths that
+            // arrived before EOR.  After stale deletion (post-EOR) it uses fresh paths.
+            if is_active && let Some(best) = update.new_best() {
+                let paths = self.tables.collect_rtc_paths(self.remote_addr);
+                let filter = crate::rtc::RtcFilter::from_paths(&paths);
+                if !filter.allows(&best.attr) {
+                    return;
+                }
+            }
         }
         let effective_max = conn_effective_max(
             &self.conn_arbiter.lock().unwrap(),
@@ -3177,8 +3240,7 @@ async fn apply_disconnect(
         // session_loop() under the same shard locks as peer_event_tx.remove(),
         // so no second pass over the table is needed here.
         ctx.cancel_gr_timer();
-        // RTC: GrHelperStarted keeps Active state (stale filter remains) or
-        // resets AwaitingEor to Inactive (no confirmed RT interests).
+        // RTC: GrHelperStarted keeps Active state or resets AwaitingEor to Inactive.
         let rtc_outputs = ctx.rtc_state.process(crate::rtc::RtcInput::GrHelperStarted);
         if rtc_outputs
             .iter()
