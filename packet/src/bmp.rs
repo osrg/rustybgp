@@ -28,8 +28,8 @@ impl Message {
     pub const PEER_DOWN: u8 = 2;
     pub const PEER_UP: u8 = 3;
     pub const INITIATION: u8 = 4;
-    pub const TERMINATION: u8 = 6;
-    pub const ROUTE_MIRRORING: u8 = 7;
+    pub const TERMINATION: u8 = 5;
+    pub const ROUTE_MIRRORING: u8 = 6;
 }
 
 #[derive(Clone)]
