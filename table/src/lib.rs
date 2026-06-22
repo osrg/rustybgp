@@ -850,22 +850,35 @@ impl Table {
         self.ribs.keys().filter(|f| **f != Family::EMPTY).copied()
     }
 
-    /// Collects all non-stale paths from `peer` for use by soft reset IN.
+    /// Collects paths from `peer` across the RIB.
     ///
     /// The returned tuples carry the pre-import-policy attributes
     /// (`original_attr`) so the caller can re-apply the current import policy
     /// and re-insert with [`Table::insert`].
     ///
-    /// Stale paths (held during GR helper mode) are intentionally excluded.
-    /// They are transient entries awaiting either peer reconnection or restart
-    /// timer expiry; re-applying policy to them has no practical effect and
-    /// would cause spurious churn.  There is no RFC guidance on soft reset
-    /// interaction with GR stale routes -- this is a pragmatic implementation
-    /// choice.
-    pub fn collect_adj_in_paths(&self, peer: std::net::IpAddr) -> Vec<SoftResetPath> {
+    /// When `family` is `Some(f)` only paths for that address family are
+    /// returned; `None` returns paths from all families.
+    ///
+    /// When `include_stale` is false, stale paths (held during GR helper mode)
+    /// are excluded.  Soft reset IN uses `false` because re-applying policy to
+    /// stale routes has no practical effect and would cause spurious churn.
+    /// RTC filter construction uses `true` when the peer is reconnecting so
+    /// that the pre-GR RT interests continue to gate VPN advertisement until
+    /// a fresh RTC End-of-RIB arrives (RFC 4684 ss.5-6).
+    pub fn collect_adj_in_paths(
+        &self,
+        peer: std::net::IpAddr,
+        family: Option<Family>,
+        include_stale: bool,
+    ) -> Vec<SoftResetPath> {
         let mut out = Vec::new();
-        for (family, rib) in &self.ribs {
-            if *family == Family::EMPTY {
+        for (fam, rib) in &self.ribs {
+            if *fam == Family::EMPTY {
+                continue;
+            }
+            if let Some(filter) = family
+                && *fam != filter
+            {
                 continue;
             }
             for (net, dst) in &rib.destinations {
@@ -873,11 +886,11 @@ impl Table {
                     if entry.path.source.remote_addr != peer {
                         continue;
                     }
-                    if entry.path.source.is_stale() {
+                    if !include_stale && entry.path.source.is_stale() {
                         continue;
                     }
                     out.push((
-                        *family,
+                        *fam,
                         net.clone(),
                         entry.remote_path_id,
                         entry.path.nexthop,
@@ -5559,5 +5572,83 @@ mod tests {
         assert_eq!(dests.len(), 1);
         let best_src = dests[0].paths[0].source.remote_addr;
         assert_eq!(best_src, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    // -------------------------------------------------------------------------
+    // collect_adj_in_paths
+    // -------------------------------------------------------------------------
+
+    fn insert_for_family(rt: &mut Table, src: &Arc<Source>, family: Family, a: u8) {
+        rt.insert(
+            src.clone(),
+            family,
+            nlri(a, 0, 0, 0, 8),
+            0,
+            nh(),
+            empty_attrs(),
+            None,
+            false,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+    }
+
+    #[test]
+    fn collect_adj_in_paths_no_family_filter_returns_all_families() {
+        let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let s = source(1, 65001, 65000, 1);
+        let mut rt = Table::new();
+        insert_for_family(&mut rt, &s, Family::IPV4, 1);
+        insert_for_family(&mut rt, &s, Family::RTC, 2);
+
+        let paths = rt.collect_adj_in_paths(peer_addr, None, false);
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn collect_adj_in_paths_family_filter_returns_only_matching_family() {
+        let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let s = source(1, 65001, 65000, 1);
+        let mut rt = Table::new();
+        insert_for_family(&mut rt, &s, Family::IPV4, 1);
+        insert_for_family(&mut rt, &s, Family::RTC, 2);
+
+        let paths = rt.collect_adj_in_paths(peer_addr, Some(Family::RTC), false);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].0, Family::RTC);
+    }
+
+    #[test]
+    fn collect_adj_in_paths_stale_excluded_when_include_stale_false() {
+        let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let s_fresh = source(1, 65001, 65000, 1);
+        let s_stale = source(1, 65001, 65000, 1);
+        s_stale.mark_stale();
+
+        let mut rt = Table::new();
+        insert_for_family(&mut rt, &s_fresh, Family::RTC, 1);
+        insert_for_family(&mut rt, &s_stale, Family::RTC, 2);
+
+        let paths = rt.collect_adj_in_paths(peer_addr, Some(Family::RTC), false);
+        assert_eq!(paths.len(), 1);
+        assert!(!paths[0].4.is_stale());
+    }
+
+    #[test]
+    fn collect_adj_in_paths_stale_included_when_include_stale_true() {
+        let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let s_fresh = source(1, 65001, 65000, 1);
+        let s_stale = source(1, 65001, 65000, 1);
+        s_stale.mark_stale();
+
+        let mut rt = Table::new();
+        insert_for_family(&mut rt, &s_fresh, Family::RTC, 1);
+        insert_for_family(&mut rt, &s_stale, Family::RTC, 2);
+
+        let paths = rt.collect_adj_in_paths(peer_addr, Some(Family::RTC), true);
+        assert_eq!(paths.len(), 2);
+        let stale_count = paths.iter().filter(|p| p.4.is_stale()).count();
+        assert_eq!(stale_count, 1);
     }
 }

@@ -29,6 +29,8 @@ mod mrt;
 mod peer_tx;
 mod proto;
 mod rpki;
+#[allow(dead_code)]
+mod rtc;
 mod table_manager;
 use std::str::FromStr;
 

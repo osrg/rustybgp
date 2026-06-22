@@ -1022,7 +1022,7 @@ impl TableShard {
         kernel_handle: Option<&kernel::KernelHandle>,
         nexthop_invalid: &FnvHashSet<IpAddr>,
     ) {
-        let paths = self.rtable.collect_adj_in_paths(peer);
+        let paths = self.rtable.collect_adj_in_paths(peer, None, false);
         for (family, net, remote_path_id, mut nh, source, original_attr, timestamp) in paths {
             let old_nh =
                 self.rtable
