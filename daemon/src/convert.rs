@@ -276,12 +276,22 @@ pub(crate) fn nlri_to_api(f: &Nlri) -> api::Nlri {
             })),
         },
         Nlri::Evpn(n) => evpn_nlri_to_api(n),
-        Nlri::Rtc(n) => api::Nlri {
-            nlri: Some(api::nlri::Nlri::Prefix(api::IpAddressPrefix {
-                prefix: n.to_string(),
-                prefix_len: 0,
-            })),
-        },
+        Nlri::Rtc(n) => {
+            use packet::rtc::MatchType;
+            let (asn, rt) = match &n.match_type {
+                MatchType::Wildcard => (0, None),
+                MatchType::AsWildcard { origin_as } => (*origin_as, None),
+                MatchType::ExactMatch {
+                    origin_as,
+                    route_target,
+                } => (*origin_as, Some(rt_to_api(route_target))),
+            };
+            api::Nlri {
+                nlri: Some(api::nlri::Nlri::RouteTargetMembership(
+                    api::RouteTargetMembershipNlri { asn, rt },
+                )),
+            }
+        }
     }
 }
 
