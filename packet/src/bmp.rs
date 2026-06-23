@@ -132,7 +132,6 @@ impl PeerDownReason {
 
     fn encode(&self, c: &mut BytesMut) -> Result<(), Error> {
         c.put_u8(self.code());
-        c.put_slice(&[0; 3]);
         let mut codec = bgp::PeerCodec::new();
         match self {
             Self::LocalNotification(notification) => {
@@ -280,8 +279,9 @@ impl Encoder<&Message> for BmpCodec {
                 c.put_u16(*local_port);
                 c.put_u16(*remote_port);
                 let mut buf = bytes::BytesMut::with_capacity(4096 * 2);
-                self.codec.encode_to(remote_open, &mut buf).unwrap();
+                // RFC 7854 §4.10: Sent OPEN (local) first, Received OPEN (remote) second.
                 self.codec.encode_to(local_open, &mut buf).unwrap();
+                self.codec.encode_to(remote_open, &mut buf).unwrap();
                 c.put_slice(buf.as_ref());
             }
             Message::Initiation(tlv) => {
@@ -310,5 +310,301 @@ impl Decoder for BmpCodec {
 
     fn decode(&mut self, _src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bgp::{
+        self, Attribute, Family, HoldTime, Ipv4Net, Ipv6Net, Nexthop, Nlri, PathNlri, Update,
+    };
+    use bytes::BytesMut;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use tokio_util::codec::Encoder;
+
+    fn encode(msg: &Message) -> String {
+        let mut codec = BmpCodec::new();
+        let mut buf = BytesMut::new();
+        codec.encode(msg, &mut buf).unwrap();
+        buf.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    // PerPeerHeader for a Global IPv4 peer: ASN=65002, BGP-ID=10.0.0.2, addr=192.168.0.1, ts=0.
+    fn ipv4_peer_header() -> PerPeerHeader {
+        PerPeerHeader::new(
+            0,
+            65002,
+            Ipv4Addr::new(10, 0, 0, 2),
+            0,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+            0,
+        )
+    }
+
+    // PerPeerHeader for a Global IPv6 peer: ASN=65002, BGP-ID=10.0.0.2, addr=2001:db8::1, ts=0.
+    fn ipv6_peer_header() -> PerPeerHeader {
+        PerPeerHeader::new(
+            0,
+            65002,
+            Ipv4Addr::new(10, 0, 0, 2),
+            0,
+            IpAddr::V6(Ipv6Addr::from_str("2001:db8::1").unwrap()),
+            0,
+        )
+    }
+
+    // BGP OPEN sent by the local router: AS=65001, hold=90, router-id=10.0.0.1, no caps.
+    fn local_open() -> bgp::Message {
+        bgp::Message::Open(bgp::Open {
+            as_number: 65001,
+            holdtime: HoldTime::new(90).unwrap(),
+            router_id: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+            capability: vec![],
+        })
+    }
+
+    // BGP OPEN received from the remote peer: AS=65002, hold=90, router-id=10.0.0.2, no caps.
+    fn remote_open() -> bgp::Message {
+        bgp::Message::Open(bgp::Open {
+            as_number: 65002,
+            holdtime: HoldTime::new(90).unwrap(),
+            router_id: u32::from(Ipv4Addr::new(10, 0, 0, 2)),
+            capability: vec![],
+        })
+    }
+
+    // Common attrs: ORIGIN IGP + AS_PATH [65001].  NEXTHOP is added by the encoder for IPv4.
+    fn basic_attrs() -> Arc<Vec<Attribute>> {
+        Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            // AS_PATH: SEQ, count=1, ASN=65001 (4-byte).
+            Attribute::new_with_bin(Attribute::AS_PATH, vec![0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9])
+                .unwrap(),
+        ])
+    }
+
+    fn ipv4_reach_update() -> bgp::Message {
+        bgp::Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![PathNlri {
+                nlri: Nlri::V4(Ipv4Net {
+                    addr: Ipv4Addr::new(10, 1, 0, 0),
+                    mask: 24,
+                }),
+                path_id: 0,
+            }],
+            nexthop: Some(Nexthop::V4(Ipv4Addr::new(192, 168, 0, 1))),
+            attr: basic_attrs(),
+        })
+    }
+
+    fn ipv6_reach_update() -> bgp::Message {
+        bgp::Message::Update(Update::Reach {
+            family: Family::IPV6,
+            entries: vec![PathNlri {
+                nlri: Nlri::V6(Ipv6Net {
+                    addr: Ipv6Addr::from_str("2001:db8:1::").unwrap(),
+                    mask: 48,
+                }),
+                path_id: 0,
+            }],
+            nexthop: Some(Nexthop::V6(Ipv6Addr::from_str("2001:db8::1").unwrap())),
+            attr: basic_attrs(),
+        })
+    }
+
+    // --- Initiation ---
+    // Reference: GoBGP NewBMPInitiation([SYSDESCR="RustyBGP", SYSNAME="router1"]).
+    #[test]
+    fn initiation() {
+        let msg = Message::Initiation(vec![
+            (Message::INFO_TYPE_SYSDESCR, b"RustyBGP".to_vec()),
+            (Message::INFO_TYPE_SYSNAME, b"router1".to_vec()),
+        ]);
+        assert_eq!(
+            encode(&msg),
+            "030000001d0400010008527573747942475000020007726f7574657231",
+        );
+    }
+
+    // --- PeerUp IPv4 ---
+    // Reference: GoBGP NewBMPPeerUpNotification(ipv4_header, "10.0.0.1", 179, 12345, sent, recv).
+    // RFC 7854 §4.10 order: Sent (local) first, Received (remote) second.
+    #[test]
+    fn peer_up() {
+        let msg = Message::PeerUp {
+            header: ipv4_peer_header(),
+            local_addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            local_port: 179,
+            remote_port: 12345,
+            local_open: local_open(),
+            remote_open: remote_open(),
+        };
+        assert_eq!(
+            encode(&msg),
+            "030000007e0300000000000000000000000000000000000000000000c0a800010000fdea0a00000200000000000000000000000000000000000000000a00000100b33039ffffffffffffffffffffffffffffffff001d0104fde9005a0a00000100ffffffffffffffffffffffffffffffff001d0104fdea005a0a00000200",
+        );
+    }
+
+    // --- PeerUp IPv6 ---
+    // Reference: GoBGP NewBMPPeerUpNotification(ipv6_header, "2001:db8::2", 179, 12345, sent, recv).
+    #[test]
+    fn peer_up_ipv6() {
+        let msg = Message::PeerUp {
+            header: ipv6_peer_header(),
+            local_addr: IpAddr::V6(Ipv6Addr::from_str("2001:db8::2").unwrap()),
+            local_port: 179,
+            remote_port: 12345,
+            local_open: local_open(),
+            remote_open: remote_open(),
+        };
+        assert_eq!(
+            encode(&msg),
+            "030000007e030080000000000000000020010db80000000000000000000000010000fdea0a000002000000000000000020010db800000000000000000000000200b33039ffffffffffffffffffffffffffffffff001d0104fde9005a0a00000100ffffffffffffffffffffffffffffffff001d0104fdea005a0a00000200",
+        );
+    }
+
+    // --- PeerDown LocalNotification ---
+    // Reference: GoBGP NewBMPPeerDownNotification(ipv4_header, REASON_LOCAL_BGP_NOTIFICATION,
+    //            CEASE/AdministrativeShutdown NOTIFICATION, nil).
+    #[test]
+    fn peer_down_local_notification() {
+        let notif = bgp::Message::Notification(bgp::Notification::CeaseAdminShutdown);
+        let msg = Message::PeerDown {
+            header: ipv4_peer_header(),
+            reason: PeerDownReason::LocalNotification(notif),
+        };
+        assert_eq!(
+            encode(&msg),
+            "03000000460200000000000000000000000000000000000000000000c0a800010000fdea0a000002000000000000000001ffffffffffffffffffffffffffffffff0015030602",
+        );
+    }
+
+    // --- RouteMonitoring IPv4 Reach (pre-policy) ---
+    // Reference: GoBGP NewBMPRouteMonitoring(ipv4_header, ipv4_reach_update).
+    #[test]
+    fn route_monitoring_ipv4_reach() {
+        let msg = Message::RouteMonitoring {
+            header: ipv4_peer_header(),
+            update: ipv4_reach_update(),
+            addpath: false,
+        };
+        assert_eq!(
+            encode(&msg),
+            "030000005f0000000000000000000000000000000000000000000000c0a800010000fdea0a0000020000000000000000ffffffffffffffffffffffffffffffff002f02000000144001010040020602010000fde9400304c0a80001180a0100",
+        );
+    }
+
+    // --- RouteMonitoring IPv4 Reach (post-policy, L flag) ---
+    // Reference: GoBGP NewBMPRouteMonitoring(post_policy_header, ipv4_reach_update).
+    #[test]
+    fn route_monitoring_ipv4_reach_post() {
+        let msg = Message::RouteMonitoring {
+            header: ipv4_peer_header().with_post_policy(),
+            update: ipv4_reach_update(),
+            addpath: false,
+        };
+        assert_eq!(
+            encode(&msg),
+            "030000005f0000400000000000000000000000000000000000000000c0a800010000fdea0a0000020000000000000000ffffffffffffffffffffffffffffffff002f02000000144001010040020602010000fde9400304c0a80001180a0100",
+        );
+    }
+
+    // --- RouteMonitoring IPv4 EoR ---
+    // Reference: GoBGP NewBMPRouteMonitoring(ipv4_header, empty UPDATE).
+    #[test]
+    fn route_monitoring_ipv4_eor() {
+        let msg = Message::RouteMonitoring {
+            header: ipv4_peer_header(),
+            update: bgp::Message::Update(Update::EndOfRib(Family::IPV4)),
+            addpath: false,
+        };
+        assert_eq!(
+            encode(&msg),
+            "03000000470000000000000000000000000000000000000000000000c0a800010000fdea0a0000020000000000000000ffffffffffffffffffffffffffffffff00170200000000",
+        );
+    }
+
+    // --- RouteMonitoring IPv4 Unreach ---
+    // Reference: GoBGP NewBMPRouteMonitoring(ipv4_header, withdrawn 10.1.0.0/24).
+    #[test]
+    fn route_monitoring_ipv4_unreach() {
+        let msg = Message::RouteMonitoring {
+            header: ipv4_peer_header(),
+            update: bgp::Message::Update(Update::Unreach {
+                family: Family::IPV4,
+                entries: vec![PathNlri {
+                    nlri: Nlri::V4(Ipv4Net {
+                        addr: Ipv4Addr::new(10, 1, 0, 0),
+                        mask: 24,
+                    }),
+                    path_id: 0,
+                }],
+            }),
+            addpath: false,
+        };
+        assert_eq!(
+            encode(&msg),
+            "030000004b0000000000000000000000000000000000000000000000c0a800010000fdea0a0000020000000000000000ffffffffffffffffffffffffffffffff001b020004180a01000000",
+        );
+    }
+
+    // --- RouteMonitoring IPv6 Reach ---
+    // RustyBGP uses FLAG_EXTENDED (0x90) for MP_REACH_NLRI; GoBGP uses 0x80.
+    // All other bytes are identical to GoBGP output.
+    #[test]
+    fn route_monitoring_ipv6_reach() {
+        let msg = Message::RouteMonitoring {
+            header: ipv6_peer_header(),
+            update: ipv6_reach_update(),
+            addpath: false,
+        };
+        assert_eq!(
+            encode(&msg),
+            "0300000074000080000000000000000020010db80000000000000000000000010000fdea0a0000020000000000000000ffffffffffffffffffffffffffffffff0044020000002d4001010040020602010000fde9900e001c0002011020010db8000000000000000000000001003020010db80001",
+        );
+    }
+
+    // --- RouteMonitoring IPv6 EoR ---
+    // RustyBGP uses FLAG_EXTENDED (0x90) for MP_UNREACH_NLRI; GoBGP uses 0x80.
+    #[test]
+    fn route_monitoring_ipv6_eor() {
+        let msg = Message::RouteMonitoring {
+            header: ipv6_peer_header(),
+            update: bgp::Message::Update(Update::EndOfRib(Family::IPV6)),
+            addpath: false,
+        };
+        assert_eq!(
+            encode(&msg),
+            "030000004e000080000000000000000020010db80000000000000000000000010000fdea0a0000020000000000000000ffffffffffffffffffffffffffffffff001e0200000007900f0003000201",
+        );
+    }
+
+    // --- RouteMonitoring Loc-RIB (RFC 9069, peer_type=3) ---
+    // Reference: GoBGP NewBMPRouteMonitoring(loc_rib_header, ipv4_reach_update).
+    // peer_type=3, peer_addr=0.0.0.0, BGP-ID=10.0.0.1, ASN=65001.
+    #[test]
+    fn route_monitoring_loc_rib() {
+        let header = PerPeerHeader::new(
+            0,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 1),
+            0,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        )
+        .with_peer_type(Message::PEER_TYPE_LOC_RIB);
+        let msg = Message::RouteMonitoring {
+            header,
+            update: ipv4_reach_update(),
+            addpath: false,
+        };
+        assert_eq!(
+            encode(&msg),
+            "030000005f0003000000000000000000000000000000000000000000000000000000fde90a0000010000000000000000ffffffffffffffffffffffffffffffff002f02000000144001010040020602010000fde9400304c0a80001180a0100",
+        );
     }
 }
