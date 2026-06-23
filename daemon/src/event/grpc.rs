@@ -26,6 +26,68 @@ fn session_state_to_api(v: SessionState) -> api::peer_state::SessionState {
     }
 }
 
+fn adj_rib_in_to_table_event(change: &AdjRibInChange) -> api::WatchEventResponse {
+    let paths = change
+        .nlris
+        .iter()
+        .map(|net| {
+            if let Some(ref attrs) = change.attrs {
+                api::Path {
+                    nlri: Some(convert::nlri_to_api(&net.nlri)),
+                    family: Some(convert::family_to_api(change.family)),
+                    identifier: net.path_id,
+                    pattrs: attrs.iter().map(convert::attr_to_api).collect(),
+                    ..Default::default()
+                }
+            } else {
+                api::Path {
+                    nlri: Some(convert::nlri_to_api(&net.nlri)),
+                    family: Some(convert::family_to_api(change.family)),
+                    identifier: net.path_id,
+                    ..Default::default()
+                }
+            }
+        })
+        .collect();
+    api::WatchEventResponse {
+        event: Some(api::watch_event_response::Event::Table(
+            api::watch_event_response::TableEvent { paths },
+        )),
+    }
+}
+
+fn watch_peer_event(
+    ty: api::watch_event_response::peer_event::Type,
+    addr: std::net::IpAddr,
+    asn: u32,
+    established: bool,
+) -> api::WatchEventResponse {
+    let session_state = if established {
+        api::peer_state::SessionState::Established as i32
+    } else {
+        api::peer_state::SessionState::Idle as i32
+    };
+    api::WatchEventResponse {
+        event: Some(api::watch_event_response::Event::Peer(
+            api::watch_event_response::PeerEvent {
+                r#type: ty.into(),
+                peer: Some(api::Peer {
+                    conf: Some(api::PeerConf {
+                        peer_asn: asn,
+                        neighbor_address: addr.to_string(),
+                        ..Default::default()
+                    }),
+                    state: Some(api::PeerState {
+                        session_state,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            },
+        )),
+    }
+}
+
 impl From<&PeerView> for api::Peer {
     fn from(p: &PeerView) -> Self {
         let session_state = SessionState::try_from(p.state.fsm.load(Ordering::Relaxed))
@@ -1190,13 +1252,39 @@ impl GoBgpService for GrpcService {
                 + 'static,
         >,
     >;
+
     async fn watch_event(
         &self,
-        _request: tonic::Request<api::WatchEventRequest>,
+        request: tonic::Request<api::WatchEventRequest>,
     ) -> Result<tonic::Response<Self::WatchEventStream>, tonic::Status> {
+        let req = request.into_inner();
+
+        let want_peer = req.peer.is_some();
+        let (want_table, want_post_policy, want_init, peer_addr_filter) =
+            if let Some(table) = &req.table {
+                let mut post_policy = false;
+                let mut init = false;
+                let mut filter_addr: Option<std::net::IpAddr> = None;
+                for f in &table.filters {
+                    use api::watch_event_request::table::filter::Type;
+                    if f.r#type() == Type::PostPolicy {
+                        post_policy = true;
+                    }
+                    if f.init {
+                        init = true;
+                    }
+                    if !f.peer_address.is_empty() {
+                        filter_addr = f.peer_address.parse().ok();
+                    }
+                }
+                (true, post_policy, init, filter_addr)
+            } else {
+                (false, false, false, None)
+            };
+
         let tables2 = self.tables.clone();
         let global2 = self.global.clone();
-        let subscription = self.tables.subscribe(false);
+        let subscription = self.tables.subscribe(want_table && want_init);
         let sub_id = subscription.id;
         let (tx, rx) = mpsc::channel(1024);
         let cancel = CancellationToken::new();
@@ -1205,91 +1293,144 @@ impl GoBgpService for GrpcService {
             .await
             .watch_event_cancels
             .insert(sub_id, cancel.clone());
+
         tokio::spawn(async move {
-            let mut rx = UnboundedReceiverStream::new(subscription.rx);
-            loop {
-                let event = tokio::select! {
-                    e = rx.next() => match e { Some(e) => e, None => break },
-                    _ = cancel.cancelled() => break,
-                };
-                let r = match event {
-                    BgpEvent::PeerUp(data) => api::WatchEventResponse {
-                        event: Some(api::watch_event_response::Event::Peer(
-                            api::watch_event_response::PeerEvent {
-                                r#type: api::watch_event_response::peer_event::Type::State.into(),
-                                peer: Some(api::Peer {
-                                    conf: Some(api::PeerConf {
-                                        peer_asn: data.peer_asn,
-                                        neighbor_address: data.peer_addr.to_string(),
-                                        ..Default::default()
-                                    }),
-                                    state: Some(api::PeerState {
-                                        session_state: 6,
-                                        ..Default::default()
-                                    }),
-                                    ..Default::default()
-                                }),
-                            },
-                        )),
-                    },
-                    BgpEvent::PeerDown(data) => api::WatchEventResponse {
-                        event: Some(api::watch_event_response::Event::Peer(
-                            api::watch_event_response::PeerEvent {
-                                r#type: api::watch_event_response::peer_event::Type::State.into(),
-                                peer: Some(api::Peer {
-                                    conf: Some(api::PeerConf {
-                                        peer_asn: data.peer_asn,
-                                        neighbor_address: data.peer_addr.to_string(),
-                                        ..Default::default()
-                                    }),
-                                    state: Some(api::PeerState {
-                                        session_state: 1,
-                                        ..Default::default()
-                                    }),
-                                    ..Default::default()
-                                }),
-                            },
-                        )),
-                    },
-                    BgpEvent::AdjRibIn(change) => {
-                        let mut paths = Vec::new();
-                        for net in &change.nlris {
-                            let path = if let Some(ref attrs) = change.attrs {
-                                api::Path {
-                                    nlri: Some(convert::nlri_to_api(&net.nlri)),
-                                    family: Some(convert::family_to_api(change.family)),
-                                    identifier: net.path_id,
-                                    pattrs: attrs.iter().map(convert::attr_to_api).collect(),
-                                    ..Default::default()
-                                }
-                            } else {
-                                api::Path {
-                                    nlri: Some(convert::nlri_to_api(&net.nlri)),
-                                    family: Some(convert::family_to_api(change.family)),
-                                    identifier: net.path_id,
-                                    ..Default::default()
-                                }
-                            };
-                            paths.push(path);
-                        }
-                        api::WatchEventResponse {
-                            event: Some(api::watch_event_response::Event::Table(
-                                api::watch_event_response::TableEvent { paths },
-                            )),
+            let mut event_rx = UnboundedReceiverStream::new(subscription.rx);
+
+            (async {
+                // Phase 1: peer init dump -- send TYPE_INIT for each established peer,
+                // then TYPE_END_OF_INIT.
+                if want_peer {
+                    let established: Vec<(std::net::IpAddr, u32)> = {
+                        let g = global2.read().await;
+                        g.peers
+                            .values()
+                            .filter(|p| p.state.session_addrs.load().is_some())
+                            .map(|p| {
+                                (
+                                    p.config.remote_addr,
+                                    p.state.remote_asn.load(Ordering::Relaxed),
+                                )
+                            })
+                            .collect()
+                    };
+                    for (addr, asn) in established {
+                        let r = watch_peer_event(
+                            api::watch_event_response::peer_event::Type::Init,
+                            addr,
+                            asn,
+                            true,
+                        );
+                        if tx.send(Ok(r)).await.is_err() {
+                            return;
                         }
                     }
-                    BgpEvent::AdjRibInPost(_)
-                    | BgpEvent::AdjRibOutPre(_)
-                    | BgpEvent::AdjRibOutPost(_)
-                    | BgpEvent::EndOfSnapshot => continue,
-                };
-                if tx.send(Ok(r)).await.is_err() {
-                    break;
+                    let eoi = api::WatchEventResponse {
+                        event: Some(api::watch_event_response::Event::Peer(
+                            api::watch_event_response::PeerEvent {
+                                r#type: api::watch_event_response::peer_event::Type::EndOfInit
+                                    .into(),
+                                peer: None,
+                            },
+                        )),
+                    };
+                    if tx.send(Ok(eoi)).await.is_err() {
+                        return;
+                    }
                 }
-            }
+
+                // Phase 2: table snapshot drain -- only when want_init was requested.
+                if want_table && want_init {
+                    'snapshot: loop {
+                        match event_rx.next().await {
+                            Some(BgpEvent::AdjRibIn(change)) => {
+                                if matches!(peer_addr_filter, Some(a) if a != change.source.remote_addr)
+                                {
+                                    continue 'snapshot;
+                                }
+                                if tx
+                                    .send(Ok(adj_rib_in_to_table_event(&change)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Some(BgpEvent::AdjRibInPost(change)) if want_post_policy => {
+                                if matches!(peer_addr_filter, Some(a) if a != change.source.remote_addr)
+                                {
+                                    continue 'snapshot;
+                                }
+                                if tx
+                                    .send(Ok(adj_rib_in_to_table_event(&change)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Some(BgpEvent::EndOfSnapshot) | None => break 'snapshot,
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Phase 3: live event loop.
+                loop {
+                    let event = tokio::select! {
+                        e = event_rx.next() => match e { Some(e) => e, None => return },
+                        _ = cancel.cancelled() => return,
+                    };
+                    let r = match event {
+                        BgpEvent::PeerUp(data) if want_peer => {
+                            if matches!(peer_addr_filter, Some(a) if a != data.peer_addr) {
+                                continue;
+                            }
+                            watch_peer_event(
+                                api::watch_event_response::peer_event::Type::State,
+                                data.peer_addr,
+                                data.peer_asn,
+                                true,
+                            )
+                        }
+                        BgpEvent::PeerDown(data) if want_peer => {
+                            if matches!(peer_addr_filter, Some(a) if a != data.peer_addr) {
+                                continue;
+                            }
+                            watch_peer_event(
+                                api::watch_event_response::peer_event::Type::State,
+                                data.peer_addr,
+                                data.peer_asn,
+                                false,
+                            )
+                        }
+                        BgpEvent::AdjRibIn(change) if want_table => {
+                            if matches!(peer_addr_filter, Some(a) if a != change.source.remote_addr)
+                            {
+                                continue;
+                            }
+                            adj_rib_in_to_table_event(&change)
+                        }
+                        BgpEvent::AdjRibInPost(change) if want_table && want_post_policy => {
+                            if matches!(peer_addr_filter, Some(a) if a != change.source.remote_addr)
+                            {
+                                continue;
+                            }
+                            adj_rib_in_to_table_event(&change)
+                        }
+                        _ => continue,
+                    };
+                    if tx.send(Ok(r)).await.is_err() {
+                        return;
+                    }
+                }
+            })
+            .await;
+
             tables2.unsubscribe(sub_id);
             global2.write().await.watch_event_cancels.remove(&sub_id);
         });
+
         Ok(tonic::Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
