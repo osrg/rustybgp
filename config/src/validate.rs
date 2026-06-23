@@ -143,6 +143,13 @@ impl Neighbor {
             ));
         }
 
+        if self.apply_policy.is_some() {
+            return Err(ConfigError::InvalidConfiguration(format!(
+                "neighbor {}: per-neighbor apply-policy is not supported; configure policy under global",
+                addr
+            )));
+        }
+
         // Validate per-family add-paths send_max
         if let Some(afi_safis) = self.afi_safis.as_ref() {
             for afi_safi in afi_safis {
