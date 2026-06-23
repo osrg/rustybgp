@@ -807,16 +807,6 @@ impl fmt::Display for Ipv4Net {
     }
 }
 
-#[test]
-fn parse_bogus_ipv4net() {
-    // try to ipv6 prefix
-    let mut buf = vec![128];
-    buf.append(&mut Ipv6Addr::from(139930210).octets().to_vec());
-    let len = buf.len();
-    let mut c = BgpReader::<UpdateCtx>::new(&buf);
-    assert!(Ipv4Net::decode(&mut c, len).is_err());
-}
-
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
 pub struct Ipv6Net {
     pub addr: Ipv6Addr,
@@ -853,116 +843,6 @@ impl fmt::Display for Ipv6Net {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.addr, self.mask)
     }
-}
-
-#[test]
-fn parse_bogus_ipv6net() {
-    // try to ipv6 prefix
-    let mut buf = vec![192];
-    buf.append(&mut Ipv6Addr::from(139930210).octets().to_vec());
-    buf.append(&mut (0..8).collect::<Vec<u8>>());
-    let len = buf.len();
-    let mut c = BgpReader::<UpdateCtx>::new(&buf);
-    assert!(Ipv6Net::decode(&mut c, len).is_err());
-}
-
-#[test]
-fn nlri_decode_ipv4() {
-    let buf = vec![24, 10, 0, 0];
-    let len = buf.len();
-    let mut c = BgpReader::<UpdateCtx>::new(&buf);
-    assert_eq!(
-        Nlri::decode(Family::IPV4, &mut c, len, true).unwrap(),
-        Nlri::V4(Ipv4Net {
-            addr: Ipv4Addr::new(10, 0, 0, 0),
-            mask: 24,
-        }),
-    );
-}
-
-#[test]
-fn nlri_decode_ipv6() {
-    let buf = vec![32, 0x20, 0x01, 0x0d, 0xb8];
-    let len = buf.len();
-    let mut c = BgpReader::<UpdateCtx>::new(&buf);
-    assert_eq!(
-        Nlri::decode(Family::IPV6, &mut c, len, true).unwrap(),
-        Nlri::V6(Ipv6Net {
-            addr: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0),
-            mask: 32,
-        }),
-    );
-}
-
-#[test]
-fn nlri_decode_unsupported_family() {
-    let buf = vec![24, 10, 0, 0];
-    let len = buf.len();
-    let mut c = BgpReader::<UpdateCtx>::new(&buf);
-    assert!(Nlri::decode(Family::IPV4_MUP, &mut c, len, true).is_err());
-}
-
-#[cfg(test)]
-fn build_update_with_attr(attr_type: u8, attr_value: &[u8]) -> Vec<u8> {
-    // flags: 0x80 = optional, non-transitive (correct for both MP_REACH and MP_UNREACH)
-    let mut attr = Vec::new();
-    attr.push(0x80u8);
-    attr.push(attr_type);
-    attr.push(attr_value.len() as u8);
-    attr.extend_from_slice(attr_value);
-
-    let attr_len = attr.len() as u16;
-
-    // BGP message: marker(16) + length(2) + type(1) + withdrawn_len(2) + attr_len(2) + attr(N)
-    let total_len = (16u16 + 2 + 1 + 2 + 2 + attr_len).to_be_bytes();
-
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&[0xFF; 16]);
-    msg.extend_from_slice(&total_len);
-    msg.push(0x02); // UPDATE
-    msg.extend_from_slice(&[0x00, 0x00]); // withdrawn_len=0
-    msg.extend_from_slice(&attr_len.to_be_bytes());
-    msg.extend_from_slice(&attr);
-    msg
-}
-
-#[test]
-fn parse_message_rejects_unnegotiated_family_mp_reach() {
-    // PeerCodec with no negotiated families (empty); receiving MP_REACH_NLRI for
-    // AFI=25/SAFI=70 (L2VPN EVPN) must be rejected with UpdateMalformedAttributeList.
-    let mut codec = PeerCodec::new();
-
-    // MP_REACH_NLRI value: AFI(2) + SAFI(1) + nexthop_len(1) + nexthop(4) + reserved(1)
-    let attr_value = [
-        0x00, 0x19, // AFI=25 (L2VPN)
-        0x46, // SAFI=70 (EVPN)
-        0x04, // nexthop_len=4
-        0xc0, 0xa8, 0x01, 0x01, // nexthop
-        0x00, // reserved
-    ];
-    let msg = build_update_with_attr(0x0E, &attr_value);
-    assert_eq!(
-        codec.parse_message(&msg).err(),
-        Some(Notification::UpdateMalformedAttributeList)
-    );
-}
-
-#[test]
-fn parse_message_rejects_unnegotiated_family_mp_unreach() {
-    // PeerCodec with no negotiated families; receiving MP_UNREACH_NLRI for
-    // AFI=25/SAFI=70 (L2VPN EVPN) must be rejected with UpdateMalformedAttributeList.
-    let mut codec = PeerCodec::new();
-
-    // MP_UNREACH_NLRI value: AFI(2) + SAFI(1)
-    let attr_value = [
-        0x00, 0x19, // AFI=25 (L2VPN)
-        0x46, // SAFI=70 (EVPN)
-    ];
-    let msg = build_update_with_attr(0x0F, &attr_value);
-    assert_eq!(
-        codec.parse_message(&msg).err(),
-        Some(Notification::UpdateMalformedAttributeList)
-    );
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3169,5 +3049,3204 @@ mod notification_tests {
                 "code {code} subcode 9 should not be hard reset"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod nlri_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn build_update_with_attr(attr_type: u8, attr_value: &[u8]) -> Vec<u8> {
+        let mut attr = Vec::new();
+        attr.push(0x80u8);
+        attr.push(attr_type);
+        attr.push(attr_value.len() as u8);
+        attr.extend_from_slice(attr_value);
+        let attr_len = attr.len() as u16;
+        let total_len = (16u16 + 2 + 1 + 2 + 2 + attr_len).to_be_bytes();
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&[0xFF; 16]);
+        msg.extend_from_slice(&total_len);
+        msg.push(0x02);
+        msg.extend_from_slice(&[0x00, 0x00]);
+        msg.extend_from_slice(&attr_len.to_be_bytes());
+        msg.extend_from_slice(&attr);
+        msg
+    }
+
+    #[test]
+    fn parse_bogus_ipv4net() {
+        let mut buf = vec![128];
+        buf.append(&mut Ipv6Addr::from(139930210).octets().to_vec());
+        let len = buf.len();
+        let mut c = BgpReader::<UpdateCtx>::new(&buf);
+        assert!(Ipv4Net::decode(&mut c, len).is_err());
+    }
+
+    #[test]
+    fn parse_bogus_ipv6net() {
+        let mut buf = vec![192];
+        buf.append(&mut Ipv6Addr::from(139930210).octets().to_vec());
+        buf.append(&mut (0..8).collect::<Vec<u8>>());
+        let len = buf.len();
+        let mut c = BgpReader::<UpdateCtx>::new(&buf);
+        assert!(Ipv6Net::decode(&mut c, len).is_err());
+    }
+
+    #[test]
+    fn nlri_decode_ipv4() {
+        let buf = vec![24, 10, 0, 0];
+        let len = buf.len();
+        let mut c = BgpReader::<UpdateCtx>::new(&buf);
+        assert_eq!(
+            Nlri::decode(Family::IPV4, &mut c, len, true).unwrap(),
+            Nlri::V4(Ipv4Net {
+                addr: Ipv4Addr::new(10, 0, 0, 0),
+                mask: 24,
+            }),
+        );
+    }
+
+    #[test]
+    fn nlri_decode_ipv6() {
+        let buf = vec![32, 0x20, 0x01, 0x0d, 0xb8];
+        let len = buf.len();
+        let mut c = BgpReader::<UpdateCtx>::new(&buf);
+        assert_eq!(
+            Nlri::decode(Family::IPV6, &mut c, len, true).unwrap(),
+            Nlri::V6(Ipv6Net {
+                addr: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0),
+                mask: 32,
+            }),
+        );
+    }
+
+    #[test]
+    fn nlri_decode_unsupported_family() {
+        let buf = vec![24, 10, 0, 0];
+        let len = buf.len();
+        let mut c = BgpReader::<UpdateCtx>::new(&buf);
+        assert!(Nlri::decode(Family::IPV4_MUP, &mut c, len, true).is_err());
+    }
+
+    #[test]
+    fn parse_message_rejects_unnegotiated_family_mp_reach() {
+        let mut codec = PeerCodec::new();
+        let attr_value = [
+            0x00, 0x19, // AFI=25 (L2VPN)
+            0x46, // SAFI=70 (EVPN)
+            0x04, 0xc0, 0xa8, 0x01, 0x01, 0x00,
+        ];
+        let msg = build_update_with_attr(0x0E, &attr_value);
+        assert_eq!(
+            codec.parse_message(&msg).err(),
+            Some(Notification::UpdateMalformedAttributeList)
+        );
+    }
+
+    #[test]
+    fn parse_message_rejects_unnegotiated_family_mp_unreach() {
+        let mut codec = PeerCodec::new();
+        let attr_value = [
+            0x00, 0x19, // AFI=25 (L2VPN)
+            0x46, // SAFI=70 (EVPN)
+        ];
+        let msg = build_update_with_attr(0x0F, &attr_value);
+        assert_eq!(
+            codec.parse_message(&msg).err(),
+            Some(Notification::UpdateMalformedAttributeList)
+        );
+    }
+}
+
+#[cfg(test)]
+mod attribute_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+
+    fn ipv4_codec() -> PeerCodec {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV4, FamilyState::default());
+        c
+    }
+
+    fn ipv4_prefix(addr: &str, mask: u8) -> PathNlri {
+        PathNlri::new(Nlri::V4(Ipv4Net {
+            addr: addr.parse().unwrap(),
+            mask,
+        }))
+    }
+
+    fn base_attrs(nexthop: Ipv4Addr) -> Vec<Attribute> {
+        vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+            Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
+        ]
+    }
+
+    fn round_trip(msg: &Message) -> ParsedMessage {
+        let mut framer = ipv4_codec();
+        let mut buf = Vec::new();
+        framer.encode_to(msg, &mut buf).unwrap();
+        framer.parse_message(&buf).unwrap()
+    }
+
+    fn update_with_attrs(attrs: Vec<Attribute>) -> Message {
+        Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
+            attr: Arc::new(attrs),
+        })
+    }
+
+    const FLAG_TRANSITIVE: u8 = 0x40;
+    const FLAG_OPTIONAL: u8 = 0x80;
+
+    #[test]
+    fn canonical_flags_well_known_mandatory() {
+        for code in [
+            Attribute::ORIGIN,
+            Attribute::AS_PATH,
+            Attribute::NEXTHOP,
+            Attribute::LOCAL_PREF,
+            Attribute::ATOMIC_AGGREGATE,
+        ] {
+            let f =
+                Attribute::canonical_flags(code).unwrap_or_else(|| panic!("code {} missing", code));
+            assert_eq!(
+                f & FLAG_TRANSITIVE,
+                FLAG_TRANSITIVE,
+                "code {} should be TRANSITIVE",
+                code
+            );
+            assert_eq!(f & FLAG_OPTIONAL, 0, "code {} should not be OPTIONAL", code);
+        }
+    }
+
+    #[test]
+    fn canonical_flags_optional_non_transitive() {
+        for code in [
+            Attribute::MULTI_EXIT_DESC,
+            Attribute::ORIGINATOR_ID,
+            Attribute::CLUSTER_LIST,
+            Attribute::MP_REACH,
+            Attribute::MP_UNREACH,
+        ] {
+            let f =
+                Attribute::canonical_flags(code).unwrap_or_else(|| panic!("code {} missing", code));
+            assert_eq!(
+                f & FLAG_OPTIONAL,
+                FLAG_OPTIONAL,
+                "code {} should be OPTIONAL",
+                code
+            );
+            assert_eq!(
+                f & FLAG_TRANSITIVE,
+                0,
+                "code {} should not be TRANSITIVE",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_flags_optional_transitive() {
+        for code in [
+            Attribute::COMMUNITY,
+            Attribute::AGGREGATOR,
+            Attribute::EXTENDED_COMMUNITY,
+            Attribute::AS4_PATH,
+            Attribute::LARGE_COMMUNITY,
+        ] {
+            let f =
+                Attribute::canonical_flags(code).unwrap_or_else(|| panic!("code {} missing", code));
+            assert_eq!(
+                f & FLAG_OPTIONAL,
+                FLAG_OPTIONAL,
+                "code {} should be OPTIONAL",
+                code
+            );
+            assert_eq!(
+                f & FLAG_TRANSITIVE,
+                FLAG_TRANSITIVE,
+                "code {} should be TRANSITIVE",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_flags_unknown_returns_none() {
+        assert_eq!(Attribute::canonical_flags(0), None);
+        assert_eq!(Attribute::canonical_flags(100), None);
+        assert_eq!(Attribute::canonical_flags(255), None);
+    }
+
+    #[test]
+    fn new_with_value_known_code() {
+        let a = Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap();
+        assert_eq!(a.code(), Attribute::ORIGIN);
+        assert_eq!(a.value(), Some(0));
+    }
+
+    #[test]
+    fn new_with_value_unknown_code_returns_none() {
+        assert!(Attribute::new_with_value(255, 0).is_none());
+    }
+
+    #[test]
+    fn new_with_bin_known_code() {
+        let bytes = vec![0xDE, 0xAD];
+        let a = Attribute::new_with_bin(Attribute::COMMUNITY, bytes.clone()).unwrap();
+        assert_eq!(a.code(), Attribute::COMMUNITY);
+        assert_eq!(a.binary(), Some(&bytes));
+    }
+
+    #[test]
+    fn new_with_bin_unknown_code_returns_none() {
+        assert!(Attribute::new_with_bin(200, vec![0x01]).is_none());
+    }
+
+    #[test]
+    fn attribute_local_pref_round_trip() {
+        let mut attrs = base_attrs("192.0.2.1".parse().unwrap());
+        attrs.push(Attribute::new_with_value(Attribute::LOCAL_PREF, 200).unwrap());
+        match round_trip(&update_with_attrs(attrs)) {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+                let lp = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::LOCAL_PREF)
+                    .expect("LOCAL_PREF must be present");
+                assert_eq!(lp.value(), Some(200));
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn attribute_as_path_round_trip() {
+        let aspath = vec![
+            Attribute::AS_PATH_TYPE_SEQ,
+            2,
+            0x00,
+            0x00,
+            0xFD,
+            0xEA,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+        ];
+        let attrs = vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(Attribute::AS_PATH, aspath.clone()).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::NEXTHOP,
+                "192.0.2.1".parse::<Ipv4Addr>().unwrap().octets().to_vec(),
+            )
+            .unwrap(),
+            Attribute::new_with_value(Attribute::LOCAL_PREF, 100).unwrap(),
+        ];
+        match round_trip(&update_with_attrs(attrs)) {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+                let ap = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::AS_PATH)
+                    .expect("AS_PATH must be present");
+                assert_eq!(ap.binary(), Some(&aspath));
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn attribute_large_community_round_trip() {
+        let lc: Vec<u8> = [65001u32, 1u32, 2u32]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        let mut attrs = base_attrs("192.0.2.1".parse().unwrap());
+        attrs.push(Attribute::new_with_bin(Attribute::LARGE_COMMUNITY, lc.clone()).unwrap());
+        match round_trip(&update_with_attrs(attrs)) {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+                let lc_attr = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::LARGE_COMMUNITY)
+                    .expect("LARGE_COMMUNITY must be present");
+                assert_eq!(lc_attr.binary(), Some(&lc));
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn attribute_extended_community_round_trip() {
+        let ec: Vec<u8> = vec![0x00, 0x02, 0x00, 0x00, 0xFD, 0xE9, 0x00, 0x64];
+        let mut attrs = base_attrs("192.0.2.1".parse().unwrap());
+        attrs.push(Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, ec.clone()).unwrap());
+        match round_trip(&update_with_attrs(attrs)) {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+                let ec_attr = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::EXTENDED_COMMUNITY)
+                    .expect("EXTENDED_COMMUNITY must be present");
+                assert_eq!(ec_attr.binary(), Some(&ec));
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn bgp_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let total = (19 + body.len()) as u16;
+        let mut buf = vec![0xff; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(msg_type);
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    fn open_body(as2: u16, holdtime: u16, router_id: Ipv4Addr, params: &[u8]) -> Vec<u8> {
+        let mut body = vec![4u8];
+        body.extend_from_slice(&as2.to_be_bytes());
+        body.extend_from_slice(&holdtime.to_be_bytes());
+        body.extend_from_slice(&u32::from(router_id).to_be_bytes());
+        body.push(params.len() as u8);
+        body.extend_from_slice(params);
+        body
+    }
+
+    fn capability_param(cap_bytes: &[u8]) -> Vec<u8> {
+        let mut p = vec![2u8, cap_bytes.len() as u8];
+        p.extend_from_slice(cap_bytes);
+        p
+    }
+
+    fn parse_open_caps(cap_bytes: &[u8]) -> Vec<Capability> {
+        let params = capability_param(cap_bytes);
+        let buf = bgp_msg(
+            1,
+            &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
+        );
+        match PeerCodec::new().parse_message(&buf).unwrap() {
+            ParsedMessage::Open(Open { capability, .. }) => capability,
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    fn round_trip(msg: &Message) -> ParsedMessage {
+        let mut framer = PeerCodec::new();
+        let mut buf = Vec::new();
+        framer.encode_to(msg, &mut buf).unwrap();
+        framer.parse_message(&buf).unwrap()
+    }
+
+    fn open_with(caps: Vec<Capability>) -> Message {
+        Message::Open(Open {
+            as_number: 65001,
+            holdtime: HoldTime::new(90).unwrap(),
+            router_id: u32::from("192.0.2.1".parse::<Ipv4Addr>().unwrap()),
+            capability: caps,
+        })
+    }
+
+    fn graceful_restart_bytes(flags: u8, restart_time: u16, families: &[(u16, u8, u8)]) -> Vec<u8> {
+        let len = 2 + families.len() as u8 * 4;
+        let mut v = vec![64u8, len];
+        let restart_word = ((flags as u16) << 12) | (restart_time & 0xfff);
+        v.extend_from_slice(&restart_word.to_be_bytes());
+        for (afi, safi, af_flags) in families {
+            v.extend_from_slice(&afi.to_be_bytes());
+            v.push(*safi);
+            v.push(*af_flags);
+        }
+        v
+    }
+
+    #[test]
+    fn capability_graceful_restart_no_families() {
+        let cap = graceful_restart_bytes(0x08, 90, &[]);
+        let caps = parse_open_caps(&cap);
+        assert_eq!(caps.len(), 1);
+        assert!(matches!(
+            &caps[0],
+            Capability::GracefulRestart { flags: 0x08, restart_time: 90, families }
+            if families.is_empty()
+        ));
+    }
+
+    #[test]
+    fn capability_graceful_restart_with_families() {
+        let cap = graceful_restart_bytes(0x08, 120, &[(1, 1, 0x80)]);
+        let caps = parse_open_caps(&cap);
+        assert_eq!(caps.len(), 1);
+        match &caps[0] {
+            Capability::GracefulRestart {
+                flags,
+                restart_time,
+                families,
+            } => {
+                assert_eq!(*flags, 0x08);
+                assert_eq!(*restart_time, 120);
+                assert_eq!(families.len(), 1);
+                assert_eq!(families[0], (Family::IPV4, 0x80));
+            }
+            _ => panic!("expected GracefulRestart"),
+        }
+    }
+
+    #[test]
+    fn capability_graceful_restart_round_trip() {
+        let original = open_with(vec![Capability::GracefulRestart {
+            flags: 0x08,
+            restart_time: 120,
+            families: vec![(Family::IPV4, 0x80), (Family::IPV6, 0x00)],
+        }]);
+        match round_trip(&original) {
+            ParsedMessage::Open(Open { capability, .. }) => {
+                assert_eq!(capability.len(), 1);
+                match &capability[0] {
+                    Capability::GracefulRestart {
+                        flags,
+                        restart_time,
+                        families,
+                    } => {
+                        assert_eq!(*flags, 0x08);
+                        assert_eq!(*restart_time, 120);
+                        assert_eq!(families.len(), 2);
+                        assert!(families.contains(&(Family::IPV4, 0x80)));
+                        assert!(families.contains(&(Family::IPV6, 0x00)));
+                    }
+                    _ => panic!("expected GracefulRestart"),
+                }
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn capability_graceful_restart_invalid_len() {
+        let cap: &[u8] = &[64, 3, 0x00, 0x5A, 0x00];
+        let params = capability_param(cap);
+        let buf = bgp_msg(
+            1,
+            &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
+        );
+        match PeerCodec::new().parse_message(&buf) {
+            Err(Notification::OpenMalformed) => {}
+            Ok(_) => panic!("expected error"),
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn capability_add_path_round_trip() {
+        let original = open_with(vec![Capability::AddPath(vec![(Family::IPV4, 3)])]);
+        match round_trip(&original) {
+            ParsedMessage::Open(Open { capability, .. }) => {
+                assert_eq!(capability.len(), 1);
+                assert!(matches!(
+                    &capability[0],
+                    Capability::AddPath(v) if *v == [(Family::IPV4, 3)]
+                ));
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn capability_add_path_multiple_families() {
+        let original = open_with(vec![Capability::AddPath(vec![
+            (Family::IPV4, 1),
+            (Family::IPV6, 2),
+        ])]);
+        match round_trip(&original) {
+            ParsedMessage::Open(Open { capability, .. }) => {
+                assert_eq!(capability.len(), 1);
+                match &capability[0] {
+                    Capability::AddPath(v) => {
+                        assert_eq!(v.len(), 2);
+                        assert!(v.contains(&(Family::IPV4, 1)));
+                        assert!(v.contains(&(Family::IPV6, 2)));
+                    }
+                    _ => panic!("expected AddPath"),
+                }
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn capability_add_path_invalid_len() {
+        let cap: &[u8] = &[69, 3, 0x00, 0x01, 0x01];
+        let params = capability_param(cap);
+        let buf = bgp_msg(
+            1,
+            &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
+        );
+        match PeerCodec::new().parse_message(&buf) {
+            Err(Notification::OpenMalformed) => {}
+            Ok(_) => panic!("expected error"),
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn capability_enhanced_route_refresh_round_trip() {
+        let original = open_with(vec![Capability::EnhancedRouteRefresh]);
+        match round_trip(&original) {
+            ParsedMessage::Open(Open { capability, .. }) => {
+                assert!(
+                    capability
+                        .iter()
+                        .any(|c| matches!(c, Capability::EnhancedRouteRefresh))
+                );
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    fn fqdn_bytes(hostname: &str, domain: &str) -> Vec<u8> {
+        let mut v = vec![73u8];
+        v.push((2 + hostname.len() + domain.len()) as u8);
+        v.push(hostname.len() as u8);
+        v.extend_from_slice(hostname.as_bytes());
+        v.push(domain.len() as u8);
+        v.extend_from_slice(domain.as_bytes());
+        v
+    }
+
+    #[test]
+    fn capability_fqdn_parse() {
+        let cap = fqdn_bytes("router1", "example.com");
+        let caps = parse_open_caps(&cap);
+        assert_eq!(caps.len(), 1);
+        assert!(matches!(
+            &caps[0],
+            Capability::Fqdn { hostname, domain }
+            if hostname == "router1" && domain == "example.com"
+        ));
+    }
+
+    #[test]
+    fn capability_fqdn_round_trip() {
+        let original = open_with(vec![Capability::Fqdn {
+            hostname: "router1".to_string(),
+            domain: "example.com".to_string(),
+        }]);
+        match round_trip(&original) {
+            ParsedMessage::Open(Open { capability, .. }) => {
+                assert_eq!(capability.len(), 1);
+                assert!(matches!(
+                    &capability[0],
+                    Capability::Fqdn { hostname, domain }
+                    if hostname == "router1" && domain == "example.com"
+                ));
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn capability_llgr_round_trip() {
+        let original = open_with(vec![Capability::LongLivedGracefulRestart(vec![(
+            Family::IPV4,
+            0x80,
+            3600,
+        )])]);
+        match round_trip(&original) {
+            ParsedMessage::Open(Open { capability, .. }) => {
+                assert_eq!(capability.len(), 1);
+                assert!(matches!(
+                    &capability[0],
+                    Capability::LongLivedGracefulRestart(v)
+                    if *v == [(Family::IPV4, 0x80, 3600)]
+                ));
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn negotiate_addpath_rx_only() {
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::AddPath(vec![(Family::IPV4, 1)]),
+        ];
+        let remote = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::AddPath(vec![(Family::IPV4, 2)]),
+        ];
+        let codec = PeerCodec::negotiate(&local, &remote);
+        assert_eq!(codec.families_iter().count(), 1);
+        let s = codec.family_state(Family::IPV4).unwrap();
+        assert!(s.addpath_rx);
+        assert!(!s.addpath_tx);
+    }
+
+    #[test]
+    fn negotiate_addpath_tx_only() {
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::AddPath(vec![(Family::IPV4, 2)]),
+        ];
+        let remote = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::AddPath(vec![(Family::IPV4, 1)]),
+        ];
+        let codec = PeerCodec::negotiate(&local, &remote);
+        assert_eq!(codec.families_iter().count(), 1);
+        let s = codec.family_state(Family::IPV4).unwrap();
+        assert!(!s.addpath_rx);
+        assert!(s.addpath_tx);
+    }
+
+    #[test]
+    fn negotiate_addpath_both() {
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::AddPath(vec![(Family::IPV4, 3)]),
+        ];
+        let remote = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::AddPath(vec![(Family::IPV4, 3)]),
+        ];
+        let codec = PeerCodec::negotiate(&local, &remote);
+        assert_eq!(codec.families_iter().count(), 1);
+        let s = codec.family_state(Family::IPV4).unwrap();
+        assert!(s.addpath_rx);
+        assert!(s.addpath_tx);
+    }
+
+    #[test]
+    fn negotiate_addpath_no_match() {
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::AddPath(vec![(Family::IPV4, 1)]),
+        ];
+        let remote = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::AddPath(vec![(Family::IPV4, 1)]),
+        ];
+        let codec = PeerCodec::negotiate(&local, &remote);
+        assert_eq!(codec.families_iter().count(), 1);
+        let s = codec.family_state(Family::IPV4).unwrap();
+        assert!(!s.addpath_rx);
+        assert!(!s.addpath_tx);
+    }
+
+    #[test]
+    fn negotiate_addpath_mismatched_family() {
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::MultiProtocol(Family::IPV6),
+            Capability::AddPath(vec![(Family::IPV4, 3)]),
+        ];
+        let remote = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::MultiProtocol(Family::IPV6),
+            Capability::AddPath(vec![(Family::IPV6, 3)]),
+        ];
+        let codec = PeerCodec::negotiate(&local, &remote);
+        assert_eq!(codec.families_iter().count(), 2);
+        for f in [Family::IPV4, Family::IPV6] {
+            let s = codec.family_state(f).unwrap();
+            assert!(!s.addpath_rx);
+            assert!(!s.addpath_tx);
+        }
+    }
+
+    #[test]
+    fn capability_unknown_preserved() {
+        let cap: &[u8] = &[200, 2, 0xAB, 0xCD];
+        let caps = parse_open_caps(cap);
+        assert_eq!(caps.len(), 1);
+        assert!(matches!(
+            &caps[0],
+            Capability::Unknown { code: 200, bin }
+            if bin == &[0xAB, 0xCD]
+        ));
+    }
+
+    #[test]
+    fn capability_extended_nexthop_round_trip() {
+        let original = open_with(vec![Capability::ExtendedNexthop(vec![(
+            Family::IPV4,
+            Family::AFI_IP6,
+        )])]);
+        match round_trip(&original) {
+            ParsedMessage::Open(Open { capability, .. }) => {
+                assert_eq!(capability.len(), 1);
+                match &capability[0] {
+                    Capability::ExtendedNexthop(v) => {
+                        assert_eq!(v.len(), 1);
+                        assert_eq!(v[0], (Family::IPV4, Family::AFI_IP6));
+                    }
+                    _ => panic!("expected ExtendedNexthop"),
+                }
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn negotiate_extended_nexthop_bilateral() {
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
+        ];
+        let remote = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
+        ];
+        let codec = PeerCodec::negotiate(&local, &remote);
+        assert_eq!(codec.families_iter().count(), 1);
+        assert!(codec.has_family(Family::IPV4));
+    }
+
+    #[test]
+    fn negotiate_extended_nexthop_unilateral() {
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
+        ];
+        let remote = vec![Capability::MultiProtocol(Family::IPV4)];
+        let codec = PeerCodec::negotiate(&local, &remote);
+        assert_eq!(codec.families_iter().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod framer_tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    fn keepalive_bytes() -> Vec<u8> {
+        let mut buf = vec![0xff; 16];
+        buf.extend_from_slice(&19u16.to_be_bytes());
+        buf.push(4);
+        buf
+    }
+
+    fn bgp_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let total = (19 + body.len()) as u16;
+        let mut buf = vec![0xff; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(msg_type);
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    fn default_framer() -> PeerCodec {
+        PeerCodec::new()
+    }
+
+    #[test]
+    fn framer_empty_buffer() {
+        let mut framer = default_framer();
+        let mut buf = BytesMut::new();
+        assert!(matches!(framer.try_parse(&mut buf), Ok(None)));
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn framer_incomplete_header() {
+        let mut framer = default_framer();
+        let mut buf = BytesMut::from(&[0xff; 10][..]);
+        assert!(matches!(framer.try_parse(&mut buf), Ok(None)));
+        assert_eq!(buf.len(), 10);
+    }
+
+    #[test]
+    fn framer_complete_keepalive() {
+        let mut framer = default_framer();
+        let mut buf = BytesMut::from(keepalive_bytes().as_slice());
+        let result = framer.try_parse(&mut buf).unwrap();
+        assert!(matches!(result, Some(ParsedMessage::Keepalive)));
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn framer_partial_message() {
+        let bytes = keepalive_bytes();
+        let mut framer = default_framer();
+        let mut buf = BytesMut::from(&bytes[..10]);
+        assert!(matches!(framer.try_parse(&mut buf), Ok(None)));
+        assert_eq!(buf.len(), 10);
+        buf.extend_from_slice(&bytes[10..]);
+        let result = framer.try_parse(&mut buf).unwrap();
+        assert!(matches!(result, Some(ParsedMessage::Keepalive)));
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn framer_two_messages_in_buffer() {
+        let mut framer = default_framer();
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&keepalive_bytes());
+        buf.extend_from_slice(&keepalive_bytes());
+        assert_eq!(buf.len(), 38);
+        let r1 = framer.try_parse(&mut buf).unwrap();
+        assert!(matches!(r1, Some(ParsedMessage::Keepalive)));
+        assert_eq!(buf.len(), 19);
+        let r2 = framer.try_parse(&mut buf).unwrap();
+        assert!(matches!(r2, Some(ParsedMessage::Keepalive)));
+        assert_eq!(buf.len(), 0);
+        assert!(matches!(framer.try_parse(&mut buf), Ok(None)));
+    }
+
+    #[test]
+    fn framer_message_then_partial() {
+        let mut framer = default_framer();
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&keepalive_bytes());
+        buf.extend_from_slice(&keepalive_bytes()[..5]);
+        assert_eq!(buf.len(), 24);
+        let r1 = framer.try_parse(&mut buf).unwrap();
+        assert!(matches!(r1, Some(ParsedMessage::Keepalive)));
+        assert_eq!(buf.len(), 5);
+        assert!(matches!(framer.try_parse(&mut buf), Ok(None)));
+        assert_eq!(buf.len(), 5);
+    }
+
+    #[test]
+    fn framer_header_length_below_minimum() {
+        let mut buf: Vec<u8> = vec![0xff; 16];
+        buf.extend_from_slice(&10u16.to_be_bytes());
+        buf.push(4);
+        let mut framer = default_framer();
+        let mut bmut = BytesMut::from(buf.as_slice());
+        match framer.try_parse(&mut bmut) {
+            Err(Notification::BadMessageLength { .. }) => {}
+            other => panic!("expected BadMessageLength, got {:?}", other.map(|_| "ok")),
+        }
+    }
+
+    #[test]
+    fn framer_header_length_exceeds_max() {
+        let mut buf: Vec<u8> = vec![0xff; 16];
+        buf.extend_from_slice(&5000u16.to_be_bytes());
+        buf.push(4);
+        let mut framer = default_framer();
+        let mut bmut = BytesMut::from(buf.as_slice());
+        match framer.try_parse(&mut bmut) {
+            Err(Notification::BadMessageLength { .. }) => {}
+            other => panic!("expected BadMessageLength, got {:?}", other.map(|_| "ok")),
+        }
+    }
+
+    #[test]
+    fn framer_unknown_message_type() {
+        let buf = bgp_msg(99, &[]);
+        let mut framer = default_framer();
+        let mut bmut = BytesMut::from(buf.as_slice());
+        match framer.try_parse(&mut bmut) {
+            Err(Notification::BadMessageType { .. }) => {}
+            other => panic!("expected BadMessageType, got {:?}", other.map(|_| "ok")),
+        }
+    }
+
+    #[test]
+    fn framer_mixed_message_types() {
+        let mut framer = {
+            let mut c = PeerCodec::new();
+            c.set_family(Family::IPV4, FamilyState::default());
+            c
+        };
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&keepalive_bytes());
+        buf.extend_from_slice(&bgp_msg(5, &[0x00, 0x01, 0x00, 0x01]));
+        let m1 = framer.try_parse(&mut buf).unwrap();
+        assert!(matches!(m1, Some(ParsedMessage::Keepalive)));
+        let m2 = framer.try_parse(&mut buf).unwrap();
+        assert!(matches!(
+            m2,
+            Some(ParsedMessage::RouteRefresh { family }) if family == Family::IPV4
+        ));
+        assert!(matches!(framer.try_parse(&mut buf), Ok(None)));
+    }
+
+    fn extended_framer() -> PeerCodec {
+        let cap = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::FourOctetAsNumber(65001),
+            Capability::ExtendedMessage,
+        ];
+        PeerCodec::negotiate(&cap, &cap)
+    }
+
+    #[test]
+    fn framer_extended_accepts_large_message() {
+        let mut framer = extended_framer();
+        assert!(framer.extended_length);
+        let body = vec![0u8; 5000 - 19];
+        let buf = bgp_msg(3, &body);
+        let mut bmut = BytesMut::from(buf.as_slice());
+        if let Err(Notification::BadMessageLength { .. }) = framer.try_parse(&mut bmut) {
+            panic!("extended framer must not reject messages <= 65535 bytes")
+        }
+    }
+
+    #[test]
+    fn framer_default_rejects_large_message() {
+        let body = vec![0u8; 5000 - 19];
+        let buf = bgp_msg(4, &body);
+        let mut framer = default_framer();
+        let mut bmut = BytesMut::from(buf.as_slice());
+        match framer.try_parse(&mut bmut) {
+            Err(Notification::BadMessageLength { .. }) => {}
+            other => panic!(
+                "default framer must reject messages > 4096 bytes, got {:?}",
+                other.map(|_| "ok")
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod message_tests {
+    use super::*;
+    use bytes::BytesMut;
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
+
+    #[test]
+    fn ipv6_eor() {
+        let mut buf = [0xff; 16].to_vec();
+        let mut body: Vec<u8> = vec![
+            0x00, 0x1e, 0x02, 0x00, 0x00, 0x00, 0x07, 0x90, 0x0f, 0x00, 0x03, 0x00, 0x02, 0x01,
+        ];
+        buf.append(&mut body);
+        let mut codec = {
+            let mut c = PeerCodec::new();
+            c.set_family(Family::IPV6, Default::default());
+            c
+        };
+        assert!(codec.parse_message(&buf).is_ok());
+    }
+
+    #[test]
+    fn parse_ipv6_update() {
+        let buf: &[u8] = &[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x00, 0x70, 0x02, 0x00, 0x00, 0x00, 0x59, 0x40, 0x01, 0x01, 0x02, 0x40,
+            0x02, 0x00, 0x80, 0x04, 0x04, 0x00, 0x00, 0x00, 0x14, 0x40, 0x05, 0x04, 0x00, 0x00,
+            0x00, 0x64, 0x80, 0x0e, 0x41, 0x00, 0x02, 0x01, 0x10, 0x20, 0x03, 0x00, 0xde, 0x20,
+            0x16, 0x01, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x00, 0x40, 0x20,
+            0x03, 0x00, 0xde, 0x20, 0x16, 0x01, 0x27, 0x40, 0x20, 0x03, 0x00, 0xde, 0x20, 0x16,
+            0x01, 0x24, 0x3f, 0x20, 0x03, 0x00, 0xde, 0x20, 0x16, 0x01, 0x28, 0x7f, 0x20, 0x03,
+            0x00, 0xde, 0x20, 0x16, 0x01, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12,
+        ];
+        let expected: Vec<PathNlri> = vec![
+            Nlri::V6(Ipv6Net {
+                addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x127, 0, 0, 0, 0),
+                mask: 64,
+            }),
+            Nlri::V6(Ipv6Net {
+                addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x124, 0, 0, 0, 0),
+                mask: 64,
+            }),
+            Nlri::V6(Ipv6Net {
+                addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x128, 0, 0, 0, 0),
+                mask: 63,
+            }),
+            Nlri::V6(Ipv6Net {
+                addr: Ipv6Addr::new(0x2003, 0xde, 0x2016, 0x1ff, 0, 0, 0, 0x12),
+                mask: 127,
+            }),
+        ]
+        .into_iter()
+        .map(PathNlri::new)
+        .collect();
+        let mut codec = {
+            let mut c = PeerCodec::new();
+            c.set_family(Family::IPV6, Default::default());
+            c
+        };
+        let msg = codec.parse_message(buf).unwrap();
+        match msg {
+            ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+                let s = mp_reach.unwrap();
+                assert_eq!(s.family, Family::IPV6);
+                assert_eq!(s.entries.len(), expected.len());
+                for (got, want) in s.entries.iter().zip(expected.iter()) {
+                    assert_eq!(got, want);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn build_many_v4_route() {
+        let net: Vec<Nlri> = (0..2000u16)
+            .map(|i| {
+                Nlri::V4(Ipv4Net {
+                    addr: Ipv4Addr::new(10, ((0xff00 & i) >> 8) as u8, (0xff & i) as u8, 1),
+                    mask: 32,
+                })
+            })
+            .collect();
+        let mut set: HashSet<PathNlri> = net.iter().cloned().map(PathNlri::new).collect();
+        let mut msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: net.iter().cloned().map(PathNlri::new).collect(),
+            nexthop: None,
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
+                Attribute::new_with_bin(Attribute::NEXTHOP, vec![0, 0, 0, 0]).unwrap(),
+            ]),
+        });
+        let codec = {
+            let mut c = PeerCodec::new();
+            c.set_family(Family::IPV4, Default::default());
+            c
+        };
+        let mut txbuf = BytesMut::with_capacity(4096);
+        let mut framer = codec;
+        framer.encode_to(&msg, &mut txbuf).unwrap();
+        let mut recv = Vec::new();
+        loop {
+            match framer.try_parse(&mut txbuf).expect("failed to decode") {
+                Some(ParsedMessage::Update(ParsedUpdate::Routes { reach, .. })) => {
+                    recv.append(&mut reach.unwrap().entries)
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert_eq!(recv.len(), net.len());
+        for n in &recv {
+            assert!(set.remove(n));
+        }
+        assert_eq!(set.len(), 0);
+        msg = Message::Update(Update::Unreach {
+            family: Family::IPV4,
+            entries: net.iter().cloned().map(PathNlri::new).collect(),
+        });
+        for n in &net {
+            set.insert(PathNlri::new(n.clone()));
+        }
+        framer.encode_to(&msg, &mut txbuf).unwrap();
+        let mut withdrawn = Vec::new();
+        loop {
+            match framer.try_parse(&mut txbuf).expect("failed to decode") {
+                Some(ParsedMessage::Update(ParsedUpdate::Routes { unreach, .. })) => {
+                    withdrawn.append(&mut unreach.unwrap().entries)
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert_eq!(withdrawn.len(), net.len());
+        for n in &withdrawn {
+            assert!(set.remove(n));
+        }
+        assert_eq!(set.len(), 0);
+    }
+
+    #[test]
+    fn many_mp_reach() {
+        let net: Vec<Nlri> = (0..2000u128)
+            .map(|i| {
+                Nlri::V6(Ipv6Net {
+                    addr: Ipv6Addr::from(i),
+                    mask: 128,
+                })
+            })
+            .collect();
+        let mut set: HashSet<PathNlri> = net.iter().cloned().map(PathNlri::new).collect();
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6,
+            entries: net.iter().cloned().map(PathNlri::new).collect(),
+            nexthop: None,
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
+                Attribute::new_with_bin(Attribute::NEXTHOP, (0..31).collect::<Vec<u8>>()).unwrap(),
+            ]),
+        });
+        let codec = {
+            let mut c = PeerCodec::new();
+            c.set_family(Family::IPV6, Default::default());
+            c
+        };
+        let mut txbuf = BytesMut::with_capacity(4096);
+        let mut framer = codec;
+        framer.encode_to(&msg, &mut txbuf).unwrap();
+        let mut recv = Vec::new();
+        loop {
+            match framer.try_parse(&mut txbuf).expect("failed to decode") {
+                Some(ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. })) => {
+                    recv.append(&mut mp_reach.unwrap().entries)
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert_eq!(recv.len(), net.len());
+        for n in &recv {
+            assert!(set.remove(n));
+        }
+        assert_eq!(set.len(), 0);
+    }
+
+    #[test]
+    fn many_mp_unreach() {
+        let net: Vec<Nlri> = (0..2000u128)
+            .map(|i| {
+                Nlri::V6(Ipv6Net {
+                    addr: Ipv6Addr::from(i),
+                    mask: 128,
+                })
+            })
+            .collect();
+        let mut set: HashSet<PathNlri> = net.iter().cloned().map(PathNlri::new).collect();
+        let msg = Message::Update(Update::Unreach {
+            family: Family::IPV6,
+            entries: net.iter().cloned().map(PathNlri::new).collect(),
+        });
+        let codec = {
+            let mut c = PeerCodec::new();
+            c.set_family(Family::IPV6, Default::default());
+            c
+        };
+        let mut txbuf = BytesMut::with_capacity(4096);
+        let mut framer = codec;
+        framer.encode_to(&msg, &mut txbuf).unwrap();
+        let mut recv = Vec::new();
+        loop {
+            match framer.try_parse(&mut txbuf).expect("failed to decode") {
+                Some(ParsedMessage::Update(ParsedUpdate::Routes { mp_unreach, .. })) => {
+                    recv.append(&mut mp_unreach.unwrap().entries)
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert_eq!(recv.len(), net.len());
+        for n in &recv {
+            assert!(set.remove(n));
+        }
+        assert_eq!(set.len(), 0);
+    }
+
+    #[test]
+    fn negotiate_extended_message_both_sides() {
+        let cap = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::FourOctetAsNumber(65001),
+            Capability::ExtendedMessage,
+        ];
+        let codec = PeerCodec::negotiate(&cap, &cap);
+        assert!(
+            codec.extended_length,
+            "extended_length must be true when both sides advertise ExtendedMessage"
+        );
+    }
+
+    #[test]
+    fn negotiate_extended_message_one_side_only() {
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::FourOctetAsNumber(65001),
+            Capability::ExtendedMessage,
+        ];
+        let remote = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::FourOctetAsNumber(65002),
+        ];
+        let codec = PeerCodec::negotiate(&local, &remote);
+        assert!(
+            !codec.extended_length,
+            "extended_length must be false when only one side advertises ExtendedMessage"
+        );
+    }
+}
+
+#[cfg(test)]
+mod misc_tests {
+    use super::*;
+    use bytes::{BufMut, BytesMut};
+
+    fn bgp_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let total = (19 + body.len()) as u16;
+        let mut buf = vec![0xff; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(msg_type);
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    fn default_codec() -> PeerCodec {
+        PeerCodec::new()
+    }
+
+    fn round_trip(msg: &Message) -> ParsedMessage {
+        let mut framer = default_codec();
+        let mut buf = BytesMut::new();
+        framer.encode_to(msg, &mut buf).unwrap();
+        framer.parse_message(&buf).unwrap()
+    }
+
+    #[test]
+    fn keepalive_parse() {
+        let buf = bgp_msg(4, &[]);
+        let mut codec = default_codec();
+        assert!(matches!(
+            codec.parse_message(&buf).unwrap(),
+            ParsedMessage::Keepalive
+        ));
+    }
+
+    #[test]
+    fn keepalive_round_trip() {
+        match round_trip(&Message::Keepalive) {
+            ParsedMessage::Keepalive => {}
+            _ => panic!("expected Keepalive"),
+        }
+    }
+
+    #[test]
+    fn keepalive_with_extra_body_is_error() {
+        let buf = bgp_msg(4, &[0x00]);
+        let mut codec = default_codec();
+        match codec.parse_message(&buf) {
+            Err(Notification::BadMessageLength { .. }) => {}
+            other => panic!("expected BadMessageLength, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn notification_parse() {
+        let body: &[u8] = &[0x01, 0x02, 0x00, 0x13];
+        let buf = bgp_msg(3, body);
+        let mut codec = default_codec();
+        match codec.parse_message(&buf).unwrap() {
+            ParsedMessage::Notification(err) => {
+                assert_eq!(err.notification_code(), 1);
+                assert_eq!(err.notification_subcode(), 2);
+                assert_eq!(err.notification_data(), &[0x00u8, 0x13]);
+            }
+            _ => panic!("expected Notification"),
+        }
+    }
+
+    #[test]
+    fn notification_parse_no_data() {
+        let body: &[u8] = &[0x04, 0x00];
+        let buf = bgp_msg(3, body);
+        let mut codec = default_codec();
+        match codec.parse_message(&buf).unwrap() {
+            ParsedMessage::Notification(err) => {
+                assert_eq!(err.notification_code(), 4);
+                assert_eq!(err.notification_subcode(), 0);
+                assert!(err.notification_data().is_empty());
+            }
+            _ => panic!("expected Notification"),
+        }
+    }
+
+    #[test]
+    fn notification_round_trip() {
+        let original = Message::Notification(Notification::BadMessageLength {
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        });
+        match round_trip(&original) {
+            ParsedMessage::Notification(err) => {
+                assert_eq!(err.notification_code(), 1);
+                assert_eq!(err.notification_subcode(), 2);
+                assert_eq!(err.notification_data(), &[0xDEu8, 0xAD, 0xBE, 0xEF]);
+            }
+            _ => panic!("expected Notification"),
+        }
+    }
+
+    #[test]
+    fn bgerror_from_notification_known_codes() {
+        assert!(matches!(
+            Notification::from_notification(1, 2, vec![]),
+            Notification::BadMessageLength { .. }
+        ));
+        assert!(matches!(
+            Notification::from_notification(1, 3, vec![]),
+            Notification::BadMessageType { .. }
+        ));
+        assert!(matches!(
+            Notification::from_notification(2, 0, vec![]),
+            Notification::OpenMalformed
+        ));
+        assert!(matches!(
+            Notification::from_notification(2, 4, vec![]),
+            Notification::OpenUnsupportedOptionalParameter { .. }
+        ));
+        assert!(matches!(
+            Notification::from_notification(2, 6, vec![]),
+            Notification::OpenUnacceptableHoldTime { .. }
+        ));
+        assert!(matches!(
+            Notification::from_notification(3, 1, vec![]),
+            Notification::UpdateMalformedAttributeList
+        ));
+        assert!(matches!(
+            Notification::from_notification(7, 1, vec![]),
+            Notification::RouteRefreshInvalidLength { .. }
+        ));
+    }
+
+    #[test]
+    fn bgerror_from_notification_unknown_code() {
+        let err = Notification::from_notification(99, 0, vec![0xAB]);
+        assert!(matches!(
+            err,
+            Notification::Other {
+                code: 99,
+                subcode: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bgerror_notification_code_round_trip() {
+        let err = Notification::BadMessageLength {
+            data: vec![0x10, 0x00],
+        };
+        assert_eq!(err.notification_code(), 1);
+        assert_eq!(err.notification_subcode(), 2);
+        assert_eq!(err.notification_data(), &[0x10, 0x00]);
+        let err = Notification::FsmUnexpectedState { state: 3 };
+        assert_eq!(err.notification_code(), 5);
+        assert_eq!(err.notification_subcode(), 3);
+    }
+
+    #[test]
+    fn route_refresh_ipv4() {
+        let body: &[u8] = &[0x00, 0x01, 0x00, 0x01];
+        let buf = bgp_msg(5, body);
+        let mut codec = default_codec();
+        match codec.parse_message(&buf).unwrap() {
+            ParsedMessage::RouteRefresh { family } => {
+                assert_eq!(family, Family::IPV4);
+            }
+            _ => panic!("expected RouteRefresh"),
+        }
+    }
+
+    #[test]
+    fn route_refresh_ipv6() {
+        let body: &[u8] = &[0x00, 0x02, 0x00, 0x01];
+        let buf = bgp_msg(5, body);
+        let mut codec = default_codec();
+        match codec.parse_message(&buf).unwrap() {
+            ParsedMessage::RouteRefresh { family } => {
+                assert_eq!(family, Family::IPV6);
+            }
+            _ => panic!("expected RouteRefresh"),
+        }
+    }
+
+    #[test]
+    fn route_refresh_round_trip() {
+        let original = Message::RouteRefresh {
+            family: Family::IPV4,
+        };
+        match round_trip(&original) {
+            ParsedMessage::RouteRefresh { family } => {
+                assert_eq!(family, Family::IPV4);
+            }
+            _ => panic!("expected RouteRefresh"),
+        }
+    }
+
+    #[test]
+    fn route_refresh_too_long() {
+        let body: &[u8] = &[0x00, 0x01, 0x00, 0x01, 0xFF];
+        let buf = bgp_msg(5, body);
+        let mut codec = default_codec();
+        match codec.parse_message(&buf) {
+            Err(Notification::RouteRefreshInvalidLength { .. }) => {}
+            Ok(_) => panic!("expected error"),
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn bad_message_type() {
+        let buf = bgp_msg(99, &[]);
+        let mut codec = default_codec();
+        match codec.parse_message(&buf) {
+            Err(Notification::BadMessageType { .. }) => {}
+            Ok(_) => panic!("expected error"),
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn parse_message_too_short_buffer() {
+        let buf: Vec<u8> = vec![0xff; 10];
+        let mut codec = default_codec();
+        match codec.parse_message(&buf) {
+            Err(Notification::BadMessageLength { .. }) => {}
+            Ok(_) => panic!("expected error"),
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn framer_bad_header_length() {
+        let mut buf = BytesMut::with_capacity(19);
+        buf.extend_from_slice(&[0xff; 16]);
+        buf.extend_from_slice(&10u16.to_be_bytes());
+        buf.put_u8(4);
+        let mut framer = PeerCodec::new();
+        match framer.try_parse(&mut buf) {
+            Err(Notification::BadMessageLength { .. }) => {}
+            Ok(_) => panic!("expected error"),
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn bgp_msg(msg_type: u8, body: &[u8]) -> Vec<u8> {
+        let total = (19 + body.len()) as u16;
+        let mut buf = vec![0xff; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(msg_type);
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    fn open_body(as2: u16, holdtime: u16, router_id: Ipv4Addr, params: &[u8]) -> Vec<u8> {
+        let mut body = vec![4u8];
+        body.extend_from_slice(&as2.to_be_bytes());
+        body.extend_from_slice(&holdtime.to_be_bytes());
+        body.extend_from_slice(&u32::from(router_id).to_be_bytes());
+        body.push(params.len() as u8);
+        body.extend_from_slice(params);
+        body
+    }
+
+    fn capability_param(cap_bytes: &[u8]) -> Vec<u8> {
+        let mut p = vec![2u8, cap_bytes.len() as u8];
+        p.extend_from_slice(cap_bytes);
+        p
+    }
+
+    fn default_codec() -> PeerCodec {
+        PeerCodec::new()
+    }
+
+    #[test]
+    fn open_minimal_parse() {
+        let buf = bgp_msg(1, &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &[]));
+        let mut codec = default_codec();
+        match codec.parse_message(&buf).unwrap() {
+            ParsedMessage::Open(Open {
+                as_number,
+                holdtime,
+                router_id,
+                capability,
+            }) => {
+                assert_eq!(as_number, 65001);
+                assert_eq!(holdtime, HoldTime::new(90).unwrap());
+                assert_eq!(
+                    router_id,
+                    u32::from("192.0.2.1".parse::<Ipv4Addr>().unwrap())
+                );
+                assert!(capability.is_empty());
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn open_with_multiprotocol_ipv4() {
+        let cap: &[u8] = &[0x01, 0x04, 0x00, 0x01, 0x00, 0x01];
+        let params = capability_param(cap);
+        let buf = bgp_msg(
+            1,
+            &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
+        );
+        let mut codec = default_codec();
+        match codec.parse_message(&buf).unwrap() {
+            ParsedMessage::Open(Open { capability, .. }) => {
+                assert_eq!(capability.len(), 1);
+                assert!(
+                    matches!(&capability[0], Capability::MultiProtocol(f) if *f == Family::IPV4)
+                );
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn open_with_multiprotocol_ipv6() {
+        let cap: &[u8] = &[0x01, 0x04, 0x00, 0x02, 0x00, 0x01];
+        let params = capability_param(cap);
+        let buf = bgp_msg(
+            1,
+            &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
+        );
+        let mut codec = default_codec();
+        match codec.parse_message(&buf).unwrap() {
+            ParsedMessage::Open(Open { capability, .. }) => {
+                assert_eq!(capability.len(), 1);
+                assert!(
+                    matches!(&capability[0], Capability::MultiProtocol(f) if *f == Family::IPV6)
+                );
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn open_with_four_octet_asn() {
+        let four_byte_asn: u32 = 131072;
+        let mut cap = vec![0x41u8, 0x04];
+        cap.extend_from_slice(&four_byte_asn.to_be_bytes());
+        let params = capability_param(&cap);
+        let buf = bgp_msg(
+            1,
+            &open_body(23456, 90, "192.0.2.1".parse().unwrap(), &params),
+        );
+        let mut codec = default_codec();
+        match codec.parse_message(&buf).unwrap() {
+            ParsedMessage::Open(Open {
+                as_number,
+                capability,
+                ..
+            }) => {
+                assert_eq!(as_number, four_byte_asn);
+                assert!(
+                    capability.iter().any(
+                        |c| matches!(c, Capability::FourOctetAsNumber(n) if *n == four_byte_asn)
+                    )
+                );
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn open_with_route_refresh() {
+        let cap: &[u8] = &[0x02, 0x00];
+        let params = capability_param(cap);
+        let buf = bgp_msg(
+            1,
+            &open_body(65001, 90, "192.0.2.1".parse().unwrap(), &params),
+        );
+        let mut codec = default_codec();
+        match codec.parse_message(&buf).unwrap() {
+            ParsedMessage::Open(Open { capability, .. }) => {
+                assert!(
+                    capability
+                        .iter()
+                        .any(|c| matches!(c, Capability::RouteRefresh))
+                );
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn open_round_trip_minimal() {
+        let original = Message::Open(Open {
+            as_number: 65001,
+            holdtime: HoldTime::new(90).unwrap(),
+            router_id: u32::from("192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()),
+            capability: vec![],
+        });
+        let mut framer = default_codec();
+        let mut buf = Vec::new();
+        framer.encode_to(&original, &mut buf).unwrap();
+        let parsed = framer.parse_message(&buf).unwrap();
+        match parsed {
+            ParsedMessage::Open(Open {
+                as_number,
+                holdtime,
+                router_id,
+                capability,
+            }) => {
+                assert_eq!(as_number, 65001);
+                assert_eq!(holdtime, HoldTime::new(90).unwrap());
+                assert_eq!(
+                    router_id,
+                    u32::from("192.0.2.1".parse::<Ipv4Addr>().unwrap())
+                );
+                assert!(capability.is_empty());
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn open_round_trip_with_capabilities() {
+        let original = Message::Open(Open {
+            as_number: 65001,
+            holdtime: HoldTime::new(180).unwrap(),
+            router_id: u32::from("10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()),
+            capability: vec![
+                Capability::MultiProtocol(Family::IPV4),
+                Capability::MultiProtocol(Family::IPV6),
+                Capability::RouteRefresh,
+                Capability::FourOctetAsNumber(65001),
+            ],
+        });
+        let mut framer = default_codec();
+        let mut buf = Vec::new();
+        framer.encode_to(&original, &mut buf).unwrap();
+        let parsed = framer.parse_message(&buf).unwrap();
+        match parsed {
+            ParsedMessage::Open(Open {
+                as_number,
+                holdtime,
+                capability,
+                ..
+            }) => {
+                assert_eq!(as_number, 65001);
+                assert_eq!(holdtime, HoldTime::new(180).unwrap());
+                assert!(
+                    capability
+                        .iter()
+                        .any(|c| matches!(c, Capability::MultiProtocol(f) if *f == Family::IPV4))
+                );
+                assert!(
+                    capability
+                        .iter()
+                        .any(|c| matches!(c, Capability::MultiProtocol(f) if *f == Family::IPV6))
+                );
+                assert!(
+                    capability
+                        .iter()
+                        .any(|c| matches!(c, Capability::RouteRefresh))
+                );
+                assert!(
+                    capability
+                        .iter()
+                        .any(|c| matches!(c, Capability::FourOctetAsNumber(n) if *n == 65001))
+                );
+            }
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn open_too_short() {
+        let body: &[u8] = &[4, 0xFD, 0xEA, 0x00, 0x5A];
+        let buf = bgp_msg(1, body);
+        let mut codec = default_codec();
+        match codec.parse_message(&buf) {
+            Err(Notification::BadMessageLength { .. }) => {}
+            Ok(_) => panic!("expected error"),
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn open_unacceptable_holdtime() {
+        for bad_holdtime in [1u16, 2u16] {
+            let buf = bgp_msg(
+                1,
+                &open_body(65001, bad_holdtime, "192.0.2.1".parse().unwrap(), &[]),
+            );
+            let mut codec = default_codec();
+            match codec.parse_message(&buf) {
+                Err(Notification::OpenUnacceptableHoldTime { .. }) => {}
+                Ok(_) => panic!("expected error for holdtime={}", bad_holdtime),
+                Err(e) => panic!("unexpected error for holdtime={}: {}", bad_holdtime, e),
+            }
+        }
+    }
+
+    #[test]
+    fn open_unsupported_optional_parameter() {
+        let params: &[u8] = &[0x01, 0x02, 0xAB, 0xCD];
+        let buf = bgp_msg(
+            1,
+            &open_body(65001, 90, "192.0.2.1".parse().unwrap(), params),
+        );
+        let mut codec = default_codec();
+        match codec.parse_message(&buf) {
+            Err(Notification::OpenUnsupportedOptionalParameter { .. }) => {}
+            Ok(_) => panic!("expected error"),
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use crate::mup;
+    use crate::prefix_sid;
+    use crate::rd::RouteDistinguisher;
+    use bytes::BytesMut;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
+
+    fn ipv4_codec() -> PeerCodec {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV4, Default::default());
+        c
+    }
+
+    fn ipv6_codec() -> PeerCodec {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV6, Default::default());
+        c
+    }
+
+    fn ipv4_attrs(nexthop: Ipv4Addr) -> Arc<Vec<Attribute>> {
+        Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+            Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
+        ])
+    }
+
+    fn ipv4_prefix(addr: &str, mask: u8) -> PathNlri {
+        PathNlri::new(Nlri::V4(Ipv4Net {
+            addr: addr.parse().unwrap(),
+            mask,
+        }))
+    }
+
+    fn ipv6_prefix(addr: &str, mask: u8) -> PathNlri {
+        PathNlri::new(Nlri::V6(Ipv6Net {
+            addr: addr.parse().unwrap(),
+            mask,
+        }))
+    }
+
+    fn round_trip(msg: &Message, codec: PeerCodec) -> ParsedMessage {
+        let mut framer = codec;
+        let mut buf = Vec::new();
+        framer.encode_to(msg, &mut buf).unwrap();
+        framer.parse_message(&buf).unwrap()
+    }
+
+    fn ipv6_attrs_no_nh() -> Arc<Vec<Attribute>> {
+        Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+        ])
+    }
+
+    #[test]
+    fn update_ipv4_announce() {
+        let prefix = ipv4_prefix("10.0.0.0", 8);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![prefix.clone()],
+            nexthop: None,
+            attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
+        });
+        match round_trip(&msg, ipv4_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { reach, unreach, .. }) => {
+                assert!(unreach.is_none());
+                let s = reach.unwrap();
+                assert_eq!(s.family, Family::IPV4);
+                assert_eq!(s.entries, vec![prefix]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_ipv4_announce_multiple() {
+        let prefixes: Vec<PathNlri> = ["10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"]
+            .iter()
+            .map(|s| {
+                let parts: Vec<&str> = s.split('/').collect();
+                ipv4_prefix(parts[0], parts[1].parse().unwrap())
+            })
+            .collect();
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: prefixes.clone(),
+            nexthop: None,
+            attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
+        });
+        match round_trip(&msg, ipv4_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { reach, .. }) => {
+                let s = reach.unwrap();
+                assert_eq!(s.entries.len(), 3);
+                for p in &prefixes {
+                    assert!(s.entries.contains(p), "missing prefix: {:?}", p);
+                }
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_ipv4_withdraw() {
+        let prefix = ipv4_prefix("10.0.0.0", 8);
+        let msg = Message::Update(Update::Unreach {
+            family: Family::IPV4,
+            entries: vec![prefix.clone()],
+        });
+        match round_trip(&msg, ipv4_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { reach, unreach, .. }) => {
+                assert!(reach.is_none());
+                let s = unreach.unwrap();
+                assert_eq!(s.family, Family::IPV4);
+                assert_eq!(s.entries, vec![prefix]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_ipv6_announce() {
+        let prefix = ipv6_prefix("2001:db8::", 32);
+        let nexthop_bytes: Vec<u8> = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec();
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6,
+            entries: vec![prefix.clone()],
+            nexthop: None,
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::AS_PATH,
+                    vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+                )
+                .unwrap(),
+                Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes).unwrap(),
+            ]),
+        });
+        match round_trip(&msg, ipv6_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_reach,
+                mp_unreach,
+                ..
+            }) => {
+                assert!(mp_unreach.is_none());
+                let s = mp_reach.unwrap();
+                assert_eq!(s.family, Family::IPV6);
+                assert_eq!(s.entries, vec![prefix]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_ipv6_withdraw() {
+        let prefix = ipv6_prefix("2001:db8::", 32);
+        let msg = Message::Update(Update::Unreach {
+            family: Family::IPV6,
+            entries: vec![prefix.clone()],
+        });
+        match round_trip(&msg, ipv6_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_reach,
+                mp_unreach,
+                ..
+            }) => {
+                assert!(mp_reach.is_none());
+                let s = mp_unreach.unwrap();
+                assert_eq!(s.family, Family::IPV6);
+                assert_eq!(s.entries, vec![prefix]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_ipv6_dual_nexthop_roundtrip() {
+        let prefix = ipv6_prefix("2001:db8::", 32);
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+        let nexthop = Nexthop::V6LinkLocal(global, link_local);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6,
+            entries: vec![prefix.clone()],
+            nexthop: Some(nexthop),
+            attr: ipv6_attrs_no_nh(),
+        });
+        match round_trip(&msg, ipv6_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+                let r = mp_reach.expect("mp_reach must be present");
+                assert_eq!(r.family, Family::IPV6);
+                assert_eq!(r.entries, vec![prefix]);
+                assert_eq!(r.nexthop, Some(nexthop), "dual nexthop must round-trip");
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_eor_ipv4() {
+        let msg = Message::eor(Family::IPV4);
+        match round_trip(&msg, ipv4_codec()) {
+            ParsedMessage::Update(ParsedUpdate::EndOfRib(family)) => {
+                assert_eq!(family, Family::IPV4);
+            }
+            _ => panic!("expected EndOfRib(IPV4)"),
+        }
+    }
+
+    #[test]
+    fn update_eor_ipv6() {
+        let msg = Message::eor(Family::IPV6);
+        match round_trip(&msg, ipv6_codec()) {
+            ParsedMessage::Update(ParsedUpdate::EndOfRib(family)) => {
+                assert_eq!(family, Family::IPV6);
+            }
+            _ => panic!("expected EndOfRib(IPV6)"),
+        }
+    }
+
+    #[test]
+    fn update_attr_origin_igp() {
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
+            attr: ipv4_attrs("192.0.2.254".parse().unwrap()),
+        });
+        match round_trip(&msg, ipv4_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, reach, .. }) => {
+                assert!(!reach.unwrap().entries.is_empty());
+                let origin = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::ORIGIN)
+                    .expect("ORIGIN attribute must be present");
+                assert_eq!(origin.value().unwrap(), 0);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_attr_med_preserved_on_encode() {
+        let med_value: u32 = 150;
+        let mut attrs = (*ipv4_attrs("192.0.2.254".parse().unwrap())).clone();
+        attrs.push(Attribute::new_with_value(Attribute::MULTI_EXIT_DESC, med_value).unwrap());
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
+            attr: Arc::new(attrs),
+        });
+        match round_trip(&msg, ipv4_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, reach, .. }) => {
+                assert!(!reach.unwrap().entries.is_empty());
+                assert!(attrs.iter().any(
+                    |a| a.code() == Attribute::MULTI_EXIT_DESC && a.value() == Some(med_value)
+                ));
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    fn ipv4_extended_nexthop_codec() -> PeerCodec {
+        let local = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
+        ];
+        PeerCodec::negotiate(&local, &local)
+    }
+
+    #[test]
+    fn update_ipv4_with_ipv6_nexthop() {
+        let prefix = ipv4_prefix("10.0.0.0", 8);
+        let nexthop_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![prefix.clone()],
+            nexthop: Some(Nexthop::V6(nexthop_v6)),
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::AS_PATH,
+                    vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+                )
+                .unwrap(),
+            ]),
+        });
+        match round_trip(&msg, ipv4_extended_nexthop_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                reach, mp_reach, ..
+            }) => {
+                assert!(reach.is_none());
+                let s = mp_reach.expect("mp_reach must be present");
+                assert_eq!(s.family, Family::IPV4);
+                assert_eq!(s.entries, vec![prefix]);
+                assert_eq!(s.nexthop, Some(Nexthop::V6(nexthop_v6)));
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_ipv4_extended_nexthop_withdraw() {
+        let prefix = ipv4_prefix("10.0.0.0", 8);
+        let msg = Message::Update(Update::Unreach {
+            family: Family::IPV4,
+            entries: vec![prefix.clone()],
+        });
+        match round_trip(&msg, ipv4_extended_nexthop_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                unreach,
+                mp_unreach,
+                ..
+            }) => {
+                assert!(unreach.is_none());
+                let s = mp_unreach.expect("mp_unreach must be present");
+                assert_eq!(s.family, Family::IPV4);
+                assert_eq!(s.entries, vec![prefix]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_attr_community() {
+        let community: u32 = (65001u32 << 16) | 100;
+        let mut attrs = (*ipv4_attrs("192.0.2.254".parse().unwrap())).clone();
+        attrs.push(
+            Attribute::new_with_bin(Attribute::COMMUNITY, community.to_be_bytes().to_vec())
+                .unwrap(),
+        );
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
+            attr: Arc::new(attrs),
+        });
+        match round_trip(&msg, ipv4_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, reach, .. }) => {
+                assert!(!reach.unwrap().entries.is_empty());
+                let comm = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::COMMUNITY)
+                    .expect("COMMUNITY must be present");
+                let bytes = comm.binary().unwrap();
+                assert_eq!(bytes.len(), 4);
+                let parsed = u32::from_be_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(parsed, community);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_ipv4_with_prefix_sid() {
+        let prefix = ipv4_prefix("10.0.0.0", 24);
+        let sid = prefix_sid::PrefixSid {
+            tlvs: vec![prefix_sid::PrefixSidTlv::Srv6L3Service(
+                prefix_sid::Srv6ServiceTlv {
+                    reserved: 0,
+                    sub_tlvs: vec![prefix_sid::Srv6ServiceSubTlv::Information(
+                        prefix_sid::Srv6InformationSubTlv {
+                            sid: "2001:0:5:3::".parse().unwrap(),
+                            flags: 0,
+                            endpoint_behavior: 19,
+                            sub_sub_tlvs: vec![prefix_sid::Srv6ServiceDataSubSubTlv::Structure(
+                                prefix_sid::Srv6SidStructureSubSubTlv {
+                                    locator_block_length: 40,
+                                    locator_node_length: 24,
+                                    function_length: 16,
+                                    argument_length: 0,
+                                    transposition_length: 16,
+                                    transposition_offset: 64,
+                                },
+                            )],
+                        },
+                    )],
+                },
+            )],
+        };
+        let sid_bytes = sid.to_vec();
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![prefix.clone()],
+            nexthop: None,
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::AS_PATH,
+                    vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+                )
+                .unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::NEXTHOP,
+                    Ipv4Addr::new(192, 0, 2, 254).octets().to_vec(),
+                )
+                .unwrap(),
+                Attribute::new_with_bin(Attribute::PREFIX_SID, sid_bytes.clone()).unwrap(),
+            ]),
+        });
+        match round_trip(&msg, ipv4_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { reach, attrs, .. }) => {
+                assert_eq!(reach.unwrap().entries, vec![prefix]);
+                let a = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::PREFIX_SID)
+                    .expect("PREFIX_SID must be present");
+                assert_eq!(a.binary().unwrap(), &sid_bytes);
+                let decoded = prefix_sid::PrefixSid::decode(a.binary().unwrap()).unwrap();
+                assert_eq!(decoded, sid);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_passes_through_unknown_prefix_sid_tlv() {
+        let prefix = ipv4_prefix("10.0.0.0", 24);
+        let sid = prefix_sid::PrefixSid {
+            tlvs: vec![prefix_sid::PrefixSidTlv::Unknown {
+                type_id: 0x55,
+                value: vec![0xAA, 0xBB, 0xCC],
+            }],
+        };
+        let sid_bytes = sid.to_vec();
+        assert_eq!(sid_bytes, vec![0x55, 0x00, 0x03, 0xAA, 0xBB, 0xCC]);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![prefix.clone()],
+            nexthop: None,
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::AS_PATH,
+                    vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+                )
+                .unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::NEXTHOP,
+                    Ipv4Addr::new(192, 0, 2, 254).octets().to_vec(),
+                )
+                .unwrap(),
+                Attribute::new_with_bin(Attribute::PREFIX_SID, sid_bytes.clone()).unwrap(),
+            ]),
+        });
+        match round_trip(&msg, ipv4_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+                let a = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::PREFIX_SID)
+                    .expect("PREFIX_SID must be present");
+                assert_eq!(a.binary().unwrap(), &sid_bytes);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    fn ipv4_mup_codec() -> PeerCodec {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV4_MUP, Default::default());
+        c
+    }
+
+    fn ipv6_mup_codec() -> PeerCodec {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV6_MUP, Default::default());
+        c
+    }
+
+    fn mup_rd() -> RouteDistinguisher {
+        RouteDistinguisher::TwoOctetAs {
+            admin: 65000,
+            assigned: 100,
+        }
+    }
+
+    #[test]
+    fn update_ipv4_mup_announce() {
+        let nlri = PathNlri::new(Nlri::Mup(mup::MupNlri::InterworkSegmentDiscovery(
+            mup::MupInterworkSegmentDiscoveryRoute {
+                rd: mup_rd(),
+                prefix_addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+                prefix_len: 24,
+            },
+        )));
+        let nexthop: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4_MUP,
+            entries: vec![nlri.clone()],
+            nexthop: None,
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::AS_PATH,
+                    vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+                )
+                .unwrap(),
+                Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
+            ]),
+        });
+        match round_trip(&msg, ipv4_mup_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_reach,
+                mp_unreach,
+                ..
+            }) => {
+                assert!(mp_unreach.is_none());
+                let s = mp_reach.unwrap();
+                assert_eq!(s.family, Family::IPV4_MUP);
+                assert_eq!(s.entries, vec![nlri]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_ipv6_mup_announce() {
+        let nlri = PathNlri::new(Nlri::Mup(mup::MupNlri::DirectSegmentDiscovery(
+            mup::MupDirectSegmentDiscoveryRoute {
+                rd: mup_rd(),
+                address: IpAddr::V6("2001:db8::1".parse().unwrap()),
+            },
+        )));
+        let nexthop_bytes: Vec<u8> = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec();
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6_MUP,
+            entries: vec![nlri.clone()],
+            nexthop: None,
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::AS_PATH,
+                    vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+                )
+                .unwrap(),
+                Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes).unwrap(),
+            ]),
+        });
+        match round_trip(&msg, ipv6_mup_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_reach,
+                mp_unreach,
+                ..
+            }) => {
+                assert!(mp_unreach.is_none());
+                let s = mp_reach.unwrap();
+                assert_eq!(s.family, Family::IPV6_MUP);
+                assert_eq!(s.entries, vec![nlri]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_mup_withdraw() {
+        let nlri = PathNlri::new(Nlri::Mup(mup::MupNlri::Type2SessionTransformed(
+            mup::MupType2SessionTransformedRoute {
+                rd: mup_rd(),
+                endpoint_address_length: 64,
+                endpoint_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                teid: 0xdead_beef,
+            },
+        )));
+        let msg = Message::Update(Update::Unreach {
+            family: Family::IPV4_MUP,
+            entries: vec![nlri.clone()],
+        });
+        match round_trip(&msg, ipv4_mup_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_reach,
+                mp_unreach,
+                ..
+            }) => {
+                assert!(mp_reach.is_none());
+                let s = mp_unreach.unwrap();
+                assert_eq!(s.family, Family::IPV4_MUP);
+                assert_eq!(s.entries, vec![nlri]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_mup_with_ext_community() {
+        let nlri = PathNlri::new(Nlri::Mup(mup::MupNlri::DirectSegmentDiscovery(
+            mup::MupDirectSegmentDiscoveryRoute {
+                rd: mup_rd(),
+                address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            },
+        )));
+        let mut ec_bytes = Vec::new();
+        mup::MupExtended {
+            sub_type: mup::EC_SUBTYPE_MUP_DIRECT_SEG,
+            segment_id2: 10,
+            segment_id4: 20,
+        }
+        .encode(&mut ec_bytes);
+        let nexthop: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4_MUP,
+            entries: vec![nlri.clone()],
+            nexthop: None,
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::AS_PATH,
+                    vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+                )
+                .unwrap(),
+                Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
+                Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, ec_bytes.clone()).unwrap(),
+            ]),
+        });
+        match round_trip(&msg, ipv4_mup_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_reach, attrs, ..
+            }) => {
+                let s = mp_reach.unwrap();
+                assert_eq!(s.entries, vec![nlri]);
+                let ec = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::EXTENDED_COMMUNITY)
+                    .expect("EXTENDED_COMMUNITY missing");
+                assert_eq!(ec.binary().unwrap(), ec_bytes.as_slice());
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    fn mp_reach_zero_nexthop_update(afi: u16, safi: u8) -> Vec<u8> {
+        let attr: Vec<u8> = vec![
+            0x80,
+            0x0E,
+            0x05,
+            (afi >> 8) as u8,
+            afi as u8,
+            safi,
+            0x00,
+            0x00,
+        ];
+        let attr_len = attr.len() as u16;
+        let total = 19u16 + 2 + 2 + attr_len;
+        let mut buf = vec![0xff; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(&attr);
+        buf
+    }
+
+    #[test]
+    fn mp_reach_zero_nexthop_non_flowspec_is_error() {
+        let buf = mp_reach_zero_nexthop_update(Family::AFI_IP, 1);
+        let mut codec = PeerCodec::new();
+        codec.set_family(Family::IPV4, FamilyState::default());
+        match codec.parse_message(&buf) {
+            Err(Notification::UpdateOptionalAttributeError) => {}
+            Err(e) => panic!("expected UpdateOptionalAttributeError, got Err({})", e),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[test]
+    fn mp_reach_zero_nexthop_flowspec_is_ok() {
+        let buf = mp_reach_zero_nexthop_update(Family::AFI_IP, 133);
+        let mut codec = PeerCodec::new();
+        codec.set_family(Family::IPV4_FLOWSPEC, FamilyState::default());
+        assert!(
+            codec.parse_message(&buf).is_ok(),
+            "FlowSpec nexthop_len=0 must be accepted"
+        );
+    }
+
+    #[test]
+    fn duplicate_non_mp_attr_is_skipped() {
+        let community: [u8; 7] = [0xC0, 0x08, 0x04, 0xFD, 0xE9, 0x00, 0x64];
+        let mut attr_bytes: Vec<u8> = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xFD, 0xEA]);
+        attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xC0, 0x00, 0x02, 0x01]);
+        attr_bytes.extend_from_slice(&community);
+        attr_bytes.extend_from_slice(&community);
+        let attr_len = attr_bytes.len() as u16;
+        let nlri: [u8; 2] = [0x08, 0x0A];
+        let total = 19u16 + 2 + 2 + attr_len + nlri.len() as u16;
+        let mut buf = vec![0xffu8; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(&attr_bytes);
+        buf.extend_from_slice(&nlri);
+        let mut codec = ipv4_codec();
+        match codec.parse_message(&buf) {
+            Ok(ParsedMessage::Update(ParsedUpdate::Routes { attrs, reach, .. })) => {
+                assert!(reach.is_some());
+                let count = attrs
+                    .iter()
+                    .filter(|a| a.code() == Attribute::COMMUNITY)
+                    .count();
+                assert_eq!(count, 1, "duplicate COMMUNITY must be skipped");
+            }
+            Ok(_) => panic!("expected Routes"),
+            Err(e) => panic!("unexpected parse error: {}", e),
+        }
+    }
+
+    #[test]
+    fn duplicate_mp_reach_is_error() {
+        let mp_reach: Vec<u8> = {
+            let mut v = vec![0x80, 0x0E, 0x15, 0x00, 0x02, 0x01, 0x10];
+            v.extend_from_slice(&[0u8; 16]);
+            v.push(0x00);
+            v
+        };
+        let attr_len = (mp_reach.len() * 2) as u16;
+        let total = 19u16 + 2 + 2 + attr_len;
+        let mut buf = vec![0xffu8; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(&mp_reach);
+        buf.extend_from_slice(&mp_reach);
+        let mut codec = ipv6_codec();
+        match codec.parse_message(&buf) {
+            Err(Notification::UpdateMalformedAttributeList) => {}
+            Err(e) => panic!("expected UpdateMalformedAttributeList, got {}", e),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    fn vpnv4_codec() -> PeerCodec {
+        let caps = vec![Capability::MultiProtocol(Family::IPV4_VPN)];
+        PeerCodec::negotiate(&caps, &caps)
+    }
+
+    fn vpnv6_codec() -> PeerCodec {
+        let caps = vec![Capability::MultiProtocol(Family::IPV6_VPN)];
+        PeerCodec::negotiate(&caps, &caps)
+    }
+
+    #[test]
+    fn update_vpnv4_nexthop_roundtrip() {
+        use crate::mpls::{MplsLabel, MplsLabelStack};
+        use crate::vpn::VpnV4Nlri;
+        let rd = RouteDistinguisher::TwoOctetAs {
+            admin: 65001,
+            assigned: 1,
+        };
+        let prefix = Ipv4Net {
+            addr: "10.0.1.0".parse().unwrap(),
+            mask: 24,
+        };
+        let nlri = PathNlri::new(Nlri::VpnV4(VpnV4Nlri {
+            labels: MplsLabelStack::new(vec![MplsLabel::new(100)]),
+            rd,
+            prefix,
+        }));
+        let nexthop = Nexthop::V4("192.0.2.1".parse().unwrap());
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4_VPN,
+            entries: vec![nlri.clone()],
+            nexthop: Some(nexthop),
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::AS_PATH,
+                    vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+                )
+                .unwrap(),
+            ]),
+        });
+        match round_trip(&msg, vpnv4_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+                let r = mp_reach.expect("mp_reach must be present for VPNv4");
+                assert_eq!(r.family, Family::IPV4_VPN);
+                assert_eq!(r.nexthop, Some(nexthop));
+                assert_eq!(r.entries, vec![nlri]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_vpnv6_nexthop_roundtrip() {
+        use crate::mpls::{MplsLabel, MplsLabelStack};
+        use crate::vpn::VpnV6Nlri;
+        let rd = RouteDistinguisher::TwoOctetAs {
+            admin: 65001,
+            assigned: 1,
+        };
+        let prefix = Ipv6Net {
+            addr: "2001:db8:1::".parse().unwrap(),
+            mask: 48,
+        };
+        let nlri = PathNlri::new(Nlri::VpnV6(VpnV6Nlri {
+            labels: MplsLabelStack::new(vec![MplsLabel::new(200)]),
+            rd,
+            prefix,
+        }));
+        let nexthop = Nexthop::V6("2001:db8::1".parse().unwrap());
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6_VPN,
+            entries: vec![nlri.clone()],
+            nexthop: Some(nexthop),
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::new_with_bin(
+                    Attribute::AS_PATH,
+                    vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+                )
+                .unwrap(),
+            ]),
+        });
+        match round_trip(&msg, vpnv6_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+                let r = mp_reach.expect("mp_reach must be present for VPNv6");
+                assert_eq!(r.family, Family::IPV6_VPN);
+                assert_eq!(r.nexthop, Some(nexthop));
+                assert_eq!(r.entries, vec![nlri]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    fn check_message_sizes(raw: &[u8]) {
+        let mut pos = 0;
+        while pos < raw.len() {
+            assert!(pos + 19 <= raw.len(), "truncated header at offset {}", pos);
+            let msg_len = u16::from_be_bytes([raw[pos + 16], raw[pos + 17]]) as usize;
+            assert!(
+                msg_len <= 4096,
+                "message at offset {} exceeds MAX_LENGTH: {}",
+                pos,
+                msg_len
+            );
+            assert!(
+                msg_len >= 19,
+                "message at offset {} too short: {}",
+                pos,
+                msg_len
+            );
+            pos += msg_len;
+        }
+        assert_eq!(pos, raw.len(), "trailing bytes in encoded buffer");
+    }
+
+    fn decode_all(buf: &mut BytesMut, codec: &mut PeerCodec) -> Vec<ParsedMessage> {
+        let mut msgs = Vec::new();
+        loop {
+            match codec.try_parse(buf) {
+                Ok(Some(msg)) => msgs.push(msg),
+                Ok(None) => break,
+                Err(e) => panic!("parse error: {:?}", e),
+            }
+        }
+        msgs
+    }
+
+    fn assert_encode_decode_splits<F>(
+        codec: &mut PeerCodec,
+        msg: &Message,
+        expected: &[PathNlri],
+        collect: F,
+    ) where
+        F: Fn(ParsedMessage) -> Option<Vec<PathNlri>>,
+    {
+        let mut raw = Vec::new();
+        let wire_count = codec.encode_to(msg, &mut raw).unwrap();
+        assert!(
+            wire_count > 1,
+            "expected split, got wire_count={}",
+            wire_count
+        );
+        check_message_sizes(&raw);
+        let mut buf = BytesMut::from(raw.as_slice());
+        let all_nlri: Vec<PathNlri> = decode_all(&mut buf, codec)
+            .into_iter()
+            .filter_map(collect)
+            .flatten()
+            .collect();
+        assert_eq!(all_nlri.len(), expected.len(), "NLRI count mismatch");
+        for p in expected {
+            assert!(all_nlri.contains(p), "missing NLRI: {:?}", p);
+        }
+    }
+
+    fn ipv4_entries(n: u32) -> Vec<PathNlri> {
+        (0..n)
+            .map(|i| ipv4_prefix(&format!("10.{}.{}.0", i / 256, i % 256), 24))
+            .collect()
+    }
+
+    fn ipv4_entries_addpath(n: u32) -> Vec<PathNlri> {
+        (0..n)
+            .map(|i| PathNlri {
+                path_id: i + 1,
+                nlri: Nlri::V4(Ipv4Net {
+                    addr: format!("10.{}.{}.0", i / 256, i % 256).parse().unwrap(),
+                    mask: 24,
+                }),
+            })
+            .collect()
+    }
+
+    fn ipv6_entries(n: u16) -> Vec<PathNlri> {
+        (0..n)
+            .map(|i| {
+                PathNlri::new(Nlri::V6(Ipv6Net {
+                    addr: Ipv6Addr::new(0x2001, 0x0db8, i, 0, 0, 0, 0, 0),
+                    mask: 48,
+                }))
+            })
+            .collect()
+    }
+
+    fn ipv6_entries_addpath(n: u16) -> Vec<PathNlri> {
+        (0..n)
+            .map(|i| PathNlri {
+                path_id: i as u32 + 1,
+                nlri: Nlri::V6(Ipv6Net {
+                    addr: Ipv6Addr::new(0x2001, 0x0db8, i, 0, 0, 0, 0, 0),
+                    mask: 48,
+                }),
+            })
+            .collect()
+    }
+
+    fn ipv4_addpath_codec() -> PeerCodec {
+        let caps = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::AddPath(vec![(Family::IPV4, 3)]),
+        ];
+        PeerCodec::negotiate(&caps, &caps)
+    }
+
+    fn ipv6_addpath_codec() -> PeerCodec {
+        let caps = vec![
+            Capability::MultiProtocol(Family::IPV6),
+            Capability::AddPath(vec![(Family::IPV6, 3)]),
+        ];
+        PeerCodec::negotiate(&caps, &caps)
+    }
+
+    #[test]
+    fn encode_to_splits_ipv4_reach() {
+        let mut codec = ipv4_codec();
+        let entries = ipv4_entries(1500);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: entries.clone(),
+            nexthop: None,
+            attr: ipv4_attrs("192.0.2.1".parse().unwrap()),
+        });
+        assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+            ParsedMessage::Update(ParsedUpdate::Routes { reach: Some(r), .. }) => Some(r.entries),
+            _ => None,
+        });
+    }
+
+    #[test]
+    fn encode_to_splits_ipv4_unreach() {
+        let mut codec = ipv4_codec();
+        let entries = ipv4_entries(1500);
+        let msg = Message::Update(Update::Unreach {
+            family: Family::IPV4,
+            entries: entries.clone(),
+        });
+        assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                unreach: Some(r), ..
+            }) => Some(r.entries),
+            _ => None,
+        });
+    }
+
+    #[test]
+    fn encode_to_splits_ipv6_reach() {
+        let mut codec = ipv6_codec();
+        let entries = ipv6_entries(800);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6,
+            entries: entries.clone(),
+            nexthop: Some(Nexthop::V6("2001:db8::1".parse().unwrap())),
+            attr: ipv6_attrs_no_nh(),
+        });
+        assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_reach: Some(r), ..
+            }) => Some(r.entries),
+            _ => None,
+        });
+    }
+
+    #[test]
+    fn encode_to_splits_ipv6_unreach() {
+        let mut codec = ipv6_codec();
+        let entries = ipv6_entries(800);
+        let msg = Message::Update(Update::Unreach {
+            family: Family::IPV6,
+            entries: entries.clone(),
+        });
+        assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_unreach: Some(r),
+                ..
+            }) => Some(r.entries),
+            _ => None,
+        });
+    }
+
+    #[test]
+    fn encode_to_splits_ipv4_reach_addpath() {
+        let mut codec = ipv4_addpath_codec();
+        let entries = ipv4_entries_addpath(700);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: entries.clone(),
+            nexthop: None,
+            attr: ipv4_attrs("192.0.2.1".parse().unwrap()),
+        });
+        assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+            ParsedMessage::Update(ParsedUpdate::Routes { reach: Some(r), .. }) => Some(r.entries),
+            _ => None,
+        });
+    }
+
+    #[test]
+    fn encode_to_splits_ipv4_unreach_addpath() {
+        let mut codec = ipv4_addpath_codec();
+        let entries = ipv4_entries_addpath(700);
+        let msg = Message::Update(Update::Unreach {
+            family: Family::IPV4,
+            entries: entries.clone(),
+        });
+        assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                unreach: Some(r), ..
+            }) => Some(r.entries),
+            _ => None,
+        });
+    }
+
+    #[test]
+    fn encode_to_splits_ipv6_reach_addpath() {
+        let mut codec = ipv6_addpath_codec();
+        let entries = ipv6_entries_addpath(500);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6,
+            entries: entries.clone(),
+            nexthop: Some(Nexthop::V6("2001:db8::1".parse().unwrap())),
+            attr: ipv6_attrs_no_nh(),
+        });
+        assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_reach: Some(r), ..
+            }) => Some(r.entries),
+            _ => None,
+        });
+    }
+
+    #[test]
+    fn encode_to_splits_ipv6_unreach_addpath() {
+        let mut codec = ipv6_addpath_codec();
+        let entries = ipv6_entries_addpath(500);
+        let msg = Message::Update(Update::Unreach {
+            family: Family::IPV6,
+            entries: entries.clone(),
+        });
+        assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_unreach: Some(r),
+                ..
+            }) => Some(r.entries),
+            _ => None,
+        });
+    }
+
+    fn raw_update_with_attrs(attr_bytes: &[u8]) -> Vec<u8> {
+        let nlri: &[u8] = &[0x08, 0x0A];
+        let attr_len = attr_bytes.len() as u16;
+        let total = 19u16 + 2 + 2 + attr_len + nlri.len() as u16;
+        let mut buf = vec![0xffu8; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(attr_bytes);
+        buf.extend_from_slice(nlri);
+        buf
+    }
+
+    fn base_attrs_without_origin() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xFD, 0xEA]);
+        v.extend_from_slice(&[0x40, 0x03, 0x04, 0xC0, 0x00, 0x02, 0x01]);
+        v
+    }
+
+    #[test]
+    fn invalid_origin_value_treat_as_withdraw() {
+        let mut attr_bytes = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x03]);
+        attr_bytes.extend_from_slice(&base_attrs_without_origin());
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+    }
+
+    #[test]
+    fn malformed_community_length_treat_as_withdraw() {
+        let mut attr_bytes = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.extend_from_slice(&base_attrs_without_origin());
+        attr_bytes.extend_from_slice(&[0xC0, 0x08, 0x03, 0xFD, 0xE9, 0x00]);
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+    }
+
+    #[test]
+    fn malformed_aggregator_length_treat_as_withdraw() {
+        let mut attr_bytes = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.extend_from_slice(&base_attrs_without_origin());
+        attr_bytes.extend_from_slice(&[0xC0, 0x07, 0x03, 0x00, 0x01, 0x00]);
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+    }
+
+    #[test]
+    fn malformed_cluster_list_length_discarded() {
+        let mut attr_bytes = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.extend_from_slice(&base_attrs_without_origin());
+        attr_bytes.extend_from_slice(&[0x80, 0x0A, 0x03, 0x00, 0x00, 0x01]);
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+        if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
+            assert!(attr.iter().all(|a| a.code() != Attribute::CLUSTER_LIST));
+        }
+    }
+
+    #[test]
+    fn malformed_aspath_truncated_segment_treat_as_withdraw() {
+        let as_path_data: Vec<u8> = vec![0x02, 0x02, 0x00, 0x00, 0xFD, 0xEA];
+        let mut attr_bytes = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.push(0x40);
+        attr_bytes.push(0x02);
+        attr_bytes.push(as_path_data.len() as u8);
+        attr_bytes.extend_from_slice(&as_path_data);
+        attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xC0, 0x00, 0x02, 0x01]);
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+    }
+
+    #[test]
+    fn malformed_aspath_invalid_segment_type_treat_as_withdraw() {
+        let as_path_data: Vec<u8> = vec![0x05, 0x01, 0x00, 0x00, 0xFD, 0xEA];
+        let mut attr_bytes = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.push(0x40);
+        attr_bytes.push(0x02);
+        attr_bytes.push(as_path_data.len() as u8);
+        attr_bytes.extend_from_slice(&as_path_data);
+        attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xC0, 0x00, 0x02, 0x01]);
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+    }
+
+    fn raw_update_with_ibgp_attrs() -> Vec<u8> {
+        let mut attr_bytes = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.extend_from_slice(&base_attrs_without_origin());
+        attr_bytes.extend_from_slice(&[0x40, 0x05, 0x04, 0x00, 0x00, 0x00, 0x64]);
+        attr_bytes.extend_from_slice(&[0x80, 0x09, 0x04, 0xC0, 0x00, 0x02, 0x01]);
+        attr_bytes.extend_from_slice(&[0x80, 0x0A, 0x04, 0x00, 0x00, 0x00, 0x01]);
+        raw_update_with_attrs(&attr_bytes)
+    }
+
+    #[test]
+    fn ebgp_discards_local_pref_originator_id_cluster_list() {
+        let buf = raw_update_with_ibgp_attrs();
+        let parsed = ipv4_codec()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, true).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+        if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
+            assert!(attr.iter().all(|a| !matches!(
+                a.code(),
+                Attribute::LOCAL_PREF | Attribute::ORIGINATOR_ID | Attribute::CLUSTER_LIST
+            )));
+        }
+    }
+
+    #[test]
+    fn ibgp_retains_local_pref_originator_id_cluster_list() {
+        let buf = raw_update_with_ibgp_attrs();
+        let parsed = ipv4_codec()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        if let Message::Update(Update::Reach { attr, .. }) = &msgs[0] {
+            assert!(attr.iter().any(|a| a.code() == Attribute::LOCAL_PREF));
+            assert!(attr.iter().any(|a| a.code() == Attribute::ORIGINATOR_ID));
+            assert!(attr.iter().any(|a| a.code() == Attribute::CLUSTER_LIST));
+        }
+    }
+
+    fn raw_ipv6_mpreach_update() -> Vec<u8> {
+        let mut attr_bytes: Vec<u8> = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xea]);
+        let mp: &[u8] = &[
+            0x00, 0x02, 0x01, 0x10, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x20, 0x01, 0x0d, 0xb8,
+        ];
+        attr_bytes.push(0x80);
+        attr_bytes.push(0x0e);
+        attr_bytes.push(mp.len() as u8);
+        attr_bytes.extend_from_slice(mp);
+        let attr_len = attr_bytes.len() as u16;
+        let total = 19u16 + 2 + 2 + attr_len;
+        let mut buf = vec![0xffu8; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(&attr_bytes);
+        buf
+    }
+
+    #[test]
+    fn missing_origin_treat_as_withdraw() {
+        let mut attr_bytes: Vec<u8> = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xea]);
+        attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xc0, 0x00, 0x02, 0x01]);
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+    }
+
+    #[test]
+    fn missing_aspath_treat_as_withdraw() {
+        let mut attr_bytes: Vec<u8> = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xc0, 0x00, 0x02, 0x01]);
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+    }
+
+    #[test]
+    fn missing_nexthop_ipv4_treat_as_withdraw() {
+        let mut attr_bytes: Vec<u8> = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.extend_from_slice(&[0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xea]);
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec().parse_message(&buf).expect("parse ok");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+    }
+
+    #[test]
+    fn missing_nexthop_attr_with_mpreach_ok() {
+        let buf = raw_ipv6_mpreach_update();
+        let parsed = ipv6_codec().parse_message(&buf).expect("parse ok");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+    }
+
+    #[test]
+    fn flowspec_ipv4_no_nexthop_accepted() {
+        let flowspec_nlri: &[u8] = &[0x03, 0x01, 0x08, 0x0a];
+        let mp: Vec<u8> = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&[0x00, 0x01]);
+            v.push(133);
+            v.push(0x00);
+            v.push(0x00);
+            v.extend_from_slice(flowspec_nlri);
+            v
+        };
+        let mut attr_bytes: Vec<u8> = Vec::new();
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        attr_bytes.extend_from_slice(&[0x40, 0x02, 0x00]);
+        attr_bytes.push(0x80);
+        attr_bytes.push(0x0e);
+        attr_bytes.push(mp.len() as u8);
+        attr_bytes.extend_from_slice(&mp);
+        let attr_len = attr_bytes.len() as u16;
+        let total = 19u16 + 2 + 2 + attr_len;
+        let mut buf = vec![0xffu8; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(&attr_bytes);
+        let mut codec = PeerCodec::new();
+        codec.set_family(Family::IPV4_FLOWSPEC, Default::default());
+        let parsed = codec.parse_message(&buf).expect("parse ok");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+    }
+
+    fn update_with_unknown_optional_attrs() -> Vec<u8> {
+        let attrs: &[u8] = &[
+            0x40, 0x01, 0x01, 0x00, 0x40, 0x02, 0x00, 0x40, 0x03, 0x04, 0x0a, 0x00, 0x00, 0x01,
+            0xC0, 0xC8, 0x03, 0x01, 0x02, 0x03, 0x80, 0xC9, 0x03, 0x04, 0x05, 0x06,
+        ];
+        let nlri: &[u8] = &[0x18, 0x0a, 0x01, 0x02];
+        let attr_len = attrs.len() as u16;
+        let total = 19u16 + 2 + 2 + attr_len + nlri.len() as u16;
+        let mut buf = vec![0xffu8; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(attrs);
+        buf.extend_from_slice(nlri);
+        buf
+    }
+
+    fn update_with_aigp(aigp_flags: u8) -> Vec<u8> {
+        let aigp_value: Vec<u8> = vec![1, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut attrs: Vec<u8> = vec![
+            0x40, 0x01, 0x01, 0x00, 0x40, 0x02, 0x00, 0x40, 0x03, 0x04, 0x0a, 0x00, 0x00, 0x01,
+        ];
+        attrs.push(aigp_flags);
+        attrs.push(Attribute::AIGP);
+        attrs.push(aigp_value.len() as u8);
+        attrs.extend_from_slice(&aigp_value);
+        let nlri: &[u8] = &[0x18, 0x0a, 0x01, 0x02];
+        let attr_len = attrs.len() as u16;
+        let total = 19u16 + 2 + 2 + attr_len + nlri.len() as u16;
+        let mut buf = vec![0xffu8; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(&attrs);
+        buf.extend_from_slice(nlri);
+        buf
+    }
+
+    #[test]
+    fn aigp_with_correct_flags_is_accepted() {
+        let mut codec = ipv4_codec();
+        let buf = update_with_aigp(0x80);
+        let parsed = codec.parse_message(&buf).expect("parse ok");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, Message::Update(Update::Reach { .. })))
+        );
+    }
+
+    #[test]
+    fn aigp_with_wrong_flags_treat_as_withdraw() {
+        let mut codec = ipv4_codec();
+        let buf = update_with_aigp(0xC0);
+        let parsed = codec.parse_message(&buf).expect("parse ok");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert!(
+            msgs.iter()
+                .all(|m| matches!(m, Message::Update(Update::Unreach { .. })))
+        );
+    }
+
+    #[test]
+    fn unknown_optional_transitive_attr_is_stored() {
+        let mut codec = ipv4_codec();
+        let buf = update_with_unknown_optional_attrs();
+        let parsed = codec.parse_message(&buf).expect("parse ok");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let attr = match &msgs[0] {
+            Message::Update(Update::Reach { attr, .. }) => attr,
+            _ => panic!("expected Reach message"),
+        };
+        let opaque = attr.iter().find(|a| a.code() == 200);
+        assert!(
+            opaque.is_some(),
+            "unknown optional transitive attr must be stored"
+        );
+        let opaque = opaque.unwrap();
+        assert!(opaque.is_opaque());
+        assert_eq!(opaque.binary().unwrap(), &vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn unknown_optional_non_transitive_attr_is_discarded() {
+        let mut codec = ipv4_codec();
+        let buf = update_with_unknown_optional_attrs();
+        let parsed = codec.parse_message(&buf).expect("parse ok");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let attr = match &msgs[0] {
+            Message::Update(Update::Reach { attr, .. }) => attr,
+            _ => panic!("expected Reach message"),
+        };
+        assert!(attr.iter().all(|a| a.code() != 201));
     }
 }
