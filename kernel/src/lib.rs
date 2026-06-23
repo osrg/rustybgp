@@ -1,4 +1,8 @@
 //! Kernel FIB integration via Linux Netlink.
+#![cfg_attr(
+    not(target_os = "linux"),
+    compile_error("rustybgp-kernel requires Linux (uses rtnetlink/Netlink)")
+)]
 //!
 //! # Types
 //!
