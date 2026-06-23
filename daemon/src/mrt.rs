@@ -144,6 +144,7 @@ impl MrtDumper {
                         | Some(BgpEvent::PeerUp(_))
                         | Some(BgpEvent::PeerDown(_))
                         | Some(BgpEvent::LocRib(_))
+                        | Some(BgpEvent::EndOfRib(_))
                         | Some(BgpEvent::EndOfSnapshot) => {}
                         None => return Ok(()),
                     }

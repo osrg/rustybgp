@@ -2881,12 +2881,15 @@ impl PeerSession {
             }
         }
 
-        // For UPDATE EndOfRib: signal GR if negotiated.
-        if let Some(family) = eor_family
-            && self.negotiated_gr.is_some()
-        {
-            self.process_effects(vec![GlobalEffect::GrEorReceived { family }], global)
-                .await;
+        // For UPDATE EndOfRib: notify EOR watchers unconditionally; signal GR if negotiated.
+        if let Some(family) = eor_family {
+            if let Some(source) = self.source.get(&family) {
+                self.tables.notify_eor(source.clone(), family);
+            }
+            if self.negotiated_gr.is_some() {
+                self.process_effects(vec![GlobalEffect::GrEorReceived { family }], global)
+                    .await;
+            }
         }
 
         // For RTC EOR: advance state and export VPN routes if suspended.

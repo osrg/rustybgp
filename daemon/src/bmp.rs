@@ -644,6 +644,7 @@ impl BmpClient {
                                 break;
                             }
                         }
+                        Some(BgpEvent::EndOfRib(_)) => {}
                         Some(BgpEvent::EndOfSnapshot) | None => break,
                     }
                 }

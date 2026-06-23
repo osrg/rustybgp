@@ -1288,36 +1288,44 @@ impl GoBgpService for GrpcService {
         let req = request.into_inner();
 
         let want_peer = req.peer.is_some();
-        let (want_table, want_adjin, want_best, want_post_policy, want_init, peer_addr_filter) =
-            if let Some(table) = &req.table {
-                let mut adjin = false;
-                let mut best = false;
-                let mut post_policy = false;
-                let mut init = false;
-                let mut filter_addr: Option<std::net::IpAddr> = None;
-                for f in &table.filters {
-                    use api::watch_event_request::table::filter::Type;
-                    match f.r#type() {
-                        Type::Unspecified | Type::Adjin => adjin = true,
-                        Type::Best => best = true,
-                        Type::PostPolicy => post_policy = true,
-                        Type::Eor => {}
-                    }
-                    if f.init {
-                        init = true;
-                    }
-                    if !f.peer_address.is_empty() {
-                        filter_addr = f.peer_address.parse().ok();
-                    }
+        let (
+            want_table,
+            want_adjin,
+            want_best,
+            want_post_policy,
+            want_eor,
+            want_init,
+            peer_addr_filter,
+        ) = if let Some(table) = &req.table {
+            let mut adjin = false;
+            let mut best = false;
+            let mut post_policy = false;
+            let mut eor = false;
+            let mut init = false;
+            let mut filter_addr: Option<std::net::IpAddr> = None;
+            for f in &table.filters {
+                use api::watch_event_request::table::filter::Type;
+                match f.r#type() {
+                    Type::Unspecified | Type::Adjin => adjin = true,
+                    Type::Best => best = true,
+                    Type::PostPolicy => post_policy = true,
+                    Type::Eor => eor = true,
                 }
-                // No explicit type defaults to pre-policy Adj-RIB-In.
-                if !adjin && !best && !post_policy {
-                    adjin = true;
+                if f.init {
+                    init = true;
                 }
-                (true, adjin, best, post_policy, init, filter_addr)
-            } else {
-                (false, false, false, false, false, None)
-            };
+                if !f.peer_address.is_empty() {
+                    filter_addr = f.peer_address.parse().ok();
+                }
+            }
+            // No explicit type defaults to pre-policy Adj-RIB-In.
+            if !adjin && !best && !post_policy && !eor {
+                adjin = true;
+            }
+            (true, adjin, best, post_policy, eor, init, filter_addr)
+        } else {
+            (false, false, false, false, false, false, None)
+        };
 
         let tables2 = self.tables.clone();
         let global2 = self.global.clone();
@@ -1486,6 +1494,29 @@ impl GoBgpService for GrpcService {
                                 &change.net,
                                 change.attr.as_ref(),
                             )
+                        }
+                        BgpEvent::EndOfRib(data) if want_table && want_eor => {
+                            if matches!(peer_addr_filter, Some(a) if a != data.source.remote_addr)
+                            {
+                                continue;
+                            }
+                            api::WatchEventResponse {
+                                event: Some(api::watch_event_response::Event::Table(
+                                    api::watch_event_response::TableEvent {
+                                        paths: vec![api::Path {
+                                            family: Some(convert::family_to_api(data.family)),
+                                            is_withdraw: true,
+                                            neighbor_ip: data.source.remote_addr.to_string(),
+                                            source_asn: data.source.remote_asn,
+                                            source_id: std::net::Ipv4Addr::from(
+                                                data.source.router_id,
+                                            )
+                                            .to_string(),
+                                            ..Default::default()
+                                        }],
+                                    },
+                                )),
+                            }
                         }
                         _ => continue,
                     };

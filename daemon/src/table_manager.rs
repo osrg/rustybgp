@@ -91,6 +91,13 @@ pub(crate) struct AdjRibOutChange {
     pub(crate) timestamp: std::time::SystemTime,
 }
 
+/// EOR (End-of-RIB) marker received from a peer (RFC 4724 §2).
+#[derive(Clone)]
+pub(crate) struct EndOfRibData {
+    pub(crate) source: Arc<table::Source>,
+    pub(crate) family: Family,
+}
+
 pub(crate) enum BgpEvent {
     AdjRibIn(AdjRibInChange),
     AdjRibInPost(AdjRibInChange),
@@ -100,6 +107,8 @@ pub(crate) enum BgpEvent {
     PeerDown(PeerDownData),
     /// Loc-RIB best-path change for BMP LOCAL monitoring (RFC 9069).
     LocRib(LocRibChange),
+    /// EOR marker received from a peer.
+    EndOfRib(EndOfRibData),
     /// Sentinel sent by `subscribe(true)` after all snapshot events have been queued.
     EndOfSnapshot,
 }
@@ -747,6 +756,13 @@ impl TableManager {
     pub(crate) fn peer_down(&self, data: PeerDownData) {
         for (_, tx) in self.subscribers.load().iter() {
             let _ = tx.send(BgpEvent::PeerDown(data.clone()));
+        }
+    }
+
+    pub(crate) fn notify_eor(&self, source: Arc<table::Source>, family: Family) {
+        let data = EndOfRibData { source, family };
+        for (_, tx) in self.subscribers.load().iter() {
+            let _ = tx.send(BgpEvent::EndOfRib(data.clone()));
         }
     }
 
