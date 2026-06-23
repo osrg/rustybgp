@@ -2670,8 +2670,10 @@ impl GoBgpService for GrpcService {
 
         {
             use api::add_bmp_request::MonitoringPolicy as P;
-            let p = request.policy;
-            if p != P::Pre as i32 && p != P::Post as i32 && p != P::Both as i32 {
+            if !matches!(
+                P::try_from(request.policy),
+                Ok(P::Pre | P::Post | P::Both | P::All)
+            ) {
                 return Err(tonic::Status::new(
                     tonic::Code::InvalidArgument,
                     "unsupported monitoring policy",
