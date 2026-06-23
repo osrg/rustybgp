@@ -1198,7 +1198,7 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<Self::WatchEventStream>, tonic::Status> {
         let tables2 = self.tables.clone();
         let global2 = self.global.clone();
-        let subscription = self.tables.subscribe_live();
+        let subscription = self.tables.subscribe(false);
         let sub_id = subscription.id;
         let (tx, rx) = mpsc::channel(1024);
         let cancel = CancellationToken::new();
@@ -1280,9 +1280,10 @@ impl GoBgpService for GrpcService {
                             )),
                         }
                     }
-                    BgpEvent::AdjRibInPost(_) => continue,
-                    BgpEvent::AdjRibOutPre(_) => continue,
-                    BgpEvent::AdjRibOutPost(_) => continue,
+                    BgpEvent::AdjRibInPost(_)
+                    | BgpEvent::AdjRibOutPre(_)
+                    | BgpEvent::AdjRibOutPost(_)
+                    | BgpEvent::EndOfSnapshot => continue,
                 };
                 if tx.send(Ok(r)).await.is_err() {
                     break;

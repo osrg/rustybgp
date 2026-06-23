@@ -87,6 +87,8 @@ pub(crate) enum BgpEvent {
     AdjRibOutPost(AdjRibOutChange),
     PeerUp(PeerUpData),
     PeerDown(PeerDownData),
+    /// Sentinel sent by `subscribe(true)` after all snapshot events have been queued.
+    EndOfSnapshot,
 }
 
 pub(crate) struct Subscription {
@@ -631,12 +633,15 @@ impl TableManager {
         out
     }
 
-    /// Subscribe with snapshot: calls `on_change` for each current route (per shard, under lock),
-    /// then registers for live AdjRibIn/PeerUp/PeerDown events.
-    pub(crate) fn subscribe_with<F>(&self, mut on_change: F) -> Subscription
-    where
-        F: FnMut(AdjRibInChange),
-    {
+    /// Subscribe to BGP events.
+    ///
+    /// When `want_snapshot` is `true`, snapshot events for all current Adj-RIB-In
+    /// routes are queued into the channel before this function returns, followed by
+    /// a `BgpEvent::EndOfSnapshot` sentinel.  Live events (and any concurrent
+    /// inserts that race with the snapshot) are delivered after the sentinel.
+    ///
+    /// When `want_snapshot` is `false`, only live events are delivered.
+    pub(crate) fn subscribe(&self, want_snapshot: bool) -> Subscription {
         let id = SubscriptionId(
             self.next_sub_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -649,55 +654,46 @@ impl TableManager {
             v.push((id, tx.clone()));
             Arc::new(v)
         });
-        // Snapshot each shard while holding the lock.  Any insert_route() on a shard
-        // that has not yet been snapshotted either:
-        //   (a) acquired the lock before us -> its route appears in the snapshot, or
-        //   (b) acquires the lock after us  -> loads subscribers inside the lock and
-        //       finds our tx (rcu already completed), so the live event is delivered.
-        for shard in &self.shards {
-            let t = shard.lock().unwrap();
-            for f in t.rtable.families().collect::<Vec<_>>() {
-                for reach in t.rtable.iter_reach(f) {
-                    let addpath = t.has_addpath(&reach.source.remote_addr, &f);
-                    on_change(AdjRibInChange {
-                        source: reach.source,
-                        family: f,
-                        addpath,
-                        nlris: vec![reach.net],
-                        attrs: Some(reach.attr),
-                        nexthop: reach.nexthop,
-                        timestamp: reach.timestamp,
-                    });
-                }
-                for reach in t.rtable.iter_reach_post(f) {
-                    let addpath = t.has_addpath(&reach.source.remote_addr, &f);
-                    let _ = tx.send(BgpEvent::AdjRibInPost(AdjRibInChange {
-                        source: reach.source,
-                        family: f,
-                        addpath,
-                        nlris: vec![reach.net],
-                        attrs: Some(reach.attr),
-                        nexthop: reach.nexthop,
-                        timestamp: reach.timestamp,
-                    }));
+        if want_snapshot {
+            // Snapshot each shard while holding the lock.  Any insert_route() on a
+            // shard that has not yet been snapshotted either:
+            //   (a) acquired the lock before us -> its route appears in the snapshot, or
+            //   (b) acquires the lock after us  -> loads subscribers inside the lock and
+            //       finds our tx (rcu already completed), so the live event is delivered.
+            // Concurrent inserts in case (b) may arrive in the channel interleaved with
+            // snapshot events; callers must drain until EndOfSnapshot and accumulate all
+            // AdjRibIn events to obtain the net state at subscription time.
+            for shard in &self.shards {
+                let t = shard.lock().unwrap();
+                for f in t.rtable.families().collect::<Vec<_>>() {
+                    for reach in t.rtable.iter_reach(f) {
+                        let addpath = t.has_addpath(&reach.source.remote_addr, &f);
+                        let _ = tx.send(BgpEvent::AdjRibIn(AdjRibInChange {
+                            source: reach.source,
+                            family: f,
+                            addpath,
+                            nlris: vec![reach.net],
+                            attrs: Some(reach.attr),
+                            nexthop: reach.nexthop,
+                            timestamp: reach.timestamp,
+                        }));
+                    }
+                    for reach in t.rtable.iter_reach_post(f) {
+                        let addpath = t.has_addpath(&reach.source.remote_addr, &f);
+                        let _ = tx.send(BgpEvent::AdjRibInPost(AdjRibInChange {
+                            source: reach.source,
+                            family: f,
+                            addpath,
+                            nlris: vec![reach.net],
+                            attrs: Some(reach.attr),
+                            nexthop: reach.nexthop,
+                            timestamp: reach.timestamp,
+                        }));
+                    }
                 }
             }
+            let _ = tx.send(BgpEvent::EndOfSnapshot);
         }
-        Subscription { rx, id }
-    }
-
-    /// Subscribe for live events only (no snapshot). Used by watch_event gRPC and MRT.
-    pub(crate) fn subscribe_live(&self) -> Subscription {
-        let id = SubscriptionId(
-            self.next_sub_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        );
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.subscribers.rcu(|cur| {
-            let mut v = (**cur).clone();
-            v.push((id, tx.clone()));
-            Arc::new(v)
-        });
         Subscription { rx, id }
     }
 

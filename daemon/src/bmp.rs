@@ -263,8 +263,20 @@ impl BmpClient {
             .await;
 
         let mut snapshot: SnapshotMap = FnvHashMap::default();
-        let subscription = tables.subscribe_with(|change| apply_snapshot(&mut snapshot, change));
-        let rx = subscription.rx;
+        let subscription = tables.subscribe(true);
+        let sub_id = subscription.id;
+        let mut rx = UnboundedReceiverStream::new(subscription.rx);
+
+        // Drain snapshot phase until EndOfSnapshot sentinel.
+        // Concurrent AdjRibIn events that arrived during snapshotting are also
+        // fed to apply_snapshot so the map reflects the net state at subscribe time.
+        while let Some(event) = rx.next().await {
+            match event {
+                BgpEvent::AdjRibIn(change) => apply_snapshot(&mut snapshot, change),
+                BgpEvent::EndOfSnapshot => break,
+                _ => {} // PeerUp/Down reconstructed from global state below
+            }
+        }
 
         // Send PeerUp for all established peers.
         let local_id = global.read().await.router_id;
@@ -273,7 +285,7 @@ impl BmpClient {
         for peer in global.read().await.peers.values() {
             if let Some((addr, peer_header, msg)) = peer.bmp_peer_up(local_id) {
                 if !send_peer_up(&mut sent_peer_up, &mut lines, addr, &msg).await {
-                    tables.unsubscribe(subscription.id);
+                    tables.unsubscribe(sub_id);
                     return;
                 }
                 established_peers.push((addr, peer_header));
@@ -284,14 +296,13 @@ impl BmpClient {
         for (addr, peer_header) in &established_peers {
             for msg in flush_peer_snapshot(&mut snapshot, *addr, peer_header) {
                 if lines.send(&msg).await.is_err() {
-                    tables.unsubscribe(subscription.id);
+                    tables.unsubscribe(sub_id);
                     return;
                 }
             }
         }
 
         // Live event loop.
-        let mut rx = UnboundedReceiverStream::new(rx);
         loop {
             tokio::select! {
                 msg = lines.next() => {
@@ -442,13 +453,13 @@ impl BmpClient {
                                 break;
                             }
                         }
-                        None => break,
+                        Some(BgpEvent::EndOfSnapshot) | None => break,
                     }
                 }
                 _ = cancel.cancelled() => break,
             }
         }
-        tables.unsubscribe(subscription.id);
+        tables.unsubscribe(sub_id);
     }
 
     pub(crate) fn try_connect(

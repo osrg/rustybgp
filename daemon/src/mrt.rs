@@ -83,7 +83,7 @@ impl MrtDumper {
         cancel: CancellationToken,
         tables: TableHandle,
     ) -> Result<(), Error> {
-        let subscription = tables.subscribe_live();
+        let subscription = tables.subscribe(false);
         let result = self.run_loop(&mut file, subscription.rx, cancel).await;
         tables.unsubscribe(subscription.id);
         result
@@ -142,7 +142,8 @@ impl MrtDumper {
                         | Some(BgpEvent::AdjRibOutPre(_))
                         | Some(BgpEvent::AdjRibOutPost(_))
                         | Some(BgpEvent::PeerUp(_))
-                        | Some(BgpEvent::PeerDown(_)) => {}
+                        | Some(BgpEvent::PeerDown(_))
+                        | Some(BgpEvent::EndOfSnapshot) => {}
                         None => return Ok(()),
                     }
                 }
