@@ -6248,6 +6248,7 @@ bgp-actions.set-next-hop = "self"
             AfiSafiType::L3VpnIpv4Multicast,
             AfiSafiType::L3VpnIpv6Multicast,
             AfiSafiType::L2VpnVpls,
+            AfiSafiType::L2VpnFlowspec,
             AfiSafiType::Ipv4Encap,
             AfiSafiType::Ipv6Encap,
             AfiSafiType::Opaque,
