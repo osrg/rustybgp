@@ -501,7 +501,6 @@ impl From<api::PeerGroup> for PeerGroup {
 
 pub(super) struct GrpcService {
     init: Arc<tokio::sync::Notify>,
-    policy_assignment_sem: tokio::sync::Semaphore,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
     pub(super) global: GlobalHandle,
     pub(super) tables: TableHandle,
@@ -517,7 +516,6 @@ impl GrpcService {
     ) -> Self {
         GrpcService {
             init,
-            policy_assignment_sem: tokio::sync::Semaphore::new(1),
             active_conn_tx,
             global,
             tables,
@@ -2235,7 +2233,6 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::AddPolicyAssignmentRequest>,
     ) -> Result<tonic::Response<api::AddPolicyAssignmentResponse>, tonic::Status> {
-        let _ = self.policy_assignment_sem.acquire().await;
         let request = request
             .into_inner()
             .assignment
@@ -2250,7 +2247,6 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::DeletePolicyAssignmentRequest>,
     ) -> Result<tonic::Response<api::DeletePolicyAssignmentResponse>, tonic::Status> {
-        let _ = self.policy_assignment_sem.acquire().await;
         let req = request.into_inner();
         let assignment = req.assignment.ok_or(Error::EmptyArgument)?;
         let (_, direction, _, policy_names) =
@@ -2309,7 +2305,6 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::SetPolicyAssignmentRequest>,
     ) -> Result<tonic::Response<api::SetPolicyAssignmentResponse>, tonic::Status> {
-        let _ = self.policy_assignment_sem.acquire().await;
         let assignment = request
             .into_inner()
             .assignment
