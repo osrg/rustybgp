@@ -2667,11 +2667,15 @@ impl GoBgpService for GrpcService {
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
 
-        if request.policy != api::add_bmp_request::MonitoringPolicy::Pre as i32 {
-            return Err(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "unsupported policy (only pre-policy supporeted",
-            ));
+        {
+            use api::add_bmp_request::MonitoringPolicy as P;
+            let p = request.policy;
+            if p != P::Pre as i32 && p != P::Post as i32 && p != P::Both as i32 {
+                return Err(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "unsupported monitoring policy",
+                ));
+            }
         }
 
         let sockaddr = SocketAddr::new(addr, request.port as u16);
