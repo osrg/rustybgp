@@ -2354,21 +2354,21 @@ impl PeerCodec {
                 dst.put_u32(*router_id);
                 let op_param_len_pos = dst.as_mut().len();
                 dst.put_u8(0);
-                dst.put_u8(2); // capability parameter type
-                let param_len_pos = dst.as_mut().len();
-                dst.put_u8(0);
-
-                let mut cap_len = 0;
-                for cap in capability {
-                    cap_len += cap.encode(dst).unwrap();
+                if !capability.is_empty() {
+                    dst.put_u8(2); // capability parameter type
+                    let param_len_pos = dst.as_mut().len();
+                    dst.put_u8(0);
+                    let mut cap_len = 0u8;
+                    for cap in capability {
+                        cap_len += cap.encode(dst).unwrap();
+                    }
+                    (&mut dst.as_mut()[param_len_pos..])
+                        .write_u8(cap_len)
+                        .unwrap();
+                    (&mut dst.as_mut()[op_param_len_pos..])
+                        .write_u8(cap_len + 2_u8)
+                        .unwrap();
                 }
-
-                (&mut dst.as_mut()[param_len_pos..])
-                    .write_u8(cap_len)
-                    .unwrap();
-                (&mut dst.as_mut()[op_param_len_pos..])
-                    .write_u8(cap_len + 2_u8)
-                    .unwrap();
                 0
             }
             Message::Update(Update::Reach {
