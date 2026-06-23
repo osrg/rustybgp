@@ -108,7 +108,7 @@ pub(crate) struct TableManager {
     /// Written only from the event loop (serialized); read lock-free from any shard.
     nexthop_invalid: ArcSwap<FnvHashSet<IpAddr>>,
     next_sub_id: std::sync::atomic::AtomicU64,
-    subscribers: Mutex<FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>>,
+    subscribers: ArcSwap<Vec<(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)>>,
     vrfs: SharedVrfs,
     next_label: std::sync::atomic::AtomicU32,
 }
@@ -125,7 +125,6 @@ impl TableManager {
                     Mutex::new(TableShard {
                         rtable: table::Table::new(),
                         peer_event_tx: FnvHashMap::default(),
-                        subscribers: FnvHashMap::default(),
                         addpath: FnvHashMap::default(),
                         vrfs: Arc::clone(&vrfs),
                     })
@@ -137,7 +136,7 @@ impl TableManager {
             export_policy: ArcSwapOption::const_empty(),
             nexthop_invalid: ArcSwap::new(Arc::new(FnvHashSet::default())),
             next_sub_id: std::sync::atomic::AtomicU64::new(0),
-            subscribers: Mutex::new(FnvHashMap::default()),
+            subscribers: ArcSwap::new(Arc::new(Vec::new())),
             vrfs,
             next_label: std::sync::atomic::AtomicU32::new(Self::LABEL_BASE),
         }
@@ -283,7 +282,12 @@ impl TableManager {
         let nht_set = self.nexthop_invalid.load();
         let idx = self.dealer(&net.nlri);
         let mut t = self.shards[idx].lock().unwrap();
+        // Load subscribers inside the shard lock (ArcSwap load is lock-free).
+        // This guarantees that subscribe_with()'s rcu() is visible before any
+        // notify call for routes inserted after the snapshot phase completes.
+        let subs = self.subscribers.load();
         t.notify_adj_rib_in(
+            &subs,
             source.clone(),
             family,
             std::slice::from_ref(&net),
@@ -300,6 +304,7 @@ impl TableManager {
             self.apply_import(import_policy.as_deref(), &source, &net.nlri, &attr, &mut nh);
         if filtered {
             t.notify_adj_rib_in_post(
+                &subs,
                 source.clone(),
                 family,
                 std::slice::from_ref(&net),
@@ -309,6 +314,7 @@ impl TableManager {
             );
         } else {
             t.notify_adj_rib_in_post(
+                &subs,
                 source.clone(),
                 family,
                 std::slice::from_ref(&net),
@@ -356,7 +362,9 @@ impl TableManager {
         let kernel_handle = self.kernel_handle.load_full();
         let idx = self.dealer(&net.nlri);
         let mut t = self.shards[idx].lock().unwrap();
+        let subs = self.subscribers.load();
         t.notify_adj_rib_in(
+            &subs,
             source.clone(),
             family,
             std::slice::from_ref(&net),
@@ -365,6 +373,7 @@ impl TableManager {
             timestamp,
         );
         t.notify_adj_rib_in_post(
+            &subs,
             source.clone(),
             family,
             std::slice::from_ref(&net),
@@ -395,9 +404,11 @@ impl TableManager {
         let import_policy = self.import_policy.load_full();
         let kernel_handle = self.kernel_handle.load_full();
         let nht_set = self.nexthop_invalid.load_full();
+        let subs = self.subscribers.load();
         for shard in &self.shards {
             let mut t = shard.lock().unwrap();
             t.soft_reset_in(
+                &subs,
                 peer,
                 import_policy.as_deref(),
                 Some(&*rpki),
@@ -631,14 +642,20 @@ impl TableManager {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         );
         let (tx, rx) = mpsc::unbounded_channel();
-        // Register for peer events (PeerUp/PeerDown) first to avoid missing events.
-        {
-            let mut subs = self.subscribers.lock().unwrap();
-            subs.insert(id, tx.clone());
-        }
-        // Snapshot each shard atomically while registering for live AdjRibIn events.
+        // Register before snapshotting shards so that any insert_route() that takes
+        // a shard lock after us will load the updated list and notify this subscriber.
+        self.subscribers.rcu(|cur| {
+            let mut v = (**cur).clone();
+            v.push((id, tx.clone()));
+            Arc::new(v)
+        });
+        // Snapshot each shard while holding the lock.  Any insert_route() on a shard
+        // that has not yet been snapshotted either:
+        //   (a) acquired the lock before us -> its route appears in the snapshot, or
+        //   (b) acquires the lock after us  -> loads subscribers inside the lock and
+        //       finds our tx (rcu already completed), so the live event is delivered.
         for shard in &self.shards {
-            let mut t = shard.lock().unwrap();
+            let t = shard.lock().unwrap();
             for f in t.rtable.families().collect::<Vec<_>>() {
                 for reach in t.rtable.iter_reach(f) {
                     let addpath = t.has_addpath(&reach.source.remote_addr, &f);
@@ -652,8 +669,6 @@ impl TableManager {
                         timestamp: reach.timestamp,
                     });
                 }
-                // Post-policy snapshot sent via channel; arrives before any live events
-                // for this shard because t.subscribers.insert() follows below.
                 for reach in t.rtable.iter_reach_post(f) {
                     let addpath = t.has_addpath(&reach.source.remote_addr, &f);
                     let _ = tx.send(BgpEvent::AdjRibInPost(AdjRibInChange {
@@ -667,7 +682,6 @@ impl TableManager {
                     }));
                 }
             }
-            t.subscribers.insert(id, tx.clone());
         }
         Subscription { rx, id }
     }
@@ -679,38 +693,27 @@ impl TableManager {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         );
         let (tx, rx) = mpsc::unbounded_channel();
-        {
-            let mut subs = self.subscribers.lock().unwrap();
-            subs.insert(id, tx.clone());
-        }
-        for shard in &self.shards {
-            let mut shard = shard.lock().unwrap();
-            shard.subscribers.insert(id, tx.clone());
-        }
+        self.subscribers.rcu(|cur| {
+            let mut v = (**cur).clone();
+            v.push((id, tx.clone()));
+            Arc::new(v)
+        });
         Subscription { rx, id }
     }
 
     pub(crate) fn unsubscribe(&self, id: SubscriptionId) {
-        {
-            let mut subs = self.subscribers.lock().unwrap();
-            subs.remove(&id);
-        }
-        for shard in &self.shards {
-            let mut shard = shard.lock().unwrap();
-            shard.subscribers.remove(&id);
-        }
+        self.subscribers
+            .rcu(|cur| Arc::new(cur.iter().filter(|(i, _)| *i != id).cloned().collect()));
     }
 
     pub(crate) fn peer_up(&self, data: PeerUpData) {
-        let subs = self.subscribers.lock().unwrap();
-        for tx in subs.values() {
+        for (_, tx) in self.subscribers.load().iter() {
             let _ = tx.send(BgpEvent::PeerUp(data.clone()));
         }
     }
 
     pub(crate) fn peer_down(&self, data: PeerDownData) {
-        let subs = self.subscribers.lock().unwrap();
-        for tx in subs.values() {
+        for (_, tx) in self.subscribers.load().iter() {
             let _ = tx.send(BgpEvent::PeerDown(data.clone()));
         }
     }
@@ -720,7 +723,11 @@ impl TableManager {
     /// Returns an empty Vec when no subscribers are registered, letting callers
     /// skip Adj-RIB-Out notification cheaply in the common (no-BMP) case.
     pub(crate) fn bmp_senders(&self) -> Vec<mpsc::UnboundedSender<BgpEvent>> {
-        self.subscribers.lock().unwrap().values().cloned().collect()
+        self.subscribers
+            .load()
+            .iter()
+            .map(|(_, tx)| tx.clone())
+            .collect()
     }
 
     /// Register a peer's event channel with every shard atomically.
@@ -973,7 +980,6 @@ fn nht_register(
 pub(crate) struct TableShard {
     pub(crate) rtable: table::Table,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
-    subscribers: FnvHashMap<SubscriptionId, mpsc::UnboundedSender<BgpEvent>>,
     pub(crate) addpath: FnvHashMap<IpAddr, FnvHashSet<Family>>,
     vrfs: SharedVrfs,
 }
@@ -1011,8 +1017,10 @@ impl TableShard {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn notify_adj_rib_in(
         &self,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
         source: Arc<table::Source>,
         family: Family,
         nets: &[packet::PathNlri],
@@ -1021,7 +1029,7 @@ impl TableShard {
         timestamp: std::time::SystemTime,
     ) {
         let addpath = self.has_addpath(&source.remote_addr, &family);
-        for tx in self.subscribers.values() {
+        for (_, tx) in subs {
             let _ = tx.send(BgpEvent::AdjRibIn(AdjRibInChange {
                 source: source.clone(),
                 family,
@@ -1034,8 +1042,10 @@ impl TableShard {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn notify_adj_rib_in_post(
         &self,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
         source: Arc<table::Source>,
         family: Family,
         nets: &[packet::PathNlri],
@@ -1044,7 +1054,7 @@ impl TableShard {
         timestamp: std::time::SystemTime,
     ) {
         let addpath = self.has_addpath(&source.remote_addr, &family);
-        for tx in self.subscribers.values() {
+        for (_, tx) in subs {
             let _ = tx.send(BgpEvent::AdjRibInPost(AdjRibInChange {
                 source: source.clone(),
                 family,
@@ -1137,6 +1147,7 @@ impl TableShard {
     /// [`table::Table::collect_adj_in_paths`] for the rationale.
     fn soft_reset_in(
         &mut self,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
         peer: std::net::IpAddr,
         import_policy: Option<&table::PolicyAssignment>,
         rpki: Option<&table::RpkiTable>,
@@ -1159,6 +1170,7 @@ impl TableShard {
             };
             if filtered {
                 self.notify_adj_rib_in_post(
+                    subs,
                     source.clone(),
                     family,
                     &[path_nlri],
@@ -1168,6 +1180,7 @@ impl TableShard {
                 );
             } else {
                 self.notify_adj_rib_in_post(
+                    subs,
                     source.clone(),
                     family,
                     &[path_nlri],
