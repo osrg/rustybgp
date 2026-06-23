@@ -64,6 +64,7 @@ fn flush_peer_snapshot(
     snapshot: &mut SnapshotMap,
     addr: IpAddr,
     peer_header: &bmp::PerPeerHeader,
+    flags: u8,
 ) -> Vec<bmp::Message> {
     let mut messages = Vec::new();
     let mut families_seen: FnvHashSet<Family> = FnvHashSet::default();
@@ -80,7 +81,7 @@ fn flush_peer_snapshot(
             });
             messages.push(bmp::Message::RouteMonitoring {
                 header: bmp::PerPeerHeader::new(
-                    0,
+                    flags,
                     change.source.remote_asn,
                     Ipv4Addr::from(change.source.router_id),
                     0,
@@ -263,16 +264,18 @@ impl BmpClient {
             .await;
 
         let mut snapshot: SnapshotMap = FnvHashMap::default();
+        let mut snapshot_post: SnapshotMap = FnvHashMap::default();
         let subscription = tables.subscribe(true);
         let sub_id = subscription.id;
         let mut rx = UnboundedReceiverStream::new(subscription.rx);
 
         // Drain snapshot phase until EndOfSnapshot sentinel.
-        // Concurrent AdjRibIn events that arrived during snapshotting are also
-        // fed to apply_snapshot so the map reflects the net state at subscribe time.
+        // Concurrent AdjRibIn/AdjRibInPost events that arrived during snapshotting
+        // are also accumulated so each map reflects the net state at subscribe time.
         while let Some(event) = rx.next().await {
             match event {
                 BgpEvent::AdjRibIn(change) => apply_snapshot(&mut snapshot, change),
+                BgpEvent::AdjRibInPost(change) => apply_snapshot(&mut snapshot_post, change),
                 BgpEvent::EndOfSnapshot => break,
                 _ => {} // PeerUp/Down reconstructed from global state below
             }
@@ -292,9 +295,24 @@ impl BmpClient {
             }
         }
 
-        // Send RouteMonitoring + EoR for buffered snapshot routes (per established peer).
+        // Send pre-policy RouteMonitoring + EoR for buffered snapshot routes.
         for (addr, peer_header) in &established_peers {
-            for msg in flush_peer_snapshot(&mut snapshot, *addr, peer_header) {
+            for msg in flush_peer_snapshot(&mut snapshot, *addr, peer_header, 0) {
+                if lines.send(&msg).await.is_err() {
+                    tables.unsubscribe(sub_id);
+                    return;
+                }
+            }
+        }
+
+        // Send post-policy RouteMonitoring + EoR for buffered snapshot routes.
+        for (addr, peer_header) in &established_peers {
+            for msg in flush_peer_snapshot(
+                &mut snapshot_post,
+                *addr,
+                &peer_header.clone().with_post_policy(),
+                bmp::Message::PEER_FLAG_POST_POLICY,
+            ) {
                 if lines.send(&msg).await.is_err() {
                     tables.unsubscribe(sub_id);
                     return;
@@ -662,7 +680,7 @@ mod tests {
     fn flush_peer_snapshot_empty_peer_returns_no_messages() {
         let mut snapshot = SnapshotMap::default();
         let header = dummy_header("10.0.0.1");
-        let msgs = flush_peer_snapshot(&mut snapshot, "10.0.0.1".parse().unwrap(), &header);
+        let msgs = flush_peer_snapshot(&mut snapshot, "10.0.0.1".parse().unwrap(), &header, 0);
         assert!(msgs.is_empty());
     }
 
@@ -677,7 +695,7 @@ mod tests {
         );
 
         let header = dummy_header("10.0.0.1");
-        let msgs = flush_peer_snapshot(&mut snapshot, source.remote_addr, &header);
+        let msgs = flush_peer_snapshot(&mut snapshot, source.remote_addr, &header, 0);
 
         // 1 RouteMonitoring + 1 EoR for IPV4
         assert_eq!(msgs.len(), 2);
@@ -703,7 +721,7 @@ mod tests {
         );
 
         let header = dummy_header("10.0.0.1");
-        let msgs = flush_peer_snapshot(&mut snapshot, source.remote_addr, &header);
+        let msgs = flush_peer_snapshot(&mut snapshot, source.remote_addr, &header, 0);
 
         // 2 RouteMonitoring + 2 EoR (one per family)
         assert_eq!(msgs.len(), 4);

@@ -70,6 +70,13 @@ impl PerPeerHeader {
         }
     }
 
+    pub fn with_post_policy(self) -> Self {
+        PerPeerHeader {
+            flags: self.flags | Message::PEER_FLAG_POST_POLICY,
+            ..self
+        }
+    }
+
     fn encode(&self, c: &mut BytesMut) -> Result<(), Error> {
         // peer type: 0 = Global Instance Peer
         c.put_u8(0);
