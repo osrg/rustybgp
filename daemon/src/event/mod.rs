@@ -1088,6 +1088,7 @@ impl Global {
                             state,
                             global.clone(),
                             tables.clone(),
+                            crate::bmp::BmpPolicy::Pre,
                         );
                     }
                 }

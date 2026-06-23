@@ -27,6 +27,27 @@ use rustybgp_packet::{self as packet, Family, bgp, bmp};
 
 use crate::event::{AdjRibInChange, AdjRibOutChange, BgpEvent, GlobalHandle, TableHandle};
 
+/// BMP monitoring policy: controls which RIB directions are sent to the client.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum BmpPolicy {
+    Pre,
+    Post,
+    Both,
+    All,
+}
+
+impl BmpPolicy {
+    fn want_adj_rib_in(self) -> bool {
+        matches!(self, Self::Pre | Self::Both | Self::All)
+    }
+    fn want_adj_rib_in_post(self) -> bool {
+        matches!(self, Self::Post | Self::Both | Self::All)
+    }
+    fn want_adj_rib_out(self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
 /// Net-state snapshot: (family, nlri) -> single-nlri AdjRibInChange per peer.
 type SnapshotMap = FnvHashMap<IpAddr, FnvHashMap<(Family, packet::PathNlri), AdjRibInChange>>;
 
@@ -234,6 +255,7 @@ impl BmpClient {
         cancel: CancellationToken,
         global: GlobalHandle,
         tables: TableHandle,
+        policy: BmpPolicy,
     ) {
         let mut lines = Framed::new(stream, bmp::BmpCodec::new());
         let sysname = hostname::get().unwrap_or_else(|_| std::ffi::OsString::from("unknown"));
@@ -296,26 +318,30 @@ impl BmpClient {
         }
 
         // Send pre-policy RouteMonitoring + EoR for buffered snapshot routes.
-        for (addr, peer_header) in &established_peers {
-            for msg in flush_peer_snapshot(&mut snapshot, *addr, peer_header, 0) {
-                if lines.send(&msg).await.is_err() {
-                    tables.unsubscribe(sub_id);
-                    return;
+        if policy.want_adj_rib_in() {
+            for (addr, peer_header) in &established_peers {
+                for msg in flush_peer_snapshot(&mut snapshot, *addr, peer_header, 0) {
+                    if lines.send(&msg).await.is_err() {
+                        tables.unsubscribe(sub_id);
+                        return;
+                    }
                 }
             }
         }
 
         // Send post-policy RouteMonitoring + EoR for buffered snapshot routes.
-        for (addr, peer_header) in &established_peers {
-            for msg in flush_peer_snapshot(
-                &mut snapshot_post,
-                *addr,
-                &peer_header.clone().with_post_policy(),
-                bmp::Message::PEER_FLAG_POST_POLICY,
-            ) {
-                if lines.send(&msg).await.is_err() {
-                    tables.unsubscribe(sub_id);
-                    return;
+        if policy.want_adj_rib_in_post() {
+            for (addr, peer_header) in &established_peers {
+                for msg in flush_peer_snapshot(
+                    &mut snapshot_post,
+                    *addr,
+                    &peer_header.clone().with_post_policy(),
+                    bmp::Message::PEER_FLAG_POST_POLICY,
+                ) {
+                    if lines.send(&msg).await.is_err() {
+                        tables.unsubscribe(sub_id);
+                        return;
+                    }
                 }
             }
         }
@@ -332,6 +358,9 @@ impl BmpClient {
                 event = rx.next() => {
                     match event {
                         Some(BgpEvent::AdjRibIn(change)) => {
+                            if !policy.want_adj_rib_in() {
+                                continue;
+                            }
                             let update = adj_rib_in_to_bmp_update(&change);
                             if lines
                                 .send(&bmp::Message::RouteMonitoring {
@@ -356,6 +385,9 @@ impl BmpClient {
                             }
                         }
                         Some(BgpEvent::AdjRibInPost(change)) => {
+                            if !policy.want_adj_rib_in_post() {
+                                continue;
+                            }
                             let update = adj_rib_in_to_bmp_update(&change);
                             if lines
                                 .send(&bmp::Message::RouteMonitoring {
@@ -380,6 +412,9 @@ impl BmpClient {
                             }
                         }
                         Some(BgpEvent::AdjRibOutPre(change)) => {
+                            if !policy.want_adj_rib_out() {
+                                continue;
+                            }
                             let update = adj_rib_out_to_bmp_update(&change);
                             if lines
                                 .send(&bmp::Message::RouteMonitoring {
@@ -405,6 +440,9 @@ impl BmpClient {
                             }
                         }
                         Some(BgpEvent::AdjRibOutPost(change)) => {
+                            if !policy.want_adj_rib_out() {
+                                continue;
+                            }
                             let update = adj_rib_out_to_bmp_update(&change);
                             if lines
                                 .send(&bmp::Message::RouteMonitoring {
@@ -486,6 +524,7 @@ impl BmpClient {
         state: Arc<BmpClientState>,
         global: GlobalHandle,
         tables: TableHandle,
+        policy: BmpPolicy,
     ) {
         tokio::spawn(async move {
             loop {
@@ -515,7 +554,7 @@ impl BmpClient {
                 );
 
                 tokio::select! {
-                    _ = BmpClient::serve(stream, cancel.clone(), global.clone(), tables.clone()) => {}
+                    _ = BmpClient::serve(stream, cancel.clone(), global.clone(), tables.clone(), policy) => {}
                     _ = cancel.cancelled() => return,
                 }
 

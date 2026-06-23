@@ -2804,18 +2804,19 @@ impl GoBgpService for GrpcService {
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
 
-        {
-            use api::add_bmp_request::MonitoringPolicy as P;
-            if !matches!(
-                P::try_from(request.policy),
-                Ok(P::Pre | P::Post | P::Both | P::All)
-            ) {
+        use api::add_bmp_request::MonitoringPolicy as P;
+        let bmp_policy = match P::try_from(request.policy) {
+            Ok(P::Pre) => crate::bmp::BmpPolicy::Pre,
+            Ok(P::Post) => crate::bmp::BmpPolicy::Post,
+            Ok(P::Both) => crate::bmp::BmpPolicy::Both,
+            Ok(P::All) => crate::bmp::BmpPolicy::All,
+            _ => {
                 return Err(tonic::Status::new(
                     tonic::Code::InvalidArgument,
                     "unsupported monitoring policy",
                 ));
             }
-        }
+        };
 
         let sockaddr = SocketAddr::new(addr, request.port as u16);
         match self.global.write().await.add_bmp_client(sockaddr) {
@@ -2832,6 +2833,7 @@ impl GoBgpService for GrpcService {
                     state,
                     self.global.clone(),
                     self.tables.clone(),
+                    bmp_policy,
                 );
             }
         }
