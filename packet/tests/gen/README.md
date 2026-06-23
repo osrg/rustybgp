@@ -17,7 +17,7 @@ run via the `go.sum` lockfile.
 ## Running a generator
 
 ```sh
-cd packet/tests/fixtures/gen
+cd packet/tests/gen
 go run ./vpn_nlri
 ```
 
