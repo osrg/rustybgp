@@ -29,7 +29,6 @@ pub struct Prefix {
     pub as_number: u32,
 }
 
-#[allow(dead_code)]
 pub enum Message {
     SerialNotify {
         session_id: u16,

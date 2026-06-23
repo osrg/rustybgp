@@ -21,7 +21,6 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::bgp;
 use crate::error::Error;
 
-#[allow(dead_code)]
 impl Message {
     pub const ROUTE_MONITORING: u8 = 0;
     pub const STATS_REPORTS: u8 = 1;
@@ -109,7 +108,6 @@ impl PerPeerHeader {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub enum PeerDownReason {
     LocalNotification(bgp::Message),
@@ -153,7 +151,6 @@ impl PeerDownReason {
     }
 }
 
-#[allow(dead_code)]
 pub enum Message {
     RouteMonitoring {
         header: PerPeerHeader,

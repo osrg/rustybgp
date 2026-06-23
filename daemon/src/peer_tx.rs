@@ -182,21 +182,8 @@ impl PendingTx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustybgp_table as table;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
     use std::str::FromStr;
-
-    #[allow(dead_code)]
-    fn src() -> Arc<table::Source> {
-        Arc::new(table::Source::new(
-            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)),
-            IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
-            1,
-            2,
-            Ipv4Addr::new(127, 0, 0, 1),
-            table::PeerRole::Ebgp,
-        ))
-    }
 
     fn nlri(net: &str) -> packet::Nlri {
         packet::Nlri::from_str(net).unwrap()

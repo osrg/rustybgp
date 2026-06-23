@@ -230,18 +230,6 @@ impl PathAttribute {
         }
     }
 
-    #[allow(dead_code)]
-    fn attr_med(&self) -> u32 {
-        match self
-            .attr
-            .iter()
-            .find(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
-        {
-            Some(attr) => attr.value().unwrap(),
-            None => 0,
-        }
-    }
-
     fn attr_originator_id(&self) -> Option<u32> {
         self.attr
             .iter()
@@ -2291,17 +2279,6 @@ mod tests {
         let bytes: Vec<u8> = ids.iter().flat_map(|&id| [0u8, 0, 0, id]).collect();
         Arc::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, bytes).unwrap(),
-        ])
-    }
-
-    #[allow(dead_code)]
-    fn attrs_with_originator(id: u8) -> Arc<Vec<packet::Attribute>> {
-        Arc::new(vec![
-            packet::Attribute::new_with_value(
-                packet::Attribute::ORIGINATOR_ID,
-                u32::from(Ipv4Addr::new(0, 0, 0, id)),
-            )
-            .unwrap(),
         ])
     }
 

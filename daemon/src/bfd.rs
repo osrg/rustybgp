@@ -141,11 +141,6 @@ struct PeerHandle {
 /// underlying task via the channel.
 pub(crate) struct BfdHandle {
     tx: mpsc::UnboundedSender<BfdRequest>,
-    #[allow(dead_code)]
-    stats: Arc<ServerStats>,
-    /// Peer states updated by peer tasks; read by gRPC handlers.
-    #[allow(dead_code)]
-    peer_states: Arc<RwLock<HashMap<IpAddr, PeerStateSnapshot>>>,
 }
 
 impl BfdHandle {
@@ -155,13 +150,8 @@ impl BfdHandle {
         let stats = Arc::new(ServerStats::default());
         let peer_states = Arc::new(RwLock::new(HashMap::<IpAddr, PeerStateSnapshot>::new()));
         let (req_tx, req_rx) = mpsc::unbounded_channel();
-        let h = BfdHandle {
-            tx: req_tx,
-            stats: stats.clone(),
-            peer_states: peer_states.clone(),
-        };
         tokio::spawn(server_loop(req_rx, event_tx, stats, peer_states));
-        h
+        BfdHandle { tx: req_tx }
     }
 
     /// Register a BGP peer for BFD monitoring.  Idempotent: a second call for
@@ -174,23 +164,6 @@ impl BfdHandle {
     /// is torn down without notifying BGP (the caller is responsible for that).
     pub(crate) fn remove_peer(&self, addr: IpAddr) {
         let _ = self.tx.send(BfdRequest::RemovePeer { addr });
-    }
-
-    /// Return the current BFD state snapshot for a peer (for gRPC queries).
-    #[allow(dead_code)]
-    pub(crate) fn get_peer_state(&self, addr: IpAddr) -> Option<PeerStateSnapshot> {
-        self.peer_states.read().ok()?.get(&addr).cloned()
-    }
-
-    /// Return server-wide packet counters.
-    #[allow(dead_code)]
-    pub(crate) fn get_server_stats(&self) -> (u64, u64, u64, u64) {
-        (
-            self.stats.rx_packet.load(Ordering::Relaxed),
-            self.stats.rx_error.load(Ordering::Relaxed),
-            self.stats.invalid_packet.load(Ordering::Relaxed),
-            self.stats.unknown_peer.load(Ordering::Relaxed),
-        )
     }
 }
 

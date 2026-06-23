@@ -101,7 +101,6 @@ impl MpHeader {
     }
 }
 
-#[allow(dead_code)]
 pub enum Message {
     Mp {
         header: MpHeader,
