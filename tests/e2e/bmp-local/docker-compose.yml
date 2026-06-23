@@ -1,0 +1,58 @@
+networks:
+  bmp-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.20.0/24
+          gateway: 172.30.20.254
+
+services:
+  rusty:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: rusty
+    privileged: true
+    networks:
+      bmp-net:
+        ipv4_address: 172.30.20.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+
+  gobgp-peer-a:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.gobgp
+    container_name: gobgp-peer-a
+    networks:
+      bmp-net:
+        ipv4_address: 172.30.20.2
+    volumes:
+      - ./gobgp-peer-a/gobgpd.conf:/etc/gobgpd.conf:ro
+      - ./gobgp-peer-a/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  gobgp-peer-b:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.gobgp
+    container_name: gobgp-peer-b
+    networks:
+      bmp-net:
+        ipv4_address: 172.30.20.3
+    volumes:
+      - ./gobgp-peer-b/gobgpd.conf:/etc/gobgpd.conf:ro
+      - ./gobgp-peer-b/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  bmp-receiver:
+    build:
+      context: ../shared/bmp-receiver
+      dockerfile: Dockerfile
+    container_name: bmp-receiver
+    networks:
+      bmp-net:
+        ipv4_address: 172.30.20.10

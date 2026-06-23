@@ -1,0 +1,18 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.20.1"
+
+bmp-servers:
+  - config:
+      address: "172.30.20.10"
+      port: 11019
+      route-monitoring-policy: pre-policy
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.20.2"
+      peer-as: 65002
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast

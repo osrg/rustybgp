@@ -1,0 +1,42 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.20.1"
+  apply-policy:
+    config:
+      export-policy-list:
+        - deny-10-2
+      default-export-policy: accept-route
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.20.2"
+      peer-as: 65002
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+
+  - config:
+      neighbor-address: "172.30.20.3"
+      peer-as: 65003
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+
+defined-sets:
+  prefix-sets:
+    - prefix-set-name: prefix-10-2
+      prefix-list:
+        - ip-prefix: "10.2.0.0/24"
+          masklength-range: "24..24"
+
+policy-definitions:
+  - name: deny-10-2
+    statements:
+      - name: s1
+        conditions:
+          match-prefix-set:
+            prefix-set: prefix-10-2
+            match-set-options: any
+        actions:
+          route-disposition: reject-route
