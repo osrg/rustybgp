@@ -529,7 +529,7 @@ pub enum Nlri {
 }
 
 impl Nlri {
-    fn encode<B: BufMut>(&self, dst: &mut B) -> Result<u16, ()> {
+    pub(crate) fn encode<B: BufMut>(&self, dst: &mut B) -> Result<u16, ()> {
         match self {
             Nlri::V4(net) => net.encode(dst),
             Nlri::V6(net) => net.encode(dst),
@@ -1293,10 +1293,10 @@ pub struct Attribute {
 
 impl Attribute {
     pub const ORIGIN_INCOMPLETE: u8 = 2;
-    const FLAG_EXTENDED: u8 = 1 << 4;
+    pub(crate) const FLAG_EXTENDED: u8 = 1 << 4;
     pub const FLAG_PARTIAL: u8 = 1 << 5;
-    const FLAG_TRANSITIVE: u8 = 1 << 6;
-    const FLAG_OPTIONAL: u8 = 1 << 7;
+    pub(crate) const FLAG_TRANSITIVE: u8 = 1 << 6;
+    pub(crate) const FLAG_OPTIONAL: u8 = 1 << 7;
 
     pub const ORIGIN: u8 = 1;
     pub const AS_PATH: u8 = 2;
