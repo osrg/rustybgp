@@ -301,10 +301,7 @@ pub fn encode_table_dump(
                 SUBTYPE_RIB_IPV6_UNICAST,
                 |dst| {
                     dst.put_u32(*seq);
-                    // GoBGP includes AFI/SAFI for IPv6 unicast (and multicast/flowspec IPv4)
-                    // even though RFC 6396 subtypes would make them implicit.
-                    dst.put_u16(bgp::Family::IPV6.afi());
-                    dst.put_u8(bgp::Family::IPV6.safi());
+                    // RFC 6396 §4.3.2: AFI/SAFI are implicit from the subtype; omit them.
                     prefix.encode(dst).unwrap();
                     write_rib_entries(dst, entries, true);
                 },
@@ -464,7 +461,11 @@ mod tests {
         assert_eq!(&buf[..], GOBGP_RIB_IPV4_UNICAST);
     }
 
+    // GoBGP adds AFI/SAFI to RIB_IPV6_UNICAST body even though RFC 6396 §4.3.2
+    // says they are implicit from the subtype.  Our encoder follows the RFC, so
+    // this test is ignored rather than deleted to document the divergence.
     #[test]
+    #[ignore = "GoBGP deviates from RFC 6396: adds AFI/SAFI to RIB_IPV6_UNICAST body"]
     fn table_dump_rib_ipv6_unicast_matches_gobgp() {
         let prefix: bgp::Nlri = "2001:db8::/32".parse().unwrap();
         let nexthop = bgp::Nexthop::V6(Ipv6Addr::from_str("2001:db8::1").unwrap());
@@ -485,5 +486,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&buf[..], GOBGP_RIB_IPV6_UNICAST);
+    }
+
+    // RFC 6396 §4.3.2 compliant encoding: no AFI/SAFI in body (body len = 52 = 0x34).
+    // GoBGP adds 3 extra bytes (AFI=2, SAFI=1) making its body 55 bytes.
+    const RFC_RIB_IPV6_UNICAST: &[u8] = &[
+        0x3b, 0x9a, 0xca, 0x00, 0x00, 0x0d, 0x00, 0x04, 0x00, 0x00, 0x00, 0x34, // header
+        0x00, 0x00, 0x00, 0x01, // seq = 1
+        0x20, 0x20, 0x01, 0x0d, 0xb8, // prefix_len=32, prefix=2001:db8::
+        0x00, 0x01, // entry count = 1
+        0x00, 0x00, // peer_index = 0
+        0x3b, 0x9a, 0xca, 0x00, // originated = 1000000000
+        0x00, 0x21, // attr_len = 33
+        0x40, 0x01, 0x01, 0x00, // ORIGIN = IGP
+        0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH = [65001]
+        0x80, 0x0e, 0x11, // MP_REACH_NLRI: optional, type=14, len=17
+        0x10, // nexthop_len = 16
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, // nexthop = 2001:db8::1
+    ];
+
+    #[test]
+    fn table_dump_rib_ipv6_unicast_rfc_compliant() {
+        let prefix: bgp::Nlri = "2001:db8::/32".parse().unwrap();
+        let nexthop = bgp::Nexthop::V6(Ipv6Addr::from_str("2001:db8::1").unwrap());
+        let mut buf = BytesMut::new();
+        encode_table_dump(
+            FIXED_TS,
+            &TableDumpRecord::RibIpv6Unicast {
+                seq: 1,
+                prefix,
+                entries: vec![RibEntry {
+                    peer_index: 0,
+                    originated: FIXED_TS,
+                    nexthop: Some(nexthop),
+                    attrs: make_attrs_origin_aspath(),
+                }],
+            },
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(&buf[..], RFC_RIB_IPV6_UNICAST);
     }
 }
