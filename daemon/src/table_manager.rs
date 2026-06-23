@@ -64,6 +64,17 @@ pub(crate) struct PeerDownData {
     pub(crate) reason: rustybgp_packet::bmp::PeerDownReason,
 }
 
+/// A Loc-RIB best-path change for BMP LOCAL monitoring (RFC 9069).
+/// `attr` is `None` for withdrawals (best path removed).
+#[derive(Clone)]
+pub(crate) struct LocRibChange {
+    pub(crate) family: Family,
+    pub(crate) net: packet::Nlri,
+    pub(crate) attr: Option<Arc<Vec<packet::Attribute>>>,
+    pub(crate) nexthop: Option<bgp::Nexthop>,
+    pub(crate) timestamp: u32,
+}
+
 /// An Adj-RIB-Out update for one neighbor (RFC 8671).
 /// `attrs` is `None` for withdrawals; `Some` for route announcements.
 #[derive(Clone)]
@@ -87,6 +98,8 @@ pub(crate) enum BgpEvent {
     AdjRibOutPost(AdjRibOutChange),
     PeerUp(PeerUpData),
     PeerDown(PeerDownData),
+    /// Loc-RIB best-path change for BMP LOCAL monitoring (RFC 9069).
+    LocRib(LocRibChange),
     /// Sentinel sent by `subscribe(true)` after all snapshot events have been queued.
     EndOfSnapshot,
 }
@@ -352,7 +365,7 @@ impl TableManager {
             table::InsertResult::PrefixLimitExceeded => return true,
             table::InsertResult::Changed(update) => {
                 nht_register(kernel_handle.as_deref(), &source, nh, old_nh);
-                t.distribute_update(update, kernel_handle.as_deref());
+                t.distribute_update(update, kernel_handle.as_deref(), &subs);
             }
             table::InsertResult::NoChange => {
                 nht_register(kernel_handle.as_deref(), &source, nh, old_nh);
@@ -397,7 +410,7 @@ impl TableManager {
             t.rtable
                 .remove(source.clone(), family, net.nlri, net.path_id, counter_ref);
         if let Some(update) = change {
-            t.distribute_update(update, kernel_handle.as_deref());
+            t.distribute_update(update, kernel_handle.as_deref(), &subs);
         }
         if let Some(nh) = old_nh
             && !source.is_kernel()
@@ -468,30 +481,33 @@ impl TableManager {
 
     pub(crate) fn drop_families(&self, addr: IpAddr, families: &[Family]) {
         let kernel_handle = self.kernel_handle.load_full();
+        let subs = self.subscribers.load();
         for shard in &self.shards {
             let mut t = shard.lock().unwrap();
             for &family in families {
-                t.disconnected(addr, family, kernel_handle.as_deref());
+                t.disconnected(addr, family, kernel_handle.as_deref(), &subs);
             }
         }
     }
 
     pub(crate) fn drop_stale_families(&self, addr: IpAddr, families: &[Family]) {
         let kernel_handle = self.kernel_handle.load_full();
+        let subs = self.subscribers.load();
         for shard in &self.shards {
             let mut t = shard.lock().unwrap();
             for &family in families {
-                t.drop_stale(addr, family, kernel_handle.as_deref());
+                t.drop_stale(addr, family, kernel_handle.as_deref(), &subs);
             }
         }
     }
 
     pub(crate) fn end_deferral_families(&self, families: &[Family]) {
         let kernel_handle = self.kernel_handle.load_full();
+        let subs = self.subscribers.load();
         for shard in &self.shards {
             let mut t = shard.lock().unwrap();
             for &family in families {
-                t.end_deferral(family, kernel_handle.as_deref());
+                t.end_deferral(family, kernel_handle.as_deref(), &subs);
             }
         }
     }
@@ -549,6 +565,17 @@ impl TableManager {
             out.extend(shard.lock().unwrap().rtable.collect_loc_rib_paths(&family));
         }
         out
+    }
+
+    /// Enumerate all active RIB families across all shards (deduplicated).
+    pub(crate) fn all_families(&self) -> Vec<Family> {
+        let mut seen = FnvHashSet::default();
+        for shard in &self.shards {
+            for f in shard.lock().unwrap().rtable.families() {
+                seen.insert(f);
+            }
+        }
+        seen.into_iter().collect()
     }
 
     /// Collect all adj-in RTC paths for `peer` across all shards (stale and fresh).
@@ -768,15 +795,16 @@ impl TableManager {
         stale_families: &[Family],
     ) {
         let kernel_handle = self.kernel_handle.load_full();
+        let subs = self.subscribers.load();
         for shard in &self.shards {
             let mut t = shard.lock().unwrap();
             t.peer_event_tx.remove(&addr);
             t.addpath.remove(&addr);
             for &family in drop_families {
-                t.disconnected(addr, family, kernel_handle.as_deref());
+                t.disconnected(addr, family, kernel_handle.as_deref(), &subs);
             }
             for &family in stale_families {
-                t.mark_stale(addr, family, kernel_handle.as_deref());
+                t.mark_stale(addr, family, kernel_handle.as_deref(), &subs);
             }
         }
     }
@@ -798,10 +826,11 @@ impl TableManager {
         self.nexthop_invalid.store(Arc::new(new_set));
 
         let kernel_handle = self.kernel_handle.load_full();
+        let subs = self.subscribers.load();
         for shard in &self.shards {
             let mut t = shard.lock().unwrap();
             for change in t.rtable.update_nexthop_validity(addr, reachable) {
-                t.distribute_update(change, kernel_handle.as_deref());
+                t.distribute_update(change, kernel_handle.as_deref(), &subs);
             }
         }
     }
@@ -999,10 +1028,11 @@ impl TableShard {
         addr: IpAddr,
         family: Family,
         kernel_handle: Option<&kernel::KernelHandle>,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
     ) {
         let (changes, nexthops) = self.rtable.drop(addr, family);
         for change in changes {
-            self.distribute_update(change, kernel_handle);
+            self.distribute_update(change, kernel_handle, subs);
         }
         if let Some(handle) = kernel_handle {
             for nh in nexthops {
@@ -1016,9 +1046,10 @@ impl TableShard {
         addr: IpAddr,
         family: Family,
         kernel_handle: Option<&kernel::KernelHandle>,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
     ) {
         for change in self.rtable.restale(addr, family) {
-            self.distribute_update(change, kernel_handle);
+            self.distribute_update(change, kernel_handle, subs);
         }
     }
 
@@ -1076,6 +1107,7 @@ impl TableShard {
         &self,
         update: table::NlriChange,
         kernel_handle: Option<&kernel::KernelHandle>,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
     ) {
         // Kernel route update for rank-1 best (raw, without export policy).
         // kernel_handle is rarely set, so check it first.
@@ -1131,6 +1163,24 @@ impl TableShard {
                         });
                     }
                 }
+            }
+        }
+
+        // Emit Loc-RIB event to BMP subscribers when best-path changes.
+        if update.best_changed && !subs.is_empty() {
+            let best = update.new_best();
+            let change = LocRibChange {
+                family: update.family,
+                net: update.net.clone(),
+                attr: best.map(|p| p.attr.clone()),
+                nexthop: best.and_then(|p| p.nexthop),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as u32,
+            };
+            for (_, tx) in subs {
+                let _ = tx.send(BgpEvent::LocRib(change.clone()));
             }
         }
 
@@ -1222,7 +1272,7 @@ impl TableShard {
                 timestamp,
             ) {
                 table::InsertResult::Changed(update) => {
-                    self.distribute_update(update, kernel_handle);
+                    self.distribute_update(update, kernel_handle, subs);
                 }
                 table::InsertResult::NoChange | table::InsertResult::PrefixLimitExceeded => {}
             }
@@ -1234,10 +1284,11 @@ impl TableShard {
         addr: IpAddr,
         family: Family,
         kernel_handle: Option<&kernel::KernelHandle>,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
     ) {
         let (changes, nexthops) = self.rtable.drop_stale(addr, family, None);
         for change in changes {
-            self.distribute_update(change, kernel_handle);
+            self.distribute_update(change, kernel_handle, subs);
         }
         if let Some(handle) = kernel_handle {
             for nh in nexthops {
@@ -1246,9 +1297,14 @@ impl TableShard {
         }
     }
 
-    fn end_deferral(&mut self, family: Family, kernel_handle: Option<&kernel::KernelHandle>) {
+    fn end_deferral(
+        &mut self,
+        family: Family,
+        kernel_handle: Option<&kernel::KernelHandle>,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
+    ) {
         for change in self.rtable.end_deferral(family) {
-            self.distribute_update(change, kernel_handle);
+            self.distribute_update(change, kernel_handle, subs);
         }
     }
 }

@@ -25,7 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use rustybgp_packet::{self as packet, Family, bgp, bmp};
 
-use crate::event::{AdjRibInChange, AdjRibOutChange, BgpEvent, GlobalHandle, TableHandle};
+use crate::event::{
+    AdjRibInChange, AdjRibOutChange, BgpEvent, GlobalHandle, LocRibChange, TableHandle,
+};
 
 /// BMP monitoring policy: controls which RIB directions are sent to the client.
 #[derive(Clone, Copy, PartialEq)]
@@ -33,6 +35,7 @@ pub(crate) enum BmpPolicy {
     Pre,
     Post,
     Both,
+    Local,
     All,
 }
 
@@ -45,6 +48,9 @@ impl BmpPolicy {
     }
     fn want_adj_rib_out(self) -> bool {
         matches!(self, Self::All)
+    }
+    fn want_loc_rib(self) -> bool {
+        matches!(self, Self::Local | Self::All)
     }
 }
 
@@ -144,6 +150,68 @@ fn adj_rib_in_to_bmp_update(change: &AdjRibInChange) -> bgp::Message {
             family: change.family,
             entries: change.nlris.clone(),
         })
+    }
+}
+
+/// Build the BMP RouteMonitoring message for one Loc-RIB best-path event (RFC 9069).
+fn loc_rib_to_bmp(change: &LocRibChange, router_id: Ipv4Addr, local_asn: u32) -> bmp::Message {
+    let update = if let Some(ref attr) = change.attr {
+        bgp::Message::Update(bgp::Update::Reach {
+            family: change.family,
+            entries: vec![packet::PathNlri {
+                nlri: change.net.clone(),
+                path_id: 0,
+            }],
+            nexthop: change.nexthop,
+            attr: attr.clone(),
+        })
+    } else {
+        bgp::Message::Update(bgp::Update::Unreach {
+            family: change.family,
+            entries: vec![packet::PathNlri {
+                nlri: change.net.clone(),
+                path_id: 0,
+            }],
+        })
+    };
+    bmp::Message::RouteMonitoring {
+        header: bmp::PerPeerHeader::new(
+            0,
+            local_asn,
+            router_id,
+            0,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            change.timestamp,
+        )
+        .with_peer_type(bmp::Message::PEER_TYPE_LOC_RIB),
+        update,
+        addpath: false,
+    }
+}
+
+/// Build the BMP PeerUp for the Loc-RIB virtual peer (RFC 9069 §3.2).
+fn loc_rib_peer_up(router_id: Ipv4Addr, local_asn: u32) -> bmp::Message {
+    let open = bgp::Message::Open(bgp::Open {
+        as_number: local_asn,
+        holdtime: bgp::HoldTime::DISABLED,
+        router_id: u32::from(router_id),
+        capability: vec![],
+    });
+    bmp::Message::PeerUp {
+        header: bmp::PerPeerHeader::new(
+            0,
+            local_asn,
+            router_id,
+            0,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        )
+        .with_peer_type(bmp::Message::PEER_TYPE_LOC_RIB),
+        local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        local_port: 0,
+        remote_port: 0,
+        local_open: open.clone(),
+        remote_open: open,
     }
 }
 
@@ -346,6 +414,63 @@ impl BmpClient {
             }
         }
 
+        // Send Loc-RIB snapshot: PeerUp for the virtual peer, then one
+        // RouteMonitoring per best-path prefix, then EoR per family.
+        if policy.want_loc_rib() {
+            let local_asn = global.read().await.asn;
+            let peer_up = loc_rib_peer_up(local_id, local_asn);
+            if lines.send(&peer_up).await.is_err() {
+                tables.unsubscribe(sub_id);
+                return;
+            }
+            let mut families_seen: FnvHashSet<Family> = FnvHashSet::default();
+            for family in tables.all_families() {
+                for change in tables.collect_loc_rib_paths(family) {
+                    let best = change.new_best();
+                    if best.is_none() {
+                        continue;
+                    }
+                    let lrc = LocRibChange {
+                        family: change.family,
+                        net: change.net.clone(),
+                        attr: best.map(|p| p.attr.clone()),
+                        nexthop: best.and_then(|p| p.nexthop),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as u32,
+                    };
+                    let msg = loc_rib_to_bmp(&lrc, local_id, local_asn);
+                    if lines.send(&msg).await.is_err() {
+                        tables.unsubscribe(sub_id);
+                        return;
+                    }
+                    families_seen.insert(family);
+                }
+            }
+            // Send EoR per family seen in the Loc-RIB snapshot.
+            let loc_rib_eor_header = bmp::PerPeerHeader::new(
+                0,
+                local_asn,
+                local_id,
+                0,
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                0,
+            )
+            .with_peer_type(bmp::Message::PEER_TYPE_LOC_RIB);
+            for family in families_seen {
+                let eor = bmp::Message::RouteMonitoring {
+                    header: loc_rib_eor_header.clone(),
+                    update: bgp::Message::eor(family),
+                    addpath: false,
+                };
+                if lines.send(&eor).await.is_err() {
+                    tables.unsubscribe(sub_id);
+                    return;
+                }
+            }
+        }
+
         // Live event loop.
         loop {
             tokio::select! {
@@ -465,6 +590,16 @@ impl BmpClient {
                                 .await
                                 .is_err()
                             {
+                                break;
+                            }
+                        }
+                        Some(BgpEvent::LocRib(change)) => {
+                            if !policy.want_loc_rib() {
+                                continue;
+                            }
+                            let local_asn = global.read().await.asn;
+                            let msg = loc_rib_to_bmp(&change, local_id, local_asn);
+                            if lines.send(&msg).await.is_err() {
                                 break;
                             }
                         }

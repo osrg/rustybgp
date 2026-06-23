@@ -31,6 +31,11 @@ impl Message {
     pub const TERMINATION: u8 = 5;
     pub const ROUTE_MIRRORING: u8 = 6;
 
+    /// Per-peer type: Global Instance Peer (RFC 7854 §4.2).
+    pub const PEER_TYPE_GLOBAL: u8 = 0;
+    /// Per-peer type: Loc-RIB Instance Peer (RFC 9069 §3.1).
+    pub const PEER_TYPE_LOC_RIB: u8 = 3;
+
     /// Per-peer header flag: peer address is IPv6 (RFC 7854 §4.2, V flag).
     pub const PEER_FLAG_IPV6: u8 = 0x80;
     /// Per-peer header flag: Adj-RIB-In post-policy (RFC 7854 §4.2, L flag).
@@ -41,6 +46,8 @@ impl Message {
 
 #[derive(Clone)]
 pub struct PerPeerHeader {
+    /// Peer Type field (RFC 7854 §4.2): 0 = Global, 3 = Loc-RIB (RFC 9069).
+    peer_type: u8,
     /// Caller-supplied per-peer flags (L, O, A, …).
     /// The V (IPv6) flag is computed from `remote_addr` at encode time.
     flags: u8,
@@ -61,6 +68,7 @@ impl PerPeerHeader {
         timestamp: u32,
     ) -> Self {
         PerPeerHeader {
+            peer_type: Message::PEER_TYPE_GLOBAL,
             flags,
             asn,
             id,
@@ -77,9 +85,13 @@ impl PerPeerHeader {
         }
     }
 
+    /// Set peer_type to Loc-RIB Instance Peer (RFC 9069 §3.1).
+    pub fn with_peer_type(self, peer_type: u8) -> Self {
+        PerPeerHeader { peer_type, ..self }
+    }
+
     fn encode(&self, c: &mut BytesMut) -> Result<(), Error> {
-        // peer type: 0 = Global Instance Peer
-        c.put_u8(0);
+        c.put_u8(self.peer_type);
         let wire_flags = self.flags
             | if self.remote_addr.is_ipv6() {
                 Message::PEER_FLAG_IPV6

@@ -660,7 +660,7 @@ pub(super) struct ConfederationConfig {
 }
 
 pub(crate) struct Global {
-    asn: u32,
+    pub(crate) asn: u32,
     pub(crate) router_id: Ipv4Addr,
     listen_port: Option<u16>,
     listen_sockets: Vec<RawFd>,
@@ -1512,7 +1512,9 @@ fn start_grpc_server(
 
 use crate::table_manager::{PeerDownData, PeerUpData, SubscriptionId, TableManager};
 // Re-export for mrt.rs and bmp.rs which import from crate::event.
-pub(crate) use crate::table_manager::{AdjRibInChange, AdjRibOutChange, BgpEvent, TableHandle};
+pub(crate) use crate::table_manager::{
+    AdjRibInChange, AdjRibOutChange, BgpEvent, LocRibChange, TableHandle,
+};
 
 pub(crate) async fn main(
     bgp: Option<config::BgpConfig>,

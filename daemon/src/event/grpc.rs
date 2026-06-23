@@ -2809,6 +2809,7 @@ impl GoBgpService for GrpcService {
             Ok(P::Pre) => crate::bmp::BmpPolicy::Pre,
             Ok(P::Post) => crate::bmp::BmpPolicy::Post,
             Ok(P::Both) => crate::bmp::BmpPolicy::Both,
+            Ok(P::Local) => crate::bmp::BmpPolicy::Local,
             Ok(P::All) => crate::bmp::BmpPolicy::All,
             _ => {
                 return Err(tonic::Status::new(
