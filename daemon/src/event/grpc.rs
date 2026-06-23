@@ -56,6 +56,34 @@ fn adj_rib_in_to_table_event(change: &AdjRibInChange) -> api::WatchEventResponse
     }
 }
 
+fn loc_rib_to_table_event(
+    family: Family,
+    net: &packet::Nlri,
+    attr: Option<&Arc<Vec<packet::Attribute>>>,
+) -> api::WatchEventResponse {
+    let path = if let Some(attrs) = attr {
+        api::Path {
+            nlri: Some(convert::nlri_to_api(net)),
+            family: Some(convert::family_to_api(family)),
+            best: true,
+            pattrs: attrs.iter().map(convert::attr_to_api).collect(),
+            ..Default::default()
+        }
+    } else {
+        api::Path {
+            nlri: Some(convert::nlri_to_api(net)),
+            family: Some(convert::family_to_api(family)),
+            is_withdraw: true,
+            ..Default::default()
+        }
+    };
+    api::WatchEventResponse {
+        event: Some(api::watch_event_response::Event::Table(
+            api::watch_event_response::TableEvent { paths: vec![path] },
+        )),
+    }
+}
+
 fn watch_peer_event(
     ty: api::watch_event_response::peer_event::Type,
     addr: std::net::IpAddr,
@@ -1260,15 +1288,20 @@ impl GoBgpService for GrpcService {
         let req = request.into_inner();
 
         let want_peer = req.peer.is_some();
-        let (want_table, want_post_policy, want_init, peer_addr_filter) =
+        let (want_table, want_adjin, want_best, want_post_policy, want_init, peer_addr_filter) =
             if let Some(table) = &req.table {
+                let mut adjin = false;
+                let mut best = false;
                 let mut post_policy = false;
                 let mut init = false;
                 let mut filter_addr: Option<std::net::IpAddr> = None;
                 for f in &table.filters {
                     use api::watch_event_request::table::filter::Type;
-                    if f.r#type() == Type::PostPolicy {
-                        post_policy = true;
+                    match f.r#type() {
+                        Type::Unspecified | Type::Adjin => adjin = true,
+                        Type::Best => best = true,
+                        Type::PostPolicy => post_policy = true,
+                        Type::Eor => {}
                     }
                     if f.init {
                         init = true;
@@ -1277,14 +1310,22 @@ impl GoBgpService for GrpcService {
                         filter_addr = f.peer_address.parse().ok();
                     }
                 }
-                (true, post_policy, init, filter_addr)
+                // No explicit type defaults to pre-policy Adj-RIB-In.
+                if !adjin && !best && !post_policy {
+                    adjin = true;
+                }
+                (true, adjin, best, post_policy, init, filter_addr)
             } else {
-                (false, false, false, None)
+                (false, false, false, false, false, None)
             };
 
         let tables2 = self.tables.clone();
         let global2 = self.global.clone();
-        let subscription = self.tables.subscribe(want_table && want_init);
+        // TYPE_BEST init uses collect_loc_rib_paths; the subscribe snapshot covers
+        // only AdjRibIn/AdjRibInPost.
+        let subscription = self
+            .tables
+            .subscribe((want_adjin || want_post_policy) && want_init);
         let sub_id = subscription.id;
         let (tx, rx) = mpsc::channel(1024);
         let cancel = CancellationToken::new();
@@ -1339,11 +1380,11 @@ impl GoBgpService for GrpcService {
                     }
                 }
 
-                // Phase 2: table snapshot drain -- only when want_init was requested.
-                if want_table && want_init {
+                // Phase 2: AdjRibIn/PostPolicy snapshot drain from subscribe channel.
+                if (want_adjin || want_post_policy) && want_init {
                     'snapshot: loop {
                         match event_rx.next().await {
-                            Some(BgpEvent::AdjRibIn(change)) => {
+                            Some(BgpEvent::AdjRibIn(change)) if want_adjin => {
                                 if matches!(peer_addr_filter, Some(a) if a != change.source.remote_addr)
                                 {
                                     continue 'snapshot;
@@ -1375,7 +1416,28 @@ impl GoBgpService for GrpcService {
                     }
                 }
 
-                // Phase 3: live event loop.
+                // Phase 3: TYPE_BEST init snapshot -- Loc-RIB current state.
+                // Done after the AdjRibIn snapshot so the Loc-RIB state is consistent
+                // with the post-import best-path selection.
+                if want_best && want_init {
+                    for family in tables2.all_families() {
+                        for dest in tables2.collect_loc_rib_paths(family) {
+                            if dest.new_best().is_none() {
+                                continue;
+                            }
+                            let r = loc_rib_to_table_event(
+                                dest.family,
+                                &dest.net,
+                                dest.new_best().map(|p| &p.attr),
+                            );
+                            if tx.send(Ok(r)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                // Phase 4: live event loop.
                 loop {
                     let event = tokio::select! {
                         e = event_rx.next() => match e { Some(e) => e, None => return },
@@ -1404,7 +1466,7 @@ impl GoBgpService for GrpcService {
                                 false,
                             )
                         }
-                        BgpEvent::AdjRibIn(change) if want_table => {
+                        BgpEvent::AdjRibIn(change) if want_table && want_adjin => {
                             if matches!(peer_addr_filter, Some(a) if a != change.source.remote_addr)
                             {
                                 continue;
@@ -1417,6 +1479,13 @@ impl GoBgpService for GrpcService {
                                 continue;
                             }
                             adj_rib_in_to_table_event(&change)
+                        }
+                        BgpEvent::LocRib(change) if want_table && want_best => {
+                            loc_rib_to_table_event(
+                                change.family,
+                                &change.net,
+                                change.attr.as_ref(),
+                            )
                         }
                         _ => continue,
                     };
