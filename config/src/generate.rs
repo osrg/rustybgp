@@ -551,6 +551,24 @@ impl TryFrom<String> for RpkiValidationResultType {
         }
     }
 }
+// typedef for identity gobgp:mrt-type.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub enum MrtType {
+    Updates,
+    Table,
+}
+
+impl TryFrom<String> for MrtType {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "updates" => Ok(Self::Updates),
+            "table" => Ok(Self::Table),
+            _ => Err(format!("invalid parameter (MrtType) {}", s)),
+        }
+    }
+}
 // typedef for identity gobgp:bfd-session-state.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(try_from = "String")]
@@ -580,12 +598,12 @@ pub enum BfdDiagnosticCode {
     NoDiagnostic,
     DetectionTimeout,
     EchoFailed,
-    ForwardingReset,
+    NeighborSignaledSessionDown,
+    ForwardingPlaneReset,
     PathDown,
     ConcatenatedPathDown,
-    AdminDown,
+    AdministrativelyDown,
     ReverseConcatenatedPathDown,
-    NeighborDown,
 }
 
 impl TryFrom<String> for BfdDiagnosticCode {
@@ -595,31 +613,13 @@ impl TryFrom<String> for BfdDiagnosticCode {
             "no_diagnostic" => Ok(Self::NoDiagnostic),
             "detection_timeout" => Ok(Self::DetectionTimeout),
             "echo_failed" => Ok(Self::EchoFailed),
-            "forwarding_reset" => Ok(Self::ForwardingReset),
+            "neighbor_signaled_session_down" => Ok(Self::NeighborSignaledSessionDown),
+            "forwarding_plane_reset" => Ok(Self::ForwardingPlaneReset),
             "path_down" => Ok(Self::PathDown),
             "concatenated_path_down" => Ok(Self::ConcatenatedPathDown),
-            "admin_down" => Ok(Self::AdminDown),
+            "administratively_down" => Ok(Self::AdministrativelyDown),
             "reverse_concatenated_path_down" => Ok(Self::ReverseConcatenatedPathDown),
-            "neighbor_down" => Ok(Self::NeighborDown),
             _ => Err(format!("invalid parameter (BfdDiagnosticCode) {}", s)),
-        }
-    }
-}
-// typedef for identity gobgp:mrt-type.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub enum MrtType {
-    Updates,
-    Table,
-}
-
-impl TryFrom<String> for MrtType {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        match s.as_str() {
-            "updates" => Ok(Self::Updates),
-            "table" => Ok(Self::Table),
-            _ => Err(format!("invalid parameter (MrtType) {}", s)),
         }
     }
 }
@@ -1359,6 +1359,11 @@ pub struct BfdState {
     // gobgp:enabled's original type is boolean.
     // Enable BFD liveness detection for this BGP neighbor.
     pub enabled: Option<bool>,
+    // original -> gobgp:port
+    // Destination UDP port for BFD control packets.
+    // Using a non-default port deviates from RFC 5881,
+    // which explicitly mandates destination UDP port 3784.
+    pub port: Option<u16>,
     // original -> gobgp:desired-minimum-tx-interval
     // Desired minimum transmission interval for BFD control packets.
     #[serde(rename = "desired-minimum-tx-interval")]
@@ -1368,8 +1373,7 @@ pub struct BfdState {
     #[serde(rename = "required-minimum-receive")]
     pub required_minimum_receive: Option<u32>,
     // original -> gobgp:detection-multiplier
-    // Detection time multiplier.  The negotiated transmit interval
-    // multiplied by this value gives the detection time.
+    // Detection time multiplier.
     #[serde(rename = "detection-multiplier")]
     pub detection_multiplier: Option<u8>,
     // original -> gobgp:session-state
@@ -1391,11 +1395,11 @@ pub struct BfdState {
     // original -> gobgp:local-discriminator
     // Unique local discriminator for this BFD session.
     #[serde(rename = "local-discriminator")]
-    pub local_discriminator: Option<String>,
+    pub local_discriminator: Option<u32>,
     // original -> gobgp:remote-discriminator
     // Discriminator received from the remote system.
     #[serde(rename = "remote-discriminator")]
-    pub remote_discriminator: Option<String>,
+    pub remote_discriminator: Option<u32>,
     // original -> gobgp:local-diagnostic-code
     // Diagnostic code for the last local session failure.
     #[serde(rename = "local-diagnostic-code")]
@@ -1422,6 +1426,11 @@ pub struct BfdConfig {
     // gobgp:enabled's original type is boolean.
     // Enable BFD liveness detection for this BGP neighbor.
     pub enabled: Option<bool>,
+    // original -> gobgp:port
+    // Destination UDP port for BFD control packets.
+    // Using a non-default port deviates from RFC 5881,
+    // which explicitly mandates destination UDP port 3784.
+    pub port: Option<u16>,
     // original -> gobgp:desired-minimum-tx-interval
     // Desired minimum transmission interval for BFD control packets.
     #[serde(rename = "desired-minimum-tx-interval")]
@@ -1431,8 +1440,7 @@ pub struct BfdConfig {
     #[serde(rename = "required-minimum-receive")]
     pub required_minimum_receive: Option<u32>,
     // original -> gobgp:detection-multiplier
-    // Detection time multiplier.  The negotiated transmit interval
-    // multiplied by this value gives the detection time.
+    // Detection time multiplier.
     #[serde(rename = "detection-multiplier")]
     pub detection_multiplier: Option<u8>,
 }
