@@ -159,24 +159,31 @@ impl TableManager {
         export_rt: Vec<[u8; 8]>,
         id: u32,
     ) -> Result<packet::mpls::MplsLabel, table::TableError> {
-        let current = self.vrfs.load_full();
-        if current.contains_key(&name) {
+        let label = self.allocate_label();
+        let mut already_exists = false;
+        self.vrfs.rcu(|cur| {
+            if cur.contains_key(&name) {
+                already_exists = true;
+                return Arc::clone(cur);
+            }
+            already_exists = false;
+            let mut new_map = (**cur).clone();
+            new_map.insert(
+                name.clone(),
+                table::Vrf {
+                    name: name.clone(),
+                    rd,
+                    import_rt: import_rt.clone(),
+                    export_rt: export_rt.clone(),
+                    label,
+                    id,
+                },
+            );
+            Arc::new(new_map)
+        });
+        if already_exists {
             return Err(table::TableError::AlreadyExists(name));
         }
-        let label = self.allocate_label();
-        let mut new_map = (*current).clone();
-        new_map.insert(
-            name.clone(),
-            table::Vrf {
-                name: name.clone(),
-                rd,
-                import_rt,
-                export_rt,
-                label,
-                id,
-            },
-        );
-        self.vrfs.store(Arc::new(new_map));
         if id > 0
             && let Some(handle) = self.kernel_handle.load_full().as_deref()
         {
@@ -186,21 +193,23 @@ impl TableManager {
     }
 
     pub(crate) fn delete_vrf(&self, name: &str) -> Result<table::Vrf, table::TableError> {
-        let current = self.vrfs.load_full();
-        let id = current.get(name).ok_or(table::TableError::NotFound)?.id;
-        let mut new_map = (*current).clone();
-        match new_map.remove(name) {
-            Some(vrf) => {
-                self.vrfs.store(Arc::new(new_map));
-                if id > 0
-                    && let Some(handle) = self.kernel_handle.load_full().as_deref()
-                {
-                    handle.delete_vrf(name);
-                }
-                Ok(vrf)
+        let mut removed: Option<table::Vrf> = None;
+        self.vrfs.rcu(|cur| {
+            let mut new_map = (**cur).clone();
+            removed = new_map.remove(name);
+            if removed.is_some() {
+                Arc::new(new_map)
+            } else {
+                Arc::clone(cur)
             }
-            None => Err(table::TableError::NotFound),
+        });
+        let vrf = removed.ok_or(table::TableError::NotFound)?;
+        if vrf.id > 0
+            && let Some(handle) = self.kernel_handle.load_full().as_deref()
+        {
+            handle.delete_vrf(name);
         }
+        Ok(vrf)
     }
 
     pub(crate) fn list_vrfs(&self, name: Option<&str>) -> Vec<table::Vrf> {
