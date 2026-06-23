@@ -987,10 +987,10 @@ impl Global {
                 if let Some(config) = m.config.as_ref()
                     && let Some(dump_type) = config.dump_type.as_ref()
                 {
-                    if dump_type != &config::generate::MrtType::Updates {
-                        log::warn!("only update dump is supported");
-                        continue;
-                    }
+                    let is_table_dump = match dump_type {
+                        config::generate::MrtType::Updates => false,
+                        config::generate::MrtType::Table => true,
+                    };
                     if let Some(filename) = config.file_name.as_ref() {
                         let cancel = CancellationToken::new();
                         {
@@ -1007,11 +1007,22 @@ impl Global {
                         match tokio::fs::File::create(std::path::Path::new(&d.pathname())).await {
                             Ok(file) => {
                                 let tables2 = tables.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = d.serve(file, cancel, tables2).await {
-                                        log::error!("mrt dumper failed: {:?}", e);
-                                    }
-                                });
+                                if is_table_dump {
+                                    let router_id = global.read().await.router_id;
+                                    tokio::spawn(async move {
+                                        if let Err(e) =
+                                            d.serve_table(file, cancel, tables2, router_id).await
+                                        {
+                                            log::error!("mrt table dumper failed: {:?}", e);
+                                        }
+                                    });
+                                } else {
+                                    tokio::spawn(async move {
+                                        if let Err(e) = d.serve(file, cancel, tables2).await {
+                                            log::error!("mrt dumper failed: {:?}", e);
+                                        }
+                                    });
+                                }
                             }
                             Err(e) => {
                                 global.write().await.mrt_dumpers.remove(&filename);

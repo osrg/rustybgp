@@ -2590,12 +2590,16 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::EnableMrtRequest>,
     ) -> Result<tonic::Response<api::EnableMrtResponse>, tonic::Status> {
         let request = request.into_inner();
-        if request.dump_type != config::generate::MrtType::Updates as i32 {
-            return Err(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "only update dump is supported",
-            ));
-        }
+        let is_table_dump = match api::enable_mrt_request::DumpType::try_from(request.dump_type) {
+            Ok(api::enable_mrt_request::DumpType::Updates) => false,
+            Ok(api::enable_mrt_request::DumpType::Table) => true,
+            _ => {
+                return Err(tonic::Status::new(
+                    tonic::Code::InvalidArgument,
+                    "invalid dump_type",
+                ));
+            }
+        };
         let interval = request.rotation_interval;
         let filename = request.filename;
         let mut d = crate::mrt::MrtDumper::new(&filename, interval);
@@ -2621,11 +2625,20 @@ impl GoBgpService for GrpcService {
             }
         };
         let tables = self.tables.clone();
-        tokio::spawn(async move {
-            if let Err(e) = d.serve(file, cancel, tables).await {
-                log::error!("mrt dumper failed: {:?}", e);
-            }
-        });
+        if is_table_dump {
+            let router_id = self.global.read().await.router_id;
+            tokio::spawn(async move {
+                if let Err(e) = d.serve_table(file, cancel, tables, router_id).await {
+                    log::error!("mrt table dumper failed: {:?}", e);
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = d.serve(file, cancel, tables).await {
+                    log::error!("mrt dumper failed: {:?}", e);
+                }
+            });
+        }
         Ok(tonic::Response::new(api::EnableMrtResponse {}))
     }
     async fn disable_mrt(

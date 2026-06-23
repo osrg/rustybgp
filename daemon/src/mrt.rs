@@ -13,14 +13,16 @@
 // permissions and limitations under the License.
 
 use futures::{FutureExt, StreamExt};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::Encoder;
 use tokio_util::sync::CancellationToken;
 
-use rustybgp_packet::{bgp, mrt};
+use rustybgp_packet::{Family, bgp, mrt};
 
 use crate::error::Error;
 use crate::event::{AdjRibInChange, BgpEvent, TableHandle};
@@ -87,6 +89,30 @@ impl MrtDumper {
         result
     }
 
+    pub(crate) async fn serve_table(
+        &mut self,
+        mut file: tokio::fs::File,
+        cancel: CancellationToken,
+        tables: TableHandle,
+        router_id: Ipv4Addr,
+    ) -> Result<(), Error> {
+        dump_table(router_id, &tables, &mut file).await?;
+        if self.interval == 0 {
+            return Ok(());
+        }
+        let start = Instant::now() + Duration::from_secs(self.interval);
+        let mut timer = tokio::time::interval_at(start, Duration::from_secs(self.interval));
+        loop {
+            tokio::select! {
+                _ = timer.tick().fuse() => {
+                    file = tokio::fs::File::create(std::path::Path::new(&self.pathname())).await?;
+                    dump_table(router_id, &tables, &mut file).await?;
+                }
+                _ = cancel.cancelled() => return Ok(()),
+            }
+        }
+    }
+
     async fn run_loop(
         &self,
         file: &mut tokio::fs::File,
@@ -128,4 +154,110 @@ impl MrtDumper {
             }
         }
     }
+}
+
+pub(crate) async fn dump_table(
+    router_id: Ipv4Addr,
+    tables: &TableHandle,
+    file: &mut tokio::fs::File,
+) -> Result<(), Error> {
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+
+    let ipv4_changes = tables.collect_loc_rib_paths(Family::IPV4);
+    let ipv6_changes = tables.collect_loc_rib_paths(Family::IPV6);
+
+    // Build peer index: one entry per unique remote peer address.
+    let mut peer_index: HashMap<IpAddr, u16> = HashMap::new();
+    let mut peers: Vec<mrt::PeerEntry> = Vec::new();
+    for change in ipv4_changes.iter().chain(ipv6_changes.iter()) {
+        for path in change.current_paths.iter() {
+            let addr = path.source.remote_addr;
+            let next_idx = peers.len() as u16;
+            peer_index.entry(addr).or_insert_with(|| {
+                peers.push(mrt::PeerEntry {
+                    bgp_id: Ipv4Addr::from(path.source.router_id),
+                    addr,
+                    asn: path.source.remote_asn,
+                });
+                next_idx
+            });
+        }
+    }
+
+    let mut buf = bytes::BytesMut::with_capacity(4096);
+    mrt::encode_table_dump(
+        timestamp,
+        &mrt::TableDumpRecord::PeerIndexTable { router_id, peers },
+        &mut buf,
+    )?;
+    file.write_all(&buf).await?;
+
+    let mut seq = 0u32;
+    for change in &ipv4_changes {
+        let entries: Vec<mrt::RibEntry> = change
+            .current_paths
+            .iter()
+            .filter_map(|path| {
+                let &idx = peer_index.get(&path.source.remote_addr)?;
+                Some(mrt::RibEntry {
+                    peer_index: idx,
+                    originated: timestamp,
+                    nexthop: path.nexthop,
+                    attrs: path.attr.clone(),
+                })
+            })
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        buf.clear();
+        mrt::encode_table_dump(
+            timestamp,
+            &mrt::TableDumpRecord::RibIpv4Unicast {
+                seq,
+                prefix: change.net.clone(),
+                entries,
+            },
+            &mut buf,
+        )?;
+        file.write_all(&buf).await?;
+        seq += 1;
+    }
+
+    seq = 0;
+    for change in &ipv6_changes {
+        let entries: Vec<mrt::RibEntry> = change
+            .current_paths
+            .iter()
+            .filter_map(|path| {
+                let &idx = peer_index.get(&path.source.remote_addr)?;
+                Some(mrt::RibEntry {
+                    peer_index: idx,
+                    originated: timestamp,
+                    nexthop: path.nexthop,
+                    attrs: path.attr.clone(),
+                })
+            })
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        buf.clear();
+        mrt::encode_table_dump(
+            timestamp,
+            &mrt::TableDumpRecord::RibIpv6Unicast {
+                seq,
+                prefix: change.net.clone(),
+                entries,
+            },
+            &mut buf,
+        )?;
+        file.write_all(&buf).await?;
+        seq += 1;
+    }
+
+    Ok(())
 }
