@@ -15,6 +15,9 @@
 
 #![recursion_limit = "1024"]
 #![warn(unreachable_pub)]
+
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub(crate) use rustybgp_api as api;
 pub(crate) use rustybgp_config as config;
 mod auth;

@@ -39,6 +39,7 @@ nix = { version = "0.31", features = ["socket", "net"] }
 uuid = { version = "1", features = ["v4"] }
 log = "0.4"
 env_logger = "0.11"
+tikv-jemallocator = "0.6"
 
 [dev-dependencies]
 toml = "1.0"
