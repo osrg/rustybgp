@@ -9505,6 +9505,66 @@ port = 3323
                 .is_err()
         );
     }
+
+    // --- start_bgp (gRPC) listen-port tests ---
+
+    fn make_unstarted_grpc_service() -> GrpcService {
+        let (active_conn_tx, _) = mpsc::unbounded_channel();
+        let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let global = Arc::new(tokio::sync::RwLock::new(Global::new(tx, bfd_tx)));
+        GrpcService::new(
+            Arc::new(tokio::sync::Notify::new()),
+            active_conn_tx,
+            global,
+            make_tables(),
+        )
+    }
+
+    fn start_bgp_req(listen_port: i32) -> tonic::Request<api::StartBgpRequest> {
+        tonic::Request::new(api::StartBgpRequest {
+            global: Some(api::Global {
+                asn: 65001,
+                router_id: "10.0.0.1".to_string(),
+                listen_port,
+                ..Default::default()
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn start_bgp_port_zero_defaults_to_179() {
+        let svc = make_unstarted_grpc_service();
+        svc.start_bgp(start_bgp_req(0)).await.unwrap();
+        assert_eq!(svc.global.read().await.listen_port, Some(Global::BGP_PORT));
+    }
+
+    #[tokio::test]
+    async fn start_bgp_port_minus_one_disables_listen() {
+        let svc = make_unstarted_grpc_service();
+        svc.start_bgp(start_bgp_req(-1)).await.unwrap();
+        assert_eq!(svc.global.read().await.listen_port, None);
+    }
+
+    #[tokio::test]
+    async fn start_bgp_port_valid_sets_port() {
+        let svc = make_unstarted_grpc_service();
+        svc.start_bgp(start_bgp_req(1179)).await.unwrap();
+        assert_eq!(svc.global.read().await.listen_port, Some(1179));
+    }
+
+    #[tokio::test]
+    async fn start_bgp_port_out_of_range_is_error() {
+        let svc = make_unstarted_grpc_service();
+        assert!(svc.start_bgp(start_bgp_req(65536)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn start_bgp_twice_is_error() {
+        let svc = make_unstarted_grpc_service();
+        svc.start_bgp(start_bgp_req(0)).await.unwrap();
+        assert!(svc.start_bgp(start_bgp_req(0)).await.is_err());
+    }
 }
 
 #[cfg(test)]
