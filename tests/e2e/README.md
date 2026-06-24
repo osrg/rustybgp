@@ -88,16 +88,22 @@ RUSTYBGP_DOCKERFILE=Dockerfile \
 | Directory | Feature | RFC(s) |
 |---|---|---|
 | `add-path` | ADD-PATH (multiple paths per prefix) | RFC 7911 |
+| `bfd` | BFD session down triggers BGP teardown without NOTIFICATION | RFC 5880, RFC 5881, RFC 5882 |
+| `bmp-pre` | BMP pre-policy monitoring | RFC 7854 |
+| `bmp-post` | BMP pre+post-policy monitoring | RFC 7854 |
+| `bmp-local` | BMP Loc-RIB monitoring | RFC 7854, RFC 9069 |
+| `bmp-all` | BMP all policies (pre+post+Loc-RIB+Adj-Out) | RFC 7854, RFC 9069 |
 | `confederation` | BGP Confederation | RFC 5065 |
 | `evpn` | EVPN Types 1-5, AddPath | RFC 7432, RFC 9136 |
 | `extended-nexthop` | Extended Nexthop Encoding | RFC 8950 |
 | `flowspec` | BGP Flowspec (IPv4 and IPv6) | RFC 8955, RFC 8956 |
 | `graceful-restart-helper` | Graceful Restart — helper side | RFC 4724 |
 | `graceful-restart-restarting` | Graceful Restart — restarting speaker | RFC 4724 |
+| `link-state` | BGP-LS (Node, Link, PrefixV4 NLRIs + BGP-LS attribute) | RFC 7752 |
 | `route-reflector` | Route Reflector | RFC 4456 |
 | `route-server` | BGP Route Server | RFC 7947 |
-| `link-state` | BGP-LS (Node, Link, PrefixV4 NLRIs + BGP-LS attribute) | RFC 7752 |
 | `rpki` | RPKI Route Origin Validation | RFC 6811, RFC 8210 |
+| `rtc` | Route Target Membership — RT-based VPN route filtering | RFC 4684 |
 | `sr-policy` | SR Policy (IPv4, MPLS binding SID, segment list) | RFC 9830 |
 
 ## Shared infrastructure

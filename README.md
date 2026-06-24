@@ -1,30 +1,24 @@
-# RustyBGP: BGP implementation in Rust
+# RustyBGP
 
-The mission is to develop a high-performance and safe BGP implementation; an experiment to implement aged and rusty BGP protocol in a modern language. RustyBGP is [much faster](https://elegantnetwork.github.io/posts/bgp-perf5-1000-internet-neighbors/) than other OSS implementations. One reason of the high performance is that RustyBGP is designed to exploit multicore processors. Here is a CPU usage comparison with FRR 7.5 during processing 32 peers with 800K prefixes each; RustyBGP (left) uses all the cores while FRR uses only few.
+RustyBGP is a BGP implementation written in Rust, designed for high performance on multicore systems. It supports most of [GoBGP](https://github.com/osrg/gobgp)'s features with the same gRPC API and configuration file format, so you can replace gobgpd with rustybgpd without changing your tooling or configuration.
 
-![](.github/assets/htop.gif)
+## Quick Start
 
-RustyBGP supports the gRPC APIs same as GoBGP; your code to manage GoBGP via the APIs should work with RustyBGP. If you need CLI, [GoBGP CLI tool](https://github.com/osrg/gobgp/releases/tag/v3.0.0) allows you to manage RustyBGP. RustyBGP also supports the same configuration file format as GoBGP (only toml and yaml for now).
-
-## Get Started
-
-You can easily build RusyBGP on any system that has Docker running. You don't need Rust development environment. You can build the x86_64 statically-linked binary as follows:
+Download the latest nightly binary ([x86_64](https://github.com/osrg/rustybgp/releases/download/nightly/rustybgp-nightly-linux-x86_64.tar.gz) / [aarch64](https://github.com/osrg/rustybgp/releases/download/nightly/rustybgp-nightly-linux-aarch64.tar.gz)):
 
 ```bash
-$ git clone https://github.com/osrg/rustybgp.git
-$ cd rustybgp
-$ docker pull ghcr.io/rust-cross/rust-musl-cross:x86_64-unknown-linux-musl
-$ docker run --rm -it -v "$(pwd)":/home/rust/src ghcr.io/rust-cross/rust-musl-cross:x86_64-unknown-linux-musl cargo build --release
-$ ls target/x86_64-unknown-linux-musl/release/rustybgpd
-target/x86_64-unknown-linux-musl/release/rustybgpd
+curl -LO https://github.com/osrg/rustybgp/releases/download/nightly/rustybgp-nightly-linux-x86_64.tar.gz
+tar xf rustybgp-nightly-linux-x86_64.tar.gz
 ```
 
+Start the daemon with your GoBGP configuration file:
+
 ```bash
-$ sudo ./target/x86_64-unknown-linux-musl/release/rustybgpd -f gobgpd.conf
+sudo ./rustybgpd -f gobgpd.conf
 Hello, RustyBGP (32 cpus)!
 ```
 
-Then you can manage the daemon on a different terminal with GoBGP's CLI command.
+You can manage it with the [GoBGP CLI](https://github.com/osrg/gobgp/releases):
 
 ```bash
 $ gobgp neighbor
@@ -32,48 +26,38 @@ Peer            AS Up/Down State       |#Received  Accepted
 198.51.100.2 65002   never Idle        |        0         0
 ```
 
-If you just want to check out the performance, start the daemon with `--any-peers` option. The daemon accepts any peers without configuration.
-
-```bash
-$ sudo ./target/x86_64-unknown-linux-musl/release/rustybgpd --as-number 65001 --router-id 203.0.113.1 --any-peers
-Hello, RustyBGP (32 cpus)!
-```
-
 ## Supported Features
 
-Currently, the very basic BGP features are supported; eBGP and iBGP, active/passive connection, RPKI, BMP (BGP monitoring protocol), MRT, etc with the following gRPC APIs.
+- Route Reflector (RFC 4456)
+- BGP Confederation (RFC 5065)
+- Route Server (RFC 7947)
+- Add-Path (RFC 7911)
+- Graceful Restart (RFC 4724)
+- RPKI (RFC 6810, RFC 8210)
+- BFD (RFC 5880 / RFC 5881)
+- BMP (RFC 7854, RFC 9069) — all monitoring policies (Pre/Post/Loc-RIB/Adj-Out)
+- MRT (RFC 6396)
+- Policy (OpenConfig model)
+- Dynamic neighbor
+- Peer group
+- Address families: IPv4/IPv6 unicast/multicast, L3VPN (RFC 4364), EVPN Types 1–5 (RFC 7432), BGP-LS (RFC 7752), Flowspec (RFC 8955), SR Policy (RFC 9256), MUP ([draft-ietf-bess-mup-safi](https://datatracker.ietf.org/doc/draft-ietf-bess-mup-safi/))
 
-| API                    | Relevant CLI                                               | Note                                         |
-| ---------------------- | ---------------------------------------------------------- | -------------------------------------------- |
-| start_bgp              | `gobgp global as <VALUE> router-id <IP>`                   |                                              |
-| get_bgp                | `gobgp global`                                             |                                              |
-| add_peer               | `gobgp neighbor add <IP> as <VALUE> router-id <IP>`        | v4/v6 families and addpath (rx) supported    |
-| delete_peer            | `gobgp neighbor del <IP>`                                  |                                              |
-| list_peer              | `gobgp neighbor`/`gobgp neighbor <IP>`                     |                                              |
-| enable_peer            | `gobgp neighbor <IP> enable`                               |                                              |
-| disable_peer           | `gobgp neighbor <IP> disable`                              |                                              |
-| add_peer_group         |                                                            |                                              |
-| add_dynamic_neighbor   |                                                            |                                              |
-| add_path               | `gobgp global rib add <PREFIX>`                            |                                              |
-| delete_path            | `gobgp global rib del <PREFIX>`                            |                                              |
-| list_path              | `gobgp global rib`/`gobgp neighbor <IP> [adj-in\|adj-out]` |                                              |
-| add_path_stream        | `gobgp mrt global inject [FILE]`                           |                                              |
-| get_table              | `gobgp global rib summary`                                 |                                              |
-| add_policy             |                                                            |                                              |
-| list_policy            |                                                            |                                              |
-| add_defined_set        |                                                            |                                              |
-| list_defined_set       |                                                            |                                              |
-| add_statement          |                                                            |                                              |
-| list_statement         |                                                            |                                              |
-| add_policy_assignment  |                                                            |                                              |
-| list_policy_assignment |                                                            |                                              |
-| add_rpki               | `gobgp rpki server <IP> add`                               |                                              |
-| list_rpki              | `gobgp rpki server`                                        |                                              |
-| list_rpki_table        | `gobgp rpki table`                                         |                                              |
-| enable_mrt             |                                                            |                                              |
-| add_bmp                | `gobgp bmp add`                                            | routemonitoring is supported only with adjin |
-| list_bmp               | `gobgp bmp`                                                |                                              |
+## Differences from GoBGP
 
-## Community, discussion and support
+RustyBGP is Linux-only and integrates directly with the Linux kernel for FIB management instead of Zebra/FRR. The kernel integration supports:
 
-You have code or documentation for RustyBGP? Awesome! Send a pull request. No CLA, board members, governance, or other mess. See [`BUILD.md`](BUILD.md) for info on code contributing.
+- Route injection and withdrawal (IPv4/IPv6, VRF)
+- ECMP (multiple nexthops via RTA_MULTIPATH)
+- Nexthop tracking (NHT) — monitors nexthop reachability and withdraws affected routes
+- Connected route redistribution — detects interface address changes and injects connected routes into BGP
+
+The following GoBGP features are not supported:
+
+- VPLS
+- MPLS VPN Multicast
+- EVPN control plane (RT-based MAC-VRF import/export; Types 1–5 NLRI relay is supported)
+- LLGR (RFC 9494)
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test, and submit patches.
