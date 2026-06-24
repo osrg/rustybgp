@@ -27,14 +27,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use rustybgp_packet as packet;
 
 use futures::StreamExt;
-#[cfg(test)]
 use futures::stream::TryStreamExt;
 use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::address::{AddressAttribute, AddressMessage};
+use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
 use rtnetlink::packet_route::route::RouteMessage;
 use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteFlags, RouteProtocol};
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
-use rtnetlink::{LinkVrf, MulticastGroup, RouteMessageBuilder, RouteNextHopBuilder};
+use rtnetlink::{IpVersion, LinkVrf, MulticastGroup, RouteMessageBuilder, RouteNextHopBuilder};
 
 pub use rtnetlink::packet_route::route::RouteProtocol as Protocol;
 
@@ -80,6 +80,8 @@ pub enum Error {
     Rtnetlink(#[from] rtnetlink::Error),
     #[error("mismatched address families for dst and nexthop")]
     FamilyMismatch,
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 /// A route change event from the kernel.
@@ -97,6 +99,45 @@ pub struct KernelRoute {
     pub nexthop: Option<IpAddr>,
     pub metric: u32,
     pub protocol: RouteProtocol,
+}
+
+/// Query the NDP table for the IPv6 link-local address of the neighbor on `ifname`.
+///
+/// Opens a transient Netlink connection, dumps all IPv6 neighbour entries,
+/// and returns the first `fe80::/10` address found on the named interface.
+/// Returns `Error::NotFound` if no link-local neighbor is present.
+pub async fn get_link_local_neighbor(ifname: &str) -> Result<Ipv6Addr, Error> {
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
+
+    let mut link_stream = handle.link().get().match_name(ifname.to_string()).execute();
+    let link = link_stream
+        .try_next()
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("interface {ifname} not found")))?;
+    let ifindex = link.header.index;
+
+    let mut neigh_stream = handle
+        .neighbours()
+        .get()
+        .set_family(IpVersion::V6)
+        .execute();
+    while let Some(msg) = neigh_stream.try_next().await? {
+        if msg.header.ifindex != ifindex {
+            continue;
+        }
+        for attr in &msg.attributes {
+            if let NeighbourAttribute::Destination(NeighbourAddress::Inet6(addr)) = attr
+                && is_link_local(IpAddr::V6(*addr))
+            {
+                return Ok(*addr);
+            }
+        }
+    }
+
+    Err(Error::NotFound(format!(
+        "no link-local neighbor on interface {ifname}"
+    )))
 }
 
 struct Handle {

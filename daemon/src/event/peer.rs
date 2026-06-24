@@ -93,6 +93,10 @@ pub(crate) struct PeerConfig {
     // Read in Step 6 (export) to attach LLGR_STALE community.
     #[allow(dead_code)]
     pub(crate) llgr: Option<LlgrPeerConfig>,
+    /// Interface name for unnumbered BGP (RFC 7938).
+    /// When set, the TCP connection uses the link-local address discovered via
+    /// NDP at peer-add time, with the interface index as the socket scope ID.
+    pub(crate) neighbor_interface: Option<String>,
 }
 
 /// Plain-struct replacement for the old PeerBuilder.
@@ -123,6 +127,8 @@ pub(crate) struct PeerParams {
     pub(crate) graceful_restart: Option<GrPeerConfig>,
     pub(crate) llgr: Option<LlgrPeerConfig>,
     pub(crate) bfd_config: Option<crate::bfd::BfdPeerConfig>,
+    /// Interface name for unnumbered BGP (RFC 7938); None for normal peers.
+    pub(crate) neighbor_interface: Option<String>,
 }
 
 impl PeerParams {
@@ -309,6 +315,7 @@ impl PeerParams {
                 prefix_limits: self.prefix_limits,
                 graceful_restart: self.graceful_restart,
                 llgr: self.llgr,
+                neighbor_interface: self.neighbor_interface,
             },
             admin_down: self.admin_down,
             state: Arc::new(PeerState {
@@ -575,6 +582,7 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                         None
                     }
                 }),
+            neighbor_interface: None,
         })
     }
 }

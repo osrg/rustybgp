@@ -20,7 +20,7 @@ use futures::{FutureExt, Stream, StreamExt};
 use std::boxed::Box;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::convert::{From, TryFrom};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::ops::Deref;
 use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -609,7 +609,16 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
         return;
     }
     let peer_addr = peer.config.remote_addr;
-    let sockaddr = std::net::SocketAddr::new(peer_addr, peer.config.remote_port);
+    // For link-local peers (unnumbered BGP), the socket must carry the
+    // interface index as the IPv6 scope ID so the kernel knows which
+    // interface to use for the link-local destination.
+    let sockaddr: SocketAddr = match (peer_addr, peer.config.neighbor_interface.as_deref()) {
+        (IpAddr::V6(v6), Some(ifname)) => {
+            let scope_id = nix::net::if_::if_nametoindex(ifname).unwrap_or(0);
+            SocketAddr::V6(SocketAddrV6::new(v6, peer.config.remote_port, 0, scope_id))
+        }
+        _ => SocketAddr::new(peer_addr, peer.config.remote_port),
+    };
     let retry_time = peer.config.connect_retry_time;
     let password = peer.config.password.as_ref().map(|x| x.to_string());
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1451,6 +1460,7 @@ async fn accept_connection(
                 graceful_restart: group.graceful_restart.clone(),
                 llgr: group.llgr.clone(),
                 bfd_config: None,
+                neighbor_interface: None,
             };
             let _ = g.add_peer(params, None);
             g.peers.get_mut(&remote_addr).unwrap()
@@ -3638,6 +3648,7 @@ mod tests {
             graceful_restart: None,
             llgr: None,
             bfd_config: None,
+            neighbor_interface: None,
         }
     }
 

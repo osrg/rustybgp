@@ -259,9 +259,19 @@ impl TryFrom<&api::Peer> for PeerParams {
 
     fn try_from(p: &api::Peer) -> Result<Self, Self::Error> {
         let conf = p.conf.as_ref().ok_or(Error::EmptyArgument)?;
-        let remote_addr = IpAddr::from_str(&conf.neighbor_address).map_err(|_| {
-            Error::InvalidArgument(format!("invalid peer address: {}", conf.neighbor_address))
-        })?;
+        // When neighbor_interface is set the remote address is not known at
+        // parse time; it will be resolved via NDP in add_peer/update_peer.
+        let (remote_addr, neighbor_interface) = if !conf.neighbor_interface.is_empty() {
+            (
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                Some(conf.neighbor_interface.clone()),
+            )
+        } else {
+            let addr = IpAddr::from_str(&conf.neighbor_address).map_err(|_| {
+                Error::InvalidArgument(format!("invalid peer address: {}", conf.neighbor_address))
+            })?;
+            (addr, None)
+        };
 
         let families: FnvHashMap<Family, u8> = p
             .afi_safis
@@ -311,7 +321,12 @@ impl TryFrom<&api::Peer> for PeerParams {
                     Global::BGP_PORT
                 }
             }),
-            expected_remote_asn: conf.peer_asn,
+            // Unnumbered BGP (RFC 7938) accepts any AS; override peer_asn with 0.
+            expected_remote_asn: if neighbor_interface.is_some() {
+                0
+            } else {
+                conf.peer_asn
+            },
             local_asn: conf.local_asn,
             passive: p.transport.as_ref().is_some_and(|x| x.passive_mode),
             rs_client: p
@@ -374,6 +389,7 @@ impl TryFrom<&api::Peer> for PeerParams {
                     None
                 }
             }),
+            neighbor_interface,
         })
     }
 }
@@ -919,6 +935,12 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::AddPeerResponse>, tonic::Status> {
         let api_peer = request.into_inner().peer.ok_or(Error::EmptyArgument)?;
         let mut params = PeerParams::try_from(&api_peer)?;
+        if let Some(ifname) = params.neighbor_interface.as_deref() {
+            let ll = kernel::get_link_local_neighbor(ifname)
+                .await
+                .map_err(|e| Error::InvalidArgument(format!("NDP lookup for {ifname}: {e}")))?;
+            params.remote_addr = IpAddr::V6(ll);
+        }
         let mut global = self.global.write().await;
         let pg_name = api_peer
             .conf
@@ -1029,7 +1051,13 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::UpdatePeerResponse>, tonic::Status> {
         let req = request.into_inner();
         let api_peer = req.peer.ok_or(Error::EmptyArgument)?;
-        let new_params = PeerParams::try_from(&api_peer)?;
+        let mut new_params = PeerParams::try_from(&api_peer)?;
+        if let Some(ifname) = new_params.neighbor_interface.as_deref() {
+            let ll = kernel::get_link_local_neighbor(ifname)
+                .await
+                .map_err(|e| Error::InvalidArgument(format!("NDP lookup for {ifname}: {e}")))?;
+            new_params.remote_addr = IpAddr::V6(ll);
+        }
 
         let mut global = self.global.write().await;
 
@@ -1108,6 +1136,7 @@ impl GoBgpService for GrpcService {
                 prefix_limits: new_params.prefix_limits,
                 graceful_restart: new_params.graceful_restart.clone(),
                 llgr: new_params.llgr.clone(),
+                neighbor_interface: new_params.neighbor_interface,
             };
 
             if needs_teardown {
