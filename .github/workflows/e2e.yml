@@ -115,6 +115,28 @@ jobs:
           RUSTYBGP_DOCKERFILE: Dockerfile
         run: ./run-test.sh
 
+  e2e-llgr:
+    name: Long-Lived Graceful Restart (RFC 9494)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run Long-Lived Graceful Restart e2e test
+        working-directory: tests/e2e/long-lived-graceful-restart
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
   e2e-flowspec:
     name: BGP Flowspec (RFC 8955/8956)
     needs: build
