@@ -767,14 +767,22 @@ impl Global {
             if let Some(router_id) = global_config.router_id {
                 self.router_id = router_id;
             }
-            if let Some(port) = global_config.port {
-                self.listen_port = match port {
-                    i32::MIN..=-1 => None,
-                    0 => Some(Global::BGP_PORT),
-                    1..=65535 => Some(port as u16),
-                    _ => return Err(Error::InvalidArgument("invalid listen port".to_string())),
+            // When port is absent in the config file, default to BGP_PORT (179).
+            // Explicit port: -1 disables listening; port: 0 is rejected because
+            // it is ambiguous (the gRPC API uses 0 to mean "default", but the
+            // config file should be unambiguous).
+            self.listen_port = match global_config.port {
+                None => Some(Global::BGP_PORT),
+                Some(i32::MIN..=-1) => None,
+                Some(0) => {
+                    return Err(Error::InvalidArgument(
+                        "port 0 is not valid in config; use port: -1 to disable listening"
+                            .to_string(),
+                    ));
                 }
-            }
+                Some(p @ 1..=65535) => Some(p as u16),
+                Some(_) => return Err(Error::InvalidArgument("invalid listen port".to_string())),
+            };
         }
 
         if let Some((id, c)) = config
@@ -9431,6 +9439,70 @@ port = 3323
             dests.len(),
             1,
             "adj-out must show the injected route for an Established peer"
+        );
+    }
+
+    // --- apply_config listen-port tests ---
+
+    fn bare_global() -> Global {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
+        Global::new(tx, bfd_tx)
+    }
+
+    fn port_config(port: Option<i32>) -> config::BgpConfig {
+        config::BgpConfig {
+            global: Some(config::generate::Global {
+                config: Some(config::generate::GlobalConfig {
+                    r#as: Some(65001),
+                    router_id: Some(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                    port,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_config_port_absent_defaults_to_179() {
+        let mut g = bare_global();
+        g.apply_config(make_tables(), &port_config(None)).unwrap();
+        assert_eq!(g.listen_port, Some(Global::BGP_PORT));
+    }
+
+    #[test]
+    fn apply_config_port_minus_one_disables_listen() {
+        let mut g = bare_global();
+        g.apply_config(make_tables(), &port_config(Some(-1)))
+            .unwrap();
+        assert_eq!(g.listen_port, None);
+    }
+
+    #[test]
+    fn apply_config_port_valid_sets_port() {
+        let mut g = bare_global();
+        g.apply_config(make_tables(), &port_config(Some(1179)))
+            .unwrap();
+        assert_eq!(g.listen_port, Some(1179));
+    }
+
+    #[test]
+    fn apply_config_port_zero_is_error() {
+        let mut g = bare_global();
+        assert!(
+            g.apply_config(make_tables(), &port_config(Some(0)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn apply_config_port_out_of_range_is_error() {
+        let mut g = bare_global();
+        assert!(
+            g.apply_config(make_tables(), &port_config(Some(65536)))
+                .is_err()
         );
     }
 }
