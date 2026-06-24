@@ -1133,21 +1133,36 @@ impl Global {
             }
         }
         if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
-            let mut server = global.write().await;
+            // Resolve params outside the write lock so that async NDP lookups
+            // for unnumbered peers (neighbor-interface) do not hold the lock.
+            let mut resolved: Vec<(PeerParams, Option<String>)> = Vec::new();
             for p in peers {
                 match PeerParams::try_from(p) {
                     Ok(mut params) => {
-                        let pg_name = p.config.as_ref().and_then(|c| c.peer_group.as_deref());
-                        if let Some(pg) = pg_name.and_then(|name| server.peer_group.get(name)) {
-                            params.apply_peer_group(pg);
+                        if let Some(ifname) = params.neighbor_interface.as_deref() {
+                            match kernel::get_link_local_neighbor(ifname).await {
+                                Ok(ll) => params.remote_addr = IpAddr::V6(ll),
+                                Err(e) => {
+                                    log::warn!(
+                                        "skipping unnumbered peer {ifname}: NDP lookup failed: {e}"
+                                    );
+                                    continue;
+                                }
+                            }
                         }
-                        if let Err(e) = server.add_peer(params, Some(active_tx.clone())) {
-                            log::error!("failed to add peer from config: {}", e);
-                        }
+                        let pg = p.config.as_ref().and_then(|c| c.peer_group.clone());
+                        resolved.push((params, pg));
                     }
-                    Err(e) => {
-                        log::warn!("skipping invalid peer config: {}", e);
-                    }
+                    Err(e) => log::warn!("skipping invalid peer config: {}", e),
+                }
+            }
+            let mut server = global.write().await;
+            for (mut params, pg_name) in resolved {
+                if let Some(pg) = pg_name.as_deref().and_then(|n| server.peer_group.get(n)) {
+                    params.apply_peer_group(pg);
+                }
+                if let Err(e) = server.add_peer(params, Some(active_tx.clone())) {
+                    log::error!("failed to add peer from config: {}", e);
                 }
             }
         }

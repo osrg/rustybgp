@@ -123,6 +123,12 @@ impl Neighbor {
             ConfigError::InvalidConfiguration("empty peer configuration".to_string())
         })?;
 
+        // Unnumbered BGP peers (RFC 7938) identify the peer by interface name
+        // rather than by address+AS.  Skip address/AS validation for them.
+        if config.neighbor_interface.is_some() {
+            return Ok(());
+        }
+
         let asn = config
             .peer_as
             .as_ref()

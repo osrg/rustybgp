@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use std::convert::TryFrom;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -460,11 +460,20 @@ impl TryFrom<&config::Neighbor> for PeerParams {
         let c = n.config.as_ref().ok_or("missing neighbor config")?;
         let afi_safis = n.afi_safis.as_deref().unwrap_or_default();
 
-        let remote_addr = c
-            .neighbor_address
-            .as_ref()
-            .ok_or("missing neighbor address")?;
-        let peer_as = c.peer_as.ok_or("missing peer-as")?;
+        // Unnumbered BGP: neighbor-interface replaces neighbor-address.
+        // The actual link-local address is resolved via NDP asynchronously
+        // in the config loading loop after try_from returns.
+        let neighbor_interface = c.neighbor_interface.clone();
+        let (remote_addr, peer_as) = if neighbor_interface.is_some() {
+            (&IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0u32)
+        } else {
+            let addr = c
+                .neighbor_address
+                .as_ref()
+                .ok_or("missing neighbor address")?;
+            let asn = c.peer_as.ok_or("missing peer-as")?;
+            (addr, asn)
+        };
 
         let transport_config = n.transport.as_ref().and_then(|t| t.config.as_ref());
         let timer_config = n.timers.as_ref().and_then(|t| t.config.as_ref());
@@ -582,7 +591,7 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                         None
                     }
                 }),
-            neighbor_interface: None,
+            neighbor_interface,
         })
     }
 }
