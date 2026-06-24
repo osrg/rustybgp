@@ -33,6 +33,7 @@ Peer            AS Up/Down State       |#Received  Accepted
 - Route Server (RFC 7947)
 - Add-Path (RFC 7911)
 - Graceful Restart (RFC 4724)
+- Long-Lived Graceful Restart (RFC 9494)
 - RPKI (RFC 6810, RFC 8210)
 - BFD (RFC 5880 / RFC 5881)
 - BMP (RFC 7854, RFC 9069) — all monitoring policies (Pre/Post/Loc-RIB/Adj-Out)
@@ -56,7 +57,6 @@ The following GoBGP features are not supported:
 - VPLS
 - MPLS VPN Multicast
 - EVPN control plane (RT-based MAC-VRF import/export; Types 1–5 NLRI relay is supported)
-- LLGR (RFC 9494)
 
 ## Contributing
 
