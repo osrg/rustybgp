@@ -286,6 +286,32 @@ struct RibEntry {
     flags: u8,
 }
 
+/// Returns true if `attrs` contains the LLGR_STALE well-known community (0xFFFF0006).
+fn has_llgr_stale_community(attrs: &[packet::Attribute]) -> bool {
+    const LLGR_STALE: u32 = 0xffff_0006;
+    attrs
+        .iter()
+        .find(|a| a.code() == packet::Attribute::COMMUNITY)
+        .and_then(|a| a.binary())
+        .is_some_and(|bin| {
+            bin.chunks(4)
+                .any(|c| c.try_into().ok().map(u32::from_be_bytes) == Some(LLGR_STALE))
+        })
+}
+
+/// Returns true if `attrs` contains the NO_LLGR well-known community (0xFFFF0007).
+pub fn has_no_llgr_community(attrs: &[packet::Attribute]) -> bool {
+    const NO_LLGR: u32 = 0xffff_0007;
+    attrs
+        .iter()
+        .find(|a| a.code() == packet::Attribute::COMMUNITY)
+        .and_then(|a| a.binary())
+        .is_some_and(|bin| {
+            bin.chunks(4)
+                .any(|c| c.try_into().ok().map(u32::from_be_bytes) == Some(NO_LLGR))
+        })
+}
+
 impl RibEntry {
     const FLAG_FILTERED: u8 = 1 << 0;
     const FLAG_NEXTHOP_INVALID: u8 = 1 << 1;
@@ -304,6 +330,13 @@ impl RibEntry {
         } else {
             self.flags &= !RibEntry::FLAG_NEXTHOP_INVALID;
         }
+    }
+
+    /// True if this entry is in the LLGR stale period: either the source was
+    /// marked LLGR stale by the helper, or the received attributes carry the
+    /// LLGR_STALE community (0xFFFF0006) propagated from another helper.
+    fn is_llgr_stale(&self) -> bool {
+        self.path.source.is_llgr_stale() || has_llgr_stale_community(&self.path.attr)
     }
 
     fn originator_id(&self) -> u32 {
@@ -380,6 +413,8 @@ impl Ord for RibEntry {
                     .is_stale()
                     .cmp(&other.path.source.is_stale())
             })
+            // LLGR stale is worse than GR stale (RFC 9494)
+            .then_with(|| self.is_llgr_stale().cmp(&other.is_llgr_stale()))
             // Shorter CLUSTER_LIST is better (RFC 4456 s9)
             .then_with(|| {
                 self_pa
@@ -639,6 +674,7 @@ pub struct Source {
     pub router_id: u32,
     pub role: PeerRole,
     stale: AtomicBool,
+    llgr_stale: AtomicBool,
 }
 
 impl Hash for Source {
@@ -659,6 +695,7 @@ static LOCAL_SOURCE: LazyLock<Arc<Source>> = LazyLock::new(|| {
         router_id: 0,
         role: PeerRole::Ibgp,
         stale: AtomicBool::new(false),
+        llgr_stale: AtomicBool::new(false),
     })
 });
 
@@ -674,6 +711,7 @@ static KERNEL_SOURCE: LazyLock<Arc<Source>> = LazyLock::new(|| {
         router_id: 0,
         role: PeerRole::Ibgp,
         stale: AtomicBool::new(false),
+        llgr_stale: AtomicBool::new(false),
     })
 });
 
@@ -710,6 +748,7 @@ impl Source {
             router_id: router_id.into(),
             role,
             stale: AtomicBool::new(false),
+            llgr_stale: AtomicBool::new(false),
         }
     }
 
@@ -728,6 +767,19 @@ impl Source {
 
     pub fn is_stale(&self) -> bool {
         self.stale.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_llgr_stale(&self) {
+        debug_assert!(!self.is_local() && !self.is_kernel());
+        self.llgr_stale.store(true, Ordering::Relaxed);
+    }
+
+    pub fn clear_llgr_stale(&self) {
+        self.llgr_stale.store(false, Ordering::Relaxed);
+    }
+
+    pub fn is_llgr_stale(&self) -> bool {
+        self.llgr_stale.load(Ordering::Relaxed)
     }
 }
 
@@ -1434,6 +1486,84 @@ impl Table {
                     .retain(|e| !(e.path.source.remote_addr == addr && e.path.source.is_stale()));
 
                 // Decrement prefix counter if peer has no more paths for this prefix.
+                let peer_still_has_path =
+                    dst.entry.iter().any(|p| p.path.source.remote_addr == addr);
+                if !peer_still_has_path && let Some(counter) = prefix_counter {
+                    counter.fetch_sub(1, Ordering::Relaxed);
+                }
+
+                if !removed_any_unfiltered {
+                    return !dst.entry.is_empty();
+                }
+
+                if dst.entry.is_empty() {
+                    changes.push(NlriChange {
+                        family,
+                        net: net.clone(),
+                        best_changed: true,
+                        any_changed: true,
+                        replaced_path_id: None,
+                        current_paths: Arc::new(vec![]),
+                    });
+                    return false;
+                }
+
+                let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let current_paths =
+                    Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
+                changes.push(NlriChange {
+                    family,
+                    net: net.clone(),
+                    best_changed: old_best_id != new_best_id,
+                    any_changed: true,
+                    replaced_path_id: None,
+                    current_paths,
+                });
+                true
+            });
+        }
+        (changes, removed_nexthops)
+    }
+
+    /// Remove LLGR stale routes for `addr` in `family` when the LLGR stale
+    /// timer expires. Mirrors `drop_stale()` but checks `is_llgr_stale()`.
+    pub fn drop_llgr_stale(
+        &mut self,
+        addr: IpAddr,
+        family: Family,
+        prefix_counter: Option<&Arc<AtomicU64>>,
+    ) -> (Vec<NlriChange>, Vec<IpAddr>) {
+        let mut changes = Vec::new();
+        let mut removed_nexthops: Vec<IpAddr> = Vec::new();
+        if let Some(rt) = self.ribs.get_mut(&family) {
+            rt.destinations.retain(|net, dst| {
+                if !dst
+                    .entry
+                    .iter()
+                    .any(|e| e.path.source.remote_addr == addr && e.is_llgr_stale())
+                {
+                    return true;
+                }
+
+                let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let removed_any_unfiltered = dst.entry.iter().any(|e| {
+                    e.path.source.remote_addr == addr
+                        && e.is_llgr_stale()
+                        && !e.is_filtered()
+                        && !e.is_nexthop_invalid()
+                });
+
+                for e in dst.entry.iter() {
+                    if e.path.source.remote_addr == addr
+                        && e.is_llgr_stale()
+                        && let Some(nh) = e.path.nexthop
+                    {
+                        removed_nexthops.push(nh.addr());
+                    }
+                }
+                dst.entry
+                    .retain(|e| !(e.path.source.remote_addr == addr && e.is_llgr_stale()));
+
                 let peer_still_has_path =
                     dst.entry.iter().any(|p| p.path.source.remote_addr == addr);
                 if !peer_still_has_path && let Some(counter) = prefix_counter {
