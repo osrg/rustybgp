@@ -76,6 +76,7 @@ ALL_TESTS=(
     rpki
     rtc
     sr-policy
+    unnumbered-bgp
 )
 
 if [ "$#" -gt 0 ]; then

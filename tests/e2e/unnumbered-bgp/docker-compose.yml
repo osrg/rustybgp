@@ -1,0 +1,62 @@
+volumes:
+  # Tiny shared tmpfs: FRR entrypoint writes a "ready" marker here after it
+  # has reconfigured BGP with the explicit link-local peer.  The rusty
+  # entrypoint waits for that marker before starting rustybgpd, avoiding the
+  # race where rusty connects before FRR has a peer configured.
+  frr-signal:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+networks:
+  # Bridge with IPv4 and IPv6 enabled.  Containers get link-local IPv6
+  # automatically; BGP uses those link-local addresses (RFC 7938 style).
+  # A ULA /64 subnet is required so Docker enables IPv6 on the bridge;
+  # BGP itself only uses the link-local addresses that the kernel assigns.
+  unnumbered-net:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.30.20.0/24
+          gateway: 172.30.20.254
+        - subnet: fd00:db8:20::/64
+
+services:
+  router-rusty:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: unnumbered-rusty
+    privileged: true
+    sysctls:
+      - net.ipv6.conf.all.forwarding=1
+      - net.ipv6.conf.all.accept_ra=2
+    networks:
+      unnumbered-net:
+        ipv4_address: 172.30.20.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+      - frr-signal:/frr-signal
+
+  router-frr:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: unnumbered-frr
+    privileged: true
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+      - net.ipv6.conf.all.accept_ra=2
+    networks:
+      unnumbered-net:
+        ipv4_address: 172.30.20.2
+    volumes:
+      - ./frr/frr.conf:/etc/frr/frr.conf:ro
+      - ./frr/entrypoint-frr.sh:/entrypoint-frr.sh:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
+      - frr-signal:/frr-signal
+    entrypoint: ["/bin/bash", "/entrypoint-frr.sh"]

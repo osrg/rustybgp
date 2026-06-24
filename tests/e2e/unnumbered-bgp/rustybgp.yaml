@@ -1,0 +1,11 @@
+global:
+  config:
+    as: 65001
+    router-id: "10.0.0.1"
+
+neighbors:
+  - config:
+      neighbor-interface: "eth0"
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast

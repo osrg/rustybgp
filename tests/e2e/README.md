@@ -105,6 +105,7 @@ RUSTYBGP_DOCKERFILE=Dockerfile \
 | `rpki` | RPKI Route Origin Validation | RFC 6811, RFC 8210 |
 | `rtc` | Route Target Membership — RT-based VPN route filtering | RFC 4684 |
 | `sr-policy` | SR Policy (IPv4, MPLS binding SID, segment list) | RFC 9830 |
+| `unnumbered-bgp` | Unnumbered BGP over IPv6 link-local + Extended Nexthop | RFC 7938, RFC 8950 |
 
 ## Shared infrastructure
 
