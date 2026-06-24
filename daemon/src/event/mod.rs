@@ -160,6 +160,8 @@ pub(super) use peer::{
 };
 
 mod export;
+#[cfg(test)]
+use export::with_llgr_stale_community;
 use export::{AdjOutSink, BmpAdjOut, ExportMap, PeerExportContext};
 use export::{inject_local_pref_if_absent, is_as_loop, process_nlri_change};
 
@@ -7824,6 +7826,87 @@ mod tests {
                 1
             );
         }
+        // ---- LLGR_STALE community on export ----
+
+        fn reach_attrs(msgs: &[bgp::Message]) -> Option<Arc<Vec<packet::Attribute>>> {
+            for msg in msgs {
+                if let bgp::Message::Update(bgp::Update::Reach { attr, .. }) = msg {
+                    return Some(Arc::clone(attr));
+                }
+            }
+            None
+        }
+
+        fn has_community(attrs: &[packet::Attribute], val: u32) -> bool {
+            attrs
+                .iter()
+                .find(|a| a.code() == packet::Attribute::COMMUNITY)
+                .and_then(|a| a.binary())
+                .is_some_and(|bin| {
+                    bin.chunks(4)
+                        .any(|c| c.try_into().ok().map(u32::from_be_bytes) == Some(val))
+                })
+        }
+
+        #[test]
+        fn llgr_stale_source_adds_llgr_stale_community() {
+            const LLGR_STALE: u32 = 0xffff_0006;
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let src = source(PEER);
+            src.mark_llgr_stale();
+            let p = path(0, src);
+            let update = change(&net, true, false, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+            );
+
+            let attrs = reach_attrs(&pending.drain_messages(Family::IPV4)).unwrap();
+            assert!(
+                has_community(&attrs, LLGR_STALE),
+                "LLGR_STALE community missing"
+            );
+        }
+
+        #[test]
+        fn non_llgr_stale_source_does_not_add_llgr_stale_community() {
+            const LLGR_STALE: u32 = 0xffff_0006;
+            let mut em = ExportMap::new();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path(0, source(PEER));
+            let update = change(&net, true, false, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+            );
+
+            let attrs = reach_attrs(&pending.drain_messages(Family::IPV4)).unwrap();
+            assert!(
+                !has_community(&attrs, LLGR_STALE),
+                "LLGR_STALE community must not appear"
+            );
+        }
     } // mod process_nlri_change
 
     fn make_grpc_service() -> GrpcService {
@@ -9424,5 +9507,62 @@ mod local_pref_tests {
         ]);
         let result = inject_local_pref_if_absent(Arc::clone(&attr));
         assert!(Arc::ptr_eq(&result, &attr));
+    }
+}
+
+#[cfg(test)]
+mod llgr_community_tests {
+    use super::*;
+
+    const LLGR_STALE: u32 = 0xffff_0006;
+
+    fn community_attr(vals: &[u32]) -> packet::Attribute {
+        let bin: Vec<u8> = vals.iter().flat_map(|v| v.to_be_bytes()).collect();
+        packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, bin).unwrap()
+    }
+
+    fn has_community(attr: &Arc<Vec<packet::Attribute>>, val: u32) -> bool {
+        attr.iter()
+            .find(|a| a.code() == packet::Attribute::COMMUNITY)
+            .and_then(|a| a.binary())
+            .is_some_and(|bin| {
+                bin.chunks(4)
+                    .any(|c| c.try_into().ok().map(u32::from_be_bytes) == Some(val))
+            })
+    }
+
+    #[test]
+    fn adds_community_when_none_present() {
+        let attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+        ]);
+        let result = with_llgr_stale_community(&attr);
+        assert!(has_community(&result, LLGR_STALE));
+    }
+
+    #[test]
+    fn appends_to_existing_community() {
+        const OTHER: u32 = 0x0001_0002;
+        let attr = Arc::new(vec![community_attr(&[OTHER])]);
+        let result = with_llgr_stale_community(&attr);
+        assert!(has_community(&result, LLGR_STALE));
+        assert!(
+            has_community(&result, OTHER),
+            "existing community must be preserved"
+        );
+    }
+
+    #[test]
+    fn no_duplicate_when_already_tagged() {
+        let attr = Arc::new(vec![community_attr(&[LLGR_STALE])]);
+        let result = with_llgr_stale_community(&attr);
+        assert!(Arc::ptr_eq(&result, &attr), "must return original Arc");
+        let count = result
+            .iter()
+            .find(|a| a.code() == packet::Attribute::COMMUNITY)
+            .and_then(|a| a.binary())
+            .map(|bin| bin.chunks(4).count())
+            .unwrap_or(0);
+        assert_eq!(count, 1, "community must appear exactly once");
     }
 }

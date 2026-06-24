@@ -525,6 +525,11 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             }
             Some((best, attr, nexthop)) => {
                 export_map.mark_sent(update.family, update.net.clone(), 0);
+                let attr = if best.source.is_llgr_stale() {
+                    with_llgr_stale_community(&attr)
+                } else {
+                    attr
+                };
                 let attr = export_ctx.export_attrs(&attr);
                 let nexthop = export_ctx.export_nexthop(nexthop, update.family);
                 // BMP post-policy Reach: use the fully-rewritten attr/nexthop.
@@ -581,6 +586,9 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                     && is_ibgp_learned(&path.source)
                 {
                     attr = rr_reflect_attrs(&attr, path.source.router_id, cid);
+                }
+                if path.source.is_llgr_stale() {
+                    attr = with_llgr_stale_community(&attr);
                 }
                 Some((path.local_path_id, attr, nexthop, Arc::clone(&path.source)))
             })
@@ -664,6 +672,48 @@ pub(super) fn rr_reflect_attrs(
     {
         new_attrs.push(a);
     }
+    Arc::new(new_attrs)
+}
+
+/// Return `attr` with the LLGR_STALE well-known community (0xFFFF0006) present.
+///
+/// If the community is already present (e.g. route relayed from another LLGR
+/// helper), returns a clone of the original Arc.  Otherwise appends 4 bytes to
+/// the existing COMMUNITY attribute, or creates a new one if absent.
+pub(super) fn with_llgr_stale_community(
+    attr: &Arc<Vec<packet::Attribute>>,
+) -> Arc<Vec<packet::Attribute>> {
+    const LLGR_STALE: [u8; 4] = [0xff, 0xff, 0x00, 0x06];
+    let existing = attr
+        .iter()
+        .find(|a| a.code() == packet::Attribute::COMMUNITY)
+        .and_then(|a| a.binary());
+    if let Some(bin) = existing {
+        if bin.chunks(4).any(|c| c == LLGR_STALE) {
+            return Arc::clone(attr);
+        }
+        // Append to the existing COMMUNITY attribute, replacing it in-place.
+        let mut new_bin = bin.to_vec();
+        new_bin.extend_from_slice(&LLGR_STALE);
+        let new_community =
+            packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, new_bin).unwrap();
+        return Arc::new(
+            attr.iter()
+                .map(|a| {
+                    if a.code() == packet::Attribute::COMMUNITY {
+                        new_community.clone()
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect(),
+        );
+    }
+    // No COMMUNITY attribute: append a new one.
+    let mut new_attrs: Vec<packet::Attribute> = attr.iter().cloned().collect();
+    new_attrs.push(
+        packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, LLGR_STALE.to_vec()).unwrap(),
+    );
     Arc::new(new_attrs)
 }
 
