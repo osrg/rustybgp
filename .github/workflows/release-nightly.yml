@@ -20,16 +20,11 @@ jobs:
             arch: aarch64
     steps:
       - uses: actions/checkout@v4
-      - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
       - name: Build static binary
         run: |
-          docker run --rm \
-            -v "$(pwd)":/home/rust/src \
-            -v /usr/bin/protoc:/usr/bin/protoc \
-            -e PROTOC=/usr/bin/protoc \
+          docker run --rm -v "$(pwd)":/home/rust/src \
             ghcr.io/rust-cross/rust-musl-cross:${{ matrix.target }} \
-            cargo build --release
+            sh -c "apt-get update -q && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev && cargo build --release"
       - name: Package
         run: |
           cp target/${{ matrix.target }}/release/rustybgpd .
