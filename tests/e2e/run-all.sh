@@ -70,6 +70,7 @@ ALL_TESTS=(
     graceful-restart-helper
     graceful-restart-restarting
     link-state
+    long-lived-graceful-restart
     route-reflector
     route-server
     rpki

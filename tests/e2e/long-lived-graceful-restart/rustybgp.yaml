@@ -1,0 +1,26 @@
+global:
+  config:
+    as: 65001
+    router-id: "172.30.5.1"
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.5.2"
+      peer-as: 65002
+    # GR helper: preserve GR-stale routes for 10 seconds after session drop.
+    graceful-restart:
+      config:
+        enabled: true
+        restart-time: 10
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+        mp-graceful-restart:
+          config:
+            enabled: true
+        # LLGR helper: after GR timer, keep LLGR-stale routes for 20 more seconds.
+        # Routes with NO_LLGR community (0xffff0007) are dropped when LLGR starts.
+        long-lived-graceful-restart:
+          config:
+            enabled: true
+            restart-time: 20

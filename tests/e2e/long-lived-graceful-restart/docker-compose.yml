@@ -1,0 +1,38 @@
+networks:
+  bgp-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.5.0/24
+          gateway: 172.30.5.254
+
+services:
+  # FRR peer (AS 65002): advertises two routes with GR + LLGR enabled.
+  # 192.168.10.0/24 - normal route (kept during LLGR stale period)
+  # 192.168.20.0/24 - route with NO_LLGR community (dropped when LLGR starts)
+  frr-peer:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: frr-peer
+    privileged: true
+    volumes:
+      - ./frr-peer/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
+    networks:
+      bgp-net:
+        ipv4_address: 172.30.5.2
+
+  # rustybgp: acts as GR+LLGR helper.
+  router-rusty:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: router-rusty
+    privileged: true
+    networks:
+      bgp-net:
+        ipv4_address: 172.30.5.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro

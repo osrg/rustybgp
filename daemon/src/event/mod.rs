@@ -2279,13 +2279,17 @@ impl PeerSession {
 
     /// Negotiate LLGR (RFC 9494) using local and remote LongLivedGracefulRestart capabilities.
     ///
-    /// Returns Some when both sides advertise the capability with at least one family in common.
-    /// The stale time for each family comes from the peer's capability (how long they want us
-    /// to preserve their stale routes).
+    /// Returns Some when both sides advertise the capability with at least one family in common
+    /// and the negotiated stale time is non-zero.
+    ///
+    /// Per RFC 9494 s3, the stale time comes from the peer's capability (how long they want us
+    /// to preserve their stale routes).  When the peer sends 0 for a family, LLGR MUST NOT be
+    /// activated for that family; we fall back to our locally configured time so that a peer
+    /// that omits the field (effectively sending 0) does not silently disable LLGR helper mode.
     fn negotiate_llgr(&self, remote_capabilities: &[packet::Capability]) -> Option<NegotiatedLlgr> {
-        let local_families: Vec<Family> = self.local_cap.iter().find_map(|c| match c {
+        let local_families: Vec<(Family, u32)> = self.local_cap.iter().find_map(|c| match c {
             packet::Capability::LongLivedGracefulRestart(v) => {
-                Some(v.iter().map(|(f, _, _)| *f).collect())
+                Some(v.iter().map(|(f, _, t)| (*f, *t)).collect())
             }
             _ => None,
         })?;
@@ -2296,15 +2300,21 @@ impl PeerSession {
                 _ => None,
             })?;
 
-        let families: Vec<(Family, std::time::Duration)> =
-            local_families
-                .iter()
-                .filter_map(|local_f| {
-                    peer_families.iter().find(|(pf, _, _)| pf == local_f).map(
-                        |(f, _, peer_time)| (*f, std::time::Duration::from_secs(*peer_time as u64)),
-                    )
-                })
-                .collect();
+        let families: Vec<(Family, std::time::Duration)> = local_families
+            .iter()
+            .filter_map(|(local_f, local_time)| {
+                let (f, _, peer_time) = peer_families.iter().find(|(pf, _, _)| pf == local_f)?;
+                let stale_secs = if *peer_time > 0 {
+                    *peer_time
+                } else {
+                    *local_time
+                };
+                if stale_secs == 0 {
+                    return None;
+                }
+                Some((*f, std::time::Duration::from_secs(stale_secs as u64)))
+            })
+            .collect();
 
         if families.is_empty() {
             return None;
@@ -6096,6 +6106,35 @@ mod tests {
             0,
             300,
         )])]; // peer: IPV6 only
+        assert!(session.negotiate_llgr(&remote_caps).is_none());
+    }
+
+    #[tokio::test]
+    async fn negotiate_llgr_falls_back_to_local_time_when_peer_sends_zero() {
+        // Peer sends stale-time=0 (some implementations omit the value or send 0).
+        // RFC 9494 says LLGR MUST NOT activate for that family, but we fall back to
+        // our locally configured time so that helper mode still engages.
+        let session = make_session_with_llgr_cap(300); // local: 300s
+        let remote_caps = vec![packet::Capability::LongLivedGracefulRestart(vec![(
+            Family::IPV4,
+            0,
+            0, // peer sends 0
+        )])];
+        let llgr = session.negotiate_llgr(&remote_caps).unwrap();
+        assert_eq!(llgr.families.len(), 1);
+        assert_eq!(llgr.families[0].0, Family::IPV4);
+        assert_eq!(llgr.families[0].1, Duration::from_secs(300)); // fallback to local
+    }
+
+    #[tokio::test]
+    async fn negotiate_llgr_none_when_both_sides_send_zero() {
+        // If both local and peer stale-times are 0, LLGR should not activate.
+        let session = make_session_with_llgr_cap(0); // local: 0s
+        let remote_caps = vec![packet::Capability::LongLivedGracefulRestart(vec![(
+            Family::IPV4,
+            0,
+            0,
+        )])];
         assert!(session.negotiate_llgr(&remote_caps).is_none());
     }
 
