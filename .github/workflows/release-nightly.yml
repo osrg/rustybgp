@@ -39,6 +39,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Move nightly tag to current commit
+        run: |
+          git tag -f nightly
+          git push origin -f nightly
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
