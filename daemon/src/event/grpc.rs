@@ -275,6 +275,7 @@ impl TryFrom<&api::Peer> for PeerParams {
             .collect();
 
         let graceful_restart = { parse_gr_api(p.graceful_restart.as_ref(), &p.afi_safis) };
+        let llgr = parse_llgr_api(&p.afi_safis);
 
         let holdtime = {
             let t = p
@@ -360,6 +361,7 @@ impl TryFrom<&api::Peer> for PeerParams {
             send_max: FnvHashMap::default(),
             prefix_limits: FnvHashMap::default(),
             graceful_restart,
+            llgr,
             bfd_config: p.bfd.as_ref().and_then(|b| {
                 if b.enabled {
                     Some(crate::bfd::BfdPeerConfig {
@@ -407,6 +409,33 @@ fn parse_gr_api(
         notification_enabled: gr.is_some_and(|g| g.notification_enabled),
         families: gr_families,
     })
+}
+
+/// Build LlgrPeerConfig from gRPC AfiSafi per-family long_lived_graceful_restart config.
+fn parse_llgr_api(afi_safis: &[api::AfiSafi]) -> Option<LlgrPeerConfig> {
+    const DEFAULT_STALE_TIME: u32 = 600;
+    let families: Vec<(Family, u32)> = afi_safis
+        .iter()
+        .filter(|a| {
+            a.long_lived_graceful_restart
+                .as_ref()
+                .is_some_and(|llgr| llgr.config.as_ref().is_some_and(|c| c.enabled))
+        })
+        .filter_map(|a| {
+            let f = a.config.as_ref()?.family.as_ref()?;
+            let stale_time = a
+                .long_lived_graceful_restart
+                .as_ref()
+                .and_then(|llgr| llgr.config.as_ref())
+                .map(|c| c.restart_time)
+                .unwrap_or(DEFAULT_STALE_TIME);
+            Some((convert::family_from_api(f), stale_time))
+        })
+        .collect();
+    if families.is_empty() {
+        return None;
+    }
+    Some(LlgrPeerConfig { families })
 }
 
 fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
@@ -585,6 +614,7 @@ impl From<api::PeerGroup> for PeerGroup {
                 .collect(),
             send_max: FnvHashMap::default(),
             graceful_restart: parse_gr_api(p.graceful_restart.as_ref(), &p.afi_safis),
+            llgr: parse_llgr_api(&p.afi_safis),
         }
     }
 }
@@ -1036,6 +1066,7 @@ impl GoBgpService for GrpcService {
             new_local_asn,
             &new_params.families,
             new_params.graceful_restart.as_ref(),
+            new_params.llgr.as_ref(),
         );
         let effective_remote_port = if new_params.remote_port != 0 {
             new_params.remote_port
@@ -1076,6 +1107,7 @@ impl GoBgpService for GrpcService {
                 password: new_params.password.clone(),
                 prefix_limits: new_params.prefix_limits,
                 graceful_restart: new_params.graceful_restart.clone(),
+                llgr: new_params.llgr.clone(),
             };
 
             if needs_teardown {

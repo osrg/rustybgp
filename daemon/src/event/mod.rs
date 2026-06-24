@@ -155,7 +155,8 @@ use grpc::GrpcService;
 
 mod peer;
 pub(super) use peer::{
-    DynamicPeer, GrPeerConfig, PeerConfig, PeerGroup, PeerParams, RouteReflectorConfig,
+    DynamicPeer, GrPeerConfig, LlgrPeerConfig, PeerConfig, PeerGroup, PeerParams,
+    RouteReflectorConfig,
 };
 
 mod export;
@@ -1210,6 +1211,7 @@ impl Global {
                     families: FnvHashMap::default(),
                     send_max: FnvHashMap::default(),
                     graceful_restart: None,
+                    llgr: None,
                 },
             );
         }
@@ -1419,6 +1421,7 @@ async fn accept_connection(
                 send_max: group.send_max.clone(),
                 prefix_limits: FnvHashMap::default(),
                 graceful_restart: group.graceful_restart.clone(),
+                llgr: group.llgr.clone(),
                 bfd_config: None,
             };
             let _ = g.add_peer(params, None);
@@ -1581,12 +1584,20 @@ struct NegotiatedGr {
     notification_enabled: bool,
 }
 
+/// Stored in DisconnectInfo so PeerSession::run can drive GrState on session drop.
+struct NegotiatedLlgr {
+    /// Intersection of local and remote LLGR families, with peer-advertised stale times.
+    families: Vec<(Family, std::time::Duration)>,
+}
+
 struct DisconnectInfo {
     role: crate::fsm::Role,
     remote_addr: IpAddr,
     export_map: ExportMap,
     /// Set when GR was successfully negotiated for at least one family.
     negotiated_gr: Option<NegotiatedGr>,
+    /// Set when LLGR was successfully negotiated for at least one family.
+    negotiated_llgr: Option<NegotiatedLlgr>,
 }
 
 /// Decide whether GR helper mode applies for a session disconnect.
@@ -1944,6 +1955,8 @@ struct PeerSession {
     prefix_counters: FnvHashMap<Family, (u32, Arc<std::sync::atomic::AtomicU64>)>,
     /// GR negotiation result from the most recent OPEN exchange.
     negotiated_gr: Option<NegotiatedGr>,
+    /// LLGR negotiation result from the most recent OPEN exchange.
+    negotiated_llgr: Option<NegotiatedLlgr>,
     /// Shared cross-session state for this peer; cloned from `Peer::context`
     /// so that `PeerSession::run` can operate on `PeerContext` without taking
     /// the global write lock.
@@ -2022,6 +2035,7 @@ impl PeerSession {
             export_map: ExportMap::new(),
             prefix_counters,
             negotiated_gr: None,
+            negotiated_llgr: None,
             context: res.context,
             local_router_id: res.local_router_id,
             cluster_id: res.cluster_id,
@@ -2096,6 +2110,7 @@ impl PeerSession {
             export_map: ExportMap::new(),
             prefix_counters: FnvHashMap::default(),
             negotiated_gr: None,
+            negotiated_llgr: None,
             context,
             local_router_id: Ipv4Addr::new(1, 0, 0, 1),
             cluster_id: None,
@@ -2151,6 +2166,41 @@ impl PeerSession {
             restart_time: std::time::Duration::from_secs(peer_restart_time as u64),
             notification_enabled,
         })
+    }
+
+    /// Negotiate LLGR (RFC 9494) using local and remote LongLivedGracefulRestart capabilities.
+    ///
+    /// Returns Some when both sides advertise the capability with at least one family in common.
+    /// The stale time for each family comes from the peer's capability (how long they want us
+    /// to preserve their stale routes).
+    fn negotiate_llgr(&self, remote_capabilities: &[packet::Capability]) -> Option<NegotiatedLlgr> {
+        let local_families: Vec<Family> = self.local_cap.iter().find_map(|c| match c {
+            packet::Capability::LongLivedGracefulRestart(v) => {
+                Some(v.iter().map(|(f, _, _)| *f).collect())
+            }
+            _ => None,
+        })?;
+
+        let peer_families: &[(Family, u8, u32)] =
+            remote_capabilities.iter().find_map(|c| match c {
+                packet::Capability::LongLivedGracefulRestart(v) => Some(v.as_slice()),
+                _ => None,
+            })?;
+
+        let families: Vec<(Family, std::time::Duration)> =
+            local_families
+                .iter()
+                .filter_map(|local_f| {
+                    peer_families.iter().find(|(pf, _, _)| pf == local_f).map(
+                        |(f, _, peer_time)| (*f, std::time::Duration::from_secs(*peer_time as u64)),
+                    )
+                })
+                .collect();
+
+        if families.is_empty() {
+            return None;
+        }
+        Some(NegotiatedLlgr { families })
     }
 
     async fn on_established(&mut self, local_sockaddr: SocketAddr, remote_sockaddr: SocketAddr) {
@@ -2400,9 +2450,10 @@ impl PeerSession {
                         .remote_holdtime
                         .store(remote_holdtime, Ordering::Relaxed);
 
-                    // Compute GR negotiation result before remote_capabilities
+                    // Compute GR/LLGR negotiation result before remote_capabilities
                     // is consumed by Arc::new below.
                     self.negotiated_gr = self.negotiate_gr(&remote_capabilities);
+                    self.negotiated_llgr = self.negotiate_llgr(&remote_capabilities);
                     effects.push(GlobalEffect::GrSessionEstablished {
                         negotiated_gr: self.negotiated_gr.clone(),
                     });
@@ -3128,6 +3179,7 @@ impl PeerSession {
             remote_addr: self.remote_addr,
             export_map: ExportMap::new(),
             negotiated_gr: None,
+            negotiated_llgr: None,
         };
         let mut stream = self.stream.take().unwrap();
         let Ok(remote_sockaddr) = stream.peer_addr() else {
@@ -3212,6 +3264,15 @@ impl PeerSession {
             .negotiated_gr
             .take()
             .and_then(|gr| gr_on_disconnect(&shutdown_reason, gr));
+        // LLGR follows the same eligibility rules as GR (RFC 9494 §4.2).
+        if disconnect.negotiated_gr.is_some()
+            || matches!(
+                shutdown_reason,
+                None | Some(crate::fsm::SessionDownReason::IoError)
+            )
+        {
+            disconnect.negotiated_llgr = self.negotiated_llgr.take();
+        }
         disconnect
     }
 
@@ -3230,6 +3291,7 @@ impl PeerSession {
             .is_some_and(|p| p.admin_down)
         {
             info.negotiated_gr = None;
+            info.negotiated_llgr = None;
         }
 
         // Operate on PeerContext directly via self.context — no global lock needed
@@ -3273,7 +3335,7 @@ async fn apply_disconnect(
     context: &Arc<std::sync::Mutex<PeerContext>>,
     remote_addr: IpAddr,
     tables: &TableHandle,
-    info: DisconnectInfo,
+    mut info: DisconnectInfo,
 ) -> bool {
     let mut ctx = context.lock().unwrap();
 
@@ -3298,8 +3360,8 @@ async fn apply_disconnect(
         let _ = arb.process(info.role, crate::fsm::Input::Disconnected);
     }
 
-    if let Some(gr) = &info.negotiated_gr {
-        // GR active (we are the helper; the peer is the restarting speaker):
+    if info.negotiated_gr.is_some() || info.negotiated_llgr.is_some() {
+        // GR and/or LLGR active (we are the helper; the peer is the restarting speaker):
         // advance the GR state machine to arm the restart timer, then wait
         // for the peer to reconnect and re-send its routes.
         //
@@ -3325,12 +3387,18 @@ async fn apply_disconnect(
             ctx.cancel_rtc_timer();
         }
 
+        let llgr_params = info
+            .negotiated_llgr
+            .take()
+            .map(|llgr| crate::gr::LlgrParams {
+                families: llgr.families,
+            });
         let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
-            gr: Some(crate::gr::GrParams {
+            gr: info.negotiated_gr.as_ref().map(|gr| crate::gr::GrParams {
                 families: gr.families.clone(),
                 restart_time: gr.restart_time,
             }),
-            llgr: None,
+            llgr: llgr_params,
         });
         for output in &outputs {
             if let crate::gr::GrOutput::StartTimer(duration) = output {
@@ -3408,6 +3476,7 @@ mod tests {
             send_max: FnvHashMap::default(),
             prefix_limits: FnvHashMap::default(),
             graceful_restart: None,
+            llgr: None,
             bfd_config: None,
         }
     }
@@ -3747,6 +3816,7 @@ mod tests {
                     families: FnvHashMap::default(),
                     send_max: FnvHashMap::default(),
                     graceful_restart: None,
+                    llgr: None,
                 },
             );
         }
@@ -3792,6 +3862,7 @@ mod tests {
                     families: FnvHashMap::default(),
                     send_max: FnvHashMap::default(),
                     graceful_restart: None,
+                    llgr: None,
                 },
             );
         }
@@ -4398,6 +4469,7 @@ mod tests {
                         notification_enabled: false,
                         families: vec![Family::IPV4],
                     }),
+                    llgr: None,
                 },
             );
         }
@@ -4643,6 +4715,7 @@ mod tests {
                     families: FnvHashMap::default(),
                     send_max: FnvHashMap::default(),
                     graceful_restart: None,
+                    llgr: None,
                 },
             );
         }
@@ -4687,6 +4760,7 @@ mod tests {
                     families,
                     send_max: FnvHashMap::default(),
                     graceful_restart: None,
+                    llgr: None,
                 },
             );
         }
@@ -5777,6 +5851,105 @@ mod tests {
     async fn negotiate_gr_neither_n_bit_not_enabled() {
         let gr = make_gr_cap(0x0, 0x0).await.unwrap();
         assert!(!gr.notification_enabled);
+    }
+
+    // ---- negotiate_llgr ----
+
+    fn make_session_with_llgr_cap(local_stale: u32) -> PeerSession {
+        let tables = make_tables();
+        let context = make_context();
+        let mut session = PeerSession::new_for_test("10.0.0.1".parse().unwrap(), context, tables);
+        session.local_cap = vec![packet::Capability::LongLivedGracefulRestart(vec![(
+            Family::IPV4,
+            0,
+            local_stale,
+        )])];
+        session
+    }
+
+    #[tokio::test]
+    async fn negotiate_llgr_succeeds_when_both_advertise() {
+        let session = make_session_with_llgr_cap(600);
+        let remote_caps = vec![packet::Capability::LongLivedGracefulRestart(vec![(
+            Family::IPV4,
+            0,
+            300,
+        )])];
+        let llgr = session.negotiate_llgr(&remote_caps).unwrap();
+        assert_eq!(llgr.families.len(), 1);
+        assert_eq!(llgr.families[0].0, Family::IPV4);
+        // Stale time comes from the peer's capability.
+        assert_eq!(llgr.families[0].1, Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn negotiate_llgr_none_when_peer_does_not_advertise() {
+        let session = make_session_with_llgr_cap(600);
+        // Peer sends no LLGR capability.
+        let remote_caps = vec![packet::Capability::RouteRefresh];
+        assert!(session.negotiate_llgr(&remote_caps).is_none());
+    }
+
+    #[tokio::test]
+    async fn negotiate_llgr_none_when_local_does_not_advertise() {
+        let tables = make_tables();
+        let context = make_context();
+        let mut session = PeerSession::new_for_test("10.0.0.1".parse().unwrap(), context, tables);
+        // No LLGR in local_cap.
+        session.local_cap = vec![packet::Capability::RouteRefresh];
+        let remote_caps = vec![packet::Capability::LongLivedGracefulRestart(vec![(
+            Family::IPV4,
+            0,
+            300,
+        )])];
+        assert!(session.negotiate_llgr(&remote_caps).is_none());
+    }
+
+    #[tokio::test]
+    async fn negotiate_llgr_empty_when_no_family_overlap() {
+        let session = make_session_with_llgr_cap(600); // local: IPV4
+        let remote_caps = vec![packet::Capability::LongLivedGracefulRestart(vec![(
+            Family::IPV6,
+            0,
+            300,
+        )])]; // peer: IPV6 only
+        assert!(session.negotiate_llgr(&remote_caps).is_none());
+    }
+
+    #[tokio::test]
+    async fn build_local_cap_includes_llgr_when_configured() {
+        let mut families = FnvHashMap::default();
+        families.insert(Family::IPV4, 0u8);
+        let llgr = LlgrPeerConfig {
+            families: vec![(Family::IPV4, 600)],
+        };
+        let caps = PeerParams::build_local_cap(
+            "10.0.0.1".parse().unwrap(),
+            65001,
+            &families,
+            None,
+            Some(&llgr),
+        );
+        let has_llgr = caps.iter().any(|c| {
+            matches!(
+                c,
+                packet::Capability::LongLivedGracefulRestart(v)
+                if v.iter().any(|(f, _, t)| *f == Family::IPV4 && *t == 600)
+            )
+        });
+        assert!(has_llgr, "LLGR capability must be advertised");
+    }
+
+    #[tokio::test]
+    async fn build_local_cap_no_llgr_when_not_configured() {
+        let mut families = FnvHashMap::default();
+        families.insert(Family::IPV4, 0u8);
+        let caps =
+            PeerParams::build_local_cap("10.0.0.1".parse().unwrap(), 65001, &families, None, None);
+        let has_llgr = caps
+            .iter()
+            .any(|c| matches!(c, packet::Capability::LongLivedGracefulRestart(_)));
+        assert!(!has_llgr, "no LLGR capability when llgr config is None");
     }
 
     // ---- RFC 8538 N-bit: gr_on_disconnect logic ----
@@ -7675,6 +7848,7 @@ mod tests {
             remote_addr: "10.0.0.1".parse().unwrap(),
             export_map: em,
             negotiated_gr,
+            negotiated_llgr: None,
         }
     }
 
@@ -7718,7 +7892,8 @@ mod tests {
     #[test]
     fn build_local_cap_ipv4_peer_no_families_defaults_to_ipv4() {
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
-        let caps = PeerParams::build_local_cap(remote_addr, 65001, &FnvHashMap::default(), None);
+        let caps =
+            PeerParams::build_local_cap(remote_addr, 65001, &FnvHashMap::default(), None, None);
         assert!(caps.iter().any(|c| matches!(
             c,
             packet::Capability::MultiProtocol(f) if *f == Family::IPV4
@@ -7731,7 +7906,8 @@ mod tests {
     #[test]
     fn build_local_cap_ipv6_peer_no_families_defaults_to_ipv6() {
         let remote_addr: IpAddr = "2001:db8::1".parse().unwrap();
-        let caps = PeerParams::build_local_cap(remote_addr, 65001, &FnvHashMap::default(), None);
+        let caps =
+            PeerParams::build_local_cap(remote_addr, 65001, &FnvHashMap::default(), None, None);
         assert!(caps.iter().any(|c| matches!(
             c,
             packet::Capability::MultiProtocol(f) if *f == Family::IPV6
@@ -7744,7 +7920,7 @@ mod tests {
         let remote_addr: IpAddr = "2001:db8::1".parse().unwrap();
         let mut families = FnvHashMap::default();
         families.insert(Family::IPV4, 0u8);
-        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None, None);
         assert!(has_cap(&caps, CAP_EXTENDED_NEXTHOP));
         assert!(caps.iter().any(|c| matches!(
             c,
@@ -7758,7 +7934,7 @@ mod tests {
         let remote_addr: IpAddr = "2001:db8::1".parse().unwrap();
         let mut families = FnvHashMap::default();
         families.insert(Family::IPV6, 0u8);
-        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None, None);
         assert!(!has_cap(&caps, CAP_EXTENDED_NEXTHOP));
     }
 
@@ -7767,7 +7943,7 @@ mod tests {
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
         let mut families = FnvHashMap::default();
         families.insert(Family::IPV4, 0u8);
-        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None, None);
         assert!(!has_cap(&caps, CAP_EXTENDED_NEXTHOP));
     }
 
@@ -7779,7 +7955,7 @@ mod tests {
         let mut families = FnvHashMap::default();
         families.insert(Family::IPV4, 0u8);
         families.insert(Family::IPV4_SRPOLICY, 0u8);
-        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None, None);
         // ExtendedNexthop is still advertised for IPV4, but not for IPV4_SRPOLICY.
         assert!(has_cap(&caps, CAP_EXTENDED_NEXTHOP));
         assert!(!caps.iter().any(|c| matches!(
@@ -7795,7 +7971,7 @@ mod tests {
         let mut families = FnvHashMap::default();
         families.insert(Family::IPV4, 3u8); // mode > 0: include in AddPath
         families.insert(Family::IPV6, 0u8); // mode == 0: exclude from AddPath
-        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None, None);
         assert!(has_cap(&caps, CAP_ADDPATH));
         let addpath_families: Vec<Family> = caps
             .iter()
@@ -7817,7 +7993,7 @@ mod tests {
         let mut families = FnvHashMap::default();
         families.insert(Family::IPV4, 0u8);
         families.insert(Family::IPV6, 0u8);
-        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None);
+        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None, None);
         assert!(!has_cap(&caps, CAP_ADDPATH));
     }
 
@@ -7829,8 +8005,13 @@ mod tests {
             notification_enabled: true,
             families: vec![Family::IPV4],
         };
-        let caps =
-            PeerParams::build_local_cap(remote_addr, 65001, &FnvHashMap::default(), Some(&gr));
+        let caps = PeerParams::build_local_cap(
+            remote_addr,
+            65001,
+            &FnvHashMap::default(),
+            Some(&gr),
+            None,
+        );
         let gr_cap = caps.iter().find_map(|c| {
             if let packet::Capability::GracefulRestart { flags, .. } = c {
                 Some(*flags)
@@ -7850,8 +8031,13 @@ mod tests {
             notification_enabled: false,
             families: vec![Family::IPV4],
         };
-        let caps =
-            PeerParams::build_local_cap(remote_addr, 65001, &FnvHashMap::default(), Some(&gr));
+        let caps = PeerParams::build_local_cap(
+            remote_addr,
+            65001,
+            &FnvHashMap::default(),
+            Some(&gr),
+            None,
+        );
         let gr_cap = caps.iter().find_map(|c| {
             if let packet::Capability::GracefulRestart { flags, .. } = c {
                 Some(*flags)

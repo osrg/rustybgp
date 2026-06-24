@@ -39,6 +39,15 @@ pub(crate) struct GrPeerConfig {
     pub(crate) families: Vec<Family>,
 }
 
+/// Static LLGR configuration for a single peer (RFC 9494), set at peer creation.
+/// `None` in `PeerConfig::llgr` means LLGR is disabled for this peer.
+#[derive(Clone)]
+pub(crate) struct LlgrPeerConfig {
+    /// Per-family LLGR stale times advertised in our OPEN (24-bit, max ~16 million seconds).
+    /// Only families with a non-zero stale time are included; non-empty by construction.
+    pub(crate) families: Vec<(Family, u32)>,
+}
+
 /// RFC 4456 Route Reflector configuration for a single peer.
 #[derive(Clone, Default)]
 pub(crate) struct RouteReflectorConfig {
@@ -80,6 +89,10 @@ pub(crate) struct PeerConfig {
     pub(crate) prefix_limits: FnvHashMap<Family, u32>,
     /// GR helper config; None = GR disabled.
     pub(crate) graceful_restart: Option<GrPeerConfig>,
+    /// LLGR helper config; None = LLGR disabled.
+    // Used in Step 5 (session handling) and Step 6 (export).
+    #[allow(dead_code)]
+    pub(crate) llgr: Option<LlgrPeerConfig>,
 }
 
 /// Plain-struct replacement for the old PeerBuilder.
@@ -108,6 +121,7 @@ pub(crate) struct PeerParams {
     pub(crate) send_max: FnvHashMap<Family, usize>,
     pub(crate) prefix_limits: FnvHashMap<Family, u32>,
     pub(crate) graceful_restart: Option<GrPeerConfig>,
+    pub(crate) llgr: Option<LlgrPeerConfig>,
     pub(crate) bfd_config: Option<crate::bfd::BfdPeerConfig>,
 }
 
@@ -124,6 +138,7 @@ impl PeerParams {
         local_asn: u32,
         families: &FnvHashMap<Family, u8>,
         graceful_restart: Option<&GrPeerConfig>,
+        llgr: Option<&LlgrPeerConfig>,
     ) -> Vec<packet::Capability> {
         let mut local_cap: Vec<packet::Capability> = Vec::new();
         if families.is_empty() {
@@ -167,6 +182,13 @@ impl PeerParams {
                 restart_time: gr.restart_time,
                 families: gr.families.iter().map(|f| (*f, 0)).collect(),
             });
+        }
+        if let Some(llgr) = llgr {
+            // F-bit (0x80): forwarding preserved during LLGR stale period.
+            // We always advertise F=0 (forwarding may not be preserved).
+            local_cap.push(packet::Capability::LongLivedGracefulRestart(
+                llgr.families.iter().map(|(f, t)| (*f, 0u8, *t)).collect(),
+            ));
         }
 
         // Always advertise 4-byte ASN support.
@@ -219,6 +241,9 @@ impl PeerParams {
         if self.graceful_restart.is_none() {
             self.graceful_restart = pg.graceful_restart.clone();
         }
+        if self.llgr.is_none() {
+            self.llgr = pg.llgr.clone();
+        }
         if !self.passive && pg.passive {
             self.passive = true;
         }
@@ -246,6 +271,7 @@ impl PeerParams {
             self.local_asn,
             &self.families,
             self.graceful_restart.as_ref(),
+            self.llgr.as_ref(),
         );
 
         let conn_arbiter = Arc::new(std::sync::Mutex::new(ConnArbiter::new(
@@ -282,6 +308,7 @@ impl PeerParams {
                 password: self.password,
                 prefix_limits: self.prefix_limits,
                 graceful_restart: self.graceful_restart,
+                llgr: self.llgr,
             },
             admin_down: self.admin_down,
             state: Arc::new(PeerState {
@@ -389,6 +416,35 @@ pub(crate) fn parse_gr_config(
     })
 }
 
+pub(crate) fn parse_llgr_config(afi_safis: &[config::AfiSafi]) -> Option<LlgrPeerConfig> {
+    const DEFAULT_STALE_TIME: u32 = 600;
+    let families: Vec<(Family, u32)> = afi_safis
+        .iter()
+        .filter(|a| {
+            a.long_lived_graceful_restart
+                .as_ref()
+                .and_then(|llgr| llgr.config.as_ref())
+                .and_then(|c| c.enabled)
+                .unwrap_or(false)
+        })
+        .filter_map(|a| {
+            let family =
+                convert::family_from_config(a.config.as_ref()?.afi_safi_name.as_ref()?).ok()?;
+            let stale_time = a
+                .long_lived_graceful_restart
+                .as_ref()
+                .and_then(|llgr| llgr.config.as_ref())
+                .and_then(|c| c.restart_time)
+                .unwrap_or(DEFAULT_STALE_TIME);
+            Some((family, stale_time))
+        })
+        .collect();
+    if families.is_empty() {
+        return None;
+    }
+    Some(LlgrPeerConfig { families })
+}
+
 impl TryFrom<&config::Neighbor> for PeerParams {
     type Error = String;
 
@@ -412,6 +468,7 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                 .as_ref()
                 .and_then(|gr| gr.config.as_ref()),
         );
+        let llgr = parse_llgr_config(afi_safis);
 
         // Extract per-family prefix limits.
         let mut prefix_limits: FnvHashMap<Family, u32> = FnvHashMap::default();
@@ -500,6 +557,7 @@ impl TryFrom<&config::Neighbor> for PeerParams {
             send_max,
             prefix_limits,
             graceful_restart,
+            llgr,
             bfd_config: n
                 .bfd
                 .as_ref()
@@ -539,12 +597,14 @@ pub(crate) struct PeerGroup {
     pub(crate) families: FnvHashMap<Family, u8>,
     pub(crate) send_max: FnvHashMap<Family, usize>,
     pub(crate) graceful_restart: Option<GrPeerConfig>,
+    pub(crate) llgr: Option<LlgrPeerConfig>,
 }
 
 impl From<&config::PeerGroup> for PeerGroup {
     fn from(pg: &config::PeerGroup) -> Self {
         let timer_config = pg.timers.as_ref().and_then(|t| t.config.as_ref());
-        let (families, send_max) = parse_afi_safis(pg.afi_safis.as_deref().unwrap_or_default());
+        let afi_safis = pg.afi_safis.as_deref().unwrap_or_default();
+        let (families, send_max) = parse_afi_safis(afi_safis);
         PeerGroup {
             as_number: pg.config.as_ref().and_then(|c| c.peer_as).unwrap_or(0),
             dynamic_peers: Vec::new(),
@@ -616,11 +676,12 @@ impl From<&config::PeerGroup> for PeerGroup {
             families,
             send_max,
             graceful_restart: parse_gr_config(
-                pg.afi_safis.as_deref().unwrap_or_default(),
+                afi_safis,
                 pg.graceful_restart
                     .as_ref()
                     .and_then(|gr| gr.config.as_ref()),
             ),
+            llgr: parse_llgr_config(afi_safis),
         }
     }
 }
