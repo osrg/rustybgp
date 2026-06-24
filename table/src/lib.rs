@@ -1705,6 +1705,134 @@ impl Table {
         changes
     }
 
+    /// Mark the source for `addr` as LLGR stale in `family`.
+    ///
+    /// Sets `source.mark_llgr_stale()` on all paths from `addr`, re-sorts
+    /// affected destinations, and returns best-path changes for distribution.
+    /// Mirrors `restale()` but for the LLGR stale flag.
+    ///
+    /// The caller must also call `drop_no_llgr()` for the same addr/family to
+    /// delete paths that carry the NO_LLGR community (RFC 9494 §4.2 MUST).
+    pub fn restale_llgr(&mut self, addr: IpAddr, family: Family) -> Vec<NlriChange> {
+        let mut changes = Vec::new();
+        if let Some(rt) = self.ribs.get_mut(&family) {
+            for (net, dst) in rt.destinations.iter_mut() {
+                if !dst.entry.iter().any(|p| p.path.source.remote_addr == addr) {
+                    continue;
+                }
+                let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let any_unfiltered_from_addr = dst
+                    .entry
+                    .iter()
+                    .any(|e| e.path.source.remote_addr == addr && !e.is_filtered());
+                for p in dst.entry.iter() {
+                    if p.path.source.remote_addr == addr {
+                        p.path.source.mark_llgr_stale();
+                    }
+                }
+                dst.entry.sort_unstable();
+                let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let best_changed = old_best_id != new_best_id;
+                if best_changed || any_unfiltered_from_addr {
+                    let current_paths = Arc::new(
+                        dst.entry
+                            .iter()
+                            .filter(|e| !e.is_filtered())
+                            .map(|e| e.path.clone())
+                            .collect(),
+                    );
+                    changes.push(NlriChange {
+                        family,
+                        net: net.clone(),
+                        best_changed,
+                        any_changed: any_unfiltered_from_addr,
+                        replaced_path_id: None,
+                        current_paths,
+                    });
+                }
+            }
+        }
+        changes
+    }
+
+    /// Remove routes from `addr` in `family` that carry the NO_LLGR community
+    /// (0xFFFF0007).  Called together with `restale_llgr()` when the LLGR stale
+    /// period begins (RFC 9494 §4.2 MUST).
+    pub fn drop_no_llgr(
+        &mut self,
+        addr: IpAddr,
+        family: Family,
+        prefix_counter: Option<&Arc<AtomicU64>>,
+    ) -> (Vec<NlriChange>, Vec<IpAddr>) {
+        let mut changes = Vec::new();
+        let mut removed_nexthops: Vec<IpAddr> = Vec::new();
+        if let Some(rt) = self.ribs.get_mut(&family) {
+            rt.destinations.retain(|net, dst| {
+                if !dst.entry.iter().any(|e| {
+                    e.path.source.remote_addr == addr && has_no_llgr_community(&e.path.attr)
+                }) {
+                    return true;
+                }
+
+                let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let removed_any_unfiltered = dst.entry.iter().any(|e| {
+                    e.path.source.remote_addr == addr
+                        && has_no_llgr_community(&e.path.attr)
+                        && !e.is_filtered()
+                        && !e.is_nexthop_invalid()
+                });
+
+                for e in dst.entry.iter() {
+                    if e.path.source.remote_addr == addr
+                        && has_no_llgr_community(&e.path.attr)
+                        && let Some(nh) = e.path.nexthop
+                    {
+                        removed_nexthops.push(nh.addr());
+                    }
+                }
+                dst.entry.retain(|e| {
+                    !(e.path.source.remote_addr == addr && has_no_llgr_community(&e.path.attr))
+                });
+
+                let peer_still_has_path =
+                    dst.entry.iter().any(|p| p.path.source.remote_addr == addr);
+                if !peer_still_has_path && let Some(counter) = prefix_counter {
+                    counter.fetch_sub(1, Ordering::Relaxed);
+                }
+
+                if !removed_any_unfiltered {
+                    return !dst.entry.is_empty();
+                }
+
+                if dst.entry.is_empty() {
+                    changes.push(NlriChange {
+                        family,
+                        net: net.clone(),
+                        best_changed: true,
+                        any_changed: true,
+                        replaced_path_id: None,
+                        current_paths: Arc::new(vec![]),
+                    });
+                    return false;
+                }
+
+                let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+                let current_paths =
+                    Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
+                changes.push(NlriChange {
+                    family,
+                    net: net.clone(),
+                    best_changed: old_best_id != new_best_id,
+                    any_changed: true,
+                    replaced_path_id: None,
+                    current_paths,
+                });
+                true
+            });
+        }
+        (changes, removed_nexthops)
+    }
+
     pub fn new() -> Self {
         Table {
             ribs: vec![(Family::EMPTY, Rib::default())].into_iter().collect(),
@@ -5784,5 +5912,183 @@ mod tests {
         assert_eq!(paths.len(), 2);
         let stale_count = paths.iter().filter(|p| p.4.is_stale()).count();
         assert_eq!(stale_count, 1);
+    }
+
+    // =========================================================================
+    // restale_llgr / drop_no_llgr / drop_llgr_stale tests
+    // =========================================================================
+
+    fn community_attr(community: u32) -> packet::Attribute {
+        packet::Attribute::new_with_bin(
+            packet::Attribute::COMMUNITY,
+            community.to_be_bytes().to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn attrs_with_no_llgr() -> Arc<Vec<packet::Attribute>> {
+        Arc::new(vec![community_attr(0xffff_0007)])
+    }
+
+    fn attrs_with_llgr_stale() -> Arc<Vec<packet::Attribute>> {
+        Arc::new(vec![community_attr(0xffff_0006)])
+    }
+
+    fn insert_with_attrs(
+        rt: &mut Table,
+        source: &Arc<Source>,
+        net: &packet::Nlri,
+        attrs: Arc<Vec<packet::Attribute>>,
+    ) {
+        rt.insert(
+            source.clone(),
+            Family::IPV4,
+            net.clone(),
+            0,
+            nh(),
+            attrs,
+            None,
+            false,
+            false,
+            None,
+            SystemTime::UNIX_EPOCH,
+        );
+    }
+
+    // --- restale_llgr ---
+
+    #[test]
+    fn restale_llgr_sets_source_flag() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &s, &net, attrs_with_origin(0));
+
+        assert!(!s.is_llgr_stale());
+        rt.restale_llgr(s.remote_addr, Family::IPV4);
+        assert!(s.is_llgr_stale());
+    }
+
+    #[test]
+    fn restale_llgr_keeps_routes() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &s, &net, attrs_with_origin(0));
+
+        rt.restale_llgr(s.remote_addr, Family::IPV4);
+
+        assert_eq!(flat_best(&rt, &Family::IPV4).len(), 1);
+    }
+
+    #[test]
+    fn restale_llgr_emits_change_when_best_demoted() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        // s1 has lower router-id so it wins the tiebreak before marking.
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        // Equal local-pref: LLGR stale flag becomes the tiebreaker.
+        insert_with_attrs(&mut rt, &s1, &net, attrs_with_local_pref(100));
+        insert_with_attrs(&mut rt, &s2, &net, attrs_with_local_pref(100));
+
+        let changes = rt.restale_llgr(s1.remote_addr, Family::IPV4);
+
+        assert!(!changes.is_empty());
+        assert!(changes[0].best_changed);
+        let best = flat_best(&rt, &Family::IPV4);
+        assert_eq!(best[0].1.source.remote_addr, s2.remote_addr);
+    }
+
+    // --- drop_no_llgr ---
+
+    #[test]
+    fn drop_no_llgr_removes_no_llgr_routes() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &s, &net, attrs_with_no_llgr());
+
+        let (changes, nexthops) = rt.drop_no_llgr(s.remote_addr, Family::IPV4, None);
+
+        assert!(flat_best(&rt, &Family::IPV4).is_empty());
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].current_paths.is_empty());
+        assert_eq!(nexthops.len(), 1);
+    }
+
+    #[test]
+    fn drop_no_llgr_keeps_normal_routes() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &s, &net, attrs_with_origin(0));
+
+        let (changes, nexthops) = rt.drop_no_llgr(s.remote_addr, Family::IPV4, None);
+
+        assert_eq!(flat_best(&rt, &Family::IPV4).len(), 1);
+        assert!(changes.is_empty());
+        assert!(nexthops.is_empty());
+    }
+
+    #[test]
+    fn drop_no_llgr_keeps_other_peer_no_llgr_route() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        insert_with_attrs(&mut rt, &s1, &net, attrs_with_no_llgr());
+        insert_with_attrs(&mut rt, &s2, &net, attrs_with_origin(0));
+
+        rt.drop_no_llgr(s1.remote_addr, Family::IPV4, None);
+
+        let best = flat_best(&rt, &Family::IPV4);
+        assert_eq!(best.len(), 1);
+        assert_eq!(best[0].1.source.remote_addr, s2.remote_addr);
+    }
+
+    #[test]
+    fn drop_llgr_stale_removes_llgr_stale_routes() {
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s = source(1, 65001, 65000, 1);
+        insert_with_attrs(&mut rt, &s, &net, attrs_with_origin(0));
+        s.mark_llgr_stale();
+
+        let (changes, _) = rt.drop_llgr_stale(s.remote_addr, Family::IPV4, None);
+
+        assert!(flat_best(&rt, &Family::IPV4).is_empty());
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].current_paths.is_empty());
+    }
+
+    #[test]
+    fn drop_llgr_stale_keeps_routes_from_other_peer() {
+        // drop_llgr_stale only removes routes from the target addr;
+        // routes from other peers (even if they carry LLGR_STALE community)
+        // are not touched.
+        let mut rt = Table::new();
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        s1.mark_llgr_stale();
+        insert_with_attrs(&mut rt, &s1, &net, attrs_with_origin(0));
+        insert_with_attrs(&mut rt, &s2, &net, attrs_with_llgr_stale());
+
+        rt.drop_llgr_stale(s1.remote_addr, Family::IPV4, None);
+
+        // s2's route stays because drop_llgr_stale filters by source.remote_addr == addr.
+        let best = flat_best(&rt, &Family::IPV4);
+        assert_eq!(best.len(), 1);
+        assert_eq!(best[0].1.source.remote_addr, s2.remote_addr);
+    }
+
+    #[test]
+    fn drop_llgr_stale_no_routes_is_noop() {
+        let mut rt = Table::new();
+        let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let (changes, nexthops) = rt.drop_llgr_stale(addr, Family::IPV4, None);
+        assert!(changes.is_empty());
+        assert!(nexthops.is_empty());
     }
 }

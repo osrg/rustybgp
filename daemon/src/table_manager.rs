@@ -510,6 +510,46 @@ impl TableManager {
         }
     }
 
+    // Called by the driver in Step 5 when GrOutput::StartLlgrTimers is received.
+    #[allow(dead_code)]
+    /// Begin the LLGR stale period for `addr`.
+    ///
+    /// Marks the source as LLGR stale and removes any routes from that source
+    /// that carry the NO_LLGR community (RFC 9494 §4.2 MUST).  Remaining routes
+    /// are kept; the LLGR_STALE community is added at export time.
+    ///
+    /// Call this when `GrOutput::StartLlgrTimers` is received from the state
+    /// machine, i.e. when the GR restart timer expires or on a direct LLGR-only
+    /// session drop.
+    pub(crate) fn mark_llgr_stale(&self, addr: IpAddr, families: &[Family]) {
+        let kernel_handle = self.kernel_handle.load_full();
+        let subs = self.subscribers.load();
+        for shard in &self.shards {
+            let mut t = shard.lock().unwrap();
+            for &family in families {
+                t.mark_llgr_stale(addr, family, kernel_handle.as_deref(), &subs);
+            }
+        }
+    }
+
+    // Called by the driver in Step 5 when GrOutput::DeleteLlgrStaleRoutes is received.
+    #[allow(dead_code)]
+    /// Remove LLGR stale routes for `addr` in the given families.
+    ///
+    /// Called when the per-family LLGR stale timer expires
+    /// (`GrOutput::DeleteLlgrStaleRoutes`) or when EOR is received after a
+    /// reconnect from the LLGR stale period.
+    pub(crate) fn drop_llgr_stale_families(&self, addr: IpAddr, families: &[Family]) {
+        let kernel_handle = self.kernel_handle.load_full();
+        let subs = self.subscribers.load();
+        for shard in &self.shards {
+            let mut t = shard.lock().unwrap();
+            for &family in families {
+                t.drop_llgr_stale(addr, family, kernel_handle.as_deref(), &subs);
+            }
+        }
+    }
+
     pub(crate) fn end_deferral_families(&self, families: &[Family]) {
         let kernel_handle = self.kernel_handle.load_full();
         let subs = self.subscribers.load();
@@ -1303,6 +1343,51 @@ impl TableShard {
         subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
     ) {
         let (changes, nexthops) = self.rtable.drop_stale(addr, family, None);
+        for change in changes {
+            self.distribute_update(change, kernel_handle, subs);
+        }
+        if let Some(handle) = kernel_handle {
+            for nh in nexthops {
+                handle.unregister_nexthop(nh);
+            }
+        }
+    }
+
+    // Used by TableManager::mark_llgr_stale, called in Step 5.
+    #[allow(dead_code)]
+    fn mark_llgr_stale(
+        &mut self,
+        addr: IpAddr,
+        family: Family,
+        kernel_handle: Option<&kernel::KernelHandle>,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
+    ) {
+        // 1. Set source LLGR stale flag and re-evaluate best paths.
+        for change in self.rtable.restale_llgr(addr, family) {
+            self.distribute_update(change, kernel_handle, subs);
+        }
+        // 2. Delete paths with NO_LLGR community (RFC 9494 §4.2 MUST).
+        let (changes, nexthops) = self.rtable.drop_no_llgr(addr, family, None);
+        for change in changes {
+            self.distribute_update(change, kernel_handle, subs);
+        }
+        if let Some(handle) = kernel_handle {
+            for nh in nexthops {
+                handle.unregister_nexthop(nh);
+            }
+        }
+    }
+
+    // Used by TableManager::drop_llgr_stale_families, called in Step 5.
+    #[allow(dead_code)]
+    fn drop_llgr_stale(
+        &mut self,
+        addr: IpAddr,
+        family: Family,
+        kernel_handle: Option<&kernel::KernelHandle>,
+        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
+    ) {
+        let (changes, nexthops) = self.rtable.drop_llgr_stale(addr, family, None);
         for change in changes {
             self.distribute_update(change, kernel_handle, subs);
         }
