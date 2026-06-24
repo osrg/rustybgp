@@ -90,7 +90,7 @@ pub(crate) struct PeerConfig {
     /// GR helper config; None = GR disabled.
     pub(crate) graceful_restart: Option<GrPeerConfig>,
     /// LLGR helper config; None = LLGR disabled.
-    // Used in Step 5 (session handling) and Step 6 (export).
+    // Read in Step 6 (export) to attach LLGR_STALE community.
     #[allow(dead_code)]
     pub(crate) llgr: Option<LlgrPeerConfig>,
 }
@@ -329,6 +329,7 @@ impl PeerParams {
                 active_connect_join_handle: None,
                 gr_state: crate::gr::GrState::new(),
                 gr_restart_timer: None,
+                llgr_family_timers: FnvHashMap::default(),
                 rtc_state: crate::rtc::RtcState::new(),
                 rtc_eor_timer: None,
             })),

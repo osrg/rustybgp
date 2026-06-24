@@ -315,6 +315,9 @@ struct PeerContext {
     /// Command channel for the GR restart timer task.
     /// Send `()` to fire the timer immediately (RunNow); drop the sender to cancel silently.
     gr_restart_timer: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Per-family LLGR stale timers.  Dropping a sender cancels the timer silently;
+    /// sending `()` fires it immediately (used on force-down while LLGR is running).
+    llgr_family_timers: FnvHashMap<Family, tokio::sync::oneshot::Sender<()>>,
     /// RTC per-peer state machine; persists across sessions when GR is active.
     rtc_state: crate::rtc::RtcState,
     /// Drop to cancel the 60-second RTC EOR timer task silently.
@@ -333,6 +336,12 @@ impl PeerContext {
         self.rtc_eor_timer.take();
     }
 
+    /// Cancel all per-family LLGR stale timers without running the expired handler.
+    /// Used when the peer reconnects during the LLGR stale period.
+    fn cancel_llgr_timers(&mut self) {
+        self.llgr_family_timers.clear();
+    }
+
     /// Fire the GR restart timer immediately, triggering stale route purge.
     /// Used when an API call forces the peer down while in GR helper mode.
     fn fire_gr_timer(&mut self) {
@@ -341,10 +350,19 @@ impl PeerContext {
         }
     }
 
-    /// Tear down the peer: fire GR timer, optionally stop the active-connect loop,
+    /// Fire all per-family LLGR timers immediately, triggering stale route deletion.
+    /// Used when a peer is forced down while in the LLGR stale period.
+    fn fire_llgr_timers(&mut self) {
+        for (_, tx) in self.llgr_family_timers.drain() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// Tear down the peer: fire GR/LLGR timers, optionally stop the active-connect loop,
     /// and send a close reason to any live session tasks.
     fn force_down(&mut self, reason: CloseReason, cancel_active_connect: bool) {
         self.fire_gr_timer();
+        self.fire_llgr_timers();
         if cancel_active_connect {
             self.active_connect_cancel_tx.take();
             self.active_connect_join_handle.take();
@@ -1807,24 +1825,108 @@ fn collect_delete_families(outputs: &[crate::gr::GrOutput]) -> Vec<Family> {
         .collect()
 }
 
+fn collect_delete_llgr_families(outputs: &[crate::gr::GrOutput]) -> Vec<Family> {
+    outputs
+        .iter()
+        .filter_map(|o| {
+            if let crate::gr::GrOutput::DeleteLlgrStaleRoutes(fs) = o {
+                Some(fs.as_slice())
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// Start per-family LLGR stale timers.  Marks routes LLGR-stale, drops NO_LLGR
+/// routes, and spawns one oneshot timer task per family.  On expiry the task
+/// calls `llgr_timer_expired`, which feeds `LlgrTimerExpired` into the GrState
+/// and then calls `drop_llgr_stale_families`.
+///
+/// The returned Vec of `(Family, Sender)` pairs must be inserted into
+/// `PeerContext::llgr_family_timers` by the caller (outside any lock held here).
+fn spawn_llgr_timers(
+    context: &Arc<std::sync::Mutex<PeerContext>>,
+    tables: &TableHandle,
+    addr: IpAddr,
+    families: &[(Family, Duration)],
+) -> Vec<(Family, tokio::sync::oneshot::Sender<()>)> {
+    let family_keys: Vec<Family> = families.iter().map(|(f, _)| *f).collect();
+    tables.mark_llgr_stale(addr, &family_keys);
+    families
+        .iter()
+        .map(|(family, duration)| {
+            let (timer_tx, timer_rx) = tokio::sync::oneshot::channel::<()>();
+            let context_c = Arc::clone(context);
+            let tables_c = tables.clone();
+            let family = *family;
+            let dur = *duration;
+            tokio::spawn(async move {
+                let run = match tokio::time::timeout(dur, timer_rx).await {
+                    Err(_) | Ok(Ok(())) => true,
+                    Ok(Err(_)) => false,
+                };
+                if run {
+                    llgr_timer_expired(context_c, tables_c, addr, family).await;
+                }
+            });
+            (family, timer_tx)
+        })
+        .collect()
+}
+
 async fn gr_restart_timer_expired(
     context: Arc<std::sync::Mutex<PeerContext>>,
     tables: TableHandle,
     addr: IpAddr,
 ) {
-    let families = {
+    let (delete_families, llgr_start) = {
         let mut ctx = context.lock().unwrap();
         let outputs = ctx.gr_state.process(crate::gr::GrInput::TimerExpired);
-        collect_delete_families(&outputs)
+        let del = collect_delete_families(&outputs);
+        let llgr = outputs.into_iter().find_map(|o| {
+            if let crate::gr::GrOutput::StartLlgrTimers(fs) = o {
+                Some(fs)
+            } else {
+                None
+            }
+        });
+        (del, llgr)
     };
-    if !families.is_empty() {
-        tables.drop_families(addr, &families);
+    if !delete_families.is_empty() {
+        tables.drop_families(addr, &delete_families);
     }
-    // GR failed: peer never reconnected, so RTC state is no longer useful.
-    // Reset to Inactive so the next session restarts the EOR handshake.
-    let mut ctx = context.lock().unwrap();
-    ctx.rtc_state.process(crate::rtc::RtcInput::SessionDropped);
-    ctx.cancel_rtc_timer();
+    if let Some(families) = llgr_start {
+        // GR timer expired and LLGR takes over for these families.
+        let timers = spawn_llgr_timers(&context, &tables, addr, &families);
+        let mut ctx = context.lock().unwrap();
+        ctx.llgr_family_timers.extend(timers);
+    } else {
+        // GR failed without LLGR: peer never reconnected, reset RTC state.
+        let mut ctx = context.lock().unwrap();
+        ctx.rtc_state.process(crate::rtc::RtcInput::SessionDropped);
+        ctx.cancel_rtc_timer();
+    }
+}
+
+async fn llgr_timer_expired(
+    context: Arc<std::sync::Mutex<PeerContext>>,
+    tables: TableHandle,
+    addr: IpAddr,
+    family: Family,
+) {
+    let delete_families = {
+        let mut ctx = context.lock().unwrap();
+        let outputs = ctx
+            .gr_state
+            .process(crate::gr::GrInput::LlgrTimerExpired(family));
+        collect_delete_llgr_families(&outputs)
+    };
+    if !delete_families.is_empty() {
+        tables.drop_llgr_stale_families(addr, &delete_families);
+    }
 }
 
 async fn rtc_eor_timer_expired(
@@ -1859,18 +1961,23 @@ enum GlobalEffect {
 
 /// Returns the families whose routes must be dropped immediately on disconnect.
 ///
-/// GR families are preserved (routes are kept stale until the restart timer
-/// fires or EOR is received).  Every other session family is dropped right away,
-/// even when GR is active for the peer.
+/// GR families are preserved (routes are kept GR-stale until the restart timer
+/// fires or EOR is received).  LLGR families are also preserved (routes are kept
+/// LLGR-stale until the per-family timer fires).  Every other session family is
+/// dropped right away.
 fn families_to_drop_on_disconnect<'a>(
     session_families: impl Iterator<Item = &'a Family>,
     negotiated_gr: Option<&NegotiatedGr>,
+    negotiated_llgr: Option<&NegotiatedLlgr>,
 ) -> Vec<Family> {
     let gr_families: FnvHashSet<Family> = negotiated_gr
         .map(|g| g.families.iter().copied().collect())
         .unwrap_or_default();
+    let llgr_families: FnvHashSet<Family> = negotiated_llgr
+        .map(|l| l.families.iter().map(|(f, _)| *f).collect())
+        .unwrap_or_default();
     session_families
-        .filter(|f| !gr_families.contains(f))
+        .filter(|f| !gr_families.contains(f) && !llgr_families.contains(f))
         .copied()
         .collect()
 }
@@ -2572,16 +2679,31 @@ impl PeerSession {
                     } else {
                         // Helper side: advance GrState (no deferral timer — restart timer
                         // started at session drop covers the full stale-route window).
-                        let delete_families = {
+                        let (delete_families, delete_llgr_families, stop_llgr) = {
                             let mut ctx = self.context.lock().unwrap();
                             let outputs = ctx
                                 .gr_state
                                 .process(crate::gr::GrInput::SessionEstablished { gr_families });
-                            collect_delete_families(&outputs)
+                            let stop = outputs
+                                .iter()
+                                .any(|o| matches!(o, crate::gr::GrOutput::StopLlgrTimers));
+                            if stop {
+                                ctx.cancel_llgr_timers();
+                            }
+                            (
+                                collect_delete_families(&outputs),
+                                collect_delete_llgr_families(&outputs),
+                                stop,
+                            )
                         };
+                        let _ = stop_llgr; // consumed via cancel_llgr_timers above
                         if !delete_families.is_empty() {
                             self.tables
                                 .drop_stale_families(self.remote_addr, &delete_families);
+                        }
+                        if !delete_llgr_families.is_empty() {
+                            self.tables
+                                .drop_llgr_stale_families(self.remote_addr, &delete_llgr_families);
                         }
                     }
                 }
@@ -2602,16 +2724,23 @@ impl PeerSession {
                     let _ = process_restarting_outputs(rd_outputs, global, &self.tables).await;
 
                     // Helper side: GrState EOR handling (no-op when GrState is Idle).
-                    let delete_families = {
+                    let (delete_families, delete_llgr_families) = {
                         let mut ctx = self.context.lock().unwrap();
                         let outputs = ctx
                             .gr_state
                             .process(crate::gr::GrInput::EorReceived(family));
-                        collect_delete_families(&outputs)
+                        (
+                            collect_delete_families(&outputs),
+                            collect_delete_llgr_families(&outputs),
+                        )
                     };
                     if !delete_families.is_empty() {
                         self.tables
                             .drop_stale_families(self.remote_addr, &delete_families);
+                    }
+                    if !delete_llgr_families.is_empty() {
+                        self.tables
+                            .drop_llgr_stale_families(self.remote_addr, &delete_llgr_families);
                     }
                 }
                 GlobalEffect::RtcSessionEstablished { duration } => {
@@ -3237,8 +3366,11 @@ impl PeerSession {
         let shutdown_reason = Some(reason);
 
         if !self.source.is_empty() {
-            let drop_families =
-                families_to_drop_on_disconnect(self.source.keys(), self.negotiated_gr.as_ref());
+            let drop_families = families_to_drop_on_disconnect(
+                self.source.keys(),
+                self.negotiated_gr.as_ref(),
+                self.negotiated_llgr.as_ref(),
+            );
             let stale_families: Vec<Family> = self
                 .negotiated_gr
                 .as_ref()
@@ -3401,21 +3533,29 @@ async fn apply_disconnect(
             llgr: llgr_params,
         });
         for output in &outputs {
-            if let crate::gr::GrOutput::StartTimer(duration) = output {
-                let dur = *duration;
-                let context_c = Arc::clone(context);
-                let tables_c = tables.clone();
-                let (timer_tx, timer_rx) = tokio::sync::oneshot::channel::<()>();
-                tokio::spawn(async move {
-                    let run = match tokio::time::timeout(dur, timer_rx).await {
-                        Err(_) | Ok(Ok(())) => true,
-                        Ok(Err(_)) => false,
-                    };
-                    if run {
-                        gr_restart_timer_expired(context_c, tables_c, remote_addr).await;
-                    }
-                });
-                ctx.gr_restart_timer = Some(timer_tx);
+            match output {
+                crate::gr::GrOutput::StartTimer(duration) => {
+                    let dur = *duration;
+                    let context_c = Arc::clone(context);
+                    let tables_c = tables.clone();
+                    let (timer_tx, timer_rx) = tokio::sync::oneshot::channel::<()>();
+                    tokio::spawn(async move {
+                        let run = match tokio::time::timeout(dur, timer_rx).await {
+                            Err(_) | Ok(Ok(())) => true,
+                            Ok(Err(_)) => false,
+                        };
+                        if run {
+                            gr_restart_timer_expired(context_c, tables_c, remote_addr).await;
+                        }
+                    });
+                    ctx.gr_restart_timer = Some(timer_tx);
+                }
+                crate::gr::GrOutput::StartLlgrTimers(families) => {
+                    // mark_llgr_stale only acquires shard locks (not PeerContext), safe here.
+                    let timers = spawn_llgr_timers(context, tables, remote_addr, families);
+                    ctx.llgr_family_timers.extend(timers);
+                }
+                _ => {}
             }
         }
         drop(info.export_map);
@@ -5356,6 +5496,7 @@ mod tests {
             active_connect_join_handle: None,
             gr_state: crate::gr::GrState::new(),
             gr_restart_timer: None,
+            llgr_family_timers: FnvHashMap::default(),
             rtc_state: crate::rtc::RtcState::new(),
             rtc_eor_timer: None,
         }))
@@ -5468,7 +5609,7 @@ mod tests {
     #[test]
     fn drop_on_disconnect_no_gr_drops_all_families() {
         let families = [Family::IPV4, Family::IPV6];
-        let result = families_to_drop_on_disconnect(families.iter(), None);
+        let result = families_to_drop_on_disconnect(families.iter(), None, None);
         assert_eq!(result.len(), 2);
         assert!(result.contains(&Family::IPV4));
         assert!(result.contains(&Family::IPV6));
@@ -5482,7 +5623,7 @@ mod tests {
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
         };
-        let result = families_to_drop_on_disconnect(families.iter(), Some(&negotiated_gr));
+        let result = families_to_drop_on_disconnect(families.iter(), Some(&negotiated_gr), None);
         assert!(result.is_empty());
     }
 
@@ -5494,7 +5635,7 @@ mod tests {
             restart_time: Duration::from_secs(90),
             notification_enabled: false,
         };
-        let result = families_to_drop_on_disconnect(families.iter(), Some(&negotiated_gr));
+        let result = families_to_drop_on_disconnect(families.iter(), Some(&negotiated_gr), None);
         assert_eq!(result, vec![Family::IPV6]);
     }
 
@@ -5561,7 +5702,7 @@ mod tests {
         };
         let session_families = [Family::IPV4, Family::IPV6];
         let drop_families =
-            families_to_drop_on_disconnect(session_families.iter(), Some(&negotiated_gr));
+            families_to_drop_on_disconnect(session_families.iter(), Some(&negotiated_gr), None);
         tables.drop_families(remote_addr, &drop_families);
 
         let t = tables.shards[0].lock().unwrap();
@@ -5618,7 +5759,7 @@ mod tests {
 
         // No GR: all families dropped.
         let session_families = [Family::IPV4];
-        let drop_families = families_to_drop_on_disconnect(session_families.iter(), None);
+        let drop_families = families_to_drop_on_disconnect(session_families.iter(), None, None);
         tables.drop_families(remote_addr, &drop_families);
 
         assert!(
@@ -5629,6 +5770,46 @@ mod tests {
                 .collect_loc_rib_paths(&Family::IPV4)
                 .is_empty()
         );
+    }
+
+    // ---- LLGR-only disconnect: routes preserved in RIB ----
+
+    #[test]
+    fn drop_on_disconnect_llgr_only_drops_nothing() {
+        // LLGR-only (no GR): the LLGR family should be excluded from drop_families.
+        let families = [Family::IPV4];
+        let llgr = NegotiatedLlgr {
+            families: vec![(Family::IPV4, Duration::from_secs(600))],
+        };
+        let result = families_to_drop_on_disconnect(families.iter(), None, Some(&llgr));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn drop_on_disconnect_llgr_for_ipv4_drops_ipv6() {
+        // LLGR covers IPv4 but not IPv6: IPv6 must still be dropped immediately.
+        let families = [Family::IPV4, Family::IPV6];
+        let llgr = NegotiatedLlgr {
+            families: vec![(Family::IPV4, Duration::from_secs(600))],
+        };
+        let result = families_to_drop_on_disconnect(families.iter(), None, Some(&llgr));
+        assert_eq!(result, vec![Family::IPV6]);
+    }
+
+    #[test]
+    fn drop_on_disconnect_gr_and_llgr_together_drops_nothing() {
+        // GR covers IPv4, LLGR covers IPv6; nothing should be dropped immediately.
+        let families = [Family::IPV4, Family::IPV6];
+        let gr = NegotiatedGr {
+            families: vec![Family::IPV4],
+            restart_time: Duration::from_secs(90),
+            notification_enabled: false,
+        };
+        let llgr = NegotiatedLlgr {
+            families: vec![(Family::IPV6, Duration::from_secs(600))],
+        };
+        let result = families_to_drop_on_disconnect(families.iter(), Some(&gr), Some(&llgr));
+        assert!(result.is_empty());
     }
 
     // After a session ends via EOF the FSM Connection slot must be cleared

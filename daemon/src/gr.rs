@@ -111,8 +111,6 @@ pub(crate) enum GrInput {
     /// The GR restart timer fired.
     TimerExpired,
     /// The LLGR stale timer for `family` fired.
-    // Used in Step 5 when per-family tokio timers fire.
-    #[allow(dead_code)]
     LlgrTimerExpired(Family),
 }
 
@@ -128,15 +126,11 @@ pub(crate) enum GrOutput {
     ///
     /// The driver must also mark the source as LLGR stale and delete any
     /// routes that carry the NO_LLGR community (0xFFFF0007).
-    // Fields consumed by the driver in Step 5.
-    #[allow(dead_code)]
     StartLlgrTimers(Vec<(Family, Duration)>),
     /// Cancel all pending LLGR family timers.
     StopLlgrTimers,
     /// Delete LLGR stale routes for the given families (LLGR timer expired
     /// or peer reconnected during the LLGR stale period).
-    // Field consumed by the driver in Step 5.
-    #[allow(dead_code)]
     DeleteLlgrStaleRoutes(Vec<Family>),
 }
 
@@ -263,7 +257,7 @@ impl GrState {
             }
 
             // Peer reconnected during LLGR stale period.
-            (Inner::LlgrStaling { .. }, GrInput::SessionEstablished { gr_families }) => {
+            (Inner::LlgrStaling { remaining }, GrInput::SessionEstablished { gr_families }) => {
                 let gr_set: FnvHashSet<Family> = gr_families.into_iter().collect();
                 let new_state = if gr_set.is_empty() {
                     Inner::Idle
@@ -273,7 +267,15 @@ impl GrState {
                         from_llgr: true,
                     }
                 };
-                (new_state, vec![GrOutput::StopLlgrTimers])
+                let mut outputs = vec![GrOutput::StopLlgrTimers];
+                // Peer reconnected without GR: no EOR mechanism to trigger cleanup,
+                // so drop remaining LLGR stale routes immediately.
+                if matches!(new_state, Inner::Idle) && !remaining.is_empty() {
+                    outputs.push(GrOutput::DeleteLlgrStaleRoutes(
+                        remaining.into_iter().collect(),
+                    ));
+                }
+                (new_state, outputs)
             }
 
             // LLGR stale timer expired for one family.
@@ -969,8 +971,10 @@ mod tests {
 
         let outputs = establish(&mut gr, vec![]);
 
-        assert_eq!(outputs.len(), 1);
+        // StopLlgrTimers + DeleteLlgrStaleRoutes for the remaining family (ipv4).
+        assert_eq!(outputs.len(), 2);
         assert!(matches!(outputs[0], GrOutput::StopLlgrTimers));
+        assert!(matches!(&outputs[1], GrOutput::DeleteLlgrStaleRoutes(f) if f == &[ipv4()]));
         assert!(matches!(gr.state, Inner::Idle));
     }
 

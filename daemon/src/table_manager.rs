@@ -510,8 +510,6 @@ impl TableManager {
         }
     }
 
-    // Called by the driver in Step 5 when GrOutput::StartLlgrTimers is received.
-    #[allow(dead_code)]
     /// Begin the LLGR stale period for `addr`.
     ///
     /// Marks the source as LLGR stale and removes any routes from that source
@@ -532,8 +530,6 @@ impl TableManager {
         }
     }
 
-    // Called by the driver in Step 5 when GrOutput::DeleteLlgrStaleRoutes is received.
-    #[allow(dead_code)]
     /// Remove LLGR stale routes for `addr` in the given families.
     ///
     /// Called when the per-family LLGR stale timer expires
@@ -1353,8 +1349,6 @@ impl TableShard {
         }
     }
 
-    // Used by TableManager::mark_llgr_stale, called in Step 5.
-    #[allow(dead_code)]
     fn mark_llgr_stale(
         &mut self,
         addr: IpAddr,
@@ -1378,8 +1372,6 @@ impl TableShard {
         }
     }
 
-    // Used by TableManager::drop_llgr_stale_families, called in Step 5.
-    #[allow(dead_code)]
     fn drop_llgr_stale(
         &mut self,
         addr: IpAddr,
