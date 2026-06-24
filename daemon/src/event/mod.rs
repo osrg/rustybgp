@@ -3326,8 +3326,11 @@ async fn apply_disconnect(
         }
 
         let outputs = ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
-            families: gr.families.clone(),
-            restart_time: gr.restart_time,
+            gr: Some(crate::gr::GrParams {
+                families: gr.families.clone(),
+                restart_time: gr.restart_time,
+            }),
+            llgr: None,
         });
         for output in &outputs {
             if let crate::gr::GrOutput::StartTimer(duration) = output {
@@ -5319,8 +5322,11 @@ mod tests {
         {
             let mut ctx = context.lock().unwrap();
             ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
-                families: vec![Family::IPV4],
-                restart_time: Duration::from_secs(90),
+                gr: Some(crate::gr::GrParams {
+                    families: vec![Family::IPV4],
+                    restart_time: Duration::from_secs(90),
+                }),
+                llgr: None,
             });
         }
 
@@ -5356,8 +5362,11 @@ mod tests {
         {
             let mut ctx = context.lock().unwrap();
             ctx.gr_state.process(crate::gr::GrInput::SessionDropped {
-                families: vec![Family::IPV4],
-                restart_time: Duration::from_secs(90),
+                gr: Some(crate::gr::GrParams {
+                    families: vec![Family::IPV4],
+                    restart_time: Duration::from_secs(90),
+                }),
+                llgr: None,
             });
             ctx.gr_state
                 .process(crate::gr::GrInput::SessionEstablished {
