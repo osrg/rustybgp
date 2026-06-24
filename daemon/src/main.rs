@@ -59,6 +59,7 @@ async fn main() -> Result<(), std::io::Error> {
             Arg::new("id")
                 .long("router-id")
                 .num_args(1)
+                .value_parser(clap::value_parser!(std::net::Ipv4Addr))
                 .help("specify router id"),
         )
         .arg(
