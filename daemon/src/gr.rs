@@ -981,6 +981,64 @@ mod tests {
         assert!(gr.is_peer_restarting());
     }
 
+    #[test]
+    fn llgr_only_reconnect_with_gr_families_eor_deletes_llgr_stale_routes() {
+        // LLGR-only: LlgrStaling -> reconnect with GR families -> EOR
+        // should delete LLGR stale routes (not GR stale routes).
+        let mut gr = GrState::new();
+        drop_llgr_only(&mut gr, vec![ipv4()]);
+
+        let outputs = establish(&mut gr, vec![ipv4()]);
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0], GrOutput::StopLlgrTimers));
+        assert!(matches!(
+            gr.state,
+            Inner::PeerReconnected {
+                from_llgr: true,
+                ..
+            }
+        ));
+
+        let outputs = gr.process(GrInput::EorReceived(ipv4()));
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(&outputs[0], GrOutput::DeleteLlgrStaleRoutes(f) if f == &[ipv4()]));
+        assert!(matches!(gr.state, Inner::Idle));
+    }
+
+    #[test]
+    fn gr_llgr_session_drop_during_restarting_resets_timer_with_new_params() {
+        // GR+LLGR: second session drop while PeerRestarting{llgr:Some} must
+        // reset the GR timer and carry the new LLGR params forward.
+        let mut gr = GrState::new();
+        drop_gr_llgr(&mut gr, vec![ipv4()]);
+        assert!(matches!(gr.state, Inner::PeerRestarting { .. }));
+
+        // Second drop with updated GR+LLGR params (e.g. different restart_time).
+        let outputs = gr.process(GrInput::SessionDropped {
+            gr: Some(GrParams {
+                families: vec![ipv4(), ipv6()],
+                restart_time: Duration::from_secs(60),
+            }),
+            llgr: Some(LlgrParams {
+                families: vec![(ipv4(), Duration::from_secs(7200))],
+            }),
+        });
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(&outputs[0], GrOutput::StartTimer(d) if *d == Duration::from_secs(60)));
+        // Still in PeerRestarting; GR timer expiry should now use new LLGR params.
+        assert!(matches!(gr.state, Inner::PeerRestarting { .. }));
+
+        // Verify the new LLGR params survive by checking timer expiry output.
+        let outputs = gr.process(GrInput::TimerExpired);
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(
+            &outputs[0],
+            GrOutput::StartLlgrTimers(v) if v == &[(ipv4(), Duration::from_secs(7200))]
+        ));
+        assert!(matches!(gr.state, Inner::LlgrStaling { .. }));
+    }
+
     // =========================================================================
     // RestartingDeferral tests
     // =========================================================================
