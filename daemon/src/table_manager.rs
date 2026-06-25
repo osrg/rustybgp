@@ -662,8 +662,8 @@ impl TableManager {
         let Some(policy) = policy else {
             return (false, Arc::clone(attrs));
         };
-        let rpki = self.rpki.read().unwrap();
-        table::apply_import(policy, Some(&rpki), source, net, attrs, nexthop)
+        let rpki = policy.needs_rpki.then(|| self.rpki.read().unwrap());
+        table::apply_import(policy, rpki.as_deref(), source, net, attrs, nexthop)
     }
 
     pub(crate) fn collect_peer_stats(

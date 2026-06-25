@@ -1118,9 +1118,20 @@ pub struct PolicyAssignment {
     pub name: Arc<str>,
     pub disposition: Disposition,
     pub policies: Vec<Arc<Policy>>,
+    /// True if any statement in any policy contains `Condition::Rpki`.
+    /// Used to skip `RpkiTable` reads in the hot path when RPKI is unused.
+    pub needs_rpki: bool,
 }
 
 impl PolicyAssignment {
+    fn compute_needs_rpki(policies: &[Arc<Policy>]) -> bool {
+        policies.iter().any(|p| {
+            p.statements
+                .iter()
+                .any(|s| s.conditions.iter().any(|c| matches!(c, Condition::Rpki(_))))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply(
         &self,
@@ -1264,10 +1275,12 @@ impl PolicyTable {
             }
             v.append(&mut old.policies.to_owned());
         }
+        let needs_rpki = PolicyAssignment::compute_needs_rpki(&v);
         let n = Arc::new(PolicyAssignment {
             name,
             policies: v,
             disposition: default_action,
+            needs_rpki,
         });
         m.replace(n.clone());
         Ok((direction, n))
@@ -1872,10 +1885,12 @@ impl PolicyTable {
             .filter(|p| p.name.as_ref() != policy_name)
             .cloned()
             .collect();
+        let needs_rpki = PolicyAssignment::compute_needs_rpki(&policies);
         Some(Arc::new(PolicyAssignment {
             name: old.name.clone(),
             disposition: old.disposition,
             policies,
+            needs_rpki,
         }))
     }
 
@@ -1901,10 +1916,12 @@ impl PolicyTable {
             .filter(|p| !policy_names.iter().any(|n| n == p.name.as_ref()))
             .cloned()
             .collect();
+        let needs_rpki = PolicyAssignment::compute_needs_rpki(&policies);
         let updated = Arc::new(PolicyAssignment {
             name: old.name.clone(),
             disposition: old.disposition,
             policies,
+            needs_rpki,
         });
         *field = Some(updated.clone());
         Ok(Some(updated))
@@ -1930,10 +1947,12 @@ impl PolicyTable {
                 }
             }
         }
+        let needs_rpki = PolicyAssignment::compute_needs_rpki(&policies);
         let assignment = Arc::new(PolicyAssignment {
             name: Arc::from(name),
             disposition: default_action,
             policies,
+            needs_rpki,
         });
         match direction {
             PolicyDirection::Import => self.assignment_import = Some(assignment.clone()),

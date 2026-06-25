@@ -3030,7 +3030,10 @@ impl PeerSession {
             return;
         };
         let export_policy = self.tables.export_policy.load_full();
-        let rpki = self.tables.rpki.read().unwrap();
+        let rpki = export_policy
+            .as_deref()
+            .filter(|p| p.needs_rpki)
+            .map(|_| self.tables.rpki.read().unwrap());
         // Build BMP Adj-RIB-Out context only when subscribers are present.
         let bmp_senders = self.tables.bmp_senders();
         let bmp = (!bmp_senders.is_empty()).then(|| {
@@ -3051,7 +3054,7 @@ impl PeerSession {
             &self.export_ctx,
             export_policy.as_deref(),
             self.cluster_id,
-            Some(&rpki),
+            rpki.as_deref(),
             bmp.as_ref(),
         );
     }
