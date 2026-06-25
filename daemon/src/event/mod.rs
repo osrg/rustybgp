@@ -3002,9 +3002,6 @@ impl PeerSession {
     }
 
     fn handle_prefix_update(&mut self, update: table::NlriChange) {
-        if self.conn_arbiter.lock().unwrap().state(self.role) != SessionState::Established {
-            return;
-        }
         if !self.codec.has_family(update.family) {
             return;
         }
