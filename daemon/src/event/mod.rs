@@ -262,36 +262,9 @@ impl ConnArbiter {
         self.fsm.state(role)
     }
 
-    fn connection(&self, role: crate::fsm::Role) -> Option<&crate::fsm::Connection> {
-        self.fsm.connection(role)
+    pub(crate) fn fsm(&self) -> &crate::fsm::PeerFsm {
+        &self.fsm
     }
-}
-
-/// Return the effective send-max for `family` from the live session.
-///
-/// Connection::send_max is trimmed to negotiated families during OPEN, so
-/// this naturally returns 1 for families where Add-Path TX was not negotiated.
-///
-/// `role = Some(r)` is the fast path used by `PeerSession` (which already
-/// knows its own role).  `role = None` searches both Active and Passive slots
-/// for a connection that has reached Established, so the caller does not need
-/// to know the role.  Returns 1 if no Established connection exists.
-fn conn_effective_max(arb: &ConnArbiter, role: Option<crate::fsm::Role>, family: Family) -> usize {
-    use crate::fsm::{Role, State};
-    let role = match role {
-        Some(r) => r,
-        None => match [Role::Active, Role::Passive]
-            .into_iter()
-            .find(|&r| arb.state(r) == State::Established)
-        {
-            Some(r) => r,
-            None => return 1,
-        },
-    };
-    arb.connection(role)
-        .and_then(|c| c.send_max().get(&family))
-        .copied()
-        .unwrap_or(1)
 }
 
 /// Cross-session mutable state for a peer.
@@ -580,18 +553,51 @@ impl Peer {
     /// show empty in that case).  Returns Some(n) when Established: n > 1
     /// if Add-Path TX was negotiated, 1 otherwise.
     fn adj_out_effective_max(&self, family: Family) -> Option<usize> {
+        use crate::fsm::{Role, State};
         let ctx = self.context.lock().unwrap();
         let arb = ctx.conn_arbiter.lock().unwrap();
-        use crate::fsm::{Role, State};
-        let role = [Role::Active, Role::Passive]
+        // Confirm a session is Established; if not, return None.
+        [Role::Active, Role::Passive]
             .into_iter()
             .find(|&r| arb.state(r) == State::Established)?;
-        Some(
-            arb.connection(role)
-                .and_then(|c| c.send_max().get(&family))
-                .copied()
-                .unwrap_or(1),
-        )
+        let fsm = arb.fsm();
+        let send_max = fsm.configured_send_max();
+        // Fast path: no Add-Path configured, result is always 1.
+        if send_max.is_empty() {
+            return Some(1);
+        }
+        let remote_cap_arc = self.state.remote_cap.load();
+        // remote_cap may be None if apply_outputs() has not run yet (e.g. in
+        // tests that drive the FSM directly).  Treat that as no Add-Path.
+        let remote_cap_opt = remote_cap_arc;
+        let remote_cap: &[packet::Capability] = remote_cap_opt
+            .as_deref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let local_cap = fsm.local_cap();
+        let result = send_max
+            .iter()
+            .filter(|(fam, _)| {
+                let local_tx = local_cap.iter().any(|c| {
+                    if let packet::Capability::AddPath(entries) = c {
+                        entries.iter().any(|(f, m)| f == *fam && m & 0x2 != 0)
+                    } else {
+                        false
+                    }
+                });
+                let remote_rx = remote_cap.iter().any(|c| {
+                    if let packet::Capability::AddPath(entries) = c {
+                        entries.iter().any(|(f, m)| f == *fam && m & 0x1 != 0)
+                    } else {
+                        false
+                    }
+                });
+                local_tx && remote_rx
+            })
+            .find(|(fam, _)| **fam == family)
+            .map(|(_, v)| *v)
+            .unwrap_or(1);
+        Some(result)
     }
 }
 
@@ -2099,6 +2105,9 @@ struct PeerSession {
     negotiated_gr: Option<NegotiatedGr>,
     /// LLGR negotiation result from the most recent OPEN exchange.
     negotiated_llgr: Option<NegotiatedLlgr>,
+    /// Cached effective send-max per family, populated from SessionEstablished.
+    /// Avoids locking conn_arbiter on every handle_prefix_update call.
+    effective_max: FnvHashMap<Family, usize>,
     /// Shared cross-session state for this peer; cloned from `Peer::context`
     /// so that `PeerSession::run` can operate on `PeerContext` without taking
     /// the global write lock.
@@ -2178,6 +2187,7 @@ impl PeerSession {
             prefix_counters,
             negotiated_gr: None,
             negotiated_llgr: None,
+            effective_max: FnvHashMap::default(),
             context: res.context,
             local_router_id: res.local_router_id,
             cluster_id: res.cluster_id,
@@ -2253,6 +2263,7 @@ impl PeerSession {
             prefix_counters: FnvHashMap::default(),
             negotiated_gr: None,
             negotiated_llgr: None,
+            effective_max: FnvHashMap::default(),
             context,
             local_router_id: Ipv4Addr::new(1, 0, 0, 1),
             cluster_id: None,
@@ -2267,6 +2278,13 @@ impl PeerSession {
             pending: FnvHashMap::default(),
             txbuf_size: 1 << 16,
         }
+    }
+
+    /// Return the effective send-max for `family`, using the cached value from
+    /// the most recent SessionEstablished output.  Returns 1 for families where
+    /// Add-Path TX was not negotiated.
+    fn effective_max(&self, family: Family) -> usize {
+        self.effective_max.get(&family).copied().unwrap_or(1)
     }
 
     /// Compute the intersection of local and remote GR families.
@@ -2393,6 +2411,12 @@ impl PeerSession {
             }
         }
 
+        // Pre-compute effective_max per family to avoid borrowing self inside
+        // the register_peer closure (which also borrows self.pending, etc.).
+        let family_effective_max: FnvHashMap<Family, usize> = families
+            .iter()
+            .map(|f| (*f, self.effective_max(*f)))
+            .collect();
         let export_policy = self.tables.export_policy.load_full();
         let rpki = self.tables.rpki.read().unwrap();
         let (rtc_awaiting_eor, rtc_active) = if self.codec.has_family(Family::RTC) {
@@ -2422,8 +2446,7 @@ impl PeerSession {
                     if rtc_awaiting_eor && crate::rtc::is_vpn_family(*f) {
                         continue;
                     }
-                    let effective_max =
-                        conn_effective_max(&self.conn_arbiter.lock().unwrap(), Some(self.role), *f);
+                    let effective_max = family_effective_max.get(f).copied().unwrap_or(1);
                     for change in rtable.collect_loc_rib_paths(f) {
                         if crate::rtc::is_vpn_family(change.family)
                             && let (Some(filter), Some(best)) = (&rtc_filter, change.new_best())
@@ -2509,8 +2532,7 @@ impl PeerSession {
             None
         };
         let export_policy = self.tables.export_policy.load_full();
-        let effective_max =
-            conn_effective_max(&self.conn_arbiter.lock().unwrap(), Some(self.role), family);
+        let effective_max = self.effective_max(family);
         let changes = self.tables.collect_loc_rib_paths(family);
         let rpki = self.tables.rpki.read().unwrap();
         // Snapshot and clear the export_map before re-walking the RIB; without
@@ -2594,8 +2616,10 @@ impl PeerSession {
                         remote_id,
                         remote_holdtime,
                         remote_capabilities,
+                        effective_max,
                     },
                 ) => {
+                    self.effective_max = effective_max;
                     self.state.remote_asn.store(remote_asn, Ordering::Relaxed);
                     self.state.remote_id.store(remote_id, Ordering::Relaxed);
                     self.state
@@ -3004,11 +3028,7 @@ impl PeerSession {
                 }
             }
         }
-        let effective_max = conn_effective_max(
-            &self.conn_arbiter.lock().unwrap(),
-            Some(self.role),
-            update.family,
-        );
+        let effective_max = self.effective_max(update.family);
         let Some(pending) = self.pending.get_mut(&update.family) else {
             return;
         };

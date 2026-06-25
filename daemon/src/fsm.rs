@@ -106,6 +106,7 @@ pub(crate) enum Output {
         remote_id: u32,
         remote_holdtime: u16,
         remote_capabilities: Vec<Capability>,
+        effective_max: FnvHashMap<Family, usize>,
     },
     /// The session is shutting down. If a NOTIFICATION should be sent before
     /// closing the connection, it is provided as the second field.
@@ -150,9 +151,6 @@ pub(crate) struct Connection {
     remote_cap: Vec<Capability>,
     negotiated_holdtime: u64,
     keepalive_interval: u64,
-
-    // send_max retained after capability negotiation
-    send_max: FnvHashMap<Family, usize>,
 }
 
 impl Connection {
@@ -162,7 +160,6 @@ impl Connection {
         local_cap: Vec<Capability>,
         local_holdtime: u64,
         expected_remote_asn: u32,
-        send_max: FnvHashMap<Family, usize>,
     ) -> Self {
         Connection {
             state: State::Idle,
@@ -177,7 +174,6 @@ impl Connection {
             remote_cap: Vec::new(),
             negotiated_holdtime: 0,
             keepalive_interval: 0,
-            send_max,
         }
     }
 
@@ -188,10 +184,6 @@ impl Connection {
     #[cfg(test)]
     fn negotiated_holdtime(&self) -> u64 {
         self.negotiated_holdtime
-    }
-
-    pub(crate) fn send_max(&self) -> &FnvHashMap<Family, usize> {
-        &self.send_max
     }
 
     fn remote_id(&self) -> u32 {
@@ -290,29 +282,6 @@ impl Connection {
         self.remote_holdtime = open.holdtime.seconds();
         self.remote_cap = open.capability.clone();
 
-        // Trim send_max to families where Add-Path TX was actually negotiated:
-        // local must have advertised TX (bit 1) and remote must have advertised
-        // RX (bit 0).  Families not meeting both conditions are removed so that
-        // conn_effective_max() naturally returns 1 for them without needing a
-        // separate addpath_tx gate at every call site.
-        self.send_max.retain(|family, _| {
-            let local_tx = self.local_cap.iter().any(|c| {
-                if let Capability::AddPath(entries) = c {
-                    entries.iter().any(|(f, m)| f == family && m & 0x2 != 0)
-                } else {
-                    false
-                }
-            });
-            let remote_rx = open.capability.iter().any(|c| {
-                if let Capability::AddPath(entries) = c {
-                    entries.iter().any(|(f, m)| f == family && m & 0x1 != 0)
-                } else {
-                    false
-                }
-            });
-            local_tx && remote_rx
-        });
-
         // Send KEEPALIVE in response to OPEN
         out.push(Output::SendMessage(bgp::Message::Keepalive));
 
@@ -347,6 +316,7 @@ impl Connection {
                         remote_id: self.remote_id,
                         remote_holdtime: self.remote_holdtime,
                         remote_capabilities: std::mem::take(&mut self.remote_cap),
+                        effective_max: FnvHashMap::default(),
                     },
                     Output::StateChanged(State::Established),
                 ]
@@ -568,9 +538,54 @@ impl PeerFsm {
             .any(|o| matches!(o, Output::StateChanged(State::OpenConfirm)));
         let session_down = outputs.iter().any(|o| matches!(o, Output::SessionDown(..)));
 
+        let send_max = &self.send_max;
+        let local_cap = &self.local_cap;
         let mut result: Vec<PeerFsmOutput> = outputs
             .into_iter()
-            .map(|o| PeerFsmOutput::Connection(role, o))
+            .map(|o| {
+                if let Output::SessionEstablished {
+                    remote_asn,
+                    remote_id,
+                    remote_holdtime,
+                    remote_capabilities,
+                    effective_max: _,
+                } = o
+                {
+                    let effective_max: FnvHashMap<Family, usize> = send_max
+                        .iter()
+                        .filter(|(family, _)| {
+                            let local_tx = local_cap.iter().any(|c| {
+                                if let Capability::AddPath(entries) = c {
+                                    entries.iter().any(|(f, m)| f == *family && m & 0x2 != 0)
+                                } else {
+                                    false
+                                }
+                            });
+                            let remote_rx = remote_capabilities.iter().any(|c| {
+                                if let Capability::AddPath(entries) = c {
+                                    entries.iter().any(|(f, m)| f == *family && m & 0x1 != 0)
+                                } else {
+                                    false
+                                }
+                            });
+                            local_tx && remote_rx
+                        })
+                        .map(|(f, v)| (*f, *v))
+                        .collect();
+                    PeerFsmOutput::Connection(
+                        role,
+                        Output::SessionEstablished {
+                            remote_asn,
+                            remote_id,
+                            remote_holdtime,
+                            remote_capabilities,
+                            effective_max,
+                        },
+                    )
+                } else {
+                    PeerFsmOutput::Connection(role, o)
+                }
+            })
             .collect();
 
         if entered_open_confirm {
@@ -656,7 +671,6 @@ impl PeerFsm {
             effective_cap,
             self.local_holdtime,
             self.expected_remote_asn,
-            self.send_max.clone(),
         ));
         let outputs = slot.as_mut().unwrap().process(Input::Connected(false));
         outputs
@@ -699,6 +713,14 @@ impl PeerFsm {
         self.close_connection(loser);
         Some(loser)
     }
+
+    pub(crate) fn configured_send_max(&self) -> &FnvHashMap<Family, usize> {
+        &self.send_max
+    }
+
+    pub(crate) fn local_cap(&self) -> &[Capability] {
+        &self.local_cap
+    }
 }
 
 #[cfg(test)]
@@ -721,7 +743,6 @@ mod tests {
             vec![Capability::MultiProtocol(Family::IPV4)],
             90,
             65002,
-            FnvHashMap::default(),
         )
     }
 
@@ -936,7 +957,6 @@ mod tests {
             vec![Capability::MultiProtocol(Family::IPV4)],
             90,
             0, // accept any
-            FnvHashMap::default(),
         );
         let _ = s.process(Input::Connected(false));
 
@@ -1229,7 +1249,6 @@ mod tests {
             vec![Capability::MultiProtocol(Family::IPV4)],
             0, // disabled holdtime
             65002,
-            FnvHashMap::default(),
         );
         let _ = s.process(Input::Connected(false));
 
