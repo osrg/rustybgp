@@ -811,14 +811,18 @@ impl Table {
     /// Each change has `best_changed` and `any_changed` set to `true` so that
     /// callers treating it as a fresh event (initial dump, route refresh) will
     /// unconditionally advertise every prefix.
-    pub fn collect_loc_rib_paths(&self, family: &Family) -> Vec<NlriChange> {
+    fn collect_loc_rib_paths_impl(&self, family: &Family, max_paths: usize) -> Vec<NlriChange> {
         let Some(t) = self.ribs.get(family) else {
             return Vec::new();
         };
         t.destinations
             .iter()
             .filter_map(|(net, dst)| {
-                let paths: Vec<Path> = dst.unfiltered_iter().map(|e| e.path.clone()).collect();
+                let paths: Vec<Path> = dst
+                    .unfiltered_iter()
+                    .take(max_paths)
+                    .map(|e| e.path.clone())
+                    .collect();
                 if paths.is_empty() {
                     return None;
                 }
@@ -832,6 +836,18 @@ impl Table {
                 })
             })
             .collect()
+    }
+
+    pub fn collect_loc_rib_paths(&self, family: &Family) -> Vec<NlriChange> {
+        self.collect_loc_rib_paths_impl(family, usize::MAX)
+    }
+
+    pub fn collect_loc_rib_paths_limited(
+        &self,
+        family: &Family,
+        max_paths: usize,
+    ) -> Vec<NlriChange> {
+        self.collect_loc_rib_paths_impl(family, max_paths)
     }
 
     pub fn state(&self, family: Family) -> TableState {

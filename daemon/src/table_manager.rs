@@ -612,6 +612,24 @@ impl TableManager {
         out
     }
 
+    pub(crate) fn collect_loc_rib_paths_limited(
+        &self,
+        family: Family,
+        max_paths: usize,
+    ) -> Vec<table::NlriChange> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(
+                shard
+                    .lock()
+                    .unwrap()
+                    .rtable
+                    .collect_loc_rib_paths_limited(&family, max_paths),
+            );
+        }
+        out
+    }
+
     /// Enumerate all active RIB families across all shards (deduplicated).
     pub(crate) fn all_families(&self) -> Vec<Family> {
         let mut seen = FnvHashSet::default();

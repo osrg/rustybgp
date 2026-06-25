@@ -2449,7 +2449,7 @@ impl PeerSession {
                     let effective_max = family_effective_max.get(f).copied().unwrap_or(1);
                     let addpath_tx = self.pending.get(f).map(|p| p.addpath_tx()).unwrap_or(false);
                     let mut sink = crate::event::export::GroupedSink::new(addpath_tx);
-                    for change in rtable.collect_loc_rib_paths(f) {
+                    for change in rtable.collect_loc_rib_paths_limited(f, effective_max) {
                         if crate::rtc::is_vpn_family(change.family)
                             && let (Some(filter), Some(best)) = (&rtc_filter, change.new_best())
                             && !filter.allows(&best.attr)
@@ -2538,7 +2538,9 @@ impl PeerSession {
         };
         let export_policy = self.tables.export_policy.load_full();
         let effective_max = self.effective_max(family);
-        let changes = self.tables.collect_loc_rib_paths(family);
+        let changes = self
+            .tables
+            .collect_loc_rib_paths_limited(family, effective_max);
         let rpki = self.tables.rpki.read().unwrap();
         // Snapshot and clear the export_map before re-walking the RIB; without
         // this we have no record of what was sent under the old filter and cannot
