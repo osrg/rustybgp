@@ -30,6 +30,9 @@ pub(crate) struct PendingTx {
     unreach: FnvHashSet<packet::PathNlri>,
     pending_eor: bool,
     addpath_tx: bool,
+    /// Pre-built UPDATE messages from the initial dump.  Drained first by
+    /// `drain_messages()` before incremental reach/unreach processing.
+    buffered: Vec<bgp::Message>,
 }
 
 impl PendingTx {
@@ -39,11 +42,26 @@ impl PendingTx {
             unreach: FnvHashSet::default(),
             pending_eor: true,
             addpath_tx,
+            buffered: Vec::new(),
         }
     }
 
+    pub(crate) fn addpath_tx(&self) -> bool {
+        self.addpath_tx
+    }
+
+    /// Enqueue pre-built UPDATE messages from the initial dump.
+    /// These are emitted before any incremental reach/unreach in `drain_messages()`.
+    pub(crate) fn buffer_messages(&mut self, msgs: Vec<bgp::Message>) {
+        debug_assert!(
+            self.buffered.is_empty(),
+            "buffer_messages called on non-empty buffer"
+        );
+        self.buffered = msgs;
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.reach.is_empty() && self.unreach.is_empty()
+        self.buffered.is_empty() && self.reach.is_empty() && self.unreach.is_empty()
     }
 
     pub(crate) fn schedule_eor(&mut self) {
@@ -79,7 +97,8 @@ impl PendingTx {
     /// Returns a list of UPDATE messages ready for encoding. The caller is
     /// responsible for encoding and writing them to the wire.
     pub(crate) fn drain_messages(&mut self, family: Family) -> Vec<bgp::Message> {
-        let mut messages = Vec::new();
+        // Start with pre-built messages from the initial dump (GroupedSink).
+        let mut messages = std::mem::take(&mut self.buffered);
 
         // 1. Withdrawals
         if !self.unreach.is_empty() {
@@ -430,6 +449,48 @@ mod tests {
         } else {
             panic!("expected reach Update");
         }
+    }
+
+    #[test]
+    fn buffered_messages_drained_before_reach() {
+        let mut p = PendingTx::new(false);
+        p.drain_messages(Family::IPV4); // consume initial EOR
+        // Simulate pre-built messages from GroupedSink (initial dump).
+        p.buffer_messages(vec![bgp::Message::Update(bgp::Update::Reach {
+            family: Family::IPV4,
+            entries: vec![packet::PathNlri::new(nlri("10.0.0.0/24"))],
+            nexthop: nh(),
+            attr: attr(0),
+        })]);
+        // An incremental reach that arrived after the initial dump.
+        p.reach(nlri("20.0.0.0/24"), 0, nh(), attr(0));
+
+        let msgs = p.drain_messages(Family::IPV4);
+        // buffered (10.0.0.0/24) must come before incremental (20.0.0.0/24).
+        assert_eq!(msgs.len(), 2);
+        let first_nlri = if let bgp::Message::Update(bgp::Update::Reach { entries, .. }) = &msgs[0]
+        {
+            entries[0].nlri.to_string()
+        } else {
+            panic!("expected Reach");
+        };
+        assert!(first_nlri.contains("10.0.0.0"), "buffered must be first");
+    }
+
+    #[test]
+    fn buffered_emptied_after_drain() {
+        let mut p = PendingTx::new(false);
+        p.drain_messages(Family::IPV4); // consume initial EOR
+        p.buffer_messages(vec![bgp::Message::Update(bgp::Update::Reach {
+            family: Family::IPV4,
+            entries: vec![packet::PathNlri::new(nlri("10.0.0.0/24"))],
+            nexthop: nh(),
+            attr: attr(0),
+        })]);
+
+        assert!(!p.is_empty());
+        p.drain_messages(Family::IPV4);
+        assert!(p.is_empty());
     }
 
     #[test]

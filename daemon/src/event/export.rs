@@ -432,6 +432,64 @@ impl NlriSink for AdjOutSink {
     }
 }
 
+type GroupedAttrKey = (Arc<Vec<packet::Attribute>>, Option<bgp::Nexthop>);
+
+/// `NlriSink` that groups routes by (attr, nexthop) directly, bypassing the
+/// per-NLRI HashMap in `PendingTx`.
+///
+/// Used during `on_established` initial advertisement where no unreach can
+/// occur (export_map is empty).  Routes are collected into groups and
+/// converted to `bgp::Message` via `into_messages()`, then passed to
+/// `PendingTx::buffer_messages()`.
+pub(super) struct GroupedSink {
+    addpath_tx: bool,
+    grouped: FnvHashMap<GroupedAttrKey, Vec<packet::PathNlri>>,
+}
+
+impl GroupedSink {
+    pub(super) fn new(addpath_tx: bool) -> Self {
+        GroupedSink {
+            addpath_tx,
+            grouped: FnvHashMap::default(),
+        }
+    }
+
+    pub(super) fn into_messages(self, family: bgp::Family) -> Vec<bgp::Message> {
+        self.grouped
+            .into_iter()
+            .map(|((attr, nexthop), entries)| {
+                bgp::Message::Update(bgp::Update::Reach {
+                    family,
+                    entries,
+                    nexthop,
+                    attr,
+                })
+            })
+            .collect()
+    }
+}
+
+impl NlriSink for GroupedSink {
+    fn reach(
+        &mut self,
+        nlri: packet::Nlri,
+        path_id: u32,
+        nexthop: Option<bgp::Nexthop>,
+        attr: Arc<Vec<packet::Attribute>>,
+        _source: &Arc<table::Source>,
+    ) {
+        let key = packet::PathNlri {
+            path_id: if self.addpath_tx { path_id } else { 0 },
+            nlri,
+        };
+        self.grouped.entry((attr, nexthop)).or_default().push(key);
+    }
+
+    fn unreach(&mut self, _nlri: packet::Nlri, _path_id: u32) {
+        // Initial dump: export_map is empty so this is never called.
+    }
+}
+
 /// Core routing-update logic shared by handle_prefix_update() and unit tests.
 ///
 /// Computes which BGP messages to send based on `update` and the peer's

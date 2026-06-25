@@ -2447,6 +2447,8 @@ impl PeerSession {
                         continue;
                     }
                     let effective_max = family_effective_max.get(f).copied().unwrap_or(1);
+                    let addpath_tx = self.pending.get(f).map(|p| p.addpath_tx()).unwrap_or(false);
+                    let mut sink = crate::event::export::GroupedSink::new(addpath_tx);
                     for change in rtable.collect_loc_rib_paths(f) {
                         if crate::rtc::is_vpn_family(change.family)
                             && let (Some(filter), Some(best)) = (&rtc_filter, change.new_best())
@@ -2454,21 +2456,21 @@ impl PeerSession {
                         {
                             continue;
                         }
-                        let Some(pending) = self.pending.get_mut(&change.family) else {
-                            continue;
-                        };
                         process_nlri_change(
                             &change,
                             effective_max,
                             self.remote_addr,
                             &mut self.export_map,
-                            pending,
+                            &mut sink,
                             &self.export_ctx,
                             export_policy.as_deref(),
                             self.cluster_id,
                             Some(&rpki),
                             None,
                         );
+                    }
+                    if let Some(pending) = self.pending.get_mut(f) {
+                        pending.buffer_messages(sink.into_messages(*f));
                     }
                 }
             });
