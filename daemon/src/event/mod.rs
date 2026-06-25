@@ -602,7 +602,7 @@ impl Peer {
 }
 
 pub(crate) enum ToPeerEvent {
-    NlriChange(table::NlriChange),
+    NlriChange(Arc<table::NlriChange>),
     /// Trigger a soft reset OUT: re-advertise all current best paths.
     SoftResetOut,
     /// Re-advertise all current best paths for the specified families.
@@ -3001,7 +3001,7 @@ impl PeerSession {
             .collect()
     }
 
-    fn handle_prefix_update(&mut self, update: table::NlriChange) {
+    fn handle_prefix_update(&mut self, update: Arc<table::NlriChange>) {
         if !self.codec.has_family(update.family) {
             return;
         }
@@ -5143,7 +5143,7 @@ mod tests {
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let update = make_prefix_update_reach(&nlri, other_source());
 
-        conn.handle_prefix_update(update);
+        conn.handle_prefix_update(Arc::new(update));
 
         // path_id=0 stored in export_map for non-Add-Path
         assert!(conn.export_map.was_sent(Family::IPV4, &nlri));
@@ -5163,7 +5163,7 @@ mod tests {
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let update = make_prefix_update_no_change(&nlri, other_source());
 
-        conn.handle_prefix_update(update);
+        conn.handle_prefix_update(Arc::new(update));
 
         assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
         assert!(conn.pending[&Family::IPV4].is_empty());
@@ -5184,7 +5184,7 @@ mod tests {
         conn.export_map.mark_sent(Family::IPV4, nlri.clone(), 0);
 
         let update = make_prefix_update_withdraw(&nlri);
-        conn.handle_prefix_update(update);
+        conn.handle_prefix_update(Arc::new(update));
 
         assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
         assert!(!conn.pending[&Family::IPV4].is_empty());
@@ -5203,7 +5203,7 @@ mod tests {
 
         // Never advertised → spurious withdraw should be suppressed.
         let update = make_prefix_update_withdraw(&nlri);
-        conn.handle_prefix_update(update);
+        conn.handle_prefix_update(Arc::new(update));
 
         assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
         assert!(conn.pending[&Family::IPV4].is_empty());

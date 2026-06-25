@@ -1238,8 +1238,9 @@ impl TableShard {
 
         // Fan out raw NlriChange to all peer channels.
         // Each peer applies export policy per-peer in process_nlri_change.
+        let update = Arc::new(update);
         for tx in self.peer_event_tx.values() {
-            let _ = tx.send(ToPeerEvent::NlriChange(update.clone()));
+            let _ = tx.send(ToPeerEvent::NlriChange(Arc::clone(&update)));
         }
     }
 
