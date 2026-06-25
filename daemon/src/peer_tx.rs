@@ -23,17 +23,11 @@ use rustybgp_packet::bgp::{self, Family, Nexthop};
 use rustybgp_packet::{self as packet};
 use std::sync::Arc;
 
-/// Key for PendingTx maps: (NLRI, path_id). path_id distinguishes
-/// multiple paths for the same prefix under RFC 7911 Add-Path.
-type PendingKey = (packet::Nlri, u32);
-
-/// Maximum number of UPDATE messages produced per drain_messages() call.
-const MAX_TX_COUNT: usize = 2048;
+type AttrKey = (Arc<Vec<packet::Attribute>>, Option<Nexthop>);
 
 pub(crate) struct PendingTx {
-    reach: FnvHashMap<PendingKey, (Arc<Vec<packet::Attribute>>, Option<Nexthop>)>,
-    unreach: FnvHashSet<PendingKey>,
-    bucket: FnvHashMap<Arc<Vec<packet::Attribute>>, FnvHashSet<PendingKey>>,
+    reach: FnvHashMap<packet::PathNlri, (Arc<Vec<packet::Attribute>>, Option<Nexthop>)>,
+    unreach: FnvHashSet<packet::PathNlri>,
     pending_eor: bool,
     addpath_tx: bool,
 }
@@ -43,7 +37,6 @@ impl PendingTx {
         PendingTx {
             reach: FnvHashMap::default(),
             unreach: FnvHashSet::default(),
-            bucket: FnvHashMap::default(),
             pending_eor: true,
             addpath_tx,
         }
@@ -64,46 +57,24 @@ impl PendingTx {
         nexthop: Option<Nexthop>,
         attr: Arc<Vec<packet::Attribute>>,
     ) {
-        let pid = if self.addpath_tx { path_id } else { 0 };
-        let key: PendingKey = (nlri, pid);
+        let key = packet::PathNlri {
+            path_id: if self.addpath_tx { path_id } else { 0 },
+            nlri,
+        };
         self.unreach.remove(&key);
-        if let Some((old_attr, _)) = self.reach.insert(key.clone(), (attr.clone(), nexthop)) {
-            // b-1) same attr → no-op
-            if old_attr == attr {
-                return;
-            }
-            // b-2) different attr → move between buckets
-            let old_bucket = self.bucket.get_mut(&old_attr).unwrap();
-            let b = old_bucket.remove(&key);
-            assert!(b);
-            if old_bucket.is_empty() {
-                self.bucket.remove(&old_attr);
-            }
-            self.bucket.entry(attr).or_default().insert(key);
-        } else {
-            // a) new key
-            self.bucket.entry(attr).or_default().insert(key);
-        }
+        self.reach.insert(key, (attr, nexthop));
     }
 
     pub(crate) fn unreach(&mut self, nlri: packet::Nlri, path_id: u32) {
-        let pid = if self.addpath_tx { path_id } else { 0 };
-        let key: PendingKey = (nlri, pid);
-        if let Some((attr, _)) = self.reach.remove(&key) {
-            let set = self.bucket.get_mut(&attr).unwrap();
-            let b = set.remove(&key);
-            assert!(b);
-            if set.is_empty() {
-                self.bucket.remove(&attr);
-            }
-        }
+        let key = packet::PathNlri {
+            path_id: if self.addpath_tx { path_id } else { 0 },
+            nlri,
+        };
+        self.reach.remove(&key);
         self.unreach.insert(key);
     }
 
     /// Drain pending changes into BGP UPDATE messages.
-    ///
-    /// `family` is the address family for this PendingTx.
-    /// `addpath_tx` controls whether path_id is included in NLRI encoding.
     ///
     /// Returns a list of UPDATE messages ready for encoding. The caller is
     /// responsible for encoding and writing them to the wire.
@@ -112,65 +83,33 @@ impl PendingTx {
 
         // 1. Withdrawals
         if !self.unreach.is_empty() {
-            let entries: Vec<packet::PathNlri> = self
-                .unreach
-                .drain()
-                .map(|(nlri, pid)| packet::PathNlri {
-                    path_id: if self.addpath_tx { pid } else { 0 },
-                    nlri,
-                })
-                .collect();
+            let entries: Vec<packet::PathNlri> = self.unreach.drain().collect();
             messages.push(bgp::Message::Update(bgp::Update::Unreach {
                 family,
                 entries,
             }));
         }
 
-        // 2. Reach updates (batched by attribute)
-        let mut sent_attrs: Vec<Arc<Vec<packet::Attribute>>> = Vec::new();
-        let mut count = 0;
+        // 2. Reach updates: drain reach into a temporary (attr, nexthop) grouping,
+        //    then emit one UPDATE per group.
+        if !self.reach.is_empty() {
+            let mut grouped: FnvHashMap<AttrKey, Vec<packet::PathNlri>> = FnvHashMap::default();
+            for (key, (attr, nexthop)) in self.reach.drain() {
+                grouped.entry((attr, nexthop)).or_default().push(key);
+            }
 
-        for (attr, keys) in self.bucket.iter() {
-            let entries = keys
-                .iter()
-                .cloned()
-                .map(|(nlri, pid)| packet::PathNlri {
-                    path_id: if self.addpath_tx { pid } else { 0 },
-                    nlri,
-                })
-                .collect();
-            // Look up nexthop from the first entry in this bucket
-            let nexthop = keys
-                .iter()
-                .next()
-                .and_then(|k| self.reach.get(k))
-                .and_then(|(_, nh)| *nh);
-
-            messages.push(bgp::Message::Update(bgp::Update::Reach {
-                family,
-                entries,
-                nexthop,
-                attr: attr.clone(),
-            }));
-            sent_attrs.push(attr.clone());
-
-            count += 1;
-            if count >= MAX_TX_COUNT {
-                break;
+            for ((attr, nexthop), entries) in grouped {
+                messages.push(bgp::Message::Update(bgp::Update::Reach {
+                    family,
+                    entries,
+                    nexthop,
+                    attr,
+                }));
             }
         }
 
-        // Remove sent entries from pending maps
-        for attr in sent_attrs {
-            if let Some(mut keys) = self.bucket.remove(&attr) {
-                for key in keys.drain() {
-                    self.reach.remove(&key);
-                }
-            }
-        }
-
-        // EOR: once all initial routes have been drained, append End-of-RIB
-        if self.pending_eor && self.is_empty() {
+        // EOR: reach and unreach are fully drained above, so emit EOR if scheduled.
+        if self.pending_eor {
             self.pending_eor = false;
             messages.push(bgp::Message::eor(family));
         }
@@ -265,13 +204,18 @@ mod tests {
         let mut p = PendingTx::new(true);
         p.reach(nlri("10.0.0.0/24"), 1, nh(), attr(0));
         p.reach(nlri("20.0.0.0/24"), 1, nh(), attr(0));
-        assert_eq!(p.bucket.len(), 1);
-        assert_eq!(p.bucket.values().next().unwrap().len(), 2);
 
-        // Re-insert 20.0.0.0/24 with same attr → no change
+        // Re-insert 20.0.0.0/24 with same attr → no duplicate in drain
         p.reach(nlri("20.0.0.0/24"), 1, nh(), attr(0));
-        assert_eq!(p.bucket.len(), 1);
-        assert_eq!(p.bucket.values().next().unwrap().len(), 2);
+
+        let msgs = p.drain_messages(Family::IPV4);
+        // 1 UPDATE (both prefixes, same attr) + EOR
+        assert_eq!(msgs.len(), 2);
+        if let bgp::Message::Update(bgp::Update::Reach { entries, .. }) = &msgs[0] {
+            assert_eq!(entries.len(), 2);
+        } else {
+            panic!("expected reach Update");
+        }
     }
 
     #[test]
@@ -279,18 +223,9 @@ mod tests {
         let mut p = PendingTx::new(true);
         p.reach(nlri("10.0.0.0/24"), 1, nh(), attr(0)); // origin=IGP
         p.reach(nlri("20.0.0.0/24"), 1, nh(), attr(0)); // origin=IGP
-        // Same attrs → 1 bucket with 2 entries
-        assert_eq!(p.bucket.len(), 1);
-        assert_eq!(p.bucket.values().next().unwrap().len(), 2);
 
-        // Change 20.0.0.0/24 to origin=EGP → moves to new bucket
+        // Change 20.0.0.0/24 to origin=EGP → separate UPDATE
         p.reach(nlri("20.0.0.0/24"), 1, nh(), attr(1));
-        assert_eq!(p.bucket.len(), 2);
-        // Old bucket has only 10.0.0.0/24
-        let old_attr = Arc::new(vec![
-            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-        ]);
-        assert_eq!(p.bucket.get(&old_attr).unwrap().len(), 1);
 
         // Drain and verify: 2 UPDATEs with correct NLRIs
         let msgs = p.drain_messages(Family::IPV4);
@@ -369,6 +304,132 @@ mod tests {
             ),
             "expected EndOfRib(IPV4)"
         );
+    }
+
+    #[test]
+    fn same_attr_different_nexthop_separate_updates() {
+        let mut p = PendingTx::new(false);
+        let nh1 = Some(Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let nh2 = Some(Nexthop::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        // Two NLRIs, same attr, different nexthop (MP families: nexthop not in attr)
+        p.reach(nlri("10.0.0.0/24"), 0, nh1, attr(0));
+        p.reach(nlri("20.0.0.0/24"), 0, nh2, attr(0));
+
+        let msgs = p.drain_messages(Family::IPV4);
+        // Must produce 2 separate Reach UPDATEs + EOR
+        let reach_msgs: Vec<_> = msgs
+            .iter()
+            .filter(|m| matches!(m, bgp::Message::Update(bgp::Update::Reach { .. })))
+            .collect();
+        assert_eq!(reach_msgs.len(), 2, "expected 2 separate Reach UPDATEs");
+        // Each UPDATE carries exactly one NLRI with the correct nexthop
+        for m in reach_msgs {
+            if let bgp::Message::Update(bgp::Update::Reach {
+                entries, nexthop, ..
+            }) = m
+            {
+                assert_eq!(entries.len(), 1);
+                let nlri_str = format!("{}", entries[0].nlri);
+                if nlri_str.contains("10.0.0.0") {
+                    assert_eq!(*nexthop, nh1);
+                } else {
+                    assert_eq!(*nexthop, nh2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nexthop_change_updates_pending() {
+        let mut p = PendingTx::new(false);
+        let nh1 = Some(Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let nh2 = Some(Nexthop::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        p.reach(nlri("10.0.0.0/24"), 0, nh1, attr(0));
+        // Same attr, different nexthop — must not be a no-op
+        p.reach(nlri("10.0.0.0/24"), 0, nh2, attr(0));
+
+        let msgs = p.drain_messages(Family::IPV4);
+        if let bgp::Message::Update(bgp::Update::Reach { nexthop, .. }) = &msgs[0] {
+            assert_eq!(*nexthop, nh2);
+        } else {
+            panic!("expected reach Update");
+        }
+    }
+
+    #[test]
+    fn schedule_eor_triggers_again() {
+        let mut p = PendingTx::new(false);
+        // First drain emits EOR
+        let msgs = p.drain_messages(Family::IPV4);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(
+            &msgs[0],
+            bgp::Message::Update(bgp::Update::EndOfRib(Family::IPV4))
+        ));
+        // No EOR on subsequent drain
+        assert!(p.drain_messages(Family::IPV4).is_empty());
+        // schedule_eor causes EOR to be emitted again
+        p.schedule_eor();
+        let msgs = p.drain_messages(Family::IPV4);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(
+            &msgs[0],
+            bgp::Message::Update(bgp::Update::EndOfRib(Family::IPV4))
+        ));
+    }
+
+    #[test]
+    fn addpath_false_normalizes_path_id_to_zero() {
+        let mut p = PendingTx::new(false);
+        // path_id=42 with addpath disabled → key is path_id=0
+        p.reach(nlri("10.0.0.0/24"), 42, nh(), attr(0));
+        // path_id=0 → same key, overwrites with attr(1)
+        p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(1));
+
+        let msgs = p.drain_messages(Family::IPV4);
+        let reach_msgs: Vec<_> = msgs
+            .iter()
+            .filter(|m| matches!(m, bgp::Message::Update(bgp::Update::Reach { .. })))
+            .collect();
+        // One entry, not two — both inserts hit the same key
+        assert_eq!(reach_msgs.len(), 1);
+        if let bgp::Message::Update(bgp::Update::Reach { entries, attr, .. }) = reach_msgs[0] {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].path_id, 0);
+            // attr(1) (the second insert) wins
+            let origin: u32 = attr
+                .iter()
+                .find(|a| a.code() == packet::Attribute::ORIGIN)
+                .and_then(|a| a.value())
+                .unwrap();
+            assert_eq!(origin, 1);
+        } else {
+            panic!("expected reach Update");
+        }
+    }
+
+    #[test]
+    fn addpath_different_path_ids_are_separate_entries() {
+        let mut p = PendingTx::new(true);
+        // Same NLRI, different path_ids → separate keys under Add-Path
+        p.reach(nlri("10.0.0.0/24"), 1, nh(), attr(0));
+        p.reach(nlri("10.0.0.0/24"), 2, nh(), attr(0));
+
+        let msgs = p.drain_messages(Family::IPV4);
+        let reach_msgs: Vec<_> = msgs
+            .iter()
+            .filter(|m| matches!(m, bgp::Message::Update(bgp::Update::Reach { .. })))
+            .collect();
+        // Same attr+nexthop → batched into 1 UPDATE with 2 path entries
+        assert_eq!(reach_msgs.len(), 1);
+        if let bgp::Message::Update(bgp::Update::Reach { entries, .. }) = reach_msgs[0] {
+            assert_eq!(entries.len(), 2);
+            let mut ids: Vec<u32> = entries.iter().map(|e| e.path_id).collect();
+            ids.sort();
+            assert_eq!(ids, vec![1, 2]);
+        } else {
+            panic!("expected reach Update");
+        }
     }
 
     #[test]
