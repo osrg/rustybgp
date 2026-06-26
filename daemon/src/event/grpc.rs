@@ -259,6 +259,9 @@ impl TryFrom<&api::Peer> for PeerParams {
 
     fn try_from(p: &api::Peer) -> Result<Self, Self::Error> {
         let conf = p.conf.as_ref().ok_or(Error::EmptyArgument)?;
+        if !conf.auth_password.is_empty() {
+            check_auth_password(&conf.auth_password)?;
+        }
         // When neighbor_interface is set the remote address is not known at
         // parse time; it will be resolved via NDP in add_peer/update_peer.
         let (remote_addr, neighbor_interface) = if !conf.neighbor_interface.is_empty() {
@@ -700,6 +703,18 @@ fn check_gr_restart_time(gr: Option<&api::GracefulRestart>) -> Result<(), Error>
         return Err(Error::InvalidArgument(format!(
             "graceful_restart restart_time {} exceeds maximum of 4095",
             gr.restart_time
+        )));
+    }
+    Ok(())
+}
+
+/// Validate an MD5 TCP authentication password (RFC 2385 / Linux TCP_MD5SIG).
+/// The kernel key buffer is 80 bytes; passwords longer than that cannot be set.
+fn check_auth_password(password: &str) -> Result<(), Error> {
+    if password.len() > 80 {
+        return Err(Error::InvalidArgument(format!(
+            "auth_password length {} exceeds maximum of 80 bytes",
+            password.len()
         )));
     }
     Ok(())
@@ -1695,6 +1710,14 @@ impl GoBgpService for GrpcService {
         parse_ttl_security(pg.ttl_security.as_ref()).map_err(tonic::Status::from)?;
         check_gr_restart_time(pg.graceful_restart.as_ref()).map_err(tonic::Status::from)?;
         parse_llgr_api(&pg.afi_safis).map_err(tonic::Status::from)?;
+        if let Some(pw) = pg
+            .conf
+            .as_ref()
+            .map(|c| c.auth_password.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            check_auth_password(pw).map_err(tonic::Status::from)?;
+        }
 
         match self
             .global
@@ -1753,6 +1776,14 @@ impl GoBgpService for GrpcService {
         parse_ttl_security(pg.ttl_security.as_ref()).map_err(tonic::Status::from)?;
         check_gr_restart_time(pg.graceful_restart.as_ref()).map_err(tonic::Status::from)?;
         parse_llgr_api(&pg.afi_safis).map_err(tonic::Status::from)?;
+        if let Some(pw) = pg
+            .conf
+            .as_ref()
+            .map(|c| c.auth_password.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            check_auth_password(pw).map_err(tonic::Status::from)?;
+        }
         let updated = PeerGroup::from(pg);
         let mut global = self.global.write().await;
         match global.peer_group.get_mut(&name) {

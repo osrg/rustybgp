@@ -145,6 +145,18 @@ fn validate_gr_restart_time(restart_time: u16) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// The Linux TCP_MD5SIG key buffer is 80 bytes; passwords longer than that
+/// cannot be set via setsockopt and must be rejected.
+fn validate_auth_password(password: &str) -> Result<(), ConfigError> {
+    if password.len() > 80 {
+        return Err(ConfigError::InvalidConfiguration(format!(
+            "auth-password length {} exceeds maximum of 80 bytes",
+            password.len()
+        )));
+    }
+    Ok(())
+}
+
 /// RFC 9494 §3: the LLGR stale time is a 24-bit field in the capability.
 /// Values 0-16777215 (0xFF_FFFF) are valid.
 fn validate_llgr_stale_time(stale_time: u32) -> Result<(), ConfigError> {
@@ -217,6 +229,10 @@ impl Neighbor {
             }
         }
 
+        if let Some(pw) = config.auth_password.as_deref().filter(|s| !s.is_empty()) {
+            validate_auth_password(pw)?;
+        }
+
         if self.add_paths.is_some() {
             return Err(ConfigError::InvalidConfiguration(
                 "use per-family addpath config".to_string(),
@@ -263,6 +279,14 @@ impl PeerGroup {
                     validate_llgr_stale_time(st)?;
                 }
             }
+        }
+        if let Some(pw) = self
+            .config
+            .as_ref()
+            .and_then(|c| c.auth_password.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            validate_auth_password(pw)?;
         }
         Ok(())
     }
@@ -588,6 +612,71 @@ mod tests {
     fn peer_group_llgr_stale_time_overflow_fails() {
         assert!(
             peer_group_with_llgr_stale_time(0x100_0000)
+                .validate()
+                .is_err()
+        );
+    }
+
+    // --- auth_password length ---
+
+    fn neighbor_with_auth_password(peer_as: u32, password: &str) -> Neighbor {
+        Neighbor {
+            config: Some(NeighborConfig {
+                neighbor_address: Some("10.0.0.1".parse().unwrap()),
+                peer_as: Some(peer_as),
+                auth_password: Some(password.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn peer_group_with_auth_password(password: &str) -> PeerGroup {
+        PeerGroup {
+            config: Some(PeerGroupConfig {
+                auth_password: Some(password.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn neighbor_auth_password_80_bytes_passes() {
+        assert!(
+            neighbor_with_auth_password(65001, &"a".repeat(80))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn neighbor_auth_password_empty_passes() {
+        assert!(neighbor_with_auth_password(65001, "").validate().is_ok());
+    }
+
+    #[test]
+    fn neighbor_auth_password_81_bytes_fails() {
+        assert!(
+            neighbor_with_auth_password(65001, &"a".repeat(81))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn peer_group_auth_password_80_bytes_passes() {
+        assert!(
+            peer_group_with_auth_password(&"a".repeat(80))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn peer_group_auth_password_81_bytes_fails() {
+        assert!(
+            peer_group_with_auth_password(&"a".repeat(81))
                 .validate()
                 .is_err()
         );

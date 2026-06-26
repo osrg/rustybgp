@@ -10286,6 +10286,89 @@ port = 3323
             .is_err()
         );
     }
+
+    // --- auth_password length validation ---
+
+    fn peer_with_auth_password(addr: &str, asn: u32, password: &str) -> api::AddPeerRequest {
+        api::AddPeerRequest {
+            peer: Some(api::Peer {
+                conf: Some(api::PeerConf {
+                    neighbor_address: addr.to_string(),
+                    peer_asn: asn,
+                    auth_password: password.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn peer_group_with_auth_password(name: &str, password: &str) -> api::AddPeerGroupRequest {
+        api::AddPeerGroupRequest {
+            peer_group: Some(api::PeerGroup {
+                conf: Some(api::PeerGroupConf {
+                    peer_group_name: name.to_string(),
+                    auth_password: password.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_peer_auth_password_80_bytes_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_auth_password(
+                "10.0.0.1",
+                65001,
+                &"a".repeat(80)
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_auth_password_81_bytes_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_auth_password(
+                "10.0.0.1",
+                65001,
+                &"a".repeat(81)
+            )))
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_auth_password_80_bytes_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_auth_password(
+                "g",
+                &"a".repeat(80)
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_auth_password_81_bytes_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_auth_password(
+                "g",
+                &"a".repeat(81)
+            )))
+            .await
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]
