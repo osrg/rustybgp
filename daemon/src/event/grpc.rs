@@ -315,6 +315,12 @@ impl TryFrom<&api::Peer> for PeerParams {
                 .map(|x| &x.config)
                 .map_or(0, |x| x.as_ref().map_or(0, |x| x.hold_time));
             if t != 0 {
+                // RFC 4271 §4.2: hold time is a 2-byte field; 0 or 3-65535.
+                if !(3..=65535).contains(&t) {
+                    return Err(Error::InvalidArgument(format!(
+                        "hold_time {t} is invalid: must be 0 or 3-65535"
+                    )));
+                }
                 t
             } else {
                 PeerParams::DEFAULT_HOLD_TIME
@@ -1626,6 +1632,21 @@ impl GoBgpService for GrpcService {
             .peer_group
             .ok_or(Error::EmptyArgument)?;
         let conf = pg.conf.as_ref().ok_or(Error::EmptyArgument)?;
+
+        // RFC 4271 §4.2: hold time is a 2-byte field; 0 or 3-65535.
+        if let Some(ht) = pg
+            .timers
+            .as_ref()
+            .and_then(|t| t.config.as_ref())
+            .map(|c| c.hold_time)
+            .filter(|&h| h != 0)
+            && !(3..=65535).contains(&ht)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "hold_time {ht} is invalid: must be 0 or 3-65535"
+            ))
+            .into());
+        }
 
         match self
             .global

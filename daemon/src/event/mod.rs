@@ -9720,6 +9720,149 @@ port = 3323
             "peer_asn=0 without a peer group must be rejected"
         );
     }
+
+    // --- hold_time gRPC validation ---
+
+    fn peer_with_hold_time(addr: &str, asn: u32, hold_time: u64) -> api::AddPeerRequest {
+        api::AddPeerRequest {
+            peer: Some(api::Peer {
+                conf: Some(api::PeerConf {
+                    neighbor_address: addr.to_string(),
+                    peer_asn: asn,
+                    ..Default::default()
+                }),
+                timers: Some(api::Timers {
+                    config: Some(api::TimersConfig {
+                        hold_time,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn peer_group_with_hold_time(hold_time: u64) -> api::AddPeerGroupRequest {
+        api::AddPeerGroupRequest {
+            peer_group: Some(api::PeerGroup {
+                conf: Some(api::PeerGroupConf {
+                    peer_group_name: "grp".to_string(),
+                    ..Default::default()
+                }),
+                timers: Some(api::Timers {
+                    config: Some(api::TimersConfig {
+                        hold_time,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_peer_hold_time_zero_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_hold_time(
+                "10.0.0.1", 65001, 0
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_hold_time_90_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_hold_time(
+                "10.0.0.1", 65001, 90
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_hold_time_65535_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_hold_time(
+                "10.0.0.1", 65001, 65535
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_hold_time_1_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_hold_time(
+                "10.0.0.1", 65001, 1
+            )))
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_hold_time_2_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_hold_time(
+                "10.0.0.1", 65001, 2
+            )))
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_hold_time_65536_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_hold_time(
+                "10.0.0.1", 65001, 65536
+            )))
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_hold_time_90_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_hold_time(90)))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_hold_time_1_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_hold_time(1)))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_hold_time_65536_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_hold_time(65536)))
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

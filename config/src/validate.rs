@@ -78,6 +78,12 @@ impl BgpConfig {
             }
         }
 
+        if let Some(peer_groups) = self.peer_groups.as_ref() {
+            for pg in peer_groups {
+                pg.validate()?;
+            }
+        }
+
         if let Some(bmp_servers) = self.bmp_servers.as_ref() {
             for n in bmp_servers {
                 n.validate()?;
@@ -117,6 +123,17 @@ impl BmpServer {
     }
 }
 
+/// RFC 4271 §4.2: hold time is a 2-byte field.  Valid values are 0
+/// (disabled) or 3–65535.  Values 1 and 2 are explicitly forbidden.
+fn validate_hold_time(hold_time: f64) -> Result<(), ConfigError> {
+    if hold_time != 0.0 && !(3.0..=65535.0).contains(&hold_time) {
+        return Err(ConfigError::InvalidConfiguration(format!(
+            "hold-time {hold_time} is invalid: must be 0 or 3-65535"
+        )));
+    }
+    Ok(())
+}
+
 impl Neighbor {
     fn validate(&self) -> Result<(), ConfigError> {
         let config = self.config.as_ref().ok_or_else(|| {
@@ -147,6 +164,15 @@ impl Neighbor {
             ConfigError::InvalidConfiguration("empty neighbor address".to_string())
         })?;
 
+        if let Some(h) = self
+            .timers
+            .as_ref()
+            .and_then(|t| t.config.as_ref())
+            .and_then(|c| c.hold_time)
+        {
+            validate_hold_time(h)?;
+        }
+
         if self.add_paths.is_some() {
             return Err(ConfigError::InvalidConfiguration(
                 "use per-family addpath config".to_string(),
@@ -160,6 +186,20 @@ impl Neighbor {
             )));
         }
 
+        Ok(())
+    }
+}
+
+impl PeerGroup {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(h) = self
+            .timers
+            .as_ref()
+            .and_then(|t| t.config.as_ref())
+            .and_then(|c| c.hold_time)
+        {
+            validate_hold_time(h)?;
+        }
         Ok(())
     }
 }
@@ -241,5 +281,97 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    fn neighbor_with_hold_time(peer_as: u32, hold_time: f64) -> Neighbor {
+        Neighbor {
+            config: Some(NeighborConfig {
+                neighbor_address: Some("10.0.0.1".parse().unwrap()),
+                peer_as: Some(peer_as),
+                ..Default::default()
+            }),
+            timers: Some(Timers {
+                config: Some(TimersConfig {
+                    hold_time: Some(hold_time),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn peer_group_with_hold_time(hold_time: f64) -> PeerGroup {
+        PeerGroup {
+            timers: Some(Timers {
+                config: Some(TimersConfig {
+                    hold_time: Some(hold_time),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    // --- hold_time: Neighbor ---
+
+    #[test]
+    fn neighbor_hold_time_zero_passes() {
+        assert!(neighbor_with_hold_time(65001, 0.0).validate().is_ok());
+    }
+
+    #[test]
+    fn neighbor_hold_time_3_passes() {
+        assert!(neighbor_with_hold_time(65001, 3.0).validate().is_ok());
+    }
+
+    #[test]
+    fn neighbor_hold_time_65535_passes() {
+        assert!(neighbor_with_hold_time(65001, 65535.0).validate().is_ok());
+    }
+
+    #[test]
+    fn neighbor_hold_time_1_fails() {
+        assert!(neighbor_with_hold_time(65001, 1.0).validate().is_err());
+    }
+
+    #[test]
+    fn neighbor_hold_time_2_fails() {
+        assert!(neighbor_with_hold_time(65001, 2.0).validate().is_err());
+    }
+
+    #[test]
+    fn neighbor_hold_time_65536_fails() {
+        assert!(neighbor_with_hold_time(65001, 65536.0).validate().is_err());
+    }
+
+    // --- hold_time: PeerGroup ---
+
+    #[test]
+    fn peer_group_hold_time_90_passes() {
+        assert!(peer_group_with_hold_time(90.0).validate().is_ok());
+    }
+
+    #[test]
+    fn peer_group_hold_time_2_fails() {
+        assert!(peer_group_with_hold_time(2.0).validate().is_err());
+    }
+
+    #[test]
+    fn peer_group_hold_time_65536_fails() {
+        assert!(peer_group_with_hold_time(65536.0).validate().is_err());
+    }
+
+    // --- BgpConfig: peer_groups hold_time propagated ---
+
+    #[test]
+    fn bgp_config_peer_group_invalid_hold_time_fails() {
+        let cfg = BgpConfig {
+            global: Some(valid_global()),
+            peer_groups: Some(vec![peer_group_with_hold_time(1.0)]),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 }
