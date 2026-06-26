@@ -60,7 +60,9 @@ impl From<Error> for tonic::Status {
                     tonic::Status::new(tonic::Code::FailedPrecondition, s)
                 }
             },
-            _ => panic!("unsupported error code"),
+            // No gRPC handler currently produces these variants, but handle
+            // them gracefully so a future addition cannot cause a panic.
+            e => tonic::Status::internal(e.to_string()),
         }
     }
 }
