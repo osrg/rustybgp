@@ -90,6 +90,12 @@ impl BgpConfig {
             }
         }
 
+        if let Some(vrfs) = self.vrfs.as_ref() {
+            for v in vrfs {
+                v.validate()?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -117,6 +123,22 @@ impl BmpServer {
         {
             return Err(ConfigError::InvalidConfiguration(
                 "unsupported monitoring policy".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Vrf {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let name = self
+            .config
+            .as_ref()
+            .and_then(|c| c.name.as_deref())
+            .unwrap_or("");
+        if name.is_empty() {
+            return Err(ConfigError::InvalidConfiguration(
+                "vrf name is empty".to_string(),
             ));
         }
         Ok(())
@@ -680,5 +702,36 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    // --- VRF name ---
+
+    fn bgp_config_with_vrf(name: Option<&str>) -> BgpConfig {
+        BgpConfig {
+            global: Some(valid_global()),
+            vrfs: Some(vec![Vrf {
+                config: Some(VrfConfig {
+                    name: name.map(str::to_string),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vrf_with_name_passes() {
+        assert!(bgp_config_with_vrf(Some("vrf1")).validate().is_ok());
+    }
+
+    #[test]
+    fn vrf_with_empty_name_fails() {
+        assert!(bgp_config_with_vrf(Some("")).validate().is_err());
+    }
+
+    #[test]
+    fn vrf_with_missing_name_fails() {
+        assert!(bgp_config_with_vrf(None).validate().is_err());
     }
 }
