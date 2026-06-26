@@ -273,16 +273,33 @@ impl TryFrom<&api::Peer> for PeerParams {
             (addr, None)
         };
 
-        let families: FnvHashMap<Family, u8> = p
+        let mut families: FnvHashMap<Family, u8> = FnvHashMap::default();
+        let mut send_max: FnvHashMap<Family, usize> = FnvHashMap::default();
+        for af in p
             .afi_safis
             .iter()
             .filter(|x| x.config.as_ref().is_some_and(|x| x.family.is_some()))
-            .map(|x| {
-                let f =
-                    convert::family_from_api(x.config.as_ref().unwrap().family.as_ref().unwrap());
-                (f, 0u8)
-            })
-            .collect();
+        {
+            let f = convert::family_from_api(af.config.as_ref().unwrap().family.as_ref().unwrap());
+            let (rx, sm) = af
+                .add_paths
+                .as_ref()
+                .and_then(|ap| ap.config.as_ref())
+                .map(|c| (c.receive, c.send_max))
+                .unwrap_or((false, 0));
+            if sm > peer::ADDPATH_SEND_MAX_LIMIT as u32 {
+                return Err(Error::InvalidArgument(format!(
+                    "send_max {sm} exceeds maximum of {}",
+                    peer::ADDPATH_SEND_MAX_LIMIT,
+                )));
+            }
+            let tx = sm > 0;
+            let mode = u8::from(rx) | (u8::from(tx) << 1);
+            families.insert(f, mode);
+            if sm > 0 {
+                send_max.insert(f, sm as usize);
+            }
+        }
 
         let graceful_restart = { parse_gr_api(p.graceful_restart.as_ref(), &p.afi_safis) };
         let llgr = parse_llgr_api(&p.afi_safis);
@@ -373,7 +390,7 @@ impl TryFrom<&api::Peer> for PeerParams {
                 Some(conf.auth_password.clone())
             },
             families,
-            send_max: FnvHashMap::default(),
+            send_max,
             prefix_limits: FnvHashMap::default(),
             graceful_restart,
             llgr,

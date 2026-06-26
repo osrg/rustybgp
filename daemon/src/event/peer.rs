@@ -26,6 +26,12 @@ use rustybgp_packet::{self as packet, Family};
 
 use super::*;
 
+/// Maximum number of Add-Path paths to advertise per prefix (send_max).
+/// Matches the u8 upper bound used in the config file representation.
+/// RFC 7911 imposes no limit; this matches FRR's uint16 range in practice
+/// and is well above any realistic deployment need.
+pub(crate) const ADDPATH_SEND_MAX_LIMIT: usize = u8::MAX as usize;
+
 /// Static GR configuration for a single peer, set at peer creation.
 /// `None` in `PeerConfig::graceful_restart` means GR is disabled for this peer.
 /// Cloned into capability negotiation at each session open.
