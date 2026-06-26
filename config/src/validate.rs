@@ -163,3 +163,83 @@ impl Neighbor {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_global() -> Global {
+        Global {
+            config: Some(GlobalConfig {
+                r#as: Some(65001),
+                router_id: Some(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn neighbor(peer_group: Option<&str>, peer_as: Option<u32>, addr: Option<&str>) -> Neighbor {
+        Neighbor {
+            config: Some(NeighborConfig {
+                peer_group: peer_group.map(str::to_string),
+                peer_as,
+                neighbor_address: addr.and_then(|a| a.parse().ok()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn neighbor_in_peer_group_missing_peer_as_passes() {
+        assert!(
+            neighbor(Some("grp"), None, Some("10.0.0.1"))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn neighbor_in_peer_group_zero_peer_as_passes() {
+        assert!(
+            neighbor(Some("grp"), Some(0), Some("10.0.0.1"))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn neighbor_without_peer_group_missing_peer_as_fails() {
+        assert!(neighbor(None, None, Some("10.0.0.1")).validate().is_err());
+    }
+
+    #[test]
+    fn neighbor_without_peer_group_zero_peer_as_fails() {
+        assert!(
+            neighbor(None, Some(0), Some("10.0.0.1"))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bgp_config_with_peer_group_zero_peer_as_passes() {
+        let cfg = BgpConfig {
+            global: Some(valid_global()),
+            neighbors: Some(vec![neighbor(Some("grp"), Some(0), Some("10.0.0.1"))]),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn bgp_config_with_peer_group_missing_peer_as_passes() {
+        let cfg = BgpConfig {
+            global: Some(valid_global()),
+            neighbors: Some(vec![neighbor(Some("grp"), None, Some("10.0.0.1"))]),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+}

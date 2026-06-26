@@ -9618,6 +9618,108 @@ port = 3323
         svc.start_bgp(start_bgp_req(0)).await.unwrap();
         assert!(svc.start_bgp(start_bgp_req(0)).await.is_err());
     }
+
+    // --- peer group ASN=0 validation ---
+
+    #[test]
+    fn neighbor_config_peer_group_missing_peer_as_accepted() {
+        let n = config::Neighbor {
+            config: Some(config::NeighborConfig {
+                neighbor_address: Some("10.0.0.1".parse().unwrap()),
+                peer_as: None,
+                peer_group: Some("grp".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let params = PeerParams::try_from(&n).unwrap();
+        assert_eq!(params.expected_remote_asn, 0);
+    }
+
+    #[test]
+    fn neighbor_config_peer_group_zero_peer_as_accepted() {
+        let n = config::Neighbor {
+            config: Some(config::NeighborConfig {
+                neighbor_address: Some("10.0.0.1".parse().unwrap()),
+                peer_as: Some(0),
+                peer_group: Some("grp".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let params = PeerParams::try_from(&n).unwrap();
+        assert_eq!(params.expected_remote_asn, 0);
+    }
+
+    #[test]
+    fn neighbor_config_no_peer_group_missing_peer_as_rejected() {
+        let n = config::Neighbor {
+            config: Some(config::NeighborConfig {
+                neighbor_address: Some("10.0.0.1".parse().unwrap()),
+                peer_as: None,
+                peer_group: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(PeerParams::try_from(&n).is_err());
+    }
+
+    #[tokio::test]
+    async fn add_peer_grpc_peer_group_zero_asn_accepted() {
+        let svc = make_grpc_service();
+        svc.add_peer_group(tonic::Request::new(api::AddPeerGroupRequest {
+            peer_group: Some(api::PeerGroup {
+                conf: Some(api::PeerGroupConf {
+                    peer_group_name: "grp".to_string(),
+                    peer_asn: 65002,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let result = svc
+            .add_peer(tonic::Request::new(api::AddPeerRequest {
+                peer: Some(api::Peer {
+                    conf: Some(api::PeerConf {
+                        neighbor_address: "10.0.0.1".to_string(),
+                        peer_asn: 0,
+                        peer_group: "grp".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "peer_asn=0 in a peer group must be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_grpc_no_peer_group_zero_asn_rejected() {
+        let svc = make_grpc_service();
+        let result = svc
+            .add_peer(tonic::Request::new(api::AddPeerRequest {
+                peer: Some(api::Peer {
+                    conf: Some(api::PeerConf {
+                        neighbor_address: "10.0.0.1".to_string(),
+                        peer_asn: 0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "peer_asn=0 without a peer group must be rejected"
+        );
+    }
 }
 
 #[cfg(test)]
