@@ -307,7 +307,7 @@ impl TryFrom<&api::Peer> for PeerParams {
 
         check_gr_restart_time(p.graceful_restart.as_ref())?;
         let graceful_restart = { parse_gr_api(p.graceful_restart.as_ref(), &p.afi_safis) };
-        let llgr = parse_llgr_api(&p.afi_safis);
+        let llgr = parse_llgr_api(&p.afi_safis)?;
 
         let holdtime = {
             let t = p
@@ -446,30 +446,36 @@ fn parse_gr_api(
 }
 
 /// Build LlgrPeerConfig from gRPC AfiSafi per-family long_lived_graceful_restart config.
-fn parse_llgr_api(afi_safis: &[api::AfiSafi]) -> Option<LlgrPeerConfig> {
+/// Returns `InvalidArgument` when any family's stale_time exceeds the 24-bit limit (RFC 9494 §3).
+fn parse_llgr_api(afi_safis: &[api::AfiSafi]) -> Result<Option<LlgrPeerConfig>, Error> {
     const DEFAULT_STALE_TIME: u32 = 600;
-    let families: Vec<(Family, u32)> = afi_safis
-        .iter()
-        .filter(|a| {
-            a.long_lived_graceful_restart
-                .as_ref()
-                .is_some_and(|llgr| llgr.config.as_ref().is_some_and(|c| c.enabled))
-        })
-        .filter_map(|a| {
-            let f = a.config.as_ref()?.family.as_ref()?;
-            let stale_time = a
-                .long_lived_graceful_restart
-                .as_ref()
-                .and_then(|llgr| llgr.config.as_ref())
-                .map(|c| c.restart_time)
-                .unwrap_or(DEFAULT_STALE_TIME);
-            Some((convert::family_from_api(f), stale_time))
-        })
-        .collect();
-    if families.is_empty() {
-        return None;
+    const MAX_STALE_TIME: u32 = 0xFF_FFFF; // 24-bit field
+    let mut families: Vec<(Family, u32)> = Vec::new();
+    for a in afi_safis {
+        let llgr = match a.long_lived_graceful_restart.as_ref() {
+            Some(l) if l.config.as_ref().is_some_and(|c| c.enabled) => l,
+            _ => continue,
+        };
+        let f = match a.config.as_ref().and_then(|c| c.family.as_ref()) {
+            Some(f) => convert::family_from_api(f),
+            None => continue,
+        };
+        let stale_time = llgr
+            .config
+            .as_ref()
+            .map(|c| c.restart_time)
+            .unwrap_or(DEFAULT_STALE_TIME);
+        if stale_time > MAX_STALE_TIME {
+            return Err(Error::InvalidArgument(format!(
+                "llgr stale_time {stale_time} exceeds maximum of {MAX_STALE_TIME}"
+            )));
+        }
+        families.push((f, stale_time));
     }
-    Some(LlgrPeerConfig { families })
+    if families.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(LlgrPeerConfig { families }))
 }
 
 fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
@@ -648,7 +654,7 @@ impl From<api::PeerGroup> for PeerGroup {
                 .collect(),
             send_max: FnvHashMap::default(),
             graceful_restart: parse_gr_api(p.graceful_restart.as_ref(), &p.afi_safis),
-            llgr: parse_llgr_api(&p.afi_safis),
+            llgr: parse_llgr_api(&p.afi_safis).unwrap_or(None),
         }
     }
 }
@@ -1688,6 +1694,7 @@ impl GoBgpService for GrpcService {
         }
         parse_ttl_security(pg.ttl_security.as_ref()).map_err(tonic::Status::from)?;
         check_gr_restart_time(pg.graceful_restart.as_ref()).map_err(tonic::Status::from)?;
+        parse_llgr_api(&pg.afi_safis).map_err(tonic::Status::from)?;
 
         match self
             .global
@@ -1745,6 +1752,7 @@ impl GoBgpService for GrpcService {
             .clone();
         parse_ttl_security(pg.ttl_security.as_ref()).map_err(tonic::Status::from)?;
         check_gr_restart_time(pg.graceful_restart.as_ref()).map_err(tonic::Status::from)?;
+        parse_llgr_api(&pg.afi_safis).map_err(tonic::Status::from)?;
         let updated = PeerGroup::from(pg);
         let mut global = self.global.write().await;
         match global.peer_group.get_mut(&name) {

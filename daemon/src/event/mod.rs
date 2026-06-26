@@ -10226,6 +10226,66 @@ port = 3323
             .is_err()
         );
     }
+
+    // --- LLGR stale_time validation ---
+
+    fn ipv4_unicast_family() -> api::Family {
+        api::Family {
+            afi: api::family::Afi::Ip as i32,
+            safi: api::family::Safi::Unicast as i32,
+        }
+    }
+
+    fn peer_with_llgr_stale_time(addr: &str, asn: u32, stale_time: u32) -> api::AddPeerRequest {
+        api::AddPeerRequest {
+            peer: Some(api::Peer {
+                conf: Some(api::PeerConf {
+                    neighbor_address: addr.to_string(),
+                    peer_asn: asn,
+                    ..Default::default()
+                }),
+                afi_safis: vec![api::AfiSafi {
+                    config: Some(api::AfiSafiConfig {
+                        family: Some(ipv4_unicast_family()),
+                        ..Default::default()
+                    }),
+                    long_lived_graceful_restart: Some(api::LongLivedGracefulRestart {
+                        config: Some(api::LongLivedGracefulRestartConfig {
+                            enabled: true,
+                            restart_time: stale_time,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_peer_llgr_stale_time_max_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_llgr_stale_time(
+                "10.0.0.1", 65001, 0xFF_FFFF
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_llgr_stale_time_overflow_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_llgr_stale_time(
+                "10.0.0.1", 65001, 0x100_0000
+            )))
+            .await
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

@@ -145,6 +145,17 @@ fn validate_gr_restart_time(restart_time: u16) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// RFC 9494 §3: the LLGR stale time is a 24-bit field in the capability.
+/// Values 0-16777215 (0xFF_FFFF) are valid.
+fn validate_llgr_stale_time(stale_time: u32) -> Result<(), ConfigError> {
+    if stale_time > 0xFF_FFFF {
+        return Err(ConfigError::InvalidConfiguration(format!(
+            "long-lived-graceful-restart restart-time {stale_time} exceeds maximum of 16777215"
+        )));
+    }
+    Ok(())
+}
+
 impl Neighbor {
     fn validate(&self) -> Result<(), ConfigError> {
         let config = self.config.as_ref().ok_or_else(|| {
@@ -193,6 +204,19 @@ impl Neighbor {
             validate_gr_restart_time(rt)?;
         }
 
+        if let Some(afi_safis) = self.afi_safis.as_ref() {
+            for a in afi_safis {
+                if let Some(st) = a
+                    .long_lived_graceful_restart
+                    .as_ref()
+                    .and_then(|llgr| llgr.config.as_ref())
+                    .and_then(|c| c.restart_time)
+                {
+                    validate_llgr_stale_time(st)?;
+                }
+            }
+        }
+
         if self.add_paths.is_some() {
             return Err(ConfigError::InvalidConfiguration(
                 "use per-family addpath config".to_string(),
@@ -227,6 +251,18 @@ impl PeerGroup {
             .and_then(|c| c.restart_time)
         {
             validate_gr_restart_time(rt)?;
+        }
+        if let Some(afi_safis) = self.afi_safis.as_ref() {
+            for a in afi_safis {
+                if let Some(st) = a
+                    .long_lived_graceful_restart
+                    .as_ref()
+                    .and_then(|llgr| llgr.config.as_ref())
+                    .and_then(|c| c.restart_time)
+                {
+                    validate_llgr_stale_time(st)?;
+                }
+            }
         }
         Ok(())
     }
@@ -467,5 +503,93 @@ mod tests {
     #[test]
     fn peer_group_gr_restart_time_4096_fails() {
         assert!(peer_group_with_gr_restart_time(4096).validate().is_err());
+    }
+
+    // --- LLGR stale_time ---
+
+    fn neighbor_with_llgr_stale_time(peer_as: u32, stale_time: u32) -> Neighbor {
+        Neighbor {
+            config: Some(NeighborConfig {
+                neighbor_address: Some("10.0.0.1".parse().unwrap()),
+                peer_as: Some(peer_as),
+                ..Default::default()
+            }),
+            afi_safis: Some(vec![AfiSafi {
+                config: Some(AfiSafiConfig {
+                    afi_safi_name: Some(AfiSafiType::Ipv4Unicast),
+                    ..Default::default()
+                }),
+                long_lived_graceful_restart: Some(LongLivedGracefulRestart {
+                    config: Some(LongLivedGracefulRestartConfig {
+                        enabled: Some(true),
+                        restart_time: Some(stale_time),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn peer_group_with_llgr_stale_time(stale_time: u32) -> PeerGroup {
+        PeerGroup {
+            afi_safis: Some(vec![AfiSafi {
+                config: Some(AfiSafiConfig {
+                    afi_safi_name: Some(AfiSafiType::Ipv4Unicast),
+                    ..Default::default()
+                }),
+                long_lived_graceful_restart: Some(LongLivedGracefulRestart {
+                    config: Some(LongLivedGracefulRestartConfig {
+                        enabled: Some(true),
+                        restart_time: Some(stale_time),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn neighbor_llgr_stale_time_max_passes() {
+        assert!(
+            neighbor_with_llgr_stale_time(65001, 0xFF_FFFF)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn neighbor_llgr_stale_time_0_passes() {
+        assert!(neighbor_with_llgr_stale_time(65001, 0).validate().is_ok());
+    }
+
+    #[test]
+    fn neighbor_llgr_stale_time_overflow_fails() {
+        assert!(
+            neighbor_with_llgr_stale_time(65001, 0x100_0000)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn peer_group_llgr_stale_time_max_passes() {
+        assert!(
+            peer_group_with_llgr_stale_time(0xFF_FFFF)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn peer_group_llgr_stale_time_overflow_fails() {
+        assert!(
+            peer_group_with_llgr_stale_time(0x100_0000)
+                .validate()
+                .is_err()
+        );
     }
 }
