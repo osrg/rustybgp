@@ -343,6 +343,7 @@ impl TryFrom<&api::Peer> for PeerParams {
             }
         };
         let ttl_security = parse_ttl_security(p.ttl_security.as_ref())?;
+        let multihop_ttl = parse_multihop_ttl(p.ebgp_multihop.as_ref())?;
 
         Ok(PeerParams {
             remote_addr,
@@ -380,13 +381,7 @@ impl TryFrom<&api::Peer> for PeerParams {
             state: SessionState::Idle,
             holdtime,
             connect_retry_time,
-            multihop_ttl: p.ebgp_multihop.as_ref().and_then(|x| {
-                if x.enabled && x.multihop_ttl != 0 {
-                    Some(x.multihop_ttl as u8)
-                } else {
-                    None
-                }
-            }),
+            multihop_ttl,
             ttl_security,
             password: if conf.auth_password.is_empty() {
                 None
@@ -668,6 +663,25 @@ pub(super) struct GrpcService {
     pub(super) global: GlobalHandle,
     pub(super) tables: TableHandle,
     path_uuid_map: tokio::sync::Mutex<FnvHashMap<uuid::Uuid, (Family, Vec<packet::PathNlri>)>>,
+}
+
+/// Validate and convert `api::EbgpMultihop` to the internal `Option<u8>`.
+/// Returns `InvalidArgument` when `multihop_ttl` does not fit in a u8 (> 255).
+/// A value of 0 with enabled=true is treated as "no multihop" (returns None).
+fn parse_multihop_ttl(mh: Option<&api::EbgpMultihop>) -> Result<Option<u8>, Error> {
+    let Some(mh) = mh else {
+        return Ok(None);
+    };
+    if !mh.enabled || mh.multihop_ttl == 0 {
+        return Ok(None);
+    }
+    if mh.multihop_ttl > u8::MAX as u32 {
+        return Err(Error::InvalidArgument(format!(
+            "multihop_ttl {} exceeds maximum of 255",
+            mh.multihop_ttl
+        )));
+    }
+    Ok(Some(mh.multihop_ttl as u8))
 }
 
 /// Validate and convert `api::TtlSecurity` to the internal `Option<u8>`.
@@ -1710,6 +1724,7 @@ impl GoBgpService for GrpcService {
         parse_ttl_security(pg.ttl_security.as_ref()).map_err(tonic::Status::from)?;
         check_gr_restart_time(pg.graceful_restart.as_ref()).map_err(tonic::Status::from)?;
         parse_llgr_api(&pg.afi_safis).map_err(tonic::Status::from)?;
+        parse_multihop_ttl(pg.ebgp_multihop.as_ref()).map_err(tonic::Status::from)?;
         if let Some(pw) = pg
             .conf
             .as_ref()
@@ -1776,6 +1791,7 @@ impl GoBgpService for GrpcService {
         parse_ttl_security(pg.ttl_security.as_ref()).map_err(tonic::Status::from)?;
         check_gr_restart_time(pg.graceful_restart.as_ref()).map_err(tonic::Status::from)?;
         parse_llgr_api(&pg.afi_safis).map_err(tonic::Status::from)?;
+        parse_multihop_ttl(pg.ebgp_multihop.as_ref()).map_err(tonic::Status::from)?;
         if let Some(pw) = pg
             .conf
             .as_ref()

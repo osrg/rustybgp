@@ -10369,6 +10369,85 @@ port = 3323
             .is_err()
         );
     }
+
+    // --- multihop_ttl validation ---
+
+    fn peer_with_multihop_ttl(addr: &str, asn: u32, ttl: u32) -> api::AddPeerRequest {
+        api::AddPeerRequest {
+            peer: Some(api::Peer {
+                conf: Some(api::PeerConf {
+                    neighbor_address: addr.to_string(),
+                    peer_asn: asn,
+                    ..Default::default()
+                }),
+                ebgp_multihop: Some(api::EbgpMultihop {
+                    enabled: true,
+                    multihop_ttl: ttl,
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn peer_group_with_multihop_ttl(name: &str, ttl: u32) -> api::AddPeerGroupRequest {
+        api::AddPeerGroupRequest {
+            peer_group: Some(api::PeerGroup {
+                conf: Some(api::PeerGroupConf {
+                    peer_group_name: name.to_string(),
+                    ..Default::default()
+                }),
+                ebgp_multihop: Some(api::EbgpMultihop {
+                    enabled: true,
+                    multihop_ttl: ttl,
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_peer_multihop_ttl_255_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_multihop_ttl(
+                "10.0.0.1", 65001, 255
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_multihop_ttl_256_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_multihop_ttl(
+                "10.0.0.1", 65001, 256
+            )))
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_multihop_ttl_255_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_multihop_ttl("g", 255)))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_multihop_ttl_256_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_multihop_ttl("g", 256)))
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]
