@@ -129,14 +129,18 @@ impl Neighbor {
             return Ok(());
         }
 
-        let asn = config
-            .peer_as
-            .as_ref()
-            .ok_or_else(|| ConfigError::InvalidConfiguration("empty peer as".to_string()))?;
-        if *asn == 0 {
-            return Err(ConfigError::InvalidConfiguration(
-                "zero as number".to_string(),
-            ));
+        // Peers in a peer group may omit peer_as (ASN=0) and inherit the AS
+        // from the group; peer_as=0 is also valid when the group accepts any AS.
+        if config.peer_group.is_none() {
+            let asn = config
+                .peer_as
+                .as_ref()
+                .ok_or_else(|| ConfigError::InvalidConfiguration("empty peer as".to_string()))?;
+            if *asn == 0 {
+                return Err(ConfigError::InvalidConfiguration(
+                    "zero as number".to_string(),
+                ));
+            }
         }
 
         let addr = config.neighbor_address.as_ref().ok_or_else(|| {

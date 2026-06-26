@@ -477,7 +477,13 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                 .neighbor_address
                 .as_ref()
                 .ok_or("missing neighbor address")?;
-            let asn = c.peer_as.ok_or("missing peer-as")?;
+            // peer_as may be absent when the peer belongs to a peer group;
+            // apply_peer_group() fills it in from the group's as_number.
+            let asn = if c.peer_group.is_some() {
+                c.peer_as.unwrap_or(0)
+            } else {
+                c.peer_as.ok_or("missing peer-as")?
+            };
             (addr, asn)
         };
 

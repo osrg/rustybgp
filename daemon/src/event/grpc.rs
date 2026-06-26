@@ -273,7 +273,7 @@ impl TryFrom<&api::Peer> for PeerParams {
             (addr, None)
         };
 
-        if neighbor_interface.is_none() && conf.peer_asn == 0 {
+        if neighbor_interface.is_none() && conf.peer_group.is_empty() && conf.peer_asn == 0 {
             return Err(Error::InvalidArgument("peer ASN must be non-zero".into()));
         }
 
