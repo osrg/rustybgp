@@ -9963,6 +9963,73 @@ port = 3323
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
+
+    // --- remote_port validation ---
+
+    fn peer_with_remote_port(addr: &str, asn: u32, remote_port: u32) -> api::AddPeerRequest {
+        api::AddPeerRequest {
+            peer: Some(api::Peer {
+                conf: Some(api::PeerConf {
+                    neighbor_address: addr.to_string(),
+                    peer_asn: asn,
+                    ..Default::default()
+                }),
+                transport: Some(api::Transport {
+                    remote_port,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_peer_remote_port_zero_uses_default() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_remote_port(
+                "10.0.0.1", 65001, 0
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_remote_port_179_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_remote_port(
+                "10.0.0.1", 65001, 179
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_remote_port_65535_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_remote_port(
+                "10.0.0.1", 65001, 65535
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_remote_port_65536_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_remote_port(
+                "10.0.0.1", 65001, 65536
+            )))
+            .await
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

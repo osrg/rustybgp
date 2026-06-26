@@ -341,13 +341,13 @@ impl TryFrom<&api::Peer> for PeerParams {
 
         Ok(PeerParams {
             remote_addr,
-            remote_port: p.transport.as_ref().map_or(Global::BGP_PORT, |x| {
-                if x.remote_port != 0 {
-                    x.remote_port as u16
+            remote_port: p.transport.as_ref().map_or(Ok(Global::BGP_PORT), |x| {
+                if x.remote_port == 0 {
+                    Ok(Global::BGP_PORT)
                 } else {
-                    Global::BGP_PORT
+                    check_port(x.remote_port)
                 }
-            }),
+            })?,
             // Unnumbered BGP (RFC 7938) accepts any AS; override peer_asn with 0.
             expected_remote_asn: if neighbor_interface.is_some() {
                 0
@@ -672,13 +672,12 @@ pub(super) struct GrpcService {
 
 /// Validate and convert a `uint32` port from a gRPC request to `u16`.
 /// Returns `InvalidArgument` for values outside the valid port range 1–65535.
-fn check_port(port: u32) -> Result<u16, tonic::Status> {
-    u16::try_from(port).ok().filter(|&p| p > 0).ok_or_else(|| {
-        tonic::Status::new(
-            tonic::Code::InvalidArgument,
-            format!("port {port} is out of valid range 1-65535"),
-        )
-    })
+/// The `?` operator converts `Error` to `tonic::Status` in async handlers.
+fn check_port(port: u32) -> Result<u16, Error> {
+    u16::try_from(port)
+        .ok()
+        .filter(|&p| p > 0)
+        .ok_or_else(|| Error::InvalidArgument(format!("port {port} is out of valid range 1-65535")))
 }
 
 impl GrpcService {
