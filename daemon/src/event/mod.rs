@@ -10129,6 +10129,103 @@ port = 3323
                 .is_err()
         );
     }
+
+    // --- graceful_restart restart_time validation ---
+
+    fn peer_with_gr_restart_time(addr: &str, asn: u32, restart_time: u32) -> api::AddPeerRequest {
+        api::AddPeerRequest {
+            peer: Some(api::Peer {
+                conf: Some(api::PeerConf {
+                    neighbor_address: addr.to_string(),
+                    peer_asn: asn,
+                    ..Default::default()
+                }),
+                graceful_restart: Some(api::GracefulRestart {
+                    enabled: true,
+                    restart_time,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn peer_group_with_gr_restart_time(name: &str, restart_time: u32) -> api::AddPeerGroupRequest {
+        api::AddPeerGroupRequest {
+            peer_group: Some(api::PeerGroup {
+                conf: Some(api::PeerGroupConf {
+                    peer_group_name: name.to_string(),
+                    ..Default::default()
+                }),
+                graceful_restart: Some(api::GracefulRestart {
+                    enabled: true,
+                    restart_time,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_peer_gr_restart_time_4095_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_gr_restart_time(
+                "10.0.0.1", 65001, 4095
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_gr_restart_time_0_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_gr_restart_time(
+                "10.0.0.1", 65001, 0
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_gr_restart_time_4096_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_gr_restart_time(
+                "10.0.0.1", 65001, 4096
+            )))
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_gr_restart_time_4095_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_gr_restart_time(
+                "g", 4095
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_gr_restart_time_4096_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_gr_restart_time(
+                "g", 4096
+            )))
+            .await
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

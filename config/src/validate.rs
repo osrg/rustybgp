@@ -134,6 +134,17 @@ fn validate_hold_time(hold_time: f64) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// RFC 4724 §3: restart_time is a 12-bit field in the OPEN message.
+/// Values 0–4095 are valid; larger values cannot be encoded.
+fn validate_gr_restart_time(restart_time: u16) -> Result<(), ConfigError> {
+    if restart_time > 4095 {
+        return Err(ConfigError::InvalidConfiguration(format!(
+            "graceful-restart restart-time {restart_time} exceeds maximum of 4095"
+        )));
+    }
+    Ok(())
+}
+
 impl Neighbor {
     fn validate(&self) -> Result<(), ConfigError> {
         let config = self.config.as_ref().ok_or_else(|| {
@@ -173,6 +184,15 @@ impl Neighbor {
             validate_hold_time(h)?;
         }
 
+        if let Some(rt) = self
+            .graceful_restart
+            .as_ref()
+            .and_then(|gr| gr.config.as_ref())
+            .and_then(|c| c.restart_time)
+        {
+            validate_gr_restart_time(rt)?;
+        }
+
         if self.add_paths.is_some() {
             return Err(ConfigError::InvalidConfiguration(
                 "use per-family addpath config".to_string(),
@@ -199,6 +219,14 @@ impl PeerGroup {
             .and_then(|c| c.hold_time)
         {
             validate_hold_time(h)?;
+        }
+        if let Some(rt) = self
+            .graceful_restart
+            .as_ref()
+            .and_then(|gr| gr.config.as_ref())
+            .and_then(|c| c.restart_time)
+        {
+            validate_gr_restart_time(rt)?;
         }
         Ok(())
     }
@@ -373,5 +401,71 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    // --- graceful_restart restart_time ---
+
+    fn neighbor_with_gr_restart_time(peer_as: u32, restart_time: u16) -> Neighbor {
+        Neighbor {
+            config: Some(NeighborConfig {
+                neighbor_address: Some("10.0.0.1".parse().unwrap()),
+                peer_as: Some(peer_as),
+                ..Default::default()
+            }),
+            graceful_restart: Some(GracefulRestart {
+                config: Some(GracefulRestartConfig {
+                    restart_time: Some(restart_time),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn peer_group_with_gr_restart_time(restart_time: u16) -> PeerGroup {
+        PeerGroup {
+            graceful_restart: Some(GracefulRestart {
+                config: Some(GracefulRestartConfig {
+                    restart_time: Some(restart_time),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn neighbor_gr_restart_time_4095_passes() {
+        assert!(
+            neighbor_with_gr_restart_time(65001, 4095)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn neighbor_gr_restart_time_0_passes() {
+        assert!(neighbor_with_gr_restart_time(65001, 0).validate().is_ok());
+    }
+
+    #[test]
+    fn neighbor_gr_restart_time_4096_fails() {
+        assert!(
+            neighbor_with_gr_restart_time(65001, 4096)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn peer_group_gr_restart_time_4095_passes() {
+        assert!(peer_group_with_gr_restart_time(4095).validate().is_ok());
+    }
+
+    #[test]
+    fn peer_group_gr_restart_time_4096_fails() {
+        assert!(peer_group_with_gr_restart_time(4096).validate().is_err());
     }
 }

@@ -305,6 +305,7 @@ impl TryFrom<&api::Peer> for PeerParams {
             }
         }
 
+        check_gr_restart_time(p.graceful_restart.as_ref())?;
         let graceful_restart = { parse_gr_api(p.graceful_restart.as_ref(), &p.afi_safis) };
         let llgr = parse_llgr_api(&p.afi_safis);
 
@@ -681,6 +682,21 @@ fn parse_ttl_security(ts: Option<&api::TtlSecurity>) -> Result<Option<u8>, Error
     } else {
         ts.ttl_min as u8
     }))
+}
+
+/// Validate the GracefulRestart restart_time field (RFC 4724 §3).
+/// restart_time is a 12-bit field in the OPEN message; values > 4095 are invalid.
+fn check_gr_restart_time(gr: Option<&api::GracefulRestart>) -> Result<(), Error> {
+    if let Some(gr) = gr
+        && gr.enabled
+        && gr.restart_time > 4095
+    {
+        return Err(Error::InvalidArgument(format!(
+            "graceful_restart restart_time {} exceeds maximum of 4095",
+            gr.restart_time
+        )));
+    }
+    Ok(())
 }
 
 /// Validate and convert a `uint32` port from a gRPC request to `u16`.
@@ -1671,6 +1687,7 @@ impl GoBgpService for GrpcService {
             .into());
         }
         parse_ttl_security(pg.ttl_security.as_ref()).map_err(tonic::Status::from)?;
+        check_gr_restart_time(pg.graceful_restart.as_ref()).map_err(tonic::Status::from)?;
 
         match self
             .global
@@ -1727,6 +1744,7 @@ impl GoBgpService for GrpcService {
             .peer_group_name
             .clone();
         parse_ttl_security(pg.ttl_security.as_ref()).map_err(tonic::Status::from)?;
+        check_gr_restart_time(pg.graceful_restart.as_ref()).map_err(tonic::Status::from)?;
         let updated = PeerGroup::from(pg);
         let mut global = self.global.write().await;
         match global.peer_group.get_mut(&name) {
