@@ -338,6 +338,7 @@ impl TryFrom<&api::Peer> for PeerParams {
                 PeerParams::DEFAULT_CONNECT_RETRY_TIME
             }
         };
+        let ttl_security = parse_ttl_security(p.ttl_security.as_ref())?;
 
         Ok(PeerParams {
             remote_addr,
@@ -382,18 +383,7 @@ impl TryFrom<&api::Peer> for PeerParams {
                     None
                 }
             }),
-            ttl_security: p.ttl_security.as_ref().and_then(|ts| {
-                if ts.enabled {
-                    let min = if ts.ttl_min == 0 {
-                        255
-                    } else {
-                        ts.ttl_min as u8
-                    };
-                    Some(min)
-                } else {
-                    None
-                }
-            }),
+            ttl_security,
             password: if conf.auth_password.is_empty() {
                 None
             } else {
@@ -668,6 +658,29 @@ pub(super) struct GrpcService {
     pub(super) global: GlobalHandle,
     pub(super) tables: TableHandle,
     path_uuid_map: tokio::sync::Mutex<FnvHashMap<uuid::Uuid, (Family, Vec<packet::PathNlri>)>>,
+}
+
+/// Validate and convert `api::TtlSecurity` to the internal `Option<u8>`.
+/// Returns `InvalidArgument` when `ttl_min` does not fit in a u8 (> 255).
+/// ttl_min=0 means "use 255 (single-hop default)"; 1–255 are passed as-is.
+fn parse_ttl_security(ts: Option<&api::TtlSecurity>) -> Result<Option<u8>, Error> {
+    let Some(ts) = ts else {
+        return Ok(None);
+    };
+    if !ts.enabled {
+        return Ok(None);
+    }
+    if ts.ttl_min > u8::MAX as u32 {
+        return Err(Error::InvalidArgument(format!(
+            "ttl_min {} exceeds maximum of 255",
+            ts.ttl_min
+        )));
+    }
+    Ok(Some(if ts.ttl_min == 0 {
+        255
+    } else {
+        ts.ttl_min as u8
+    }))
 }
 
 /// Validate and convert a `uint32` port from a gRPC request to `u16`.
@@ -1657,6 +1670,7 @@ impl GoBgpService for GrpcService {
             ))
             .into());
         }
+        parse_ttl_security(pg.ttl_security.as_ref()).map_err(tonic::Status::from)?;
 
         match self
             .global
@@ -1712,6 +1726,7 @@ impl GoBgpService for GrpcService {
             .ok_or(Error::EmptyArgument)?
             .peer_group_name
             .clone();
+        parse_ttl_security(pg.ttl_security.as_ref()).map_err(tonic::Status::from)?;
         let updated = PeerGroup::from(pg);
         let mut global = self.global.write().await;
         match global.peer_group.get_mut(&name) {

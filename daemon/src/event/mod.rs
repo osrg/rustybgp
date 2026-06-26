@@ -10030,6 +10030,105 @@ port = 3323
             .is_err()
         );
     }
+
+    // --- ttl_min validation ---
+
+    fn peer_with_ttl_min(addr: &str, asn: u32, ttl_min: u32) -> api::AddPeerRequest {
+        api::AddPeerRequest {
+            peer: Some(api::Peer {
+                conf: Some(api::PeerConf {
+                    neighbor_address: addr.to_string(),
+                    peer_asn: asn,
+                    ..Default::default()
+                }),
+                ttl_security: Some(api::TtlSecurity {
+                    enabled: true,
+                    ttl_min,
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn peer_group_with_ttl_min(name: &str, ttl_min: u32) -> api::AddPeerGroupRequest {
+        api::AddPeerGroupRequest {
+            peer_group: Some(api::PeerGroup {
+                conf: Some(api::PeerGroupConf {
+                    peer_group_name: name.to_string(),
+                    ..Default::default()
+                }),
+                ttl_security: Some(api::TtlSecurity {
+                    enabled: true,
+                    ttl_min,
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_peer_ttl_min_255_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_ttl_min(
+                "10.0.0.1", 65001, 255
+            )))
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_ttl_min_1_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_ttl_min("10.0.0.1", 65001, 1)))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_ttl_min_0_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_ttl_min("10.0.0.1", 65001, 0)))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_ttl_min_256_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer(tonic::Request::new(peer_with_ttl_min(
+                "10.0.0.1", 65001, 256
+            )))
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_ttl_min_255_accepted() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_ttl_min("g", 255)))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_group_ttl_min_256_rejected() {
+        let svc = make_grpc_service();
+        assert!(
+            svc.add_peer_group(tonic::Request::new(peer_group_with_ttl_min("g", 256)))
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]
