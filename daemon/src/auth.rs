@@ -38,7 +38,7 @@ impl TcpMd5sig {
                 libc::AF_INET6 as u16
             }
         };
-        let k = std::ffi::CString::new(password).unwrap().into_bytes();
+        let k = password.into_bytes();
         let keylen = k.len();
         let mut key = [0; 80];
         key[..std::cmp::min(keylen, 80)].clone_from_slice(&k[..std::cmp::min(keylen, 80)]);
