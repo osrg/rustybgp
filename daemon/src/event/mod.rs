@@ -2482,7 +2482,10 @@ impl PeerSession {
             if rtc_awaiting_eor && crate::rtc::is_vpn_family(*f) {
                 continue;
             }
-            self.pending.get_mut(f).unwrap().schedule_eor();
+            self.pending
+                .get_mut(f)
+                .unwrap()
+                .buffer_messages(vec![bgp::Message::eor(*f)]);
         }
         let remote_holdtime = HoldTime::new(self.state.remote_holdtime.load(Ordering::Relaxed))
             .unwrap_or(HoldTime::DISABLED);

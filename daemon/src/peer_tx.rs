@@ -40,7 +40,7 @@ impl PendingTx {
         PendingTx {
             reach: FnvHashMap::default(),
             unreach: FnvHashSet::default(),
-            pending_eor: true,
+            pending_eor: false,
             addpath_tx,
             buffered: Vec::new(),
         }
@@ -161,8 +161,8 @@ mod tests {
 
         assert!(!p.is_empty());
         let msgs = p.drain_messages(Family::IPV4);
-        // Same attributes → batched into 1 UPDATE + EOR
-        assert_eq!(msgs.len(), 2);
+        // Same attributes → batched into 1 UPDATE
+        assert_eq!(msgs.len(), 1);
         if let bgp::Message::Update(bgp::Update::Reach { entries, .. }) = &msgs[0] {
             assert_eq!(entries.len(), 2);
         } else {
@@ -177,8 +177,8 @@ mod tests {
         p.unreach(nlri("10.0.0.0/24"), 0);
 
         let msgs = p.drain_messages(Family::IPV4);
-        // withdrawal + EOR
-        assert_eq!(msgs.len(), 2);
+        // withdrawal
+        assert_eq!(msgs.len(), 1);
         if let bgp::Message::Update(bgp::Update::Unreach { entries, .. }) = &msgs[0] {
             assert!(!entries.is_empty());
         } else {
@@ -194,8 +194,8 @@ mod tests {
         p.unreach(nlri("10.0.0.0/24"), 0);
 
         let msgs = p.drain_messages(Family::IPV4);
-        // withdrawal + EOR
-        assert_eq!(msgs.len(), 2);
+        // withdrawal
+        assert_eq!(msgs.len(), 1);
         if let bgp::Message::Update(bgp::Update::Unreach { entries, .. }) = &msgs[0] {
             assert!(!entries.is_empty());
         } else {
@@ -210,8 +210,8 @@ mod tests {
         p.reach(nlri("20.0.0.0/24"), 0, nh(), attr(1)); // origin=EGP
 
         let msgs = p.drain_messages(Family::IPV4);
-        // Different attributes → 2 UPDATEs + EOR
-        assert_eq!(msgs.len(), 3);
+        // Different attributes → 2 UPDATEs
+        assert_eq!(msgs.len(), 2);
     }
 
     #[test]
@@ -224,8 +224,8 @@ mod tests {
         p.reach(nlri("20.0.0.0/24"), 1, nh(), attr(0));
 
         let msgs = p.drain_messages(Family::IPV4);
-        // 1 UPDATE (both prefixes, same attr) + EOR
-        assert_eq!(msgs.len(), 2);
+        // 1 UPDATE (both prefixes, same attr)
+        assert_eq!(msgs.len(), 1);
         if let bgp::Message::Update(bgp::Update::Reach { entries, .. }) = &msgs[0] {
             assert_eq!(entries.len(), 2);
         } else {
@@ -283,6 +283,10 @@ mod tests {
     #[test]
     fn eor_generated_when_empty() {
         let mut p = PendingTx::new(false);
+        // No auto-EOR: new() starts with pending_eor=false
+        assert!(p.drain_messages(Family::IPV4).is_empty());
+        // schedule_eor causes EOR to be emitted
+        p.schedule_eor();
         let msgs = p.drain_messages(Family::IPV4);
         assert_eq!(msgs.len(), 1);
         assert!(
@@ -292,7 +296,6 @@ mod tests {
             ),
             "expected EndOfRib(IPV4)"
         );
-
         // Not generated again
         let msgs = p.drain_messages(Family::IPV4);
         assert!(msgs.is_empty());
@@ -302,6 +305,7 @@ mod tests {
     fn eor_follows_last_reach() {
         let mut p = PendingTx::new(false);
         p.reach(nlri("10.0.0.0/24"), 0, nh(), attr(0));
+        p.schedule_eor();
         // Drain produces reach UPDATE + EOR
         let msgs = p.drain_messages(Family::IPV4);
         assert_eq!(msgs.len(), 2);
@@ -374,7 +378,10 @@ mod tests {
     #[test]
     fn schedule_eor_triggers_again() {
         let mut p = PendingTx::new(false);
-        // First drain emits EOR
+        // No auto-EOR: first drain returns empty
+        assert!(p.drain_messages(Family::IPV4).is_empty());
+        // schedule_eor causes EOR to be emitted
+        p.schedule_eor();
         let msgs = p.drain_messages(Family::IPV4);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(
@@ -450,7 +457,7 @@ mod tests {
     #[test]
     fn buffered_messages_drained_before_reach() {
         let mut p = PendingTx::new(false);
-        p.drain_messages(Family::IPV4); // consume initial EOR
+        p.drain_messages(Family::IPV4); // no-op (pending_eor starts false)
         // Simulate pre-built messages from GroupedSink (initial dump).
         p.buffer_messages(vec![bgp::Message::Update(bgp::Update::Reach {
             family: Family::IPV4,
@@ -476,7 +483,7 @@ mod tests {
     #[test]
     fn buffered_emptied_after_drain() {
         let mut p = PendingTx::new(false);
-        p.drain_messages(Family::IPV4); // consume initial EOR
+        p.drain_messages(Family::IPV4); // no-op (pending_eor starts false)
         p.buffer_messages(vec![bgp::Message::Update(bgp::Update::Reach {
             family: Family::IPV4,
             entries: vec![packet::PathNlri::new(nlri("10.0.0.0/24"))],
