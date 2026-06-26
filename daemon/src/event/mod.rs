@@ -9863,6 +9863,106 @@ port = 3323
                 .is_err()
         );
     }
+
+    // --- RPKI/BMP port validation ---
+
+    #[tokio::test]
+    async fn add_rpki_valid_port_accepted() {
+        let svc = make_grpc_service();
+        let result = svc
+            .add_rpki(tonic::Request::new(api::AddRpkiRequest {
+                address: "10.0.0.1".to_string(),
+                port: 323,
+                ..Default::default()
+            }))
+            .await;
+        // May fail with AlreadyExists or succeed; either is not an InvalidArgument.
+        assert!(
+            result.is_ok()
+                || result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| e.code() != tonic::Code::InvalidArgument)
+        );
+    }
+
+    #[tokio::test]
+    async fn add_rpki_port_zero_rejected() {
+        let svc = make_grpc_service();
+        let result = svc
+            .add_rpki(tonic::Request::new(api::AddRpkiRequest {
+                address: "10.0.0.1".to_string(),
+                port: 0,
+                ..Default::default()
+            }))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn add_rpki_port_65536_rejected() {
+        let svc = make_grpc_service();
+        let result = svc
+            .add_rpki(tonic::Request::new(api::AddRpkiRequest {
+                address: "10.0.0.1".to_string(),
+                port: 65536,
+                ..Default::default()
+            }))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn add_bmp_valid_port_accepted() {
+        let svc = make_grpc_service();
+        let result = svc
+            .add_bmp(tonic::Request::new(api::AddBmpRequest {
+                address: "10.0.0.1".to_string(),
+                port: 4789,
+                policy: api::add_bmp_request::MonitoringPolicy::Pre as i32,
+                ..Default::default()
+            }))
+            .await;
+        assert!(
+            result.is_ok()
+                || result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| e.code() != tonic::Code::InvalidArgument)
+        );
+    }
+
+    #[tokio::test]
+    async fn add_bmp_port_zero_rejected() {
+        let svc = make_grpc_service();
+        let result = svc
+            .add_bmp(tonic::Request::new(api::AddBmpRequest {
+                address: "10.0.0.1".to_string(),
+                port: 0,
+                policy: api::add_bmp_request::MonitoringPolicy::Pre as i32,
+                ..Default::default()
+            }))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn add_bmp_port_65536_rejected() {
+        let svc = make_grpc_service();
+        let result = svc
+            .add_bmp(tonic::Request::new(api::AddBmpRequest {
+                address: "10.0.0.1".to_string(),
+                port: 65536,
+                policy: api::add_bmp_request::MonitoringPolicy::Pre as i32,
+                ..Default::default()
+            }))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
 }
 
 #[cfg(test)]

@@ -670,6 +670,17 @@ pub(super) struct GrpcService {
     path_uuid_map: tokio::sync::Mutex<FnvHashMap<uuid::Uuid, (Family, Vec<packet::PathNlri>)>>,
 }
 
+/// Validate and convert a `uint32` port from a gRPC request to `u16`.
+/// Returns `InvalidArgument` for values outside the valid port range 1–65535.
+fn check_port(port: u32) -> Result<u16, tonic::Status> {
+    u16::try_from(port).ok().filter(|&p| p > 0).ok_or_else(|| {
+        tonic::Status::new(
+            tonic::Code::InvalidArgument,
+            format!("port {port} is out of valid range 1-65535"),
+        )
+    })
+}
+
 impl GrpcService {
     pub(super) fn new(
         init: Arc<tokio::sync::Notify>,
@@ -2677,7 +2688,7 @@ impl GoBgpService for GrpcService {
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
 
-        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        let sockaddr = SocketAddr::new(addr, check_port(request.port)?);
         match self.global.write().await.add_rpki_client(sockaddr) {
             Err(()) => {
                 return Err(tonic::Status::new(
@@ -2698,7 +2709,7 @@ impl GoBgpService for GrpcService {
         let request = request.into_inner();
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
-        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        let sockaddr = SocketAddr::new(addr, check_port(request.port)?);
         if self.global.write().await.remove_rpki_client(sockaddr) {
             Ok(tonic::Response::new(api::DeleteRpkiResponse {}))
         } else {
@@ -2755,7 +2766,7 @@ impl GoBgpService for GrpcService {
         let request = request.into_inner();
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
-        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        let sockaddr = SocketAddr::new(addr, check_port(request.port)?);
         let (cancel, soft_reset, state) = {
             let mut global = self.global.write().await;
             match global.rpki_clients.get_mut(&sockaddr) {
@@ -2791,7 +2802,7 @@ impl GoBgpService for GrpcService {
         let request = request.into_inner();
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
-        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        let sockaddr = SocketAddr::new(addr, check_port(request.port)?);
         let mut global = self.global.write().await;
         match global.rpki_clients.get_mut(&sockaddr) {
             None => Err(tonic::Status::new(
@@ -2817,7 +2828,7 @@ impl GoBgpService for GrpcService {
         let request = request.into_inner();
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
-        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        let sockaddr = SocketAddr::new(addr, check_port(request.port)?);
         if request.soft {
             let global = self.global.read().await;
             return match global.rpki_clients.get(&sockaddr) {
@@ -3022,7 +3033,7 @@ impl GoBgpService for GrpcService {
             }
         };
 
-        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        let sockaddr = SocketAddr::new(addr, check_port(request.port)?);
         match self.global.write().await.add_bmp_client(sockaddr) {
             Err(()) => {
                 return Err(tonic::Status::new(
@@ -3050,7 +3061,7 @@ impl GoBgpService for GrpcService {
         let request = request.into_inner();
         let addr = IpAddr::from_str(&request.address)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid address"))?;
-        let sockaddr = SocketAddr::new(addr, request.port as u16);
+        let sockaddr = SocketAddr::new(addr, check_port(request.port)?);
         if self.global.write().await.remove_bmp_client(sockaddr) {
             Ok(tonic::Response::new(api::DeleteBmpResponse {}))
         } else {
