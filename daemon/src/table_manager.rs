@@ -1672,4 +1672,82 @@ mod tests {
             "2001:db8::1".parse::<IpAddr>().unwrap()
         );
     }
+
+    #[test]
+    fn dest_ids_are_globally_unique_across_shards() {
+        // Each shard's IdAllocator starts local_id at 0, so without the
+        // shard_idx encoding in bits [31:24] the first route in every shard
+        // would collide on dest_id=0.  This test inserts routes into a
+        // 2-shard TableManager, then checks per-shard that every dest_id
+        // carries the correct shard_idx in bits [31:24] and that no two
+        // dest_ids are equal across the whole table.
+        use std::net::IpAddr;
+
+        let tm = TableManager::new(2);
+        let source = Arc::new(table::Source::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            65001,
+            65000,
+            Ipv4Addr::new(10, 0, 0, 1),
+            table::PeerRole::Ebgp,
+        ));
+        let attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0u32).unwrap(),
+        ]);
+
+        // Insert 64 distinct /24 prefixes.  With FnvHasher % 2, this is
+        // more than enough to guarantee both shards receive at least one route.
+        for i in 0..64u8 {
+            let nlri = packet::Nlri::V4(packet::bgp::Ipv4Net {
+                addr: Ipv4Addr::new(10, 0, i, 0),
+                mask: 24,
+            });
+            tm.insert_route(
+                source.clone(),
+                Family::IPV4,
+                packet::PathNlri::new(nlri),
+                Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
+                attr.clone(),
+                None,
+                std::time::SystemTime::UNIX_EPOCH,
+            );
+        }
+
+        let mut all_dest_ids = FnvHashSet::default();
+        let mut shard_counts = [0usize; 2];
+
+        for (shard_idx, shard) in tm.shards.iter().enumerate() {
+            let t = shard.lock().unwrap();
+            let changes = t.rtable.collect_loc_rib_paths_limited(&Family::IPV4, 1);
+            for change in &changes {
+                assert_eq!(
+                    (change.dest_id >> 24) as usize,
+                    shard_idx,
+                    "dest_id bits[31:24] must equal shard_idx for shard {}",
+                    shard_idx
+                );
+                assert!(
+                    all_dest_ids.insert(change.dest_id),
+                    "dest_id {} is duplicated across shards",
+                    change.dest_id
+                );
+                shard_counts[shard_idx] += 1;
+            }
+        }
+
+        assert!(shard_counts[0] > 0, "shard 0 received no routes");
+        assert!(shard_counts[1] > 0, "shard 1 received no routes");
+
+        // The first dest_id in each shard has local_id=0.  Without the
+        // shard_idx in bits[31:24] they would both be 0 and collide.
+        assert!(
+            all_dest_ids.contains(&0u32),
+            "shard 0 local_id=0 route must exist"
+        );
+        assert!(
+            all_dest_ids.contains(&(1u32 << 24)),
+            "shard 1 local_id=0 route must exist"
+        );
+    }
 }

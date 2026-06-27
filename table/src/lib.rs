@@ -455,6 +455,10 @@ struct IdAllocator {
 
 impl IdAllocator {
     fn new(shard_idx: u32) -> Self {
+        debug_assert!(
+            shard_idx < 256,
+            "shard_idx must fit in bits [31:24] (max 255)"
+        );
         IdAllocator {
             bits: Vec::new(),
             shard_idx,
@@ -864,6 +868,13 @@ impl Rib {
         }
     }
 }
+
+/// Maximum number of RIB shards.
+///
+/// dest_id packs shard_idx into bits [31:24], so at most 256 distinct shard
+/// indices (0-255) can be represented without overlapping the local-id field.
+/// Capping at 255 keeps shard_idx safely within one byte.
+pub const MAX_NUM_SHARDS: usize = 255;
 
 pub struct Table {
     ribs: FnvHashMap<Family, Rib>,
@@ -6241,5 +6252,108 @@ mod tests {
         let (changes, nexthops) = rt.drop_llgr_stale(addr, Family::IPV4, None);
         assert!(changes.is_empty());
         assert!(nexthops.is_empty());
+    }
+
+    // ---- IdAllocator dest_id lifecycle tests ----
+
+    #[test]
+    fn id_allocator_alloc_sequential() {
+        let mut alloc = IdAllocator::new(0);
+        assert_eq!(alloc.alloc(), 0);
+        assert_eq!(alloc.alloc(), 1);
+        assert_eq!(alloc.alloc(), 2);
+    }
+
+    #[test]
+    fn id_allocator_dealloc_reuses_lowest_free_id() {
+        let mut alloc = IdAllocator::new(0);
+        let id0 = alloc.alloc();
+        let id1 = alloc.alloc();
+        let _id2 = alloc.alloc();
+        // Free id0; the next alloc must return the lowest free slot.
+        alloc.dealloc(id0);
+        assert_eq!(alloc.alloc(), id0);
+        // Free id1; next alloc returns id1 (lower than id2+1).
+        alloc.dealloc(id1);
+        assert_eq!(alloc.alloc(), id1);
+    }
+
+    #[test]
+    fn id_allocator_encodes_shard_idx_in_high_bits() {
+        let shard: u32 = 5;
+        let mut alloc = IdAllocator::new(shard);
+        let id = alloc.alloc();
+        assert_eq!(id >> 24, shard, "shard_idx must occupy bits [31:24]");
+        assert_eq!(id & 0x00FF_FFFF, 0, "first local_id must be 0");
+        // dealloc accepts the full combined id.
+        alloc.dealloc(id);
+        assert_eq!(alloc.alloc(), id, "freed id must be reused");
+    }
+
+    #[test]
+    fn remove_last_path_frees_dest_id_for_reuse() {
+        // Removing the last path from a destination must deallocate its dest_id
+        // so that subsequent inserts can reuse it (lowest-free allocation).
+        let s1 = source(1, 65001, 65000, 1);
+        let n1 = nlri(10, 0, 0, 0, 24);
+        let n2 = nlri(10, 0, 1, 0, 24);
+        let n3 = nlri(10, 0, 2, 0, 24);
+
+        let mut rt = Table::new(0);
+        insert_path(&mut rt, &s1, &n1); // dest_id = 0
+        insert_path(&mut rt, &s1, &n2); // dest_id = 1
+
+        let id_n1 = rt
+            .collect_loc_rib_paths_limited(&Family::IPV4, 1)
+            .into_iter()
+            .find(|c| c.net == n1)
+            .expect("n1 must be in RIB")
+            .dest_id;
+
+        // Remove all paths for n1; its dest_id must be freed.
+        rt.remove(s1.clone(), Family::IPV4, n1, 0, None);
+
+        // Insert n3: must receive the freed dest_id (lowest free = id_n1).
+        insert_path(&mut rt, &s1, &n3);
+        let id_n3 = rt
+            .collect_loc_rib_paths_limited(&Family::IPV4, 1)
+            .into_iter()
+            .find(|c| c.net == n3)
+            .expect("n3 must be in RIB")
+            .dest_id;
+
+        assert_eq!(id_n3, id_n1, "dest_id must be recycled after remove");
+    }
+
+    #[test]
+    fn drop_peer_routes_frees_dest_ids_for_reuse() {
+        // Dropping all routes from a peer must free their dest_ids.
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        let n1 = nlri(10, 0, 0, 0, 24);
+        let n2 = nlri(10, 0, 1, 0, 24);
+        let n3 = nlri(10, 0, 2, 0, 24);
+
+        let mut rt = Table::new(0);
+        insert_path(&mut rt, &s1, &n1); // dest_id = 0
+        insert_path(&mut rt, &s1, &n2); // dest_id = 1
+
+        // Drop all routes from s1; dest_ids 0 and 1 must be freed.
+        rt.drop(s1.remote_addr, Family::IPV4);
+
+        // Insert n3 via s2: must reuse the lowest freed id (0).
+        insert_path(&mut rt, &s2, &n3);
+        let id_n3 = rt
+            .collect_loc_rib_paths_limited(&Family::IPV4, 1)
+            .into_iter()
+            .next()
+            .expect("n3 must be in RIB")
+            .dest_id;
+
+        assert_eq!(
+            id_n3 & 0x00FF_FFFF,
+            0,
+            "lowest freed local_id must be reused"
+        );
     }
 }

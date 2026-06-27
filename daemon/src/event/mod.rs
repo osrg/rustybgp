@@ -1011,7 +1011,9 @@ impl Global {
             kernel_event_tx,
             bfd_event_tx,
         )));
-        let tables: TableHandle = Arc::new(TableManager::new(num_cpus::get()));
+        let tables: TableHandle = Arc::new(TableManager::new(
+            num_cpus::get().min(table::MAX_NUM_SHARDS),
+        ));
 
         let notify = Arc::new(tokio::sync::Notify::new());
 
@@ -5596,7 +5598,6 @@ mod tests {
 
     #[test]
     fn export_map_mark_and_check() {
-        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let mut m = ExportMap::new();
         assert!(!m.was_sent(Family::IPV4, 1));
         m.mark_sent(Family::IPV4, 1, 0);
@@ -5612,7 +5613,6 @@ mod tests {
 
     #[test]
     fn export_map_mark_withdrawn_clears() {
-        let nlri: packet::Nlri = "10.1.0.0/16".parse().unwrap();
         let mut m = ExportMap::new();
         m.mark_sent(Family::IPV4, 1, 0);
         assert!(m.was_sent(Family::IPV4, 1));
@@ -5622,8 +5622,6 @@ mod tests {
 
     #[test]
     fn export_map_multiple_families_independent() {
-        let v4: packet::Nlri = "10.0.0.0/8".parse().unwrap();
-        let v6: packet::Nlri = "2001:db8::/32".parse().unwrap();
         let mut m = ExportMap::new();
         m.mark_sent(Family::IPV4, 1, 0);
         assert!(m.was_sent(Family::IPV4, 1));
@@ -8286,7 +8284,6 @@ mod tests {
     // ---- apply_disconnect: export_map lifetime ----
 
     fn make_disconnect_info(negotiated_gr: Option<NegotiatedGr>) -> DisconnectInfo {
-        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let mut em = ExportMap::new();
         em.mark_sent(Family::IPV4, 1, 0);
         DisconnectInfo {
