@@ -440,16 +440,62 @@ impl PartialEq for RibEntry {
 
 impl Eq for RibEntry {}
 
+/// Bitmap-based allocator for per-Rib destination IDs.
+///
+/// Bit i set = ID i is in use (same convention as BIRD's hmap).
+/// Allocates the lowest free ID in O(1) via `u64::trailing_ones()`.
+#[derive(Default)]
+struct IdAllocator {
+    bits: Vec<u64>,
+}
+
+impl IdAllocator {
+    fn alloc(&mut self) -> u32 {
+        for (i, word) in self.bits.iter_mut().enumerate() {
+            if *word != u64::MAX {
+                let bit = word.trailing_ones();
+                *word |= 1u64 << bit;
+                let id = i as u32 * 64 + bit;
+                debug_assert!(
+                    id < (1 << 24),
+                    "local dest_id overflow (> 16M routes per shard)"
+                );
+                return id;
+            }
+        }
+        let i = self.bits.len();
+        self.bits.push(1);
+        let id = i as u32 * 64;
+        debug_assert!(
+            id < (1 << 24),
+            "local dest_id overflow (> 16M routes per shard)"
+        );
+        id
+    }
+
+    fn dealloc(&mut self, id: u32) {
+        let i = (id / 64) as usize;
+        let bit = id % 64;
+        self.bits[i] &= !(1u64 << bit);
+        while self.bits.last() == Some(&0) {
+            self.bits.pop();
+        }
+    }
+}
+
 struct Destination {
     entry: Vec<RibEntry>,
     next_path_id: u32,
+    /// Stable per-Rib integer ID assigned at insertion, freed at removal.
+    id: u32,
 }
 
 impl Destination {
-    fn new() -> Self {
+    fn with_id(id: u32) -> Self {
         Destination {
             entry: Vec::new(),
             next_path_id: 1,
+            id,
         }
     }
 
@@ -575,6 +621,9 @@ pub type SoftResetPath = (
 pub struct NlriChange {
     pub family: Family,
     pub net: packet::Nlri,
+    /// Stable integer ID for the Destination within its Rib.
+    /// Used by ExportMap as a cheap u32 key instead of hashing Nlri.
+    pub dest_id: u32,
 
     // Non-Add-Path peers use the following two fields only.
     /// True when the best path changed. Non-Add-Path peers skip if false.
@@ -788,20 +837,35 @@ impl Source {
 /// `deferring` is set while the local speaker is in Restarting Speaker mode
 /// (RFC 4724 §4.2): best-path selection is suppressed for this family until
 /// EOR has been received from all helper peers or the deferral timer fires.
-#[derive(Default)]
 pub struct Rib {
     pub deferring: bool,
     destinations: FnvHashMap<packet::Nlri, Destination>,
+    id_allocator: IdAllocator,
+    /// Shard index, stored in bits [31:24] of every NlriChange.dest_id produced
+    /// by this Rib. Bits [23:0] hold the per-Rib local id from IdAllocator.
+    shard_idx: u32,
+}
+
+impl Rib {
+    fn new(shard_idx: u32) -> Self {
+        Rib {
+            deferring: false,
+            destinations: FnvHashMap::default(),
+            id_allocator: IdAllocator::default(),
+            shard_idx,
+        }
+    }
 }
 
 pub struct Table {
     ribs: FnvHashMap<Family, Rib>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, PrefixStats>>,
+    shard_idx: u32,
 }
 
 impl Default for Table {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
@@ -829,6 +893,7 @@ impl Table {
                 Some(NlriChange {
                     family: *family,
                     net: net.clone(),
+                    dest_id: dst.id,
                     best_changed: true,
                     any_changed: true,
                     replaced_path_id: None,
@@ -1121,12 +1186,23 @@ impl Table {
                 0
             };
 
-        let rt = self.ribs.entry(family).or_default();
+        let shard_idx = self.shard_idx;
+        let rt = self
+            .ribs
+            .entry(family)
+            .or_insert_with(|| Rib::new(shard_idx));
         let deferring = rt.deferring;
+        let is_new_dest = !rt.destinations.contains_key(&net);
+        let new_dest_id = if is_new_dest {
+            let local_id = rt.id_allocator.alloc();
+            Some((rt.shard_idx << 24) | local_id)
+        } else {
+            None
+        };
         let dst = rt
             .destinations
             .entry(net.clone())
-            .or_insert_with(Destination::new);
+            .or_insert_with(|| Destination::with_id(new_dest_id.unwrap()));
 
         // Capture the current best's (source, attr) Arc pointers before any modification.
         // Comparing them with the post-insertion best detects all best-path changes:
@@ -1247,10 +1323,12 @@ impl Table {
         let replaced_path_id = replaced.as_ref().map(|r| r.path.local_path_id);
 
         let current_paths = Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
+        let dest_id = dst.id;
 
         InsertResult::Changed(NlriChange {
             family,
             net,
+            dest_id,
             best_changed,
             any_changed,
             replaced_path_id,
@@ -1261,7 +1339,11 @@ impl Table {
     /// Set the deferral flag for `family`: best-path changes from `insert()` are
     /// suppressed until `end_deferral()` is called.
     pub fn start_deferral(&mut self, family: Family) {
-        self.ribs.entry(family).or_default().deferring = true;
+        let shard_idx = self.shard_idx;
+        self.ribs
+            .entry(family)
+            .or_insert_with(|| Rib::new(shard_idx))
+            .deferring = true;
     }
 
     /// Clear the deferral flag for `family` and return one NlriChange per
@@ -1309,6 +1391,7 @@ impl Table {
         let Some(dst) = rt.destinations.get_mut(&net) else {
             return (None, None);
         };
+        let dst_id = dst.id;
         // Match by remote_addr + path_id, not by Arc identity.  This correctly
         // removes a stale path from a previous GR session (different Source Arc
         // but same peer) when the peer reconnects and sends a WITHDRAW.
@@ -1352,11 +1435,13 @@ impl Table {
         }
 
         if dst.entry.is_empty() {
+            rt.id_allocator.dealloc(dst_id & 0x00FF_FFFF);
             rt.destinations.remove(&net);
             let change = if was_unfiltered {
                 Some(NlriChange {
                     family,
                     net,
+                    dest_id: dst_id,
                     best_changed: true,
                     any_changed: true,
                     replaced_path_id: None,
@@ -1384,6 +1469,7 @@ impl Table {
             Some(NlriChange {
                 family,
                 net,
+                dest_id: dst_id,
                 best_changed,
                 any_changed,
                 replaced_path_id: None,
@@ -1404,6 +1490,7 @@ impl Table {
             }
         }
         if let Some(rt) = self.ribs.get_mut(&family) {
+            let mut freed_ids = Vec::new();
             rt.destinations.retain(|net, dst| {
                 if !dst.entry.iter().any(|e| e.path.source.remote_addr == addr) {
                     return true;
@@ -1424,6 +1511,9 @@ impl Table {
                 dst.entry.retain(|e| e.path.source.remote_addr != addr);
 
                 if !removed_any_unfiltered {
+                    if dst.entry.is_empty() {
+                        freed_ids.push(dst.id);
+                    }
                     return !dst.entry.is_empty();
                 }
 
@@ -1431,11 +1521,13 @@ impl Table {
                     changes.push(NlriChange {
                         family,
                         net: net.clone(),
+                        dest_id: dst.id,
                         best_changed: true,
                         any_changed: true,
                         replaced_path_id: None,
                         current_paths: Arc::new(vec![]),
                     });
+                    freed_ids.push(dst.id);
                     return false;
                 }
 
@@ -1445,6 +1537,7 @@ impl Table {
                 changes.push(NlriChange {
                     family,
                     net: net.clone(),
+                    dest_id: dst.id,
                     best_changed: old_best_id != new_best_id,
                     any_changed: true,
                     replaced_path_id: None,
@@ -1452,6 +1545,9 @@ impl Table {
                 });
                 true
             });
+            for id in freed_ids {
+                rt.id_allocator.dealloc(id & 0x00FF_FFFF);
+            }
         }
         (changes, removed_nexthops)
     }
@@ -1472,6 +1568,7 @@ impl Table {
         let mut changes = Vec::new();
         let mut removed_nexthops: Vec<IpAddr> = Vec::new();
         if let Some(rt) = self.ribs.get_mut(&family) {
+            let mut freed_ids = Vec::new();
             rt.destinations.retain(|net, dst| {
                 if !dst
                     .entry
@@ -1509,6 +1606,9 @@ impl Table {
                 }
 
                 if !removed_any_unfiltered {
+                    if dst.entry.is_empty() {
+                        freed_ids.push(dst.id);
+                    }
                     return !dst.entry.is_empty();
                 }
 
@@ -1516,11 +1616,13 @@ impl Table {
                     changes.push(NlriChange {
                         family,
                         net: net.clone(),
+                        dest_id: dst.id,
                         best_changed: true,
                         any_changed: true,
                         replaced_path_id: None,
                         current_paths: Arc::new(vec![]),
                     });
+                    freed_ids.push(dst.id);
                     return false;
                 }
 
@@ -1530,6 +1632,7 @@ impl Table {
                 changes.push(NlriChange {
                     family,
                     net: net.clone(),
+                    dest_id: dst.id,
                     best_changed: old_best_id != new_best_id,
                     any_changed: true,
                     replaced_path_id: None,
@@ -1537,6 +1640,9 @@ impl Table {
                 });
                 true
             });
+            for id in freed_ids {
+                rt.id_allocator.dealloc(id & 0x00FF_FFFF);
+            }
         }
         (changes, removed_nexthops)
     }
@@ -1552,6 +1658,7 @@ impl Table {
         let mut changes = Vec::new();
         let mut removed_nexthops: Vec<IpAddr> = Vec::new();
         if let Some(rt) = self.ribs.get_mut(&family) {
+            let mut freed_ids = Vec::new();
             rt.destinations.retain(|net, dst| {
                 if !dst
                     .entry
@@ -1587,6 +1694,9 @@ impl Table {
                 }
 
                 if !removed_any_unfiltered {
+                    if dst.entry.is_empty() {
+                        freed_ids.push(dst.id);
+                    }
                     return !dst.entry.is_empty();
                 }
 
@@ -1594,11 +1704,13 @@ impl Table {
                     changes.push(NlriChange {
                         family,
                         net: net.clone(),
+                        dest_id: dst.id,
                         best_changed: true,
                         any_changed: true,
                         replaced_path_id: None,
                         current_paths: Arc::new(vec![]),
                     });
+                    freed_ids.push(dst.id);
                     return false;
                 }
 
@@ -1608,6 +1720,7 @@ impl Table {
                 changes.push(NlriChange {
                     family,
                     net: net.clone(),
+                    dest_id: dst.id,
                     best_changed: old_best_id != new_best_id,
                     any_changed: true,
                     replaced_path_id: None,
@@ -1615,6 +1728,9 @@ impl Table {
                 });
                 true
             });
+            for id in freed_ids {
+                rt.id_allocator.dealloc(id & 0x00FF_FFFF);
+            }
         }
         (changes, removed_nexthops)
     }
@@ -1664,6 +1780,7 @@ impl Table {
                 changes.push(NlriChange {
                     family: *family,
                     net: net.clone(),
+                    dest_id: dst.id,
                     best_changed,
                     any_changed: true,
                     replaced_path_id: None,
@@ -1710,6 +1827,7 @@ impl Table {
                     changes.push(NlriChange {
                         family,
                         net: net.clone(),
+                        dest_id: dst.id,
                         best_changed,
                         any_changed: any_unfiltered_from_addr,
                         replaced_path_id: None,
@@ -1760,6 +1878,7 @@ impl Table {
                     changes.push(NlriChange {
                         family,
                         net: net.clone(),
+                        dest_id: dst.id,
                         best_changed,
                         any_changed: any_unfiltered_from_addr,
                         replaced_path_id: None,
@@ -1783,6 +1902,7 @@ impl Table {
         let mut changes = Vec::new();
         let mut removed_nexthops: Vec<IpAddr> = Vec::new();
         if let Some(rt) = self.ribs.get_mut(&family) {
+            let mut freed_ids = Vec::new();
             rt.destinations.retain(|net, dst| {
                 if !dst.entry.iter().any(|e| {
                     e.path.source.remote_addr == addr && has_no_llgr_community(&e.path.attr)
@@ -1817,6 +1937,9 @@ impl Table {
                 }
 
                 if !removed_any_unfiltered {
+                    if dst.entry.is_empty() {
+                        freed_ids.push(dst.id);
+                    }
                     return !dst.entry.is_empty();
                 }
 
@@ -1824,11 +1947,13 @@ impl Table {
                     changes.push(NlriChange {
                         family,
                         net: net.clone(),
+                        dest_id: dst.id,
                         best_changed: true,
                         any_changed: true,
                         replaced_path_id: None,
                         current_paths: Arc::new(vec![]),
                     });
+                    freed_ids.push(dst.id);
                     return false;
                 }
 
@@ -1838,6 +1963,7 @@ impl Table {
                 changes.push(NlriChange {
                     family,
                     net: net.clone(),
+                    dest_id: dst.id,
                     best_changed: old_best_id != new_best_id,
                     any_changed: true,
                     replaced_path_id: None,
@@ -1845,14 +1971,20 @@ impl Table {
                 });
                 true
             });
+            for id in freed_ids {
+                rt.id_allocator.dealloc(id & 0x00FF_FFFF);
+            }
         }
         (changes, removed_nexthops)
     }
 
-    pub fn new() -> Self {
+    pub fn new(shard_idx: u32) -> Self {
         Table {
-            ribs: vec![(Family::EMPTY, Rib::default())].into_iter().collect(),
+            ribs: vec![(Family::EMPTY, Rib::new(shard_idx))]
+                .into_iter()
+                .collect(),
             route_stats: FnvHashMap::default(),
+            shard_idx,
         }
     }
 
@@ -2202,7 +2334,7 @@ mod tests {
         let n2 = nlri(2, 0, 0, 0, 24);
         let n3 = nlri(3, 0, 0, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let family = Family::IPV4;
         let attrs = Arc::new(Vec::new());
 
@@ -2290,7 +2422,7 @@ mod tests {
 
     #[test]
     fn insert_single() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let update = rt.insert(
             source(1, 65001, 65000, 1),
             Family::IPV4,
@@ -2310,7 +2442,7 @@ mod tests {
 
     #[test]
     fn insert_same_nlri_no_best_change() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // Insert with router_id=1 (lower, so this is best)
         rt.insert(
@@ -2350,7 +2482,7 @@ mod tests {
 
     #[test]
     fn best_path_local_pref() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         rt.insert(
             source(1, 65001, 65000, 1),
@@ -2389,7 +2521,7 @@ mod tests {
 
     #[test]
     fn best_path_as_path_length() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         rt.insert(
             source(1, 65001, 65000, 1),
@@ -2428,7 +2560,7 @@ mod tests {
 
     #[test]
     fn best_path_origin() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // Insert with ORIGIN=Incomplete(2), router_id=1
         rt.insert(
@@ -2469,7 +2601,7 @@ mod tests {
 
     #[test]
     fn best_path_ebgp_over_ibgp() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // iBGP peer (remote_asn == local_asn), router_id=1 (lower)
         rt.insert(
@@ -2510,7 +2642,7 @@ mod tests {
 
     #[test]
     fn best_path_router_id() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // router_id=10
         rt.insert(
@@ -2558,7 +2690,7 @@ mod tests {
 
     #[test]
     fn best_path_shorter_cluster_list_wins() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // Two hops in CLUSTER_LIST — inserted first
         rt.insert(
@@ -2598,7 +2730,7 @@ mod tests {
 
     #[test]
     fn best_path_no_cluster_list_beats_one_hop() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // One hop in CLUSTER_LIST
         rt.insert(
@@ -2638,7 +2770,7 @@ mod tests {
 
     #[test]
     fn best_path_equal_cluster_list_falls_through_to_originator_id() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // Same CLUSTER_LIST length (1), higher ORIGINATOR_ID
         rt.insert(
@@ -2700,7 +2832,7 @@ mod tests {
 
     #[test]
     fn remove_best_path() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
@@ -2742,7 +2874,7 @@ mod tests {
 
     #[test]
     fn remove_non_best_path() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
@@ -2785,7 +2917,7 @@ mod tests {
 
     #[test]
     fn remove_last_path() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         rt.insert(
@@ -2811,7 +2943,7 @@ mod tests {
 
     #[test]
     fn filtered_path_no_change() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // Only filtered path → no best change, no any_changed
         let update = rt.insert(
@@ -2855,7 +2987,7 @@ mod tests {
     // A2: filtered at head, insert unfiltered behind existing unfiltered best
     #[test]
     fn filtered_head_insert_unfiltered_non_best() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // filtered path at head (router_id=1)
         rt.insert(
@@ -2911,7 +3043,7 @@ mod tests {
     // B1: replace filtered path at index 0 → unfiltered best unchanged
     #[test]
     fn replace_filtered_head_no_best_change() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // filtered at head
@@ -2965,7 +3097,7 @@ mod tests {
     // B2: replace unfiltered best with filtered → best changes to another unfiltered
     #[test]
     fn replace_unfiltered_best_changes() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // filtered at head (router_id=3, won't be best)
@@ -3033,7 +3165,7 @@ mod tests {
     // B2b: replace unfiltered best with worse attrs → another path becomes best
     #[test]
     fn replace_unfiltered_best_with_worse_attrs_changes_best() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
@@ -3095,7 +3227,7 @@ mod tests {
     // B3: replace unfiltered non-best → no best change, but any_changed
     #[test]
     fn replace_unfiltered_non_best_no_change() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // filtered at head
         rt.insert(
@@ -3164,7 +3296,7 @@ mod tests {
 
     #[test]
     fn filtered_path_peer_stats() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         rt.insert(
@@ -3192,7 +3324,7 @@ mod tests {
     fn addpath_peer_stats_counts_prefixes_not_paths() {
         // Add-Path: two paths (path_id=1, path_id=2) for the same prefix from
         // the same peer must count as received=1, not received=2.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let src = source(1, 65001, 65000, 1);
 
@@ -3242,7 +3374,7 @@ mod tests {
     fn addpath_remove_last_path_decrements_received() {
         // Removing the last path for a prefix must decrement received.
         // Removing one of two Add-Path paths must NOT decrement received.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let src = source(1, 65001, 65000, 1);
 
@@ -3298,7 +3430,7 @@ mod tests {
 
     #[test]
     fn best_returns_all_prefixes() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let s1 = source(1, 65001, 65000, 1);
         rt.insert(
             s1.clone(),
@@ -3346,7 +3478,7 @@ mod tests {
 
     #[test]
     fn policy_prefix_reject() {
-        let _rt = Table::new();
+        let _rt = Table::new(0);
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3397,7 +3529,7 @@ mod tests {
 
     #[test]
     fn policy_default_accept() {
-        let _rt = Table::new();
+        let _rt = Table::new(0);
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3449,7 +3581,7 @@ mod tests {
 
     #[test]
     fn policy_nexthop_action_address() {
-        let _rt = Table::new();
+        let _rt = Table::new(0);
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3510,7 +3642,7 @@ mod tests {
 
     #[test]
     fn policy_nexthop_action_self() {
-        let _rt = Table::new();
+        let _rt = Table::new(0);
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3570,7 +3702,7 @@ mod tests {
 
     #[test]
     fn policy_nexthop_no_match_unchanged() {
-        let _rt = Table::new();
+        let _rt = Table::new(0);
         let mut ptable = PolicyTable::new();
 
         ptable
@@ -3665,7 +3797,7 @@ mod tests {
     fn best_path_local_pref_over_router_id() {
         // Regression: previously, a path losing on LOCAL_PREF could still
         // win on router_id due to missing "lose" checks in the comparison loop.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // s1: local_pref=200, router_id=2
         let s1 = source(1, 65001, 65000, 2);
@@ -3707,7 +3839,7 @@ mod tests {
 
     #[test]
     fn replace_unfiltered_to_filtered_withdraws() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // Insert unfiltered path
@@ -3746,7 +3878,7 @@ mod tests {
     #[test]
     fn withdraw_source_is_old_best() {
         // When all paths become filtered, the update should indicate best_changed and new_best=None.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         // s1 is unfiltered best
@@ -3800,7 +3932,7 @@ mod tests {
 
     #[test]
     fn best_skips_filtered_paths() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // filtered path (better router_id)
         rt.insert(
@@ -3838,7 +3970,7 @@ mod tests {
 
     #[test]
     fn best_skips_all_filtered_destination() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         rt.insert(
             source(1, 65001, 65000, 1),
@@ -3860,7 +3992,7 @@ mod tests {
 
     #[test]
     fn remove_best_with_filtered_head() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // Each peer produces its own Arc<Vec<Attribute>> (realistic: separate UPDATE messages).
         // filtered at head
@@ -3916,7 +4048,7 @@ mod tests {
 
     #[test]
     fn remove_last_unfiltered_withdraws() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // filtered path
         rt.insert(
@@ -3957,7 +4089,7 @@ mod tests {
 
     #[test]
     fn drop_best_with_filtered_head() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let attrs = attrs_with_local_pref(100);
         // filtered at head
@@ -4014,7 +4146,7 @@ mod tests {
 
     #[test]
     fn drop_filtered_no_change() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // filtered path from s1
         let s1 = source(1, 65001, 65000, 1);
@@ -4055,7 +4187,7 @@ mod tests {
 
     #[test]
     fn state_counts_filtered_as_not_accepted() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // 1 filtered path
         rt.insert(
@@ -4096,7 +4228,7 @@ mod tests {
     #[test]
     fn stable_id_new_best_no_churn() {
         // Inserting a new best should update best and current_paths correctly.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 10); // router_id=10
         let s2 = source(2, 65002, 65000, 5); // router_id=5, better
@@ -4163,7 +4295,7 @@ mod tests {
     #[test]
     fn stable_id_preserved_on_replacement() {
         // Replacing a path's attributes preserves its stable local_path_id.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
 
@@ -4213,7 +4345,7 @@ mod tests {
     #[test]
     fn stable_id_withdraw_uses_original_id() {
         // When a path is removed, the update indicates best_changed and the new best.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
 
         let s1 = source(1, 65001, 65000, 1); // best (router_id=1)
@@ -4265,7 +4397,7 @@ mod tests {
 
     #[test]
     fn stable_id_best_uses_stored_ids() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
@@ -4317,7 +4449,7 @@ mod tests {
 
     #[test]
     fn stale_routes_still_returned_by_best() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         rt.insert(
@@ -4346,7 +4478,7 @@ mod tests {
         // Simulate GR: existing route is marked stale, then a fresh route arrives
         // from a different peer. The fresh peer has a higher router_id (worse
         // tie-breaker) but must win because non-stale beats stale.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let stale_src = source(1, 65001, 65000, 1); // router_id=1 (better tie-breaker)
         let fresh_src = source(2, 65002, 65000, 2); // router_id=2 (worse tie-breaker)
@@ -4393,7 +4525,7 @@ mod tests {
 
     #[test]
     fn drop_stale_source_removes_routes() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         rt.insert(
@@ -4423,7 +4555,7 @@ mod tests {
     fn drop_stale_removes_only_stale_paths_keeps_fresh() {
         // fresh_src and stale_src have routes for the same prefix.
         // drop_stale should remove the stale route but leave the fresh one.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let stale_src = source(1, 65001, 65000, 1);
         let fresh_src = source(2, 65001, 65000, 2);
@@ -4471,7 +4603,7 @@ mod tests {
     #[test]
     fn drop_stale_removes_route_when_no_fresh_alternative() {
         // Only one source; after mark_stale, drop_stale removes it completely.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         rt.insert(
@@ -4496,7 +4628,7 @@ mod tests {
     #[test]
     fn drop_stale_leaves_fresh_routes_untouched() {
         // Source has fresh (not stale) routes; drop_stale must not remove them.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         rt.insert(
@@ -4524,7 +4656,7 @@ mod tests {
     fn restale_demotes_stale_when_fresh_alternative_exists() {
         // stale source has lower router_id (normally wins), fresh source has higher.
         // After mark_stale + restale(), fresh must be rank=1.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let stale_src = source(1, 65001, 65000, 1); // router_id 1 (better without stale)
         let fresh_src = source(2, 65001, 65000, 2); // router_id 2 (worse without stale)
@@ -4589,7 +4721,7 @@ mod tests {
     /// Source (old session) for the same (peer, path_id) pair.
     #[test]
     fn gr_fresh_path_replaces_stale_on_reconnect() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
 
         // Session 1: insert a path, then mark it stale (simulating TCP drop + GR).
@@ -4667,7 +4799,7 @@ mod tests {
     /// stale path must be removed even though the Source Arc differs.
     #[test]
     fn gr_withdraw_removes_stale_path_from_prior_session() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
 
         // Session 1: insert path, then mark stale.
@@ -4712,7 +4844,7 @@ mod tests {
     /// stale paths with other path_ids survive until drop_stale.
     #[test]
     fn gr_fresh_path_replaces_only_matching_path_id() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
 
         // Session 1: insert two Add-Path paths (id=1 and id=2), then go stale.
@@ -4775,7 +4907,7 @@ mod tests {
     #[test]
     fn restale_no_alternative_keeps_stale_as_best() {
         // Only one source; after mark_stale + restale(), it stays as rank=1.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let src = source(1, 65001, 65000, 1);
 
@@ -4812,7 +4944,7 @@ mod tests {
     #[test]
     fn deferral_suppresses_insert_changes() {
         // While deferring, insert() stores the route but returns no changes.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let src = source(1, 65001, 65000, 1);
 
@@ -4844,7 +4976,7 @@ mod tests {
     #[test]
     fn deferral_does_not_affect_other_families() {
         // Deferring IPv4 must not suppress IPv6 inserts.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net6 = packet::Nlri::V6(packet::bgp::Ipv6Net {
             addr: std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
             mask: 32,
@@ -4878,7 +5010,7 @@ mod tests {
     #[test]
     fn end_deferral_returns_accumulated_routes() {
         // Routes inserted during deferral are returned by end_deferral().
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let n1 = nlri(10, 0, 0, 0, 24);
         let n2 = nlri(10, 0, 1, 0, 24);
         let src = source(1, 65001, 65000, 1);
@@ -4934,7 +5066,7 @@ mod tests {
     #[test]
     fn end_deferral_on_non_deferred_family_is_noop() {
         // end_deferral on a family that was never deferred returns empty.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let changes = rt.end_deferral(Family::IPV4);
         assert!(changes.is_empty());
     }
@@ -4942,7 +5074,7 @@ mod tests {
     #[test]
     fn insert_after_end_deferral_distributes_normally() {
         // After deferral ends, subsequent inserts produce changes as usual.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let src = source(1, 65001, 65000, 1);
 
@@ -4973,7 +5105,7 @@ mod tests {
     #[test]
     fn prefix_limit_blocks_new_prefix_when_exceeded() {
         // A fresh prefix must be rejected when the counter is already at max.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let src = source(1, 65001, 65000, 1);
         let counter = Arc::new(AtomicU64::new(1));
         let max: u32 = 1;
@@ -5007,7 +5139,7 @@ mod tests {
     fn prefix_limit_allows_replacement_when_exceeded() {
         // Replacing an existing path for the same peer/path_id is always
         // allowed even when the counter is at max.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let src = source(1, 65001, 65000, 1);
         let counter = Arc::new(AtomicU64::new(0));
         let max: u32 = 1;
@@ -5054,7 +5186,7 @@ mod tests {
     #[test]
     fn prefix_limit_increments_counter_for_new_prefixes() {
         // Each genuinely new prefix increments the counter.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let src = source(1, 65001, 65000, 1);
         let counter = Arc::new(AtomicU64::new(0));
         let max: u32 = 3;
@@ -5133,7 +5265,7 @@ mod tests {
         let n1 = nlri(10, 0, 0, 0, 24);
         let n2 = nlri(10, 0, 1, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &s1, &n1);
         insert_path(&mut rt, &s2, &n2);
 
@@ -5150,7 +5282,7 @@ mod tests {
         let s2 = source(2, 65002, 65000, 2);
         let n1 = nlri(10, 0, 0, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &s1, &n1);
         insert_path(&mut rt, &s2, &n1);
 
@@ -5192,7 +5324,7 @@ mod tests {
         let n2 = nlri(10, 0, 1, 0, 24);
         let n3 = nlri(10, 0, 2, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &s1, &n1);
         insert_path(&mut rt, &s1, &n2);
         insert_path(&mut rt, &s1, &n3);
@@ -5216,7 +5348,7 @@ mod tests {
         let n1 = nlri(10, 0, 0, 0, 24);
         let n2 = nlri(10, 0, 1, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &s1, &n1);
         insert_path(&mut rt, &s1, &n2);
 
@@ -5237,7 +5369,7 @@ mod tests {
         // outside: 10.1.0.0/24
         let other = nlri(10, 1, 0, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &s1, &super16);
         insert_path(&mut rt, &s1, &sub24a);
         insert_path(&mut rt, &s1, &sub24b);
@@ -5269,7 +5401,7 @@ mod tests {
         let sub24 = nlri(10, 0, 1, 0, 24);
         let other = nlri(10, 1, 0, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &s1, &super16);
         insert_path(&mut rt, &s1, &sub24);
         insert_path(&mut rt, &s1, &other);
@@ -5313,7 +5445,7 @@ mod tests {
         let s1 = source(1, 65001, 65000, 1);
         let n1 = nlri(10, 0, 0, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_filtered_path(&mut rt, &s1, &n1);
 
         // Without enable_filtered the destination has no unfiltered paths and is omitted.
@@ -5329,7 +5461,7 @@ mod tests {
         let n1 = nlri(10, 0, 0, 0, 24);
         let n2 = nlri(10, 0, 1, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &s1, &n1); // unfiltered
         insert_filtered_path(&mut rt, &s1, &n2); // filtered
 
@@ -5356,7 +5488,7 @@ mod tests {
         let post_policy = attrs_with_local_pref(200);
         let original = attrs_with_local_pref(100);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         rt.insert(
             s1.clone(),
             Family::IPV4,
@@ -5394,7 +5526,7 @@ mod tests {
         let n1 = nlri(10, 0, 0, 0, 24);
         let attr = attrs_with_local_pref(100);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         // Pass None for original_attr: the insert() body falls back to Arc::clone(&attr).
         rt.insert(
             s1.clone(),
@@ -5431,7 +5563,7 @@ mod tests {
         let post_policy = attrs_with_local_pref(200);
         let original = attrs_with_local_pref(100);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         rt.insert(
             s1.clone(),
             Family::IPV4,
@@ -5564,7 +5696,7 @@ mod tests {
         let peer2 = rs_source(2, 65002);
         let n1 = nlri(10, 0, 1, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &peer2, &n1);
 
         let peer1_addr = peer1.remote_addr;
@@ -5582,7 +5714,7 @@ mod tests {
         let peer2 = rs_source(2, 65002);
         let n1 = nlri(10, 0, 1, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &peer1, &n1);
         insert_path(&mut rt, &peer2, &n1);
 
@@ -5603,7 +5735,7 @@ mod tests {
         let peer2 = source(2, 65002, 65000, 2); // rs_client=false
         let n1 = nlri(10, 0, 1, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &peer2, &n1);
 
         // RsLocal(peer1) must not include non-RS-client peer2's path.
@@ -5619,7 +5751,7 @@ mod tests {
         let peer1 = rs_source(1, 65001);
         let n1 = nlri(10, 0, 1, 0, 24);
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_path(&mut rt, &peer1, &n1);
 
         let peer1_addr = peer1.remote_addr;
@@ -5638,7 +5770,7 @@ mod tests {
         // Insert peer2's path; original_attr differs from post-import attr.
         let original = attrs_with_local_pref(200);
         let post_import = attrs_with_local_pref(100);
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         rt.insert(
             peer2.clone(),
             Family::IPV4,
@@ -5666,6 +5798,7 @@ mod tests {
         NlriChange {
             family: Family::IPV4,
             net: nlri(10, 0, 0, 0, 24),
+            dest_id: 1,
             best_changed: true,
             any_changed: true,
             replaced_path_id: None,
@@ -5787,7 +5920,7 @@ mod tests {
         let src1 = source(1, 65001, 65000, 1);
         let src2 = source(2, 65002, 65000, 2);
         let net = evpn_type2_nlri(0);
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         // src1 advertises seq=1, src2 advertises seq=5; src2 should win.
         evpn_insert(&mut rt, &src1, &net, attrs_with_mac_mobility(1));
         evpn_insert(&mut rt, &src2, &net, attrs_with_mac_mobility(5));
@@ -5804,7 +5937,7 @@ mod tests {
         let src1 = source(1, 65001, 65000, 1);
         let src2 = source(2, 65002, 65000, 2);
         let net = evpn_type2_nlri(0);
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         // src1 has no MAC Mobility, src2 has seq=1; src2 wins.
         evpn_insert(&mut rt, &src1, &net, empty_attrs());
         evpn_insert(&mut rt, &src2, &net, attrs_with_mac_mobility(1));
@@ -5823,7 +5956,7 @@ mod tests {
         let src1 = source(1, 65000, 65000, 1); // router_id = 0.0.0.1
         let src2 = source(2, 65000, 65000, 2); // router_id = 0.0.0.2
         let net = evpn_type2_nlri(0);
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         evpn_insert(&mut rt, &src1, &net, attrs_with_mac_mobility(3));
         evpn_insert(&mut rt, &src2, &net, attrs_with_mac_mobility(3));
         let dests: Vec<_> = rt
@@ -5841,7 +5974,7 @@ mod tests {
         let src1 = source(1, 65000, 65000, 1);
         let src2 = source(2, 65000, 65000, 2);
         let net = evpn_type2_nlri(0);
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         evpn_insert(&mut rt, &src1, &net, empty_attrs());
         evpn_insert(&mut rt, &src2, &net, empty_attrs());
         let dests: Vec<_> = rt
@@ -5876,7 +6009,7 @@ mod tests {
     fn collect_adj_in_paths_no_family_filter_returns_all_families() {
         let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let s = source(1, 65001, 65000, 1);
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_for_family(&mut rt, &s, Family::IPV4, 1);
         insert_for_family(&mut rt, &s, Family::RTC, 2);
 
@@ -5888,7 +6021,7 @@ mod tests {
     fn collect_adj_in_paths_family_filter_returns_only_matching_family() {
         let peer_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let s = source(1, 65001, 65000, 1);
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_for_family(&mut rt, &s, Family::IPV4, 1);
         insert_for_family(&mut rt, &s, Family::RTC, 2);
 
@@ -5904,7 +6037,7 @@ mod tests {
         let s_stale = source(1, 65001, 65000, 1);
         s_stale.mark_stale();
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_for_family(&mut rt, &s_fresh, Family::RTC, 1);
         insert_for_family(&mut rt, &s_stale, Family::RTC, 2);
 
@@ -5920,7 +6053,7 @@ mod tests {
         let s_stale = source(1, 65001, 65000, 1);
         s_stale.mark_stale();
 
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         insert_for_family(&mut rt, &s_fresh, Family::RTC, 1);
         insert_for_family(&mut rt, &s_stale, Family::RTC, 2);
 
@@ -5975,7 +6108,7 @@ mod tests {
 
     #[test]
     fn restale_llgr_sets_source_flag() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         insert_with_attrs(&mut rt, &s, &net, attrs_with_origin(0));
@@ -5987,7 +6120,7 @@ mod tests {
 
     #[test]
     fn restale_llgr_keeps_routes() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         insert_with_attrs(&mut rt, &s, &net, attrs_with_origin(0));
@@ -5999,7 +6132,7 @@ mod tests {
 
     #[test]
     fn restale_llgr_emits_change_when_best_demoted() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         // s1 has lower router-id so it wins the tiebreak before marking.
         let s1 = source(1, 65001, 65000, 1);
@@ -6020,7 +6153,7 @@ mod tests {
 
     #[test]
     fn drop_no_llgr_removes_no_llgr_routes() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         insert_with_attrs(&mut rt, &s, &net, attrs_with_no_llgr());
@@ -6035,7 +6168,7 @@ mod tests {
 
     #[test]
     fn drop_no_llgr_keeps_normal_routes() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         insert_with_attrs(&mut rt, &s, &net, attrs_with_origin(0));
@@ -6049,7 +6182,7 @@ mod tests {
 
     #[test]
     fn drop_no_llgr_keeps_other_peer_no_llgr_route() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
@@ -6065,7 +6198,7 @@ mod tests {
 
     #[test]
     fn drop_llgr_stale_removes_llgr_stale_routes() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s = source(1, 65001, 65000, 1);
         insert_with_attrs(&mut rt, &s, &net, attrs_with_origin(0));
@@ -6083,7 +6216,7 @@ mod tests {
         // drop_llgr_stale only removes routes from the target addr;
         // routes from other peers (even if they carry LLGR_STALE community)
         // are not touched.
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65002, 65000, 2);
@@ -6101,7 +6234,7 @@ mod tests {
 
     #[test]
     fn drop_llgr_stale_no_routes_is_noop() {
-        let mut rt = Table::new();
+        let mut rt = Table::new(0);
         let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let (changes, nexthops) = rt.drop_llgr_stale(addr, Family::IPV4, None);
         assert!(changes.is_empty());

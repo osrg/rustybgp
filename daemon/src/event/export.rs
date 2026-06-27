@@ -125,10 +125,15 @@ impl BmpAdjOut {
 
 #[derive(Clone)]
 pub(super) struct ExportMap {
-    // family -> nlri -> set of sent path_ids
+    // family -> dest_id -> sent_path_ids
     // Non-Add-Path: inner set is {0} when prefix is advertised
     // Add-Path: inner set contains each local_path_id that was sent
-    advertised: FnvHashMap<Family, FnvHashMap<packet::Nlri, FnvHashSet<u32>>>,
+    //
+    // Using dest_id (u32) as the key instead of Nlri reduces hashing cost
+    // on the hot path (BIRD-style bitmap approach, sequential integer key).
+    // Nlri is not stored here; withdrawals always obtain it from the NlriChange
+    // (update.net), so do_route_refresh does not need to snapshot it.
+    advertised: FnvHashMap<Family, FnvHashMap<u32, FnvHashSet<u32>>>,
 }
 
 impl Default for ExportMap {
@@ -144,53 +149,45 @@ impl ExportMap {
         }
     }
 
-    pub(super) fn mark_sent(&mut self, family: Family, nlri: packet::Nlri, path_id: u32) {
+    pub(super) fn mark_sent(&mut self, family: Family, dest_id: u32, path_id: u32) {
         self.advertised
             .entry(family)
             .or_default()
-            .entry(nlri)
+            .entry(dest_id)
             .or_default()
             .insert(path_id);
     }
 
-    pub(super) fn mark_withdrawn(&mut self, family: Family, nlri: &packet::Nlri, path_id: u32) {
+    pub(super) fn mark_withdrawn(&mut self, family: Family, dest_id: u32, path_id: u32) {
         if let Some(m) = self.advertised.get_mut(&family)
-            && let Some(s) = m.get_mut(nlri)
+            && let Some(entry) = m.get_mut(&dest_id)
         {
-            s.remove(&path_id);
-            if s.is_empty() {
-                m.remove(nlri);
+            entry.remove(&path_id);
+            if entry.is_empty() {
+                m.remove(&dest_id);
             }
         }
     }
 
-    pub(super) fn was_sent(&self, family: Family, nlri: &packet::Nlri) -> bool {
+    pub(super) fn was_sent(&self, family: Family, dest_id: u32) -> bool {
         self.advertised
             .get(&family)
-            .is_some_and(|m| m.contains_key(nlri))
+            .is_some_and(|m| m.contains_key(&dest_id))
     }
 
-    pub(super) fn contains_path(&self, family: Family, nlri: &packet::Nlri, path_id: u32) -> bool {
+    pub(super) fn contains_path(&self, family: Family, dest_id: u32, path_id: u32) -> bool {
         self.advertised
             .get(&family)
-            .and_then(|m| m.get(nlri))
+            .and_then(|m| m.get(&dest_id))
             .is_some_and(|s| s.contains(&path_id))
     }
 
-    pub(super) fn sent_path_ids(&self, family: Family, nlri: &packet::Nlri) -> FnvHashSet<u32> {
+    pub(super) fn sent_path_ids(&self, family: Family, dest_id: u32) -> FnvHashSet<u32> {
         self.advertised
             .get(&family)
-            .and_then(|m| m.get(nlri))
+            .and_then(|m| m.get(&dest_id))
             .cloned()
             .unwrap_or_default()
-    }
-
-    /// Remove and return all previously-sent (nlri → path_id set) entries for `family`.
-    pub(super) fn take_family(
-        &mut self,
-        family: Family,
-    ) -> FnvHashMap<packet::Nlri, FnvHashSet<u32>> {
-        self.advertised.remove(&family).unwrap_or_default()
     }
 }
 
@@ -576,13 +573,13 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                 if let Some(bmp) = bmp {
                     bmp.post(update.family, update.net.clone(), 0, None);
                 }
-                if export_map.was_sent(update.family, &update.net) {
-                    export_map.mark_withdrawn(update.family, &update.net, 0);
+                if export_map.was_sent(update.family, update.dest_id) {
+                    export_map.mark_withdrawn(update.family, update.dest_id, 0);
                     sink.unreach(update.net.clone(), 0);
                 }
             }
             Some((best, attr, nexthop)) => {
-                export_map.mark_sent(update.family, update.net.clone(), 0);
+                export_map.mark_sent(update.family, update.dest_id, 0);
                 let attr = if best.source.is_llgr_stale() {
                     with_llgr_stale_community(&attr)
                 } else {
@@ -654,11 +651,11 @@ pub(super) fn process_nlri_change<S: NlriSink>(
 
         // Withdraw paths that were sent but are no longer in top-N
         // (including paths pushed out by send_max boundary or policy).
-        let sent_ids = export_map.sent_path_ids(update.family, &update.net);
+        let sent_ids = export_map.sent_path_ids(update.family, update.dest_id);
         let current_ids: FnvHashSet<u32> =
             current_top_n.iter().map(|(pid, _, _, _)| *pid).collect();
         for &pid in sent_ids.difference(&current_ids) {
-            export_map.mark_withdrawn(update.family, &update.net, pid);
+            export_map.mark_withdrawn(update.family, update.dest_id, pid);
             if let Some(bmp) = bmp {
                 bmp.post(update.family, update.net.clone(), pid, None);
             }
@@ -667,10 +664,10 @@ pub(super) fn process_nlri_change<S: NlriSink>(
 
         // Advertise paths that are new or whose attributes were replaced.
         for (pid, attr, nexthop, source) in &current_top_n {
-            let already_sent = export_map.contains_path(update.family, &update.net, *pid);
+            let already_sent = export_map.contains_path(update.family, update.dest_id, *pid);
             let was_replaced = update.replaced_path_id == Some(*pid);
             if !already_sent || was_replaced {
-                export_map.mark_sent(update.family, update.net.clone(), *pid);
+                export_map.mark_sent(update.family, update.dest_id, *pid);
                 let attr = export_ctx.export_attrs(attr);
                 let nexthop = export_ctx.export_nexthop(*nexthop, update.family);
                 if let Some(bmp) = bmp {

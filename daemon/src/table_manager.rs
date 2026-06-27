@@ -145,9 +145,9 @@ impl TableManager {
         let vrfs: SharedVrfs = Arc::new(ArcSwap::new(Arc::new(FnvHashMap::default())));
         TableManager {
             shards: (0..num_shards)
-                .map(|_| {
+                .map(|i| {
                     Mutex::new(TableShard {
-                        rtable: table::Table::new(),
+                        rtable: table::Table::new(i as u32),
                         peer_event_tx: FnvHashMap::default(),
                         addpath: FnvHashMap::default(),
                         vrfs: Arc::clone(&vrfs),

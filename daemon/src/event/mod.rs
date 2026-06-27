@@ -2542,11 +2542,16 @@ impl PeerSession {
             .tables
             .collect_loc_rib_paths_limited(family, effective_max);
         let rpki = self.tables.rpki.read().unwrap();
-        // Snapshot and clear the export_map before re-walking the RIB; without
-        // this we have no record of what was sent under the old filter and cannot
-        // generate explicit withdrawals for routes that the new filter rejects.
-        let old_sent = self.export_map.take_family(family);
-        for change in changes {
+        // Re-walk the RIB under the current export policy.
+        //
+        // process_nlri_change handles withdrawals implicitly: if a route was
+        // previously sent (was_sent=true) but is now rejected by the updated
+        // policy, it generates a WITHDRAW using update.net.  Routes that were
+        // removed from the RIB since the last refresh are not returned by
+        // collect_loc_rib_paths_limited; their ExportMap entries remain intact
+        // (was_sent=true) so the pending NlriChange withdrawal queued when the
+        // route was deleted will still trigger a WITHDRAW when processed.
+        for change in &changes {
             if let (Some(filter), Some(best)) = (&rtc_filter, change.new_best())
                 && !filter.allows(&best.attr)
             {
@@ -2556,7 +2561,7 @@ impl PeerSession {
                 continue;
             };
             process_nlri_change(
-                &change,
+                change,
                 effective_max,
                 self.remote_addr,
                 &mut self.export_map,
@@ -2567,15 +2572,6 @@ impl PeerSession {
                 Some(&rpki),
                 None,
             );
-        }
-        for (nlri, path_ids) in old_sent {
-            if !self.export_map.was_sent(family, &nlri)
-                && let Some(pending) = self.pending.get_mut(&family)
-            {
-                for path_id in path_ids {
-                    pending.unreach(nlri.clone(), path_id);
-                }
-            }
         }
         self.pending.get_mut(&family).unwrap().schedule_eor();
     }
@@ -5100,6 +5096,7 @@ mod tests {
         table::NlriChange {
             family: Family::IPV4,
             net: nlri.clone(),
+            dest_id: 1,
             best_changed: true,
             any_changed: true,
             replaced_path_id: None,
@@ -5111,6 +5108,7 @@ mod tests {
         table::NlriChange {
             family: Family::IPV4,
             net: nlri.clone(),
+            dest_id: 1,
             best_changed: true,
             any_changed: true,
             replaced_path_id: None,
@@ -5131,6 +5129,7 @@ mod tests {
         table::NlriChange {
             family: Family::IPV4,
             net: nlri.clone(),
+            dest_id: 1,
             best_changed: false,
             any_changed: false,
             replaced_path_id: None,
@@ -5152,9 +5151,9 @@ mod tests {
 
         conn.handle_prefix_update(Arc::new(update));
 
-        // path_id=0 stored in export_map for non-Add-Path
-        assert!(conn.export_map.was_sent(Family::IPV4, &nlri));
-        assert!(conn.export_map.contains_path(Family::IPV4, &nlri, 0));
+        // path_id=0 stored in export_map for non-Add-Path (dest_id=1 from make_prefix_update_reach)
+        assert!(conn.export_map.was_sent(Family::IPV4, 1));
+        assert!(conn.export_map.contains_path(Family::IPV4, 1, 0));
         assert!(!conn.pending[&Family::IPV4].is_empty());
     }
 
@@ -5172,7 +5171,7 @@ mod tests {
 
         conn.handle_prefix_update(Arc::new(update));
 
-        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(!conn.export_map.was_sent(Family::IPV4, 1));
         assert!(conn.pending[&Family::IPV4].is_empty());
     }
 
@@ -5187,13 +5186,13 @@ mod tests {
         setup_ipv4_session(&mut conn);
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
 
-        // Pre-mark as sent so the withdraw fires.
-        conn.export_map.mark_sent(Family::IPV4, nlri.clone(), 0);
+        // Pre-mark as sent so the withdraw fires (dest_id=1 matches make_prefix_update_withdraw).
+        conn.export_map.mark_sent(Family::IPV4, 1, 0);
 
         let update = make_prefix_update_withdraw(&nlri);
         conn.handle_prefix_update(Arc::new(update));
 
-        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(!conn.export_map.was_sent(Family::IPV4, 1));
         assert!(!conn.pending[&Family::IPV4].is_empty());
     }
 
@@ -5212,7 +5211,7 @@ mod tests {
         let update = make_prefix_update_withdraw(&nlri);
         conn.handle_prefix_update(Arc::new(update));
 
-        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(!conn.export_map.was_sent(Family::IPV4, 1));
         assert!(conn.pending[&Family::IPV4].is_empty());
     }
 
@@ -5235,7 +5234,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn do_route_refresh_withdraws_route_absent_from_rib() {
+    async fn do_route_refresh_preserves_was_sent_for_route_absent_from_rib() {
+        // A route that was previously advertised but has since been removed from
+        // the RIB is not returned by collect_loc_rib_paths_limited, so
+        // process_nlri_change is never called for it during route_refresh.
+        // Its ExportMap entry must remain intact (was_sent=true) so that the
+        // pending NlriChange withdrawal queued when the route was deleted will
+        // still generate a WITHDRAW when it is processed.
         let global = make_global();
         let tables = make_tables();
         let (client, server) = loopback_pair().await;
@@ -5244,15 +5249,17 @@ mod tests {
         let mut conn = established_connection(&global, &tables, remote_addr, server).await;
         setup_ipv4_session(&mut conn);
 
-        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
-        // Simulate a route previously sent to this peer with no corresponding RIB entry.
-        conn.export_map.mark_sent(Family::IPV4, nlri.clone(), 0);
+        // Simulate a route previously sent with a dest_id that has no RIB entry.
+        // Any dest_id value works here since there is no real route in the table;
+        // use u32::MAX to avoid colliding with real allocations (which start at 0).
+        let phantom_dest_id: u32 = u32::MAX;
+        conn.export_map.mark_sent(Family::IPV4, phantom_dest_id, 0);
 
         conn.do_route_refresh(Family::IPV4).await;
 
-        // The route must be withdrawn because it is absent from the loc-RIB.
-        assert!(!conn.export_map.was_sent(Family::IPV4, &nlri));
-        assert!(!conn.pending[&Family::IPV4].is_empty());
+        // was_sent must still be true: the pending NlriChange withdrawal is
+        // responsible for generating the WITHDRAW, not do_route_refresh itself.
+        assert!(conn.export_map.was_sent(Family::IPV4, phantom_dest_id));
     }
 
     #[tokio::test]
@@ -5267,14 +5274,88 @@ mod tests {
 
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         insert_ipv4_route(&tables, &nlri);
-        // Simulate the route having been sent in a previous advertisement.
-        conn.export_map.mark_sent(Family::IPV4, nlri.clone(), 0);
+        // Get the real dest_id assigned by the RIB to pre-populate export_map correctly.
+        let dest_id = tables
+            .collect_loc_rib_paths_limited(Family::IPV4, 1)
+            .into_iter()
+            .next()
+            .expect("route must exist in RIB after insert")
+            .dest_id;
+        conn.export_map.mark_sent(Family::IPV4, dest_id, 0);
 
         conn.do_route_refresh(Family::IPV4).await;
 
         // The route is still in the RIB: it must be re-advertised, not withdrawn.
-        assert!(conn.export_map.was_sent(Family::IPV4, &nlri));
+        assert!(conn.export_map.was_sent(Family::IPV4, dest_id));
         assert!(!conn.pending[&Family::IPV4].is_empty());
+    }
+
+    fn reject_all_policy() -> Arc<table::PolicyAssignment> {
+        Arc::new(table::PolicyAssignment {
+            name: Arc::from("reject-all"),
+            disposition: table::Disposition::Reject,
+            policies: vec![],
+            needs_rpki: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn do_route_refresh_withdraws_filtered_route() {
+        // A route that was previously sent but is now rejected by an updated
+        // export policy must receive a WITHDRAW during do_route_refresh.
+        // process_nlri_change sees was_sent=true and no valid path after policy
+        // filter, so it calls sink.unreach() using update.net as the Nlri.
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        setup_ipv4_session(&mut conn);
+
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        insert_ipv4_route(&tables, &nlri);
+        let dest_id = tables
+            .collect_loc_rib_paths_limited(Family::IPV4, 1)
+            .into_iter()
+            .next()
+            .expect("route must exist in RIB after insert")
+            .dest_id;
+        conn.export_map.mark_sent(Family::IPV4, dest_id, 0);
+
+        // Simulate a policy change that now rejects all routes.
+        tables.export_policy.store(Some(reject_all_policy()));
+
+        conn.do_route_refresh(Family::IPV4).await;
+
+        // Route was previously sent but is now filtered: must be withdrawn.
+        assert!(!conn.export_map.was_sent(Family::IPV4, dest_id));
+        assert!(!conn.pending[&Family::IPV4].is_empty());
+    }
+
+    #[tokio::test]
+    async fn do_route_refresh_ignores_never_sent_filtered_route() {
+        // A route in the RIB that was never sent (always filtered) must not
+        // generate a WITHDRAW during do_route_refresh even when a reject policy
+        // is active: process_nlri_change sees was_sent=false and takes no action.
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+        setup_ipv4_session(&mut conn);
+
+        let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
+        insert_ipv4_route(&tables, &nlri);
+        // Do NOT call mark_sent: the route was always filtered, never advertised.
+
+        tables.export_policy.store(Some(reject_all_policy()));
+
+        conn.do_route_refresh(Family::IPV4).await;
+
+        // Nothing was sent before, so nothing to withdraw.
+        assert!(conn.pending[&Family::IPV4].is_empty());
     }
 
     /// `apply_outputs` with `SessionDown(reason, Some(notif))` returns `Step::Terminate`
@@ -5517,26 +5598,26 @@ mod tests {
     fn export_map_mark_and_check() {
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let mut m = ExportMap::new();
-        assert!(!m.was_sent(Family::IPV4, &nlri));
-        m.mark_sent(Family::IPV4, nlri.clone(), 0);
-        assert!(m.was_sent(Family::IPV4, &nlri));
+        assert!(!m.was_sent(Family::IPV4, 1));
+        m.mark_sent(Family::IPV4, 1, 0);
+        assert!(m.was_sent(Family::IPV4, 1));
     }
 
     #[test]
     fn export_map_never_sent_returns_false() {
-        let nlri: packet::Nlri = "192.168.1.0/24".parse().unwrap();
+        let _nlri: packet::Nlri = "192.168.1.0/24".parse().unwrap();
         let m = ExportMap::new();
-        assert!(!m.was_sent(Family::IPV4, &nlri));
+        assert!(!m.was_sent(Family::IPV4, 1));
     }
 
     #[test]
     fn export_map_mark_withdrawn_clears() {
         let nlri: packet::Nlri = "10.1.0.0/16".parse().unwrap();
         let mut m = ExportMap::new();
-        m.mark_sent(Family::IPV4, nlri.clone(), 0);
-        assert!(m.was_sent(Family::IPV4, &nlri));
-        m.mark_withdrawn(Family::IPV4, &nlri, 0);
-        assert!(!m.was_sent(Family::IPV4, &nlri));
+        m.mark_sent(Family::IPV4, 1, 0);
+        assert!(m.was_sent(Family::IPV4, 1));
+        m.mark_withdrawn(Family::IPV4, 1, 0);
+        assert!(!m.was_sent(Family::IPV4, 1));
     }
 
     #[test]
@@ -5544,12 +5625,12 @@ mod tests {
         let v4: packet::Nlri = "10.0.0.0/8".parse().unwrap();
         let v6: packet::Nlri = "2001:db8::/32".parse().unwrap();
         let mut m = ExportMap::new();
-        m.mark_sent(Family::IPV4, v4.clone(), 0);
-        assert!(m.was_sent(Family::IPV4, &v4));
-        assert!(!m.was_sent(Family::IPV6, &v4));
-        m.mark_sent(Family::IPV6, v6.clone(), 0);
-        assert!(m.was_sent(Family::IPV6, &v6));
-        assert!(!m.was_sent(Family::IPV4, &v6));
+        m.mark_sent(Family::IPV4, 1, 0);
+        assert!(m.was_sent(Family::IPV4, 1));
+        assert!(!m.was_sent(Family::IPV6, 1));
+        m.mark_sent(Family::IPV6, 2, 0);
+        assert!(m.was_sent(Family::IPV6, 2));
+        assert!(!m.was_sent(Family::IPV4, 2));
     }
 
     fn make_context() -> Arc<std::sync::Mutex<PeerContext>> {
@@ -6380,6 +6461,7 @@ mod tests {
             table::NlriChange {
                 family: Family::IPV4,
                 net: nlri.clone(),
+                dest_id: 1,
                 best_changed,
                 any_changed,
                 replaced_path_id,
@@ -6439,7 +6521,7 @@ mod tests {
             );
 
             assert!(pending.is_empty());
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
         }
 
         #[test]
@@ -6463,8 +6545,8 @@ mod tests {
                 None,
             );
 
-            assert!(em.was_sent(Family::IPV4, &net));
-            assert!(em.contains_path(Family::IPV4, &net, 0)); // non-addpath uses path_id=0
+            assert!(em.was_sent(Family::IPV4, 1));
+            assert!(em.contains_path(Family::IPV4, 1, 0)); // non-addpath uses path_id=0
             let msgs = pending.drain_messages(Family::IPV4);
             let reach = reach_entries(&msgs);
             assert_eq!(reach.len(), 1);
@@ -6475,7 +6557,7 @@ mod tests {
         #[test]
         fn withdraw_when_best_gone_and_was_sent() {
             let mut em = ExportMap::new();
-            em.mark_sent(Family::IPV4, nlri("10.0.0.0/24"), 0);
+            em.mark_sent(Family::IPV4, 1, 0);
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let update = change(&net, true, true, None, vec![]);
@@ -6493,7 +6575,7 @@ mod tests {
                 None,
             );
 
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
             let msgs = pending.drain_messages(Family::IPV4);
             let unreach = unreach_entries(&msgs);
             assert_eq!(unreach.len(), 1);
@@ -6521,7 +6603,7 @@ mod tests {
             );
 
             assert!(pending.is_empty());
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
         }
 
         #[test]
@@ -6547,7 +6629,7 @@ mod tests {
             );
 
             assert!(pending.is_empty());
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
         }
 
         #[test]
@@ -6571,7 +6653,7 @@ mod tests {
                 None,
                 None,
             );
-            assert!(em.was_sent(Family::IPV4, &net));
+            assert!(em.was_sent(Family::IPV4, 1));
             pending.drain_messages(Family::IPV4); // flush
 
             // 2. Withdraw
@@ -6587,7 +6669,7 @@ mod tests {
                 None,
                 None,
             );
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
             let msgs = pending.drain_messages(Family::IPV4);
             assert_eq!(unreach_entries(&msgs).len(), 1);
         }
@@ -6640,8 +6722,8 @@ mod tests {
                 None,
             );
 
-            assert!(em.contains_path(Family::IPV4, &net, 1));
-            assert!(em.contains_path(Family::IPV4, &net, 2));
+            assert!(em.contains_path(Family::IPV4, 1, 1));
+            assert!(em.contains_path(Family::IPV4, 1, 2));
             let msgs = pending.drain_messages(Family::IPV4);
             let reach = reach_entries(&msgs);
             let pids: std::collections::HashSet<u32> = reach.iter().map(|e| e.1).collect();
@@ -6654,8 +6736,8 @@ mod tests {
         fn path_removed_sends_withdraw() {
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
-            em.mark_sent(Family::IPV4, net.clone(), 1);
-            em.mark_sent(Family::IPV4, net.clone(), 2);
+            em.mark_sent(Family::IPV4, 1, 1);
+            em.mark_sent(Family::IPV4, 1, 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let src = source(PEER);
             // path_id=2 is removed; only path_id=1 remains
@@ -6674,8 +6756,8 @@ mod tests {
                 None,
             );
 
-            assert!(em.contains_path(Family::IPV4, &net, 1));
-            assert!(!em.contains_path(Family::IPV4, &net, 2));
+            assert!(em.contains_path(Family::IPV4, 1, 1));
+            assert!(!em.contains_path(Family::IPV4, 1, 2));
             let msgs = pending.drain_messages(Family::IPV4);
             let unreach = unreach_entries(&msgs);
             assert_eq!(unreach.len(), 1);
@@ -6686,8 +6768,8 @@ mod tests {
         fn replaced_path_readvertised() {
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
-            em.mark_sent(Family::IPV4, net.clone(), 1);
-            em.mark_sent(Family::IPV4, net.clone(), 2);
+            em.mark_sent(Family::IPV4, 1, 1);
+            em.mark_sent(Family::IPV4, 1, 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let src = source(PEER);
             // path_id=1 was replaced (new attributes); path_id=2 unchanged
@@ -6722,8 +6804,8 @@ mod tests {
             // top-2 = [pid=3, pid=1]; pid=2 pushed out → WITHDRAW pid=2, UPDATE pid=3
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
-            em.mark_sent(Family::IPV4, net.clone(), 1);
-            em.mark_sent(Family::IPV4, net.clone(), 2);
+            em.mark_sent(Family::IPV4, 1, 1);
+            em.mark_sent(Family::IPV4, 1, 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let src = source(PEER);
             let paths = vec![path(3, src.clone()), path(1, src.clone()), path(2, src)];
@@ -6742,9 +6824,9 @@ mod tests {
                 None,
             );
 
-            assert!(em.contains_path(Family::IPV4, &net, 3));
-            assert!(em.contains_path(Family::IPV4, &net, 1));
-            assert!(!em.contains_path(Family::IPV4, &net, 2)); // pushed out
+            assert!(em.contains_path(Family::IPV4, 1, 3));
+            assert!(em.contains_path(Family::IPV4, 1, 1));
+            assert!(!em.contains_path(Family::IPV4, 1, 2)); // pushed out
             let msgs = pending.drain_messages(Family::IPV4);
             let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
             let unreach_pids: Vec<u32> = unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
@@ -6761,8 +6843,8 @@ mod tests {
             // top-2 = [pid=2, pid=3]: WITHDRAW pid=1, UPDATE pid=3 (enters window)
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
-            em.mark_sent(Family::IPV4, net.clone(), 1);
-            em.mark_sent(Family::IPV4, net.clone(), 2);
+            em.mark_sent(Family::IPV4, 1, 1);
+            em.mark_sent(Family::IPV4, 1, 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let src = source(PEER);
             // pid=1 was removed; remaining: pid=2, pid=3
@@ -6782,9 +6864,9 @@ mod tests {
                 None,
             );
 
-            assert!(!em.contains_path(Family::IPV4, &net, 1)); // withdrawn
-            assert!(em.contains_path(Family::IPV4, &net, 2)); // kept
-            assert!(em.contains_path(Family::IPV4, &net, 3)); // entered window
+            assert!(!em.contains_path(Family::IPV4, 1, 1)); // withdrawn
+            assert!(em.contains_path(Family::IPV4, 1, 2)); // kept
+            assert!(em.contains_path(Family::IPV4, 1, 3)); // entered window
             let msgs = pending.drain_messages(Family::IPV4);
             let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
             let unreach_pids: Vec<u32> = unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
@@ -6797,8 +6879,8 @@ mod tests {
         fn all_paths_removed_withdraws_all() {
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
-            em.mark_sent(Family::IPV4, net.clone(), 1);
-            em.mark_sent(Family::IPV4, net.clone(), 2);
+            em.mark_sent(Family::IPV4, 1, 1);
+            em.mark_sent(Family::IPV4, 1, 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let update = change(&net, true, true, None, vec![]);
 
@@ -6815,7 +6897,7 @@ mod tests {
                 None,
             );
 
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
             let msgs = pending.drain_messages(Family::IPV4);
             let unreach_pids: std::collections::HashSet<u32> =
                 unreach_entries(&msgs).into_iter().map(|e| e.1).collect();
@@ -6847,7 +6929,7 @@ mod tests {
             );
 
             assert!(pending.is_empty());
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
         }
 
         #[test]
@@ -6879,9 +6961,9 @@ mod tests {
                 None,
             );
 
-            assert!(em.contains_path(Family::IPV4, &net, 1));
-            assert!(!em.contains_path(Family::IPV4, &net, 2)); // self path not sent
-            assert!(em.contains_path(Family::IPV4, &net, 3));
+            assert!(em.contains_path(Family::IPV4, 1, 1));
+            assert!(!em.contains_path(Family::IPV4, 1, 2)); // self path not sent
+            assert!(em.contains_path(Family::IPV4, 1, 3));
             let msgs = pending.drain_messages(Family::IPV4);
             let reach_pids: Vec<u32> = reach_entries(&msgs).into_iter().map(|e| e.1).collect();
             assert_eq!(reach_pids.len(), 2);
@@ -6936,7 +7018,7 @@ mod tests {
 
             // Split horizon: iBGP-learned route must not be forwarded to iBGP peer
             assert!(pending.is_empty());
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
         }
 
         #[test]
@@ -6944,7 +7026,7 @@ mod tests {
             let mut em = ExportMap::new();
             let net = nlri("10.0.0.0/24");
             // Previously sent an eBGP-learned best
-            em.mark_sent(Family::IPV4, net.clone(), 0);
+            em.mark_sent(Family::IPV4, 1, 0);
             let mut pending = crate::peer_tx::PendingTx::new(false);
             // New best is iBGP-learned
             let path = path(1, ibgp_source(PEER));
@@ -6964,7 +7046,7 @@ mod tests {
             );
 
             // Must send a withdrawal for the previously-sent route
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
             let msgs = pending.drain_messages(Family::IPV4);
             assert_eq!(unreach_entries(&msgs).len(), 1);
         }
@@ -6992,7 +7074,7 @@ mod tests {
             );
 
             // eBGP-learned route CAN be forwarded to iBGP peer
-            assert!(em.was_sent(Family::IPV4, &net));
+            assert!(em.was_sent(Family::IPV4, 1));
             let msgs = pending.drain_messages(Family::IPV4);
             assert_eq!(reach_entries(&msgs).len(), 1);
         }
@@ -7022,8 +7104,8 @@ mod tests {
             );
 
             // Only the eBGP-learned path (pid=2) should be advertised
-            assert!(!em.contains_path(Family::IPV4, &net, 1));
-            assert!(em.contains_path(Family::IPV4, &net, 2));
+            assert!(!em.contains_path(Family::IPV4, 1, 1));
+            assert!(em.contains_path(Family::IPV4, 1, 2));
             let msgs = pending.drain_messages(Family::IPV4);
             let reach = reach_entries(&msgs);
             assert_eq!(reach.len(), 1);
@@ -7506,7 +7588,7 @@ mod tests {
             );
 
             assert!(pending.is_empty());
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
         }
 
         // rr-client source -> non-client dest: forwarded in RR mode
@@ -7531,7 +7613,7 @@ mod tests {
                 None,
             );
 
-            assert!(em.was_sent(Family::IPV4, &net));
+            assert!(em.was_sent(Family::IPV4, 1));
             assert_eq!(
                 reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 1
@@ -7560,7 +7642,7 @@ mod tests {
                 None,
             );
 
-            assert!(em.was_sent(Family::IPV4, &net));
+            assert!(em.was_sent(Family::IPV4, 1));
             assert_eq!(
                 reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 1
@@ -7809,7 +7891,7 @@ mod tests {
                 None,
             );
 
-            assert!(em.was_sent(Family::IPV4, &net));
+            assert!(em.was_sent(Family::IPV4, 1));
             assert_eq!(
                 reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 1
@@ -7862,7 +7944,7 @@ mod tests {
                 None,
             );
 
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
             assert_eq!(
                 reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 0
@@ -7891,7 +7973,7 @@ mod tests {
                 None,
             );
 
-            assert!(!em.was_sent(Family::IPV4, &net));
+            assert!(!em.was_sent(Family::IPV4, 1));
             assert_eq!(
                 reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 0
@@ -7920,7 +8002,7 @@ mod tests {
                 None,
             );
 
-            assert!(em.was_sent(Family::IPV4, &net));
+            assert!(em.was_sent(Family::IPV4, 1));
             assert_eq!(
                 reach_entries(&pending.drain_messages(Family::IPV4)).len(),
                 1
@@ -8206,7 +8288,7 @@ mod tests {
     fn make_disconnect_info(negotiated_gr: Option<NegotiatedGr>) -> DisconnectInfo {
         let nlri: packet::Nlri = "10.0.0.0/24".parse().unwrap();
         let mut em = ExportMap::new();
-        em.mark_sent(Family::IPV4, nlri, 0);
+        em.mark_sent(Family::IPV4, 1, 0);
         DisconnectInfo {
             role: crate::fsm::Role::Active,
             remote_addr: "10.0.0.1".parse().unwrap(),
