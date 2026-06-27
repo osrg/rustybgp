@@ -2175,7 +2175,7 @@ impl GoBgpService for GrpcService {
                     let changes = self.tables.collect_loc_rib_paths(family);
                     let rpki = self.tables.rpki.read().unwrap();
                     let mut sink = AdjOutSink::default();
-                    let mut export_map = ExportMap::new();
+                    let mut export_map = ExportMap::default();
                     for change in changes {
                         process_nlri_change(
                             &change,

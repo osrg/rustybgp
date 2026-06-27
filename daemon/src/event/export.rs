@@ -123,71 +123,111 @@ impl BmpAdjOut {
     }
 }
 
+/// Per-family inner map.  Two variants to avoid per-dest HashSet allocations
+/// in the common non-Add-Path case.
+#[derive(Clone)]
+enum FamilyMap {
+    /// Non-Add-Path: set of dest_ids that have been sent (path_id is always 0).
+    Plain(FnvHashSet<u32>),
+    /// Add-Path: dest_id -> set of path_ids that have been sent.
+    AddPath(FnvHashMap<u32, FnvHashSet<u32>>),
+}
+
 #[derive(Clone)]
 pub(super) struct ExportMap {
-    // family -> dest_id -> sent_path_ids
-    // Non-Add-Path: inner set is {0} when prefix is advertised
-    // Add-Path: inner set contains each local_path_id that was sent
+    // family -> FamilyMap
     //
-    // Using dest_id (u32) as the key instead of Nlri reduces hashing cost
-    // on the hot path (BIRD-style bitmap approach, sequential integer key).
-    // Nlri is not stored here; withdrawals always obtain it from the NlriChange
-    // (update.net), so do_route_refresh does not need to snapshot it.
-    advertised: FnvHashMap<Family, FnvHashMap<u32, FnvHashSet<u32>>>,
+    // Using dest_id (u32) as the key instead of Nlri reduces hashing cost on
+    // the hot path.  Nlri is not stored here; withdrawals always obtain it from
+    // NlriChange (update.net), so do_route_refresh does not need to snapshot it.
+    advertised: FnvHashMap<Family, FamilyMap>,
 }
 
 impl Default for ExportMap {
     fn default() -> Self {
-        Self::new()
+        Self::new([])
     }
 }
 
 impl ExportMap {
-    pub(super) fn new() -> Self {
-        ExportMap {
-            advertised: FnvHashMap::default(),
-        }
+    /// Create an ExportMap with the given families pre-configured for Add-Path.
+    ///
+    /// Families in `addpath_families` start in `AddPath` mode; all others start
+    /// in `Plain` mode and are initialized lazily on first `mark_sent`.
+    /// Called from `on_established()` once per session with the set of families
+    /// whose `effective_max > 1`.
+    pub(super) fn new(addpath_families: impl IntoIterator<Item = Family>) -> Self {
+        let advertised = addpath_families
+            .into_iter()
+            .map(|f| (f, FamilyMap::AddPath(FnvHashMap::default())))
+            .collect();
+        ExportMap { advertised }
     }
 
     pub(super) fn mark_sent(&mut self, family: Family, dest_id: u32, path_id: u32) {
-        self.advertised
+        match self
+            .advertised
             .entry(family)
-            .or_default()
-            .entry(dest_id)
-            .or_default()
-            .insert(path_id);
-    }
-
-    pub(super) fn mark_withdrawn(&mut self, family: Family, dest_id: u32, path_id: u32) {
-        if let Some(m) = self.advertised.get_mut(&family)
-            && let Some(entry) = m.get_mut(&dest_id)
+            .or_insert_with(|| FamilyMap::Plain(FnvHashSet::default()))
         {
-            entry.remove(&path_id);
-            if entry.is_empty() {
-                m.remove(&dest_id);
+            FamilyMap::Plain(s) => {
+                s.insert(dest_id);
+            }
+            FamilyMap::AddPath(m) => {
+                m.entry(dest_id).or_default().insert(path_id);
             }
         }
     }
 
+    pub(super) fn mark_withdrawn(&mut self, family: Family, dest_id: u32, path_id: u32) {
+        match self.advertised.get_mut(&family) {
+            Some(FamilyMap::Plain(s)) => {
+                s.remove(&dest_id);
+            }
+            Some(FamilyMap::AddPath(m)) => {
+                if let Some(ids) = m.get_mut(&dest_id) {
+                    ids.remove(&path_id);
+                    if ids.is_empty() {
+                        m.remove(&dest_id);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
     pub(super) fn was_sent(&self, family: Family, dest_id: u32) -> bool {
-        self.advertised
-            .get(&family)
-            .is_some_and(|m| m.contains_key(&dest_id))
+        match self.advertised.get(&family) {
+            Some(FamilyMap::Plain(s)) => s.contains(&dest_id),
+            Some(FamilyMap::AddPath(m)) => m.contains_key(&dest_id),
+            None => false,
+        }
     }
 
     pub(super) fn contains_path(&self, family: Family, dest_id: u32, path_id: u32) -> bool {
-        self.advertised
-            .get(&family)
-            .and_then(|m| m.get(&dest_id))
-            .is_some_and(|s| s.contains(&path_id))
+        match self.advertised.get(&family) {
+            Some(FamilyMap::Plain(s)) => s.contains(&dest_id),
+            Some(FamilyMap::AddPath(m)) => {
+                m.get(&dest_id).is_some_and(|ids| ids.contains(&path_id))
+            }
+            None => false,
+        }
     }
 
     pub(super) fn sent_path_ids(&self, family: Family, dest_id: u32) -> FnvHashSet<u32> {
-        self.advertised
-            .get(&family)
-            .and_then(|m| m.get(&dest_id))
-            .cloned()
-            .unwrap_or_default()
+        match self.advertised.get(&family) {
+            Some(FamilyMap::Plain(s)) => {
+                if s.contains(&dest_id) {
+                    let mut ids = FnvHashSet::default();
+                    ids.insert(0u32);
+                    ids
+                } else {
+                    FnvHashSet::default()
+                }
+            }
+            Some(FamilyMap::AddPath(m)) => m.get(&dest_id).cloned().unwrap_or_default(),
+            None => FnvHashSet::default(),
+        }
     }
 }
 

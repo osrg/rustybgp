@@ -2185,7 +2185,7 @@ impl PeerSession {
             source: FnvHashMap::default(),
             peer_event_rx: None,
             tables: res.tables,
-            export_map: ExportMap::new(),
+            export_map: ExportMap::default(),
             prefix_counters,
             negotiated_gr: None,
             negotiated_llgr: None,
@@ -2261,7 +2261,7 @@ impl PeerSession {
             source: FnvHashMap::default(),
             peer_event_rx: None,
             tables,
-            export_map: ExportMap::new(),
+            export_map: ExportMap::default(),
             prefix_counters: FnvHashMap::default(),
             negotiated_gr: None,
             negotiated_llgr: None,
@@ -2419,6 +2419,14 @@ impl PeerSession {
             .iter()
             .map(|f| (*f, self.effective_max(*f)))
             .collect();
+        // Rebuild ExportMap with Add-Path families pre-configured.  effective_max
+        // is fixed for the session lifetime; constructing once here is cleaner
+        // than upgrading lazily inside process_nlri_change.
+        self.export_map = ExportMap::new(
+            family_effective_max
+                .iter()
+                .filter_map(|(f, max)| (*max > 1).then_some(*f)),
+        );
         let export_policy = self.tables.export_policy.load_full();
         let rpki = self.tables.rpki.read().unwrap();
         let (rtc_awaiting_eor, rtc_active) = if self.codec.has_family(Family::RTC) {
@@ -3371,7 +3379,7 @@ impl PeerSession {
         let mut disconnect = DisconnectInfo {
             role: self.role,
             remote_addr: self.remote_addr,
-            export_map: ExportMap::new(),
+            export_map: ExportMap::default(),
             negotiated_gr: None,
             negotiated_llgr: None,
         };
@@ -5673,7 +5681,7 @@ mod tests {
 
     #[test]
     fn export_map_mark_and_check() {
-        let mut m = ExportMap::new();
+        let mut m = ExportMap::default();
         assert!(!m.was_sent(Family::IPV4, 1));
         m.mark_sent(Family::IPV4, 1, 0);
         assert!(m.was_sent(Family::IPV4, 1));
@@ -5682,13 +5690,13 @@ mod tests {
     #[test]
     fn export_map_never_sent_returns_false() {
         let _nlri: packet::Nlri = "192.168.1.0/24".parse().unwrap();
-        let m = ExportMap::new();
+        let m = ExportMap::default();
         assert!(!m.was_sent(Family::IPV4, 1));
     }
 
     #[test]
     fn export_map_mark_withdrawn_clears() {
-        let mut m = ExportMap::new();
+        let mut m = ExportMap::default();
         m.mark_sent(Family::IPV4, 1, 0);
         assert!(m.was_sent(Family::IPV4, 1));
         m.mark_withdrawn(Family::IPV4, 1, 0);
@@ -5697,7 +5705,7 @@ mod tests {
 
     #[test]
     fn export_map_multiple_families_independent() {
-        let mut m = ExportMap::new();
+        let mut m = ExportMap::default();
         m.mark_sent(Family::IPV4, 1, 0);
         assert!(m.was_sent(Family::IPV4, 1));
         assert!(!m.was_sent(Family::IPV6, 1));
@@ -6575,7 +6583,7 @@ mod tests {
 
         #[test]
         fn noop_when_best_unchanged() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let update = change(&net, false, false, None, vec![]);
@@ -6600,7 +6608,7 @@ mod tests {
 
         #[test]
         fn new_best_sends_update() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let path = path(1, source(PEER));
@@ -6631,7 +6639,7 @@ mod tests {
 
         #[test]
         fn withdraw_when_best_gone_and_was_sent() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             em.mark_sent(Family::IPV4, 1, 0);
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
@@ -6660,7 +6668,7 @@ mod tests {
 
         #[test]
         fn spurious_withdraw_suppressed() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let update = change(&net, true, true, None, vec![]);
@@ -6685,7 +6693,7 @@ mod tests {
 
         #[test]
         fn nonaddpath_echo_prevention() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             // Path from self — must not be echoed back
@@ -6712,7 +6720,7 @@ mod tests {
 
         #[test]
         fn advertise_then_withdraw_sequence() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let remote = SELF.parse().unwrap();
@@ -6758,7 +6766,7 @@ mod tests {
 
         #[test]
         fn noop_when_any_unchanged() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::new([Family::IPV4]);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let net = nlri("10.0.0.0/24");
             let path = path(1, source(PEER));
@@ -6783,7 +6791,7 @@ mod tests {
 
         #[test]
         fn new_paths_send_updates() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::new([Family::IPV4]);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let net = nlri("10.0.0.0/24");
             let src = source(PEER);
@@ -6816,7 +6824,7 @@ mod tests {
 
         #[test]
         fn path_removed_sends_withdraw() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::new([Family::IPV4]);
             let net = nlri("10.0.0.0/24");
             em.mark_sent(Family::IPV4, 1, 1);
             em.mark_sent(Family::IPV4, 1, 2);
@@ -6849,7 +6857,7 @@ mod tests {
 
         #[test]
         fn replaced_path_readvertised() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::new([Family::IPV4]);
             let net = nlri("10.0.0.0/24");
             em.mark_sent(Family::IPV4, 1, 1);
             em.mark_sent(Family::IPV4, 1, 2);
@@ -6886,7 +6894,7 @@ mod tests {
             // Before: export_map = {pid=1(rank1), pid=2(rank2)}, send_max=2
             // New path pid=3 arrives at rank1 → current_paths = [pid=3, pid=1, pid=2]
             // top-2 = [pid=3, pid=1]; pid=2 pushed out → WITHDRAW pid=2, UPDATE pid=3
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::new([Family::IPV4]);
             let net = nlri("10.0.0.0/24");
             em.mark_sent(Family::IPV4, 1, 1);
             em.mark_sent(Family::IPV4, 1, 2);
@@ -6926,7 +6934,7 @@ mod tests {
             // paths = [pid=1(rank1), pid=2(rank2), pid=3(rank3)] — pid=3 outside window
             // Delete pid=1 → current_paths = [pid=2(rank1), pid=3(rank2)]
             // top-2 = [pid=2, pid=3]: WITHDRAW pid=1, UPDATE pid=3 (enters window)
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::new([Family::IPV4]);
             let net = nlri("10.0.0.0/24");
             em.mark_sent(Family::IPV4, 1, 1);
             em.mark_sent(Family::IPV4, 1, 2);
@@ -6963,7 +6971,7 @@ mod tests {
 
         #[test]
         fn all_paths_removed_withdraws_all() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::new([Family::IPV4]);
             let net = nlri("10.0.0.0/24");
             em.mark_sent(Family::IPV4, 1, 1);
             em.mark_sent(Family::IPV4, 1, 2);
@@ -6994,7 +7002,7 @@ mod tests {
 
         #[test]
         fn addpath_echo_prevention() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::new([Family::IPV4]);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let net = nlri("10.0.0.0/24");
             // Both paths from self — neither should be sent
@@ -7023,7 +7031,7 @@ mod tests {
         #[test]
         fn mixed_self_and_peer_paths() {
             // Only peer paths should be sent; self paths filtered out
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::new([Family::IPV4]);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let net = nlri("10.0.0.0/24");
             let self_src = source(SELF);
@@ -7085,7 +7093,7 @@ mod tests {
 
         #[test]
         fn ibgp_split_horizon_suppresses_ibgp_learned_route() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             // Route learned from an iBGP peer (remote_asn == local_asn)
@@ -7113,7 +7121,7 @@ mod tests {
 
         #[test]
         fn ibgp_split_horizon_withdraws_when_best_becomes_ibgp() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let net = nlri("10.0.0.0/24");
             // Previously sent an eBGP-learned best
             em.mark_sent(Family::IPV4, 1, 0);
@@ -7144,7 +7152,7 @@ mod tests {
 
         #[test]
         fn ibgp_forwards_ebgp_learned_route() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             // Route learned from an eBGP peer (remote_asn != local_asn)
@@ -7173,7 +7181,7 @@ mod tests {
 
         #[test]
         fn ibgp_split_horizon_addpath_filters_ibgp_paths() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::new([Family::IPV4]);
             let mut pending = crate::peer_tx::PendingTx::new(true);
             let net = nlri("10.0.0.0/24");
             let paths = vec![
@@ -7661,7 +7669,7 @@ mod tests {
         // non-client source -> non-client dest: still suppressed in RR mode
         #[test]
         fn rr_non_client_to_non_client_suppressed() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, ibgp_source(PEER));
@@ -7688,7 +7696,7 @@ mod tests {
         // rr-client source -> non-client dest: forwarded in RR mode
         #[test]
         fn rr_client_source_forwarded_to_non_client() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, rr_client_source(PEER));
@@ -7718,7 +7726,7 @@ mod tests {
         // non-client source -> rr-client dest: forwarded in RR mode
         #[test]
         fn rr_non_client_forwarded_to_rr_client() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, ibgp_source(PEER));
@@ -7777,7 +7785,7 @@ mod tests {
         // ORIGINATOR_ID is set to source router_id when absent
         #[test]
         fn rr_reflect_sets_originator_id() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             // ibgp_source router_id = 10.0.0.1
@@ -7813,7 +7821,7 @@ mod tests {
         // Existing ORIGINATOR_ID is preserved (not overwritten)
         #[test]
         fn rr_reflect_preserves_existing_originator_id() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let orig_id = u32::from(Ipv4Addr::new(9, 9, 9, 9));
@@ -7856,7 +7864,7 @@ mod tests {
         // Local cluster_id is prepended to CLUSTER_LIST
         #[test]
         fn rr_reflect_prepends_cluster_id_to_cluster_list() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let existing_cid = Ipv4Addr::new(2, 0, 0, 2);
@@ -7899,7 +7907,7 @@ mod tests {
         // CLUSTER_LIST is created from scratch (not present in original attrs)
         #[test]
         fn rr_reflect_creates_cluster_list_when_absent() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             // path() uses plain attrs (ORIGIN only, no CLUSTER_LIST)
@@ -7934,7 +7942,7 @@ mod tests {
         // eBGP-learned route forwarded to RR client: no RR attributes added
         #[test]
         fn rr_no_reflection_for_ebgp_route() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             // source() has remote_asn=65002, local_asn=65001 → eBGP learned
@@ -7973,7 +7981,7 @@ mod tests {
         // RR client source -> RR client dest: forwarded (client-to-client)
         #[test]
         fn rr_client_to_client_forwarded() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, rr_client_source(PEER));
@@ -8027,7 +8035,7 @@ mod tests {
         // RS-client source must not reach a non-RS-client (eBGP) peer.
         #[test]
         fn rs_isolation_suppresses_rs_client_route_to_ebgp_peer() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, rs_client_source(PEER));
@@ -8057,7 +8065,7 @@ mod tests {
         // Non-RS-client (eBGP) source must not reach an RS-client peer.
         #[test]
         fn rs_isolation_suppresses_ebgp_route_to_rs_client_peer() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, source(PEER));
@@ -8087,7 +8095,7 @@ mod tests {
         // RS-client source must be forwarded to another RS-client peer.
         #[test]
         fn rs_isolation_forwards_rs_client_route_to_rs_client_peer() {
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(1, rs_client_source(PEER));
@@ -8138,7 +8146,7 @@ mod tests {
         #[test]
         fn llgr_stale_source_adds_llgr_stale_community() {
             const LLGR_STALE: u32 = 0xffff_0006;
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let src = source(PEER);
@@ -8170,7 +8178,7 @@ mod tests {
         #[test]
         fn non_llgr_stale_source_does_not_add_llgr_stale_community() {
             const LLGR_STALE: u32 = 0xffff_0006;
-            let mut em = ExportMap::new();
+            let mut em = ExportMap::default();
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let p = path(0, source(PEER));
@@ -8393,7 +8401,7 @@ mod tests {
     // ---- apply_disconnect: export_map lifetime ----
 
     fn make_disconnect_info(negotiated_gr: Option<NegotiatedGr>) -> DisconnectInfo {
-        let mut em = ExportMap::new();
+        let mut em = ExportMap::default();
         em.mark_sent(Family::IPV4, 1, 0);
         DisconnectInfo {
             role: crate::fsm::Role::Active,
