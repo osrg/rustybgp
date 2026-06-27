@@ -509,6 +509,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
     cluster_id: Option<Ipv4Addr>,
     rpki: Option<&table::RpkiTable>,
     bmp: Option<&BmpAdjOut>,
+    rtc_filter: Option<&crate::rtc::RtcFilter>,
 ) {
     if effective_max == 1 {
         // Non-Add-Path fast path: O(1) skip when best unchanged.
@@ -539,9 +540,13 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                 visible_best.map(|b| (Arc::clone(&b.attr), b.nexthop)),
             );
         }
-        // Apply export policy to the visible best; a rejected best is treated
-        // as if no best exists (withdraw if previously advertised).
+        // Apply the RTC filter and export policy to the visible best; a
+        // rejected best is treated as if no best exists (withdraw if
+        // previously advertised).
         let policy_result = visible_best.and_then(|best| {
+            if rtc_filter.is_some_and(|f| !f.allows(&best.attr)) {
+                return None;
+            }
             let mut nexthop = best.nexthop;
             let mut attr = Arc::clone(&best.attr);
             if export_policy.is_some_and(|policy| {
@@ -620,6 +625,9 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             .filter(|p| !rs_isolation_suppress(&p.source, export_ctx.role))
             .take(effective_max)
             .filter_map(|path| {
+                if rtc_filter.is_some_and(|f| !f.allows(&path.attr)) {
+                    return None;
+                }
                 let mut nexthop = path.nexthop;
                 let mut attr = Arc::clone(&path.attr);
                 if export_policy.is_some_and(|policy| {

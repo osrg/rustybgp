@@ -2188,6 +2188,7 @@ impl GoBgpService for GrpcService {
                             cluster_id,
                             Some(&rpki),
                             None,
+                            None,
                         );
                     }
                     let destinations = sink.destinations;
