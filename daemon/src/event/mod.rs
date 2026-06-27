@@ -2557,6 +2557,15 @@ impl PeerSession {
             if let (Some(filter), Some(best)) = (&rtc_filter, change.new_best())
                 && !filter.allows(&best.attr)
             {
+                // Route is now rejected by the RTC filter (peer removed the
+                // matching VRF). Withdraw any paths that were previously sent.
+                for path_id in self.export_map.sent_path_ids(change.family, change.dest_id) {
+                    self.export_map
+                        .mark_withdrawn(change.family, change.dest_id, path_id);
+                    if let Some(pending) = self.pending.get_mut(&change.family) {
+                        pending.unreach(change.net.clone(), path_id);
+                    }
+                }
                 continue;
             }
             let Some(pending) = self.pending.get_mut(&change.family) else {
