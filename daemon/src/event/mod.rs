@@ -5369,6 +5369,86 @@ mod tests {
         assert!(conn.pending[&Family::IPV4].is_empty());
     }
 
+    #[tokio::test]
+    async fn do_route_refresh_rtc_filter_withdraws_previously_sent_vpn_route() {
+        // When a peer removes a VRF, the RTC filter is rebuilt with an empty RT
+        // set that rejects all VPN routes.  A VPN route that was previously sent
+        // must be explicitly withdrawn; without the fix, the RTC-filter continue
+        // path would skip process_nlri_change and leave was_sent=true intact.
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+
+        let mut conn = established_connection(&global, &tables, remote_addr, server).await;
+
+        // Set up VPN + RTC families, mirroring what on_established does for a
+        // VPN peer that negotiated RTC.
+        conn.codec
+            .set_family(Family::IPV4_VPN, bgp::FamilyState::default());
+        conn.codec
+            .set_family(Family::RTC, bgp::FamilyState::default());
+        conn.pending
+            .insert(Family::IPV4_VPN, crate::peer_tx::PendingTx::new(false));
+
+        // Drive rtc_state to Active (SessionEstablished then EorReceived).
+        {
+            let mut ctx = conn.context.lock().unwrap();
+            ctx.rtc_state
+                .process(crate::rtc::RtcInput::SessionEstablished {
+                    negotiated_families: vec![Family::RTC, Family::IPV4_VPN],
+                });
+            ctx.rtc_state.process(crate::rtc::RtcInput::EorReceived);
+        }
+
+        // Insert a VPN route into the RIB.
+        let vpn_nlri = packet::Nlri::VpnV4(packet::vpn::VpnV4Nlri {
+            labels: packet::mpls::MplsLabelStack::new(vec![packet::mpls::MplsLabel::new(100)]),
+            rd: packet::rd::RouteDistinguisher::TwoOctetAs {
+                admin: 65001,
+                assigned: 1,
+            },
+            prefix: bgp::Ipv4Net {
+                addr: Ipv4Addr::new(10, 1, 0, 0),
+                mask: 24,
+            },
+        });
+        tables.insert_route(
+            other_source(),
+            Family::IPV4_VPN,
+            packet::PathNlri::new(vpn_nlri),
+            Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0u32).unwrap(),
+            ]),
+            None,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let dest_id = tables
+            .collect_loc_rib_paths_limited(Family::IPV4_VPN, 1)
+            .into_iter()
+            .next()
+            .expect("VPN route must exist in RIB after insert")
+            .dest_id;
+
+        // Mark the route as previously sent.
+        conn.export_map.mark_sent(Family::IPV4_VPN, dest_id, 0);
+
+        // No RTC paths in adj-in (peer removed all VRFs).  RtcFilter::from_paths(&[])
+        // rejects every VPN route.  do_route_refresh must detect was_sent=true and
+        // emit a WITHDRAW rather than silently leaving the stale route in the peer RIB.
+        conn.do_route_refresh(Family::IPV4_VPN).await;
+
+        assert!(
+            !conn.export_map.was_sent(Family::IPV4_VPN, dest_id),
+            "route must be marked withdrawn after RTC filter rejects it"
+        );
+        assert!(
+            !conn.pending[&Family::IPV4_VPN].is_empty(),
+            "pending must contain a WITHDRAW for the RTC-filtered VPN route"
+        );
+    }
+
     /// `apply_outputs` with `SessionDown(reason, Some(notif))` returns `Step::Terminate`
     /// with the notification field set. `SendMessage` outputs (non-notification BGP messages
     /// such as OPEN or KEEPALIVE) are still queued into `ctrl_msgs`.
