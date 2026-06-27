@@ -1192,17 +1192,12 @@ impl Table {
             .entry(family)
             .or_insert_with(|| Rib::new(shard_idx));
         let deferring = rt.deferring;
-        let is_new_dest = !rt.destinations.contains_key(&net);
-        let new_dest_id = if is_new_dest {
-            let local_id = rt.id_allocator.alloc();
-            Some((rt.shard_idx << 24) | local_id)
-        } else {
-            None
-        };
-        let dst = rt
-            .destinations
-            .entry(net.clone())
-            .or_insert_with(|| Destination::with_id(new_dest_id.unwrap()));
+        let id_alloc = &mut rt.id_allocator;
+        let shard_idx = rt.shard_idx;
+        let dst = rt.destinations.entry(net.clone()).or_insert_with(|| {
+            let local_id = id_alloc.alloc();
+            Destination::with_id((shard_idx << 24) | local_id)
+        });
 
         // Capture the current best's (source, attr) Arc pointers before any modification.
         // Comparing them with the post-insertion best detects all best-path changes:
