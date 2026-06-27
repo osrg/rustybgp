@@ -397,28 +397,30 @@ impl PeerExportContext {
 pub(super) trait NlriSink {
     fn reach(
         &mut self,
+        dest_id: u32,
         nlri: packet::Nlri,
         path_id: u32,
         nexthop: Option<bgp::Nexthop>,
         attr: Arc<Vec<packet::Attribute>>,
         source: &Arc<table::Source>,
     );
-    fn unreach(&mut self, nlri: packet::Nlri, path_id: u32);
+    fn unreach(&mut self, dest_id: u32, nlri: packet::Nlri, path_id: u32);
 }
 
 impl NlriSink for crate::peer_tx::PendingTx {
     fn reach(
         &mut self,
+        dest_id: u32,
         nlri: packet::Nlri,
         path_id: u32,
         nexthop: Option<bgp::Nexthop>,
         attr: Arc<Vec<packet::Attribute>>,
         _source: &Arc<table::Source>,
     ) {
-        crate::peer_tx::PendingTx::reach(self, nlri, path_id, nexthop, attr);
+        crate::peer_tx::PendingTx::reach(self, dest_id, nlri, path_id, nexthop, attr);
     }
-    fn unreach(&mut self, nlri: packet::Nlri, path_id: u32) {
-        crate::peer_tx::PendingTx::unreach(self, nlri, path_id);
+    fn unreach(&mut self, dest_id: u32, nlri: packet::Nlri, path_id: u32) {
+        crate::peer_tx::PendingTx::unreach(self, dest_id, nlri, path_id);
     }
 }
 
@@ -437,6 +439,7 @@ pub(super) struct AdjOutSink {
 impl NlriSink for AdjOutSink {
     fn reach(
         &mut self,
+        _dest_id: u32,
         nlri: packet::Nlri,
         _path_id: u32,
         _nexthop: Option<bgp::Nexthop>,
@@ -464,7 +467,7 @@ impl NlriSink for AdjOutSink {
         }
     }
 
-    fn unreach(&mut self, _nlri: packet::Nlri, _path_id: u32) {
+    fn unreach(&mut self, _dest_id: u32, _nlri: packet::Nlri, _path_id: u32) {
         // Snapshot mode: ExportMap is always empty so this is never called.
     }
 }
@@ -509,6 +512,7 @@ impl GroupedSink {
 impl NlriSink for GroupedSink {
     fn reach(
         &mut self,
+        _dest_id: u32,
         nlri: packet::Nlri,
         path_id: u32,
         nexthop: Option<bgp::Nexthop>,
@@ -522,7 +526,7 @@ impl NlriSink for GroupedSink {
         self.grouped.entry((attr, nexthop)).or_default().push(key);
     }
 
-    fn unreach(&mut self, _nlri: packet::Nlri, _path_id: u32) {
+    fn unreach(&mut self, _dest_id: u32, _nlri: packet::Nlri, _path_id: u32) {
         // Initial dump: export_map is empty so this is never called.
     }
 }
@@ -620,7 +624,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                 }
                 if export_map.was_sent(update.family, update.dest_id) {
                     export_map.mark_withdrawn(update.family, update.dest_id, 0);
-                    sink.unreach(update.net.clone(), 0);
+                    sink.unreach(update.dest_id, update.net.clone(), 0);
                 }
             }
             Some((best, attr, nexthop)) => {
@@ -641,7 +645,14 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                         Some((Arc::clone(&attr), nexthop)),
                     );
                 }
-                sink.reach(update.net.clone(), 0, nexthop, attr, &best.source);
+                sink.reach(
+                    update.dest_id,
+                    update.net.clone(),
+                    0,
+                    nexthop,
+                    attr,
+                    &best.source,
+                );
             }
         }
     } else {
@@ -707,7 +718,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             if let Some(bmp) = bmp {
                 bmp.post(update.family, update.net.clone(), pid, None);
             }
-            sink.unreach(update.net.clone(), pid);
+            sink.unreach(update.dest_id, update.net.clone(), pid);
         }
 
         // Advertise paths that are new or whose attributes were replaced.
@@ -726,7 +737,14 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                         Some((Arc::clone(&attr), nexthop)),
                     );
                 }
-                sink.reach(update.net.clone(), *pid, nexthop, attr, source);
+                sink.reach(
+                    update.dest_id,
+                    update.net.clone(),
+                    *pid,
+                    nexthop,
+                    attr,
+                    source,
+                );
             }
         }
     }
