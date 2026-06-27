@@ -442,40 +442,52 @@ impl Eq for RibEntry {}
 
 /// Bitmap-based allocator for per-Rib destination IDs.
 ///
-/// Bit i set = ID i is in use (same convention as BIRD's hmap).
-/// Allocates the lowest free ID in O(1) via `u64::trailing_ones()`.
-#[derive(Default)]
+/// Bit i set = local ID i is in use (same convention as BIRD's hmap).
+/// Allocates the lowest free local ID in O(1) via `u64::trailing_ones()`
+/// and packs `shard_idx` into bits [31:24] of the returned dest_id so
+/// that dest_ids are globally unique across all shards.
+/// `dealloc` accepts the full combined dest_id and strips the shard bits
+/// internally; callers need not know the encoding.
 struct IdAllocator {
     bits: Vec<u64>,
+    shard_idx: u32,
 }
 
 impl IdAllocator {
+    fn new(shard_idx: u32) -> Self {
+        IdAllocator {
+            bits: Vec::new(),
+            shard_idx,
+        }
+    }
+
     fn alloc(&mut self) -> u32 {
         for (i, word) in self.bits.iter_mut().enumerate() {
             if *word != u64::MAX {
                 let bit = word.trailing_ones();
                 *word |= 1u64 << bit;
-                let id = i as u32 * 64 + bit;
+                let local_id = i as u32 * 64 + bit;
                 debug_assert!(
-                    id < (1 << 24),
+                    local_id < (1 << 24),
                     "local dest_id overflow (> 16M routes per shard)"
                 );
-                return id;
+                return (self.shard_idx << 24) | local_id;
             }
         }
         let i = self.bits.len();
         self.bits.push(1);
-        let id = i as u32 * 64;
+        let local_id = i as u32 * 64;
         debug_assert!(
-            id < (1 << 24),
+            local_id < (1 << 24),
             "local dest_id overflow (> 16M routes per shard)"
         );
-        id
+        (self.shard_idx << 24) | local_id
     }
 
     fn dealloc(&mut self, id: u32) {
-        let i = (id / 64) as usize;
-        let bit = id % 64;
+        let local_id = id & 0x00FF_FFFF;
+        let i = (local_id / 64) as usize;
+        let bit = local_id % 64;
         self.bits[i] &= !(1u64 << bit);
         while self.bits.last() == Some(&0) {
             self.bits.pop();
@@ -841,9 +853,6 @@ pub struct Rib {
     pub deferring: bool,
     destinations: FnvHashMap<packet::Nlri, Destination>,
     id_allocator: IdAllocator,
-    /// Shard index, stored in bits [31:24] of every NlriChange.dest_id produced
-    /// by this Rib. Bits [23:0] hold the per-Rib local id from IdAllocator.
-    shard_idx: u32,
 }
 
 impl Rib {
@@ -851,8 +860,7 @@ impl Rib {
         Rib {
             deferring: false,
             destinations: FnvHashMap::default(),
-            id_allocator: IdAllocator::default(),
-            shard_idx,
+            id_allocator: IdAllocator::new(shard_idx),
         }
     }
 }
@@ -1193,11 +1201,10 @@ impl Table {
             .or_insert_with(|| Rib::new(shard_idx));
         let deferring = rt.deferring;
         let id_alloc = &mut rt.id_allocator;
-        let shard_idx = rt.shard_idx;
-        let dst = rt.destinations.entry(net.clone()).or_insert_with(|| {
-            let local_id = id_alloc.alloc();
-            Destination::with_id((shard_idx << 24) | local_id)
-        });
+        let dst = rt
+            .destinations
+            .entry(net.clone())
+            .or_insert_with(|| Destination::with_id(id_alloc.alloc()));
 
         // Capture the current best's (source, attr) Arc pointers before any modification.
         // Comparing them with the post-insertion best detects all best-path changes:
@@ -1430,7 +1437,7 @@ impl Table {
         }
 
         if dst.entry.is_empty() {
-            rt.id_allocator.dealloc(dst_id & 0x00FF_FFFF);
+            rt.id_allocator.dealloc(dst_id);
             rt.destinations.remove(&net);
             let change = if was_unfiltered {
                 Some(NlriChange {
@@ -1541,7 +1548,7 @@ impl Table {
                 true
             });
             for id in freed_ids {
-                rt.id_allocator.dealloc(id & 0x00FF_FFFF);
+                rt.id_allocator.dealloc(id);
             }
         }
         (changes, removed_nexthops)
@@ -1636,7 +1643,7 @@ impl Table {
                 true
             });
             for id in freed_ids {
-                rt.id_allocator.dealloc(id & 0x00FF_FFFF);
+                rt.id_allocator.dealloc(id);
             }
         }
         (changes, removed_nexthops)
@@ -1724,7 +1731,7 @@ impl Table {
                 true
             });
             for id in freed_ids {
-                rt.id_allocator.dealloc(id & 0x00FF_FFFF);
+                rt.id_allocator.dealloc(id);
             }
         }
         (changes, removed_nexthops)
@@ -1967,7 +1974,7 @@ impl Table {
                 true
             });
             for id in freed_ids {
-                rt.id_allocator.dealloc(id & 0x00FF_FFFF);
+                rt.id_allocator.dealloc(id);
             }
         }
         (changes, removed_nexthops)
