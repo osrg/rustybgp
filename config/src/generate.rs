@@ -3583,6 +3583,10 @@ pub struct GlobalState {
     // original type is list of inet:ip-address
     #[serde(rename = "local-address-list")]
     pub local_address_list: Option<Vec<std::net::IpAddr>>,
+    // original -> gobgp:bind-to-device
+    // Device name for binding the BGP listener socket.
+    #[serde(rename = "bind-to-device")]
+    pub bind_to_device: Option<String>,
 }
 // struct for container bgp:config.
 // Configuration parameters relating to the global BGP router.
@@ -3606,6 +3610,10 @@ pub struct GlobalConfig {
     // original type is list of inet:ip-address
     #[serde(rename = "local-address-list")]
     pub local_address_list: Option<Vec<std::net::IpAddr>>,
+    // original -> gobgp:bind-to-device
+    // Device name for binding the BGP listener socket.
+    #[serde(rename = "bind-to-device")]
+    pub bind_to_device: Option<String>,
 }
 // struct for container bgp:global.
 // Global configuration for the BGP router.
