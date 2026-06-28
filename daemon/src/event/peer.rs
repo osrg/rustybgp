@@ -103,6 +103,11 @@ pub(crate) struct PeerConfig {
     /// When set, the TCP connection uses the link-local address discovered via
     /// NDP at peer-add time, with the interface index as the socket scope ID.
     pub(crate) neighbor_interface: Option<String>,
+    /// Interface name for binding this peer's TCP socket; corresponds to GoBGP's
+    /// Transport.BindInterface.  The primary use case is a Linux VRF device: when
+    /// set, the outgoing socket is bound to that Linux VRF device and TCP MD5 is
+    /// scoped to its ifindex so the key applies only within that Linux VRF device.
+    pub(crate) bind_interface: Option<String>,
 }
 
 /// Plain-struct replacement for the old PeerBuilder.
@@ -135,6 +140,8 @@ pub(crate) struct PeerParams {
     pub(crate) bfd_config: Option<crate::bfd::BfdPeerConfig>,
     /// Interface name for unnumbered BGP (RFC 7938); None for normal peers.
     pub(crate) neighbor_interface: Option<String>,
+    /// Interface name for binding this peer's TCP socket (primarily a Linux VRF device); None if unused.
+    pub(crate) bind_interface: Option<String>,
 }
 
 impl PeerParams {
@@ -322,6 +329,7 @@ impl PeerParams {
                 graceful_restart: self.graceful_restart,
                 llgr: self.llgr,
                 neighbor_interface: self.neighbor_interface,
+                bind_interface: self.bind_interface,
             },
             admin_down: self.admin_down,
             state: Arc::new(PeerState {
@@ -604,6 +612,12 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                     }
                 }),
             neighbor_interface,
+            bind_interface: n
+                .transport
+                .as_ref()
+                .and_then(|t| t.config.as_ref())
+                .and_then(|c| c.bind_interface.clone())
+                .filter(|s| !s.is_empty()),
         })
     }
 }

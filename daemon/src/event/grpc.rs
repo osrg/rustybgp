@@ -406,6 +406,11 @@ impl TryFrom<&api::Peer> for PeerParams {
                 }
             }),
             neighbor_interface,
+            bind_interface: p
+                .transport
+                .as_ref()
+                .filter(|t| !t.bind_interface.is_empty())
+                .map(|t| t.bind_interface.clone()),
         })
     }
 }
@@ -921,12 +926,13 @@ impl GoBgpService for GrpcService {
             } else {
                 Some(g.bind_to_device.as_str())
             };
+            let ifindex = device.map(auth::ifindex_of).unwrap_or(0);
             global.listen_sockets.append(
                 &mut listen_addresses
                     .into_iter()
                     .map(|addr| create_listen_socket(addr, device))
                     .filter_map(|x| x.ok())
-                    .map(|x| x.as_raw_fd())
+                    .map(|x| (x.as_raw_fd(), ifindex))
                     .collect(),
             );
         }
@@ -1059,8 +1065,8 @@ impl GoBgpService for GrpcService {
             params.apply_peer_group(pg);
         }
         if let Some(password) = params.password.as_ref() {
-            for fd in &global.listen_sockets {
-                auth::set_md5sig(*fd, &params.remote_addr, password);
+            for &(fd, ifindex) in &global.listen_sockets {
+                auth::set_md5sig(fd, &params.remote_addr, password, ifindex);
             }
         }
         global.add_peer(params, Some(self.active_conn_tx.clone()))?;
@@ -1083,8 +1089,8 @@ impl GoBgpService for GrpcService {
                     );
                 }
                 if p.config.password.is_some() {
-                    for fd in &global.listen_sockets {
-                        auth::set_md5sig(*fd, &peer_addr, "");
+                    for &(fd, ifindex) in &global.listen_sockets {
+                        auth::set_md5sig(fd, &peer_addr, "", ifindex);
                     }
                 }
                 if let Some(bfd) = &global.bfd_handle {
@@ -1243,6 +1249,7 @@ impl GoBgpService for GrpcService {
                 graceful_restart: new_params.graceful_restart.clone(),
                 llgr: new_params.llgr.clone(),
                 neighbor_interface: new_params.neighbor_interface,
+                bind_interface: new_params.bind_interface,
             };
 
             if needs_teardown {
@@ -1275,13 +1282,13 @@ impl GoBgpService for GrpcService {
         // Update TCP MD5 socket option after releasing the peer borrow.
         if old_password != new_params.password {
             if old_password.is_some() {
-                for fd in &listen_sockets {
-                    auth::set_md5sig(*fd, &peer_addr, "");
+                for &(fd, ifindex) in &listen_sockets {
+                    auth::set_md5sig(fd, &peer_addr, "", ifindex);
                 }
             }
             if let Some(pw) = &new_params.password {
-                for fd in &listen_sockets {
-                    auth::set_md5sig(*fd, &peer_addr, pw);
+                for &(fd, ifindex) in &listen_sockets {
+                    auth::set_md5sig(fd, &peer_addr, pw, ifindex);
                 }
             }
         }

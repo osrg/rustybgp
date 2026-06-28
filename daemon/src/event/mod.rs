@@ -627,6 +627,8 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
     };
     let retry_time = peer.config.connect_retry_time;
     let password = peer.config.password.as_ref().map(|x| x.to_string());
+    let bind_interface = peer.config.bind_interface.clone();
+    let peer_ifindex = bind_interface.as_deref().map(auth::ifindex_of).unwrap_or(0);
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let join_handle = tokio::spawn(async move {
         loop {
@@ -634,8 +636,11 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
                 IpAddr::V4(_) => tokio::net::TcpSocket::new_v4().unwrap(),
                 IpAddr::V6(_) => tokio::net::TcpSocket::new_v6().unwrap(),
             };
+            if let Some(dev) = bind_interface.as_deref() {
+                let _ = socket.bind_device(Some(dev.as_bytes()));
+            }
             if let Some(key) = password.as_ref() {
-                auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key);
+                auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex);
             }
             tokio::select! {
                 result = tokio::time::timeout(
@@ -705,7 +710,7 @@ pub(crate) struct Global {
     pub(crate) asn: u32,
     pub(crate) router_id: Ipv4Addr,
     listen_port: Option<u16>,
-    listen_sockets: Vec<RawFd>,
+    listen_sockets: Vec<(RawFd, u32)>,
     pub(crate) peers: FnvHashMap<IpAddr, Peer>,
     peer_group: FnvHashMap<String, PeerGroup>,
 
@@ -1292,7 +1297,9 @@ impl Global {
 
         loop {
             notify.notified().await;
-            let listen_sockets = if let Some(listen_port) = global.read().await.listen_port {
+            let (listen_sockets, listen_ifindex) = if let Some(listen_port) =
+                global.read().await.listen_port
+            {
                 let global_config = bgp
                     .as_ref()
                     .and_then(|x| x.global.as_ref())
@@ -1311,26 +1318,28 @@ impl Global {
                 let device = global_config
                     .and_then(|c| c.bind_to_device.as_deref())
                     .filter(|s| !s.is_empty());
-
-                addrs
+                let ifindex = device.map(auth::ifindex_of).unwrap_or(0);
+                let sockets = addrs
                     .into_iter()
                     .map(|addr| create_listen_socket(addr, device))
                     .filter_map(|x| x.ok())
-                    .collect()
+                    .collect::<Vec<_>>();
+                (sockets, ifindex)
             } else {
-                Vec::new()
+                (Vec::new(), 0)
             };
 
-            global
-                .write()
-                .await
-                .listen_sockets
-                .append(&mut listen_sockets.iter().map(|x| x.as_raw_fd()).collect());
+            global.write().await.listen_sockets.append(
+                &mut listen_sockets
+                    .iter()
+                    .map(|x| (x.as_raw_fd(), listen_ifindex))
+                    .collect(),
+            );
 
             for (addr, peer) in &global.read().await.peers {
                 if let Some(password) = &peer.config.password {
                     for l in &listen_sockets {
-                        auth::set_md5sig(l.as_raw_fd(), addr, password);
+                        auth::set_md5sig(l.as_raw_fd(), addr, password, listen_ifindex);
                     }
                 }
             }
@@ -1493,6 +1502,7 @@ async fn accept_connection(
                 llgr: group.llgr.clone(),
                 bfd_config: None,
                 neighbor_interface: None,
+                bind_interface: None,
             };
             let _ = g.add_peer(params, None);
             g.peers.get_mut(&remote_addr).unwrap()
@@ -3701,6 +3711,7 @@ mod tests {
             llgr: None,
             bfd_config: None,
             neighbor_interface: None,
+            bind_interface: None,
         }
     }
 
