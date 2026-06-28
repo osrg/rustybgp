@@ -916,10 +916,15 @@ impl GoBgpService for GrpcService {
                     .collect::<Result<Vec<_>, _>>()?
             };
 
+            let device = if g.bind_to_device.is_empty() {
+                None
+            } else {
+                Some(g.bind_to_device.as_str())
+            };
             global.listen_sockets.append(
                 &mut listen_addresses
                     .into_iter()
-                    .map(create_listen_socket)
+                    .map(|addr| create_listen_socket(addr, device))
                     .filter_map(|x| x.ok())
                     .map(|x| x.as_raw_fd())
                     .collect(),

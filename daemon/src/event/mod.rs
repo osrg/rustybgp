@@ -660,7 +660,10 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
     ctx.active_connect_join_handle = Some(join_handle);
 }
 
-fn create_listen_socket(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+fn create_listen_socket(
+    addr: SocketAddr,
+    device: Option<&str>,
+) -> std::io::Result<std::net::TcpListener> {
     let sock = socket2::Socket::new(
         match addr {
             SocketAddr::V4(_) => socket2::Domain::IPV4,
@@ -676,6 +679,9 @@ fn create_listen_socket(addr: SocketAddr) -> std::io::Result<std::net::TcpListen
     sock.set_reuse_address(true)?;
     sock.set_reuse_port(true)?;
     sock.set_nonblocking(true)?;
+    if let Some(dev) = device {
+        sock.bind_device(Some(dev.as_bytes()))?;
+    }
     sock.bind(&addr.into())?;
     sock.listen(4096)?;
 
@@ -1287,25 +1293,28 @@ impl Global {
         loop {
             notify.notified().await;
             let listen_sockets = if let Some(listen_port) = global.read().await.listen_port {
-                let addrs = if let Some(b) = bgp
+                let global_config = bgp
                     .as_ref()
                     .and_then(|x| x.global.as_ref())
-                    .and_then(|g| g.config.as_ref())
-                    .and_then(|c| c.local_address_list.as_ref())
-                {
-                    b.iter()
-                        .map(|x| SocketAddr::new(*x, listen_port))
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
-                        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port),
-                    ]
-                };
+                    .and_then(|g| g.config.as_ref());
+                let addrs =
+                    if let Some(b) = global_config.and_then(|c| c.local_address_list.as_ref()) {
+                        b.iter()
+                            .map(|x| SocketAddr::new(*x, listen_port))
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![
+                            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
+                            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port),
+                        ]
+                    };
+                let device = global_config
+                    .and_then(|c| c.bind_to_device.as_deref())
+                    .filter(|s| !s.is_empty());
 
                 addrs
                     .into_iter()
-                    .map(create_listen_socket)
+                    .map(|addr| create_listen_socket(addr, device))
                     .filter_map(|x| x.ok())
                     .collect()
             } else {
