@@ -13,18 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::SystemTime;
-
-pub(crate) trait ToApi<T: prost::Message> {
-    fn to_api(&self) -> T;
-}
-
-impl ToApi<prost_types::Timestamp> for SystemTime {
-    fn to_api(&self) -> prost_types::Timestamp {
-        let unix = self.duration_since(SystemTime::UNIX_EPOCH).unwrap();
-        prost_types::Timestamp {
-            seconds: unix.as_secs() as i64,
-            nanos: unix.subsec_nanos() as i32,
-        }
-    }
+/// Return the current time as seconds since the Unix epoch (truncated to u32).
+pub(crate) fn unix_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32
 }

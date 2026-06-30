@@ -113,11 +113,7 @@ fn flush_peer_snapshot(
                     Ipv4Addr::from(change.source.router_id),
                     0,
                     change.source.remote_addr,
-                    change
-                        .timestamp
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as u32,
+                    change.timestamp,
                 ),
                 update,
                 addpath: change.addpath,
@@ -435,10 +431,7 @@ impl BmpClient {
                         net: change.net.clone(),
                         attr: best.map(|p| p.attr.clone()),
                         nexthop: best.and_then(|p| p.nexthop),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as u32,
+                        timestamp: crate::proto::unix_secs(),
                     };
                     let msg = loc_rib_to_bmp(&lrc, local_id, local_asn);
                     if lines.send(&msg).await.is_err() {
@@ -495,10 +488,7 @@ impl BmpClient {
                                         Ipv4Addr::from(change.source.router_id),
                                         0,
                                         change.source.remote_addr,
-                                        change.timestamp
-                                            .duration_since(SystemTime::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs() as u32,
+                                        change.timestamp,
                                     ),
                                     update,
                                     addpath: change.addpath,
@@ -522,10 +512,7 @@ impl BmpClient {
                                         Ipv4Addr::from(change.source.router_id),
                                         0,
                                         change.source.remote_addr,
-                                        change.timestamp
-                                            .duration_since(SystemTime::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs() as u32,
+                                        change.timestamp,
                                     ),
                                     update,
                                     addpath: change.addpath,
@@ -549,11 +536,7 @@ impl BmpClient {
                                         Ipv4Addr::from(change.peer_id),
                                         0,
                                         change.peer_addr,
-                                        change
-                                            .timestamp
-                                            .duration_since(SystemTime::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs() as u32,
+                                        change.timestamp,
                                     ),
                                     update,
                                     addpath: change.addpath,
@@ -578,11 +561,7 @@ impl BmpClient {
                                         Ipv4Addr::from(change.peer_id),
                                         0,
                                         change.peer_addr,
-                                        change
-                                            .timestamp
-                                            .duration_since(SystemTime::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs() as u32,
+                                        change.timestamp,
                                     ),
                                     update,
                                     addpath: change.addpath,
@@ -747,7 +726,7 @@ mod tests {
             nlris,
             attrs: Some(Arc::new(Vec::new())),
             nexthop: None,
-            timestamp: SystemTime::UNIX_EPOCH,
+            timestamp: 0u32,
         }
     }
 
@@ -763,7 +742,7 @@ mod tests {
             nlris,
             attrs: None,
             nexthop: None,
-            timestamp: SystemTime::UNIX_EPOCH,
+            timestamp: 0u32,
         }
     }
 

@@ -4301,7 +4301,6 @@ pub(crate) fn destination_to_api(
     family: Family,
     binary: &PathBinaryFlags,
 ) -> api::Destination {
-    use crate::proto::ToApi;
     api::Destination {
         prefix: d.net.to_string(),
         paths: d
@@ -4315,7 +4314,10 @@ pub(crate) fn destination_to_api(
                 },
                 family: Some(family_to_api(family)),
                 identifier: p.remote_path_id,
-                age: Some(p.timestamp.to_api()),
+                age: Some(prost_types::Timestamp {
+                    seconds: p.timestamp as i64,
+                    nanos: 0,
+                }),
                 pattrs: if binary.only_binary {
                     vec![]
                 } else {

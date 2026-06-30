@@ -2935,7 +2935,7 @@ impl PeerSession {
         reach: Option<bgp::ReachNlri>,
         unreach: Option<packet::UnreachNlri>,
         attr: Arc<Vec<packet::Attribute>>,
-        timestamp: std::time::SystemTime,
+        timestamp: u32,
     ) -> bool {
         // RFC 4456 §8 loop detection: discard UPDATE if ORIGINATOR_ID equals
         // local router-id, or if CLUSTER_LIST already contains local cluster-id.
@@ -3141,7 +3141,7 @@ impl PeerSession {
 
         // For UPDATE Routes: if FSM didn't reject (no SessionDown), process routes.
         if let Some((reach, unreach, attr)) = route_fields {
-            let rx_timestamp = std::time::SystemTime::now();
+            let rx_timestamp = crate::proto::unix_secs();
             if self.rx_update(reach, unreach, attr, rx_timestamp).await {
                 let cease = bgp::Message::Notification(
                     rustybgp_packet::Notification::CeaseMaxPrefixReached,
@@ -5254,7 +5254,7 @@ mod tests {
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0u32).unwrap(),
             ]),
             None,
-            std::time::SystemTime::UNIX_EPOCH,
+            0u32,
         );
     }
 
@@ -5436,7 +5436,7 @@ mod tests {
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0u32).unwrap(),
             ]),
             None,
-            std::time::SystemTime::UNIX_EPOCH,
+            0u32,
         );
         let dest_id = tables
             .collect_loc_rib_paths_limited(Family::IPV4_VPN, 1)
@@ -5932,7 +5932,7 @@ mod tests {
                 false,
                 false,
                 None,
-                std::time::SystemTime::UNIX_EPOCH,
+                0u32,
             );
             let _ = t.rtable.insert(
                 source.clone(),
@@ -5945,7 +5945,7 @@ mod tests {
                 false,
                 false,
                 None,
-                std::time::SystemTime::UNIX_EPOCH,
+                0u32,
             );
         }
 
@@ -5999,7 +5999,7 @@ mod tests {
                 false,
                 false,
                 None,
-                std::time::SystemTime::UNIX_EPOCH,
+                0u32,
             );
         }
         assert_eq!(
@@ -9121,12 +9121,7 @@ port = 3323
         ]);
 
         let exceeded = session
-            .rx_update(
-                reach_set("10.0.0.0/24"),
-                None,
-                attrs,
-                std::time::SystemTime::now(),
-            )
+            .rx_update(reach_set("10.0.0.0/24"), None, attrs, 0u32)
             .await;
 
         assert!(!exceeded, "loop detection must not trigger CEASE");
@@ -9148,12 +9143,7 @@ port = 3323
         ]);
 
         let exceeded = session
-            .rx_update(
-                reach_set("10.0.0.0/24"),
-                None,
-                attrs,
-                std::time::SystemTime::now(),
-            )
+            .rx_update(reach_set("10.0.0.0/24"), None, attrs, 0u32)
             .await;
 
         assert!(!exceeded, "loop detection must not trigger CEASE");
@@ -9180,12 +9170,7 @@ port = 3323
         ]);
 
         let exceeded = session
-            .rx_update(
-                reach_set("10.0.0.0/24"),
-                None,
-                attrs,
-                std::time::SystemTime::now(),
-            )
+            .rx_update(reach_set("10.0.0.0/24"), None, attrs, 0u32)
             .await;
 
         assert!(!exceeded, "loop detection must not trigger CEASE");

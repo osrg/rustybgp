@@ -22,7 +22,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::ops::AddAssign;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::SystemTime;
 
 use rustybgp_packet::{self as packet, Attribute, Family, bgp};
 
@@ -181,7 +180,7 @@ pub struct PathEntry {
     /// AddPath path identifier received from the peer (0 when AddPath is not in use).
     /// AddPath path identifier received from the peer (0 when AddPath is not in use).
     pub remote_path_id: u32,
-    pub timestamp: SystemTime,
+    pub timestamp: u32,
     pub attr: Arc<Vec<packet::Attribute>>,
     pub validation: Option<RpkiValidation>,
     /// True when this path is marked stale during Graceful Restart (RFC 4724).
@@ -282,7 +281,7 @@ struct RibEntry {
     /// increment.
     original_attr: Arc<Vec<packet::Attribute>>,
     remote_path_id: u32,
-    timestamp: SystemTime,
+    timestamp: u32,
     flags: u8,
 }
 
@@ -582,7 +581,7 @@ pub struct Reach {
     pub net: packet::PathNlri,
     pub attr: Arc<Vec<packet::Attribute>>,
     pub nexthop: Option<bgp::Nexthop>,
-    pub timestamp: SystemTime,
+    pub timestamp: u32,
 }
 
 impl From<Reach> for bgp::Message {
@@ -626,7 +625,7 @@ pub type SoftResetPath = (
     Option<bgp::Nexthop>,
     Arc<Source>,
     Arc<Vec<packet::Attribute>>,
-    SystemTime,
+    u32,
 );
 
 /// Result of a single `Table::insert()` or `Table::remove()` operation.
@@ -1196,7 +1195,7 @@ impl Table {
         filtered: bool,
         nexthop_invalid: bool,
         prefix_limit: Option<(u32, &Arc<AtomicU64>)>,
-        timestamp: SystemTime,
+        timestamp: u32,
     ) -> InsertResult {
         let flags = if filtered { RibEntry::FLAG_FILTERED } else { 0 }
             | if nexthop_invalid {
@@ -2362,7 +2361,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             s2,
@@ -2375,7 +2374,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             s1.clone(),
@@ -2388,7 +2387,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             s1.clone(),
@@ -2401,7 +2400,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         assert_eq!(rt.ribs.get(&family).unwrap().destinations.len(), 3);
@@ -2447,7 +2446,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().any_changed);
         assert!(update.as_changed().unwrap().best_changed);
@@ -2469,7 +2468,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // Insert with router_id=2 (higher, won't become best)
         let update = rt.insert(
@@ -2483,7 +2482,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // Best did not change; second path entered current_paths at index 1
         assert!(!update.as_changed().unwrap().best_changed);
@@ -2508,7 +2507,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         let update = rt.insert(
             source(2, 65002, 65000, 2),
@@ -2521,7 +2520,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // Higher local_pref wins → best changes to source 2
         assert!(update.as_changed().unwrap().best_changed);
@@ -2547,7 +2546,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         let update = rt.insert(
             source(2, 65002, 65000, 2),
@@ -2560,7 +2559,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // Shorter AS path wins
         assert!(update.as_changed().unwrap().best_changed);
@@ -2587,7 +2586,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // Insert with ORIGIN=IGP(0), router_id=2
         let update = rt.insert(
@@ -2601,7 +2600,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // IGP (lower origin value) wins
         assert!(update.as_changed().unwrap().best_changed);
@@ -2628,7 +2627,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // eBGP peer (remote_asn != local_asn), router_id=2 (higher)
         let update = rt.insert(
@@ -2642,7 +2641,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // eBGP wins even though router_id is higher
         assert!(update.as_changed().unwrap().best_changed);
@@ -2669,7 +2668,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // router_id=5 (lower wins)
         let update = rt.insert(
@@ -2683,7 +2682,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         let best = update.as_changed().unwrap().new_best().unwrap();
@@ -2717,7 +2716,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // One hop in CLUSTER_LIST — shorter wins
         let update = rt.insert(
@@ -2731,7 +2730,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         let best = update.as_changed().unwrap().new_best().unwrap();
@@ -2757,7 +2756,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // No CLUSTER_LIST (length 0) — wins
         let update = rt.insert(
@@ -2771,7 +2770,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         let best = update.as_changed().unwrap().new_best().unwrap();
@@ -2807,7 +2806,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // Same CLUSTER_LIST length (1), lower ORIGINATOR_ID — wins
         let update = rt.insert(
@@ -2831,7 +2830,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         let best = update.as_changed().unwrap().new_best().unwrap();
@@ -2860,7 +2859,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             s2.clone(),
@@ -2873,7 +2872,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // Remove best (router_id=1) → s2 promoted to best
         let (update, _) = rt.remove(s1, Family::IPV4, net, 0, None);
@@ -2902,7 +2901,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             s2.clone(),
@@ -2915,7 +2914,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // Remove non-best (router_id=2) → best unchanged, s1 still best
         let (update, _) = rt.remove(s2, Family::IPV4, net, 0, None);
@@ -2944,7 +2943,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         let (update, _) = rt.remove(s1, Family::IPV4, net, 0, None);
         // Withdrawal: best gone
@@ -2970,7 +2969,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(
             update.as_changed().is_none(),
@@ -2990,7 +2989,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         let best = update.as_changed().unwrap().new_best().unwrap();
@@ -3014,7 +3013,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered best (router_id=2)
         let s2 = source(2, 65002, 65000, 2);
@@ -3029,7 +3028,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         let best = update.as_changed().unwrap().new_best().unwrap();
@@ -3046,7 +3045,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(!update.as_changed().unwrap().best_changed);
         assert!(update.as_changed().unwrap().any_changed);
@@ -3071,7 +3070,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered best
         rt.insert(
@@ -3085,7 +3084,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // replace the filtered head with updated attrs (still filtered) → no best change, no any_changed
         let update = rt.insert(
@@ -3099,7 +3098,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(
             update.as_changed().is_none(),
@@ -3125,7 +3124,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered best (router_id=1)
         rt.insert(
@@ -3139,7 +3138,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // another unfiltered (router_id=2)
         let s2 = source(2, 65002, 65000, 2);
@@ -3154,7 +3153,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // replace s1 as filtered → s2 becomes unfiltered best
         let update = rt.insert(
@@ -3168,7 +3167,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         let best = update.as_changed().unwrap().new_best().unwrap();
@@ -3195,7 +3194,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             s2.clone(),
@@ -3208,7 +3207,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         // Replace s1 with worse attrs (local_pref=50) → s2 (local_pref=100) becomes best.
@@ -3223,7 +3222,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         let update = update
@@ -3254,7 +3253,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered best (router_id=1)
         let s1 = source(1, 65001, 65000, 1);
@@ -3269,7 +3268,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered non-best (router_id=2)
         let s2 = source(2, 65002, 65000, 2);
@@ -3284,7 +3283,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // replace s2 with different attrs → still non-best
         let update = rt.insert(
@@ -3298,7 +3297,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(!update.as_changed().unwrap().best_changed);
         assert!(update.as_changed().unwrap().any_changed);
@@ -3323,7 +3322,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // filtered path: received=1, accepted=0
         let stats: Vec<_> = rt.peer_stats(&s1.remote_addr).unwrap().collect();
@@ -3353,7 +3352,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // Second path (path_id=2): same prefix, additional Add-Path path.
         // received must NOT increment again.
@@ -3368,7 +3367,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         let stats: Vec<_> = rt.peer_stats(&src.remote_addr).unwrap().collect();
@@ -3402,7 +3401,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             src.clone(),
@@ -3415,7 +3414,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         // Remove path_id=1: path_id=2 still exists -> received must stay 1
@@ -3456,7 +3455,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             s1.clone(),
@@ -3469,7 +3468,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             s1.clone(),
@@ -3482,7 +3481,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert_eq!(flat_best(&rt, &Family::IPV4).len(), 3);
     }
@@ -3825,7 +3824,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // s2: local_pref=50, router_id=1 (better router_id, worse local_pref)
         let s2 = source(2, 65002, 65000, 1);
@@ -3840,7 +3839,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // s1 must remain best (higher local_pref wins over lower router_id)
         // s2 enters as a new current path, best unchanged
@@ -3867,7 +3866,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         // Replace with filtered → no unfiltered best remains → best_changed, new_best=None
@@ -3882,7 +3881,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         assert!(update.as_changed().unwrap().new_best().is_none());
@@ -3906,7 +3905,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // s2 inserts a filtered path
         let s2 = source(2, 65002, 65000, 2);
@@ -3921,7 +3920,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // s1 gets replaced as filtered → all filtered → withdrawal
         let update = rt.insert(
@@ -3935,7 +3934,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         assert!(update.as_changed().unwrap().new_best().is_none());
@@ -3959,7 +3958,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered path
         let s2 = source(2, 65002, 65000, 2);
@@ -3974,7 +3973,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         let bests = flat_best(&rt, &Family::IPV4);
         assert_eq!(bests.len(), 1);
@@ -3996,7 +3995,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(rt.collect_loc_rib_paths(&Family::IPV4).is_empty());
     }
@@ -4020,7 +4019,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered best (router_id=2)
         let s2 = source(2, 65002, 65000, 2);
@@ -4035,7 +4034,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered non-best (router_id=3)
         let s3 = source(3, 65003, 65000, 3);
@@ -4050,7 +4049,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // remove s2 (best) → s3 becomes new best
         let (update, _) = rt.remove(s2, Family::IPV4, net, 0, None);
@@ -4075,7 +4074,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // only unfiltered path
         let s2 = source(2, 65002, 65000, 2);
@@ -4090,7 +4089,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // remove s2 → all filtered → withdrawal (best_changed=true, new_best=None)
         let (update, _) = rt.remove(s2, Family::IPV4, net, 0, None);
@@ -4117,7 +4116,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered best
         let s2 = source(2, 65002, 65000, 2);
@@ -4132,7 +4131,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered non-best
         let s3 = source(3, 65003, 65000, 3);
@@ -4147,7 +4146,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // drop s2 → s3 becomes new best
         let (changes, _) = rt.drop(s2.remote_addr, Family::IPV4);
@@ -4174,7 +4173,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // unfiltered best from s2
         let s2 = source(2, 65002, 65000, 2);
@@ -4189,7 +4188,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // drop s1 (filtered) → no best change
         let (changes, _) = rt.drop(s1.remote_addr, Family::IPV4);
@@ -4214,7 +4213,7 @@ mod tests {
             true,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // 1 unfiltered path
         rt.insert(
@@ -4228,7 +4227,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         let s = rt.state(Family::IPV4);
         assert_eq!(s.num_destination, 1);
@@ -4258,7 +4257,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         let best = update.as_changed().unwrap().new_best().unwrap();
@@ -4276,7 +4275,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(update.as_changed().unwrap().best_changed);
         assert_eq!(update.as_changed().unwrap().current_paths.len(), 2);
@@ -4323,7 +4322,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         let original_id = update
             .as_changed()
@@ -4344,7 +4343,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         // Same path_id preserved, replaced_path_id indicates what was replaced
         assert_eq!(
@@ -4374,7 +4373,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         let s1_id = u1.as_changed().unwrap().new_best().unwrap().local_path_id;
         rt.insert(
@@ -4388,7 +4387,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         // Remove s1 → s2 becomes new best; s1_id was the old best
@@ -4426,7 +4425,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             s2.clone(),
@@ -4439,7 +4438,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         let best = flat_best(&rt, &Family::IPV4);
@@ -4476,7 +4475,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         s.mark_stale();
@@ -4507,7 +4506,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         // Mark stale before the fresh route arrives (as GR does after session drop)
@@ -4524,7 +4523,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         let best = flat_best(&rt, &Family::IPV4);
@@ -4552,7 +4551,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         s.mark_stale();
@@ -4584,7 +4583,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             fresh_src.clone(),
@@ -4597,7 +4596,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         stale_src.mark_stale();
@@ -4630,7 +4629,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         s.mark_stale();
@@ -4655,7 +4654,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         let (changes, _) = rt.drop_stale(s.remote_addr, Family::IPV4, None);
@@ -4685,7 +4684,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             fresh_src.clone(),
@@ -4698,7 +4697,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         // Without stale, stale_src wins (lower router_id).
@@ -4750,7 +4749,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         s1.mark_stale();
 
@@ -4780,7 +4779,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         // The stale path from session 1 must be replaced, not accumulated.
@@ -4828,7 +4827,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         s1.mark_stale();
 
@@ -4873,7 +4872,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         rt.insert(
             s1.clone(),
@@ -4886,7 +4885,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         s1.mark_stale();
         assert_eq!(flat_best(&rt, &Family::IPV4).len(), 2);
@@ -4904,7 +4903,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         // id=1 replaced (now fresh), id=2 still stale.
@@ -4935,7 +4934,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         let changes = rt.restale(src.remote_addr, Family::IPV4);
@@ -4974,7 +4973,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(
             update.as_changed().is_none(),
@@ -5012,7 +5011,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(
             update.as_changed().unwrap().best_changed || update.as_changed().unwrap().any_changed,
@@ -5043,7 +5042,7 @@ mod tests {
                 false,
                 false,
                 None,
-                SystemTime::UNIX_EPOCH,
+                0u32,
             );
             assert!(u.as_changed().is_none());
         }
@@ -5059,7 +5058,7 @@ mod tests {
                 false,
                 false,
                 None,
-                SystemTime::UNIX_EPOCH,
+                0u32,
             );
             assert!(u.as_changed().is_none());
         }
@@ -5105,7 +5104,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(
             update.as_changed().unwrap().best_changed || update.as_changed().unwrap().any_changed,
@@ -5136,7 +5135,7 @@ mod tests {
             false,
             false,
             pl,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(
             matches!(result, InsertResult::PrefixLimitExceeded),
@@ -5170,7 +5169,7 @@ mod tests {
             false,
             false,
             Some((max, &counter)),
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert_eq!(counter.load(Ordering::Relaxed), 1);
 
@@ -5186,7 +5185,7 @@ mod tests {
             false,
             false,
             Some((max, &counter)),
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(
             !matches!(result, InsertResult::PrefixLimitExceeded),
@@ -5223,7 +5222,7 @@ mod tests {
                 false,
                 false,
                 Some((max, &counter)),
-                SystemTime::UNIX_EPOCH,
+                0u32,
             );
             assert!(
                 !matches!(result, InsertResult::PrefixLimitExceeded),
@@ -5246,7 +5245,7 @@ mod tests {
             false,
             false,
             Some((max, &counter)),
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
         assert!(matches!(result, InsertResult::PrefixLimitExceeded));
         assert_eq!(counter.load(Ordering::Relaxed), 3);
@@ -5267,7 +5266,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
     }
 
@@ -5449,7 +5448,7 @@ mod tests {
             true, // filtered = true
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
     }
 
@@ -5513,7 +5512,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         let peer = s1.remote_addr;
@@ -5552,7 +5551,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         let peer = s1.remote_addr;
@@ -5588,7 +5587,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         let reaches: Vec<_> = rt.iter_reach(Family::IPV4).collect();
@@ -5795,7 +5794,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
 
         let peer1_addr = peer1.remote_addr;
@@ -5924,7 +5923,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
     }
 
@@ -6014,7 +6013,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
     }
 
@@ -6113,7 +6112,7 @@ mod tests {
             false,
             false,
             None,
-            SystemTime::UNIX_EPOCH,
+            0u32,
         );
     }
 

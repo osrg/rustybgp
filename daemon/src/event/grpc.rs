@@ -1989,7 +1989,7 @@ impl GoBgpService for GrpcService {
             insert_attrs = vpn_attrs;
         }
         let map_nets = insert_nets.clone();
-        let timestamp = std::time::SystemTime::now();
+        let timestamp = crate::proto::unix_secs();
         let source = table::Source::local();
         if let Some(attrs) = insert_attrs {
             for net in insert_nets {
@@ -2032,7 +2032,7 @@ impl GoBgpService for GrpcService {
             .await
             .remove(&id)
             .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "uuid not found"))?;
-        let timestamp = std::time::SystemTime::now();
+        let timestamp = crate::proto::unix_secs();
         let source = table::Source::local();
         for net in nets {
             self.tables
@@ -2277,7 +2277,7 @@ impl GoBgpService for GrpcService {
                 if let Ok((family, nets, attrs, nexthop)) = self.local_path(path)
                     && let Some(attrs) = attrs
                 {
-                    let timestamp = std::time::SystemTime::now();
+                    let timestamp = crate::proto::unix_secs();
                     for net in nets {
                         self.tables.insert_route(
                             source.clone(),
@@ -2349,7 +2349,7 @@ impl GoBgpService for GrpcService {
         self.tables
             .add_vrf(name, rd, import_rt, export_rt, vrf.id)
             .map_err(Error::Table)?;
-        let now = std::time::SystemTime::now();
+        let now = crate::proto::unix_secs();
         for nlri in nlris.into_iter() {
             self.tables.insert_route(
                 table::Source::local(),
@@ -2390,7 +2390,7 @@ impl GoBgpService for GrpcService {
                 }),
             })
             .collect::<Vec<_>>();
-        let now = std::time::SystemTime::now();
+        let now = crate::proto::unix_secs();
         for nlri in nlris.into_iter() {
             self.tables
                 .remove_route(table::Source::local(), Family::RTC, nlri, None, now);

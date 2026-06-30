@@ -15,7 +15,6 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use fnv::{FnvHashMap, FnvHashSet};
 use tokio::sync::mpsc;
@@ -37,7 +36,7 @@ pub(super) struct BmpAdjOut {
     peer_asn: u32,
     peer_id: u32,
     addpath: bool,
-    timestamp: SystemTime,
+    timestamp: u32,
 }
 
 impl BmpAdjOut {
@@ -54,7 +53,7 @@ impl BmpAdjOut {
             peer_asn,
             peer_id,
             addpath,
-            timestamp: SystemTime::now(),
+            timestamp: crate::proto::unix_secs(),
         }
     }
 
@@ -449,7 +448,7 @@ impl NlriSink for AdjOutSink {
         let entry = table::PathEntry {
             source: Arc::clone(source),
             remote_path_id: 0,
-            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            timestamp: 0u32,
             attr,
             validation: None,
             stale: source.is_stale(),

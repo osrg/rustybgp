@@ -555,7 +555,6 @@ mod tests {
     use rustybgp_packet::bgp::Attribute;
     use rustybgp_table::SoftResetPath;
     use std::sync::Arc;
-    use std::time::SystemTime;
 
     fn make_rtc_path(match_type: MatchType) -> SoftResetPath {
         let nlri = Nlri::Rtc(rustybgp_packet::rtc::RtcNlri { match_type });
@@ -566,7 +565,7 @@ mod tests {
             None,
             rustybgp_table::Source::local(),
             Arc::new(vec![]),
-            SystemTime::UNIX_EPOCH,
+            0u32,
         )
     }
 
@@ -653,15 +652,7 @@ mod tests {
             rustybgp_table::PeerRole::Ebgp,
         ));
         src.mark_stale();
-        (
-            Family::RTC,
-            nlri,
-            0,
-            None,
-            src,
-            Arc::new(vec![]),
-            SystemTime::UNIX_EPOCH,
-        )
+        (Family::RTC, nlri, 0, None, src, Arc::new(vec![]), 0u32)
     }
 
     #[test]

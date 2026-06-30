@@ -39,7 +39,7 @@ pub(crate) struct AdjRibInChange {
     pub(crate) nlris: Vec<packet::PathNlri>,
     pub(crate) attrs: Option<Arc<Vec<packet::Attribute>>>,
     pub(crate) nexthop: Option<bgp::Nexthop>,
-    pub(crate) timestamp: std::time::SystemTime,
+    pub(crate) timestamp: u32,
 }
 
 #[derive(Clone)]
@@ -88,7 +88,7 @@ pub(crate) struct AdjRibOutChange {
     pub(crate) nlri: packet::PathNlri,
     pub(crate) attrs: Option<Arc<Vec<packet::Attribute>>>,
     pub(crate) nexthop: Option<bgp::Nexthop>,
-    pub(crate) timestamp: std::time::SystemTime,
+    pub(crate) timestamp: u32,
 }
 
 /// EOR (End-of-RIB) marker received from a peer (RFC 4724 §2).
@@ -308,7 +308,7 @@ impl TableManager {
         nexthop: Option<bgp::Nexthop>,
         attr: Arc<Vec<packet::Attribute>>,
         prefix_limit: Option<(u32, Arc<std::sync::atomic::AtomicU64>)>,
-        timestamp: std::time::SystemTime,
+        timestamp: u32,
     ) -> bool {
         let import_policy = self.import_policy.load_full();
         let kernel_handle = self.kernel_handle.load_full();
@@ -390,7 +390,7 @@ impl TableManager {
         family: Family,
         net: packet::PathNlri,
         prefix_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
-        timestamp: std::time::SystemTime,
+        timestamp: u32,
     ) {
         let kernel_handle = self.kernel_handle.load_full();
         let idx = self.dealer(&net.nlri);
@@ -917,7 +917,7 @@ impl TableManager {
             Some(nexthop),
             attr,
             None,
-            std::time::SystemTime::now(),
+            crate::proto::unix_secs(),
         );
     }
 
@@ -930,7 +930,7 @@ impl TableManager {
             family,
             packet::PathNlri { nlri, path_id: 0 },
             None,
-            std::time::SystemTime::now(),
+            crate::proto::unix_secs(),
         );
     }
 
@@ -1132,7 +1132,7 @@ impl TableShard {
         nets: &[packet::PathNlri],
         attrs: Option<&Arc<Vec<packet::Attribute>>>,
         nexthop: Option<bgp::Nexthop>,
-        timestamp: std::time::SystemTime,
+        timestamp: u32,
     ) {
         let addpath = self.has_addpath(&source.remote_addr, &family);
         for (_, tx) in subs {
@@ -1157,7 +1157,7 @@ impl TableShard {
         nets: &[packet::PathNlri],
         attrs: Option<&Arc<Vec<packet::Attribute>>>,
         nexthop: Option<bgp::Nexthop>,
-        timestamp: std::time::SystemTime,
+        timestamp: u32,
     ) {
         let addpath = self.has_addpath(&source.remote_addr, &family);
         for (_, tx) in subs {
@@ -1244,10 +1244,7 @@ impl TableShard {
                 net: update.net.clone(),
                 attr: best.map(|p| p.attr.clone()),
                 nexthop: best.and_then(|p| p.nexthop),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as u32,
+                timestamp: crate::proto::unix_secs(),
             };
             for (_, tx) in subs {
                 let _ = tx.send(BgpEvent::LocRib(change.clone()));
@@ -1576,7 +1573,7 @@ mod tests {
             Some(packet::bgp::Nexthop::V4(nh)),
             Arc::new(vec![]),
             None,
-            std::time::SystemTime::UNIX_EPOCH,
+            0u32,
         );
     }
 
@@ -1710,7 +1707,7 @@ mod tests {
                 Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
                 attr.clone(),
                 None,
-                std::time::SystemTime::UNIX_EPOCH,
+                0u32,
             );
         }
 
