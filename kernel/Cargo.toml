@@ -1,8 +1,8 @@
 [package]
 name = "rustybgp-kernel"
-version = "0.1.0"
-authors = ["FUJITA Tomonori <fujita.tomonori@gmail.com>"]
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 
 [dependencies]
 rtnetlink = "0.21"

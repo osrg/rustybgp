@@ -3,5 +3,10 @@
 resolver = "2"
 members = ["api", "config", "kernel", "packet", "table", "daemon"]
 
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+authors = ["FUJITA Tomonori <fujita.tomonori@gmail.com>"]
+
 [profile.release]
 lto = true
