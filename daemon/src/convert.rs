@@ -4248,6 +4248,22 @@ pub(crate) fn defined_set_kind_from_api(
     }
 }
 
+/// Extracts `(default_action, policy_names)` from a `PolicyAssignment`, ignoring
+/// its `name`/`direction` fields. Used where the direction is already implied by
+/// context (e.g. `ApplyPolicy.export_policy`) rather than carried in the message.
+pub(crate) fn disposition_and_policies_from_api(
+    req: api::PolicyAssignment,
+) -> (rustybgp_table::Disposition, Vec<String>) {
+    use rustybgp_table::Disposition;
+
+    let default_action = match api::RouteAction::try_from(req.default_action) {
+        Ok(api::RouteAction::Accept) => Disposition::Accept,
+        _ => Disposition::Reject,
+    };
+    let policy_names: Vec<String> = req.policies.into_iter().map(|p| p.name).collect();
+    (default_action, policy_names)
+}
+
 pub(crate) fn policy_assignment_from_api(
     req: api::PolicyAssignment,
 ) -> Result<
@@ -4259,7 +4275,7 @@ pub(crate) fn policy_assignment_from_api(
     ),
     rustybgp_table::TableError,
 > {
-    use rustybgp_table::{Disposition, PolicyDirection, TableError};
+    use rustybgp_table::{PolicyDirection, TableError};
 
     let direction = match api::PolicyDirection::try_from(req.direction) {
         Ok(api::PolicyDirection::Import) => PolicyDirection::Import,
@@ -4270,12 +4286,9 @@ pub(crate) fn policy_assignment_from_api(
             ));
         }
     };
-    let default_action = match api::RouteAction::try_from(req.default_action) {
-        Ok(api::RouteAction::Accept) => Disposition::Accept,
-        _ => Disposition::Reject,
-    };
-    let policy_names: Vec<String> = req.policies.into_iter().map(|p| p.name).collect();
-    Ok((req.name, direction, default_action, policy_names))
+    let name = req.name.clone();
+    let (default_action, policy_names) = disposition_and_policies_from_api(req);
+    Ok((name, direction, default_action, policy_names))
 }
 
 pub(crate) fn routing_table_state_to_api(s: rustybgp_table::TableState) -> api::GetTableResponse {

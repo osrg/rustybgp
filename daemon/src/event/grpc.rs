@@ -411,6 +411,11 @@ impl TryFrom<&api::Peer> for PeerParams {
                 .as_ref()
                 .filter(|t| !t.bind_interface.is_empty())
                 .map(|t| t.bind_interface.clone()),
+            export_policy: p
+                .apply_policy
+                .as_ref()
+                .and_then(|ap| ap.export_policy.clone())
+                .map(convert::disposition_and_policies_from_api),
         })
     }
 }
@@ -1213,6 +1218,23 @@ impl GoBgpService for GrpcService {
         } else {
             Global::BGP_PORT
         };
+        // UpdatePeer declares the peer's full desired state (matches PeerConfig's
+        // full-replace semantics below): a request with no apply-policy.export_policy
+        // clears any existing per-peer override, reverting the peer to the global policy.
+        let export_policy = new_params
+            .export_policy
+            .take()
+            .map(|(disposition, names)| {
+                global.ptable.build_assignment(
+                    None,
+                    &peer_addr.to_string(),
+                    table::PolicyDirection::Export,
+                    disposition,
+                    names,
+                )
+            })
+            .transpose()
+            .map_err(Error::from)?;
 
         let old_password;
         {
@@ -1251,6 +1273,7 @@ impl GoBgpService for GrpcService {
                 neighbor_interface: new_params.neighbor_interface,
                 bind_interface: new_params.bind_interface,
             };
+            peer.state.export_policy.store(export_policy);
 
             if needs_teardown {
                 // Build a fresh ConnArbiter carrying the updated PeerFsm so the
@@ -2456,15 +2479,12 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::DeletePolicyResponse>, tonic::Status> {
         let req = request.into_inner();
         let name = req.policy.map(|p| p.name).unwrap_or_default();
-        let (import, export) = self
-            .global
-            .write()
-            .await
-            .ptable
-            .delete_policy(&name, req.preserve_statements, req.all)
-            .map_err(Error::from)?;
-        self.tables.import_policy.store(import);
-        self.tables.export_policy.store(export);
+        self.global.write().await.delete_policy(
+            self.tables.clone(),
+            &name,
+            req.preserve_statements,
+            req.all,
+        )?;
         Ok(tonic::Response::new(api::DeletePolicyResponse {}))
     }
     type ListPolicyStream = Pin<
@@ -2545,7 +2565,15 @@ impl GoBgpService for GrpcService {
             }
         }
 
-        self.global.write().await.ptable = new_ptable;
+        let mut global = self.global.write().await;
+        global.ptable = new_ptable;
+        // A full policy reload invalidates any per-peer export override built
+        // against the old table; clear all of them rather than leave a peer
+        // holding a stale Arc<PolicyAssignment> disconnected from the new table.
+        for peer in global.peers.values() {
+            peer.state.export_policy.store(None);
+        }
+        drop(global);
         self.tables.import_policy.store(new_import);
         self.tables.export_policy.store(new_export);
         Ok(tonic::Response::new(api::SetPoliciesResponse {}))
@@ -2704,20 +2732,15 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::DeletePolicyAssignmentResponse>, tonic::Status> {
         let req = request.into_inner();
         let assignment = req.assignment.ok_or(Error::EmptyArgument)?;
-        let (_, direction, _, policy_names) =
+        let (name, direction, _, policy_names) =
             convert::policy_assignment_from_api(assignment).map_err(Error::from)?;
-        let updated = self
-            .global
-            .write()
-            .await
-            .ptable
-            .delete_policy_assignment(direction, &policy_names, req.all)
-            .map_err(Error::from)?;
-        if direction == table::PolicyDirection::Import {
-            self.tables.import_policy.store(updated);
-        } else {
-            self.tables.export_policy.store(updated);
-        }
+        self.global.write().await.delete_policy_assignment(
+            self.tables.clone(),
+            name,
+            direction,
+            policy_names,
+            req.all,
+        )?;
         Ok(tonic::Response::new(api::DeletePolicyAssignmentResponse {}))
     }
     type ListPolicyAssignmentStream = Pin<
@@ -2733,16 +2756,42 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::ListPolicyAssignmentRequest>,
     ) -> Result<tonic::Response<Self::ListPolicyAssignmentStream>, tonic::Status> {
         let request = request.into_inner();
-        let v: Vec<api::ListPolicyAssignmentResponse> = self
-            .global
-            .read()
-            .await
-            .ptable
-            .iter_assignments(request.direction)
-            .map(|(dir, pa)| api::ListPolicyAssignmentResponse {
-                assignment: Some(convert::policy_assignment_to_api(pa, dir)),
-            })
-            .collect();
+        let global = self.global.read().await;
+        let v: Vec<api::ListPolicyAssignmentResponse> = if Global::is_global_rib_name(&request.name)
+        {
+            global
+                .ptable
+                .iter_assignments(request.direction)
+                .map(|(dir, pa)| api::ListPolicyAssignmentResponse {
+                    assignment: Some(convert::policy_assignment_to_api(pa, dir)),
+                })
+                .collect()
+        } else {
+            let addr: IpAddr = request.name.parse().map_err(|_| {
+                Error::InvalidArgument(format!("{} is not a valid peer address", request.name))
+            })?;
+            let peer = global
+                .peers
+                .get(&addr)
+                .ok_or_else(|| Error::InvalidArgument(format!("peer {addr} isn't found")))?;
+            // Per-peer policy only supports export; an import-only request has no results.
+            if request.direction == api::PolicyDirection::Import as i32 {
+                Vec::new()
+            } else {
+                peer.state
+                    .export_policy
+                    .load_full()
+                    .map(|pa| api::ListPolicyAssignmentResponse {
+                        assignment: Some(convert::policy_assignment_to_api(
+                            &pa,
+                            api::PolicyDirection::Export as i32,
+                        )),
+                    })
+                    .into_iter()
+                    .collect()
+            }
+        };
+        drop(global);
 
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(async move {

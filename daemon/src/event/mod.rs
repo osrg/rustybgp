@@ -185,6 +185,11 @@ pub(super) struct PeerState {
     remote_holdtime: AtomicU16,
     remote_cap: ArcSwapOption<Vec<packet::Capability>>,
     session_addrs: ArcSwapOption<SessionAddrs>,
+    /// Per-peer export policy override; `None` means "inherit the global export
+    /// policy". Written only by gRPC handlers holding the `Global` write lock
+    /// (never by `PeerSession`); read lock-free from the export hot path via
+    /// `.load_full().or_else(|| self.tables.export_policy.load_full())`.
+    export_policy: ArcSwapOption<table::PolicyAssignment>,
 }
 
 /// Per-peer FSM coordinator.  Created once when `local_router_id` is known
@@ -464,6 +469,15 @@ impl Peer {
             gr_peer_restarting: ctx.gr_state.is_peer_restarting(),
             gr_local_restarting: is_restarting,
         }
+    }
+
+    /// True if this peer's export policy override currently references `name`.
+    /// Used by `Global::delete_policy` to refuse deleting a policy still in use.
+    fn references_policy(&self, name: &str) -> bool {
+        self.state
+            .export_policy
+            .load_full()
+            .is_some_and(|a| a.policies.iter().any(|p| p.name.as_ref() == name))
     }
 
     /// Clears session-negotiated state and connection handles so the peer is
@@ -747,6 +761,15 @@ pub(crate) struct Global {
 impl Global {
     const BGP_PORT: u16 = 179;
 
+    /// Matches GoBGP's `table.GLOBAL_RIB_NAME`: `PolicyAssignment.name` is
+    /// treated as the global assignment when it is either empty or this
+    /// literal; any other value must parse as a peer address.
+    const GLOBAL_RIB_NAME: &'static str = "global";
+
+    fn is_global_rib_name(name: &str) -> bool {
+        name.is_empty() || name == Self::GLOBAL_RIB_NAME
+    }
+
     fn new(
         kernel_event_tx: mpsc::UnboundedSender<kernel::KernelEvent>,
         bfd_event_tx: mpsc::UnboundedSender<crate::bfd::BfdEvent>,
@@ -964,8 +987,21 @@ impl Global {
         {
             params.local_asn = conf.id;
         }
-        // Extract bfd_config before params.build() consumes params.
+        // Extract bfd_config and export_policy before params.build() consumes params.
         let bfd_config = params.bfd_config.take();
+        let export_policy = params
+            .export_policy
+            .take()
+            .map(|(disposition, names)| {
+                self.ptable.build_assignment(
+                    None,
+                    &params.remote_addr.to_string(),
+                    table::PolicyDirection::Export,
+                    disposition,
+                    names,
+                )
+            })
+            .transpose()?;
         let mut peer = params.build(u32::from(self.router_id), self.asn);
         if peer.admin_down {
             peer.state
@@ -974,6 +1010,9 @@ impl Global {
         }
         if let Some(tx) = tx {
             enable_active_connect(&mut peer, tx);
+        }
+        if let Some(export_policy) = export_policy {
+            peer.state.export_policy.store(Some(export_policy));
         }
         let addr = peer.config.remote_addr;
         self.peers.insert(addr, peer);
@@ -989,6 +1028,42 @@ impl Global {
         Ok(())
     }
 
+    /// Deletes a named policy. Refuses (`TableError::StillInUse`) if any assignment
+    /// -- global (import or export) or any peer's per-peer export override --
+    /// still references it; see [[per-peer-policy]] design (a) and GoBGP's
+    /// `DeletePolicy`/`inUse()` (which this mirrors, but checks both directions
+    /// correctly rather than checking EXPORT twice).
+    ///
+    /// `all=true` wipes the entire policy table (all policies/statements/global
+    /// assignments); per-peer export overrides are cleared too so no peer is left
+    /// holding a reference into the now-empty table.
+    pub(super) fn delete_policy(
+        &mut self,
+        tables: Arc<TableManager>,
+        name: &str,
+        preserve_statements: bool,
+        all: bool,
+    ) -> Result<(), Error> {
+        if !all && self.peers.values().any(|p| p.references_policy(name)) {
+            return Err(Error::Table(table::TableError::StillInUse(
+                name.to_string(),
+            )));
+        }
+        let (import, export) = self.ptable.delete_policy(name, preserve_statements, all)?;
+        if all {
+            for peer in self.peers.values() {
+                peer.state.export_policy.store(None);
+            }
+        }
+        tables.import_policy.store(import);
+        tables.export_policy.store(export);
+        Ok(())
+    }
+
+    /// `req.name`: empty or `"global"` means the global assignment (see
+    /// `is_global_rib_name`); otherwise it must parse as a peer address
+    /// (IPv4/IPv6, matching GoBGP's convention), and the assignment applies
+    /// only to that peer's export policy (per-peer import is not supported).
     pub(super) fn add_policy_assignment(
         &mut self,
         tables: Arc<TableManager>,
@@ -996,14 +1071,82 @@ impl Global {
     ) -> Result<(), Error> {
         let (name, direction, default_action, policy_names) =
             convert::policy_assignment_from_api(req)?;
-        let (dir, assignment) =
-            self.ptable
-                .add_assignment(&name, direction, default_action, policy_names)?;
-        if dir == table::PolicyDirection::Import {
-            tables.import_policy.store(Some(Arc::clone(&assignment)));
-        } else {
-            tables.export_policy.store(Some(Arc::clone(&assignment)));
+        if Self::is_global_rib_name(&name) {
+            let (dir, assignment) =
+                self.ptable
+                    .add_assignment(&name, direction, default_action, policy_names)?;
+            if dir == table::PolicyDirection::Import {
+                tables.import_policy.store(Some(Arc::clone(&assignment)));
+            } else {
+                tables.export_policy.store(Some(Arc::clone(&assignment)));
+            }
+            return Ok(());
         }
+        if direction != table::PolicyDirection::Export {
+            return Err(Error::InvalidArgument(
+                "per-peer import policy is not supported".to_string(),
+            ));
+        }
+        let addr: IpAddr = name
+            .parse()
+            .map_err(|_| Error::InvalidArgument(format!("{name} is not a valid peer address")))?;
+        let peer = self
+            .peers
+            .get(&addr)
+            .ok_or_else(|| Error::InvalidArgument(format!("peer {addr} isn't found")))?;
+        let existing = peer.state.export_policy.load_full();
+        let assignment = self.ptable.build_assignment(
+            existing.as_deref(),
+            &name,
+            table::PolicyDirection::Export,
+            default_action,
+            policy_names,
+        )?;
+        peer.state.export_policy.store(Some(assignment));
+        Ok(())
+    }
+
+    /// See `add_policy_assignment` for the `name` convention.
+    pub(super) fn delete_policy_assignment(
+        &mut self,
+        tables: Arc<TableManager>,
+        name: String,
+        direction: table::PolicyDirection,
+        policy_names: Vec<String>,
+        all: bool,
+    ) -> Result<(), Error> {
+        if Self::is_global_rib_name(&name) {
+            let updated = self
+                .ptable
+                .delete_policy_assignment(direction, &policy_names, all)?;
+            if direction == table::PolicyDirection::Import {
+                tables.import_policy.store(updated);
+            } else {
+                tables.export_policy.store(updated);
+            }
+            return Ok(());
+        }
+        if direction != table::PolicyDirection::Export {
+            return Err(Error::InvalidArgument(
+                "per-peer import policy is not supported".to_string(),
+            ));
+        }
+        let addr: IpAddr = name
+            .parse()
+            .map_err(|_| Error::InvalidArgument(format!("{name} is not a valid peer address")))?;
+        let peer = self
+            .peers
+            .get(&addr)
+            .ok_or_else(|| Error::InvalidArgument(format!("peer {addr} isn't found")))?;
+        if all {
+            peer.state.export_policy.store(None);
+            return Ok(());
+        }
+        let existing = peer.state.export_policy.load_full();
+        let old = existing.as_deref().ok_or(table::TableError::NotFound)?;
+        peer.state
+            .export_policy
+            .store(Some(old.without_policies(&policy_names)));
         Ok(())
     }
 
@@ -1503,6 +1646,10 @@ async fn accept_connection(
                 bfd_config: None,
                 neighbor_interface: None,
                 bind_interface: None,
+                // PeerGroup does not carry policy config; dynamic peers inherit
+                // the global export policy (per-peer/peer-group policy inheritance
+                // is not yet supported).
+                export_policy: None,
             };
             let _ = g.add_peer(params, None);
             g.peers.get_mut(&remote_addr).unwrap()
@@ -2268,6 +2415,7 @@ impl PeerSession {
                 remote_holdtime: AtomicU16::new(0),
                 remote_cap: ArcSwapOption::empty(),
                 session_addrs: ArcSwapOption::empty(),
+                export_policy: ArcSwapOption::empty(),
             }),
             counter_tx: Default::default(),
             counter_rx: Default::default(),
@@ -2446,7 +2594,11 @@ impl PeerSession {
                 .iter()
                 .filter_map(|(f, max)| (*max > 1).then_some(*f)),
         );
-        let export_policy = self.tables.export_policy.load_full();
+        let export_policy = self
+            .state
+            .export_policy
+            .load_full()
+            .or_else(|| self.tables.export_policy.load_full());
         let rpki = self.tables.rpki.read().unwrap();
         let (rtc_awaiting_eor, rtc_active) = if self.codec.has_family(Family::RTC) {
             let ctx = self.context.lock().unwrap();
@@ -2566,7 +2718,11 @@ impl PeerSession {
         } else {
             None
         };
-        let export_policy = self.tables.export_policy.load_full();
+        let export_policy = self
+            .state
+            .export_policy
+            .load_full()
+            .or_else(|| self.tables.export_policy.load_full());
         let effective_max = self.effective_max(family);
         let changes = self
             .tables
@@ -3055,7 +3211,11 @@ impl PeerSession {
         let Some(pending) = self.pending.get_mut(&update.family) else {
             return;
         };
-        let export_policy = self.tables.export_policy.load_full();
+        let export_policy = self
+            .state
+            .export_policy
+            .load_full()
+            .or_else(|| self.tables.export_policy.load_full());
         let rpki = export_policy
             .as_deref()
             .filter(|p| p.needs_rpki)
@@ -3712,7 +3872,240 @@ mod tests {
             bfd_config: None,
             neighbor_interface: None,
             bind_interface: None,
+            export_policy: None,
         }
+    }
+
+    /// Adds an unconditional (no-condition) statement/policy pair named `name`
+    /// that always resolves to `disposition`.
+    fn add_simple_policy(g: &mut Global, name: &str, disposition: table::Disposition) {
+        let stmt_name = format!("{name}-stmt");
+        g.ptable
+            .add_statement(
+                &stmt_name,
+                Vec::new(),
+                Some(disposition),
+                table::Actions::default(),
+            )
+            .unwrap();
+        g.ptable.add_policy(name, vec![stmt_name]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_peer_resolves_export_policy_from_params() {
+        let global = make_global();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut g = global.write().await;
+        add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+
+        let mut params = default_peer_params(remote_addr);
+        params.export_policy = Some((table::Disposition::Accept, vec!["p1".to_string()]));
+        g.add_peer(params, None).unwrap();
+
+        let peer = g.peers.get(&remote_addr).unwrap();
+        let assignment = peer.state.export_policy.load_full().unwrap();
+        assert_eq!(assignment.policies.len(), 1);
+        assert_eq!(assignment.policies[0].name.as_ref(), "p1");
+    }
+
+    #[tokio::test]
+    async fn add_peer_without_export_policy_inherits_global() {
+        let global = make_global();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let mut g = global.write().await;
+        g.add_peer(default_peer_params(remote_addr), None).unwrap();
+
+        let peer = g.peers.get(&remote_addr).unwrap();
+        assert!(peer.state.export_policy.load_full().is_none());
+    }
+
+    #[tokio::test]
+    async fn add_peer_rejects_unknown_export_policy_name() {
+        let global = make_global();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+        let mut g = global.write().await;
+
+        let mut params = default_peer_params(remote_addr);
+        params.export_policy = Some((
+            table::Disposition::Accept,
+            vec!["no-such-policy".to_string()],
+        ));
+        assert!(g.add_peer(params, None).is_err());
+        // The peer must not be left half-added when policy resolution fails.
+        assert!(!g.peers.contains_key(&remote_addr));
+    }
+
+    #[tokio::test]
+    async fn add_policy_assignment_per_peer_sets_peer_state() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4));
+        let mut g = global.write().await;
+        add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+        g.add_peer(default_peer_params(remote_addr), None).unwrap();
+
+        g.add_policy_assignment(
+            tables.clone(),
+            api::PolicyAssignment {
+                name: remote_addr.to_string(),
+                direction: api::PolicyDirection::Export as i32,
+                policies: vec![api::Policy {
+                    name: "p1".to_string(),
+                    statements: Vec::new(),
+                }],
+                default_action: api::RouteAction::Accept as i32,
+            },
+        )
+        .unwrap();
+
+        let peer = g.peers.get(&remote_addr).unwrap();
+        let assignment = peer.state.export_policy.load_full().unwrap();
+        assert_eq!(assignment.policies[0].name.as_ref(), "p1");
+        // The global slot must stay untouched by a per-peer assignment.
+        assert!(tables.export_policy.load_full().is_none());
+    }
+
+    #[tokio::test]
+    async fn add_policy_assignment_name_global_is_treated_as_global() {
+        let global = make_global();
+        let tables = make_tables();
+        let mut g = global.write().await;
+        add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+
+        // "global" must not be parsed as a peer address (GoBGP's GLOBAL_RIB_NAME).
+        g.add_policy_assignment(
+            tables.clone(),
+            api::PolicyAssignment {
+                name: "global".to_string(),
+                direction: api::PolicyDirection::Export as i32,
+                policies: vec![api::Policy {
+                    name: "p1".to_string(),
+                    statements: Vec::new(),
+                }],
+                default_action: api::RouteAction::Accept as i32,
+            },
+        )
+        .unwrap();
+
+        let assignment = tables.export_policy.load_full().unwrap();
+        assert_eq!(assignment.policies[0].name.as_ref(), "p1");
+    }
+
+    #[tokio::test]
+    async fn add_policy_assignment_rejects_per_peer_import() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let mut g = global.write().await;
+        add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+        g.add_peer(default_peer_params(remote_addr), None).unwrap();
+
+        let result = g.add_policy_assignment(
+            tables,
+            api::PolicyAssignment {
+                name: remote_addr.to_string(),
+                direction: api::PolicyDirection::Import as i32,
+                policies: vec![api::Policy {
+                    name: "p1".to_string(),
+                    statements: Vec::new(),
+                }],
+                default_action: api::RouteAction::Accept as i32,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn add_policy_assignment_rejects_unknown_peer_address() {
+        let global = make_global();
+        let tables = make_tables();
+        let mut g = global.write().await;
+        add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+
+        let result = g.add_policy_assignment(
+            tables,
+            api::PolicyAssignment {
+                name: "10.0.0.9".to_string(),
+                direction: api::PolicyDirection::Export as i32,
+                policies: vec![api::Policy {
+                    name: "p1".to_string(),
+                    statements: Vec::new(),
+                }],
+                default_action: api::RouteAction::Accept as i32,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_policy_refuses_when_referenced_by_peer() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+        let mut g = global.write().await;
+        add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+        let mut params = default_peer_params(remote_addr);
+        params.export_policy = Some((table::Disposition::Accept, vec!["p1".to_string()]));
+        g.add_peer(params, None).unwrap();
+
+        let result = g.delete_policy(tables, "p1", false, false);
+        assert!(matches!(
+            result,
+            Err(Error::Table(table::TableError::StillInUse(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_policy_succeeds_when_unreferenced() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+        let mut g = global.write().await;
+        add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+        g.add_peer(default_peer_params(remote_addr), None).unwrap();
+
+        g.delete_policy(tables, "p1", false, false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_policy_all_clears_peer_overrides() {
+        let global = make_global();
+        let tables = make_tables();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8));
+        let mut g = global.write().await;
+        add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+        let mut params = default_peer_params(remote_addr);
+        params.export_policy = Some((table::Disposition::Accept, vec!["p1".to_string()]));
+        g.add_peer(params, None).unwrap();
+
+        g.delete_policy(tables, "", false, true).unwrap();
+
+        let peer = g.peers.get(&remote_addr).unwrap();
+        assert!(peer.state.export_policy.load_full().is_none());
+    }
+
+    #[test]
+    fn peer_params_from_config_neighbor_extracts_export_policy() {
+        let mut n = make_minimal_neighbor_config("10.0.0.1");
+        n.apply_policy = Some(config::generate::ApplyPolicy {
+            config: Some(config::generate::ApplyPolicyConfig {
+                export_policy_list: Some(vec!["p1".to_string()]),
+                default_export_policy: Some(config::DefaultPolicyType::RejectRoute),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let params = PeerParams::try_from(&n).unwrap();
+        let (disposition, names) = params.export_policy.unwrap();
+        assert_eq!(disposition, table::Disposition::Reject);
+        assert_eq!(names, vec!["p1".to_string()]);
+    }
+
+    #[test]
+    fn peer_params_from_config_neighbor_without_apply_policy_is_none() {
+        let n = make_minimal_neighbor_config("10.0.0.1");
+        let params = PeerParams::try_from(&n).unwrap();
+        assert!(params.export_policy.is_none());
     }
 
     /// Returns (client_stream, server_stream) connected over loopback.

@@ -1151,6 +1151,23 @@ impl PolicyAssignment {
         }
         self.disposition
     }
+
+    /// Returns a copy of this assignment with `policy_names` removed.
+    pub fn without_policies(&self, policy_names: &[String]) -> Arc<PolicyAssignment> {
+        let policies: Vec<Arc<Policy>> = self
+            .policies
+            .iter()
+            .filter(|p| !policy_names.iter().any(|n| n == p.name.as_ref()))
+            .cloned()
+            .collect();
+        let needs_rpki = Self::compute_needs_rpki(&policies);
+        Arc::new(PolicyAssignment {
+            name: self.name.clone(),
+            disposition: self.disposition,
+            policies,
+            needs_rpki,
+        })
+    }
 }
 
 /// Apply import policy to a received route.
@@ -1225,13 +1242,20 @@ impl PolicyTable {
         Default::default()
     }
 
-    pub fn add_assignment(
-        &mut self,
+    /// Resolve `policy_names` against this table and build a new `PolicyAssignment`.
+    /// When `existing` is given, its policies are appended after validating there is
+    /// no name collision (used by `AddPolicyAssignment` semantics, which accumulate
+    /// across repeated calls rather than replacing). Shared by the global-assignment
+    /// path (`add_assignment`) and the per-peer path in the daemon crate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_assignment(
+        &self,
+        existing: Option<&PolicyAssignment>,
         name: &str,
         direction: PolicyDirection,
         default_action: Disposition,
         policy_names: Vec<String>,
-    ) -> Result<(PolicyDirection, Arc<PolicyAssignment>), TableError> {
+    ) -> Result<Arc<PolicyAssignment>, TableError> {
         let mut v = Vec::new();
         for pname in &policy_names {
             match self.policies.get(pname.as_str()) {
@@ -1258,13 +1282,7 @@ impl PolicyTable {
             }
         }
 
-        let m = match direction {
-            PolicyDirection::Import => &mut self.assignment_import,
-            PolicyDirection::Export => &mut self.assignment_export,
-        };
-
-        let name: Arc<str> = Arc::from(name);
-        if let Some(old) = m.take() {
+        if let Some(old) = existing {
             for p0 in &old.policies {
                 if let Some(p) = v.iter().find(|p1| p0.name == p1.name) {
                     return Err(TableError::InvalidArgument(format!(
@@ -1273,16 +1291,49 @@ impl PolicyTable {
                     )));
                 }
             }
-            v.append(&mut old.policies.to_owned());
+            v.extend(old.policies.iter().cloned());
         }
         let needs_rpki = PolicyAssignment::compute_needs_rpki(&v);
-        let n = Arc::new(PolicyAssignment {
-            name,
+        Ok(Arc::new(PolicyAssignment {
+            name: Arc::from(name),
             policies: v,
             disposition: default_action,
             needs_rpki,
-        });
-        m.replace(n.clone());
+        }))
+    }
+
+    /// Returns true if `name` is referenced by either global assignment (import or export).
+    pub fn policy_in_use_globally(&self, name: &str) -> bool {
+        [&self.assignment_import, &self.assignment_export]
+            .iter()
+            .any(|a| {
+                a.as_ref()
+                    .is_some_and(|a| a.policies.iter().any(|p| p.name.as_ref() == name))
+            })
+    }
+
+    pub fn add_assignment(
+        &mut self,
+        name: &str,
+        direction: PolicyDirection,
+        default_action: Disposition,
+        policy_names: Vec<String>,
+    ) -> Result<(PolicyDirection, Arc<PolicyAssignment>), TableError> {
+        let slot = match direction {
+            PolicyDirection::Import => &self.assignment_import,
+            PolicyDirection::Export => &self.assignment_export,
+        };
+        let n = self.build_assignment(
+            slot.as_deref(),
+            name,
+            direction,
+            default_action,
+            policy_names,
+        )?;
+        match direction {
+            PolicyDirection::Import => self.assignment_import = Some(n.clone()),
+            PolicyDirection::Export => self.assignment_export = Some(n.clone()),
+        }
         Ok((direction, n))
     }
 
@@ -1849,12 +1900,14 @@ impl PolicyTable {
             return Ok((None, None));
         }
 
-        let policy = self.policies.remove(name).ok_or(TableError::NotFound)?;
+        // Global (import/export) in-use check. The daemon crate checks per-peer
+        // assignments before calling this, since PolicyTable has no visibility
+        // into per-peer state. See PeerState.export_policy in the daemon crate.
+        if self.policy_in_use_globally(name) {
+            return Err(TableError::StillInUse(name.to_string()));
+        }
 
-        self.assignment_import =
-            Self::filter_policy_from_assignment(self.assignment_import.take(), name);
-        self.assignment_export =
-            Self::filter_policy_from_assignment(self.assignment_export.take(), name);
+        let policy = self.policies.remove(name).ok_or(TableError::NotFound)?;
 
         if !preserve_statements {
             for stmt in &policy.statements {
@@ -1874,26 +1927,6 @@ impl PolicyTable {
         ))
     }
 
-    fn filter_policy_from_assignment(
-        assignment: Option<Arc<PolicyAssignment>>,
-        policy_name: &str,
-    ) -> Option<Arc<PolicyAssignment>> {
-        let old = assignment?;
-        let policies: Vec<Arc<Policy>> = old
-            .policies
-            .iter()
-            .filter(|p| p.name.as_ref() != policy_name)
-            .cloned()
-            .collect();
-        let needs_rpki = PolicyAssignment::compute_needs_rpki(&policies);
-        Some(Arc::new(PolicyAssignment {
-            name: old.name.clone(),
-            disposition: old.disposition,
-            policies,
-            needs_rpki,
-        }))
-    }
-
     // Returns the updated assignment after removing policies (or None if all=true).
     pub fn delete_policy_assignment(
         &mut self,
@@ -1909,20 +1942,8 @@ impl PolicyTable {
             *field = None;
             return Ok(None);
         }
-        let old = field.take().ok_or(TableError::NotFound)?;
-        let policies: Vec<Arc<Policy>> = old
-            .policies
-            .iter()
-            .filter(|p| !policy_names.iter().any(|n| n == p.name.as_ref()))
-            .cloned()
-            .collect();
-        let needs_rpki = PolicyAssignment::compute_needs_rpki(&policies);
-        let updated = Arc::new(PolicyAssignment {
-            name: old.name.clone(),
-            disposition: old.disposition,
-            policies,
-            needs_rpki,
-        });
+        let old = field.as_ref().ok_or(TableError::NotFound)?;
+        let updated = old.without_policies(policy_names);
         *field = Some(updated.clone());
         Ok(Some(updated))
     }
@@ -1935,25 +1956,8 @@ impl PolicyTable {
         default_action: Disposition,
         policy_names: Vec<String>,
     ) -> Result<Arc<PolicyAssignment>, TableError> {
-        let mut policies = Vec::new();
-        for pname in &policy_names {
-            match self.policies.get(pname.as_str()) {
-                Some(p) => policies.push(p.clone()),
-                None => {
-                    return Err(TableError::InvalidArgument(format!(
-                        "{} policy not found",
-                        pname
-                    )));
-                }
-            }
-        }
-        let needs_rpki = PolicyAssignment::compute_needs_rpki(&policies);
-        let assignment = Arc::new(PolicyAssignment {
-            name: Arc::from(name),
-            disposition: default_action,
-            policies,
-            needs_rpki,
-        });
+        let assignment =
+            self.build_assignment(None, name, direction, default_action, policy_names)?;
         match direction {
             PolicyDirection::Import => self.assignment_import = Some(assignment.clone()),
             PolicyDirection::Export => self.assignment_export = Some(assignment.clone()),

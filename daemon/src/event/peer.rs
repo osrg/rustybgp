@@ -23,6 +23,7 @@ use fnv::FnvHashMap;
 use crate::config;
 use crate::convert;
 use rustybgp_packet::{self as packet, Family};
+use rustybgp_table::Disposition;
 
 use super::*;
 
@@ -142,6 +143,12 @@ pub(crate) struct PeerParams {
     pub(crate) neighbor_interface: Option<String>,
     /// Interface name for binding this peer's TCP socket (primarily a Linux VRF device); None if unused.
     pub(crate) bind_interface: Option<String>,
+    /// Per-peer export policy requested via `apply-policy`; `(default_action, policy_names)`.
+    /// `None` means no per-peer override was requested (peer inherits the global export
+    /// policy). Resolved against the policy table and applied to `PeerState.export_policy`
+    /// by `Global::add_peer`/`update_peer` after `build()`, since resolving policy names
+    /// requires `Global.ptable`, which `build()` does not have access to.
+    pub(crate) export_policy: Option<(Disposition, Vec<String>)>,
 }
 
 impl PeerParams {
@@ -341,6 +348,9 @@ impl PeerParams {
                 remote_holdtime: AtomicU16::new(0),
                 remote_cap: ArcSwapOption::empty(),
                 session_addrs: ArcSwapOption::empty(),
+                // Resolved against the policy table and stored by the caller
+                // (`Global::add_peer`) after insertion; see `PeerParams::export_policy`.
+                export_policy: ArcSwapOption::empty(),
             }),
             counter_tx: Default::default(),
             counter_rx: Default::default(),
@@ -618,6 +628,23 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                 .and_then(|t| t.config.as_ref())
                 .and_then(|c| c.bind_interface.clone())
                 .filter(|s| !s.is_empty()),
+            export_policy: n
+                .apply_policy
+                .as_ref()
+                .and_then(|ap| ap.config.as_ref())
+                .and_then(|c| {
+                    if c.export_policy_list.is_none() && c.default_export_policy.is_none() {
+                        return None;
+                    }
+                    let disposition = match c.default_export_policy {
+                        Some(config::DefaultPolicyType::RejectRoute) => Disposition::Reject,
+                        _ => Disposition::Accept,
+                    };
+                    Some((
+                        disposition,
+                        c.export_policy_list.clone().unwrap_or_default(),
+                    ))
+                }),
         })
     }
 }
