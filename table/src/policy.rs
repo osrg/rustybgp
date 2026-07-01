@@ -16,7 +16,6 @@
 use fnv::FnvHashMap;
 use ip_network_table_deps_treebitmap::IpLookupTable;
 use regex::Regex;
-use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -1381,6 +1380,13 @@ impl PolicyTable {
         v.into_iter()
     }
 
+    /// If no policy named `name` exists, creates it. Otherwise appends the
+    /// given statements to it (GoBGP `Policy.Add` semantics: plain
+    /// concatenation, no dedup) unless the existing policy is in use -- see
+    /// the note on `delete_defined_set` for why appending to an in-use policy
+    /// can't propagate to assignments built before the merge. The daemon
+    /// crate additionally checks per-peer references before calling this,
+    /// since `PolicyTable` has no visibility into per-peer state.
     pub fn add_policy(
         &mut self,
         name: &str,
@@ -1398,113 +1404,174 @@ impl PolicyTable {
                 }
             }
         }
-        let name: Arc<str> = Arc::from(name);
-        match self.policies.entry(name.clone()) {
-            Occupied(_) => Err(TableError::AlreadyExists(format!("{}", name))),
-            Vacant(e) => {
-                e.insert(Arc::new(Policy {
-                    name,
-                    statements: v,
-                }));
-                Ok(())
+        match self.policies.get(name) {
+            None => {
+                self.policies.insert(
+                    Arc::from(name),
+                    Arc::new(Policy {
+                        name: Arc::from(name),
+                        statements: v,
+                    }),
+                );
+            }
+            Some(existing) => {
+                if self.policy_in_use_globally(name) {
+                    return Err(TableError::StillInUse(name.to_string()));
+                }
+                let mut new = (**existing).clone();
+                new.statements.extend(v);
+                self.policies.insert(new.name.clone(), Arc::new(new));
             }
         }
+        Ok(())
     }
 
+    /// If no defined-set named `set`'s name exists, creates it. Otherwise merges
+    /// (GoBGP `Append` semantics: values are unioned, no dedup) unless the
+    /// existing set is in use -- see the note on `delete_defined_set` for why
+    /// merging into an in-use set can't propagate to statements built before
+    /// the merge. To replace an in-use set wholesale instead, use
+    /// `replace_defined_set` (mirrors `AddDefinedSetRequest.replace`).
     pub fn add_defined_set(&mut self, set: DefinedSetConfig) -> Result<(), TableError> {
         match set {
             DefinedSetConfig::Prefix { name, prefixes } => {
-                let arc_name: Arc<str> = Arc::from(name.as_str());
-                if let Vacant(e) = self.prefix_sets.entry(arc_name.clone()) {
-                    let mut zero = None;
-                    let mut zero6 = None;
-                    let mut v4 = IpLookupTable::new();
-                    let mut v6 = IpLookupTable::new();
-                    for p in &prefixes {
-                        match packet::IpNet::from_str(&p.ip_prefix) {
-                            Ok(n) => {
-                                let prefix = Prefix {
-                                    net: n,
-                                    min_length: p.mask_length_min,
-                                    max_length: p.mask_length_max,
-                                };
-
-                                match &prefix.net {
-                                    packet::IpNet::V4(net) => {
-                                        if net.addr == Ipv4Addr::new(0, 0, 0, 0) && net.mask == 0 {
-                                            zero = Some((prefix.min_length, prefix.max_length));
-                                        } else {
-                                            v4.insert(net.addr, net.mask as u32, prefix);
-                                        }
-                                    }
-                                    packet::IpNet::V6(net) => {
-                                        if net.addr == Ipv6Addr::UNSPECIFIED && net.mask == 0 {
-                                            zero6 = Some((prefix.min_length, prefix.max_length));
-                                        } else {
-                                            v6.insert(net.addr, net.mask as u32, prefix);
-                                        }
-                                    }
-                                }
+                let mut zero = None;
+                let mut zero6 = None;
+                let mut new_v4 = Vec::new();
+                let mut new_v6 = Vec::new();
+                for p in &prefixes {
+                    let net = packet::IpNet::from_str(&p.ip_prefix).map_err(|_| {
+                        TableError::InvalidArgument(format!(
+                            "invalid prefix format {:?}",
+                            p.ip_prefix
+                        ))
+                    })?;
+                    let prefix = Prefix {
+                        net: net.clone(),
+                        min_length: p.mask_length_min,
+                        max_length: p.mask_length_max,
+                    };
+                    match &net {
+                        packet::IpNet::V4(n) => {
+                            if n.addr == Ipv4Addr::new(0, 0, 0, 0) && n.mask == 0 {
+                                zero = Some((prefix.min_length, prefix.max_length));
+                            } else {
+                                new_v4.push((n.addr, n.mask as u32, prefix));
                             }
-                            Err(_) => {
-                                return Err(TableError::InvalidArgument(format!(
-                                    "invalid prefix format {:?}",
-                                    p.ip_prefix
-                                )));
+                        }
+                        packet::IpNet::V6(n) => {
+                            if n.addr == Ipv6Addr::UNSPECIFIED && n.mask == 0 {
+                                zero6 = Some((prefix.min_length, prefix.max_length));
+                            } else {
+                                new_v6.push((n.addr, n.mask as u32, prefix));
                             }
                         }
                     }
-                    if v4.is_empty() && v6.is_empty() && zero.is_none() && zero6.is_none() {
-                        return Err(TableError::InvalidArgument(
-                            "empty prefix defined-type".to_string(),
-                        ));
-                    } else {
-                        e.insert(Arc::new(PrefixSet {
-                            v4,
-                            v6,
-                            zero,
-                            zero6,
-                        }));
-                        return Ok(());
+                }
+                match self.prefix_sets.get(name.as_str()) {
+                    None => {
+                        if new_v4.is_empty()
+                            && new_v6.is_empty()
+                            && zero.is_none()
+                            && zero6.is_none()
+                        {
+                            return Err(TableError::InvalidArgument(
+                                "empty prefix defined-type".to_string(),
+                            ));
+                        }
+                        let mut v4 = IpLookupTable::new();
+                        let mut v6 = IpLookupTable::new();
+                        for (addr, mask, p) in new_v4 {
+                            v4.insert(addr, mask, p);
+                        }
+                        for (addr, mask, p) in new_v6 {
+                            v6.insert(addr, mask, p);
+                        }
+                        self.prefix_sets.insert(
+                            Arc::from(name.as_str()),
+                            Arc::new(PrefixSet {
+                                v4,
+                                v6,
+                                zero,
+                                zero6,
+                            }),
+                        );
+                    }
+                    Some(existing) => {
+                        self.reject_if_prefix_set_in_use(&name)?;
+                        let mut v4 = IpLookupTable::new();
+                        let mut v6 = IpLookupTable::new();
+                        for (addr, mask, p) in existing.v4.iter() {
+                            v4.insert(addr, mask, p.clone());
+                        }
+                        for (addr, mask, p) in existing.v6.iter() {
+                            v6.insert(addr, mask, p.clone());
+                        }
+                        for (addr, mask, p) in new_v4 {
+                            v4.insert(addr, mask, p);
+                        }
+                        for (addr, mask, p) in new_v6 {
+                            v6.insert(addr, mask, p);
+                        }
+                        let zero = zero.or(existing.zero);
+                        let zero6 = zero6.or(existing.zero6);
+                        self.prefix_sets.insert(
+                            Arc::from(name.as_str()),
+                            Arc::new(PrefixSet {
+                                v4,
+                                v6,
+                                zero,
+                                zero6,
+                            }),
+                        );
                     }
                 }
-                Err(TableError::AlreadyExists(name))
+                Ok(())
             }
             DefinedSetConfig::Neighbor { name, neighbors } => {
-                let arc_name: Arc<str> = Arc::from(name.as_str());
-                let mut v = Vec::with_capacity(neighbors.len());
+                let mut new_v = Vec::with_capacity(neighbors.len());
                 for n in &neighbors {
-                    match packet::IpNet::from_str(n) {
-                        Ok(addr) => {
-                            v.push(addr);
+                    let addr = packet::IpNet::from_str(n).map_err(|_| {
+                        TableError::InvalidArgument(format!("invalid neighbor format {:?}", n))
+                    })?;
+                    new_v.push(addr);
+                }
+                let sets = match self.neighbor_sets.get(name.as_str()) {
+                    None => {
+                        if new_v.is_empty() {
+                            return Err(TableError::InvalidArgument(
+                                "empty neighbor defined-type".to_string(),
+                            ));
                         }
-                        Err(_) => {
-                            return Err(TableError::InvalidArgument(format!(
-                                "invalid neighbor format {:?}",
-                                n
-                            )));
-                        }
+                        new_v
                     }
-                }
-                if v.is_empty() {
-                    return Err(TableError::InvalidArgument(
-                        "empty neighbor defined-type".to_string(),
-                    ));
-                } else if let Vacant(e) = self.neighbor_sets.entry(arc_name) {
-                    e.insert(Arc::new(NeighborSet { sets: v }));
-                    return Ok(());
-                }
-                Err(TableError::AlreadyExists(name))
+                    Some(existing) => {
+                        for stmt in self.statements.values() {
+                            if stmt
+                                .conditions
+                                .iter()
+                                .any(|c| matches!(c, Condition::Neighbor(n, ..) if n == &name))
+                            {
+                                return Err(TableError::StillInUse(name));
+                            }
+                        }
+                        let mut sets = existing.sets.clone();
+                        sets.extend(new_v);
+                        sets
+                    }
+                };
+                self.neighbor_sets
+                    .insert(Arc::from(name.as_str()), Arc::new(NeighborSet { sets }));
+                Ok(())
             }
             DefinedSetConfig::AsPath { name, patterns } => {
-                let arc_name: Arc<str> = Arc::from(name.as_str());
-                let mut v0 = Vec::with_capacity(patterns.len());
-                let mut v1 = Vec::with_capacity(patterns.len());
+                let mut new_single = Vec::with_capacity(patterns.len());
+                let mut new_regex = Vec::with_capacity(patterns.len());
                 for n in &patterns {
-                    if let Some(n) = SingleAsPathMatch::new(n) {
-                        v0.push(n);
-                    } else if let Ok(n) = Regex::new(&n.replace('_', "(^|[,{}() ]|$)")) {
-                        v1.push(n);
+                    if let Some(m) = SingleAsPathMatch::new(n) {
+                        new_single.push(m);
+                    } else if let Ok(r) = Regex::new(&n.replace('_', "(^|[,{}() ]|$)")) {
+                        new_regex.push(r);
                     } else {
                         return Err(TableError::InvalidArgument(format!(
                             "invalid aspath format {:?}",
@@ -1512,93 +1579,245 @@ impl PolicyTable {
                         )));
                     }
                 }
-                if !v0.is_empty() || !v1.is_empty() {
-                    if let Vacant(e) = self.aspath_sets.entry(arc_name) {
-                        e.insert(Arc::new(AsPathSet {
-                            single_sets: v0,
-                            sets: v1,
-                        }));
-                        return Ok(());
+                let (single_sets, sets) = match self.aspath_sets.get(name.as_str()) {
+                    None => {
+                        if new_single.is_empty() && new_regex.is_empty() {
+                            return Err(TableError::InvalidArgument(
+                                "empty aspath defined-type".to_string(),
+                            ));
+                        }
+                        (new_single, new_regex)
                     }
-                } else {
-                    return Err(TableError::InvalidArgument(
-                        "empty aspath defined-type".to_string(),
-                    ));
-                }
-                Err(TableError::AlreadyExists(name))
+                    Some(existing) => {
+                        for stmt in self.statements.values() {
+                            if stmt
+                                .conditions
+                                .iter()
+                                .any(|c| matches!(c, Condition::AsPath(n, ..) if n == &name))
+                            {
+                                return Err(TableError::StillInUse(name));
+                            }
+                        }
+                        let mut single_sets = existing.single_sets.clone();
+                        single_sets.extend(new_single);
+                        let mut sets = existing.sets.to_vec();
+                        sets.extend(new_regex);
+                        (single_sets, sets)
+                    }
+                };
+                self.aspath_sets.insert(
+                    Arc::from(name.as_str()),
+                    Arc::new(AsPathSet { single_sets, sets }),
+                );
+                Ok(())
             }
             DefinedSetConfig::Community { name, patterns } => {
-                let arc_name: Arc<str> = Arc::from(name.as_str());
-                let mut v = Vec::with_capacity(patterns.len());
+                let mut new_v = Vec::with_capacity(patterns.len());
                 for n in &patterns {
-                    if let Ok(n) = parse_community(n) {
-                        v.push(n);
-                    } else {
-                        return Err(TableError::InvalidArgument(format!(
-                            "invalid community format {:?}",
-                            n
-                        )));
+                    new_v.push(parse_community(n).map_err(|_| {
+                        TableError::InvalidArgument(format!("invalid community format {:?}", n))
+                    })?);
+                }
+                let sets = match self.community_sets.get(name.as_str()) {
+                    None => {
+                        if new_v.is_empty() {
+                            return Err(TableError::InvalidArgument(
+                                "empty community defined-type".to_string(),
+                            ));
+                        }
+                        new_v
                     }
-                }
-                if v.is_empty() {
-                    return Err(TableError::InvalidArgument(
-                        "empty community defined-type".to_string(),
-                    ));
-                } else if let Vacant(e) = self.community_sets.entry(arc_name) {
-                    e.insert(Arc::new(CommunitySet { sets: v }));
-                    return Ok(());
-                }
-                Err(TableError::AlreadyExists(name))
+                    Some(existing) => {
+                        for stmt in self.statements.values() {
+                            if stmt
+                                .conditions
+                                .iter()
+                                .any(|c| matches!(c, Condition::Community(n, ..) if n == &name))
+                            {
+                                return Err(TableError::StillInUse(name));
+                            }
+                        }
+                        let mut sets = existing.sets.to_vec();
+                        sets.extend(new_v);
+                        sets
+                    }
+                };
+                self.community_sets
+                    .insert(Arc::from(name.as_str()), Arc::new(CommunitySet { sets }));
+                Ok(())
             }
             DefinedSetConfig::ExtCommunity { name, patterns } => {
-                let arc_name: Arc<str> = Arc::from(name.as_str());
-                let mut v = Vec::with_capacity(patterns.len());
+                let mut new_v = Vec::with_capacity(patterns.len());
                 for n in &patterns {
-                    match Regex::new(n) {
-                        Ok(r) => v.push(r),
-                        Err(_) => {
-                            return Err(TableError::InvalidArgument(format!(
-                                "invalid ext-community regex {:?}",
-                                n
-                            )));
+                    new_v.push(Regex::new(n).map_err(|_| {
+                        TableError::InvalidArgument(format!("invalid ext-community regex {:?}", n))
+                    })?);
+                }
+                let sets =
+                    match self.ext_community_sets.get(name.as_str()) {
+                        None => {
+                            if new_v.is_empty() {
+                                return Err(TableError::InvalidArgument(
+                                    "empty ext-community defined-type".to_string(),
+                                ));
+                            }
+                            new_v
                         }
-                    }
-                }
-                if v.is_empty() {
-                    return Err(TableError::InvalidArgument(
-                        "empty ext-community defined-type".to_string(),
-                    ));
-                } else if let Vacant(e) = self.ext_community_sets.entry(arc_name) {
-                    e.insert(Arc::new(ExtCommunitySet { sets: v }));
-                    return Ok(());
-                }
-                Err(TableError::AlreadyExists(name))
+                        Some(existing) => {
+                            for stmt in self.statements.values() {
+                                if stmt.conditions.iter().any(
+                                    |c| matches!(c, Condition::ExtCommunity(n, ..) if n == &name),
+                                ) {
+                                    return Err(TableError::StillInUse(name));
+                                }
+                            }
+                            let mut sets = existing.sets.to_vec();
+                            sets.extend(new_v);
+                            sets
+                        }
+                    };
+                self.ext_community_sets
+                    .insert(Arc::from(name.as_str()), Arc::new(ExtCommunitySet { sets }));
+                Ok(())
             }
             DefinedSetConfig::LargeCommunity { name, patterns } => {
-                let arc_name: Arc<str> = Arc::from(name.as_str());
-                let mut v = Vec::with_capacity(patterns.len());
+                let mut new_v = Vec::with_capacity(patterns.len());
                 for n in &patterns {
-                    match Regex::new(n) {
-                        Ok(r) => v.push(r),
-                        Err(_) => {
-                            return Err(TableError::InvalidArgument(format!(
-                                "invalid large-community regex {:?}",
-                                n
-                            )));
+                    new_v.push(Regex::new(n).map_err(|_| {
+                        TableError::InvalidArgument(format!(
+                            "invalid large-community regex {:?}",
+                            n
+                        ))
+                    })?);
+                }
+                let sets = match self.large_community_sets.get(name.as_str()) {
+                    None => {
+                        if new_v.is_empty() {
+                            return Err(TableError::InvalidArgument(
+                                "empty large-community defined-type".to_string(),
+                            ));
                         }
+                        new_v
                     }
-                }
-                if v.is_empty() {
-                    return Err(TableError::InvalidArgument(
-                        "empty large-community defined-type".to_string(),
-                    ));
-                } else if let Vacant(e) = self.large_community_sets.entry(arc_name) {
-                    e.insert(Arc::new(LargeCommunitySet { sets: v }));
-                    return Ok(());
-                }
-                Err(TableError::AlreadyExists(name))
+                    Some(existing) => {
+                        for stmt in self.statements.values() {
+                            if stmt.conditions.iter().any(
+                                |c| matches!(c, Condition::LargeCommunity(n, ..) if n == &name),
+                            ) {
+                                return Err(TableError::StillInUse(name));
+                            }
+                        }
+                        let mut sets = existing.sets.to_vec();
+                        sets.extend(new_v);
+                        sets
+                    }
+                };
+                self.large_community_sets.insert(
+                    Arc::from(name.as_str()),
+                    Arc::new(LargeCommunitySet { sets }),
+                );
+                Ok(())
             }
         }
+    }
+
+    fn reject_if_prefix_set_in_use(&self, name: &str) -> Result<(), TableError> {
+        for stmt in self.statements.values() {
+            if stmt
+                .conditions
+                .iter()
+                .any(|c| matches!(c, Condition::Prefix(n, ..) if n == name))
+            {
+                return Err(TableError::StillInUse(name.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Unconditionally replaces the named defined-set (mirrors
+    /// `AddDefinedSetRequest.replace`), or creates it if absent. Rejects an
+    /// in-use target for the same reason `delete_defined_set`/the merge path of
+    /// `add_defined_set` do.
+    pub fn replace_defined_set(&mut self, set: DefinedSetConfig) -> Result<(), TableError> {
+        match &set {
+            DefinedSetConfig::Prefix { name, .. } => self.reject_if_prefix_set_in_use(name)?,
+            DefinedSetConfig::Neighbor { name, .. } => {
+                for stmt in self.statements.values() {
+                    if stmt
+                        .conditions
+                        .iter()
+                        .any(|c| matches!(c, Condition::Neighbor(n, ..) if n == name))
+                    {
+                        return Err(TableError::StillInUse(name.clone()));
+                    }
+                }
+            }
+            DefinedSetConfig::AsPath { name, .. } => {
+                for stmt in self.statements.values() {
+                    if stmt
+                        .conditions
+                        .iter()
+                        .any(|c| matches!(c, Condition::AsPath(n, ..) if n == name))
+                    {
+                        return Err(TableError::StillInUse(name.clone()));
+                    }
+                }
+            }
+            DefinedSetConfig::Community { name, .. } => {
+                for stmt in self.statements.values() {
+                    if stmt
+                        .conditions
+                        .iter()
+                        .any(|c| matches!(c, Condition::Community(n, ..) if n == name))
+                    {
+                        return Err(TableError::StillInUse(name.clone()));
+                    }
+                }
+            }
+            DefinedSetConfig::ExtCommunity { name, .. } => {
+                for stmt in self.statements.values() {
+                    if stmt
+                        .conditions
+                        .iter()
+                        .any(|c| matches!(c, Condition::ExtCommunity(n, ..) if n == name))
+                    {
+                        return Err(TableError::StillInUse(name.clone()));
+                    }
+                }
+            }
+            DefinedSetConfig::LargeCommunity { name, .. } => {
+                for stmt in self.statements.values() {
+                    if stmt
+                        .conditions
+                        .iter()
+                        .any(|c| matches!(c, Condition::LargeCommunity(n, ..) if n == name))
+                    {
+                        return Err(TableError::StillInUse(name.clone()));
+                    }
+                }
+            }
+        }
+        match &set {
+            DefinedSetConfig::Prefix { name, .. } => {
+                self.prefix_sets.remove(name.as_str());
+            }
+            DefinedSetConfig::Neighbor { name, .. } => {
+                self.neighbor_sets.remove(name.as_str());
+            }
+            DefinedSetConfig::AsPath { name, .. } => {
+                self.aspath_sets.remove(name.as_str());
+            }
+            DefinedSetConfig::Community { name, .. } => {
+                self.community_sets.remove(name.as_str());
+            }
+            DefinedSetConfig::ExtCommunity { name, .. } => {
+                self.ext_community_sets.remove(name.as_str());
+            }
+            DefinedSetConfig::LargeCommunity { name, .. } => {
+                self.large_community_sets.remove(name.as_str());
+            }
+        }
+        self.add_defined_set(set)
     }
 
     pub fn iter_defined_sets(&self) -> impl Iterator<Item = DefinedSetRef<'_>> + '_ {
@@ -1632,6 +1851,12 @@ impl PolicyTable {
             )
     }
 
+    /// If no statement named `name` exists, creates it. Otherwise merges
+    /// (GoBGP `Statement.mod(ADD, ...)` semantics: each condition/action/
+    /// disposition *kind* is added if not already set on the existing
+    /// statement, and errors if it is) unless the existing statement is in
+    /// use -- see the note on `delete_defined_set` for why merging into an
+    /// in-use statement can't propagate to policies built before the merge.
     pub fn add_statement(
         &mut self,
         name: &str,
@@ -1639,9 +1864,6 @@ impl PolicyTable {
         disposition: Option<Disposition>,
         actions: Actions,
     ) -> Result<(), TableError> {
-        if self.statements.contains_key(name) {
-            return Err(TableError::AlreadyExists(name.to_string()));
-        }
         let mut v = Vec::new();
         for cond in conditions {
             match cond {
@@ -1750,13 +1972,71 @@ impl PolicyTable {
                 }
             }
         }
-        let s = Statement {
-            name: Arc::from(name),
-            conditions: v,
-            disposition,
-            actions,
+        let Some(existing) = self.statements.get(name) else {
+            let s = Statement {
+                name: Arc::from(name),
+                conditions: v,
+                disposition,
+                actions,
+            };
+            self.statements.insert(s.name.clone(), Arc::new(s));
+            return Ok(());
         };
-        self.statements.insert(s.name.clone(), Arc::new(s));
+
+        for policy in self.policies.values() {
+            if policy.statements.iter().any(|s| s.name.as_ref() == name) {
+                return Err(TableError::StillInUse(name.to_string()));
+            }
+        }
+
+        let mut new = (**existing).clone();
+        for cond in v {
+            if new
+                .conditions
+                .iter()
+                .any(|c| std::mem::discriminant(c) == std::mem::discriminant(&cond))
+            {
+                return Err(TableError::InvalidArgument(format!(
+                    "condition is already set in statement {}",
+                    name
+                )));
+            }
+            new.conditions.push(cond);
+        }
+
+        if disposition.is_some() {
+            if new.disposition.is_some() {
+                return Err(TableError::InvalidArgument(format!(
+                    "route action is already set in statement {}",
+                    name
+                )));
+            }
+            new.disposition = disposition;
+        }
+
+        macro_rules! add_action {
+            ($field:ident, $label:literal) => {
+                if actions.$field.is_some() {
+                    if new.actions.$field.is_some() {
+                        return Err(TableError::InvalidArgument(format!(
+                            "{} action is already set in statement {}",
+                            $label, name
+                        )));
+                    }
+                    new.actions.$field = actions.$field;
+                }
+            };
+        }
+        add_action!(nexthop, "nexthop");
+        add_action!(community, "community");
+        add_action!(local_pref, "local-pref");
+        add_action!(med, "med");
+        add_action!(as_prepend, "as-prepend");
+        add_action!(ext_community, "ext-community");
+        add_action!(large_community, "large-community");
+        add_action!(origin, "origin");
+
+        self.statements.insert(new.name.clone(), Arc::new(new));
         Ok(())
     }
 
@@ -4275,6 +4555,200 @@ mod tests {
             .unwrap();
 
         let result = ptable.delete_policy("pol1", false, false, vec!["st1".to_string()]);
+        assert!(matches!(result, Err(TableError::StillInUse(_))));
+    }
+
+    fn one_prefix_set(name: &str, ip_prefix: &str) -> DefinedSetConfig {
+        DefinedSetConfig::Prefix {
+            name: name.to_string(),
+            prefixes: vec![PrefixConfig {
+                ip_prefix: ip_prefix.to_string(),
+                mask_length_min: 24,
+                mask_length_max: 24,
+            }],
+        }
+    }
+
+    #[test]
+    fn add_defined_set_merges_into_existing() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(one_prefix_set("ps1", "10.0.0.0/24"))
+            .unwrap();
+        ptable
+            .add_defined_set(one_prefix_set("ps1", "10.1.0.0/24"))
+            .unwrap();
+
+        let set = prefix_set_by_name(&ptable, "ps1");
+        assert!(set.v4.exact_match(Ipv4Addr::new(10, 0, 0, 0), 24).is_some());
+        assert!(set.v4.exact_match(Ipv4Addr::new(10, 1, 0, 0), 24).is_some());
+    }
+
+    #[test]
+    fn add_defined_set_rejects_merge_when_in_use() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(one_prefix_set("ps1", "10.0.0.0/24"))
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::PrefixSet(
+                    "ps1".to_string(),
+                    MatchOption::Any,
+                )],
+                Some(Disposition::Reject),
+                Actions::default(),
+            )
+            .unwrap();
+
+        let result = ptable.add_defined_set(one_prefix_set("ps1", "10.1.0.0/24"));
+        assert!(matches!(result, Err(TableError::StillInUse(_))));
+    }
+
+    #[test]
+    fn replace_defined_set_overwrites_existing() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(one_prefix_set("ps1", "10.0.0.0/24"))
+            .unwrap();
+
+        ptable
+            .replace_defined_set(one_prefix_set("ps1", "10.1.0.0/24"))
+            .unwrap();
+
+        let set = prefix_set_by_name(&ptable, "ps1");
+        assert!(set.v4.exact_match(Ipv4Addr::new(10, 0, 0, 0), 24).is_none());
+        assert!(set.v4.exact_match(Ipv4Addr::new(10, 1, 0, 0), 24).is_some());
+    }
+
+    #[test]
+    fn replace_defined_set_rejects_when_in_use() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(one_prefix_set("ps1", "10.0.0.0/24"))
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::PrefixSet(
+                    "ps1".to_string(),
+                    MatchOption::Any,
+                )],
+                Some(Disposition::Reject),
+                Actions::default(),
+            )
+            .unwrap();
+
+        let result = ptable.replace_defined_set(one_prefix_set("ps1", "10.1.0.0/24"));
+        assert!(matches!(result, Err(TableError::StillInUse(_))));
+        let set = prefix_set_by_name(&ptable, "ps1");
+        assert!(
+            set.v4.exact_match(Ipv4Addr::new(10, 0, 0, 0), 24).is_some(),
+            "rejected replace must leave the original set intact"
+        );
+    }
+
+    #[test]
+    fn add_statement_merges_new_condition_kind() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::LocalPrefEq(100)],
+                Some(Disposition::Reject),
+                Actions::default(),
+            )
+            .unwrap();
+
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::MedEq(50)],
+                None,
+                Actions::default(),
+            )
+            .unwrap();
+
+        let stmt = ptable.statements.get("st1").unwrap();
+        assert_eq!(stmt.conditions.len(), 2);
+    }
+
+    #[test]
+    fn add_statement_errors_when_kind_already_set() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::LocalPrefEq(100)],
+                Some(Disposition::Reject),
+                Actions::default(),
+            )
+            .unwrap();
+
+        let result = ptable.add_statement(
+            "st1",
+            vec![ConditionConfig::LocalPrefEq(200)],
+            None,
+            Actions::default(),
+        );
+        assert!(matches!(result, Err(TableError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn add_statement_rejects_merge_when_in_use() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement("st1", vec![], Some(Disposition::Reject), Actions::default())
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+
+        let result = ptable.add_statement(
+            "st1",
+            vec![ConditionConfig::LocalPrefEq(100)],
+            None,
+            Actions::default(),
+        );
+        assert!(matches!(result, Err(TableError::StillInUse(_))));
+    }
+
+    #[test]
+    fn add_policy_appends_statements() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement("st1", vec![], Some(Disposition::Reject), Actions::default())
+            .unwrap();
+        ptable
+            .add_statement("st2", vec![], Some(Disposition::Accept), Actions::default())
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+
+        ptable.add_policy("pol1", vec!["st2".to_string()]).unwrap();
+
+        let pol = ptable.policies.get("pol1").unwrap();
+        assert_eq!(pol.statements.len(), 2);
+    }
+
+    #[test]
+    fn add_policy_rejects_merge_when_in_use() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement("st1", vec![], Some(Disposition::Reject), Actions::default())
+            .unwrap();
+        ptable
+            .add_statement("st2", vec![], Some(Disposition::Accept), Actions::default())
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+
+        let result = ptable.add_policy("pol1", vec!["st2".to_string()]);
         assert!(matches!(result, Err(TableError::StillInUse(_))));
     }
 }

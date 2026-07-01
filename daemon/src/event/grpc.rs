@@ -2462,16 +2462,11 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddPolicyRequest>,
     ) -> Result<tonic::Response<api::AddPolicyResponse>, tonic::Status> {
         let policy = request.into_inner().policy.ok_or(Error::EmptyArgument)?;
-        self.global
-            .write()
-            .await
-            .ptable
-            .add_policy(
-                &policy.name,
-                policy.statements.into_iter().map(|s| s.name).collect(),
-            )
-            .map_err(Error::from)
-            .map(|_| Ok(tonic::Response::new(api::AddPolicyResponse {})))?
+        self.global.write().await.add_policy(
+            &policy.name,
+            policy.statements.into_iter().map(|s| s.name).collect(),
+        )?;
+        Ok(tonic::Response::new(api::AddPolicyResponse {}))
     }
     async fn delete_policy(
         &self,
@@ -2537,14 +2532,23 @@ impl GoBgpService for GrpcService {
             new_ptable.add_defined_set(set).map_err(Error::from)?;
         }
 
+        let mut added_statements = std::collections::HashSet::new();
         for policy in &req.policies {
             for stmt in &policy.statements {
+                // The same statement may appear in multiple policies; add it once
+                // -- add_statement now merges into an existing statement rather
+                // than erroring, which would wrongly duplicate its conditions/
+                // actions if called again with the same payload.
+                if !added_statements.insert(stmt.name.clone()) {
+                    continue;
+                }
                 let conditions =
                     convert::conditions_from_api(stmt.conditions.clone()).map_err(Error::from)?;
                 let (disposition, actions) =
                     convert::disposition_from_api(stmt.actions.clone()).map_err(Error::from)?;
-                // Ignore AlreadyExists: the same statement may appear in multiple policies.
-                let _ = new_ptable.add_statement(&stmt.name, conditions, disposition, actions);
+                new_ptable
+                    .add_statement(&stmt.name, conditions, disposition, actions)
+                    .map_err(Error::from)?;
             }
             let stmt_names = policy.statements.iter().map(|s| s.name.clone()).collect();
             new_ptable
@@ -2584,18 +2588,19 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::AddDefinedSetRequest>,
     ) -> Result<tonic::Response<api::AddDefinedSetResponse>, tonic::Status> {
-        let set = request
-            .into_inner()
-            .defined_set
-            .ok_or(Error::EmptyArgument)?;
+        let req = request.into_inner();
+        let set = req.defined_set.ok_or(Error::EmptyArgument)?;
         let set = convert::defined_set_from_api(set).map_err(Error::from)?;
-        self.global
-            .write()
-            .await
-            .ptable
-            .add_defined_set(set)
-            .map_err(Error::from)
-            .map(|_| Ok(tonic::Response::new(api::AddDefinedSetResponse {})))?
+        let mut global = self.global.write().await;
+        if req.replace {
+            global
+                .ptable
+                .replace_defined_set(set)
+                .map_err(Error::from)?;
+        } else {
+            global.ptable.add_defined_set(set).map_err(Error::from)?;
+        }
+        Ok(tonic::Response::new(api::AddDefinedSetResponse {}))
     }
     async fn delete_defined_set(
         &self,

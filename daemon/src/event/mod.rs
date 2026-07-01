@@ -1028,15 +1028,14 @@ impl Global {
         Ok(())
     }
 
-    /// Deletes a named policy. Refuses (`TableError::StillInUse`) if any assignment
-    /// -- global (import or export) or any peer's per-peer export override --
-    /// still references it; see [[per-peer-policy]] design (a) and GoBGP's
-    /// `DeletePolicy`/`inUse()` (which this mirrors, but checks both directions
-    /// correctly rather than checking EXPORT twice).
-    ///
-    /// `all=true` wipes the entire policy table (all policies/statements/global
-    /// assignments); per-peer export overrides are cleared too so no peer is left
-    /// holding a reference into the now-empty table.
+    /// Deletes (`all=true`) or partially edits (`all=false`, removing the given
+    /// statement names) a named policy. Refuses (`TableError::StillInUse`) if any
+    /// assignment -- global (import or export) or any peer's per-peer export
+    /// override -- still references it; see [[per-peer-policy]] design (a) and
+    /// GoBGP's `DeletePolicy`/`inUse()` (which this mirrors, but checks both
+    /// directions correctly rather than checking EXPORT twice, and -- unlike
+    /// GoBGP -- also rejects the `all=false` partial edit when in use; see
+    /// `delete_defined_set` in `table/src/policy.rs` for why).
     pub(super) fn delete_policy(
         &mut self,
         tables: Arc<TableManager>,
@@ -1055,6 +1054,25 @@ impl Global {
                 .delete_policy(name, preserve_statements, all, statement_names)?;
         tables.import_policy.store(import);
         tables.export_policy.store(export);
+        Ok(())
+    }
+
+    /// Creates `name`, or (GoBGP `Policy.Add` semantics) appends `statement_names`
+    /// to it if it already exists. Refuses to merge into an in-use policy for the
+    /// same reason `delete_policy`'s `all=false` partial edit does; success
+    /// therefore never touches an active assignment, so unlike `delete_policy`
+    /// there is nothing to re-store into `TableManager`.
+    pub(super) fn add_policy(
+        &mut self,
+        name: &str,
+        statement_names: Vec<String>,
+    ) -> Result<(), Error> {
+        if self.peers.values().any(|p| p.references_policy(name)) {
+            return Err(Error::Table(table::TableError::StillInUse(
+                name.to_string(),
+            )));
+        }
+        self.ptable.add_policy(name, statement_names)?;
         Ok(())
     }
 
@@ -4109,6 +4127,31 @@ mod tests {
             peer_b.state.export_policy.load_full().is_some(),
             "peer override for an unrelated policy must survive"
         );
+    }
+
+    #[tokio::test]
+    async fn add_policy_refuses_to_merge_when_referenced_by_peer() {
+        let global = make_global();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 11));
+        let mut g = global.write().await;
+        add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+        g.ptable
+            .add_statement(
+                "extra-stmt",
+                Vec::new(),
+                Some(table::Disposition::Accept),
+                table::Actions::default(),
+            )
+            .unwrap();
+        let mut params = default_peer_params(remote_addr);
+        params.export_policy = Some((table::Disposition::Accept, vec!["p1".to_string()]));
+        g.add_peer(params, None).unwrap();
+
+        let result = g.add_policy("p1", vec!["extra-stmt".to_string()]);
+        assert!(matches!(
+            result,
+            Err(Error::Table(table::TableError::StillInUse(_)))
+        ));
     }
 
     #[test]
