@@ -1363,16 +1363,18 @@ impl PolicyTable {
         Ok((direction, n))
     }
 
+    /// `direction`: 0=unspecified (both), 1=import, 2=export.
     pub fn iter_assignments(
         &self,
         direction: i32,
     ) -> impl Iterator<Item = (i32, &PolicyAssignment)> + '_ {
         let mut v: Vec<(i32, &PolicyAssignment)> = Vec::with_capacity(2);
-        if direction != 2 {
-            if let Some(a) = self.assignment_import.as_ref() {
-                v.push((1, a));
-            }
-        } else if direction != 1
+        if direction != 2
+            && let Some(a) = self.assignment_import.as_ref()
+        {
+            v.push((1, a));
+        }
+        if direction != 1
             && let Some(a) = self.assignment_export.as_ref()
         {
             v.push((2, a));
@@ -4750,5 +4752,63 @@ mod tests {
 
         let result = ptable.add_policy("pol1", vec!["st2".to_string()]);
         assert!(matches!(result, Err(TableError::StillInUse(_))));
+    }
+
+    #[test]
+    fn iter_assignments_unspecified_direction_returns_both() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement("st1", vec![], Some(Disposition::Reject), Actions::default())
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Import,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+        ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+
+        let dirs: Vec<i32> = ptable.iter_assignments(0).map(|(dir, _)| dir).collect();
+        assert_eq!(dirs.len(), 2, "unspecified direction must return both");
+        assert!(dirs.contains(&1), "import missing");
+        assert!(dirs.contains(&2), "export missing");
+    }
+
+    #[test]
+    fn iter_assignments_import_direction_excludes_export() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_statement("st1", vec![], Some(Disposition::Reject), Actions::default())
+            .unwrap();
+        ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+        ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Import,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+        ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Export,
+                Disposition::Accept,
+                vec!["pol1".to_string()],
+            )
+            .unwrap();
+
+        let dirs: Vec<i32> = ptable.iter_assignments(1).map(|(dir, _)| dir).collect();
+        assert_eq!(dirs, vec![1]);
     }
 }

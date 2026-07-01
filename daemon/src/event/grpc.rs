@@ -2638,6 +2638,7 @@ impl GoBgpService for GrpcService {
             .iter_defined_sets()
             .map(convert::defined_set_to_api)
             .filter(|x| x.defined_type == req.defined_type)
+            .filter(|x| req.name.is_empty() || x.name == req.name)
             .map(|x| api::ListDefinedSetResponse {
                 defined_set: Some(x),
             })

@@ -4154,6 +4154,78 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn list_defined_set_filters_by_name() {
+        let svc = make_grpc_service();
+        for (name, prefix) in [("ps1", "10.0.0.0/24"), ("ps2", "10.1.0.0/24")] {
+            svc.add_defined_set(tonic::Request::new(api::AddDefinedSetRequest {
+                defined_set: Some(api::DefinedSet {
+                    defined_type: api::DefinedType::Prefix as i32,
+                    name: name.to_string(),
+                    list: Vec::new(),
+                    prefixes: vec![api::Prefix {
+                        ip_prefix: prefix.to_string(),
+                        mask_length_min: 24,
+                        mask_length_max: 24,
+                    }],
+                }),
+                replace: false,
+            }))
+            .await
+            .unwrap();
+        }
+
+        let req = tonic::Request::new(api::ListDefinedSetRequest {
+            defined_type: api::DefinedType::Prefix as i32,
+            name: "ps1".to_string(),
+        });
+        let stream = svc.list_defined_set(req).await.unwrap().into_inner();
+        let names: Vec<String> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok()?.defined_set)
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, vec!["ps1".to_string()]);
+    }
+
+    /// Unlike GoBGP, an unspecified `name` lists only the global assignment.
+    /// GoBGP additionally lists every route-server-client peer's export
+    /// override here, but not a regular peer's -- an inconsistency this
+    /// project chose not to replicate.
+    #[tokio::test]
+    async fn list_policy_assignment_unspecified_name_excludes_peers() {
+        let svc = make_grpc_service();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 12));
+        {
+            let mut g = svc.global.write().await;
+            add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+            let mut params = default_peer_params(remote_addr);
+            params.rs_client = true;
+            params.export_policy = Some((table::Disposition::Accept, vec!["p1".to_string()]));
+            g.add_peer(params, None).unwrap();
+        }
+
+        let req = tonic::Request::new(api::ListPolicyAssignmentRequest {
+            name: String::new(),
+            direction: api::PolicyDirection::Unspecified as i32,
+        });
+        let stream = svc.list_policy_assignment(req).await.unwrap().into_inner();
+        let names: Vec<String> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok()?.assignment)
+            .map(|a| a.name)
+            .collect();
+        assert!(
+            !names.contains(&remote_addr.to_string()),
+            "peer assignments must not leak into the unspecified-name query: {:?}",
+            names
+        );
+    }
+
     #[test]
     fn peer_params_from_config_neighbor_extracts_export_policy() {
         let mut n = make_minimal_neighbor_config("10.0.0.1");
