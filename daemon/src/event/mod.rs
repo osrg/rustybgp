@@ -1043,18 +1043,16 @@ impl Global {
         name: &str,
         preserve_statements: bool,
         all: bool,
+        statement_names: Vec<String>,
     ) -> Result<(), Error> {
-        if !all && self.peers.values().any(|p| p.references_policy(name)) {
+        if self.peers.values().any(|p| p.references_policy(name)) {
             return Err(Error::Table(table::TableError::StillInUse(
                 name.to_string(),
             )));
         }
-        let (import, export) = self.ptable.delete_policy(name, preserve_statements, all)?;
-        if all {
-            for peer in self.peers.values() {
-                peer.state.export_policy.store(None);
-            }
-        }
+        let (import, export) =
+            self.ptable
+                .delete_policy(name, preserve_statements, all, statement_names)?;
         tables.import_policy.store(import);
         tables.export_policy.store(export);
         Ok(())
@@ -4048,7 +4046,7 @@ mod tests {
         params.export_policy = Some((table::Disposition::Accept, vec!["p1".to_string()]));
         g.add_peer(params, None).unwrap();
 
-        let result = g.delete_policy(tables, "p1", false, false);
+        let result = g.delete_policy(tables, "p1", false, false, vec![]);
         assert!(matches!(
             result,
             Err(Error::Table(table::TableError::StillInUse(_)))
@@ -4064,11 +4062,11 @@ mod tests {
         add_simple_policy(&mut g, "p1", table::Disposition::Reject);
         g.add_peer(default_peer_params(remote_addr), None).unwrap();
 
-        g.delete_policy(tables, "p1", false, false).unwrap();
+        g.delete_policy(tables, "p1", false, false, vec![]).unwrap();
     }
 
     #[tokio::test]
-    async fn delete_policy_all_clears_peer_overrides() {
+    async fn delete_policy_all_refuses_when_referenced_by_peer() {
         let global = make_global();
         let tables = make_tables();
         let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8));
@@ -4078,10 +4076,39 @@ mod tests {
         params.export_policy = Some((table::Disposition::Accept, vec!["p1".to_string()]));
         g.add_peer(params, None).unwrap();
 
-        g.delete_policy(tables, "", false, true).unwrap();
-
+        let result = g.delete_policy(tables, "p1", false, true, vec![]);
+        assert!(matches!(
+            result,
+            Err(Error::Table(table::TableError::StillInUse(_)))
+        ));
         let peer = g.peers.get(&remote_addr).unwrap();
-        assert!(peer.state.export_policy.load_full().is_none());
+        assert!(
+            peer.state.export_policy.load_full().is_some(),
+            "rejected deletion must not clear the peer's override"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_policy_all_leaves_unrelated_peer_overrides_untouched() {
+        let global = make_global();
+        let tables = make_tables();
+        let addr_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
+        let addr_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10));
+        let mut g = global.write().await;
+        add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+        add_simple_policy(&mut g, "p2", table::Disposition::Accept);
+        g.add_peer(default_peer_params(addr_a), None).unwrap();
+        let mut params_b = default_peer_params(addr_b);
+        params_b.export_policy = Some((table::Disposition::Accept, vec!["p2".to_string()]));
+        g.add_peer(params_b, None).unwrap();
+
+        g.delete_policy(tables, "p1", false, true, vec![]).unwrap();
+
+        let peer_b = g.peers.get(&addr_b).unwrap();
+        assert!(
+            peer_b.state.export_policy.load_full().is_some(),
+            "peer override for an unrelated policy must survive"
+        );
     }
 
     #[test]

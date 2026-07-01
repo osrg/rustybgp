@@ -2478,12 +2478,14 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::DeletePolicyRequest>,
     ) -> Result<tonic::Response<api::DeletePolicyResponse>, tonic::Status> {
         let req = request.into_inner();
-        let name = req.policy.map(|p| p.name).unwrap_or_default();
+        let policy = req.policy.unwrap_or_default();
+        let statement_names = policy.statements.into_iter().map(|s| s.name).collect();
         self.global.write().await.delete_policy(
             self.tables.clone(),
-            &name,
+            &policy.name,
             req.preserve_statements,
             req.all,
+            statement_names,
         )?;
         Ok(tonic::Response::new(api::DeletePolicyResponse {}))
     }
@@ -2601,12 +2603,12 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::DeleteDefinedSetResponse>, tonic::Status> {
         let req = request.into_inner();
         let set = req.defined_set.ok_or(Error::EmptyArgument)?;
-        let kind = convert::defined_set_kind_from_api(set.defined_type).map_err(Error::from)?;
+        let set = convert::defined_set_from_api(set).map_err(Error::from)?;
         self.global
             .write()
             .await
             .ptable
-            .delete_defined_set(&set.name, kind, req.all)
+            .delete_defined_set(set, req.all)
             .map_err(Error::from)?;
         Ok(tonic::Response::new(api::DeleteDefinedSetResponse {}))
     }
@@ -2668,12 +2670,15 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::DeleteStatementRequest>,
     ) -> Result<tonic::Response<api::DeleteStatementResponse>, tonic::Status> {
         let req = request.into_inner();
-        let name = req.statement.map(|s| s.name).unwrap_or_default();
+        let statement = req.statement.unwrap_or_default();
+        let conditions = convert::conditions_from_api(statement.conditions).map_err(Error::from)?;
+        let (disposition, actions) =
+            convert::disposition_from_api(statement.actions).map_err(Error::from)?;
         self.global
             .write()
             .await
             .ptable
-            .delete_statement(&name, req.all)
+            .delete_statement(&statement.name, req.all, conditions, disposition, actions)
             .map_err(Error::from)?;
         Ok(tonic::Response::new(api::DeleteStatementResponse {}))
     }
