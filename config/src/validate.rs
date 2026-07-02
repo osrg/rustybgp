@@ -190,6 +190,18 @@ fn validate_llgr_stale_time(stale_time: u32) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// AFI-SAFI-level and peer-group-level apply-policy are not read by the
+/// daemon at all (only neighbor-level export-policy is); reject any such
+/// config so it fails validation instead of being silently ignored.
+fn reject_apply_policy(ap: Option<&ApplyPolicy>, context: &str) -> Result<(), ConfigError> {
+    if ap.is_some() {
+        return Err(ConfigError::InvalidConfiguration(format!(
+            "{context}: apply-policy is not supported here; configure policy under global or per-neighbor export-policy"
+        )));
+    }
+    Ok(())
+}
+
 impl Neighbor {
     fn validate(&self) -> Result<(), ConfigError> {
         let config = self.config.as_ref().ok_or_else(|| {
@@ -248,6 +260,10 @@ impl Neighbor {
                 {
                     validate_llgr_stale_time(st)?;
                 }
+                reject_apply_policy(
+                    a.apply_policy.as_ref(),
+                    &format!("neighbor {addr} afi-safi"),
+                )?;
             }
         }
 
@@ -261,10 +277,15 @@ impl Neighbor {
             ));
         }
 
-        if self.apply_policy.is_some() {
+        if self
+            .apply_policy
+            .as_ref()
+            .and_then(|ap| ap.config.as_ref())
+            .map(|c| c.import_policy_list.is_some() || c.default_import_policy.is_some())
+            .unwrap_or(false)
+        {
             return Err(ConfigError::InvalidConfiguration(format!(
-                "neighbor {}: per-neighbor apply-policy is not supported; configure policy under global",
-                addr
+                "neighbor {addr}: per-neighbor import policy is not supported; configure policy under global"
             )));
         }
 
@@ -274,6 +295,12 @@ impl Neighbor {
 
 impl PeerGroup {
     fn validate(&self) -> Result<(), ConfigError> {
+        let name = self
+            .config
+            .as_ref()
+            .and_then(|c| c.peer_group_name.as_deref())
+            .unwrap_or("<unnamed>");
+
         if let Some(h) = self
             .timers
             .as_ref()
@@ -300,6 +327,10 @@ impl PeerGroup {
                 {
                     validate_llgr_stale_time(st)?;
                 }
+                reject_apply_policy(
+                    a.apply_policy.as_ref(),
+                    &format!("peer-group {name} afi-safi"),
+                )?;
             }
         }
         if let Some(pw) = self
@@ -310,6 +341,7 @@ impl PeerGroup {
         {
             validate_auth_password(pw)?;
         }
+        reject_apply_policy(self.apply_policy.as_ref(), &format!("peer-group {name}"))?;
         Ok(())
     }
 }
@@ -391,6 +423,131 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    // --- apply-policy: Neighbor ---
+
+    fn neighbor_with_apply_policy(apply_policy: ApplyPolicy) -> Neighbor {
+        Neighbor {
+            config: Some(NeighborConfig {
+                neighbor_address: Some("10.0.0.1".parse().unwrap()),
+                peer_as: Some(65001),
+                ..Default::default()
+            }),
+            apply_policy: Some(apply_policy),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn neighbor_export_policy_list_passes() {
+        let ap = ApplyPolicy {
+            config: Some(ApplyPolicyConfig {
+                export_policy_list: Some(vec!["p1".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(neighbor_with_apply_policy(ap).validate().is_ok());
+    }
+
+    #[test]
+    fn neighbor_default_export_policy_passes() {
+        let ap = ApplyPolicy {
+            config: Some(ApplyPolicyConfig {
+                default_export_policy: Some(DefaultPolicyType::RejectRoute),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(neighbor_with_apply_policy(ap).validate().is_ok());
+    }
+
+    #[test]
+    fn neighbor_import_policy_list_fails() {
+        let ap = ApplyPolicy {
+            config: Some(ApplyPolicyConfig {
+                import_policy_list: Some(vec!["p1".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(neighbor_with_apply_policy(ap).validate().is_err());
+    }
+
+    #[test]
+    fn neighbor_default_import_policy_alone_fails() {
+        let ap = ApplyPolicy {
+            config: Some(ApplyPolicyConfig {
+                default_import_policy: Some(DefaultPolicyType::RejectRoute),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(neighbor_with_apply_policy(ap).validate().is_err());
+    }
+
+    #[test]
+    fn neighbor_afi_safi_apply_policy_fails() {
+        let n = Neighbor {
+            config: Some(NeighborConfig {
+                neighbor_address: Some("10.0.0.1".parse().unwrap()),
+                peer_as: Some(65001),
+                ..Default::default()
+            }),
+            afi_safis: Some(vec![AfiSafi {
+                apply_policy: Some(ApplyPolicy {
+                    config: Some(ApplyPolicyConfig {
+                        export_policy_list: Some(vec!["p1".to_string()]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert!(n.validate().is_err());
+    }
+
+    // --- apply-policy: PeerGroup ---
+
+    #[test]
+    fn peer_group_apply_policy_fails() {
+        let pg = PeerGroup {
+            apply_policy: Some(ApplyPolicy {
+                config: Some(ApplyPolicyConfig {
+                    export_policy_list: Some(vec!["p1".to_string()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(pg.validate().is_err());
+    }
+
+    #[test]
+    fn peer_group_afi_safi_apply_policy_fails() {
+        let pg = PeerGroup {
+            afi_safis: Some(vec![AfiSafi {
+                apply_policy: Some(ApplyPolicy {
+                    config: Some(ApplyPolicyConfig {
+                        default_export_policy: Some(DefaultPolicyType::RejectRoute),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert!(pg.validate().is_err());
+    }
+
+    #[test]
+    fn peer_group_without_apply_policy_passes() {
+        assert!(PeerGroup::default().validate().is_ok());
     }
 
     fn neighbor_with_hold_time(peer_as: u32, hold_time: f64) -> Neighbor {
