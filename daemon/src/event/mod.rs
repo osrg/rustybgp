@@ -7857,14 +7857,55 @@ mod tests {
         }
 
         #[test]
-        fn ebgp_export_strips_med() {
+        fn ebgp_export_attrs_does_not_touch_med() {
+            // MED stripping for eBGP happens in clear_received_med(), called
+            // *before* export policy runs, not in export_attrs() (which runs
+            // after policy). See clear_received_med_* tests below.
             let ctx = ebgp_ctx();
             let exported = ctx.export_attrs(&attr_with_med());
             assert!(
-                exported
-                    .iter()
+                exported.iter().any(
+                    |a| a.code() == packet::Attribute::MULTI_EXIT_DESC && a.value() == Some(50)
+                ),
+                "export_attrs() must not strip MED -- that would undo a set-med export policy"
+            );
+        }
+
+        #[test]
+        fn clear_received_med_strips_for_ebgp() {
+            let ctx = ebgp_ctx();
+            let mut attr = attr_with_med();
+            ctx.clear_received_med(&mut attr);
+            assert!(
+                attr.iter()
                     .all(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC),
-                "MED must be stripped for eBGP (non-transitive, MUST NOT leak to other ASes)"
+                "a received MED must be cleared for eBGP before export policy runs"
+            );
+        }
+
+        #[test]
+        fn clear_received_med_keeps_for_ibgp() {
+            let ctx = ibgp_ctx();
+            let mut attr = attr_with_med();
+            ctx.clear_received_med(&mut attr);
+            assert!(
+                attr.iter().any(
+                    |a| a.code() == packet::Attribute::MULTI_EXIT_DESC && a.value() == Some(50)
+                ),
+                "MED must be passed through for iBGP"
+            );
+        }
+
+        #[test]
+        fn clear_received_med_keeps_for_confed_ebgp() {
+            let ctx = confed_ebgp_ctx();
+            let mut attr = attr_with_med();
+            ctx.clear_received_med(&mut attr);
+            assert!(
+                attr.iter().any(
+                    |a| a.code() == packet::Attribute::MULTI_EXIT_DESC && a.value() == Some(50)
+                ),
+                "confederation members are treated as internal (RFC 5065): MED must survive"
             );
         }
 

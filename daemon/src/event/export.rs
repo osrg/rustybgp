@@ -253,6 +253,30 @@ impl PeerExportContext {
         bgp::PeerCodec::new()
     }
 
+    /// Clear a received MED before export policy runs, for eBGP peers only.
+    ///
+    /// RFC 4271 §5.1.4: MED "must not ... propagate to other neighboring
+    /// ASes". This has to run *before* export policy (not folded into the
+    /// post-policy `export_attrs`) so that a `set-med` export policy action
+    /// can still set MED for the direct eBGP peer -- that use case is exactly
+    /// what MED is for. FRR does the same thing in the same order:
+    /// `subgroup_announce_check()` zeroes MED for eBGP peers before applying
+    /// the outbound route-map, so a route-map `set metric` still lands on the
+    /// wire. ConfedEbgp / iBGP / RS client keep MED as-is (confederation
+    /// members are treated as internal per RFC 5065).
+    pub(super) fn clear_received_med(&self, attr: &mut Arc<Vec<packet::Attribute>>) {
+        if self.role != PeerRole::Ebgp {
+            return;
+        }
+        if !attr
+            .iter()
+            .any(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
+        {
+            return;
+        }
+        Arc::make_mut(attr).retain(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC);
+    }
+
     /// Apply per-peer attribute transformation to outgoing route attributes.
     ///
     /// eBGP: prepend `local_asn` to AS_PATH (adding a synthetic segment for
@@ -262,6 +286,12 @@ impl PeerExportContext {
     /// default value (100) if absent (RFC 4271 §5.1.5 requires LOCAL_PREF in
     /// all UPDATE messages to internal peers).
     /// RS client: pass through unchanged.
+    ///
+    /// MED is intentionally not handled here: unlike LOCAL_PREF, an eBGP
+    /// export policy may legitimately set MED for the direct peer (RFC 4271
+    /// §5.1.4), so clearing a *received* MED must happen before export
+    /// policy runs -- see `clear_received_med`, called earlier in the export
+    /// pipeline -- rather than here, after policy has already run.
     pub(super) fn export_attrs(
         &self,
         attrs: &Arc<Vec<bgp::Attribute>>,
@@ -308,7 +338,6 @@ impl PeerExportContext {
                             bgp::Attribute::LOCAL_PREF
                                 | bgp::Attribute::ORIGINATOR_ID
                                 | bgp::Attribute::CLUSTER_LIST
-                                | bgp::Attribute::MULTI_EXIT_DESC
                                 | bgp::Attribute::AIGP
                         )
                     })
@@ -592,6 +621,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             }
             let mut nexthop = best.nexthop;
             let mut attr = Arc::clone(&best.attr);
+            export_ctx.clear_received_med(&mut attr);
             if export_policy.is_some_and(|policy| {
                 table::apply_export(
                     policy,
@@ -680,6 +710,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                 }
                 let mut nexthop = path.nexthop;
                 let mut attr = Arc::clone(&path.attr);
+                export_ctx.clear_received_med(&mut attr);
                 if export_policy.is_some_and(|policy| {
                     table::apply_export(
                         policy,
