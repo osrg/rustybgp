@@ -7347,6 +7347,74 @@ mod tests {
             );
         }
 
+        #[test]
+        fn ebgp_export_honors_addpath_explicit_nexthop() {
+            // A route injected via the AddPath gRPC API (table::Source::local())
+            // with an explicit nexthop must reach an eBGP peer unchanged, even
+            // with no export policy configured (GoBGP parity).
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let mut p = path(1, table::Source::local());
+            p.nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 100, 1)));
+            let update = change(&net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(), // local_addr = 127.0.0.1
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            let msgs = pending.drain_messages(Family::IPV4);
+            assert_eq!(
+                reach_nexthops(&msgs),
+                vec![Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 100, 1)))],
+                "AddPath-injected explicit nexthop must be honored for eBGP export"
+            );
+        }
+
+        #[test]
+        fn ebgp_export_fills_self_for_addpath_unspecified_nexthop() {
+            // A route injected via AddPath with nexthop=0.0.0.0 (the common
+            // "let the router fill this in" convention) must still get
+            // self-nexthop, matching GoBGP's IsUnspecified() check.
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let mut p = path(1, table::Source::local());
+            p.nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::UNSPECIFIED));
+            let update = change(&net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(), // local_addr = 127.0.0.1
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            let msgs = pending.drain_messages(Family::IPV4);
+            assert_eq!(
+                reach_nexthops(&msgs),
+                vec![Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)))],
+                "AddPath nexthop=0.0.0.0 must still be filled with self-nexthop"
+            );
+        }
+
         // ---- export policy: as-prepend confed-awareness ----
 
         fn as_prepend_export_policy(asn: u32, repeat: u32) -> Arc<table::PolicyAssignment> {
@@ -8050,7 +8118,7 @@ mod tests {
             let ctx = ebgp_ctx();
             let mut attr = attr_with_med();
             let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
-            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
             assert!(
                 attr.iter()
                     .all(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC),
@@ -8063,7 +8131,7 @@ mod tests {
             let ctx = ibgp_ctx();
             let mut attr = attr_with_med();
             let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
-            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
             assert!(
                 attr.iter().any(
                     |a| a.code() == packet::Attribute::MULTI_EXIT_DESC && a.value() == Some(50)
@@ -8077,7 +8145,7 @@ mod tests {
             let ctx = confed_ebgp_ctx();
             let mut attr = attr_with_med();
             let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
-            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
             assert!(
                 attr.iter().any(
                     |a| a.code() == packet::Attribute::MULTI_EXIT_DESC && a.value() == Some(50)
@@ -8283,7 +8351,7 @@ mod tests {
             let mut attr = Arc::new(vec![]);
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
             let mut nexthop = Some(original);
-            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
             assert_eq!(
                 nexthop,
                 Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
@@ -8297,8 +8365,80 @@ mod tests {
             let mut attr = Arc::new(vec![]);
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
             let mut nexthop = Some(original);
-            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
             assert_eq!(nexthop, Some(original), "iBGP nexthop must be unchanged");
+        }
+
+        // ---- pre_policy_defaults: locally-injected explicit nexthop (GoBGP parity) ----
+
+        #[test]
+        fn pre_policy_defaults_honors_explicit_local_nexthop_for_ebgp() {
+            let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
+            let mut attr = Arc::new(vec![]);
+            let explicit = bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1));
+            let mut nexthop = Some(explicit);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, true);
+            assert_eq!(
+                nexthop,
+                Some(explicit),
+                "a locally-injected route's explicit nexthop must be honored for eBGP"
+            );
+        }
+
+        #[test]
+        fn pre_policy_defaults_fills_self_for_local_unspecified_nexthop_ebgp() {
+            let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
+            let mut attr = Arc::new(vec![]);
+            let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::UNSPECIFIED));
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, true);
+            assert_eq!(
+                nexthop,
+                Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                "0.0.0.0 on a locally-injected route is a sentinel for self-nexthop"
+            );
+        }
+
+        #[test]
+        fn pre_policy_defaults_honors_explicit_local_nexthop_for_ibgp() {
+            let ctx = ibgp_ctx();
+            let mut attr = Arc::new(vec![]);
+            let explicit = bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1));
+            let mut nexthop = Some(explicit);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, true);
+            assert_eq!(
+                nexthop,
+                Some(explicit),
+                "a locally-injected route's explicit nexthop must be honored for iBGP too"
+            );
+        }
+
+        #[test]
+        fn pre_policy_defaults_fills_self_for_local_unspecified_nexthop_ibgp() {
+            let ctx = ibgp_ctx(); // local_addr = 127.0.0.1
+            let mut attr = Arc::new(vec![]);
+            let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::UNSPECIFIED));
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, true);
+            assert_eq!(
+                nexthop,
+                Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                "0.0.0.0 on a locally-injected route must be filled with self for iBGP too"
+            );
+        }
+
+        #[test]
+        fn pre_policy_defaults_ignores_is_local_for_peer_received_ebgp() {
+            // A peer-received route (is_local=false) must still be forced to
+            // self-nexthop for eBGP regardless of the nexthop value -- is_local
+            // only changes behavior for locally-injected routes.
+            let ctx = ebgp_ctx();
+            let mut attr = Arc::new(vec![]);
+            let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1)));
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
+            assert_eq!(
+                nexthop,
+                Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                "peer-received nexthop must still be forced to self for eBGP"
+            );
         }
 
         // ---- Confederation: export_attrs / pre_policy_defaults ----
@@ -8411,7 +8551,7 @@ mod tests {
             let mut attr = Arc::new(vec![]);
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
             let mut nexthop = Some(original);
-            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
             assert_eq!(
                 nexthop,
                 Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),

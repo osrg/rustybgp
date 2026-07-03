@@ -280,6 +280,7 @@ impl PeerExportContext {
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
         family: Family,
+        is_local: bool,
     ) {
         if self.role == PeerRole::Ebgp
             && attr
@@ -289,7 +290,7 @@ impl PeerExportContext {
             Arc::make_mut(attr).retain(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC);
         }
 
-        self.export_nexthop(nexthop, family);
+        self.export_nexthop(nexthop, family, is_local);
     }
 
     /// Apply per-peer attribute transformation to outgoing route attributes.
@@ -403,10 +404,20 @@ impl PeerExportContext {
     /// self-nexthop for any role, except Flowspec (RFC 8955 §4 carries no
     /// nexthop).
     ///
+    /// `is_local` (`Source::is_local()`): for a locally-injected route (e.g.
+    /// via the `AddPath` gRPC API) with an explicit, non-unspecified nexthop,
+    /// that value is honored for *any* role instead of being forced to self
+    /// -- an unspecified nexthop (`0.0.0.0`/`::`, a common "let the router
+    /// fill this in" sentinel) still gets the self-nexthop default. Mirrors
+    /// GoBGP's `UpdatePathAttrs`: `!path.IsLocal() || nexthop.IsUnspecified()`
+    /// for eBGP and `path.IsLocal() && nexthop.IsUnspecified()` for iBGP --
+    /// both reduce to the same "local + unspecified -> self, local + explicit
+    /// -> keep" rule, which is what this function implements directly.
+    ///
     /// Called only from `pre_policy_defaults`, i.e. before export policy
     /// runs, so that a `set-nexthop` export policy action can override this
     /// default rather than being clobbered by it afterward.
-    fn export_nexthop(&self, nexthop: &mut Option<bgp::Nexthop>, family: Family) {
+    fn export_nexthop(&self, nexthop: &mut Option<bgp::Nexthop>, family: Family, is_local: bool) {
         let local = || match self.local_addr {
             IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
             IpAddr::V6(v6) => {
@@ -430,6 +441,12 @@ impl PeerExportContext {
             // No stored nexthop for non-Flowspec (e.g. locally originated RTC):
             // use per-peer local address.
             (_, None) => Some(local()),
+            // Locally-injected route with an explicit nexthop: honor it,
+            // regardless of peer role.
+            (_, Some(nh)) if is_local && !nh.addr().is_unspecified() => Some(nh),
+            // Locally-injected route with an unspecified (0.0.0.0/::) nexthop:
+            // fill in self, regardless of peer role.
+            (_, Some(_)) if is_local => Some(local()),
             (PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient, Some(nh)) => Some(nh),
             (PeerRole::ConfedEbgp | PeerRole::Ebgp, Some(_)) => Some(local()),
         };
@@ -640,7 +657,12 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             let original_nexthop = best.nexthop;
             let mut nexthop = best.nexthop;
             let mut attr = Arc::clone(&best.attr);
-            export_ctx.pre_policy_defaults(&mut attr, &mut nexthop, update.family);
+            export_ctx.pre_policy_defaults(
+                &mut attr,
+                &mut nexthop,
+                update.family,
+                best.source.is_local(),
+            );
             if export_policy.is_some_and(|policy| {
                 table::apply_export(
                     policy,
@@ -731,7 +753,12 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                 let original_nexthop = path.nexthop;
                 let mut nexthop = path.nexthop;
                 let mut attr = Arc::clone(&path.attr);
-                export_ctx.pre_policy_defaults(&mut attr, &mut nexthop, update.family);
+                export_ctx.pre_policy_defaults(
+                    &mut attr,
+                    &mut nexthop,
+                    update.family,
+                    path.source.is_local(),
+                );
                 if export_policy.is_some_and(|policy| {
                     table::apply_export(
                         policy,
