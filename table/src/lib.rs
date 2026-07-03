@@ -2011,6 +2011,7 @@ impl Table {
         peer_addr: IpAddr,
         rpki: Option<&RpkiTable>,
         original_nexthop: Option<bgp::Nexthop>,
+        is_confed: bool,
     ) -> Disposition {
         assignment.apply(
             source,
@@ -2018,6 +2019,7 @@ impl Table {
             attr,
             nexthop,
             original_nexthop,
+            is_confed,
             local_addr,
             peer_addr,
             rpki,
@@ -3546,6 +3548,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(result, Disposition::Reject);
     }
@@ -3599,6 +3602,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(result, Disposition::Accept);
     }
@@ -3657,6 +3661,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(result, Disposition::Accept);
         assert_eq!(
@@ -3718,6 +3723,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(result, Disposition::Accept);
         assert_eq!(
@@ -3782,6 +3788,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(nexthop, original);
     }

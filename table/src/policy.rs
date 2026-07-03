@@ -819,6 +819,7 @@ impl Statement {
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
         original_nexthop: Option<bgp::Nexthop>,
+        is_confed: bool,
         local_addr: IpAddr,
         peer_addr: IpAddr,
         rpki: Option<&RpkiTable>,
@@ -934,7 +935,11 @@ impl Statement {
             };
             let mut new_as_path = existing;
             for _ in 0..action.repeat {
-                new_as_path = new_as_path.as_path_prepend(asn);
+                new_as_path = if is_confed {
+                    new_as_path.as_path_prepend_confed(asn)
+                } else {
+                    new_as_path.as_path_prepend(asn)
+                };
             }
             attrs.retain(|a| a.code() != packet::Attribute::AS_PATH);
             attrs.push(new_as_path);
@@ -1136,6 +1141,7 @@ impl Policy {
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
         original_nexthop: Option<bgp::Nexthop>,
+        is_confed: bool,
         local_addr: IpAddr,
         peer_addr: IpAddr,
         rpki: Option<&RpkiTable>,
@@ -1147,6 +1153,7 @@ impl Policy {
                 attr,
                 nexthop,
                 original_nexthop,
+                is_confed,
                 local_addr,
                 peer_addr,
                 rpki,
@@ -1185,6 +1192,7 @@ impl PolicyAssignment {
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
         original_nexthop: Option<bgp::Nexthop>,
+        is_confed: bool,
         local_addr: IpAddr,
         peer_addr: IpAddr,
         rpki: Option<&RpkiTable>,
@@ -1196,6 +1204,7 @@ impl PolicyAssignment {
                 attr,
                 nexthop,
                 original_nexthop,
+                is_confed,
                 local_addr,
                 peer_addr,
                 rpki,
@@ -1245,12 +1254,15 @@ pub fn apply_import(
     // PolicyTable::build_assignment() also rejects nexthop actions in import
     // policies at load time, so this is never actually exercised.
     let original_nexthop = *nexthop;
+    // Import is never "towards a confederation member" in the export sense,
+    // so a policy's as-prepend action (if any) always uses AS_SEQUENCE.
     let filtered = policy.apply(
         source,
         net,
         &mut attr,
         nexthop,
         original_nexthop,
+        false,
         source.local_addr,
         source.remote_addr,
         rpki,
@@ -1265,6 +1277,11 @@ pub fn apply_import(
 /// `NexthopAction::Unchanged` to restore the genuine original instead of
 /// confirming the just-applied default.
 ///
+/// `is_confed` marks the destination peer as a confederation member: a
+/// policy's as-prepend action then adds AS_CONFED_SEQUENCE instead of
+/// AS_SEQUENCE, matching GoBGP's `AsPathPrependAction.Apply`, which passes
+/// `confed := option.Info.Confederation` into the shared `PrependAsn`.
+///
 /// Returns the `Disposition` from the policy chain.
 /// Pass `rpki: None` to skip RPKI validation (e.g. in tests or when no RTR session is active).
 #[allow(clippy::too_many_arguments)]
@@ -1276,6 +1293,7 @@ pub fn apply_export(
     attr: &mut Arc<Vec<packet::Attribute>>,
     nexthop: &mut Option<bgp::Nexthop>,
     original_nexthop: Option<bgp::Nexthop>,
+    is_confed: bool,
     local_addr: IpAddr,
     peer_addr: IpAddr,
 ) -> Disposition {
@@ -1285,6 +1303,7 @@ pub fn apply_export(
         attr,
         nexthop,
         original_nexthop,
+        is_confed,
         local_addr,
         peer_addr,
         rpki,
@@ -2649,6 +2668,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
 
         let result = get_communities(&attr);
@@ -2680,6 +2700,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
 
         let result = get_communities(&attr);
@@ -2707,6 +2728,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
 
         let result = get_communities(&attr);
@@ -2735,6 +2757,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
 
         assert!(
@@ -2766,6 +2789,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
 
         let result = get_communities(&attr);
@@ -2824,6 +2848,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
 
         assert_eq!(get_local_pref(&attr), Some(200));
@@ -2854,6 +2879,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
 
         assert_eq!(get_local_pref(&attr), Some(150));
@@ -2914,6 +2940,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_med(&attr), Some(300));
     }
@@ -2935,6 +2962,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_med(&attr), Some(100));
     }
@@ -2956,6 +2984,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_med(&attr), Some(250));
     }
@@ -2977,6 +3006,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_med(&attr), Some(150));
     }
@@ -2998,6 +3028,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_med(&attr), Some(0));
     }
@@ -3068,6 +3099,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_as_path(&attr), vec![65100, 65001, 65002]);
     }
@@ -3089,6 +3121,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_as_path(&attr), vec![65100, 65100, 65100, 65001]);
     }
@@ -3110,6 +3143,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_as_path(&attr), vec![65001, 65001, 65002]);
     }
@@ -3131,8 +3165,44 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_as_path(&attr), vec![65100, 65100]);
+    }
+
+    #[test]
+    fn as_prepend_confed_uses_as_confed_sequence() {
+        // A policy's as-prepend action targeting a confederation member must
+        // land in AS_CONFED_SEQUENCE, not AS_SEQUENCE, or the AS_PATH would
+        // look like it left the confederation when it didn't.
+        let assignment = make_as_prepend_assignment(65100, 1, false);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![as_path_attr(&[65001, 65002])]);
+        let mut nexthop = nh();
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+            None,
+            None,
+            true,
+        );
+        let aspath = attr
+            .iter()
+            .find(|a| a.code() == packet::Attribute::AS_PATH)
+            .expect("AS_PATH must be present");
+        let buf = aspath.binary().unwrap();
+        assert_eq!(
+            buf[0],
+            packet::Attribute::AS_PATH_TYPE_CONFED_SEQ,
+            "prepended segment must be AS_CONFED_SEQUENCE for a confed peer"
+        );
+        assert_eq!(get_as_path(&attr), vec![65100, 65001, 65002]);
     }
 
     fn make_ext_community_assignment(action: ExtCommunityAction) -> Arc<PolicyAssignment> {
@@ -3201,6 +3271,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         let result = get_ext_communities(&attr);
         assert!(result.contains(&SOO_65002_100), "original preserved");
@@ -3227,6 +3298,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         let result = get_ext_communities(&attr);
         assert!(!result.contains(&RT_65001_100), "removed");
@@ -3253,6 +3325,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         let result = get_ext_communities(&attr);
         assert_eq!(result, vec![RT_65001_100]);
@@ -3319,6 +3392,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         let result = get_large_communities(&attr);
         assert!(result.contains(&(65000, 1, 200)), "original preserved");
@@ -3345,6 +3419,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         let result = get_large_communities(&attr);
         assert!(!result.contains(&(65000, 1, 100)), "removed");
@@ -3371,6 +3446,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_large_communities(&attr), vec![(65001, 2, 50)]);
     }
@@ -3427,6 +3503,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_origin(&attr), Some(0));
     }
@@ -3450,6 +3527,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(get_origin(&attr), Some(2));
         assert_eq!(
@@ -3502,6 +3580,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3525,6 +3604,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3548,6 +3628,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3571,6 +3652,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3595,6 +3677,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3619,6 +3702,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3641,6 +3725,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3663,6 +3748,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3686,6 +3772,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3708,6 +3795,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3730,6 +3818,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3752,6 +3841,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3774,6 +3864,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3796,6 +3887,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3826,6 +3918,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3906,6 +3999,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3931,6 +4025,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -4005,6 +4100,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -4030,6 +4126,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -4074,6 +4171,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -4096,6 +4194,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -4120,6 +4219,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -4225,6 +4325,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(
             nexthop,
@@ -4256,6 +4357,7 @@ mod tests {
             s.remote_addr,
             None,
             original_nexthop,
+            false,
         );
         assert_eq!(
             nexthop, original_nexthop,
@@ -4283,6 +4385,7 @@ mod tests {
             s.remote_addr,
             None,
             None,
+            false,
         );
         assert_eq!(
             nexthop,

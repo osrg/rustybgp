@@ -7347,6 +7347,79 @@ mod tests {
             );
         }
 
+        // ---- export policy: as-prepend confed-awareness ----
+
+        fn as_prepend_export_policy(asn: u32, repeat: u32) -> Arc<table::PolicyAssignment> {
+            let mut ptable = table::PolicyTable::new();
+            ptable
+                .add_statement(
+                    "st1",
+                    vec![],
+                    Some(table::Disposition::Accept),
+                    table::Actions {
+                        as_prepend: Some(table::AsPrependAction {
+                            asn,
+                            repeat,
+                            use_left_most: false,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+            let (_, assignment) = ptable
+                .add_assignment(
+                    "peer",
+                    table::PolicyDirection::Export,
+                    table::Disposition::Accept,
+                    vec!["pol1".to_string()],
+                )
+                .unwrap();
+            assignment
+        }
+
+        #[test]
+        fn confed_ebgp_export_policy_as_prepend_uses_confed_sequence() {
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path(1, source(PEER));
+            let update = change(&net, true, true, None, vec![p]);
+            let policy = as_prepend_export_policy(65100, 1);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &confed_ebgp_ctx(), // local_asn = 65001
+                Some(&policy),
+                None,
+                None,
+                None,
+                None,
+            );
+
+            let msgs = pending.drain_messages(Family::IPV4);
+            let attr = reach_attrs(&msgs).expect("reach message must be present");
+            let aspath = attr
+                .iter()
+                .find(|a| a.code() == packet::Attribute::AS_PATH)
+                .expect("AS_PATH must be present");
+            let buf = aspath.binary().unwrap();
+            assert_eq!(
+                buf[0],
+                packet::Attribute::AS_PATH_TYPE_CONFED_SEQ,
+                "policy as-prepend for a ConfedEbgp peer must land in AS_CONFED_SEQUENCE"
+            );
+            assert_eq!(
+                bgp::AsPathIter::new(aspath).flatten().collect::<Vec<u32>>(),
+                vec![65001, 65100],
+                "own Member-AS stays outermost; policy prepend follows inside the same segment"
+            );
+        }
+
         #[test]
         fn nonaddpath_echo_prevention() {
             let mut em = ExportMap::default();

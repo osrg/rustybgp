@@ -650,6 +650,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                     &mut attr,
                     &mut nexthop,
                     original_nexthop,
+                    export_ctx.role == PeerRole::ConfedEbgp,
                     export_ctx.local_addr,
                     remote_addr,
                 ) == table::Disposition::Reject
@@ -740,6 +741,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                         &mut attr,
                         &mut nexthop,
                         original_nexthop,
+                        export_ctx.role == PeerRole::ConfedEbgp,
                         export_ctx.local_addr,
                         remote_addr,
                     ) == table::Disposition::Reject
