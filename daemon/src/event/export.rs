@@ -253,28 +253,43 @@ impl PeerExportContext {
         bgp::PeerCodec::new()
     }
 
-    /// Clear a received MED before export policy runs, for eBGP peers only.
+    /// Apply pre-policy defaults for export, run before `apply_export()`.
     ///
-    /// RFC 4271 §5.1.4: MED "must not ... propagate to other neighboring
-    /// ASes". This has to run *before* export policy (not folded into the
-    /// post-policy `export_attrs`) so that a `set-med` export policy action
-    /// can still set MED for the direct eBGP peer -- that use case is exactly
-    /// what MED is for. FRR does the same thing in the same order:
+    /// Clears a received MED for eBGP peers (RFC 4271 §5.1.4: MED "must not
+    /// ... propagate to other neighboring ASes") and defaults the nexthop
+    /// (see `export_nexthop`: self-nexthop for eBGP/ConfedEbgp; local
+    /// address when no nexthop is stored, e.g. a locally-originated route).
+    /// Both must run *before* export policy -- not folded into the
+    /// post-policy `export_attrs` -- so that `set-med` / `set-nexthop`
+    /// export policy actions are not silently discarded by a later,
+    /// unconditional rewrite. FRR does the same for MED in the same order:
     /// `subgroup_announce_check()` zeroes MED for eBGP peers before applying
-    /// the outbound route-map, so a route-map `set metric` still lands on the
-    /// wire. ConfedEbgp / iBGP / RS client keep MED as-is (confederation
-    /// members are treated as internal per RFC 5065).
-    pub(super) fn clear_received_med(&self, attr: &mut Arc<Vec<packet::Attribute>>) {
-        if self.role != PeerRole::Ebgp {
-            return;
-        }
-        if !attr
-            .iter()
-            .any(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
+    /// the outbound route-map, so a route-map `set metric` still lands on
+    /// the wire. GoBGP does the same for nexthop: `prePolicyFilterpath` runs
+    /// `UpdatePathAttrs` (which forces self-nexthop) before `ApplyPolicy`.
+    ///
+    /// `nexthop` must hold the genuine, as-received value on entry: this
+    /// call overwrites it with the default, so callers must snapshot the
+    /// route's original nexthop beforehand and pass that snapshot into
+    /// `apply_export()` as `original_nexthop`, used only by
+    /// `NexthopAction::Unchanged` to restore the genuine original instead of
+    /// confirming the default just applied here (mirrors GoBGP's
+    /// `options.OldNextHop`, captured before `UpdatePathAttrs` runs).
+    pub(super) fn pre_policy_defaults(
+        &self,
+        attr: &mut Arc<Vec<packet::Attribute>>,
+        nexthop: &mut Option<bgp::Nexthop>,
+        family: Family,
+    ) {
+        if self.role == PeerRole::Ebgp
+            && attr
+                .iter()
+                .any(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
         {
-            return;
+            Arc::make_mut(attr).retain(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC);
         }
-        Arc::make_mut(attr).retain(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC);
+
+        self.export_nexthop(nexthop, family);
     }
 
     /// Apply per-peer attribute transformation to outgoing route attributes.
@@ -287,11 +302,12 @@ impl PeerExportContext {
     /// all UPDATE messages to internal peers).
     /// RS client: pass through unchanged.
     ///
-    /// MED is intentionally not handled here: unlike LOCAL_PREF, an eBGP
-    /// export policy may legitimately set MED for the direct peer (RFC 4271
-    /// §5.1.4), so clearing a *received* MED must happen before export
-    /// policy runs -- see `clear_received_med`, called earlier in the export
-    /// pipeline -- rather than here, after policy has already run.
+    /// MED and nexthop are intentionally not handled here: unlike LOCAL_PREF,
+    /// an eBGP export policy may legitimately set them for the direct peer
+    /// (RFC 4271 §5.1.4, and third-party nexthop respectively), so their
+    /// defaults must be applied before export policy runs -- see
+    /// `pre_policy_defaults`, called earlier in the export pipeline --
+    /// rather than here, after policy has already run.
     pub(super) fn export_attrs(
         &self,
         attrs: &Arc<Vec<bgp::Attribute>>,
@@ -379,16 +395,18 @@ impl PeerExportContext {
         )
     }
 
-    /// Apply per-peer nexthop transformation to an outgoing route nexthop.
+    /// Compute the default per-peer nexthop for an outgoing route.
     ///
-    /// eBGP: replace with local_addr (with link-local for IPv6 when available).
-    /// iBGP / iBGP-RR-client / RS client: pass through unchanged (next-hop
-    /// unchanged).
-    pub(super) fn export_nexthop(
-        &self,
-        nexthop: Option<bgp::Nexthop>,
-        family: Family,
-    ) -> Option<bgp::Nexthop> {
+    /// eBGP / ConfedEbgp: self-nexthop (local_addr, with link-local for IPv6
+    /// when available). iBGP / iBGP-RR-client / RS client: pass through
+    /// unchanged. No stored nexthop (e.g. a locally-originated route):
+    /// self-nexthop for any role, except Flowspec (RFC 8955 §4 carries no
+    /// nexthop).
+    ///
+    /// Called only from `pre_policy_defaults`, i.e. before export policy
+    /// runs, so that a `set-nexthop` export policy action can override this
+    /// default rather than being clobbered by it afterward.
+    fn export_nexthop(&self, nexthop: &mut Option<bgp::Nexthop>, family: Family) {
         let local = || match self.local_addr {
             IpAddr::V4(v4) => bgp::Nexthop::V4(v4),
             IpAddr::V6(v6) => {
@@ -406,7 +424,7 @@ impl PeerExportContext {
                 | Family::IPV4_FLOWSPEC_VPN
                 | Family::IPV6_FLOWSPEC_VPN
         );
-        match (self.role, nexthop) {
+        *nexthop = match (self.role, *nexthop) {
             // Flowspec carries no nexthop (RFC 8955 §4): preserve None.
             (_, None) if is_flowspec => None,
             // No stored nexthop for non-Flowspec (e.g. locally originated RTC):
@@ -414,7 +432,7 @@ impl PeerExportContext {
             (_, None) => Some(local()),
             (PeerRole::RsClient | PeerRole::Ibgp | PeerRole::IbgpRrClient, Some(nh)) => Some(nh),
             (PeerRole::ConfedEbgp | PeerRole::Ebgp, Some(_)) => Some(local()),
-        }
+        };
     }
 }
 
@@ -619,9 +637,10 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             if rtc_filter.is_some_and(|f| !f.allows(&best.attr)) {
                 return None;
             }
+            let original_nexthop = best.nexthop;
             let mut nexthop = best.nexthop;
             let mut attr = Arc::clone(&best.attr);
-            export_ctx.clear_received_med(&mut attr);
+            export_ctx.pre_policy_defaults(&mut attr, &mut nexthop, update.family);
             if export_policy.is_some_and(|policy| {
                 table::apply_export(
                     policy,
@@ -630,6 +649,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                     &update.net,
                     &mut attr,
                     &mut nexthop,
+                    original_nexthop,
                     export_ctx.local_addr,
                     remote_addr,
                 ) == table::Disposition::Reject
@@ -664,7 +684,6 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                     attr
                 };
                 let attr = export_ctx.export_attrs(&attr);
-                let nexthop = export_ctx.export_nexthop(nexthop, update.family);
                 // BMP post-policy Reach: use the fully-rewritten attr/nexthop.
                 if let Some(bmp) = bmp {
                     bmp.post(
@@ -691,7 +710,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
         }
         // Build the effective top-N after echo prevention, split horizon, and
         // export policy.  Store post-policy (attr, nexthop) so that
-        // export_attrs/export_nexthop can be applied in one step below.
+        // export_attrs can be applied in one step below.
         let current_top_n: Vec<(
             u32,
             Arc<Vec<packet::Attribute>>,
@@ -708,9 +727,10 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                 if rtc_filter.is_some_and(|f| !f.allows(&path.attr)) {
                     return None;
                 }
+                let original_nexthop = path.nexthop;
                 let mut nexthop = path.nexthop;
                 let mut attr = Arc::clone(&path.attr);
-                export_ctx.clear_received_med(&mut attr);
+                export_ctx.pre_policy_defaults(&mut attr, &mut nexthop, update.family);
                 if export_policy.is_some_and(|policy| {
                     table::apply_export(
                         policy,
@@ -719,6 +739,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                         &update.net,
                         &mut attr,
                         &mut nexthop,
+                        original_nexthop,
                         export_ctx.local_addr,
                         remote_addr,
                     ) == table::Disposition::Reject
@@ -758,7 +779,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             if !already_sent || was_replaced {
                 export_map.mark_sent(update.family, update.dest_id, *pid);
                 let attr = export_ctx.export_attrs(attr);
-                let nexthop = export_ctx.export_nexthop(*nexthop, update.family);
+                let nexthop = *nexthop;
                 if let Some(bmp) = bmp {
                     bmp.post(
                         update.family,

@@ -818,6 +818,7 @@ impl Statement {
         net: &packet::Nlri,
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
+        original_nexthop: Option<bgp::Nexthop>,
         local_addr: IpAddr,
         peer_addr: IpAddr,
         rpki: Option<&RpkiTable>,
@@ -850,7 +851,15 @@ impl Statement {
                         IpAddr::V6(v6) => bgp::Nexthop::V6(v6),
                     });
                 }
-                NexthopAction::Unchanged => {}
+                // Restore the genuine pre-default nexthop. When there is none
+                // (e.g. a locally-originated route with no stored nexthop),
+                // leave the caller-supplied default in place rather than
+                // clearing it: a non-Flowspec UPDATE cannot omit NEXT_HOP.
+                NexthopAction::Unchanged => {
+                    if let Some(orig) = original_nexthop {
+                        *nexthop = Some(orig);
+                    }
+                }
             }
         }
 
@@ -1126,12 +1135,22 @@ impl Policy {
         net: &packet::Nlri,
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
+        original_nexthop: Option<bgp::Nexthop>,
         local_addr: IpAddr,
         peer_addr: IpAddr,
         rpki: Option<&RpkiTable>,
     ) -> Disposition {
         for statement in &self.statements {
-            let d = statement.apply(source, net, attr, nexthop, local_addr, peer_addr, rpki);
+            let d = statement.apply(
+                source,
+                net,
+                attr,
+                nexthop,
+                original_nexthop,
+                local_addr,
+                peer_addr,
+                rpki,
+            );
             if d != Disposition::Pass {
                 return d;
             }
@@ -1165,12 +1184,22 @@ impl PolicyAssignment {
         net: &packet::Nlri,
         attr: &mut Arc<Vec<packet::Attribute>>,
         nexthop: &mut Option<bgp::Nexthop>,
+        original_nexthop: Option<bgp::Nexthop>,
         local_addr: IpAddr,
         peer_addr: IpAddr,
         rpki: Option<&RpkiTable>,
     ) -> Disposition {
         for policy in &self.policies {
-            let d = policy.apply(source, net, attr, nexthop, local_addr, peer_addr, rpki);
+            let d = policy.apply(
+                source,
+                net,
+                attr,
+                nexthop,
+                original_nexthop,
+                local_addr,
+                peer_addr,
+                rpki,
+            );
             if d != Disposition::Pass {
                 return d;
             }
@@ -1211,11 +1240,17 @@ pub fn apply_import(
     nexthop: &mut Option<bgp::Nexthop>,
 ) -> (bool, Arc<Vec<packet::Attribute>>) {
     let mut attr = Arc::clone(attrs);
+    // Import has no pre-policy nexthop defaulting step, so the "original" is
+    // just the current value -- NexthopAction::Unchanged is a no-op here.
+    // PolicyTable::build_assignment() also rejects nexthop actions in import
+    // policies at load time, so this is never actually exercised.
+    let original_nexthop = *nexthop;
     let filtered = policy.apply(
         source,
         net,
         &mut attr,
         nexthop,
+        original_nexthop,
         source.local_addr,
         source.remote_addr,
         rpki,
@@ -1224,6 +1259,11 @@ pub fn apply_import(
 }
 
 /// Apply export policy to a route being advertised to a peer.
+///
+/// `original_nexthop` is the nexthop as received, before any pre-policy
+/// defaulting (e.g. eBGP self-nexthop) was applied to `nexthop` -- used by
+/// `NexthopAction::Unchanged` to restore the genuine original instead of
+/// confirming the just-applied default.
 ///
 /// Returns the `Disposition` from the policy chain.
 /// Pass `rpki: None` to skip RPKI validation (e.g. in tests or when no RTR session is active).
@@ -1235,10 +1275,20 @@ pub fn apply_export(
     net: &packet::Nlri,
     attr: &mut Arc<Vec<packet::Attribute>>,
     nexthop: &mut Option<bgp::Nexthop>,
+    original_nexthop: Option<bgp::Nexthop>,
     local_addr: IpAddr,
     peer_addr: IpAddr,
 ) -> Disposition {
-    policy.apply(source, net, attr, nexthop, local_addr, peer_addr, rpki)
+    policy.apply(
+        source,
+        net,
+        attr,
+        nexthop,
+        original_nexthop,
+        local_addr,
+        peer_addr,
+        rpki,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2598,6 +2648,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
 
         let result = get_communities(&attr);
@@ -2628,6 +2679,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
 
         let result = get_communities(&attr);
@@ -2653,6 +2705,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
 
@@ -2680,6 +2733,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
 
@@ -2710,6 +2764,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
 
@@ -2768,6 +2823,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
 
         assert_eq!(get_local_pref(&attr), Some(200));
@@ -2796,6 +2852,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
 
@@ -2856,6 +2913,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(get_med(&attr), Some(300));
     }
@@ -2875,6 +2933,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(get_med(&attr), Some(100));
@@ -2896,6 +2955,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(get_med(&attr), Some(250));
     }
@@ -2916,6 +2976,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(get_med(&attr), Some(150));
     }
@@ -2935,6 +2996,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(get_med(&attr), Some(0));
@@ -3005,6 +3067,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(get_as_path(&attr), vec![65100, 65001, 65002]);
     }
@@ -3024,6 +3087,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(get_as_path(&attr), vec![65100, 65100, 65100, 65001]);
@@ -3045,6 +3109,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(get_as_path(&attr), vec![65001, 65001, 65002]);
     }
@@ -3064,6 +3129,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(get_as_path(&attr), vec![65100, 65100]);
@@ -3134,6 +3200,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         let result = get_ext_communities(&attr);
         assert!(result.contains(&SOO_65002_100), "original preserved");
@@ -3159,6 +3226,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         let result = get_ext_communities(&attr);
         assert!(!result.contains(&RT_65001_100), "removed");
@@ -3183,6 +3251,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         let result = get_ext_communities(&attr);
@@ -3249,6 +3318,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         let result = get_large_communities(&attr);
         assert!(result.contains(&(65000, 1, 200)), "original preserved");
@@ -3274,6 +3344,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         let result = get_large_communities(&attr);
         assert!(!result.contains(&(65000, 1, 100)), "removed");
@@ -3298,6 +3369,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(get_large_communities(&attr), vec![(65001, 2, 50)]);
@@ -3354,6 +3426,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(get_origin(&attr), Some(0));
     }
@@ -3375,6 +3448,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(get_origin(&attr), Some(2));
@@ -3427,6 +3501,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3448,6 +3523,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Accept);
@@ -3471,6 +3547,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3492,6 +3569,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Accept);
@@ -3516,6 +3594,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3539,6 +3618,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3560,6 +3640,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3580,6 +3661,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Accept);
@@ -3603,6 +3685,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3623,6 +3706,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Reject);
@@ -3645,6 +3729,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -3665,6 +3750,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Reject);
@@ -3687,6 +3773,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3707,6 +3794,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Accept);
@@ -3736,6 +3824,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Reject);
@@ -3816,6 +3905,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3839,6 +3929,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Accept);
@@ -3913,6 +4004,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Reject);
     }
@@ -3936,6 +4028,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Accept);
@@ -3980,6 +4073,7 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(d, Disposition::Accept);
     }
@@ -4000,6 +4094,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Reject);
@@ -4023,6 +4118,7 @@ mod tests {
             &mut nexthop,
             local_addr(),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(d, Disposition::Accept);
@@ -4128,11 +4224,70 @@ mod tests {
             local_addr(),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(
             nexthop,
             Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1))),
             "nexthop should be set to peer address"
+        );
+    }
+
+    #[test]
+    fn nexthop_unchanged_action_restores_original() {
+        // `nexthop` simulates the value already overwritten by a pre-policy
+        // default (e.g. eBGP self-nexthop); `original_nexthop` is the
+        // genuine value received before that default was applied.
+        // NexthopAction::Unchanged must restore the latter, not confirm the
+        // former -- otherwise "unchanged" would always mean "self".
+        let assignment = make_nexthop_assignment(NexthopAction::Unchanged);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        let original_nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+            None,
+            original_nexthop,
+        );
+        assert_eq!(
+            nexthop, original_nexthop,
+            "unchanged should restore the genuine original nexthop, not keep the pre-policy default"
+        );
+    }
+
+    #[test]
+    fn nexthop_unchanged_action_keeps_default_when_no_original() {
+        // When there was no genuine original (e.g. a locally-originated
+        // route with no stored nexthop), Unchanged must not clear nexthop
+        // back to None -- a non-Flowspec UPDATE cannot omit NEXT_HOP.
+        let assignment = make_nexthop_assignment(NexthopAction::Unchanged);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(vec![]);
+        let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+            None,
+            None,
+        );
+        assert_eq!(
+            nexthop,
+            Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            "with no original, the pre-policy default must be left in place"
         );
     }
 

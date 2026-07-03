@@ -2010,8 +2010,18 @@ impl Table {
         local_addr: IpAddr,
         peer_addr: IpAddr,
         rpki: Option<&RpkiTable>,
+        original_nexthop: Option<bgp::Nexthop>,
     ) -> Disposition {
-        assignment.apply(source, net, attr, nexthop, local_addr, peer_addr, rpki)
+        assignment.apply(
+            source,
+            net,
+            attr,
+            nexthop,
+            original_nexthop,
+            local_addr,
+            peer_addr,
+            rpki,
+        )
     }
 }
 
@@ -3535,6 +3545,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             s.remote_addr,
             None,
+            None,
         );
         assert_eq!(result, Disposition::Reject);
     }
@@ -3586,6 +3597,7 @@ mod tests {
             &mut nh(),
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(result, Disposition::Accept);
@@ -3643,6 +3655,7 @@ mod tests {
             &mut nexthop,
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(result, Disposition::Accept);
@@ -3703,6 +3716,7 @@ mod tests {
             &mut nexthop,
             local_addr,
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(result, Disposition::Accept);
@@ -3766,6 +3780,7 @@ mod tests {
             &mut nexthop,
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             s.remote_addr,
+            None,
             None,
         );
         assert_eq!(nexthop, original);

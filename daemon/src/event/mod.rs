@@ -536,8 +536,8 @@ impl Peer {
 
     /// Build a `PeerExportContext` for adj-out display (no live session needed).
     ///
-    /// Uses the router-id as `local_addr` fallback; `export_nexthop` is not
-    /// called for display so the exact local address does not matter.
+    /// Uses the router-id as `local_addr` fallback; `pre_policy_defaults` is
+    /// not called for display so the exact local address does not matter.
     fn adj_out_export_ctx(&self, global: &Global) -> PeerExportContext {
         PeerExportContext {
             role: self.peer_role(global),
@@ -7131,6 +7131,16 @@ mod tests {
             out
         }
 
+        /// Extract the nexthop carried by each reach UPDATE message.
+        fn reach_nexthops(msgs: &[bgp::Message]) -> Vec<Option<bgp::Nexthop>> {
+            msgs.iter()
+                .filter_map(|msg| match msg {
+                    bgp::Message::Update(bgp::Update::Reach { nexthop, .. }) => Some(*nexthop),
+                    _ => None,
+                })
+                .collect()
+        }
+
         const SELF: &str = "10.0.0.1";
         const PEER: &str = "10.0.0.2";
 
@@ -7244,6 +7254,97 @@ mod tests {
 
             assert!(pending.is_empty());
             assert!(!em.was_sent(Family::IPV4, 1));
+        }
+
+        // ---- export policy: NexthopAction::Unchanged vs pre-policy default ----
+
+        fn nexthop_export_policy(action: table::NexthopAction) -> Arc<table::PolicyAssignment> {
+            let mut ptable = table::PolicyTable::new();
+            ptable
+                .add_statement(
+                    "st1",
+                    vec![],
+                    Some(table::Disposition::Accept),
+                    table::Actions {
+                        nexthop: Some(action),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            ptable.add_policy("pol1", vec!["st1".to_string()]).unwrap();
+            let (_, assignment) = ptable
+                .add_assignment(
+                    "peer",
+                    table::PolicyDirection::Export,
+                    table::Disposition::Accept,
+                    vec!["pol1".to_string()],
+                )
+                .unwrap();
+            assignment
+        }
+
+        #[test]
+        fn ebgp_export_policy_nexthop_unchanged_preserves_third_party_nexthop() {
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let mut p = path(1, source(PEER));
+            // Third-party nexthop: neither this router's local_addr nor the peer's address.
+            p.nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 100, 1)));
+            let update = change(&net, true, true, None, vec![p]);
+            let policy = nexthop_export_policy(table::NexthopAction::Unchanged);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                Some(&policy),
+                None,
+                None,
+                None,
+                None,
+            );
+
+            let msgs = pending.drain_messages(Family::IPV4);
+            assert_eq!(
+                reach_nexthops(&msgs),
+                vec![Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 100, 1)))],
+                "NexthopAction::Unchanged must preserve the third-party nexthop, not force self"
+            );
+        }
+
+        #[test]
+        fn ebgp_export_without_policy_forces_self_nexthop() {
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let mut p = path(1, source(PEER));
+            p.nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 100, 1)));
+            let update = change(&net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(), // local_addr = 127.0.0.1
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            let msgs = pending.drain_messages(Family::IPV4);
+            assert_eq!(
+                reach_nexthops(&msgs),
+                vec![Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)))],
+                "without a set-nexthop policy, eBGP export must force self-nexthop"
+            );
         }
 
         #[test]
@@ -7768,7 +7869,7 @@ mod tests {
             assert_eq!(reach[0].1, 2);
         }
 
-        // ---- export_attrs / export_nexthop per-role correctness ----
+        // ---- export_attrs / pre_policy_defaults per-role correctness ----
 
         fn attr_with_local_pref() -> Arc<Vec<packet::Attribute>> {
             Arc::new(vec![
@@ -7858,9 +7959,9 @@ mod tests {
 
         #[test]
         fn ebgp_export_attrs_does_not_touch_med() {
-            // MED stripping for eBGP happens in clear_received_med(), called
+            // MED stripping for eBGP happens in pre_policy_defaults(), called
             // *before* export policy runs, not in export_attrs() (which runs
-            // after policy). See clear_received_med_* tests below.
+            // after policy). See pre_policy_defaults_*_med_* tests below.
             let ctx = ebgp_ctx();
             let exported = ctx.export_attrs(&attr_with_med());
             assert!(
@@ -7872,10 +7973,11 @@ mod tests {
         }
 
         #[test]
-        fn clear_received_med_strips_for_ebgp() {
+        fn pre_policy_defaults_strips_med_for_ebgp() {
             let ctx = ebgp_ctx();
             let mut attr = attr_with_med();
-            ctx.clear_received_med(&mut attr);
+            let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
             assert!(
                 attr.iter()
                     .all(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC),
@@ -7884,10 +7986,11 @@ mod tests {
         }
 
         #[test]
-        fn clear_received_med_keeps_for_ibgp() {
+        fn pre_policy_defaults_keeps_med_for_ibgp() {
             let ctx = ibgp_ctx();
             let mut attr = attr_with_med();
-            ctx.clear_received_med(&mut attr);
+            let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
             assert!(
                 attr.iter().any(
                     |a| a.code() == packet::Attribute::MULTI_EXIT_DESC && a.value() == Some(50)
@@ -7897,10 +8000,11 @@ mod tests {
         }
 
         #[test]
-        fn clear_received_med_keeps_for_confed_ebgp() {
+        fn pre_policy_defaults_keeps_med_for_confed_ebgp() {
             let ctx = confed_ebgp_ctx();
             let mut attr = attr_with_med();
-            ctx.clear_received_med(&mut attr);
+            let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
             assert!(
                 attr.iter().any(
                     |a| a.code() == packet::Attribute::MULTI_EXIT_DESC && a.value() == Some(50)
@@ -8101,26 +8205,30 @@ mod tests {
         }
 
         #[test]
-        fn ebgp_export_rewrites_nexthop() {
+        fn pre_policy_defaults_rewrites_nexthop_for_ebgp() {
             let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
+            let mut attr = Arc::new(vec![]);
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-            let exported = ctx.export_nexthop(Some(original), Family::IPV4);
+            let mut nexthop = Some(original);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
             assert_eq!(
-                exported,
+                nexthop,
                 Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
                 "eBGP nexthop must be rewritten to local_addr"
             );
         }
 
         #[test]
-        fn ibgp_export_keeps_nexthop() {
+        fn pre_policy_defaults_keeps_nexthop_for_ibgp() {
             let ctx = ibgp_ctx();
+            let mut attr = Arc::new(vec![]);
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-            let exported = ctx.export_nexthop(Some(original), Family::IPV4);
-            assert_eq!(exported, Some(original), "iBGP nexthop must be unchanged");
+            let mut nexthop = Some(original);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
+            assert_eq!(nexthop, Some(original), "iBGP nexthop must be unchanged");
         }
 
-        // ---- Confederation: export_attrs / export_nexthop ----
+        // ---- Confederation: export_attrs / pre_policy_defaults ----
 
         fn confed_ebgp_ctx() -> PeerExportContext {
             PeerExportContext {
@@ -8225,12 +8333,14 @@ mod tests {
         }
 
         #[test]
-        fn confed_ebgp_export_nexthop_rewrites_to_local() {
+        fn confed_ebgp_pre_policy_defaults_rewrites_nexthop_to_local() {
             let ctx = confed_ebgp_ctx(); // local_addr = 127.0.0.1
+            let mut attr = Arc::new(vec![]);
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
-            let exported = ctx.export_nexthop(Some(original), Family::IPV4);
+            let mut nexthop = Some(original);
+            ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4);
             assert_eq!(
-                exported,
+                nexthop,
                 Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1))),
                 "ConfedEbgp nexthop must be rewritten to local_addr"
             );
