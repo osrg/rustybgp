@@ -30,3 +30,15 @@ gobgp_bgp_state() {
         echo "Idle"
     fi
 }
+
+# Query a BIRD BGP protocol's state via birdc text output.
+# Returns "Established" or "Idle".
+bird_bgp_state() {
+    local container=$1 protocol=$2
+    if docker exec "$container" birdc show protocols "$protocol" 2>/dev/null \
+        | grep -qE "^${protocol}[[:space:]]+BGP[[:space:]].*Established"; then
+        echo "Established"
+    else
+        echo "Idle"
+    fi
+}

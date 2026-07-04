@@ -1,0 +1,19 @@
+global:
+  config:
+    as: 65010
+    router-id: "172.30.40.1"
+
+neighbors:
+  - config:
+      neighbor-address: "172.30.40.2"
+      peer-as: 4200000000
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast
+
+  - config:
+      neighbor-address: "172.30.41.2"
+      peer-as: 65020
+    afi-safis:
+      - config:
+          afi-safi-name: ipv4-unicast

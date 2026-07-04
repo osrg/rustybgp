@@ -1,0 +1,83 @@
+networks:
+  gobgp-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.40.0/24
+          gateway: 172.30.40.254
+
+  bird-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.41.0/24
+          gateway: 172.30.41.254
+
+  frr-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.42.0/24
+          gateway: 172.30.42.254
+
+services:
+  rusty:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: rusty
+    privileged: true
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      gobgp-net:
+        ipv4_address: 172.30.40.1
+      bird-net:
+        ipv4_address: 172.30.41.1
+    volumes:
+      - ./rustybgp.yaml:/etc/rustybgp.yaml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+
+  gobgp-new:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.gobgp
+    container_name: gobgp-new
+    networks:
+      gobgp-net:
+        ipv4_address: 172.30.40.2
+    volumes:
+      - ./gobgp-new/gobgpd.conf:/etc/gobgpd.conf:ro
+      - ./gobgp-new/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  bird-old:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.bird
+    container_name: bird-old
+    privileged: true
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      bird-net:
+        ipv4_address: 172.30.41.2
+      frr-net:
+        ipv4_address: 172.30.42.1
+    volumes:
+      - ./bird-old/bird.conf:/etc/bird.conf:ro
+
+  frr-new:
+    image: quay.io/frrouting/frr:10.6.0
+    container_name: frr-new
+    privileged: true
+    volumes:
+      - ./frr-new/frr.conf:/etc/frr/frr.conf:ro
+      - ../shared/daemons:/etc/frr/daemons:ro
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      frr-net:
+        ipv4_address: 172.30.42.2

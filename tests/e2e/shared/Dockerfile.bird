@@ -1,0 +1,28 @@
+# BIRD Internet Routing Daemon image, built from source (CZ.NIC does not
+# publish an official prebuilt image). Used as a real RFC 6793 "OLD BGP
+# speaker" reference implementation via `enable as4 off;` in the two-byte-as
+# e2e test.
+FROM alpine:3.21 AS builder
+
+ARG BIRD_VERSION=v2.19.1
+
+RUN apk add --no-cache \
+        git autoconf automake libtool m4 bison flex \
+        gcc make musl-dev linux-headers \
+        ncurses-dev readline-dev
+
+WORKDIR /src
+RUN git clone --depth 1 --branch ${BIRD_VERSION} https://github.com/CZ-NIC/bird.git .
+
+RUN autoreconf && \
+    ./configure --prefix=/usr --sysconfdir=/etc --runstatedir=/run && \
+    make -j"$(nproc)"
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ncurses-libs readline bash
+
+COPY --from=builder /src/bird /usr/local/sbin/bird
+COPY --from=builder /src/birdc /usr/local/sbin/birdc
+
+ENTRYPOINT ["/usr/local/sbin/bird", "-f"]

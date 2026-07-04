@@ -76,6 +76,7 @@ ALL_TESTS=(
     rpki
     rtc
     sr-policy
+    two-byte-as
     unnumbered-bgp
 )
 

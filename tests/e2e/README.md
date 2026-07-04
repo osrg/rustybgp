@@ -105,6 +105,7 @@ RUSTYBGP_DOCKERFILE=Dockerfile \
 | `rpki` | RPKI Route Origin Validation | RFC 6811, RFC 8210 |
 | `rtc` | Route Target Membership — RT-based VPN route filtering | RFC 4684 |
 | `sr-policy` | SR Policy (IPv4, MPLS binding SID, segment list) | RFC 9830 |
+| `two-byte-as` | Two-Octet AS Number Peer (AS4_PATH/AS4_AGGREGATOR interop with a real BIRD OLD BGP speaker) | RFC 6793 |
 | `unnumbered-bgp` | Unnumbered BGP over IPv6 link-local + Extended Nexthop | RFC 7938, RFC 8950 |
 
 ## Shared infrastructure
@@ -114,4 +115,6 @@ RUSTYBGP_DOCKERFILE=Dockerfile \
 - `Dockerfile.rustybgp` — builds `rustybgpd` from source (used by default locally)
 - `Dockerfile.rustybgp-prebuilt` — copies a prebuilt binary (used by CI)
 - `Dockerfile.gobgp` — GoBGP image used as a BGP peer in most tests
+- `Dockerfile.bird` — BIRD image built from source (CZ.NIC publishes no official
+  prebuilt image); used as a real RFC 6793 OLD BGP speaker in `two-byte-as`
 - `helpers.sh` — shell functions sourced by every `run-test.sh`
