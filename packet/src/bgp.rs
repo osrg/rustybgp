@@ -1310,7 +1310,13 @@ impl Attribute {
         }
     }
 
-    fn decode(code: u8, flags: u8, c: &mut dyn io::Read, len: u16) -> Result<Self, ()> {
+    fn decode(
+        code: u8,
+        flags: u8,
+        c: &mut dyn io::Read,
+        len: u16,
+        two_byte_as: bool,
+    ) -> Result<Self, ()> {
         let data = match code {
             Self::ORIGIN => {
                 if len != 1 {
@@ -1332,25 +1338,61 @@ impl Attribute {
             Self::AS_PATH => {
                 let mut b = vec![0u8; len as usize];
                 c.read_exact(&mut b).map_err(|_| ())?;
-                // RFC 4271 §4.3: validate segment structure.
-                // Each segment: 1-byte type (1-4), 1-byte count, count*4 bytes of 4-octet ASNs.
-                let mut pos = 0usize;
-                while pos < b.len() {
-                    if pos + 2 > b.len() {
-                        return Err(());
+                if two_byte_as {
+                    // RFC 6793 §4.2.3: an OLD BGP speaker encodes each AS as two
+                    // octets. Up-convert to the canonical four-octet internal
+                    // representation used everywhere else in this codebase;
+                    // AS_TRANS (23456) is preserved as-is here and resolved
+                    // later by reconciling with AS4_PATH.
+                    let mut out = Vec::with_capacity(b.len() * 2);
+                    let mut pos = 0usize;
+                    while pos < b.len() {
+                        if pos + 2 > b.len() {
+                            return Err(());
+                        }
+                        let seg_type = b[pos];
+                        let seg_count = b[pos + 1] as usize;
+                        if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET)
+                            .contains(&seg_type)
+                        {
+                            return Err(());
+                        }
+                        let seg_end = pos + 2 + seg_count * 2;
+                        if seg_end > b.len() {
+                            return Err(());
+                        }
+                        out.push(seg_type);
+                        out.push(b[pos + 1]);
+                        for i in 0..seg_count {
+                            let start = pos + 2 + i * 2;
+                            let as2 = u16::from_be_bytes([b[start], b[start + 1]]);
+                            out.extend_from_slice(&(as2 as u32).to_be_bytes());
+                        }
+                        pos = seg_end;
                     }
-                    let seg_type = b[pos];
-                    let seg_count = b[pos + 1] as usize;
-                    if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET).contains(&seg_type)
-                    {
-                        return Err(());
+                    AttributeData::Bin(out)
+                } else {
+                    // RFC 4271 §4.3: validate segment structure.
+                    // Each segment: 1-byte type (1-4), 1-byte count, count*4 bytes of 4-octet ASNs.
+                    let mut pos = 0usize;
+                    while pos < b.len() {
+                        if pos + 2 > b.len() {
+                            return Err(());
+                        }
+                        let seg_type = b[pos];
+                        let seg_count = b[pos + 1] as usize;
+                        if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET)
+                            .contains(&seg_type)
+                        {
+                            return Err(());
+                        }
+                        pos += 2 + seg_count * 4;
+                        if pos > b.len() {
+                            return Err(());
+                        }
                     }
-                    pos += 2 + seg_count * 4;
-                    if pos > b.len() {
-                        return Err(());
-                    }
+                    AttributeData::Bin(b)
                 }
-                AttributeData::Bin(b)
             }
             Self::ATOMIC_AGGREGATE => {
                 // RFC 4271 §5.1.6: ATOMIC_AGGREGATE has zero-length value
@@ -1360,13 +1402,23 @@ impl Attribute {
                 AttributeData::Bin(vec![])
             }
             Self::AGGREGATOR => {
-                // RFC 4271 §5.1.7: 2-octet ASN (6 bytes) or 4-octet ASN (8 bytes, RFC 6793 §4.2.3)
+                // RFC 4271 §5.1.7: 2-octet ASN (6 bytes) or 4-octet ASN (8 bytes, RFC 6793 §4.2.3).
+                // Always canonicalized to the 8-byte (four-octet ASN) internal form,
+                // matching the AS_PATH up-conversion above.
                 if len != 6 && len != 8 {
                     return Err(());
                 }
                 let mut b = vec![0u8; len as usize];
                 c.read_exact(&mut b).map_err(|_| ())?;
-                AttributeData::Bin(b)
+                if len == 6 {
+                    let asn = u16::from_be_bytes([b[0], b[1]]) as u32;
+                    let mut out = Vec::with_capacity(8);
+                    out.extend_from_slice(&asn.to_be_bytes());
+                    out.extend_from_slice(&b[2..]);
+                    AttributeData::Bin(out)
+                } else {
+                    AttributeData::Bin(b)
+                }
             }
             Self::COMMUNITY => {
                 // RFC 1997 §4: each community value is 4 octets
@@ -1398,6 +1450,44 @@ impl Attribute {
             Self::LARGE_COMMUNITY => {
                 // RFC 8092 §2: each large community value is 12 octets
                 if !len.is_multiple_of(12) {
+                    return Err(());
+                }
+                let mut b = vec![0u8; len as usize];
+                c.read_exact(&mut b).map_err(|_| ())?;
+                AttributeData::Bin(b)
+            }
+            Self::AS4_PATH => {
+                // RFC 6793 §6: malformed if the length is not a multiple of two
+                // or too small to carry at least one AS number, or any segment
+                // has a zero/inconsistent length or an undefined segment type.
+                // Always four-octet-per-AS; there is no two-octet AS4_PATH form.
+                if !len.is_multiple_of(2) || len < 6 {
+                    return Err(());
+                }
+                let mut b = vec![0u8; len as usize];
+                c.read_exact(&mut b).map_err(|_| ())?;
+                let mut pos = 0usize;
+                while pos < b.len() {
+                    if pos + 2 > b.len() {
+                        return Err(());
+                    }
+                    let seg_type = b[pos];
+                    let seg_count = b[pos + 1] as usize;
+                    if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET).contains(&seg_type)
+                        || seg_count == 0
+                    {
+                        return Err(());
+                    }
+                    pos += 2 + seg_count * 4;
+                    if pos > b.len() {
+                        return Err(());
+                    }
+                }
+                AttributeData::Bin(b)
+            }
+            Self::AS4_AGGREGATOR => {
+                // RFC 6793 §6: malformed if the length is not 8.
+                if len != 8 {
                     return Err(());
                 }
                 let mut b = vec![0u8; len as usize];
@@ -1589,6 +1679,151 @@ impl Attribute {
         } else {
             None
         }
+    }
+
+    /// Returns true if any AS number in this (canonical four-octet) AS_PATH
+    /// exceeds the two-octet range. RFC 6793 §4.2.2: only in that case does an
+    /// OLD BGP speaker also need an accompanying AS4_PATH attribute.
+    fn as_path_has_wide_as(&self) -> bool {
+        assert_eq!(self.code, Attribute::AS_PATH);
+        let buf = self.binary().unwrap();
+        let mut pos = 0usize;
+        while pos < buf.len() {
+            let seg_count = buf[pos + 1] as usize;
+            for i in 0..seg_count {
+                let start = pos + 2 + i * 4;
+                let asn = u32::from_be_bytes(buf[start..start + 4].try_into().unwrap());
+                if asn > u16::MAX as u32 {
+                    return true;
+                }
+            }
+            pos += 2 + seg_count * 4;
+        }
+        false
+    }
+
+    /// Down-converts this (canonical four-octet) AS_PATH to the two-octet wire
+    /// form sent to an OLD BGP speaker (RFC 6793 §4.2.2), substituting
+    /// AS_TRANS (23456) for any AS number that doesn't fit in two octets.
+    fn as_path_downgrade_2byte(&self) -> Vec<u8> {
+        assert_eq!(self.code, Attribute::AS_PATH);
+        let buf = self.binary().unwrap();
+        let mut out = Vec::with_capacity(buf.len());
+        let mut pos = 0usize;
+        while pos < buf.len() {
+            let seg_type = buf[pos];
+            let seg_count = buf[pos + 1] as usize;
+            out.push(seg_type);
+            out.push(buf[pos + 1]);
+            for i in 0..seg_count {
+                let start = pos + 2 + i * 4;
+                let asn = u32::from_be_bytes(buf[start..start + 4].try_into().unwrap());
+                let as2 = if asn > u16::MAX as u32 {
+                    Capability::TRANS_ASN
+                } else {
+                    asn as u16
+                };
+                out.extend_from_slice(&as2.to_be_bytes());
+            }
+            pos += 2 + seg_count * 4;
+        }
+        out
+    }
+
+    /// Counts the AS hops in a (canonical four-octet) AS_PATH/AS4_PATH value,
+    /// per the RFC 4271 §9.1.2.2 convention also used by RFC 6793 §4.2.3:
+    /// AS_SET counts as one hop regardless of its member count, AS_SEQUENCE
+    /// entries count individually, and AS_CONFED_SEQUENCE/AS_CONFED_SET do
+    /// not count at all.
+    fn count_as_hops(bin: &[u8]) -> usize {
+        let mut pos = 0usize;
+        let mut count = 0usize;
+        while pos < bin.len() {
+            let seg_type = bin[pos];
+            let seg_count = bin[pos + 1] as usize;
+            match seg_type {
+                Self::AS_PATH_TYPE_SET => count += 1,
+                Self::AS_PATH_TYPE_SEQ => count += seg_count,
+                _ => {}
+            }
+            pos += 2 + seg_count * 4;
+        }
+        count
+    }
+
+    /// Copies the leading `n` AS hops from a (canonical four-octet) AS_PATH
+    /// value, using the same hop-counting convention as `count_as_hops`.
+    /// AS_CONFED_SEQUENCE/AS_CONFED_SET segments are always carried through in
+    /// full while still accumulating hops, since confederation boundaries
+    /// (RFC 5065) are orthogonal to the OLD/NEW BGP speaker boundary.
+    fn as_path_take_prefix(bin: &[u8], mut n: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while n > 0 && pos < bin.len() {
+            let seg_type = bin[pos];
+            let seg_count = bin[pos + 1] as usize;
+            let seg_end = pos + 2 + seg_count * 4;
+            match seg_type {
+                Self::AS_PATH_TYPE_SEQ => {
+                    let take = seg_count.min(n);
+                    out.push(seg_type);
+                    out.push(take as u8);
+                    out.extend_from_slice(&bin[pos + 2..pos + 2 + take * 4]);
+                    n -= take;
+                }
+                Self::AS_PATH_TYPE_SET => {
+                    out.extend_from_slice(&bin[pos..seg_end]);
+                    n -= 1;
+                }
+                _ => {
+                    out.extend_from_slice(&bin[pos..seg_end]);
+                }
+            }
+            pos = seg_end;
+        }
+        out
+    }
+
+    /// Reconstructs the true AS_PATH from a received two-octet-derived
+    /// AS_PATH and its accompanying AS4_PATH (RFC 6793 §4.2.3): if `as_path`
+    /// has fewer AS hops than `as4_path`, `as4_path` is ignored; otherwise the
+    /// leading `len(as_path) - len(as4_path)` hops of `as_path` are prepended
+    /// to `as4_path`.
+    fn as_path_reconcile(as_path: &[u8], as4_path: &[u8]) -> Vec<u8> {
+        let as_path_count = Self::count_as_hops(as_path);
+        let as4_path_count = Self::count_as_hops(as4_path);
+        if as_path_count < as4_path_count {
+            return as_path.to_vec();
+        }
+        let mut merged = Self::as_path_take_prefix(as_path, as_path_count - as4_path_count);
+        merged.extend_from_slice(as4_path);
+        merged
+    }
+
+    /// Returns the aggregating router's AS number from a (canonical
+    /// eight-byte) AGGREGATOR attribute.
+    fn aggregator_asn(&self) -> u32 {
+        assert_eq!(self.code, Attribute::AGGREGATOR);
+        let buf = self.binary().unwrap();
+        u32::from_be_bytes(buf[..4].try_into().unwrap())
+    }
+
+    /// Down-converts this (canonical eight-byte) AGGREGATOR to the six-byte
+    /// wire form sent to an OLD BGP speaker (RFC 6793 §4.2.2), substituting
+    /// AS_TRANS (23456) when the aggregating AS doesn't fit in two octets.
+    fn aggregator_downgrade_2byte(&self) -> Vec<u8> {
+        assert_eq!(self.code, Attribute::AGGREGATOR);
+        let buf = self.binary().unwrap();
+        let asn = self.aggregator_asn();
+        let as2 = if asn > u16::MAX as u32 {
+            Capability::TRANS_ASN
+        } else {
+            asn as u16
+        };
+        let mut out = Vec::with_capacity(6);
+        out.extend_from_slice(&as2.to_be_bytes());
+        out.extend_from_slice(&buf[4..8]);
+        out
     }
 
     pub(crate) fn encode_wire<B: BufMut + AsMut<[u8]>>(&self, dst: &mut B) -> u16 {
@@ -1957,6 +2192,11 @@ pub struct PeerCodec {
     pub extended_length: bool,
     extended_nexthop: bool,
     families: FnvHashMap<Family, FamilyState>,
+    /// RFC 6793: the peer did not negotiate the Four-Octet AS Number
+    /// capability (i.e. it is an OLD BGP speaker in RFC 6793 terms).
+    /// AS_PATH/AGGREGATOR are exchanged in two-octet-ASN wire form with
+    /// AS4_PATH/AS4_AGGREGATOR carrying the real four-octet AS numbers.
+    pub two_byte_as: bool,
 }
 
 impl Default for PeerCodec {
@@ -1971,6 +2211,7 @@ impl PeerCodec {
             extended_length: false,
             extended_nexthop: false,
             families: FnvHashMap::default(),
+            two_byte_as: false,
         }
     }
 
@@ -2038,10 +2279,17 @@ impl PeerCodec {
             }
         }
         let has = |v: &[Capability]| v.iter().any(|c| matches!(c, Capability::ExtendedMessage));
+        let has_as4 = |v: &[Capability]| {
+            v.iter()
+                .any(|c| matches!(c, Capability::FourOctetAsNumber(_)))
+        };
         PeerCodec {
             extended_length: has(local) && has(remote),
             extended_nexthop,
             families,
+            // RFC 6793 SS4.1: both sides must advertise and receive the
+            // capability for the session to use four-octet AS numbers.
+            two_byte_as: !(has_as4(local) && has_as4(remote)),
         }
     }
 
@@ -2272,7 +2520,54 @@ impl PeerCodec {
                 // NEXTHOP is written below for traditional IPv4.
                 // MP_REACH/MP_UNREACH are synthesized below for MP paths.
                 for a in attr.as_ref() {
-                    attr_len += a.encode_wire(dst);
+                    if !self.two_byte_as {
+                        attr_len += a.encode_wire(dst);
+                        continue;
+                    }
+                    match a.code() {
+                        Attribute::AS_PATH => {
+                            // RFC 6793 §4.2.2: send AS_PATH in two-octet-ASN
+                            // wire form to an OLD BGP speaker, with a
+                            // companion AS4_PATH carrying the real
+                            // four-octet AS numbers whenever one doesn't fit
+                            // in two octets.
+                            let downgraded = Attribute::new_with_bin(
+                                Attribute::AS_PATH,
+                                a.as_path_downgrade_2byte(),
+                            )
+                            .unwrap();
+                            attr_len += downgraded.encode_wire(dst);
+                            if a.as_path_has_wide_as() {
+                                let stripped = a.as_path_strip_confed();
+                                let as4_path = Attribute::new_with_bin(
+                                    Attribute::AS4_PATH,
+                                    stripped.binary().unwrap().clone(),
+                                )
+                                .unwrap();
+                                attr_len += as4_path.encode_wire(dst);
+                            }
+                        }
+                        Attribute::AGGREGATOR => {
+                            // RFC 6793 §4.2.2: likewise for AGGREGATOR/AS4_AGGREGATOR.
+                            let downgraded = Attribute::new_with_bin(
+                                Attribute::AGGREGATOR,
+                                a.aggregator_downgrade_2byte(),
+                            )
+                            .unwrap();
+                            attr_len += downgraded.encode_wire(dst);
+                            if a.aggregator_asn() > u16::MAX as u32 {
+                                let as4_aggregator = Attribute::new_with_bin(
+                                    Attribute::AS4_AGGREGATOR,
+                                    a.binary().unwrap().clone(),
+                                )
+                                .unwrap();
+                                attr_len += as4_aggregator.encode_wire(dst);
+                            }
+                        }
+                        _ => {
+                            attr_len += a.encode_wire(dst);
+                        }
+                    }
                 }
 
                 if *family == Family::IPV4 && !ipv4_via_mp {
@@ -2442,6 +2737,49 @@ impl PeerCodec {
         }
         Ok(entries)
     }
+
+    /// Reconstructs AS_PATH and AGGREGATOR from AS4_PATH/AS4_AGGREGATOR
+    /// received from an OLD BGP speaker (RFC 6793 §4.2.3), removing the
+    /// AS4_* attributes from `attrs` once consumed. No-op if neither is
+    /// present.
+    fn reconcile_as4(attrs: &mut Vec<Attribute>) {
+        let as4_path = attrs
+            .iter()
+            .position(|a| a.code() == Attribute::AS4_PATH)
+            .map(|i| attrs.remove(i));
+        let as4_aggregator = attrs
+            .iter()
+            .position(|a| a.code() == Attribute::AS4_AGGREGATOR)
+            .map(|i| attrs.remove(i));
+
+        // RFC 6793 §4.2.3: if both AGGREGATOR and AS4_AGGREGATOR are present
+        // and AGGREGATOR's AS number is not AS_TRANS, the aggregation
+        // happened at an OLD router with a genuine two-octet AS, so both
+        // AS4_AGGREGATOR and AS4_PATH are untrustworthy and ignored.
+        let mut ignore_as4_path = false;
+        if let Some(as4_aggregator) = as4_aggregator
+            && let Some(idx) = attrs.iter().position(|a| a.code() == Attribute::AGGREGATOR)
+        {
+            if attrs[idx].aggregator_asn() == Capability::TRANS_ASN as u32 {
+                let bin = as4_aggregator.binary().unwrap().clone();
+                attrs[idx] = Attribute::new_with_bin(Attribute::AGGREGATOR, bin).unwrap();
+            } else {
+                ignore_as4_path = true;
+            }
+        }
+
+        if !ignore_as4_path
+            && let Some(as4_path) = as4_path
+            && let Some(idx) = attrs.iter().position(|a| a.code() == Attribute::AS_PATH)
+        {
+            let merged = Attribute::as_path_reconcile(
+                attrs[idx].binary().unwrap(),
+                as4_path.binary().unwrap(),
+            );
+            attrs[idx] = Attribute::new_with_bin(Attribute::AS_PATH, merged).unwrap();
+        }
+    }
+
     pub fn parse_message(&mut self, buf: &[u8]) -> Result<ParsedMessage, Notification> {
         if buf.len() < Message::HEADER_LENGTH as usize {
             return Err(Notification::BadMessageLength { data: vec![] });
@@ -2611,7 +2949,8 @@ impl PeerCodec {
                                 continue;
                             } else {
                                 let cur = c.position();
-                                match Attribute::decode(code, flags, &mut c, alen) {
+                                match Attribute::decode(code, flags, &mut c, alen, self.two_byte_as)
+                                {
                                     Ok(a) => {
                                         if code == Attribute::MP_REACH {
                                             mp_reach_attr = Some(a);
@@ -2620,15 +2959,29 @@ impl PeerCodec {
                                         } else if code == Attribute::NEXTHOP {
                                             reach_nexthop =
                                                 a.binary().and_then(|b| Nexthop::from_bytes(b));
+                                        } else if (code == Attribute::AS4_PATH
+                                            || code == Attribute::AS4_AGGREGATOR)
+                                            && !self.two_byte_as
+                                        {
+                                            // RFC 6793 §6: a NEW BGP speaker that
+                                            // receives AS4_PATH/AS4_AGGREGATOR from
+                                            // another NEW speaker must discard it.
                                         } else {
                                             attr.push(a);
                                         }
                                     }
                                     Err(_) => {
-                                        error_attrs.push(AttributeError {
-                                            attr_code: code,
-                                            attr_flags: flags,
-                                        });
+                                        // RFC 6793 §6: malformed AS4_PATH/AS4_AGGREGATOR
+                                        // are discarded outright, not treated as a
+                                        // generic (possibly treat-as-withdraw) error.
+                                        if code != Attribute::AS4_PATH
+                                            && code != Attribute::AS4_AGGREGATOR
+                                        {
+                                            error_attrs.push(AttributeError {
+                                                attr_code: code,
+                                                attr_flags: flags,
+                                            });
+                                        }
                                         c.set_position(cur + alen as u64);
                                         continue;
                                     }
@@ -2810,6 +3163,10 @@ impl PeerCodec {
                     && error_attrs.is_empty()
                 {
                     return Ok(ParsedMessage::Update(ParsedUpdate::EndOfRib(*family)));
+                }
+
+                if self.two_byte_as {
+                    Self::reconcile_as4(&mut attr);
                 }
 
                 Ok(ParsedMessage::Update(ParsedUpdate::Routes {
@@ -6248,5 +6605,622 @@ mod update_tests {
             _ => panic!("expected Reach message"),
         };
         assert!(attr.iter().all(|a| a.code() != 201));
+    }
+}
+
+/// RFC 6793 (BGP Support for Four-octet AS Number Space) interop tests:
+/// `PeerCodec::two_byte_as` handling, AS_PATH/AGGREGATOR two-octet wire form,
+/// and AS4_PATH/AS4_AGGREGATOR reconciliation.
+///
+/// AS_PATH/AS4_PATH/AGGREGATOR/AS4_AGGREGATOR wire vectors below (the
+/// `GOBGP_*` constants) are generated from GoBGP's packet library as an
+/// independent reference implementation; see `packet/tests/gen/two_byte_as`.
+#[cfg(test)]
+mod two_byte_as_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+
+    fn ipv4_codec() -> PeerCodec {
+        let mut c = PeerCodec::new();
+        c.set_family(Family::IPV4, Default::default());
+        c
+    }
+
+    fn ipv4_codec_2byte_as() -> PeerCodec {
+        let mut c = ipv4_codec();
+        c.two_byte_as = true;
+        c
+    }
+
+    fn round_trip(msg: &Message, codec: PeerCodec) -> ParsedMessage {
+        let mut framer = codec;
+        let mut buf = Vec::new();
+        framer.encode_to(msg, &mut buf).unwrap();
+        framer.parse_message(&buf).unwrap()
+    }
+
+    fn seg_bytes(seg_type: u8, asns: &[u32]) -> Vec<u8> {
+        let mut v = vec![seg_type, asns.len() as u8];
+        for &a in asns {
+            v.extend_from_slice(&a.to_be_bytes());
+        }
+        v
+    }
+
+    fn attr_tlv(flags: u8, code: u8, value: &[u8]) -> Vec<u8> {
+        let mut v = vec![flags, code, value.len() as u8];
+        v.extend_from_slice(value);
+        v
+    }
+
+    fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn ipv4_prefix(addr: &str, mask: u8) -> PathNlri {
+        PathNlri::new(Nlri::V4(Ipv4Net {
+            addr: addr.parse().unwrap(),
+            mask,
+        }))
+    }
+
+    fn origin_and_nexthop() -> Vec<u8> {
+        let mut v = vec![0x40, Attribute::ORIGIN, 0x01, 0x00];
+        v.extend_from_slice(&attr_tlv(
+            0x40,
+            Attribute::NEXTHOP,
+            &[0xC0, 0x00, 0x02, 0x01],
+        ));
+        v
+    }
+
+    fn raw_update_with_attrs(attr_bytes: &[u8]) -> Vec<u8> {
+        let nlri: &[u8] = &[0x08, 0x0A];
+        let attr_len = attr_bytes.len() as u16;
+        let total = 19u16 + 2 + 2 + attr_len + nlri.len() as u16;
+        let mut buf = vec![0xffu8; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(attr_bytes);
+        buf.extend_from_slice(nlri);
+        buf
+    }
+
+    fn parse_attrs_2byte_as(attr_bytes: &[u8]) -> Vec<Attribute> {
+        let buf = raw_update_with_attrs(attr_bytes);
+        match ipv4_codec_2byte_as().parse_message(&buf).unwrap() {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => attrs,
+            _ => panic!("expected Update::Routes"),
+        }
+    }
+
+    fn aggregator_bin(asn: u32, addr: Ipv4Addr) -> Vec<u8> {
+        let mut v = asn.to_be_bytes().to_vec();
+        v.extend_from_slice(&addr.octets());
+        v
+    }
+
+    // --- GoBGP-generated wire vectors (regenerate via `go run
+    // ./two_byte_as` in packet/tests/gen if the scenarios below change) ---
+
+    // AS_PATH (2-octet) SEQ: 65000, 4000, AS_TRANS, AS_TRANS, 40001
+    const GOBGP_AS2_65000_4000_TRANS_TRANS_40001: &[u8] = &[
+        0x02, 0x05, 0xfd, 0xe8, 0x0f, 0xa0, 0x5b, 0xa0, 0x5b, 0xa0, 0x9c, 0x41,
+    ];
+    // AS4_PATH SEQ: 400000, 300000, 40001
+    const GOBGP_AS4_400000_300000_40001: &[u8] = &[
+        0x02, 0x03, 0x00, 0x06, 0x1a, 0x80, 0x00, 0x04, 0x93, 0xe0, 0x00, 0x00, 0x9c, 0x41,
+    ];
+    // four-octet AS_PATH SEQ 65000,4000,400000,300000,40001, as AS4_PATH-shaped value bytes
+    const GOBGP_AS4_65000_4000_400000_300000_40001: &[u8] = &[
+        0x02, 0x05, 0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x0f, 0xa0, 0x00, 0x06, 0x1a, 0x80, 0x00,
+        0x04, 0x93, 0xe0, 0x00, 0x00, 0x9c, 0x41,
+    ];
+    // AS_PATH (2-octet) SEQ: 65000, AS_TRANS
+    const GOBGP_AS2_65000_TRANS: &[u8] = &[0x02, 0x02, 0xfd, 0xe8, 0x5b, 0xa0];
+    // AS4_PATH SEQ: 65000, 400000
+    const GOBGP_AS4_65000_400000: &[u8] =
+        &[0x02, 0x02, 0x00, 0x00, 0xfd, 0xe8, 0x00, 0x06, 0x1a, 0x80];
+    // AS4_PATH SEQ: 65000, 400000, 300000
+    const GOBGP_AS4_65000_400000_300000: &[u8] = &[
+        0x02, 0x03, 0x00, 0x00, 0xfd, 0xe8, 0x00, 0x06, 0x1a, 0x80, 0x00, 0x04, 0x93, 0xe0,
+    ];
+    // AS_PATH (2-octet): SET{65010, 65020}, SEQ[AS_TRANS]
+    const GOBGP_AS2_SET_65010_65020_SEQ_TRANS: &[u8] =
+        &[0x01, 0x02, 0xfd, 0xf2, 0xfd, 0xfc, 0x02, 0x01, 0x5b, 0xa0];
+    // AS4_PATH SEQ: 500000
+    const GOBGP_AS4_500000: &[u8] = &[0x02, 0x01, 0x00, 0x07, 0xa1, 0x20];
+    // AS_PATH (2-octet): CONFED_SEQ[65001], SEQ[65000, AS_TRANS]
+    const GOBGP_AS2_CONFEDSEQ_65001_SEQ_65000_TRANS: &[u8] =
+        &[0x03, 0x01, 0xfd, 0xe9, 0x02, 0x02, 0xfd, 0xe8, 0x5b, 0xa0];
+    // AS4_PATH SEQ: 600000
+    const GOBGP_AS4_600000: &[u8] = &[0x02, 0x01, 0x00, 0x09, 0x27, 0xc0];
+    // AGGREGATOR (2-octet): AS_TRANS, 198.51.100.1
+    const GOBGP_AGGREGATOR_TRANS_198_51_100_1: &[u8] = &[0x5b, 0xa0, 0xc6, 0x33, 0x64, 0x01];
+    // AGGREGATOR (2-octet): 65055, 198.51.100.1
+    const GOBGP_AGGREGATOR_65055_198_51_100_1: &[u8] = &[0xfe, 0x1f, 0xc6, 0x33, 0x64, 0x01];
+    // AS4_AGGREGATOR: 400000, 198.51.100.1
+    const GOBGP_AS4_AGGREGATOR_400000_198_51_100_1: &[u8] =
+        &[0x00, 0x06, 0x1a, 0x80, 0xc6, 0x33, 0x64, 0x01];
+
+    // --- negotiate() ---
+
+    #[test]
+    fn negotiate_two_byte_as_when_remote_lacks_capability() {
+        let local = [Capability::FourOctetAsNumber(65001)];
+        let remote = [];
+        assert!(PeerCodec::negotiate(&local, &remote).two_byte_as);
+    }
+
+    #[test]
+    fn negotiate_four_byte_as_when_both_sides_have_capability() {
+        let local = [Capability::FourOctetAsNumber(65001)];
+        let remote = [Capability::FourOctetAsNumber(400000)];
+        assert!(!PeerCodec::negotiate(&local, &remote).two_byte_as);
+    }
+
+    // --- decode / reconcile (RFC 6793 §4.2.3) ---
+
+    #[test]
+    fn reconcile_takes_leading_hops_when_as_path_longer() {
+        let mut attr_bytes = origin_and_nexthop();
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0x40,
+            Attribute::AS_PATH,
+            GOBGP_AS2_65000_4000_TRANS_TRANS_40001,
+        ));
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0xC0,
+            Attribute::AS4_PATH,
+            GOBGP_AS4_400000_300000_40001,
+        ));
+        let attrs = parse_attrs_2byte_as(&attr_bytes);
+        assert!(attrs.iter().all(|a| a.code() != Attribute::AS4_PATH));
+        let as_path = attrs
+            .iter()
+            .find(|a| a.code() == Attribute::AS_PATH)
+            .unwrap();
+        // The leading 2 hops are taken as a new SEQ segment (count=2) and the
+        // AS4_PATH segment (count=3) is appended as-is -- RFC 6793 §4.2.3
+        // prepends "AS numbers and path segments", it does not require
+        // merging adjacent same-type segments into one (matching BIRD's
+        // as_path_merge, a plain concatenation).
+        let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 4000]);
+        expected.extend_from_slice(&seg_bytes(
+            Attribute::AS_PATH_TYPE_SEQ,
+            &[400000, 300000, 40001],
+        ));
+        assert_eq!(as_path.binary().unwrap(), &expected);
+    }
+
+    #[test]
+    fn reconcile_equal_hop_counts_uses_as4_path_directly() {
+        let mut attr_bytes = origin_and_nexthop();
+        attr_bytes.extend_from_slice(&attr_tlv(0x40, Attribute::AS_PATH, GOBGP_AS2_65000_TRANS));
+        attr_bytes.extend_from_slice(&attr_tlv(0xC0, Attribute::AS4_PATH, GOBGP_AS4_65000_400000));
+        let attrs = parse_attrs_2byte_as(&attr_bytes);
+        let as_path = attrs
+            .iter()
+            .find(|a| a.code() == Attribute::AS_PATH)
+            .unwrap();
+        assert_eq!(
+            as_path.binary().unwrap(),
+            &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 400000])
+        );
+    }
+
+    #[test]
+    fn as4_path_ignored_when_longer_than_as_path() {
+        let mut attr_bytes = origin_and_nexthop();
+        attr_bytes.extend_from_slice(&attr_tlv(0x40, Attribute::AS_PATH, GOBGP_AS2_65000_TRANS));
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0xC0,
+            Attribute::AS4_PATH,
+            GOBGP_AS4_65000_400000_300000,
+        ));
+        let attrs = parse_attrs_2byte_as(&attr_bytes);
+        assert!(attrs.iter().all(|a| a.code() != Attribute::AS4_PATH));
+        let as_path = attrs
+            .iter()
+            .find(|a| a.code() == Attribute::AS_PATH)
+            .unwrap();
+        // AS_TRANS (23456) is left unresolved: AS4_PATH was ignored (RFC 6793 §4.2.3).
+        assert_eq!(
+            as_path.binary().unwrap(),
+            &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 23456])
+        );
+    }
+
+    #[test]
+    fn as_set_counts_as_one_hop() {
+        let mut attr_bytes = origin_and_nexthop();
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0x40,
+            Attribute::AS_PATH,
+            GOBGP_AS2_SET_65010_65020_SEQ_TRANS,
+        ));
+        attr_bytes.extend_from_slice(&attr_tlv(0xC0, Attribute::AS4_PATH, GOBGP_AS4_500000));
+        let attrs = parse_attrs_2byte_as(&attr_bytes);
+        let as_path = attrs
+            .iter()
+            .find(|a| a.code() == Attribute::AS_PATH)
+            .unwrap();
+        let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_SET, &[65010, 65020]);
+        expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[500000]));
+        assert_eq!(as_path.binary().unwrap(), &expected);
+    }
+
+    #[test]
+    fn confed_segment_carried_through_without_consuming_hop_budget() {
+        let mut attr_bytes = origin_and_nexthop();
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0x40,
+            Attribute::AS_PATH,
+            GOBGP_AS2_CONFEDSEQ_65001_SEQ_65000_TRANS,
+        ));
+        attr_bytes.extend_from_slice(&attr_tlv(0xC0, Attribute::AS4_PATH, GOBGP_AS4_600000));
+        let attrs = parse_attrs_2byte_as(&attr_bytes);
+        let as_path = attrs
+            .iter()
+            .find(|a| a.code() == Attribute::AS_PATH)
+            .unwrap();
+        let mut expected = seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001]);
+        expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000]));
+        expected.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[600000]));
+        assert_eq!(as_path.binary().unwrap(), &expected);
+    }
+
+    #[test]
+    fn aggregator_reconciled_when_as_trans() {
+        let mut attr_bytes = origin_and_nexthop();
+        attr_bytes.extend_from_slice(&attr_tlv(0x40, Attribute::AS_PATH, GOBGP_AS2_65000_TRANS));
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0xC0,
+            Attribute::AGGREGATOR,
+            GOBGP_AGGREGATOR_TRANS_198_51_100_1,
+        ));
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0xC0,
+            Attribute::AS4_AGGREGATOR,
+            GOBGP_AS4_AGGREGATOR_400000_198_51_100_1,
+        ));
+        let attrs = parse_attrs_2byte_as(&attr_bytes);
+        assert!(attrs.iter().all(|a| a.code() != Attribute::AS4_AGGREGATOR));
+        let agg = attrs
+            .iter()
+            .find(|a| a.code() == Attribute::AGGREGATOR)
+            .unwrap();
+        assert_eq!(
+            agg.binary().unwrap(),
+            &aggregator_bin(400000, Ipv4Addr::new(198, 51, 100, 1))
+        );
+    }
+
+    #[test]
+    fn aggregator_not_as_trans_ignores_as4_aggregator_and_as4_path() {
+        let mut attr_bytes = origin_and_nexthop();
+        attr_bytes.extend_from_slice(&attr_tlv(0x40, Attribute::AS_PATH, GOBGP_AS2_65000_TRANS));
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0xC0,
+            Attribute::AGGREGATOR,
+            GOBGP_AGGREGATOR_65055_198_51_100_1,
+        ));
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0xC0,
+            Attribute::AS4_AGGREGATOR,
+            GOBGP_AS4_AGGREGATOR_400000_198_51_100_1,
+        ));
+        attr_bytes.extend_from_slice(&attr_tlv(0xC0, Attribute::AS4_PATH, GOBGP_AS4_65000_400000));
+        let attrs = parse_attrs_2byte_as(&attr_bytes);
+        assert!(attrs.iter().all(|a| a.code() != Attribute::AS4_AGGREGATOR));
+        assert!(attrs.iter().all(|a| a.code() != Attribute::AS4_PATH));
+        let agg = attrs
+            .iter()
+            .find(|a| a.code() == Attribute::AGGREGATOR)
+            .unwrap();
+        assert_eq!(
+            agg.binary().unwrap(),
+            &aggregator_bin(65055, Ipv4Addr::new(198, 51, 100, 1))
+        );
+        // RFC 6793 §4.2.3: AS_PATH reconciliation is skipped too in this case.
+        let as_path = attrs
+            .iter()
+            .find(|a| a.code() == Attribute::AS_PATH)
+            .unwrap();
+        assert_eq!(
+            as_path.binary().unwrap(),
+            &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 23456])
+        );
+    }
+
+    #[test]
+    fn malformed_as4_path_discarded_not_treat_as_withdraw() {
+        let mut attr_bytes = origin_and_nexthop();
+        attr_bytes.extend_from_slice(&attr_tlv(0x40, Attribute::AS_PATH, GOBGP_AS2_65000_TRANS));
+        // RFC 6793 §6: length 7 is not a multiple of two -> malformed.
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0xC0,
+            Attribute::AS4_PATH,
+            &[0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ));
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec_2byte_as()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        // RFC 6793 §6 mandates plain attribute discard, not treat-as-withdraw.
+        match &msgs[0] {
+            Message::Update(Update::Reach { attr, .. }) => {
+                assert!(attr.iter().all(|a| a.code() != Attribute::AS4_PATH));
+                let as_path = attr
+                    .iter()
+                    .find(|a| a.code() == Attribute::AS_PATH)
+                    .unwrap();
+                assert_eq!(
+                    as_path.binary().unwrap(),
+                    &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 23456])
+                );
+            }
+            _ => panic!("expected Reach message"),
+        }
+    }
+
+    #[test]
+    fn malformed_as4_aggregator_discarded_not_treat_as_withdraw() {
+        let mut attr_bytes = origin_and_nexthop();
+        attr_bytes.extend_from_slice(&attr_tlv(0x40, Attribute::AS_PATH, GOBGP_AS2_65000_TRANS));
+        // RFC 6793 §6: AS4_AGGREGATOR length must be exactly 8.
+        attr_bytes.extend_from_slice(&attr_tlv(0xC0, Attribute::AS4_AGGREGATOR, &[0u8; 7]));
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec_2byte_as()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Message::Update(Update::Reach { .. })));
+    }
+
+    #[test]
+    fn as4_path_from_as4_capable_peer_is_discarded() {
+        let mut attr_bytes = origin_and_nexthop();
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0x40,
+            Attribute::AS_PATH,
+            &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000]),
+        ));
+        attr_bytes.extend_from_slice(&attr_tlv(
+            0xC0,
+            Attribute::AS4_PATH,
+            GOBGP_AS4_400000_300000_40001,
+        ));
+        let buf = raw_update_with_attrs(&attr_bytes);
+        // A plain (AS4-capable, two_byte_as == false) session.
+        match ipv4_codec().parse_message(&buf).unwrap() {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+                assert!(attrs.iter().all(|a| a.code() != Attribute::AS4_PATH));
+                let as_path = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::AS_PATH)
+                    .unwrap();
+                assert_eq!(
+                    as_path.binary().unwrap(),
+                    &seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000])
+                );
+            }
+            _ => panic!("expected Update::Routes"),
+        }
+    }
+
+    // --- encode (RFC 6793 §4.2.2) ---
+
+    #[test]
+    fn encode_writes_downgraded_as_path_and_as4_path() {
+        let attr = Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                seg_bytes(
+                    Attribute::AS_PATH_TYPE_SEQ,
+                    &[65000, 4000, 400000, 300000, 40001],
+                ),
+            )
+            .unwrap(),
+        ]);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
+            attr,
+        });
+        let mut buf = Vec::new();
+        ipv4_codec_2byte_as().encode_to(&msg, &mut buf).unwrap();
+        assert!(contains_subsequence(
+            &buf,
+            &attr_tlv(
+                0x40,
+                Attribute::AS_PATH,
+                GOBGP_AS2_65000_4000_TRANS_TRANS_40001
+            )
+        ));
+        assert!(contains_subsequence(
+            &buf,
+            &attr_tlv(
+                0xC0,
+                Attribute::AS4_PATH,
+                GOBGP_AS4_65000_4000_400000_300000_40001
+            )
+        ));
+    }
+
+    #[test]
+    fn encode_omits_as4_path_when_no_wide_as() {
+        let attr = Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 4000]),
+            )
+            .unwrap(),
+        ]);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
+            attr,
+        });
+        let mut buf = Vec::new();
+        ipv4_codec_2byte_as().encode_to(&msg, &mut buf).unwrap();
+        assert!(!contains_subsequence(&buf, &[0xC0, Attribute::AS4_PATH]));
+    }
+
+    #[test]
+    fn encode_writes_downgraded_aggregator_and_as4_aggregator() {
+        let attr = Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000]),
+            )
+            .unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AGGREGATOR,
+                aggregator_bin(400000, Ipv4Addr::new(198, 51, 100, 1)),
+            )
+            .unwrap(),
+        ]);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
+            attr,
+        });
+        let mut buf = Vec::new();
+        ipv4_codec_2byte_as().encode_to(&msg, &mut buf).unwrap();
+        assert!(contains_subsequence(
+            &buf,
+            &attr_tlv(
+                0xC0,
+                Attribute::AGGREGATOR,
+                GOBGP_AGGREGATOR_TRANS_198_51_100_1
+            )
+        ));
+        assert!(contains_subsequence(
+            &buf,
+            &attr_tlv(
+                0xC0,
+                Attribute::AS4_AGGREGATOR,
+                GOBGP_AS4_AGGREGATOR_400000_198_51_100_1
+            )
+        ));
+    }
+
+    #[test]
+    fn encode_omits_as4_aggregator_when_as_fits_two_bytes() {
+        let attr = Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000]),
+            )
+            .unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AGGREGATOR,
+                aggregator_bin(65055, Ipv4Addr::new(198, 51, 100, 1)),
+            )
+            .unwrap(),
+        ]);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
+            attr,
+        });
+        let mut buf = Vec::new();
+        ipv4_codec_2byte_as().encode_to(&msg, &mut buf).unwrap();
+        assert!(!contains_subsequence(
+            &buf,
+            &[0xC0, Attribute::AS4_AGGREGATOR]
+        ));
+    }
+
+    // --- full pipeline round trip ---
+
+    #[test]
+    fn round_trip_through_two_byte_as_session_preserves_as_path() {
+        let attr = Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                seg_bytes(
+                    Attribute::AS_PATH_TYPE_SEQ,
+                    &[65000, 4000, 400000, 300000, 40001],
+                ),
+            )
+            .unwrap(),
+        ]);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
+            attr,
+        });
+        match round_trip(&msg, ipv4_codec_2byte_as()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+                assert!(attrs.iter().all(|a| a.code() != Attribute::AS4_PATH));
+                let as_path = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::AS_PATH)
+                    .unwrap();
+                assert_eq!(
+                    as_path.binary().unwrap(),
+                    &seg_bytes(
+                        Attribute::AS_PATH_TYPE_SEQ,
+                        &[65000, 4000, 400000, 300000, 40001]
+                    )
+                );
+            }
+            _ => panic!("expected Update::Routes"),
+        }
+    }
+
+    #[test]
+    fn round_trip_through_two_byte_as_session_preserves_aggregator() {
+        let attr = Arc::new(vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000]),
+            )
+            .unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AGGREGATOR,
+                aggregator_bin(400000, Ipv4Addr::new(198, 51, 100, 1)),
+            )
+            .unwrap(),
+        ]);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: None,
+            attr,
+        });
+        match round_trip(&msg, ipv4_codec_2byte_as()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
+                assert!(attrs.iter().all(|a| a.code() != Attribute::AS4_AGGREGATOR));
+                let agg = attrs
+                    .iter()
+                    .find(|a| a.code() == Attribute::AGGREGATOR)
+                    .unwrap();
+                assert_eq!(
+                    agg.binary().unwrap(),
+                    &aggregator_bin(400000, Ipv4Addr::new(198, 51, 100, 1))
+                );
+            }
+            _ => panic!("expected Update::Routes"),
+        }
     }
 }
