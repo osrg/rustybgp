@@ -256,26 +256,6 @@ impl Connection {
             return out;
         }
 
-        // Require 4-octet ASN capability (RFC 6793).
-        // 2-octet-only peers are not supported; refuse to prevent silent AS_PATH corruption.
-        let peer_as4 = open
-            .capability
-            .iter()
-            .any(|c| matches!(c, Capability::FourOctetAsNumber(_)));
-        if !peer_as4 {
-            // RFC 5492 §4: data contains the capability TLV we require.
-            let mut cap_data = vec![Capability::FOUR_OCTET_AS_NUMBER, 4];
-            cap_data.extend_from_slice(&self.local_asn.to_be_bytes());
-            let notif = bgp::Message::Notification(
-                rustybgp_packet::Notification::OpenUnsupportedCapability { data: cap_data },
-            );
-            out.push(Output::SessionDown(
-                SessionDownReason::LocalNotification(notif.clone()),
-                Some(notif),
-            ));
-            return out;
-        }
-
         // Store remote parameters
         self.remote_asn = open.as_number;
         self.remote_id = open.router_id;
@@ -820,6 +800,43 @@ mod tests {
         assert!(has_output(&out, |o| matches!(
             o,
             Output::StateChanged(State::Established)
+        )));
+    }
+
+    #[test]
+    fn open_without_four_octet_as_number_still_establishes_with_two_byte_as() {
+        let mut s = basic_connection();
+        let _ = s.process(Input::Connected(false));
+        assert_eq!(s.state(), State::OpenSent);
+
+        // Remote OPEN without the Four-Octet AS Number capability (RFC 6793
+        // OLD BGP speaker): the session must still establish, falling back
+        // to two-octet AS_PATH/AGGREGATOR encoding instead of refusing.
+        let open = bgp::Message::Open(bgp::Open {
+            as_number: 65002,
+            holdtime: HoldTime::new(60).unwrap(),
+            router_id: remote_router_id(),
+            capability: vec![Capability::MultiProtocol(Family::IPV4)],
+        });
+        let out = s.process(Input::MessageReceived(open));
+
+        assert_eq!(s.state(), State::OpenConfirm);
+        assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(..))));
+        let codec = out.iter().find_map(|o| match o {
+            Output::SessionNegotiated(codec) => Some(codec),
+            _ => None,
+        });
+        assert!(
+            codec.is_some_and(|c| c.two_byte_as),
+            "expected SessionNegotiated with two_byte_as == true"
+        );
+
+        // The session proceeds normally: KEEPALIVE -> Established.
+        let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SessionEstablished { .. }
         )));
     }
 
