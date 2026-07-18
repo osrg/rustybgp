@@ -1216,16 +1216,23 @@ impl Table {
             .entry(net.clone())
             .or_insert_with(|| Destination::with_id(id_alloc.alloc()));
 
-        // Capture the current best's (source, attr) Arc pointers before any modification.
-        // Comparing them with the post-insertion best detects all best-path changes:
+        // Capture the current best's (source, attr, nexthop) before any modification.
+        // Comparing it with the post-insertion best detects all best-path changes:
         // new path wins, old best replaced (same local_path_id, new attrs), or
         // old best displaced by a different path after attribute update.
         // Both source and attr are needed: paths may share the same attr Arc when
         // attrs.clone() is used within one UPDATE message (same allocation, same ptr),
         // so attr alone cannot distinguish a different path becoming best.
-        let old_best_key = dst
-            .unfiltered_best()
-            .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
+        // The nexthop is compared too because it lives in a separate Path field, not
+        // in attr: without it a re-advertisement that changes only the nexthop of an
+        // interned (shared-Arc) attr set would compare equal and be suppressed.
+        let old_best_key = dst.unfiltered_best().map(|p| {
+            (
+                Arc::as_ptr(&p.path.source),
+                Arc::as_ptr(&p.path.attr),
+                p.path.nexthop,
+            )
+        });
 
         // Single pass: find replaced index, check peer_has_path.
         let mut replaced_idx: Option<usize> = None;
@@ -1324,9 +1331,13 @@ impl Table {
         }
 
         // Compute change flags.
-        let new_best_key = dst
-            .unfiltered_best()
-            .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
+        let new_best_key = dst.unfiltered_best().map(|p| {
+            (
+                Arc::as_ptr(&p.path.source),
+                Arc::as_ptr(&p.path.attr),
+                p.path.nexthop,
+            )
+        });
         let best_changed = old_best_key != new_best_key;
         let any_changed = !filtered || replaced.as_ref().is_some_and(|r| !r.is_filtered());
         if !best_changed && !any_changed {
@@ -1413,10 +1424,14 @@ impl Table {
             return (None, None);
         };
 
-        // Capture (source, attr) Arc pointers before removal for best_changed detection.
-        let old_best_key = dst
-            .unfiltered_best()
-            .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
+        // Capture (source, attr, nexthop) before removal for best_changed detection.
+        let old_best_key = dst.unfiltered_best().map(|p| {
+            (
+                Arc::as_ptr(&p.path.source),
+                Arc::as_ptr(&p.path.attr),
+                p.path.nexthop,
+            )
+        });
         let was_unfiltered = !dst.entry[i].is_filtered();
 
         let removed = dst.entry.remove(i);
@@ -1465,9 +1480,13 @@ impl Table {
             return (change, removed_nexthop);
         }
 
-        let new_best_key = dst
-            .unfiltered_best()
-            .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
+        let new_best_key = dst.unfiltered_best().map(|p| {
+            (
+                Arc::as_ptr(&p.path.source),
+                Arc::as_ptr(&p.path.attr),
+                p.path.nexthop,
+            )
+        });
         let best_changed = old_best_key != new_best_key;
         let any_changed = was_unfiltered;
 
@@ -1763,7 +1782,13 @@ impl Table {
                     .entry
                     .iter()
                     .find(|p| !p.is_filtered() && !p.is_nexthop_invalid())
-                    .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
+                    .map(|p| {
+                        (
+                            Arc::as_ptr(&p.path.source),
+                            Arc::as_ptr(&p.path.attr),
+                            p.path.nexthop,
+                        )
+                    });
 
                 // Phase 2: update flags for matching entries.
                 let mut any_changed = false;
@@ -1785,7 +1810,13 @@ impl Table {
                     .entry
                     .iter()
                     .find(|p| !p.is_filtered() && !p.is_nexthop_invalid())
-                    .map(|p| (Arc::as_ptr(&p.path.source), Arc::as_ptr(&p.path.attr)));
+                    .map(|p| {
+                        (
+                            Arc::as_ptr(&p.path.source),
+                            Arc::as_ptr(&p.path.attr),
+                            p.path.nexthop,
+                        )
+                    });
                 let best_changed = old_best_key != new_best_key;
                 let current_paths =
                     Arc::new(dst.unfiltered_iter().map(|e| e.path.clone()).collect());
@@ -2500,6 +2531,79 @@ mod tests {
         assert!(!update.as_changed().unwrap().best_changed);
         assert!(update.as_changed().unwrap().any_changed);
         assert_eq!(update.as_changed().unwrap().current_paths.len(), 2);
+    }
+
+    // Regression: a re-advertisement that changes only the nexthop of an
+    // otherwise identical path (same source, same attr Arc, same route key)
+    // must be detected as a best-path change, not suppressed. Mirrors GoBGP
+    // #3496, where Path.Equal compared an attributes hash that excluded the
+    // MP_REACH nexthop and wrongly suppressed such re-advertisements. Here the
+    // attr Arc is shared across inserts (the interned-attr case) so the only
+    // difference the change detector can see is the separate nexthop field.
+    #[test]
+    fn insert_nexthop_only_change_is_best_change() {
+        let mut rt = Table::new(0);
+        let net = nlri(10, 0, 0, 0, 24);
+        let attr = attrs_with_local_pref(100);
+        let src = source(1, 65001, 65000, 1);
+        let nh1 = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let nh2 = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 2)));
+
+        rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net.clone(),
+            0,
+            nh1,
+            attr.clone(),
+            None,
+            false,
+            false,
+            None,
+            0u32,
+        );
+
+        // Same source, same attr Arc, same route key; only the nexthop changed.
+        let update = rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net.clone(),
+            0,
+            nh2,
+            attr.clone(),
+            None,
+            false,
+            false,
+            None,
+            0u32,
+        );
+        assert!(
+            update.as_changed().unwrap().best_changed,
+            "nexthop-only change must be a best-path change"
+        );
+        assert_eq!(
+            update.as_changed().unwrap().new_best().unwrap().nexthop,
+            nh2
+        );
+
+        // Identical re-add (nexthop unchanged too): best must not change.
+        let update = rt.insert(
+            src.clone(),
+            Family::IPV4,
+            net.clone(),
+            0,
+            nh2,
+            attr.clone(),
+            None,
+            false,
+            false,
+            None,
+            0u32,
+        );
+        assert!(
+            !update.as_changed().unwrap().best_changed,
+            "identical re-add must not be a best-path change"
+        );
     }
 
     // --- best path selection ---
