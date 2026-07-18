@@ -3965,13 +3965,10 @@ fn parse_ext_community_value(s: &str) -> Option<[u8; 8]> {
         bytes[4..8].copy_from_slice(&bw.to_bits().to_be_bytes());
         return Some(bytes);
     }
-    let (sub_type, rest) = if let Some(r) = s.strip_prefix("rt:") {
-        (0x02u8, r)
-    } else if let Some(r) = s.strip_prefix("soo:") {
-        (0x03u8, r)
-    } else {
-        return None;
-    };
+    let (sub_type, rest) = s
+        .strip_prefix("rt:")
+        .map(|r| (0x02u8, r))
+        .or_else(|| s.strip_prefix("soo:").map(|r| (0x03u8, r)))?;
     // Try "ASN:local-admin" — 4-octet AS when ASN > 65535, 2-octet otherwise
     let parts: Vec<&str> = rest.splitn(2, ':').collect();
     if parts.len() != 2 {

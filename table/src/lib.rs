@@ -2233,7 +2233,7 @@ impl RpkiTable {
     }
 
     pub fn drop_source(&mut self, source: Arc<IpAddr>) {
-        for (_, roa) in self.roas.iter_mut() {
+        for roa in self.roas.values_mut() {
             let mut empty = Vec::new();
             for (n, e) in roa.iter_mut() {
                 let mut i = 0;
