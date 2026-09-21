@@ -649,7 +649,7 @@ pub fn mac_mobility(attrs: &[crate::bgp::Attribute]) -> Option<(u32, bool)> {
         .find(|a| a.code() == crate::bgp::Attribute::EXTENDED_COMMUNITY)
         .and_then(|a| a.binary())
         .and_then(|b| {
-            b.chunks_exact(8).find_map(|ec| {
+            b.as_chunks::<8>().0.iter().find_map(|ec| {
                 if ec[0] == 0x06 && ec[1] == 0x00 {
                     let sticky = ec[2] & 0x01 != 0;
                     let seq = u32::from_be_bytes([ec[4], ec[5], ec[6], ec[7]]);

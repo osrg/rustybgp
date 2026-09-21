@@ -261,8 +261,10 @@ fn decode_link_desc_tlvs(data: &[u8]) -> Vec<LinkDescTlv> {
             }
             TLV_MULTI_TOPO_ID => {
                 let ids = value
-                    .chunks_exact(2)
-                    .map(|b| u16::from_be_bytes([b[0], b[1]]) & 0x0fff)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_be_bytes(*b) & 0x0fff)
                     .collect();
                 LinkDescTlv::MultiTopoId(ids)
             }
@@ -324,8 +326,10 @@ fn decode_prefix_desc_tlvs(data: &[u8]) -> Vec<PrefixDescTlv> {
         let tlv = match tlv_type {
             TLV_MULTI_TOPO_ID => {
                 let ids = value
-                    .chunks_exact(2)
-                    .map(|b| u16::from_be_bytes([b[0], b[1]]) & 0x0fff)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_be_bytes(*b) & 0x0fff)
                     .collect();
                 PrefixDescTlv::MultiTopoId(ids)
             }
@@ -495,8 +499,8 @@ impl BgpLsNlri {
                             sids.push(sid);
                         }
                         TLV_MULTI_TOPO_ID => {
-                            for chunk in value.chunks_exact(2) {
-                                multi_topo_ids.push(u16::from_be_bytes(chunk.try_into().unwrap()));
+                            for chunk in value.as_chunks::<2>().0 {
+                                multi_topo_ids.push(u16::from_be_bytes(*chunk));
                             }
                         }
                         _ => {}
@@ -1082,8 +1086,8 @@ pub fn parse_ls_attr(data: &[u8]) -> Vec<LsTlv> {
             ),
             TLV_UNRESERVED_BANDWIDTH if value.len() >= 32 => {
                 let mut bw = [0u32; 8];
-                for (i, chunk) in value[..32].chunks_exact(4).enumerate() {
-                    bw[i] = u32::from_be_bytes(chunk.try_into().unwrap());
+                for (i, chunk) in value[..32].as_chunks::<4>().0.iter().enumerate() {
+                    bw[i] = u32::from_be_bytes(*chunk);
                 }
                 LsTlv::UnreservedBandwidth(bw)
             }
@@ -1106,8 +1110,10 @@ pub fn parse_ls_attr(data: &[u8]) -> Vec<LsTlv> {
             }
             TLV_SRLG => {
                 let srlgs = value
-                    .chunks_exact(4)
-                    .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_be_bytes(*b))
                     .collect();
                 LsTlv::Srlg(srlgs)
             }

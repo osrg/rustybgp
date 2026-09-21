@@ -155,9 +155,8 @@ impl RtcFilter {
                 let Some(data) = attr.binary() else {
                     continue;
                 };
-                for chunk in data.chunks_exact(8) {
-                    let bytes: [u8; 8] = chunk.try_into().unwrap();
-                    if self.rts.contains(&bytes) {
+                for bytes in data.as_chunks::<8>().0 {
+                    if self.rts.contains(bytes) {
                         return true;
                     }
                 }

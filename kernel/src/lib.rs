@@ -34,7 +34,7 @@ use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
 use rtnetlink::packet_route::route::RouteMessage;
 use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteFlags, RouteProtocol};
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
-use rtnetlink::{IpVersion, LinkVrf, MulticastGroup, RouteMessageBuilder, RouteNextHopBuilder};
+use rtnetlink::{LinkVrf, MulticastGroup, RouteMessageBuilder, RouteNextHopBuilder};
 
 pub use rtnetlink::packet_route::route::RouteProtocol as Protocol;
 
@@ -120,7 +120,7 @@ pub async fn get_link_local_neighbor(ifname: &str) -> Result<Ipv6Addr, Error> {
     let mut neigh_stream = handle
         .neighbours()
         .get()
-        .set_family(IpVersion::V6)
+        .set_address_family(AddressFamily::Inet6)
         .execute();
     while let Some(msg) = neigh_stream.try_next().await? {
         if msg.header.ifindex != ifindex {
