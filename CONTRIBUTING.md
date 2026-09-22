@@ -19,7 +19,7 @@ The end-to-end tests in `tests/e2e/` each spin up a Docker Compose topology, run
 ## Commits
 
 - Add a `Signed-off-by` trailer to every commit. By doing so you certify that you wrote the patch and have the right to submit it under the project license.
-- If you used an AI coding assistant, add an `Assisted-by` trailer identifying the tool. The `Signed-off-by` confirms that you have reviewed the generated code and take responsibility for its correctness — following the [Linux kernel coding assistants policy](https://docs.kernel.org/process/coding-assistants.html).
+- If you used an AI tool, add an `Assisted-by` trailer identifying the tool. See [Using AI tools](#using-ai-tools).
 - Commit messages must be ASCII only. Explain *why* the change is made; the diff already shows what changed.
 
 Example:
@@ -33,3 +33,13 @@ What problem does it solve?
 Assisted-by: Claude Sonnet 4.6 <noreply@anthropic.com>
 Signed-off-by: Your Name <your@email.com>
 ```
+
+## Using AI tools
+
+You may use AI tools such as large language models. These rules follow the [Linux kernel guidelines for tool-generated content](https://github.com/torvalds/linux/blob/master/Documentation/process/generated-content.rst).
+
+- Say that you used one. Add an `Assisted-by: Claude Opus 5 <noreply@anthropic.com>` trailer to the commit message. Do not use `Co-Authored-By`. A tool is not an author.
+- You are responsible for the result. Your `Signed-off-by` means that you reviewed the change. You must understand the whole change and be able to explain it. If you cannot answer a review comment without going back to the tool, do not send the change. A pull request that its author cannot explain may be closed without a review.
+- The same applies to an issue. Do not open one only because a tool read the code and said that it looks wrong. Reproduce the problem first, and send a fix if you can write one.
+
+Trivial help, such as completion or formatting, needs no disclosure.
