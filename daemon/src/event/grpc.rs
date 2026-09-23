@@ -1005,6 +1005,7 @@ impl GoBgpService for GrpcService {
             }
         }
         global.peers.clear();
+        global.rebuild_local_cluster_ids();
         for client in global.bmp_clients.values() {
             client.cancel.cancel();
         }
@@ -1084,6 +1085,7 @@ impl GoBgpService for GrpcService {
         if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
             let mut global = self.global.write().await;
             if let Some(p) = global.peers.remove(&peer_addr) {
+                global.rebuild_local_cluster_ids();
                 {
                     let mut ctx = p.context.lock().unwrap();
                     ctx.force_down(
@@ -1301,6 +1303,8 @@ impl GoBgpService for GrpcService {
                 ctx.conn_arbiter = new_conn_arbiter;
             }
         }
+
+        global.rebuild_local_cluster_ids();
 
         // Update TCP MD5 socket option after releasing the peer borrow.
         if old_password != new_params.password {

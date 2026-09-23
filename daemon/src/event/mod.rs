@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use fnv::{FnvHashMap, FnvHashSet};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, Stream, StreamExt};
@@ -726,6 +726,9 @@ pub(crate) struct Global {
     listen_port: Option<u16>,
     listen_sockets: Vec<(RawFd, u32)>,
     pub(crate) peers: FnvHashMap<IpAddr, Peer>,
+    /// Effective local RR cluster IDs, shared with existing sessions so peer
+    /// configuration changes take effect without locking Global on UPDATEs.
+    local_cluster_ids: Arc<ArcSwap<FnvHashSet<Ipv4Addr>>>,
     peer_group: FnvHashMap<String, PeerGroup>,
 
     confederation: Option<ConfederationConfig>,
@@ -780,6 +783,7 @@ impl Global {
             listen_port: None,
             listen_sockets: Vec::new(),
             peers: FnvHashMap::default(),
+            local_cluster_ids: Arc::new(ArcSwap::from_pointee(FnvHashSet::default())),
             peer_group: FnvHashMap::default(),
 
             confederation: None,
@@ -970,6 +974,23 @@ impl Global {
         self.rpki_clients.iter()
     }
 
+    /// RFC 4456 §§7–8: only a route reflector has a local cluster ID.
+    /// Check all local clusters on receipt, including from non-client peers.
+    fn rebuild_local_cluster_ids(&self) {
+        let ids = self
+            .peers
+            .values()
+            .filter(|p| p.peer_role(self) == PeerRole::IbgpRrClient)
+            .map(|p| {
+                p.config
+                    .route_reflector
+                    .route_reflector_cluster_id
+                    .unwrap_or(p.config.local_router_id)
+            })
+            .collect();
+        self.local_cluster_ids.store(Arc::new(ids));
+    }
+
     fn add_peer(
         &mut self,
         mut params: PeerParams,
@@ -1016,6 +1037,7 @@ impl Global {
         }
         let addr = peer.config.remote_addr;
         self.peers.insert(addr, peer);
+        self.rebuild_local_cluster_ids();
 
         // Register with BFD server if the peer has BFD enabled.
         if let Some(bfd_cfg) = bfd_config {
@@ -1596,6 +1618,7 @@ async fn accept_connection(
     let remote_addr = remote_sockaddr.ip();
     let mut g = global.write().await;
     let is_restarting = g.selection_deferral.is_some();
+    let local_cluster_ids = Arc::clone(&g.local_cluster_ids);
     let confederation = g.confederation.as_ref().map(|c| (c.id, c.members.clone()));
     let peer = match g.peers.get_mut(&remote_addr) {
         Some(peer) => {
@@ -1729,6 +1752,7 @@ async fn accept_connection(
         context,
         local_router_id: peer.config.local_router_id,
         cluster_id,
+        local_cluster_ids,
         confederation_id: confederation.as_ref().map_or(0, |(id, _)| *id),
     };
     PeerSession::new(stream, remote_addr, role, Some(close_rx), res)
@@ -2226,9 +2250,10 @@ struct PeerResources {
     context: Arc<std::sync::Mutex<PeerContext>>,
     /// Local router-id used for RR ORIGINATOR_ID loop detection.
     local_router_id: Ipv4Addr,
-    /// RFC 4456 cluster-id for RR attribute manipulation and loop detection.
+    /// RFC 4456 cluster-id for outbound RR attribute manipulation.
     /// None for eBGP/RS-client sessions where RR logic does not apply.
     cluster_id: Option<Ipv4Addr>,
+    local_cluster_ids: Arc<ArcSwap<FnvHashSet<Ipv4Addr>>>,
     /// Confederation Identifier for AS_PATH loop detection (0 = not configured).
     confederation_id: u32,
 }
@@ -2297,8 +2322,11 @@ struct PeerSession {
 
     /// Local router-id for RR ORIGINATOR_ID loop detection (RFC 4456 §8).
     local_router_id: Ipv4Addr,
-    /// RFC 4456 cluster-id; Some only for iBGP sessions on an RR.
+    /// Cluster ID for outbound reflection to this peer.
     cluster_id: Option<Ipv4Addr>,
+    /// Actual local RR clusters for inbound loop detection. Empty on a plain
+    /// iBGP speaker; independent of the sending peer's client/non-client role.
+    local_cluster_ids: Arc<ArcSwap<FnvHashSet<Ipv4Addr>>>,
 
     // --- session I/O state ---
     ctrl_msgs: Vec<bgp::Message>,
@@ -2373,6 +2401,7 @@ impl PeerSession {
             context: res.context,
             local_router_id: res.local_router_id,
             cluster_id: res.cluster_id,
+            local_cluster_ids: res.local_cluster_ids,
             ctrl_msgs: Vec::new(),
             codec,
             keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
@@ -2450,6 +2479,7 @@ impl PeerSession {
             context,
             local_router_id: Ipv4Addr::new(1, 0, 0, 1),
             cluster_id: None,
+            local_cluster_ids: Arc::new(ArcSwap::from_pointee(FnvHashSet::default())),
             ctrl_msgs: Vec::new(),
             codec,
             keepalive_futures: vec![tokio::time::sleep(Duration::new(u64::MAX, 0))]
@@ -3115,15 +3145,23 @@ impl PeerSession {
                 .iter()
                 .find(|a| a.code() == packet::Attribute::ORIGINATOR_ID)
                 .is_some_and(|a| a.value().unwrap_or(0) == local_rid);
-            let cluster_loop = self.cluster_id.is_some_and(|cid| {
-                let cid_bytes = u32::from(cid).to_be_bytes();
-                attr.iter()
-                    .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
-                    .is_some_and(|a| {
-                        a.binary()
-                            .is_some_and(|b| b.chunks(4).any(|c| c == cid_bytes))
-                    })
-            });
+            let cluster_loop = matches!(
+                self.export_ctx.role,
+                PeerRole::Ibgp | PeerRole::IbgpRrClient
+            ) && {
+                let local_ids = self.local_cluster_ids.load();
+                !local_ids.is_empty()
+                    && attr
+                        .iter()
+                        .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
+                        .is_some_and(|a| {
+                            a.binary().is_some_and(|b| {
+                                b.as_chunks::<4>().0.iter().any(|c| {
+                                    local_ids.contains(&Ipv4Addr::new(c[0], c[1], c[2], c[3]))
+                                })
+                            })
+                        })
+            };
             if originator_loop || cluster_loop {
                 return false;
             }
@@ -3715,6 +3753,7 @@ impl PeerSession {
         {
             if peer.config.delete_on_disconnected {
                 server.peers.remove(&remote_addr);
+                server.rebuild_local_cluster_ids();
             } else {
                 peer.clear_session_state();
                 enable_active_connect(peer, active_conn_tx);
@@ -3847,6 +3886,7 @@ async fn apply_disconnect(
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use tokio::io::AsyncReadExt;
 
     fn make_global() -> GlobalHandle {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -10072,7 +10112,10 @@ port = 3323
         let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
         let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
         let local_cid = Ipv4Addr::new(1, 2, 3, 4);
-        session.cluster_id = Some(local_cid);
+        session.export_ctx.role = PeerRole::IbgpRrClient;
+        session
+            .local_cluster_ids
+            .store(Arc::new([local_cid].into_iter().collect()));
         let cid_bytes = u32::from(local_cid).to_be_bytes().to_vec();
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cid_bytes).unwrap(),
@@ -10095,7 +10138,10 @@ port = 3323
         let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
         let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
         let local_cid = Ipv4Addr::new(1, 2, 3, 4);
-        session.cluster_id = Some(local_cid);
+        session.export_ctx.role = PeerRole::Ibgp;
+        session
+            .local_cluster_ids
+            .store(Arc::new([local_cid].into_iter().collect()));
         // CLUSTER_LIST: [2.0.0.2, 1.2.3.4 (local), 3.0.0.3]
         let mut cid_bytes = Vec::new();
         cid_bytes.extend_from_slice(&u32::from(Ipv4Addr::new(2, 0, 0, 2)).to_be_bytes());
@@ -10112,6 +10158,256 @@ port = 3323
         assert!(!exceeded, "loop detection must not trigger CEASE");
         let state = tables.table_state(Family::IPV4);
         assert_eq!(state.num_destination, 0, "route must not be inserted");
+    }
+
+    fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut wire = vec![0xff; 16];
+        wire.extend_from_slice(&((19 + body.len()) as u16).to_be_bytes());
+        wire.push(kind);
+        wire.extend_from_slice(body);
+        wire
+    }
+
+    async fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0; 19];
+        stream.read_exact(&mut header).await.unwrap();
+        let mut wire = header.to_vec();
+        wire.resize(u16::from_be_bytes([header[16], header[17]]) as usize, 0);
+        stream.read_exact(&mut wire[19..]).await.unwrap();
+        wire
+    }
+
+    async fn wait_prefixes(tables: &TableHandle, peer: IpAddr, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tables
+                    .collect_peer_stats(&[peer])
+                    .get(&peer)
+                    .and_then(|s| s.get(&Family::IPV4))
+                    .is_some_and(|s| s.received == expected && s.accepted == expected)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("peer route counters did not converge");
+    }
+
+    #[tokio::test]
+    async fn plain_ibgp_accepts_cluster_list_containing_router_id() {
+        for role in [crate::fsm::Role::Active, crate::fsm::Role::Passive] {
+            let global = make_global();
+            let tables = make_tables();
+            let (mut client, server) = loopback_pair().await;
+            let peer_addr = client.local_addr().unwrap().ip();
+            {
+                let mut g = global.write().await;
+                g.asn = 65001;
+                g.router_id = "192.0.2.1".parse().unwrap();
+                let mut params = default_peer_params(peer_addr);
+                params.local_asn = 65001;
+                params.expected_remote_asn = 65001;
+                params.passive = true; // Do not retry after test teardown.
+                params.families.insert(Family::IPV4, 0);
+                g.add_peer(params, None).unwrap();
+            }
+            let session = accept_connection(&global, &tables, server, role)
+                .await
+                .unwrap();
+            let (active_tx, _active_rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(session.run(global.clone(), active_tx));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                assert_eq!(read_frame(&mut client).await[18], 1); // OPEN
+                let remote_open = bgp::Message::Open(bgp::Open {
+                    as_number: 65001,
+                    holdtime: HoldTime::new(90).unwrap(),
+                    router_id: u32::from(Ipv4Addr::new(192, 0, 2, 2)),
+                    capability: vec![
+                        packet::Capability::MultiProtocol(Family::IPV4),
+                        packet::Capability::FourOctetAsNumber(65001),
+                    ],
+                });
+                let mut wire = bytes::BytesMut::new();
+                bgp::PeerCodec::new()
+                    .encode_to(&remote_open, &mut wire)
+                    .unwrap();
+                client.write_all(&wire).await.unwrap();
+                assert_eq!(read_frame(&mut client).await[18], 4); // KEEPALIVE
+                client.write_all(&frame(4, &[])).await.unwrap();
+            })
+            .await
+            .expect("BGP handshake timed out");
+
+            // Independently encoded UPDATE: a remote cluster happens to equal our
+            // router ID, but this plain iBGP speaker has no local RR cluster.
+            let attrs = [
+                0x40, 1, 1, 0, // ORIGIN: IGP
+                0x40, 2, 0, // empty AS_PATH (iBGP)
+                0x40, 3, 4, 192, 0, 2, 2, // NEXT_HOP
+                0x40, 5, 4, 0, 0, 0, 100, // LOCAL_PREF
+                0x80, 9, 4, 192, 0, 2, 3, // different ORIGINATOR_ID
+                0x80, 10, 4, 192, 0, 2, 1, // CLUSTER_LIST matches local router ID
+            ];
+            let prefix = [24, 198, 51, 100];
+            let mut body = vec![0, 0];
+            body.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+            body.extend(attrs);
+            body.extend(prefix);
+            client.write_all(&frame(2, &body)).await.unwrap();
+            wait_prefixes(&tables, peer_addr, 1).await;
+
+            let mut withdrawal = (prefix.len() as u16).to_be_bytes().to_vec();
+            withdrawal.extend(prefix);
+            withdrawal.extend([0, 0]);
+            client.write_all(&frame(2, &withdrawal)).await.unwrap();
+            wait_prefixes(&tables, peer_addr, 0).await;
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    fn attrs(cluster: Ipv4Addr) -> Arc<Vec<packet::Attribute>> {
+        Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+            packet::Attribute::new_with_bin(
+                packet::Attribute::CLUSTER_LIST,
+                cluster.octets().to_vec(),
+            )
+            .unwrap(),
+        ])
+    }
+
+    fn rr_params(addr: &str, cluster: Option<Ipv4Addr>) -> PeerParams {
+        let mut params = default_peer_params(addr.parse().unwrap());
+        params.local_asn = 65001;
+        params.expected_remote_asn = 65001;
+        params.route_reflector = RouteReflectorConfig {
+            route_reflector_client: true,
+            route_reflector_cluster_id: cluster,
+        };
+        params
+    }
+
+    #[tokio::test]
+    async fn cluster_loop_checks_all_local_clusters_from_clients_and_non_clients() {
+        let global = make_global();
+        let cid = Ipv4Addr::new(192, 0, 2, 10);
+        let default_cid = global.read().await.router_id;
+        {
+            let mut g = global.write().await;
+            g.add_peer(rr_params("10.0.0.3", Some(cid)), None).unwrap();
+            g.add_peer(rr_params("10.0.0.4", None), None).unwrap();
+        }
+        for role in [PeerRole::Ibgp, PeerRole::IbgpRrClient] {
+            let tables = make_tables();
+            let peer = "10.0.0.2".parse().unwrap();
+            let mut session = PeerSession::new_for_test(peer, make_context(), tables.clone());
+            session.export_ctx.role = role;
+            session.local_cluster_ids = global.read().await.local_cluster_ids.clone();
+            session.source.insert(
+                Family::IPV4,
+                Arc::new(table::Source::new(
+                    peer,
+                    "10.0.0.1".parse().unwrap(),
+                    65001,
+                    65001,
+                    "192.0.2.2".parse().unwrap(),
+                    role,
+                )),
+            );
+            for cluster in [cid, default_cid] {
+                assert!(
+                    !session
+                        .rx_update(reach_set("198.51.100.0/24"), None, attrs(cluster), 0)
+                        .await
+                );
+                assert_eq!(tables.table_state(Family::IPV4).num_destination, 0);
+            }
+            // A reflection path through a different cluster is valid.
+            session
+                .rx_update(
+                    reach_set("198.51.100.0/24"),
+                    None,
+                    attrs(Ipv4Addr::new(192, 0, 2, 30)),
+                    0,
+                )
+                .await;
+            assert_eq!(tables.table_state(Family::IPV4).num_destination, 1);
+            // ORIGINATOR_ID protection still applies to ordinary iBGP speakers.
+            let originator = Arc::new(vec![
+                packet::Attribute::new_with_value(
+                    packet::Attribute::ORIGINATOR_ID,
+                    u32::from(session.local_router_id),
+                )
+                .unwrap(),
+            ]);
+            session
+                .rx_update(reach_set("203.0.113.0/24"), None, originator, 0)
+                .await;
+            assert_eq!(tables.table_state(Family::IPV4).num_destination, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_loop_configuration_updates_existing_sessions() {
+        let svc = make_unstarted_grpc_service();
+        let cid = Ipv4Addr::new(192, 0, 2, 10);
+        let new_cid = Ipv4Addr::new(192, 0, 2, 20);
+        // Hold the same shared reference that an already-established session uses.
+        let ids = svc.global.read().await.local_cluster_ids.clone();
+        assert!(ids.load().is_empty());
+        {
+            let mut g = svc.global.write().await;
+            g.asn = 65001;
+            g.router_id = Ipv4Addr::new(192, 0, 2, 1);
+            // A cluster-id alone does not enable route reflection.
+            let mut plain = rr_params("10.0.0.2", Some(cid));
+            plain.route_reflector.route_reflector_client = false;
+            g.add_peer(plain, None).unwrap();
+            assert!(ids.load().is_empty());
+            g.add_peer(rr_params("10.0.0.3", Some(cid)), None).unwrap();
+            g.add_peer(rr_params("10.0.0.4", Some(cid)), None).unwrap();
+        }
+        assert_eq!(ids.load().len(), 1);
+        assert!(ids.load().contains(&cid));
+        let mut api_peer: api::Peer = {
+            let g = svc.global.read().await;
+            (&g.peers[&"10.0.0.3".parse::<IpAddr>().unwrap()].view(false)).into()
+        };
+        api_peer.conf = Some(api::PeerConf {
+            neighbor_address: "10.0.0.3".to_string(),
+            local_asn: 65001,
+            peer_asn: 65001,
+            ..Default::default()
+        });
+        api_peer
+            .route_reflector
+            .as_mut()
+            .unwrap()
+            .route_reflector_cluster_id = new_cid.to_string();
+        svc.update_peer(tonic::Request::new(api::UpdatePeerRequest {
+            peer: Some(api_peer),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert!(ids.load().contains(&cid));
+        assert!(ids.load().contains(&new_cid));
+        for (addr, removed) in [("10.0.0.3", new_cid), ("10.0.0.4", cid)] {
+            svc.delete_peer(tonic::Request::new(api::DeletePeerRequest {
+                address: addr.to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+            assert!(!ids.load().contains(&removed));
+        }
+        assert!(ids.load().is_empty());
     }
 
     // --- VRF gRPC end-to-end ---
