@@ -1671,16 +1671,14 @@ async fn accept_connection(
             g.peers.get_mut(&remote_addr).unwrap()
         }
     };
+    // Without GTSM, preserve the socket TTL for same-AS internal peers
+    // (RFC 4271, Section 1.1) so iBGP can traverse intermediate routers.
     if let Some(ttl_min) = peer.config.ttl_security {
         // GTSM (RFC 5082): send with TTL=255, drop incoming below ttl_min.
         let _ = stream.set_ttl(255);
         auth::set_min_ttl(stream.as_raw_fd(), &remote_addr, ttl_min);
-    } else if let Some(ttl) = peer.config.multihop_ttl {
-        if peer.config.expected_remote_asn != peer.config.local_asn {
-            let _ = stream.set_ttl(ttl.into());
-        }
-    } else {
-        let _ = stream.set_ttl(1);
+    } else if peer.config.expected_remote_asn != peer.config.local_asn {
+        let _ = stream.set_ttl(peer.config.multihop_ttl.unwrap_or(1).into());
     }
     let context = Arc::clone(&peer.context);
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<CloseReason>();
@@ -4259,6 +4257,45 @@ mod tests {
         let (client, server) =
             tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept(),);
         (client.unwrap(), server.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn accept_connection_ttl_policy() {
+        // Use a non-default initial TTL to verify iBGP preserves the socket
+        // setting, including when the peer overrides the global local AS.
+        let cases = [
+            (0, 65001, None, None, 73),
+            (0, 65001, Some(7), None, 73),
+            (9002, 9002, None, None, 73),
+            (9002, 65001, None, None, 1),
+            (0, 65002, None, None, 1),
+            (0, 65002, Some(7), None, 7),
+            (0, 65001, None, Some(200), 255),
+            (0, 65002, Some(7), Some(200), 255),
+        ];
+        for role in [crate::fsm::Role::Active, crate::fsm::Role::Passive] {
+            for (local_asn, remote_asn, multihop_ttl, ttl_security, expected) in cases {
+                let global = make_global();
+                let tables = make_tables();
+                let (client, server) = loopback_pair().await;
+                server.set_ttl(73).unwrap();
+                let mut params = default_peer_params(client.local_addr().unwrap().ip());
+                params.local_asn = local_asn;
+                params.expected_remote_asn = remote_asn;
+                params.multihop_ttl = multihop_ttl;
+                params.ttl_security = ttl_security;
+                global.write().await.add_peer(params, None).unwrap();
+
+                let session = accept_connection(&global, &tables, server, role)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    session.stream.as_ref().unwrap().ttl().unwrap(),
+                    expected,
+                    "{role:?}: local AS {local_asn}, remote AS {remote_asn}, multihop {multihop_ttl:?}, GTSM {ttl_security:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
