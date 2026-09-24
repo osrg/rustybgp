@@ -505,12 +505,13 @@ impl NlriSink for AdjOutSink {
         _dest_id: u32,
         nlri: packet::Nlri,
         _path_id: u32,
-        _nexthop: Option<bgp::Nexthop>,
+        nexthop: Option<bgp::Nexthop>,
         attr: Arc<Vec<packet::Attribute>>,
         source: &Arc<table::Source>,
     ) {
         let entry = table::PathEntry {
             source: Arc::clone(source),
+            nexthop,
             remote_path_id: 0,
             timestamp: 0u32,
             attr,

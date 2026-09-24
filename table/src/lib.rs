@@ -172,10 +172,11 @@ pub struct DestinationEntry {
 /// for gRPC `ListPath` responses and similar inspection APIs.
 ///
 /// Contains display fields (timestamp, RPKI validation, policy state) that are
-/// not needed for route distribution.  The nexthop is intentionally absent; it
-/// is embedded in the serialised UPDATE attributes for the API response.
+/// not needed for route distribution. The nexthop is kept separately from the
+/// attributes in the RIB and must be restored in API responses.
 pub struct PathEntry {
     pub source: Arc<Source>,
+    pub nexthop: Option<bgp::Nexthop>,
     /// AddPath path identifier received from the peer (0 when AddPath is not in use).
     /// AddPath path identifier received from the peer (0 when AddPath is not in use).
     pub remote_path_id: u32,
@@ -279,9 +280,17 @@ struct RibEntry {
     /// allocation as `path.attr`, so storing it costs only a reference-count
     /// increment.
     original_attr: Arc<Vec<packet::Attribute>>,
+    /// Pre-import-policy nexthop, which may differ from `path.nexthop`.
+    original_nexthop: Option<bgp::Nexthop>,
     remote_path_id: u32,
     timestamp: u32,
     flags: u8,
+}
+
+/// Pre-import-policy path data kept for Adj-RIB-In and policy re-evaluation.
+pub struct OriginalPath {
+    pub attr: Arc<Vec<packet::Attribute>>,
+    pub nexthop: Option<bgp::Nexthop>,
 }
 
 /// Returns true if `attrs` contains the LLGR_STALE well-known community (0xFFFF0006).
@@ -979,7 +988,7 @@ impl Table {
                         path_id: e.remote_path_id,
                     },
                     attr: e.original_attr.clone(),
-                    nexthop: e.path.nexthop,
+                    nexthop: e.original_nexthop,
                     timestamp: e.timestamp,
                 })
             })
@@ -1058,7 +1067,7 @@ impl Table {
                         *fam,
                         net.clone(),
                         entry.remote_path_id,
-                        entry.path.nexthop,
+                        entry.original_nexthop,
                         Arc::clone(&entry.path.source),
                         Arc::clone(&entry.original_attr),
                         entry.timestamp,
@@ -1080,6 +1089,7 @@ impl Table {
             .filter(|p| enable_filtered || !p.is_filtered())
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
+                nexthop: p.path.nexthop,
                 remote_path_id: p.remote_path_id,
                 timestamp: p.timestamp,
                 attr: p.path.attr.clone(),
@@ -1102,6 +1112,7 @@ impl Table {
             .filter(|p| enable_filtered || !p.is_filtered())
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
+                nexthop: p.original_nexthop,
                 remote_path_id: p.remote_path_id,
                 timestamp: p.timestamp,
                 attr: p.original_attr.clone(),
@@ -1130,6 +1141,7 @@ impl Table {
         best.into_iter()
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
+                nexthop: p.original_nexthop,
                 remote_path_id: 0,
                 timestamp: p.timestamp,
                 attr: p.original_attr.clone(),
@@ -1190,7 +1202,7 @@ impl Table {
         remote_id: u32,
         nexthop: Option<bgp::Nexthop>,
         attr: Arc<Vec<packet::Attribute>>,
-        original_attr: Option<Arc<Vec<packet::Attribute>>>,
+        original: Option<OriginalPath>,
         filtered: bool,
         nexthop_invalid: bool,
         prefix_limit: Option<(u32, &Arc<AtomicU64>)>,
@@ -1270,7 +1282,10 @@ impl Table {
             .as_ref()
             .map_or_else(|| dst.alloc_path_id(), |old| old.path.local_path_id);
 
-        let original_attr = original_attr.unwrap_or_else(|| Arc::clone(&attr));
+        let original = original.unwrap_or_else(|| OriginalPath {
+            attr: Arc::clone(&attr),
+            nexthop,
+        });
 
         let entry = RibEntry {
             path: Path {
@@ -1279,7 +1294,8 @@ impl Table {
                 nexthop,
                 attr,
             },
-            original_attr,
+            original_attr: original.attr,
+            original_nexthop: original.nexthop,
             remote_path_id: remote_id,
             timestamp,
             flags,
@@ -5633,7 +5649,10 @@ mod tests {
             0,
             nh(),
             post_policy.clone(),
-            Some(original.clone()),
+            Some(OriginalPath {
+                attr: original.clone(),
+                nexthop: nh(),
+            }),
             false,
             false,
             None,
@@ -5693,6 +5712,56 @@ mod tests {
     }
 
     #[test]
+    fn adj_in_preserves_received_nexthop_after_import_rewrite() {
+        let source = source(1, 65001, 65000, 1);
+        let original_nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        let rewritten_nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let mut table = Table::new(0);
+        table.insert(
+            source.clone(),
+            Family::IPV4,
+            nlri(203, 0, 113, 0, 24),
+            0,
+            rewritten_nexthop,
+            empty_attrs(),
+            Some(OriginalPath {
+                attr: empty_attrs(),
+                nexthop: original_nexthop,
+            }),
+            false,
+            false,
+            None,
+            0,
+        );
+
+        let global: Vec<_> = table
+            .destinations(TableQuery::Global, Family::IPV4, vec![], false)
+            .collect();
+        let adj_in: Vec<_> = table
+            .destinations(
+                TableQuery::AdjIn(source.remote_addr),
+                Family::IPV4,
+                vec![],
+                false,
+            )
+            .collect();
+        assert_eq!(global[0].paths[0].nexthop, rewritten_nexthop);
+        assert_eq!(adj_in[0].paths[0].nexthop, original_nexthop);
+        assert_eq!(
+            table.iter_reach(Family::IPV4).next().unwrap().nexthop,
+            original_nexthop
+        );
+        assert_eq!(
+            table.iter_reach_post(Family::IPV4).next().unwrap().nexthop,
+            rewritten_nexthop
+        );
+        assert_eq!(
+            table.collect_adj_in_paths(source.remote_addr, Some(Family::IPV4), false)[0].3,
+            original_nexthop
+        );
+    }
+
+    #[test]
     fn iter_reach_returns_original_attr() {
         // iter_reach() is used by BMP RouteMonitoring and must carry pre-policy attrs.
         let s1 = source(1, 65001, 65000, 1);
@@ -5708,7 +5777,10 @@ mod tests {
             0,
             nh(),
             post_policy,
-            Some(original.clone()),
+            Some(OriginalPath {
+                attr: original.clone(),
+                nexthop: nh(),
+            }),
             false,
             false,
             None,
@@ -5915,7 +5987,10 @@ mod tests {
             0,
             nh(),
             post_import.clone(),
-            Some(original.clone()),
+            Some(OriginalPath {
+                attr: original.clone(),
+                nexthop: nh(),
+            }),
             false,
             false,
             None,

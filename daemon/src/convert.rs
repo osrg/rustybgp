@@ -4289,6 +4289,41 @@ pub(crate) struct PathBinaryFlags {
     pub only_binary: bool,
 }
 
+/// NEXT_HOP / MP_REACH are stored separately from attributes in the RIB.
+/// Rebuild them for ListPath, including the NLRI inside MP_REACH.
+fn path_nexthop_attribute(
+    net: &Nlri,
+    family: Family,
+    nexthop: Option<packet::bgp::Nexthop>,
+) -> Option<Attribute> {
+    if family == Family::IPV4 && matches!(nexthop, Some(packet::bgp::Nexthop::V4(_))) {
+        return Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.unwrap().to_bytes());
+    }
+    if family == Family::IPV4 && nexthop.is_none() {
+        return None;
+    }
+    let mut nh = nexthop.map(|n| n.to_bytes()).unwrap_or_default();
+    if matches!(
+        family,
+        Family::IPV4_FLOWSPEC
+            | Family::IPV6_FLOWSPEC
+            | Family::IPV4_FLOWSPEC_VPN
+            | Family::IPV6_FLOWSPEC_VPN
+    ) {
+        nh.clear();
+    } else if matches!(family, Family::IPV4_VPN | Family::IPV6_VPN) {
+        let mut vpn_nh = vec![0; 8];
+        vpn_nh.extend(nh);
+        nh = vpn_nh;
+    }
+    let mut body = family.afi().to_be_bytes().to_vec();
+    body.extend([family.safi(), nh.len() as u8]);
+    body.extend(nh);
+    body.push(0);
+    body.extend(net.encode_to_bytes());
+    Attribute::new_with_bin(Attribute::MP_REACH, body)
+}
+
 pub(crate) fn destination_to_api(
     d: rustybgp_table::DestinationEntry,
     family: Family,
@@ -4299,37 +4334,69 @@ pub(crate) fn destination_to_api(
         paths: d
             .paths
             .into_iter()
-            .map(|p| api::Path {
-                nlri: if binary.only_binary {
-                    None
-                } else {
-                    Some(nlri_to_api(&d.net))
-                },
-                family: Some(family_to_api(family)),
-                identifier: p.remote_path_id,
-                age: Some(prost_types::Timestamp {
-                    seconds: p.timestamp as i64,
-                    nanos: 0,
-                }),
-                pattrs: if binary.only_binary {
+            .map(|p| {
+                let nh_attr = path_nexthop_attribute(&d.net, family, p.nexthop);
+                let attrs = p
+                    .attr
+                    .iter()
+                    .filter(|a| !matches!(a.code(), Attribute::NEXTHOP | Attribute::MP_REACH))
+                    .chain(nh_attr.iter());
+                let pattrs = if binary.only_binary {
                     vec![]
                 } else {
-                    p.attr.iter().map(attr_to_api).collect()
-                },
-                validation: p.validation.map(rpki_validation_to_api),
-                stale: p.stale,
-                filtered: p.filtered,
-                nlri_binary: if binary.nlri_binary {
-                    d.net.encode_to_bytes()
-                } else {
-                    vec![]
-                },
-                pattrs_binary: if binary.attr_binary {
-                    p.attr.iter().map(|a| a.encode_to_bytes()).collect()
-                } else {
-                    vec![]
-                },
-                ..Default::default()
+                    attrs
+                        .clone()
+                        .map(|a| {
+                            if a.code() != Attribute::MP_REACH {
+                                return attr_to_api(a);
+                            }
+                            let next_hops = match p.nexthop {
+                                Some(packet::bgp::Nexthop::V6LinkLocal(global, local)) => {
+                                    vec![global.to_string(), local.to_string()]
+                                }
+                                Some(nh) => vec![nh.addr().to_string()],
+                                None => vec![],
+                            };
+                            api::Attribute {
+                                attr: Some(api::attribute::Attr::MpReach(
+                                    api::MpReachNlriAttribute {
+                                        family: Some(family_to_api(family)),
+                                        next_hops,
+                                        nlris: vec![nlri_to_api(&d.net)],
+                                    },
+                                )),
+                            }
+                        })
+                        .collect()
+                };
+                api::Path {
+                    nlri: if binary.only_binary {
+                        None
+                    } else {
+                        Some(nlri_to_api(&d.net))
+                    },
+                    family: Some(family_to_api(family)),
+                    identifier: p.remote_path_id,
+                    age: Some(prost_types::Timestamp {
+                        seconds: p.timestamp as i64,
+                        nanos: 0,
+                    }),
+                    pattrs,
+                    validation: p.validation.map(rpki_validation_to_api),
+                    stale: p.stale,
+                    filtered: p.filtered,
+                    nlri_binary: if binary.nlri_binary {
+                        d.net.encode_to_bytes()
+                    } else {
+                        vec![]
+                    },
+                    pattrs_binary: if binary.attr_binary {
+                        attrs.map(|a| a.encode_to_bytes()).collect()
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                }
             })
             .collect(),
     }

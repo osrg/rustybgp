@@ -9279,6 +9279,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_path_adj_in_restores_structured_and_binary_nexthops() {
+        let svc = make_grpc_service();
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+        let source = Arc::new(table::Source::new(
+            peer,
+            "10.0.0.1".parse().unwrap(),
+            65002,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 2),
+            PeerRole::Ebgp,
+        ));
+        let cases = [
+            (Family::IPV4, "198.51.100.0/24", "192.0.2.1"),
+            (Family::IPV6, "2001:db8:1::/48", "2001:db8::1"),
+        ];
+        for (family, prefix, nexthop) in cases {
+            let net: packet::Nlri = prefix.parse().unwrap();
+            let nh = if family == Family::IPV4 {
+                bgp::Nexthop::V4(nexthop.parse().unwrap())
+            } else {
+                bgp::Nexthop::V6(nexthop.parse().unwrap())
+            };
+            assert!(!svc.tables.insert_route(
+                source.clone(),
+                family,
+                packet::PathNlri {
+                    nlri: net.clone(),
+                    path_id: 0,
+                },
+                Some(nh),
+                Arc::new(vec![
+                    packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                ]),
+                None,
+                0,
+            ));
+
+            let request = api::ListPathRequest {
+                table_type: api::TableType::AdjIn as i32,
+                name: peer.to_string(),
+                family: Some(convert::family_to_api(family)),
+                enable_nlri_binary: true,
+                enable_attribute_binary: true,
+                ..Default::default()
+            };
+            let mut stream = svc
+                .list_path(tonic::Request::new(request.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            let destination = stream.next().await.unwrap().unwrap().destination.unwrap();
+            assert!(stream.next().await.is_none());
+            let path = &destination.paths[0];
+            assert_eq!(path.nlri_binary, net.encode_to_bytes());
+            assert!(path.nlri.is_some());
+            if family == Family::IPV4 {
+                assert!(path.pattrs.iter().any(|a| matches!(
+                    &a.attr,
+                    Some(api::attribute::Attr::NextHop(nh)) if nh.next_hop == nexthop
+                )));
+                let mut expected = vec![0x40, packet::Attribute::NEXTHOP, 4];
+                expected.extend(nexthop.parse::<Ipv4Addr>().unwrap().octets());
+                assert!(path.pattrs_binary.contains(&expected));
+            } else {
+                assert!(path.pattrs.iter().any(|a| matches!(
+                    &a.attr,
+                    Some(api::attribute::Attr::MpReach(mp))
+                        if mp.next_hops == [nexthop] && mp.nlris.len() == 1
+                )));
+                assert!(path.pattrs_binary.iter().any(|bytes| {
+                    bytes.starts_with(&[0x80, packet::Attribute::MP_REACH])
+                        && bytes.get(3..7) == Some(&[0, 2, 1, 16][..])
+                        && bytes.get(7..23)
+                            == Some(&nexthop.parse::<Ipv6Addr>().unwrap().octets()[..])
+                }));
+            }
+
+            let mut only_binary = request;
+            only_binary.enable_nlri_binary = false;
+            only_binary.enable_attribute_binary = false;
+            only_binary.enable_only_binary = true;
+            let mut stream = svc
+                .list_path(tonic::Request::new(only_binary))
+                .await
+                .unwrap()
+                .into_inner();
+            let path = &stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .destination
+                .unwrap()
+                .paths[0];
+            assert!(path.nlri.is_none());
+            assert!(path.pattrs.is_empty());
+            assert_eq!(path.nlri_binary, net.encode_to_bytes());
+            assert!(!path.pattrs_binary.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn add_path_inserts_route() {
         let svc = make_grpc_service();
         let req = tonic::Request::new(api::AddPathRequest {
