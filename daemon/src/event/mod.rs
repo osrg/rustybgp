@@ -707,6 +707,52 @@ fn create_listen_socket(
     Ok(sock.into())
 }
 
+/// Addresses to listen on. An empty list means the default wildcard
+/// addresses (0.0.0.0 and ::), same as GoBGP.
+fn listen_addrs(addrs: &[IpAddr], port: u16) -> (Vec<SocketAddr>, bool) {
+    if addrs.is_empty() {
+        (
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+            ],
+            true,
+        )
+    } else {
+        (
+            addrs.iter().map(|a| SocketAddr::new(*a, port)).collect(),
+            false,
+        )
+    }
+}
+
+/// A bind error that does not stop the start. Only the default wildcard
+/// IPv6 address on a host without IPv6 support is skipped.
+fn is_ignorable_listen_error(addr: &SocketAddr, is_default: bool, e: &std::io::Error) -> bool {
+    is_default && addr.is_ipv6() && e.raw_os_error() == Some(libc::EAFNOSUPPORT)
+}
+
+/// Create all BGP listen sockets. If one of them fails, the sockets
+/// already created are closed and an error is returned.
+fn create_listen_sockets(
+    addrs: Vec<SocketAddr>,
+    is_default: bool,
+    device: Option<&str>,
+) -> Result<Vec<(std::net::TcpListener, u32)>, String> {
+    let ifindex = device.map(auth::ifindex_of).unwrap_or(0);
+    let mut listeners = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        match create_listen_socket(addr, device) {
+            Ok(l) => listeners.push((l, ifindex)),
+            Err(e) if is_ignorable_listen_error(&addr, is_default, &e) => {
+                log::warn!("skip listening on {addr}: {e}");
+            }
+            Err(e) => return Err(format!("failed to listen on {addr}: {e}")),
+        }
+    }
+    Ok(listeners)
+}
+
 pub(crate) type GlobalHandle = Arc<tokio::sync::RwLock<Global>>;
 
 /// Active BGP confederation configuration (RFC 5065).
@@ -725,6 +771,9 @@ pub(crate) struct Global {
     pub(crate) router_id: Ipv4Addr,
     listen_port: Option<u16>,
     listen_sockets: Vec<(RawFd, u32)>,
+    /// Listen sockets created at start, with their ifindex. The listener
+    /// loop takes them when it starts.
+    pending_listeners: Vec<(std::net::TcpListener, u32)>,
     pub(crate) peers: FnvHashMap<IpAddr, Peer>,
     /// Effective local RR cluster IDs, shared with existing sessions so peer
     /// configuration changes take effect without locking Global on UPDATEs.
@@ -782,6 +831,7 @@ impl Global {
             router_id: Ipv4Addr::new(0, 0, 0, 0),
             listen_port: None,
             listen_sockets: Vec::new(),
+            pending_listeners: Vec::new(),
             peers: FnvHashMap::default(),
             local_cluster_ids: Arc::new(ArcSwap::from_pointee(FnvHashSet::default())),
             peer_group: FnvHashMap::default(),
@@ -1210,9 +1260,29 @@ impl Global {
         let notify = Arc::new(tokio::sync::Notify::new());
 
         if let Some(bgp) = bgp.as_ref() {
-            match global.write().await.apply_config(tables.clone(), bgp) {
+            let mut server = global.write().await;
+            match server.apply_config(tables.clone(), bgp) {
                 Ok(ready) => {
                     if ready {
+                        if let Some(listen_port) = server.listen_port {
+                            let global_config = bgp.global.as_ref().and_then(|g| g.config.as_ref());
+                            let (addrs, is_default) = listen_addrs(
+                                global_config
+                                    .and_then(|c| c.local_address_list.as_deref())
+                                    .unwrap_or(&[]),
+                                listen_port,
+                            );
+                            let device = global_config
+                                .and_then(|c| c.bind_to_device.as_deref())
+                                .filter(|s| !s.is_empty());
+                            match create_listen_sockets(addrs, is_default, device) {
+                                Ok(listeners) => server.pending_listeners = listeners,
+                                Err(e) => {
+                                    log::error!("{e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
                         notify.notify_one();
                     }
                 }
@@ -1478,56 +1548,28 @@ impl Global {
 
         loop {
             notify.notified().await;
-            let (listen_sockets, listen_ifindex) = if let Some(listen_port) =
-                global.read().await.listen_port
-            {
-                let global_config = bgp
-                    .as_ref()
-                    .and_then(|x| x.global.as_ref())
-                    .and_then(|g| g.config.as_ref());
-                let addrs =
-                    if let Some(b) = global_config.and_then(|c| c.local_address_list.as_ref()) {
-                        b.iter()
-                            .map(|x| SocketAddr::new(*x, listen_port))
-                            .collect::<Vec<_>>()
-                    } else {
-                        vec![
-                            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
-                            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port),
-                        ]
-                    };
-                let device = global_config
-                    .and_then(|c| c.bind_to_device.as_deref())
-                    .filter(|s| !s.is_empty());
-                let ifindex = device.map(auth::ifindex_of).unwrap_or(0);
-                let sockets = addrs
-                    .into_iter()
-                    .map(|addr| create_listen_socket(addr, device))
-                    .filter_map(|x| x.ok())
-                    .collect::<Vec<_>>();
-                (sockets, ifindex)
-            } else {
-                (Vec::new(), 0)
+            let listen_sockets = {
+                let mut server = global.write().await;
+                let listen_sockets = std::mem::take(&mut server.pending_listeners);
+                server.listen_sockets.extend(
+                    listen_sockets
+                        .iter()
+                        .map(|(l, ifindex)| (l.as_raw_fd(), *ifindex)),
+                );
+                listen_sockets
             };
-
-            global.write().await.listen_sockets.append(
-                &mut listen_sockets
-                    .iter()
-                    .map(|x| (x.as_raw_fd(), listen_ifindex))
-                    .collect(),
-            );
 
             for (addr, peer) in &global.read().await.peers {
                 if let Some(password) = &peer.config.password {
-                    for l in &listen_sockets {
-                        auth::set_md5sig(l.as_raw_fd(), addr, password, listen_ifindex);
+                    for (l, ifindex) in &listen_sockets {
+                        auth::set_md5sig(l.as_raw_fd(), addr, password, *ifindex);
                     }
                 }
             }
 
             let mut incomings = listen_sockets
                 .into_iter()
-                .map(|x| {
+                .map(|(x, _)| {
                     tokio_stream::wrappers::TcpListenerStream::new(
                         TcpListener::from_std(x).unwrap(),
                     )
@@ -11008,21 +11050,41 @@ port = 3323
     }
 
     fn start_bgp_req(listen_port: i32) -> tonic::Request<api::StartBgpRequest> {
+        start_bgp_req_with_addrs(listen_port, vec![])
+    }
+
+    fn start_bgp_req_with_addrs(
+        listen_port: i32,
+        listen_addresses: Vec<String>,
+    ) -> tonic::Request<api::StartBgpRequest> {
         tonic::Request::new(api::StartBgpRequest {
             global: Some(api::Global {
                 asn: 65001,
                 router_id: "10.0.0.1".to_string(),
                 listen_port,
+                listen_addresses,
                 ..Default::default()
             }),
         })
     }
 
+    /// A local port that is free now.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
     #[tokio::test]
     async fn start_bgp_port_zero_defaults_to_179() {
         let svc = make_unstarted_grpc_service();
-        svc.start_bgp(start_bgp_req(0)).await.unwrap();
-        assert_eq!(svc.global.read().await.listen_port, Some(Global::BGP_PORT));
+        // Binding port 179 needs privileges, so accept both results. On
+        // success the default port must be used.
+        if svc.start_bgp(start_bgp_req(0)).await.is_ok() {
+            assert_eq!(svc.global.read().await.listen_port, Some(Global::BGP_PORT));
+        }
     }
 
     #[tokio::test]
@@ -11035,8 +11097,116 @@ port = 3323
     #[tokio::test]
     async fn start_bgp_port_valid_sets_port() {
         let svc = make_unstarted_grpc_service();
-        svc.start_bgp(start_bgp_req(1179)).await.unwrap();
-        assert_eq!(svc.global.read().await.listen_port, Some(1179));
+        let port = free_port();
+        svc.start_bgp(start_bgp_req_with_addrs(
+            port as i32,
+            vec!["127.0.0.1".to_string()],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(svc.global.read().await.listen_port, Some(port));
+    }
+
+    #[tokio::test]
+    async fn start_bgp_uses_listen_addresses() {
+        let svc = make_unstarted_grpc_service();
+        let port = free_port();
+        svc.start_bgp(start_bgp_req_with_addrs(
+            port as i32,
+            vec!["127.0.0.1".to_string()],
+        ))
+        .await
+        .unwrap();
+        let global = svc.global.read().await;
+        let addrs: Vec<SocketAddr> = global
+            .pending_listeners
+            .iter()
+            .map(|(l, _)| l.local_addr().unwrap())
+            .collect();
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)]
+        );
+    }
+
+    #[tokio::test]
+    async fn start_bgp_bind_failure_is_error() {
+        // Without SO_REUSEPORT on this socket, the second bind fails with
+        // EADDRINUSE.
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let svc = make_unstarted_grpc_service();
+        let err = svc
+            .start_bgp(start_bgp_req_with_addrs(
+                port as i32,
+                vec!["127.0.0.1".to_string()],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let global = svc.global.read().await;
+        assert_eq!(global.asn, 0, "BGP must stay not started");
+        assert_eq!(global.listen_port, None);
+        assert!(global.pending_listeners.is_empty());
+        drop(global);
+        drop(busy);
+
+        // The failed call must not block a retry.
+        svc.start_bgp(start_bgp_req_with_addrs(
+            port as i32,
+            vec!["127.0.0.1".to_string()],
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_bgp_partial_bind_failure_closes_sockets() {
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let svc = make_unstarted_grpc_service();
+        // 127.0.0.2 binds, then 127.0.0.1 fails.
+        assert!(
+            svc.start_bgp(start_bgp_req_with_addrs(
+                port as i32,
+                vec!["127.0.0.2".to_string(), "127.0.0.1".to_string()],
+            ))
+            .await
+            .is_err()
+        );
+        // The socket on 127.0.0.2 must be closed again.
+        std::net::TcpListener::bind(("127.0.0.2", port)).unwrap();
+    }
+
+    #[test]
+    fn ignorable_listen_error_only_default_ipv6_eafnosupport() {
+        let eafnosupport = std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT);
+        let eacces = std::io::Error::from_raw_os_error(libc::EACCES);
+        let v4 = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 179);
+        let v6 = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 179);
+        assert!(is_ignorable_listen_error(&v6, true, &eafnosupport));
+        assert!(!is_ignorable_listen_error(&v6, false, &eafnosupport));
+        assert!(!is_ignorable_listen_error(&v6, true, &eacces));
+        assert!(!is_ignorable_listen_error(&v4, true, &eafnosupport));
+    }
+
+    #[test]
+    fn listen_addrs_default_is_wildcard() {
+        let (addrs, is_default) = listen_addrs(&[], 179);
+        assert!(is_default);
+        assert_eq!(
+            addrs,
+            vec![
+                SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 179),
+                SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 179),
+            ]
+        );
+        let (addrs, is_default) = listen_addrs(&[Ipv4Addr::LOCALHOST.into()], 179);
+        assert!(!is_default);
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 179)]
+        );
     }
 
     #[tokio::test]
@@ -11048,8 +11218,8 @@ port = 3323
     #[tokio::test]
     async fn start_bgp_twice_is_error() {
         let svc = make_unstarted_grpc_service();
-        svc.start_bgp(start_bgp_req(0)).await.unwrap();
-        assert!(svc.start_bgp(start_bgp_req(0)).await.is_err());
+        svc.start_bgp(start_bgp_req(-1)).await.unwrap();
+        assert!(svc.start_bgp(start_bgp_req(-1)).await.is_err());
     }
 
     // --- peer group ASN=0 validation ---

@@ -888,8 +888,7 @@ impl GoBgpService for GrpcService {
                 "already started",
             ));
         }
-        global.asn = g.asn;
-        global.listen_port = match g.listen_port {
+        let listen_port = match g.listen_port {
             1..=65535 => Some(g.listen_port as u16),
             0 => Some(Global::BGP_PORT),
             i32::MIN..=-1 => None,
@@ -901,46 +900,36 @@ impl GoBgpService for GrpcService {
             }
         };
 
-        if let Some(listen_port) = global.listen_port {
-            let listen_addresses = if g.listen_addresses.is_empty() {
-                vec![
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port),
-                ]
-            } else {
-                g.listen_addresses
-                    .iter()
-                    .map(|addr| {
-                        let addr = IpAddr::from_str(addr).map_err(|_| {
-                            tonic::Status::new(
-                                tonic::Code::InvalidArgument,
-                                format!("invalid listen address: {}", addr),
-                            )
-                        })?;
-
-                        Ok::<std::net::SocketAddr, tonic::Status>(SocketAddr::new(
-                            addr,
-                            listen_port,
-                        ))
+        // Create the listen sockets before changing any state, so a bind
+        // failure leaves BGP not started.
+        let listeners = if let Some(listen_port) = listen_port {
+            let listen_addresses = g
+                .listen_addresses
+                .iter()
+                .map(|addr| {
+                    IpAddr::from_str(addr).map_err(|_| {
+                        tonic::Status::new(
+                            tonic::Code::InvalidArgument,
+                            format!("invalid listen address: {}", addr),
+                        )
                     })
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (addrs, is_default) = listen_addrs(&listen_addresses, listen_port);
             let device = if g.bind_to_device.is_empty() {
                 None
             } else {
                 Some(g.bind_to_device.as_str())
             };
-            let ifindex = device.map(auth::ifindex_of).unwrap_or(0);
-            global.listen_sockets.append(
-                &mut listen_addresses
-                    .into_iter()
-                    .map(|addr| create_listen_socket(addr, device))
-                    .filter_map(|x| x.ok())
-                    .map(|x| (x.as_raw_fd(), ifindex))
-                    .collect(),
-            );
-        }
+            create_listen_sockets(addrs, is_default, device)
+                .map_err(|e| tonic::Status::new(tonic::Code::FailedPrecondition, e))?
+        } else {
+            Vec::new()
+        };
+
+        global.asn = g.asn;
+        global.listen_port = listen_port;
+        global.pending_listeners = listeners;
 
         global.router_id = Ipv4Addr::from_str(&g.router_id).map_err(|_| {
             tonic::Status::new(
@@ -1025,6 +1014,7 @@ impl GoBgpService for GrpcService {
         global.asn = 0;
         global.router_id = Ipv4Addr::new(0, 0, 0, 0);
         global.listen_port = None;
+        global.pending_listeners.clear();
         global.kernel_service.take();
         self.tables.kernel_handle.store(None);
         if let Some(tx) = global.stop_tx.take() {
