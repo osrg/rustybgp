@@ -1434,7 +1434,12 @@ impl Table {
         // removes a stale path from a previous GR session (different Source Arc
         // but same peer) when the peer reconnects and sends a WITHDRAW.
         let Some(i) = dst.entry.iter().position(|e| {
-            e.path.source.remote_addr == source.remote_addr && e.remote_path_id == remote_id
+            e.path.source.remote_addr == source.remote_addr
+                && e.remote_path_id == remote_id
+                // Canonical local and kernel sources both use 0.0.0.0, but
+                // an API withdrawal must never remove a kernel-owned path.
+                && e.path.source.is_local() == source.is_local()
+                && e.path.source.is_kernel() == source.is_kernel()
         }) else {
             return (None, None);
         };
@@ -2340,6 +2345,38 @@ mod tests {
 
     fn empty_attrs() -> Arc<Vec<packet::Attribute>> {
         Arc::new(Vec::new())
+    }
+
+    #[test]
+    fn remove_keeps_local_and_kernel_sources_distinct() {
+        for (owner, other) in [
+            (Source::kernel(), Source::local()),
+            (Source::local(), Source::kernel()),
+        ] {
+            let mut rt = Table::new(0);
+            let net = nlri(10, 0, 0, 0, 24);
+            rt.insert(
+                owner.clone(),
+                Family::IPV4,
+                net.clone(),
+                0,
+                nh(),
+                empty_attrs(),
+                None,
+                false,
+                false,
+                None,
+                0,
+            );
+            assert!(
+                rt.remove(other, Family::IPV4, net.clone(), 0, None)
+                    .0
+                    .is_none()
+            );
+            assert_eq!(rt.collect_loc_rib_paths(&Family::IPV4).len(), 1);
+            assert!(rt.remove(owner, Family::IPV4, net, 0, None).0.is_some());
+            assert!(rt.collect_loc_rib_paths(&Family::IPV4).is_empty());
+        }
     }
 
     fn attrs_with_local_pref(val: u32) -> Arc<Vec<packet::Attribute>> {

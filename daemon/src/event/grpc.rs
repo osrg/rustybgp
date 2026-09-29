@@ -667,12 +667,14 @@ impl From<api::PeerGroup> for PeerGroup {
     }
 }
 
+type PathUuidMap = FnvHashMap<uuid::Uuid, (Family, Vec<packet::PathNlri>)>;
+
 pub(super) struct GrpcService {
     init: Arc<tokio::sync::Notify>,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
     pub(super) global: GlobalHandle,
     pub(super) tables: TableHandle,
-    path_uuid_map: tokio::sync::Mutex<FnvHashMap<uuid::Uuid, (Family, Vec<packet::PathNlri>)>>,
+    path_uuid_map: tokio::sync::Mutex<PathUuidMap>,
 }
 
 /// Validate and convert `api::EbgpMultihop` to the internal `Option<u8>`.
@@ -768,6 +770,27 @@ impl GrpcService {
             tables,
             path_uuid_map: tokio::sync::Mutex::new(FnvHashMap::default()),
         }
+    }
+
+    fn withdraw_local_paths(
+        &self,
+        uuid_map: &mut PathUuidMap,
+        family: Family,
+        nets: &[packet::PathNlri],
+    ) {
+        let timestamp = crate::proto::unix_secs();
+        for net in nets {
+            self.tables
+                .remove_route(table::Source::local(), family, net.clone(), None, timestamp);
+        }
+        // Forget every handle for a removed path, so a stale UUID cannot
+        // delete a later announcement with the same NLRI and identifier.
+        uuid_map.retain(|_, (mapped_family, mapped_nets)| {
+            if *mapped_family == family {
+                mapped_nets.retain(|net| !nets.contains(net));
+            }
+            !mapped_nets.is_empty()
+        });
     }
 
     async fn is_available(&self, need_active: bool) -> Result<(), Error> {
@@ -2039,18 +2062,7 @@ impl GoBgpService for GrpcService {
         // Serialize route mutations and UUID bookkeeping with DeletePath.
         let mut uuid_map = self.path_uuid_map.lock().await;
         if is_withdraw {
-            for net in &insert_nets {
-                self.tables
-                    .remove_route(source.clone(), family, net.clone(), None, timestamp);
-            }
-            // A legacy withdrawal does not supply a UUID. Forget all handles
-            // for these paths so they cannot delete a subsequent announcement.
-            uuid_map.retain(|_, (mapped_family, mapped_nets)| {
-                if *mapped_family == family {
-                    mapped_nets.retain(|net| !insert_nets.contains(net));
-                }
-                !mapped_nets.is_empty()
-            });
+            self.withdraw_local_paths(&mut uuid_map, family, &insert_nets);
             return Ok(tonic::Response::new(api::AddPathResponse::default()));
         }
         if let Some(attrs) = insert_attrs {
@@ -2078,10 +2090,37 @@ impl GoBgpService for GrpcService {
     ) -> Result<tonic::Response<api::DeletePathResponse>, tonic::Status> {
         let inner = request.into_inner();
         if inner.uuid.is_empty() {
-            return Err(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "uuid is required",
-            ));
+            let table_type = api::TableType::try_from(inner.table_type)
+                .map_err(|_| tonic::Status::invalid_argument("invalid table type"))?;
+            if !matches!(
+                table_type,
+                api::TableType::Unspecified | api::TableType::Global | api::TableType::Vrf
+            ) {
+                return Err(tonic::Status::invalid_argument(
+                    "DeletePath only supports global and VRF tables",
+                ));
+            }
+            let path = inner.path.ok_or(Error::EmptyArgument)?;
+            let (mut family, mut nets, attrs, _) = self.local_path(path)?;
+            if table_type == api::TableType::Vrf {
+                if inner.vrf_id.is_empty() {
+                    return Err(tonic::Status::invalid_argument(
+                        "vrf_id is required for VRF table type",
+                    ));
+                }
+                let vrf = self
+                    .tables
+                    .list_vrfs(Some(&inner.vrf_id))
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        tonic::Status::not_found(format!("VRF '{}' not found", inner.vrf_id))
+                    })?;
+                (family, nets, _) = vrf_export_path(family, nets, attrs, &vrf)?;
+            }
+            let mut uuid_map = self.path_uuid_map.lock().await;
+            self.withdraw_local_paths(&mut uuid_map, family, &nets);
+            return Ok(tonic::Response::new(api::DeletePathResponse {}));
         }
         let id = uuid::Uuid::from_slice(&inner.uuid)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid uuid"))?;
@@ -2089,12 +2128,7 @@ impl GoBgpService for GrpcService {
         let (family, nets) = uuid_map
             .remove(&id)
             .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "uuid not found"))?;
-        let timestamp = crate::proto::unix_secs();
-        let source = table::Source::local();
-        for net in nets {
-            self.tables
-                .remove_route(source.clone(), family, net, None, timestamp);
-        }
+        self.withdraw_local_paths(&mut uuid_map, family, &nets);
         Ok(tonic::Response::new(api::DeletePathResponse {}))
     }
     type ListPathStream = Pin<
