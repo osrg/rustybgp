@@ -783,14 +783,57 @@ impl GrpcService {
             self.tables
                 .remove_route(table::Source::local(), family, net.clone(), None, timestamp);
         }
+        let removed: FnvHashSet<_> = nets.iter().collect();
         // Forget every handle for a removed path, so a stale UUID cannot
         // delete a later announcement with the same NLRI and identifier.
         uuid_map.retain(|_, (mapped_family, mapped_nets)| {
             if *mapped_family == family {
-                mapped_nets.retain(|net| !nets.contains(net));
+                mapped_nets.retain(|net| !removed.contains(net));
             }
             !mapped_nets.is_empty()
         });
+    }
+
+    fn local_paths_to_delete(
+        &self,
+        uuid_map: &PathUuidMap,
+        family: Option<Family>,
+        vrf: Option<&table::Vrf>,
+    ) -> FnvHashMap<Family, Vec<packet::PathNlri>> {
+        let mut paths: FnvHashMap<Family, Vec<packet::PathNlri>> = FnvHashMap::default();
+        let in_vrf = |net: &packet::PathNlri| {
+            vrf.is_none_or(|vrf| match &net.nlri {
+                packet::Nlri::VpnV4(n) => n.rd == vrf.rd && n.labels.labels() == [vrf.label],
+                packet::Nlri::VpnV6(n) => n.rd == vrf.rd && n.labels.labels() == [vrf.label],
+                _ => false,
+            })
+        };
+        for shard in &self.tables.shards {
+            let shard = shard.lock().unwrap();
+            for f in shard
+                .rtable
+                .families()
+                .filter(|f| family.is_none_or(|family| *f == family))
+            {
+                // iter_reach includes policy-filtered routes and their original
+                // path identifiers, including paths injected without a UUID.
+                for reach in shard.rtable.iter_reach(f).filter(|r| r.source.is_local()) {
+                    if in_vrf(&reach.net) {
+                        paths.entry(f).or_default().push(reach.net);
+                    }
+                }
+            }
+        }
+        // Also invalidate handles for local paths replaced by kernel updates.
+        for (f, nets) in uuid_map.values() {
+            if family.is_none_or(|family| *f == family) {
+                paths
+                    .entry(*f)
+                    .or_default()
+                    .extend(nets.iter().filter(|net| in_vrf(net)).cloned());
+            }
+        }
+        paths
     }
 
     async fn is_available(&self, need_active: bool) -> Result<(), Error> {
@@ -2100,26 +2143,54 @@ impl GoBgpService for GrpcService {
                     "DeletePath only supports global and VRF tables",
                 ));
             }
-            let path = inner.path.ok_or(Error::EmptyArgument)?;
-            let (mut family, mut nets, attrs, _) = self.local_path(path)?;
-            if table_type == api::TableType::Vrf {
+            let vrf = if table_type == api::TableType::Vrf {
                 if inner.vrf_id.is_empty() {
                     return Err(tonic::Status::invalid_argument(
                         "vrf_id is required for VRF table type",
                     ));
                 }
-                let vrf = self
-                    .tables
-                    .list_vrfs(Some(&inner.vrf_id))
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        tonic::Status::not_found(format!("VRF '{}' not found", inner.vrf_id))
-                    })?;
-                (family, nets, _) = vrf_export_path(family, nets, attrs, &vrf)?;
-            }
+                Some(
+                    self.tables
+                        .list_vrfs(Some(&inner.vrf_id))
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            tonic::Status::not_found(format!("VRF '{}' not found", inner.vrf_id))
+                        })?,
+                )
+            } else {
+                None
+            };
+            let paths = if let Some(path) = inner.path {
+                let (mut family, mut nets, attrs, _) = self.local_path(path)?;
+                if let Some(vrf) = &vrf {
+                    (family, nets, _) = vrf_export_path(family, nets, attrs, vrf)?;
+                }
+                Some((family, nets))
+            } else {
+                None
+            };
             let mut uuid_map = self.path_uuid_map.lock().await;
-            self.withdraw_local_paths(&mut uuid_map, family, &nets);
+            if let Some((family, nets)) = paths {
+                self.withdraw_local_paths(&mut uuid_map, family, &nets);
+            } else {
+                let mut family = inner.family.as_ref().map(convert::family_from_api);
+                if vrf.is_some() {
+                    family = match family {
+                        Some(Family::IPV4) => Some(Family::IPV4_VPN),
+                        Some(Family::IPV6) => Some(Family::IPV6_VPN),
+                        None => None,
+                        _ => {
+                            return Err(tonic::Status::invalid_argument(
+                                "VRF DeletePath only supports IPv4/IPv6 families",
+                            ));
+                        }
+                    };
+                }
+                for (family, nets) in self.local_paths_to_delete(&uuid_map, family, vrf.as_ref()) {
+                    self.withdraw_local_paths(&mut uuid_map, family, &nets);
+                }
+            }
             return Ok(tonic::Response::new(api::DeletePathResponse {}));
         }
         let id = uuid::Uuid::from_slice(&inner.uuid)
