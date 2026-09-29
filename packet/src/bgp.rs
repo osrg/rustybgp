@@ -581,6 +581,16 @@ impl Nlri {
         buf
     }
 
+    /// Decode exactly one wire-format NLRI, without an ADD-PATH identifier.
+    pub fn decode_from_bytes(family: Family, bytes: &[u8]) -> Result<Self, Notification> {
+        let mut reader = BgpReader::<UpdateCtx>::new(bytes);
+        let nlri = Self::decode(family, &mut reader, bytes.len(), true)?;
+        if reader.remaining_len() != 0 {
+            return Err(Notification::UpdateMalformedAttributeList);
+        }
+        Ok(nlri)
+    }
+
     // Add a new match arm here when introducing a new SAFI.
     fn decode<C: ParseContext>(
         family: Family,
@@ -1212,6 +1222,29 @@ impl Attribute {
 
     pub fn flags(&self) -> u8 {
         self.flags
+    }
+
+    /// Decode one complete BGP attribute, using four-octet AS numbers as in
+    /// GoBGP's binary gRPC representation. Reject truncation and trailing data.
+    pub fn decode_from_bytes(bytes: &[u8]) -> Result<Self, Notification> {
+        let invalid = || Notification::UpdateMalformedAttributeList;
+        let mut reader = Cursor::new(bytes);
+        let flags = reader.read_u8().map_err(|_| invalid())?;
+        let code = reader.read_u8().map_err(|_| invalid())?;
+        let len = if flags & Self::FLAG_EXTENDED != 0 {
+            reader.read_u16::<NetworkEndian>().map_err(|_| invalid())?
+        } else {
+            reader.read_u8().map_err(|_| invalid())? as u16
+        };
+        if reader.position() as usize + len as usize != bytes.len() {
+            return Err(invalid());
+        }
+        let attribute =
+            Self::decode(code, flags, &mut reader, len, false).map_err(|_| invalid())?;
+        if reader.position() as usize != bytes.len() {
+            return Err(invalid());
+        }
+        Ok(attribute)
     }
 
     pub fn new_with_value(code: u8, val: u32) -> Option<Self> {
