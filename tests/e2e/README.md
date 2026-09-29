@@ -1,8 +1,8 @@
 # RustyBGP End-to-End Tests
 
-Each subdirectory is a self-contained test scenario. Every test starts its
-own Docker Compose topology, runs assertions against live BGP sessions, and
-tears everything down on exit.
+Each subdirectory is a self-contained test scenario. The topology tests
+start Docker Compose, run assertions against live BGP sessions, and tear
+everything down on exit. The CLI-only gRPC path test runs locally.
 
 ## Prerequisites
 
@@ -21,6 +21,20 @@ On aarch64 (Apple Silicon, ARM servers):
 ```
 rustup target add aarch64-unknown-linux-musl
 ```
+
+## CLI-only gRPC path test
+
+This test runs without Docker or a BGP listener. Build `rustybgpd` and
+install the GoBGP v4 CLI, then run from the repository root:
+
+```
+cargo build -p rustybgpd
+python3 tests/e2e/grpc-paths/run-test.py --gobgp /path/to/gobgp
+```
+
+Use `--rustybgpd /path/to/rustybgpd` to test a different build. The test
+starts a temporary loopback gRPC server and covers IPv4, IPv6, FlowSpec,
+path identifiers, VRF isolation, and family-scoped `rib del all`.
 
 ## Running all tests locally
 

@@ -9770,14 +9770,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_path_without_uuid_or_path_is_rejected() {
+    async fn delete_path_without_selectors_is_idempotent() {
         let svc = make_grpc_service();
         let req = tonic::Request::new(api::DeletePathRequest {
             uuid: vec![],
             ..Default::default()
         });
-        let err = svc.delete_path(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        svc.delete_path(req).await.unwrap();
+        assert!(svc.tables.collect_loc_rib_paths(Family::IPV4).is_empty());
     }
 
     #[tokio::test]
@@ -10039,6 +10039,164 @@ mod tests {
         });
         let err = svc.delete_path(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn delete_path_all_respects_family_and_preserves_nonlocal_routes() {
+        let svc = make_grpc_service();
+        let path = ipv4_path("10.2.0.0", 24, "10.0.0.1");
+        let mut handles = vec![add_gobgp_path(&svc, path.clone()).await.unwrap().uuid];
+        handles.push(
+            add_gobgp_path(
+                &svc,
+                api::Path {
+                    identifier: 2,
+                    ..path
+                },
+            )
+            .await
+            .unwrap()
+            .uuid,
+        );
+        let ipv6 = add_gobgp_path(&svc, gobgp_binary_path(Family::IPV6))
+            .await
+            .unwrap()
+            .uuid;
+        let installed = svc.tables.collect_loc_rib_paths(Family::IPV4);
+        let local = installed[0].new_best().unwrap();
+        let peer = Arc::new(table::Source::new(
+            "192.0.2.1".parse().unwrap(),
+            "192.0.2.2".parse().unwrap(),
+            65002,
+            65001,
+            Ipv4Addr::new(192, 0, 2, 1),
+            PeerRole::Ebgp,
+        ));
+        for source in [peer, table::Source::kernel()] {
+            svc.tables.insert_route(
+                source,
+                Family::IPV4,
+                packet::PathNlri {
+                    path_id: 0,
+                    nlri: installed[0].net.clone(),
+                },
+                local.nexthop,
+                local.attr.clone(),
+                None,
+                0,
+            );
+        }
+        // This policy-filtered local path has no UUID and is absent from Loc-RIB.
+        svc.tables.shards[0].lock().unwrap().rtable.insert(
+            table::Source::local(),
+            Family::IPV4,
+            packet::Nlri::from_str("10.3.0.0/24").unwrap(),
+            7,
+            local.nexthop,
+            local.attr.clone(),
+            None,
+            true,
+            false,
+            None,
+            0,
+        );
+        let request = api::DeletePathRequest {
+            family: Some(convert::family_to_api(Family::IPV4)),
+            ..Default::default()
+        };
+        svc.delete_path(tonic::Request::new(request.clone()))
+            .await
+            .unwrap();
+        assert!(
+            svc.tables.shards[0]
+                .lock()
+                .unwrap()
+                .rtable
+                .iter_reach(Family::IPV4)
+                .all(|r| !r.source.is_local())
+        );
+        assert_eq!(
+            svc.tables.collect_loc_rib_paths(Family::IPV4)[0]
+                .current_paths
+                .len(),
+            2
+        );
+        assert_eq!(svc.tables.collect_loc_rib_paths(Family::IPV6).len(), 1);
+        for uuid in handles {
+            assert_eq!(
+                delete_gobgp_path(&svc, uuid).await.unwrap_err().code(),
+                tonic::Code::NotFound
+            );
+        }
+        svc.delete_path(tonic::Request::new(request)).await.unwrap();
+        svc.delete_path(tonic::Request::new(api::DeletePathRequest::default()))
+            .await
+            .unwrap();
+        assert!(svc.tables.collect_loc_rib_paths(Family::IPV6).is_empty());
+        assert_eq!(
+            delete_gobgp_path(&svc, ipv6).await.unwrap_err().code(),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            svc.tables.collect_loc_rib_paths(Family::IPV4)[0]
+                .current_paths
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_path_all_vrf_respects_family_and_label_scope() {
+        let svc = make_grpc_service();
+        // Even with the same RD, each VRF's distinct export label scopes deletion.
+        for name in ["blue", "red"] {
+            svc.add_vrf(tonic::Request::new(make_vrf_req(name, 65000, 1, 65000, 1)))
+                .await
+                .unwrap();
+            for family in [Family::IPV4, Family::IPV6] {
+                svc.add_path(tonic::Request::new(api::AddPathRequest {
+                    table_type: api::TableType::Vrf as i32,
+                    vrf_id: name.into(),
+                    path: Some(gobgp_binary_path(family)),
+                }))
+                .await
+                .unwrap();
+            }
+        }
+        let global = add_gobgp_path(&svc, gobgp_binary_path(Family::IPV4))
+            .await
+            .unwrap()
+            .uuid;
+        let request = api::DeletePathRequest {
+            table_type: api::TableType::Vrf as i32,
+            vrf_id: "blue".into(),
+            family: Some(convert::family_to_api(Family::IPV4)),
+            ..Default::default()
+        };
+        svc.delete_path(tonic::Request::new(request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(svc.tables.collect_loc_rib_paths(Family::IPV4_VPN).len(), 1);
+        assert_eq!(svc.tables.collect_loc_rib_paths(Family::IPV6_VPN).len(), 2);
+        let mut invalid = request.clone();
+        invalid.family = Some(convert::family_to_api(Family::IPV4_FLOWSPEC));
+        assert_eq!(
+            svc.delete_path(tonic::Request::new(invalid))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        svc.delete_path(tonic::Request::new(api::DeletePathRequest {
+            family: None,
+            ..request
+        }))
+        .await
+        .unwrap();
+        assert_eq!(svc.tables.collect_loc_rib_paths(Family::IPV4_VPN).len(), 1);
+        assert_eq!(svc.tables.collect_loc_rib_paths(Family::IPV6_VPN).len(), 1);
+        assert_eq!(svc.tables.collect_loc_rib_paths(Family::IPV4).len(), 1);
+        delete_gobgp_path(&svc, global).await.unwrap();
     }
 
     fn ipv4_path_with_id(prefix: &str, prefix_len: u32, nexthop: &str, path_id: u32) -> api::Path {
