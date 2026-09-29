@@ -2008,8 +2008,9 @@ impl GoBgpService for GrpcService {
         let inner = request.into_inner();
         let table_type =
             api::TableType::try_from(inner.table_type).unwrap_or(api::TableType::Global);
-        let (mut family, nets, attrs, nexthop) =
-            self.local_path(inner.path.ok_or(Error::EmptyArgument)?)?;
+        let path = inner.path.ok_or(Error::EmptyArgument)?;
+        let is_withdraw = path.is_withdraw;
+        let (mut family, nets, attrs, nexthop) = self.local_path(path)?;
         let mut insert_nets = nets.clone();
         let mut insert_attrs = attrs;
         if table_type == api::TableType::Vrf {
@@ -2035,6 +2036,23 @@ impl GoBgpService for GrpcService {
         let map_nets = insert_nets.clone();
         let timestamp = crate::proto::unix_secs();
         let source = table::Source::local();
+        // Serialize route mutations and UUID bookkeeping with DeletePath.
+        let mut uuid_map = self.path_uuid_map.lock().await;
+        if is_withdraw {
+            for net in &insert_nets {
+                self.tables
+                    .remove_route(source.clone(), family, net.clone(), None, timestamp);
+            }
+            // A legacy withdrawal does not supply a UUID. Forget all handles
+            // for these paths so they cannot delete a subsequent announcement.
+            uuid_map.retain(|_, (mapped_family, mapped_nets)| {
+                if *mapped_family == family {
+                    mapped_nets.retain(|net| !insert_nets.contains(net));
+                }
+                !mapped_nets.is_empty()
+            });
+            return Ok(tonic::Response::new(api::AddPathResponse::default()));
+        }
         if let Some(attrs) = insert_attrs {
             for net in insert_nets {
                 self.tables.insert_route(
@@ -2049,10 +2067,7 @@ impl GoBgpService for GrpcService {
             }
         }
         let id = uuid::Uuid::new_v4();
-        self.path_uuid_map
-            .lock()
-            .await
-            .insert(id, (family, map_nets));
+        uuid_map.insert(id, (family, map_nets));
         Ok(tonic::Response::new(api::AddPathResponse {
             uuid: id.as_bytes().to_vec(),
         }))
@@ -2070,10 +2085,8 @@ impl GoBgpService for GrpcService {
         }
         let id = uuid::Uuid::from_slice(&inner.uuid)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "invalid uuid"))?;
-        let (family, nets) = self
-            .path_uuid_map
-            .lock()
-            .await
+        let mut uuid_map = self.path_uuid_map.lock().await;
+        let (family, nets) = uuid_map
             .remove(&id)
             .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "uuid not found"))?;
         let timestamp = crate::proto::unix_secs();
