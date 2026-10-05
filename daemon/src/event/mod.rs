@@ -642,28 +642,52 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
     let retry_time = peer.config.connect_retry_time;
     let password = peer.config.password.as_ref().map(|x| x.to_string());
     let bind_interface = peer.config.bind_interface.clone();
+    let local_address = peer.config.local_address.clone();
     let peer_ifindex = bind_interface.as_deref().map(auth::ifindex_of).unwrap_or(0);
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let join_handle = tokio::spawn(async move {
         loop {
-            let socket = match peer_addr {
-                IpAddr::V4(_) => tokio::net::TcpSocket::new_v4().unwrap(),
-                IpAddr::V6(_) => tokio::net::TcpSocket::new_v6().unwrap(),
+            let connect = async {
+                let socket = match peer_addr {
+                    IpAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+                    IpAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+                };
+                if let Some(dev) = bind_interface.as_deref() {
+                    socket.bind_device(Some(dev.as_bytes()))?;
+                }
+                if let Some(value) = local_address.as_deref() {
+                    let mut local = peer::local_socket_address(value)?;
+                    // Go's TCP dialer treats either unspecified address as a
+                    // wildcard, even when it differs from the remote family.
+                    if local.ip().is_unspecified() {
+                        local = SocketAddr::new(
+                            if peer_addr.is_ipv4() {
+                                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                            } else {
+                                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                            },
+                            0,
+                        );
+                    }
+                    socket.bind(local)?;
+                }
+                if let Some(key) = password.as_ref() {
+                    auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex);
+                }
+                socket.connect(sockaddr).await
             };
-            if let Some(dev) = bind_interface.as_deref() {
-                let _ = socket.bind_device(Some(dev.as_bytes()));
-            }
-            if let Some(key) = password.as_ref() {
-                auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex);
-            }
             tokio::select! {
                 result = tokio::time::timeout(
                     tokio::time::Duration::from_secs(5),
-                    socket.connect(sockaddr),
+                    connect,
                 ) => {
-                    if let Ok(Ok(stream)) = result {
-                        let _ = ch.send(stream);
-                        return;
+                    match result {
+                        Ok(Ok(stream)) => {
+                            let _ = ch.send(stream);
+                            return;
+                        }
+                        Ok(Err(e)) => log::warn!("connect to {peer_addr} from {local_address:?} failed: {e}"),
+                        Err(_) => log::debug!("connect to {peer_addr} timed out"),
                     }
                 }
                 _ = &mut cancel_rx => return,
@@ -1046,6 +1070,8 @@ impl Global {
         mut params: PeerParams,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
     ) -> std::result::Result<(), Error> {
+        peer::validate_local_address(params.local_address.as_deref(), params.remote_addr)
+            .map_err(Error::InvalidArgument)?;
         if self.peers.contains_key(&params.remote_addr) {
             return Err(Error::AlreadyExists(
                 "peer address already exists".to_string(),
@@ -1512,6 +1538,7 @@ impl Global {
             server.peer_group.insert(
                 "any".to_string(),
                 PeerGroup {
+                    local_address: None,
                     as_number: 0,
                     dynamic_peers: vec![
                         DynamicPeer {
@@ -1664,6 +1691,14 @@ async fn accept_connection(
     let confederation = g.confederation.as_ref().map(|c| (c.id, c.members.clone()));
     let peer = match g.peers.get_mut(&remote_addr) {
         Some(peer) => {
+            if !peer::accepts_local_address(
+                peer.config.local_address.as_deref(),
+                stream.local_addr().ok()?,
+                peer.config.bind_interface.as_deref(),
+            ) {
+                log::warn!("mismatched local address for peer {remote_addr}");
+                return None;
+            }
             if peer.admin_down {
                 log::warn!(
                     "admin down; ignore a new passive connection from {}",
@@ -1701,7 +1736,15 @@ async fn accept_connection(
                 );
                 return None;
             };
+            if !peer::accepts_local_address(
+                group.local_address.as_deref(),
+                stream.local_addr().ok()?,
+                None,
+            ) {
+                return None;
+            }
             let params = PeerParams {
+                local_address: group.local_address.clone(),
                 remote_addr,
                 remote_port: Global::BGP_PORT,
                 expected_remote_asn: group.as_number,
@@ -1732,7 +1775,7 @@ async fn accept_connection(
                 // is not yet supported).
                 export_policy: None,
             };
-            let _ = g.add_peer(params, None);
+            g.add_peer(params, None).ok()?;
             g.peers.get_mut(&remote_addr).unwrap()
         }
     };
@@ -3930,6 +3973,411 @@ mod tests {
     use std::net::Ipv4Addr;
     use tokio::io::AsyncReadExt;
 
+    #[test]
+    fn local_address_config_api_validation_and_inheritance() {
+        for (remote, local) in [
+            ("192.0.2.1", "192.0.2.2"),
+            ("2001:db8::1", "2001:db8::2"),
+            ("fe80::1", "fe80::2%lo"),
+            ("192.0.2.1", "0.0.0.0"),
+            ("2001:db8::1", "::"),
+            ("192.0.2.1", ""),
+        ] {
+            let text = format!(
+                r#"
+[config]
+neighbor-address = "{remote}"
+peer-as = 65001
+[transport.config]
+local-address = "{local}"
+"#
+            );
+            let conf: config::Neighbor = toml::from_str(&text).unwrap();
+            let params = PeerParams::try_from(&conf).unwrap();
+            assert_eq!(
+                params.local_address.as_deref(),
+                if local.is_empty() { None } else { Some(local) }
+            );
+            let api = local_address_api_peer(remote, local, 179);
+            let params = PeerParams::try_from(&api).unwrap();
+            assert_eq!(
+                params.local_address.as_deref(),
+                if local.is_empty() { None } else { Some(local) }
+            );
+        }
+        for value in [
+            "garbage",
+            "192.0.2.2/32",
+            "2001:db8::1",
+            "192.0.2.2%lo",
+            "fe80::1%",
+            "fe80::1%lo%extra",
+        ] {
+            assert!(
+                PeerParams::try_from(&local_address_api_peer("192.0.2.1", value, 179)).is_err(),
+                "{value}"
+            );
+            let mut conf = make_minimal_neighbor_config("192.0.2.1");
+            conf.transport = Some(config::Transport {
+                config: Some(config::TransportConfig {
+                    local_address: Some(value.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            assert!(PeerParams::try_from(&conf).is_err(), "{value}");
+        }
+        let mut group = make_pg_for_apply();
+        group.local_address = Some("192.0.2.2".into());
+        let mut params = default_peer_params("192.0.2.1".parse().unwrap());
+        params.apply_peer_group(&group);
+        assert_eq!(params.local_address.as_deref(), Some("192.0.2.2"));
+        params.local_address = Some("0.0.0.0".into());
+        params.apply_peer_group(&group);
+        assert_eq!(params.local_address.as_deref(), Some("0.0.0.0"));
+    }
+
+    fn local_address_api_peer(remote: &str, local: &str, port: u16) -> api::Peer {
+        api::Peer {
+            conf: Some(api::PeerConf {
+                neighbor_address: remote.into(),
+                peer_asn: 65001,
+                ..Default::default()
+            }),
+            transport: Some(api::Transport {
+                local_address: local.into(),
+                remote_port: port.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn local_address_active_socket_binding() {
+        // 127.0.0.2 proves the configured address wins over OS source selection.
+        for (remote, source) in [
+            ("127.0.0.1", "127.0.0.2"),
+            ("::1", "::1"),
+            ("127.0.0.1", "0.0.0.0"),
+            ("::1", "::"),
+            ("::1", "0.0.0.0"),
+            ("127.0.0.1", "::"),
+            ("127.0.0.1", "::ffff:127.0.0.2"),
+            ("127.0.0.1", ""),
+        ] {
+            let listener = TcpListener::bind(format!(
+                "{}:0",
+                if remote == "::1" { "[::1]" } else { remote }
+            ))
+            .await
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let params =
+                PeerParams::try_from(&local_address_api_peer(remote, source, addr.port())).unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let global = make_global();
+            global.write().await.add_peer(params, Some(tx)).unwrap();
+            let (incoming, observed) =
+                tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let outgoing = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.ip(), outgoing.local_addr().unwrap().ip());
+            if source == "127.0.0.2" || source == "::1" {
+                assert_eq!(observed.ip().to_string(), source);
+            }
+            drop((incoming, outgoing));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_address_bind_failure_does_not_fall_back() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let params = PeerParams::try_from(&local_address_api_peer(
+            "127.0.0.1",
+            "192.0.2.254",
+            listener.local_addr().unwrap().port(),
+        ))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let global = make_global();
+        global.write().await.add_peer(params, Some(tx)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err());
+        let g = global.read().await;
+        let p = g.peers.get(&"127.0.0.1".parse().unwrap()).unwrap();
+        let mut ctx = p.context.lock().unwrap();
+        assert!(
+            !ctx.active_connect_join_handle
+                .as_ref()
+                .unwrap()
+                .is_finished(),
+            "retry loop must survive bind errors"
+        );
+        ctx.active_connect_cancel_tx.take();
+    }
+
+    #[tokio::test]
+    async fn local_address_passive_checks_before_session_state_changes() {
+        for (configured, bind_interface, accepted) in [
+            (None, None, true),
+            (Some("0.0.0.0"), None, true),
+            (Some("127.0.0.1"), None, true),
+            (Some("127.0.0.2"), None, false),
+            (Some("127.0.0.2"), Some("vrf-test"), true),
+        ] {
+            let global = make_global();
+            let tables = make_tables();
+            let (client, server) = loopback_pair().await;
+            let remote = client.local_addr().unwrap().ip();
+            let mut params = default_peer_params(remote);
+            params.local_address = configured.map(str::to_string);
+            params.bind_interface = bind_interface.map(str::to_string);
+            global.write().await.add_peer(params, None).unwrap();
+            let session =
+                accept_connection(&global, &tables, server, crate::fsm::Role::Passive).await;
+            assert_eq!(
+                session.is_some(),
+                accepted,
+                "{configured:?} {bind_interface:?}"
+            );
+            if !accepted {
+                assert_eq!(
+                    global.read().await.peers[&remote]
+                        .state
+                        .fsm
+                        .load(Ordering::Relaxed),
+                    SessionState::Idle as u8
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_address_ipv6_scope_and_wildcard_matching() {
+        let scope = nix::net::if_::if_nametoindex("lo").unwrap();
+        let named = peer::local_socket_address("fe80::1%lo").unwrap();
+        assert_eq!(
+            named,
+            peer::local_socket_address(&format!("fe80::1%{scope}")).unwrap()
+        );
+        assert!(peer::accepts_local_address(Some("fe80::1%lo"), named, None));
+        assert!(!peer::accepts_local_address(
+            Some("fe80::1%lo"),
+            "[fe80::1]:179".parse().unwrap(),
+            None
+        ));
+        assert!(peer::accepts_local_address(Some("::"), named, None));
+        assert!(peer::local_socket_address("fe80::1%rustybgp-no-such-interface").is_err());
+    }
+
+    #[tokio::test]
+    async fn local_address_update_restarts_idle_dial_and_reports_setting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let svc = GrpcService::new(
+            Arc::new(tokio::sync::Notify::new()),
+            tx,
+            make_global(),
+            make_tables(),
+        );
+        let remote = "127.0.0.1".parse().unwrap();
+        let initial = local_address_api_peer("127.0.0.1", "192.0.2.254", port);
+        svc.add_peer(tonic::Request::new(api::AddPeerRequest {
+            peer: Some(initial),
+        }))
+        .await
+        .unwrap();
+        {
+            let g = svc.global.read().await;
+            let report = api::Peer::from(&g.peers[&remote].view(false));
+            assert_eq!(report.transport.unwrap().local_address, "192.0.2.254");
+        }
+        // A source-only change on an idle active peer must restart its dial loop.
+        svc.update_peer(tonic::Request::new(api::UpdatePeerRequest {
+            peer: Some(local_address_api_peer("127.0.0.1", "127.0.0.2", port)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let (_incoming, addr) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr.ip().to_string(), "127.0.0.2");
+        let _outgoing = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let g = svc.global.read().await;
+        assert_eq!(
+            api::Peer::from(&g.peers[&remote].view(false))
+                .transport
+                .unwrap()
+                .local_address,
+            "127.0.0.2"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_address_update_tears_down_existing_session() {
+        let svc = make_grpc_service();
+        let mut initial = local_address_api_peer("192.0.2.1", "192.0.2.2", 179);
+        initial.transport.as_mut().unwrap().passive_mode = true;
+        svc.add_peer(tonic::Request::new(api::AddPeerRequest {
+            peer: Some(initial.clone()),
+        }))
+        .await
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let remote = "192.0.2.1".parse().unwrap();
+        svc.global.read().await.peers[&remote]
+            .context
+            .lock()
+            .unwrap()
+            .conn_arbiter
+            .lock()
+            .unwrap()
+            .passive_close_tx = Some(tx);
+        // Unchanged config preserves the session.
+        svc.update_peer(tonic::Request::new(api::UpdatePeerRequest {
+            peer: Some(initial.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        initial.transport.as_mut().unwrap().local_address = "192.0.2.3".into();
+        svc.update_peer(tonic::Request::new(api::UpdatePeerRequest {
+            peer: Some(initial),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(CloseReason::SendMessage(_))));
+    }
+
+    #[tokio::test]
+    async fn local_address_peer_group_api_and_dynamic_neighbor() {
+        let svc = make_grpc_service();
+        let mut group = api::PeerGroup {
+            conf: Some(api::PeerGroupConf {
+                peer_group_name: "source".into(),
+                peer_asn: 65001,
+                ..Default::default()
+            }),
+            transport: Some(api::Transport {
+                local_address: "127.0.0.2".into(),
+                passive_mode: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        svc.add_peer_group(tonic::Request::new(api::AddPeerGroupRequest {
+            peer_group: Some(group.clone()),
+        }))
+        .await
+        .unwrap();
+        let mut request = local_address_api_peer("127.0.0.1", "", 179);
+        request.conf.as_mut().unwrap().peer_group = "source".into();
+        request.transport.as_mut().unwrap().passive_mode = true;
+        svc.add_peer(tonic::Request::new(api::AddPeerRequest {
+            peer: Some(request),
+        }))
+        .await
+        .unwrap();
+        let remote = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            svc.global.read().await.peers[&remote]
+                .config
+                .local_address
+                .as_deref(),
+            Some("127.0.0.2")
+        );
+        {
+            let mut global = svc.global.write().await;
+            global.peers.remove(&remote);
+            global
+                .peer_group
+                .get_mut("source")
+                .unwrap()
+                .dynamic_peers
+                .push(DynamicPeer {
+                    prefix: "127.0.0.0/8".parse().unwrap(),
+                });
+        }
+        let (_client, server) = loopback_pair().await;
+        assert!(
+            accept_connection(&svc.global, &svc.tables, server, crate::fsm::Role::Passive)
+                .await
+                .is_none()
+        );
+        assert!(
+            svc.global.read().await.peers.is_empty(),
+            "wrong destination must not create a dynamic peer"
+        );
+        group.transport.as_mut().unwrap().local_address = "127.0.0.1".into();
+        svc.update_peer_group(tonic::Request::new(api::UpdatePeerGroupRequest {
+            peer_group: Some(group),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let (_client, server) = loopback_pair().await;
+        assert!(
+            accept_connection(&svc.global, &svc.tables, server, crate::fsm::Role::Passive)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            svc.global.read().await.peers[&remote]
+                .config
+                .local_address
+                .as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn local_address_config_validation_and_group_conversion() {
+        for local in ["192.0.2.2", "2001:db8::2", "fe80::1%lo", "", "bad-address"] {
+            let text = format!(
+                r#"
+[global.config]
+as = 65001
+router-id = "192.0.2.1"
+[[peer-groups]]
+[peer-groups.config]
+peer-group-name = "source"
+[peer-groups.transport.config]
+local-address = "{local}"
+"#
+            );
+            let conf: config::BgpConfig = toml::from_str(&text).unwrap();
+            assert_eq!(conf.validate().is_ok(), local != "bad-address");
+            if conf.validate().is_ok() {
+                let pg = PeerGroup::from(&conf.peer_groups.unwrap()[0]);
+                assert_eq!(
+                    pg.local_address.as_deref(),
+                    if local.is_empty() { None } else { Some(local) }
+                );
+            }
+        }
+    }
+
     fn make_global() -> GlobalHandle {
         let (tx, _rx) = mpsc::unbounded_channel();
         let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
@@ -3945,6 +4393,7 @@ mod tests {
 
     fn default_peer_params(remote_addr: IpAddr) -> PeerParams {
         PeerParams {
+            local_address: None,
             remote_addr,
             remote_port: Global::BGP_PORT,
             expected_remote_asn: 0,
@@ -4453,6 +4902,7 @@ mod tests {
             let mut g = global.write().await;
             g.add_peer(
                 PeerParams {
+                    local_address: None,
                     admin_down: true,
                     ..default_peer_params(remote_addr)
                 },
@@ -4597,6 +5047,7 @@ mod tests {
             });
             g.add_peer(
                 PeerParams {
+                    local_address: None,
                     expected_remote_asn: 65002,
                     local_asn: 65001,
                     ..default_peer_params(remote_addr)
@@ -4630,6 +5081,7 @@ mod tests {
             });
             g.add_peer(
                 PeerParams {
+                    local_address: None,
                     expected_remote_asn: 65099,
                     local_asn: 65001,
                     ..default_peer_params(remote_addr)
@@ -4663,6 +5115,7 @@ mod tests {
         let addr: IpAddr = "127.0.0.1".parse().unwrap();
         g.add_peer(
             PeerParams {
+                local_address: None,
                 expected_remote_asn: 65100,
                 ..default_peer_params(addr)
             },
@@ -4688,6 +5141,7 @@ mod tests {
             g.peer_group.insert(
                 "test-group".to_string(),
                 PeerGroup {
+                    local_address: None,
                     as_number: 65002,
                     dynamic_peers: vec![DynamicPeer {
                         prefix: packet::IpNet::new(remote_addr, 32),
@@ -4731,6 +5185,7 @@ mod tests {
             g.peer_group.insert(
                 "full-group".to_string(),
                 PeerGroup {
+                    local_address: None,
                     as_number: 65002,
                     dynamic_peers: vec![DynamicPeer {
                         prefix: packet::IpNet::new(remote_addr, 32),
@@ -5337,6 +5792,7 @@ mod tests {
             g.peer_group.insert(
                 "gr-group".to_string(),
                 PeerGroup {
+                    local_address: None,
                     as_number: 65002,
                     dynamic_peers: vec![DynamicPeer {
                         prefix: packet::IpNet::new(remote_addr, 32),
@@ -5587,6 +6043,7 @@ mod tests {
             g.peer_group.insert(
                 "ts-group".to_string(),
                 PeerGroup {
+                    local_address: None,
                     as_number: 65002,
                     dynamic_peers: vec![DynamicPeer {
                         prefix: packet::IpNet::new(remote_addr, 32),
@@ -5632,6 +6089,7 @@ mod tests {
             g.peer_group.insert(
                 "fam-group".to_string(),
                 PeerGroup {
+                    local_address: None,
                     as_number: 65002,
                     dynamic_peers: vec![DynamicPeer {
                         prefix: packet::IpNet::new(remote_addr, 32),
