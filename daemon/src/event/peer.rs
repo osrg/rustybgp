@@ -183,20 +183,27 @@ impl PeerParams {
             if !addpath.is_empty() {
                 local_cap.push(packet::Capability::AddPath(addpath));
             }
-            // RFC 8950: advertise ExtendedNexthop when peering over IPv6
-            // with IPv4 address family configured.
-            // SR Policy (SAFI 73) is excluded: its nexthop is always the
-            // originator address in the same AFI, not an IPv6-mapped address.
-            if matches!(remote_addr, IpAddr::V6(_)) {
-                let enh_families: Vec<(Family, u16)> = families
-                    .keys()
-                    .filter(|f| f.afi() == Family::AFI_IP && **f != Family::IPV4_SRPOLICY)
-                    .map(|f| (*f, Family::AFI_IP6))
-                    .collect();
-                if !enh_families.is_empty() {
-                    local_cap.push(packet::Capability::ExtendedNexthop(enh_families));
+        }
+        // RFC 8950: receive support is independent of the TCP address family.
+        // Derive tuples from the advertised MP families, including the default
+        // IPv4 family when no explicit afi-safis were configured. Restrict them
+        // to the AFI/SAFI pairs defined by RFC 8950 (not RTC, FlowSpec or SR Policy).
+        let enh_families: Vec<_> = local_cap
+            .iter()
+            .filter_map(|cap| match cap {
+                packet::Capability::MultiProtocol(f)
+                    if matches!(
+                        *f,
+                        Family::IPV4 | Family::IPV4_MC | Family::IPV4_MPLS | Family::IPV4_VPN
+                    ) =>
+                {
+                    Some((*f, Family::AFI_IP6))
                 }
-            }
+                _ => None,
+            })
+            .collect();
+        if !enh_families.is_empty() {
+            local_cap.push(packet::Capability::ExtendedNexthop(enh_families));
         }
         if let Some(gr) = graceful_restart {
             // N-bit (0x4): supports GR for NOTIFICATION and Hold Timer (RFC 8538).
