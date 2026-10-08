@@ -720,7 +720,14 @@ impl Nexthop {
             4 => Some(Nexthop::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))),
             16 => {
                 let arr: [u8; 16] = b.try_into().ok()?;
-                Some(Nexthop::V6(Ipv6Addr::from(arr)))
+                let addr = Ipv6Addr::from(arr);
+                // An IPv4-mapped address is the IPv4 address it embeds
+                // (RFC 4291 Section 2.5.5.2). The encoder sends an IPv4
+                // nexthop for an AFI=2 family in this form.
+                match addr.to_ipv4_mapped() {
+                    Some(v4) => Some(Nexthop::V4(v4)),
+                    None => Some(Nexthop::V6(addr)),
+                }
             }
             32 => {
                 let global: [u8; 16] = b[..16].try_into().ok()?;
@@ -2346,6 +2353,18 @@ impl PeerCodec {
         // nexthop.  VPN families prefix the nexthop with an 8-byte zero RD (RFC 4364
         // §4.3.2). Otherwise preserve the actual nexthop length: negotiating
         // Extended Nexthop permits IPv6 nexthops but does not convert IPv4 ones.
+        // An IPv4 nexthop for an AFI=2 family is encoded as an IPv4-mapped IPv6
+        // address (RFC 4798 Section 2, RFC 4659 Section 3.2.1.2). SR Policy
+        // keeps the nexthop as-is: its nexthop length does not depend on the
+        // AFI (RFC 9830 Section 2.1).
+        let nexthop = match nexthop {
+            Some(Nexthop::V4(v4))
+                if family.afi() == Family::AFI_IP6 && *family != Family::IPV6_SRPOLICY =>
+            {
+                Some(Nexthop::V6(v4.to_ipv6_mapped()))
+            }
+            _ => *nexthop,
+        };
         let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
         if matches!(
             *family,
@@ -5466,6 +5485,46 @@ mod update_tests {
     }
 
     #[test]
+    fn update_ipv6_ipv4_nexthop_is_ipv4_mapped() {
+        let prefix = ipv6_prefix("2001:db8::", 32);
+        let nexthop: Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let codec = ipv6_codec();
+        let mut wire = BytesMut::new();
+        codec.mp_reach_encode(
+            0,
+            &mut wire,
+            &Family::IPV6,
+            std::slice::from_ref(&prefix),
+            &Some(Nexthop::V4(nexthop)),
+        );
+        // An IPv4 nexthop for AFI=2 is sent as ::ffff:192.0.2.1 (16 bytes).
+        assert_eq!(
+            &wire[..],
+            &[
+                0x90, 14, 0, 26, 0, 2, 1, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2,
+                1, 0, 32, 0x20, 0x01, 0x0d, 0xb8
+            ]
+        );
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6,
+            entries: vec![prefix.clone()],
+            nexthop: Some(Nexthop::V4(nexthop)),
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::empty_as_path(),
+            ]),
+        });
+        match round_trip(&msg, codec) {
+            ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+                let routes = mp_reach.expect("mp_reach must be present");
+                assert_eq!(routes.entries, vec![prefix]);
+                assert_eq!(routes.nexthop, Some(Nexthop::V4(nexthop)));
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
     fn update_ipv4_with_ipv6_nexthop() {
         let prefix = ipv4_prefix("10.0.0.0", 8);
         let nexthop_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
@@ -6016,6 +6075,55 @@ mod update_tests {
                 let r = mp_reach.expect("mp_reach must be present for VPNv6");
                 assert_eq!(r.family, Family::IPV6_VPN);
                 assert_eq!(r.nexthop, Some(nexthop));
+                assert_eq!(r.entries, vec![nlri]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_vpnv6_ipv4_nexthop_is_ipv4_mapped() {
+        use crate::mpls::{MplsLabel, MplsLabelStack};
+        use crate::vpn::VpnV6Nlri;
+        let nlri = PathNlri::new(Nlri::VpnV6(VpnV6Nlri {
+            labels: MplsLabelStack::new(vec![MplsLabel::new(200)]),
+            rd: RouteDistinguisher::TwoOctetAs {
+                admin: 65001,
+                assigned: 1,
+            },
+            prefix: Ipv6Net {
+                addr: "2001:db8:1::".parse().unwrap(),
+                mask: 48,
+            },
+        }));
+        let nexthop: Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6_VPN,
+            entries: vec![nlri.clone()],
+            nexthop: Some(Nexthop::V4(nexthop)),
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::empty_as_path(),
+            ]),
+        });
+        // RFC 4659 Section 3.2.1.2: 24-byte VPN-IPv6 nexthop with a zero RD and
+        // an IPv4-mapped IPv6 address.
+        let mut wire = BytesMut::new();
+        vpnv6_codec().mp_reach_encode(
+            0,
+            &mut wire,
+            &Family::IPV6_VPN,
+            std::slice::from_ref(&nlri),
+            &Some(Nexthop::V4(nexthop)),
+        );
+        let mut expected = vec![24];
+        expected.extend_from_slice(&[0; 8]);
+        expected.extend_from_slice(&nexthop.to_ipv6_mapped().octets());
+        assert_eq!(&wire[7..32], &expected[..]);
+        match round_trip(&msg, vpnv6_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+                let r = mp_reach.expect("mp_reach must be present for VPNv6");
+                assert_eq!(r.nexthop, Some(Nexthop::V4(nexthop)));
                 assert_eq!(r.entries, vec![nlri]);
             }
             _ => panic!("expected Update"),
