@@ -2344,7 +2344,8 @@ impl PeerCodec {
         // Attribute transformation (nexthop rewrite) is applied by PeerExportContext
         // before routes enter PendingTx, so the nexthop here is already the export
         // nexthop.  VPN families prefix the nexthop with an 8-byte zero RD (RFC 4364
-        // §4.3.2); other families pad IPv4 to 16 bytes for MP_REACH.
+        // §4.3.2). Otherwise preserve the actual nexthop length: negotiating
+        // Extended Nexthop permits IPv6 nexthops but does not convert IPv4 ones.
         let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
         if matches!(
             *family,
@@ -2359,22 +2360,6 @@ impl PeerCodec {
             dst.put_u8(8 + nh_bytes.len() as u8);
             dst.put_bytes(0, 8); // 8-byte zero RD (RFC 4364 §4.3.2)
             dst.put_slice(&nh_bytes);
-        } else if nh_bytes.len() < 16
-            && !matches!(
-                family,
-                &Family::IPV4_SRPOLICY
-                    | &Family::IPV6_SRPOLICY
-                    | &Family::IPV4_MC
-                    | &Family::IPV6_MC
-                    | &Family::L2VPN_EVPN
-            )
-        {
-            // Pad IPv4 nexthop to 16 bytes for RFC 8950 extended-nexthop families.
-            // SR Policy and multicast use the nexthop as-is (RFC 4760 requires 4-byte
-            // IPv4 nexthop for AFI=1 multicast; SR Policy follows the same rule).
-            dst.put_u8(16);
-            dst.put_slice(&nh_bytes);
-            dst.put_bytes(0, 16 - nh_bytes.len());
         } else {
             dst.put_u8(nh_bytes.len() as u8);
             dst.put_slice(&nh_bytes);
@@ -4531,11 +4516,10 @@ mod message_tests {
         let msg = Message::Update(Update::Reach {
             family: Family::IPV6,
             entries: net.iter().cloned().map(PathNlri::new).collect(),
-            nexthop: None,
+            nexthop: Some(Nexthop::V6("2001:db8::1".parse().unwrap())),
             attr: Arc::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
-                Attribute::new_with_bin(Attribute::NEXTHOP, (0..31).collect::<Vec<u8>>()).unwrap(),
             ]),
         });
         let codec = {
@@ -4550,7 +4534,12 @@ mod message_tests {
         loop {
             match framer.try_parse(&mut txbuf).expect("failed to decode") {
                 Some(ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. })) => {
-                    recv.append(&mut mp_reach.unwrap().entries)
+                    let mut routes = mp_reach.unwrap();
+                    assert_eq!(
+                        routes.nexthop,
+                        Some(Nexthop::V6("2001:db8::1".parse().unwrap()))
+                    );
+                    recv.append(&mut routes.entries)
                 }
                 Some(_) => {}
                 None => break,
@@ -5286,11 +5275,11 @@ mod update_tests {
     #[test]
     fn update_ipv6_announce() {
         let prefix = ipv6_prefix("2001:db8::", 32);
-        let nexthop_bytes: Vec<u8> = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec();
+        let nexthop: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let msg = Message::Update(Update::Reach {
             family: Family::IPV6,
             entries: vec![prefix.clone()],
-            nexthop: None,
+            nexthop: Some(Nexthop::V6(nexthop)),
             attr: Arc::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
@@ -5298,7 +5287,6 @@ mod update_tests {
                     vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
                 )
                 .unwrap(),
-                Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes).unwrap(),
             ]),
         });
         match round_trip(&msg, ipv6_codec()) {
@@ -5309,6 +5297,7 @@ mod update_tests {
             }) => {
                 assert!(mp_unreach.is_none());
                 let s = mp_reach.unwrap();
+                assert_eq!(s.nexthop, Some(Nexthop::V6(nexthop)));
                 assert_eq!(s.family, Family::IPV6);
                 assert_eq!(s.entries, vec![prefix]);
             }
@@ -5432,6 +5421,48 @@ mod update_tests {
             Capability::ExtendedNexthop(vec![(Family::IPV4, Family::AFI_IP6)]),
         ];
         PeerCodec::negotiate(&local, &local)
+    }
+
+    #[test]
+    fn update_ipv4_extended_nexthop_preserves_ipv4_nexthop() {
+        let prefix = ipv4_prefix("10.0.0.0", 8);
+        let nexthop = Some(Nexthop::V4("192.0.2.1".parse().unwrap()));
+        let codec = ipv4_extended_nexthop_codec();
+        let mut wire = BytesMut::new();
+        codec.mp_reach_encode(
+            0,
+            &mut wire,
+            &Family::IPV4,
+            std::slice::from_ref(&prefix),
+            &nexthop,
+        );
+        // MP_REACH must carry a four-byte IPv4 nexthop even when both peers
+        // advertise Extended Nexthop. Padding it to 16 bytes yields c000:201::.
+        assert_eq!(
+            &wire[..],
+            &[0x90, 14, 0, 11, 0, 1, 1, 4, 192, 0, 2, 1, 0, 8, 10]
+        );
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![prefix.clone()],
+            nexthop,
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::empty_as_path(),
+            ]),
+        });
+        match round_trip(&msg, codec) {
+            ParsedMessage::Update(ParsedUpdate::Routes {
+                reach, mp_reach, ..
+            }) => {
+                assert!(reach.is_none());
+                let routes = mp_reach.expect("mp_reach must be present");
+                assert_eq!(routes.family, Family::IPV4);
+                assert_eq!(routes.entries, vec![prefix]);
+                assert_eq!(routes.nexthop, nexthop);
+            }
+            _ => panic!("expected Update"),
+        }
     }
 
     #[test]
@@ -5653,7 +5684,7 @@ mod update_tests {
         let msg = Message::Update(Update::Reach {
             family: Family::IPV4_MUP,
             entries: vec![nlri.clone()],
-            nexthop: None,
+            nexthop: Some(Nexthop::V4(nexthop)),
             attr: Arc::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
@@ -5661,7 +5692,6 @@ mod update_tests {
                     vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
                 )
                 .unwrap(),
-                Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
             ]),
         });
         match round_trip(&msg, ipv4_mup_codec()) {
@@ -5672,6 +5702,7 @@ mod update_tests {
             }) => {
                 assert!(mp_unreach.is_none());
                 let s = mp_reach.unwrap();
+                assert_eq!(s.nexthop, Some(Nexthop::V4(nexthop)));
                 assert_eq!(s.family, Family::IPV4_MUP);
                 assert_eq!(s.entries, vec![nlri]);
             }
@@ -5687,11 +5718,11 @@ mod update_tests {
                 address: IpAddr::V6("2001:db8::1".parse().unwrap()),
             },
         )));
-        let nexthop_bytes: Vec<u8> = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec();
+        let nexthop: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let msg = Message::Update(Update::Reach {
             family: Family::IPV6_MUP,
             entries: vec![nlri.clone()],
-            nexthop: None,
+            nexthop: Some(Nexthop::V6(nexthop)),
             attr: Arc::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
@@ -5699,7 +5730,6 @@ mod update_tests {
                     vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
                 )
                 .unwrap(),
-                Attribute::new_with_bin(Attribute::NEXTHOP, nexthop_bytes).unwrap(),
             ]),
         });
         match round_trip(&msg, ipv6_mup_codec()) {
@@ -5710,6 +5740,7 @@ mod update_tests {
             }) => {
                 assert!(mp_unreach.is_none());
                 let s = mp_reach.unwrap();
+                assert_eq!(s.nexthop, Some(Nexthop::V6(nexthop)));
                 assert_eq!(s.family, Family::IPV6_MUP);
                 assert_eq!(s.entries, vec![nlri]);
             }
@@ -5765,7 +5796,7 @@ mod update_tests {
         let msg = Message::Update(Update::Reach {
             family: Family::IPV4_MUP,
             entries: vec![nlri.clone()],
-            nexthop: None,
+            nexthop: Some(Nexthop::V4(nexthop)),
             attr: Arc::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
@@ -5773,7 +5804,6 @@ mod update_tests {
                     vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
                 )
                 .unwrap(),
-                Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
                 Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, ec_bytes.clone()).unwrap(),
             ]),
         });
@@ -5782,6 +5812,7 @@ mod update_tests {
                 mp_reach, attrs, ..
             }) => {
                 let s = mp_reach.unwrap();
+                assert_eq!(s.nexthop, Some(Nexthop::V4(nexthop)));
                 assert_eq!(s.entries, vec![nlri]);
                 let ec = attrs
                     .iter()
