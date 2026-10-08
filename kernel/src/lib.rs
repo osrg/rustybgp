@@ -373,7 +373,19 @@ impl Handle {
                 b.build()
             }
         };
-        self.inner.route().del(msg).execute().await?;
+        if let Err(e) = self.inner.route().del(msg).execute().await {
+            // A withdraw for a prefix that is no longer (or was never) in the
+            // kernel is routine: the kernel may have removed its connected
+            // route first, or the route was never installed because the best
+            // path was kernel-sourced. Treat ESRCH ("No such process") as
+            // success so the caller's error log stays meaningful.
+            if let rtnetlink::Error::NetlinkError(em) = &e
+                && em.raw_code() == -libc::ESRCH
+            {
+                return Ok(());
+            }
+            return Err(e.into());
+        }
         Ok(())
     }
 
