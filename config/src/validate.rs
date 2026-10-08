@@ -24,6 +24,34 @@ pub enum ConfigError {
     InvalidConfiguration(String),
 }
 
+/// Parse a transport source address, including an optional IPv6 zone (`%eth0`).
+/// Callers treat an empty setting as automatic source selection.
+pub fn parse_local_address(value: &str) -> Result<(std::net::IpAddr, Option<&str>), ConfigError> {
+    let (ip, zone) = value
+        .split_once('%')
+        .map_or((value, None), |(ip, zone)| (ip, Some(zone)));
+    let ip: std::net::IpAddr = ip.parse().map_err(|_| {
+        ConfigError::InvalidConfiguration(format!("invalid transport local-address: {value}"))
+    })?;
+    if zone.is_some_and(|z| z.is_empty() || z.contains('%') || !ip.is_ipv6()) {
+        return Err(ConfigError::InvalidConfiguration(format!(
+            "invalid transport local-address zone: {value}"
+        )));
+    }
+    Ok((ip.to_canonical(), zone))
+}
+
+fn validate_transport(transport: Option<&Transport>) -> Result<(), ConfigError> {
+    if let Some(value) = transport
+        .and_then(|t| t.config.as_ref())
+        .and_then(|c| c.local_address.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        parse_local_address(value)?;
+    }
+    Ok(())
+}
+
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct BgpConfig {
@@ -204,6 +232,7 @@ fn reject_apply_policy(ap: Option<&ApplyPolicy>, context: &str) -> Result<(), Co
 
 impl Neighbor {
     fn validate(&self) -> Result<(), ConfigError> {
+        validate_transport(self.transport.as_ref())?;
         let config = self.config.as_ref().ok_or_else(|| {
             ConfigError::InvalidConfiguration("empty peer configuration".to_string())
         })?;
@@ -295,6 +324,7 @@ impl Neighbor {
 
 impl PeerGroup {
     fn validate(&self) -> Result<(), ConfigError> {
+        validate_transport(self.transport.as_ref())?;
         let name = self
             .config
             .as_ref()

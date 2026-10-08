@@ -222,12 +222,29 @@ impl From<&PeerView> for api::Peer {
             timers: Some(tm),
             transport: Some(api::Transport {
                 local_address: p
-                    .state
-                    .session_addrs
-                    .load()
-                    .as_ref()
-                    .map(|a| a.local.ip().to_string())
-                    .unwrap_or_default(),
+                    .config
+                    .local_address
+                    .clone()
+                    .filter(|value| {
+                        config::parse_local_address(value).is_ok_and(|(ip, _)| !ip.is_unspecified())
+                    })
+                    .or_else(|| {
+                        p.state
+                            .session_addrs
+                            .load()
+                            .as_ref()
+                            .map(|a| a.local.ip().to_string())
+                    })
+                    .unwrap_or_else(|| {
+                        p.config.local_address.clone().unwrap_or_else(|| {
+                            if p.config.remote_addr.is_ipv4() {
+                                "0.0.0.0"
+                            } else {
+                                "::"
+                            }
+                            .to_string()
+                        })
+                    }),
                 ..Default::default()
             }),
             route_reflector: Some(api::RouteReflector {
@@ -344,8 +361,18 @@ impl TryFrom<&api::Peer> for PeerParams {
         };
         let ttl_security = parse_ttl_security(p.ttl_security.as_ref())?;
         let multihop_ttl = parse_multihop_ttl(p.ebgp_multihop.as_ref())?;
+        peer::validate_local_address(
+            p.transport.as_ref().map(|t| t.local_address.as_str()),
+            remote_addr,
+        )
+        .map_err(Error::InvalidArgument)?;
 
         Ok(PeerParams {
+            local_address: p
+                .transport
+                .as_ref()
+                .map(|t| t.local_address.clone())
+                .filter(|s| !s.is_empty()),
             remote_addr,
             remote_port: p.transport.as_ref().map_or(Ok(Global::BGP_PORT), |x| {
                 if x.remote_port == 0 {
@@ -520,9 +547,10 @@ fn peer_group_to_api(name: &str, pg: &PeerGroup) -> api::PeerGroup {
         } else {
             None
         },
-        transport: if pg.passive {
+        transport: if pg.passive || pg.local_address.is_some() {
             Some(api::Transport {
-                passive_mode: true,
+                passive_mode: pg.passive,
+                local_address: pg.local_address.clone().unwrap_or_default(),
                 ..Default::default()
             })
         } else {
@@ -600,6 +628,11 @@ impl From<api::PeerGroup> for PeerGroup {
     fn from(p: api::PeerGroup) -> PeerGroup {
         let conf = p.conf.as_ref();
         PeerGroup {
+            local_address: p
+                .transport
+                .as_ref()
+                .map(|t| t.local_address.clone())
+                .filter(|s| !s.is_empty()),
             as_number: conf.map_or(0, |c| c.peer_asn),
             dynamic_peers: Vec::new(),
             route_server_client: p.route_server.is_some_and(|c| c.route_server_client),
@@ -1170,6 +1203,17 @@ impl GoBgpService for GrpcService {
 
         let mut global = self.global.write().await;
 
+        if let Some(pg) = api_peer
+            .conf
+            .as_ref()
+            .and_then(|c| global.peer_group.get(&c.peer_group))
+            && new_params.local_address.is_none()
+        {
+            new_params.local_address = pg.local_address.clone();
+        }
+        peer::validate_local_address(new_params.local_address.as_deref(), new_params.remote_addr)
+            .map_err(Error::InvalidArgument)?;
+
         let peer = global
             .peers
             .get(&new_params.remote_addr)
@@ -1232,7 +1276,8 @@ impl GoBgpService for GrpcService {
         {
             let peer = global.peers.get_mut(&peer_addr).unwrap();
 
-            let needs_teardown = effective_remote_port != peer.config.remote_port
+            let needs_teardown = new_params.local_address != peer.config.local_address
+                || effective_remote_port != peer.config.remote_port
                 || new_params.expected_remote_asn != peer.config.expected_remote_asn
                 || new_local_asn != peer.config.local_asn
                 || new_params.passive != peer.config.passive
@@ -1244,6 +1289,7 @@ impl GoBgpService for GrpcService {
             old_password = peer.config.password.clone();
 
             peer.config = PeerConfig {
+                local_address: new_params.local_address.clone(),
                 remote_addr: peer_addr,
                 remote_port: effective_remote_port,
                 expected_remote_asn: new_params.expected_remote_asn,
@@ -1284,6 +1330,10 @@ impl GoBgpService for GrpcService {
                     ),
                 )));
                 let mut ctx = peer.context.lock().unwrap();
+                let has_session = {
+                    let arb = ctx.conn_arbiter.lock().unwrap();
+                    arb.active_close_tx.is_some() || arb.passive_close_tx.is_some()
+                };
                 ctx.force_down(
                     CloseReason::SendMessage(bgp::Message::Notification(
                         rustybgp_packet::Notification::CeasePeerDeconfigured,
@@ -1291,6 +1341,12 @@ impl GoBgpService for GrpcService {
                     true,
                 );
                 ctx.conn_arbiter = new_conn_arbiter;
+                drop(ctx);
+                // Without a live session there is no disconnect event to restart
+                // the canceled dial loop. Apply the new source immediately.
+                if !has_session {
+                    enable_active_connect(peer, self.active_conn_tx.clone());
+                }
             }
         }
 
@@ -1754,6 +1810,15 @@ impl GoBgpService for GrpcService {
         check_gr_restart_time(pg.graceful_restart.as_ref()).map_err(tonic::Status::from)?;
         parse_llgr_api(&pg.afi_safis).map_err(tonic::Status::from)?;
         parse_multihop_ttl(pg.ebgp_multihop.as_ref()).map_err(tonic::Status::from)?;
+        if let Some(value) = pg
+            .transport
+            .as_ref()
+            .map(|t| t.local_address.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            config::parse_local_address(value)
+                .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+        }
         if let Some(pw) = pg
             .conf
             .as_ref()
@@ -1821,6 +1886,15 @@ impl GoBgpService for GrpcService {
         check_gr_restart_time(pg.graceful_restart.as_ref()).map_err(tonic::Status::from)?;
         parse_llgr_api(&pg.afi_safis).map_err(tonic::Status::from)?;
         parse_multihop_ttl(pg.ebgp_multihop.as_ref()).map_err(tonic::Status::from)?;
+        if let Some(value) = pg
+            .transport
+            .as_ref()
+            .map(|t| t.local_address.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            config::parse_local_address(value)
+                .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+        }
         if let Some(pw) = pg
             .conf
             .as_ref()
@@ -1842,6 +1916,7 @@ impl GoBgpService for GrpcService {
                 entry.holdtime = updated.holdtime;
                 entry.local_asn = updated.local_asn;
                 entry.passive = updated.passive;
+                entry.local_address = updated.local_address;
                 entry.route_reflector = updated.route_reflector;
                 entry.multihop_ttl = updated.multihop_ttl;
                 entry.auth_password = updated.auth_password;
