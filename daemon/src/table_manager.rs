@@ -1084,6 +1084,57 @@ fn nht_register(
     }
 }
 
+/// Whether a path may be installed into the kernel FIB by us.
+///
+/// Kernel-sourced paths (connected routes picked up by address monitoring)
+/// and local-sourced paths (gRPC/CLI injection) are not installed:
+///
+/// - Kernel paths carry the local interface address as nexthop.
+///   Re-installing such a route turns the kernel's
+///   `dev ethX proto kernel scope link` connected entry into
+///   `via <own address> ... proto bgp`, which
+///   1. replaces the connected route that makes on-link nexthops resolvable,
+///      so subsequent BGP-learned route installs fail with
+///      "Network unreachable", and
+///   2. makes NHT treat every nexthop inside that subnet as unreachable:
+///      `Handle::lookup_route` rejects fib-match entries with
+///      `protocol == Bgp`, and the poisoned entry is exactly that.  Peers
+///      then withdraw the routes they announced through us.
+/// - Local paths: previously a gRPC/CLI-injected best path was written to
+///   the FIB (and to the VRF tables for VPN families).  With this change it
+///   is no longer installed.  Like FRR, which does not announce network
+///   routes (BGP_ROUTE_STATIC) to zebra in
+///   `bgp_zebra_announce_eligible()`, local injection is RIB-only here.
+fn fib_eligible(path: &table::Path) -> bool {
+    !path.source.is_kernel() && !path.source.is_local()
+}
+
+/// Compute the ECMP nexthop set for the kernel FIB sync of a best-path
+/// change.  An empty result means withdraw.
+///
+/// When the new best path is kernel- or local-sourced (see
+/// [`fib_eligible`]), the result is empty so that `Handle::apply` sends a
+/// withdraw instead of skipping the sync: a BGP route previously installed
+/// for this prefix must be removed when such a path takes over.  That
+/// withdraw deletes only `proto bgp` routes, so the kernel's own connected
+/// entry is untouched, and a withdraw for a route that was never installed
+/// is silently ignored (ESRCH).  Kernel/local paths are also filtered out
+/// of the ECMP set: their role is Ibgp, so they can tie with an iBGP path
+/// in decision steps 1-6 and would otherwise add our own interface address
+/// to the multipath route.
+fn fib_nexthops(update: &table::NlriChange) -> Vec<bgp::Nexthop> {
+    if update.new_best().is_some_and(fib_eligible) {
+        update
+            .ecmp_paths()
+            .into_iter()
+            .filter(|p| fib_eligible(p))
+            .filter_map(|p| p.nexthop)
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
 pub(crate) struct TableShard {
     pub(crate) rtable: table::Table,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
@@ -1183,19 +1234,13 @@ impl TableShard {
         subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
     ) {
         // Kernel route update for rank-1 best (raw, without export policy).
-        // kernel_handle is rarely set, so check it first.
+        // kernel_handle is rarely set, so check it first.  An empty nexthops
+        // list (kernel/local-sourced best, or no best at all) withdraws the
+        // proto bgp route instead of installing anything.
         if let Some(handle) = kernel_handle
             && update.best_changed
         {
-            let nexthops: Vec<_> = if update.new_best().is_none() {
-                vec![]
-            } else {
-                update
-                    .ecmp_paths()
-                    .into_iter()
-                    .filter_map(|p| p.nexthop)
-                    .collect()
-            };
+            let nexthops = fib_nexthops(&update);
             let metric = update
                 .new_best()
                 .and_then(|p| {
@@ -1549,6 +1594,113 @@ mod tests {
             false,
         );
         assert_eq!(paths.len(), 0);
+    }
+
+    // --- kernel FIB sync decision (via-self install loop guard) ---
+
+    /// Build an `NlriChange` whose `current_paths` carry the given
+    /// (source, nexthop) pairs.
+    fn change_with_paths(
+        prefix: &str,
+        paths: Vec<(Arc<table::Source>, Option<std::net::Ipv4Addr>)>,
+    ) -> table::NlriChange {
+        let nlri: packet::Nlri = prefix.parse().unwrap();
+        let paths: Vec<table::Path> = paths
+            .into_iter()
+            .enumerate()
+            .map(|(i, (source, nexthop))| table::Path {
+                local_path_id: i as u32,
+                source,
+                nexthop: nexthop.map(packet::bgp::Nexthop::V4),
+                attr: Arc::new(vec![]),
+            })
+            .collect();
+        table::NlriChange {
+            family: Family::IPV4,
+            net: nlri,
+            dest_id: 0,
+            best_changed: true,
+            any_changed: true,
+            replaced_path_id: None,
+            current_paths: Arc::new(paths),
+        }
+    }
+
+    #[test]
+    fn fib_nexthops_installs_for_bgp_best() {
+        let src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
+        let update = change_with_paths(
+            "192.168.2.0/24",
+            vec![(src, Some("192.0.2.1".parse().unwrap()))],
+        );
+        let nhs = fib_nexthops(&update);
+        assert_eq!(nhs.len(), 1);
+        assert_eq!(
+            nhs[0].addr(),
+            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn fib_nexthops_withdraws_when_best_gone() {
+        // Prefix emptied: the possibly stale BGP-installed route must be
+        // withdrawn from the kernel.
+        let update = change_with_paths("192.168.2.0/24", vec![]);
+        assert!(fib_nexthops(&update).is_empty());
+    }
+
+    #[test]
+    fn fib_nexthops_withdraws_for_kernel_sourced_best() {
+        // Connected-injection case: a kernel-sourced best path must not be
+        // re-installed (would poison the kernel table via-self), so the
+        // result withdraws any stale proto bgp route instead.  The peer
+        // 10.0.0.2 sits inside the connected 10.0.0.0/24.
+        let update = change_with_paths(
+            "10.0.0.0/24",
+            vec![(table::Source::kernel(), Some("10.0.0.1".parse().unwrap()))],
+        );
+        assert!(fib_nexthops(&update).is_empty());
+    }
+
+    #[test]
+    fn fib_nexthops_withdraws_for_local_sourced_best() {
+        // Local (gRPC/CLI) best path: RIB-only, must not be installed; the
+        // result withdraws any stale proto bgp route.
+        let update = change_with_paths(
+            "192.168.2.0/24",
+            vec![(table::Source::local(), Some("192.0.2.9".parse().unwrap()))],
+        );
+        assert!(fib_nexthops(&update).is_empty());
+    }
+
+    #[test]
+    fn fib_nexthops_filters_kernel_and_local_from_ecmp() {
+        // Kernel and local paths have role Ibgp, so they tie with an iBGP
+        // best path in decision steps 1-6 and ecmp_paths() includes them.
+        // Their nexthops (e.g. our own interface address) must not end up
+        // in the multipath route.
+        let ibgp = Arc::new(table::Source::new(
+            "10.0.0.2".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            65001,
+            65001,
+            "10.0.0.2".parse().unwrap(),
+            table::PeerRole::Ibgp,
+        ));
+        let update = change_with_paths(
+            "192.168.2.0/24",
+            vec![
+                (ibgp, Some("192.0.2.1".parse().unwrap())),
+                (table::Source::kernel(), Some("10.0.0.1".parse().unwrap())),
+                (table::Source::local(), Some("192.0.2.9".parse().unwrap())),
+            ],
+        );
+        let nhs = fib_nexthops(&update);
+        assert_eq!(nhs.len(), 1);
+        assert_eq!(
+            nhs[0].addr(),
+            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     // --- NHT (Nexthop Tracking) tests ---
