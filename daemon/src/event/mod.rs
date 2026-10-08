@@ -9447,6 +9447,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gobgp_compat_invalid_binary_attribute_flags_do_not_install_routes() {
+        for (family, index, flags) in [
+            (Family::IPV4, 0, 0xe0), // ORIGIN: Optional must be clear
+            (Family::IPV4, 0, 0x00), // ORIGIN: Transitive must be set
+            (Family::IPV6, 1, 0xc0), // MP_REACH: Transitive must be clear
+            (Family::IPV6, 1, 0x00), // MP_REACH: Optional must be set
+            (Family::IPV4, 2, 0x80), // COMMUNITY: Transitive must be set
+            (Family::IPV4, 2, 0x40), // COMMUNITY: Optional must be set
+        ] {
+            let svc = make_grpc_service();
+            let mut path = gobgp_binary_path(family);
+            path.pattrs_binary[index][0] = flags;
+            assert_eq!(
+                add_gobgp_path(&svc, path).await.unwrap_err().code(),
+                tonic::Code::InvalidArgument,
+                "family {family:?}, attribute {index}, flags {flags:#x}"
+            );
+            assert!(svc.tables.collect_loc_rib_paths(family).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn gobgp_compat_binary_partial_community_is_accepted() {
+        let svc = make_grpc_service();
+        let mut path = gobgp_binary_path(Family::IPV4);
+        path.pattrs_binary[2][0] = 0xe0; // Optional, Transitive, Partial
+        add_gobgp_path(&svc, path).await.unwrap();
+        let paths = svc.tables.collect_loc_rib_paths(Family::IPV4);
+        let community = paths[0]
+            .new_best()
+            .unwrap()
+            .attr
+            .iter()
+            .find(|a| a.code() == bgp::Attribute::COMMUNITY)
+            .unwrap();
+        assert_eq!(community.flags(), 0xe0);
+    }
+
+    #[tokio::test]
     async fn gobgp_compat_malformed_binary_requests_do_not_install_routes() {
         let valid = gobgp_binary_path(Family::IPV4);
         let mut bad_paths = vec![];

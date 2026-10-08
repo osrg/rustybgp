@@ -1238,6 +1238,13 @@ impl Attribute {
         let mut reader = Cursor::new(bytes);
         let flags = reader.read_u8().map_err(|_| invalid())?;
         let code = reader.read_u8().map_err(|_| invalid())?;
+        // Match UPDATE parsing: known attributes must have their canonical
+        // Optional and Transitive bits. Extended Length and Partial may vary.
+        if let Some(expected) = Self::canonical_flags(code)
+            && (flags ^ expected) & (Self::FLAG_OPTIONAL | Self::FLAG_TRANSITIVE) != 0
+        {
+            return Err(invalid());
+        }
         let len = if flags & Self::FLAG_EXTENDED != 0 {
             reader.read_u16::<NetworkEndian>().map_err(|_| invalid())?
         } else {
