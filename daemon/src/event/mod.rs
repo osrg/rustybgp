@@ -9455,6 +9455,8 @@ mod tests {
             (Family::IPV6, 1, 0x00), // MP_REACH: Optional must be set
             (Family::IPV4, 2, 0x80), // COMMUNITY: Transitive must be set
             (Family::IPV4, 2, 0x40), // COMMUNITY: Optional must be set
+            (Family::IPV4, 0, 0x60), // ORIGIN: Partial must be clear
+            (Family::IPV6, 1, 0xa0), // MP_REACH: Partial must be clear
         ] {
             let svc = make_grpc_service();
             let mut path = gobgp_binary_path(family);
@@ -9465,6 +9467,47 @@ mod tests {
                 "family {family:?}, attribute {index}, flags {flags:#x}"
             );
             assert!(svc.tables.collect_loc_rib_paths(family).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn gobgp_compat_binary_unknown_attribute_flags() {
+        for (flags, accepted) in [
+            (0x40, false), // well-known
+            (0x50, false), // well-known, Extended Length
+            (0x80, true),  // optional non-transitive
+            (0xa0, false), // optional non-transitive, Partial
+            (0xc0, true),  // optional transitive
+            (0xe0, true),  // optional transitive, Partial
+        ] {
+            let svc = make_grpc_service();
+            let mut path = gobgp_binary_path(Family::IPV4);
+            let attr = if flags & 0x10 != 0 {
+                vec![flags, 99, 0, 1, 0]
+            } else {
+                vec![flags, 99, 1, 0]
+            };
+            path.pattrs_binary.push(attr);
+            let result = add_gobgp_path(&svc, path).await;
+            let paths = svc.tables.collect_loc_rib_paths(Family::IPV4);
+            if accepted {
+                result.unwrap();
+                let unknown = paths[0]
+                    .new_best()
+                    .unwrap()
+                    .attr
+                    .iter()
+                    .find(|a| a.code() == 99)
+                    .unwrap();
+                assert_eq!(unknown.flags(), flags, "flags {flags:#x}");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code(),
+                    tonic::Code::InvalidArgument,
+                    "flags {flags:#x}"
+                );
+                assert!(paths.is_empty(), "flags {flags:#x}");
+            }
         }
     }
 

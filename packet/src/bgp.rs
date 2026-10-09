@@ -1238,10 +1238,23 @@ impl Attribute {
         let mut reader = Cursor::new(bytes);
         let flags = reader.read_u8().map_err(|_| invalid())?;
         let code = reader.read_u8().map_err(|_| invalid())?;
-        // Match UPDATE parsing: known attributes must have their canonical
-        // Optional and Transitive bits. Extended Length and Partial may vary.
-        if let Some(expected) = Self::canonical_flags(code)
-            && (flags ^ expected) & (Self::FLAG_OPTIONAL | Self::FLAG_TRANSITIVE) != 0
+        match Self::canonical_flags(code) {
+            // Match UPDATE parsing: known attributes must have their canonical
+            // Optional and Transitive bits.
+            Some(expected)
+                if (flags ^ expected) & (Self::FLAG_OPTIONAL | Self::FLAG_TRANSITIVE) != 0 =>
+            {
+                return Err(invalid());
+            }
+            // An unknown well-known attribute makes the peer send a
+            // NOTIFICATION (RFC 4271 Section 6.3). UPDATE parsing rejects it too.
+            None if flags & Self::FLAG_OPTIONAL == 0 => return Err(invalid()),
+            _ => {}
+        }
+        // RFC 4271 Section 4.3: the Partial bit must be 0 for well-known and
+        // optional non-transitive attributes.
+        if flags & Self::FLAG_PARTIAL != 0
+            && (flags & Self::FLAG_OPTIONAL == 0 || flags & Self::FLAG_TRANSITIVE == 0)
         {
             return Err(invalid());
         }
