@@ -1109,6 +1109,18 @@ pub struct NeighborSet {
     pub sets: Vec<packet::IpNet>,
 }
 
+impl NeighborSet {
+    fn parse_member(value: &str) -> Result<packet::IpNet, TableError> {
+        if let Ok(addr) = value.parse::<IpAddr>() {
+            let mask = if addr.is_ipv4() { 32 } else { 128 };
+            return Ok(packet::IpNet::new(addr, mask));
+        }
+        value.parse().map_err(|_| {
+            TableError::InvalidArgument(format!("invalid neighbor format {:?}", value))
+        })
+    }
+}
+
 pub struct AsPathSet {
     pub single_sets: Vec<SingleAsPathMatch>,
     pub sets: Vec<Regex>,
@@ -1602,10 +1614,7 @@ impl PolicyTable {
             DefinedSetConfig::Neighbor { name, neighbors } => {
                 let mut new_v = Vec::with_capacity(neighbors.len());
                 for n in &neighbors {
-                    let addr = packet::IpNet::from_str(n).map_err(|_| {
-                        TableError::InvalidArgument(format!("invalid neighbor format {:?}", n))
-                    })?;
-                    new_v.push(addr);
+                    new_v.push(NeighborSet::parse_member(n)?);
                 }
                 let sets = match self.neighbor_sets.get(name.as_str()) {
                     None => {
@@ -2233,9 +2242,7 @@ impl PolicyTable {
                     .ok_or(TableError::NotFound)?;
                 let mut sets = existing.sets.clone();
                 for n in &neighbors {
-                    let addr = packet::IpNet::from_str(n).map_err(|_| {
-                        TableError::InvalidArgument(format!("invalid neighbor format {:?}", n))
-                    })?;
+                    let addr = NeighborSet::parse_member(n)?;
                     sets.retain(|s| s != &addr);
                 }
                 self.neighbor_sets
@@ -4558,6 +4565,122 @@ mod tests {
         let src = import_source(1);
         let (filtered, _) = apply_import(&policy, None, &src, &net, &attrs, &mut nh);
         assert!(filtered);
+    }
+
+    fn neighbor_set(members: &[&str]) -> DefinedSetConfig {
+        DefinedSetConfig::Neighbor {
+            name: "neighbors".to_string(),
+            neighbors: members.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn neighbor_set_bare_ips_match_only_the_specified_hosts() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(neighbor_set(&["22.33.44.55", "2001:db8::1"]))
+            .unwrap();
+        ptable
+            .add_defined_set(neighbor_set(&["192.0.2.0/24", "2001:db8:1::/48"]))
+            .unwrap();
+        let set = ptable.neighbor_sets.get("neighbors").unwrap();
+        assert!(set.sets[0] == "22.33.44.55/32".parse().unwrap());
+        assert!(set.sets[1] == "2001:db8::1/128".parse().unwrap());
+        let condition =
+            Condition::Neighbor("neighbors".to_string(), MatchOption::Any, Arc::clone(set));
+        for (addr, expected) in [
+            ("22.33.44.55", true),
+            ("22.33.44.56", false),
+            ("2001:db8::1", true),
+            ("2001:db8::2", false),
+            ("192.0.2.123", true),
+            ("192.0.3.123", false),
+            ("2001:db8:1::123", true),
+            ("2001:db8:2::123", false),
+        ] {
+            assert_eq!(
+                condition.evalute(
+                    &source(),
+                    &nlri(),
+                    &Arc::new(vec![]),
+                    None,
+                    addr.parse().unwrap(),
+                    None,
+                ),
+                expected,
+                "neighbor {addr}",
+            );
+        }
+    }
+
+    #[test]
+    fn neighbor_set_delete_accepts_bare_ips_and_host_prefixes_interchangeably() {
+        for (added, deleted) in [
+            ("22.33.44.55", "22.33.44.55/32"),
+            ("22.33.44.55/32", "22.33.44.55"),
+            ("2001:db8::1", "2001:db8::1/128"),
+            ("2001:db8::1/128", "2001:db8::1"),
+        ] {
+            let mut ptable = PolicyTable::new();
+            ptable
+                .add_defined_set(neighbor_set(&[added, "192.0.2.0/24"]))
+                .unwrap();
+            ptable
+                .delete_defined_set(neighbor_set(&[deleted]), false)
+                .unwrap();
+            assert!(
+                ptable.neighbor_sets.get("neighbors").unwrap().sets
+                    == vec!["192.0.2.0/24".parse().unwrap()],
+                "delete {deleted} after adding {added}",
+            );
+        }
+    }
+
+    #[test]
+    fn neighbor_set_replace_accepts_bare_ips() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(neighbor_set(&["192.0.2.0/24"]))
+            .unwrap();
+        ptable
+            .replace_defined_set(neighbor_set(&["22.33.44.55", "2001:db8::1"]))
+            .unwrap();
+        assert!(
+            ptable.neighbor_sets.get("neighbors").unwrap().sets
+                == vec![
+                    "22.33.44.55/32".parse().unwrap(),
+                    "2001:db8::1/128".parse().unwrap(),
+                ],
+        );
+    }
+
+    #[test]
+    fn neighbor_set_rejects_invalid_addresses_and_prefixes() {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(neighbor_set(&["192.0.2.0/24"]))
+            .unwrap();
+        for invalid in [
+            "not-an-address",
+            "256.0.0.1",
+            "2001:db8::gg",
+            "192.0.2.1/33",
+            "2001:db8::1/129",
+            "192.0.2.1/",
+        ] {
+            assert!(matches!(
+                ptable.add_defined_set(neighbor_set(&[invalid])),
+                Err(TableError::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                ptable.delete_defined_set(neighbor_set(&[invalid]), false),
+                Err(TableError::InvalidArgument(_))
+            ));
+            assert!(
+                ptable.neighbor_sets.get("neighbors").unwrap().sets
+                    == vec!["192.0.2.0/24".parse().unwrap()],
+            );
+        }
     }
 
     fn two_prefix_set() -> DefinedSetConfig {
