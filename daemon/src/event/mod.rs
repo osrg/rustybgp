@@ -9484,6 +9484,137 @@ mod tests {
         }
     }
 
+    fn vpn_mp_reach_path(family: Family, next_hop: &str) -> api::Path {
+        let nlri = api::Nlri {
+            nlri: Some(api::nlri::Nlri::LabeledVpnIpPrefix(
+                api::LabeledVpnipAddressPrefix {
+                    labels: vec![100],
+                    rd: make_vrf_req("blue", 65000, 1, 65000, 1).vrf.unwrap().rd,
+                    prefix_len: if family == Family::IPV4_VPN { 24 } else { 48 },
+                    prefix: if family == Family::IPV4_VPN {
+                        "198.51.100.0"
+                    } else {
+                        "2001:db8::"
+                    }
+                    .into(),
+                },
+            )),
+        };
+        api::Path {
+            family: Some(convert::family_to_api(family)),
+            nlri: Some(nlri.clone()),
+            identifier: 7,
+            pattrs: vec![api::Attribute {
+                attr: Some(api::attribute::Attr::MpReach(api::MpReachNlriAttribute {
+                    family: Some(convert::family_to_api(family)),
+                    next_hops: vec![next_hop.into()],
+                    nlris: vec![nlri],
+                })),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn gobgp_compat_vpn_mp_reach_preserves_nexthop() {
+        for family in [Family::IPV4_VPN, Family::IPV6_VPN] {
+            for (next_hop, expected) in [
+                ("192.0.2.1", bgp::Nexthop::V4("192.0.2.1".parse().unwrap())),
+                (
+                    "2001:db8::1",
+                    bgp::Nexthop::V6("2001:db8::1".parse().unwrap()),
+                ),
+                (
+                    "::ffff:192.0.2.1",
+                    bgp::Nexthop::V4("192.0.2.1".parse().unwrap()),
+                ),
+            ] {
+                for binary in [true, false] {
+                    let svc = make_grpc_service();
+                    let mut path = vpn_mp_reach_path(family, next_hop);
+                    let net = convert::net_from_api(path.nlri.clone().unwrap(), family).unwrap();
+                    let address: IpAddr = next_hop.parse().unwrap();
+                    let nh = match address {
+                        IpAddr::V4(v4) if family == Family::IPV6_VPN => {
+                            v4.to_ipv6_mapped().octets().to_vec()
+                        }
+                        IpAddr::V4(v4) => v4.octets().to_vec(),
+                        IpAddr::V6(v6) => v6.octets().to_vec(),
+                    };
+                    if binary {
+                        // GoBGP's wire format: one zero RD before the IP next hop.
+                        let mut body = family.afi().to_be_bytes().to_vec();
+                        body.extend([family.safi(), (8 + nh.len()) as u8]);
+                        body.extend([0; 8]);
+                        body.extend(nh);
+                        body.push(0);
+                        body.extend(net.encode_to_bytes());
+                        let mut attr = vec![0x80, 14, body.len() as u8];
+                        attr.extend(body);
+                        path.nlri = None;
+                        path.nlri_binary = net.encode_to_bytes();
+                        path.pattrs.clear();
+                        path.pattrs_binary = vec![attr];
+                    }
+                    add_gobgp_path(&svc, path).await.unwrap();
+                    let paths = svc.tables.collect_loc_rib_paths(family);
+                    assert_eq!(paths.len(), 1);
+                    assert_eq!(paths[0].net, net);
+                    assert_eq!(paths[0].new_best().unwrap().nexthop, Some(expected));
+
+                    // Both ListPath representations must be usable as AddPath input.
+                    for only_binary in [false, true] {
+                        let mut stream = svc
+                            .list_path(tonic::Request::new(api::ListPathRequest {
+                                table_type: api::TableType::Global as i32,
+                                family: Some(convert::family_to_api(family)),
+                                enable_only_binary: only_binary,
+                                ..Default::default()
+                            }))
+                            .await
+                            .unwrap()
+                            .into_inner();
+                        let listed = stream.next().await.unwrap().unwrap().destination.unwrap();
+                        assert_eq!(listed.paths.len(), 1);
+                        assert_eq!(listed.paths[0].identifier, 7);
+                        let copy = make_grpc_service();
+                        add_gobgp_path(&copy, listed.paths[0].clone())
+                            .await
+                            .unwrap();
+                        let copied = copy.tables.collect_loc_rib_paths(family);
+                        assert_eq!(copied[0].net, net);
+                        assert_eq!(copied[0].new_best().unwrap().nexthop, Some(expected));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gobgp_compat_vpn_mp_reach_rejects_missing_rd_or_address() {
+        for family in [Family::IPV4_VPN, Family::IPV6_VPN] {
+            // Raw IP lengths (4/16/32) must not be accepted without the RD;
+            // zero bytes or an RD alone are not a next-hop address either.
+            for nh_len in [0, 4, 8, 16, 32] {
+                let svc = make_grpc_service();
+                let mut path = vpn_mp_reach_path(family, "2001:db8::1");
+                let mut body = family.afi().to_be_bytes().to_vec();
+                body.extend([family.safi(), nh_len]);
+                body.extend(vec![0; nh_len as usize]);
+                body.push(0);
+                let mut attr = vec![0x80, 14, body.len() as u8];
+                attr.extend(body);
+                path.pattrs_binary = vec![attr];
+                assert_eq!(
+                    add_gobgp_path(&svc, path).await.unwrap_err().code(),
+                    tonic::Code::InvalidArgument,
+                    "family {family:?}, next-hop length {nh_len}",
+                );
+                assert!(svc.tables.collect_loc_rib_paths(family).is_empty());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn gobgp_compat_binary_fields_take_precedence_over_structured_fields() {
         let svc = make_grpc_service();
