@@ -43,6 +43,8 @@ Peer            AS Up/Down State       |#Received  Accepted
 - Peer group
 - Address families: IPv4/IPv6 unicast/multicast, L3VPN (RFC 4364), EVPN Types 1–5 (RFC 7432), BGP-LS (RFC 7752), Flowspec (RFC 8955), SR Policy (RFC 9256), MUP ([draft-ietf-bess-mup-safi](https://datatracker.ietf.org/doc/draft-ietf-bess-mup-safi/))
 
+See [configuration details](docs/configuration.md) for transport settings.
+
 ## Differences from GoBGP
 
 RustyBGP is Linux-only and integrates directly with the Linux kernel for FIB management instead of Zebra/FRR. The kernel integration supports:

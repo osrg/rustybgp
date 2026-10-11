@@ -33,6 +33,61 @@ use super::*;
 /// and is well above any realistic deployment need.
 pub(crate) const ADDPATH_SEND_MAX_LIMIT: usize = u8::MAX as usize;
 
+pub(crate) fn validate_local_address(value: Option<&str>, remote: IpAddr) -> Result<(), String> {
+    if let Some(value) = value.filter(|s| !s.is_empty()) {
+        let (ip, _) = config::parse_local_address(value).map_err(|e| e.to_string())?;
+        if !ip.is_unspecified() && ip.is_ipv4() != remote.to_canonical().is_ipv4() {
+            return Err(format!(
+                "transport local-address {value} and neighbor {remote} have different address families"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve IPv6 zones at connection time so interface changes are picked up on retry.
+pub(super) fn local_socket_address(value: &str) -> std::io::Result<SocketAddr> {
+    let (ip, zone) = config::parse_local_address(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let scope = match zone {
+        Some(zone) => zone
+            .parse::<u32>()
+            .or_else(|_| nix::net::if_::if_nametoindex(zone))
+            .map_err(std::io::Error::other)?,
+        None => 0,
+    };
+    Ok(match ip {
+        IpAddr::V4(ip) => SocketAddr::new(IpAddr::V4(ip), 0),
+        IpAddr::V6(ip) => SocketAddr::V6(SocketAddrV6::new(ip, 0, 0, scope)),
+    })
+}
+
+/// GoBGP checks the local endpoint on passive connections, except for wildcard
+/// addresses and peers using bind-interface (e.g. a Linux VRF).
+pub(super) fn accepts_local_address(
+    value: Option<&str>,
+    local: SocketAddr,
+    bind_interface: Option<&str>,
+) -> bool {
+    if bind_interface.is_some() {
+        return true;
+    }
+    let Some(value) = value else {
+        return true;
+    };
+    match local_socket_address(value) {
+        Ok(expected) if expected.ip().is_unspecified() => true,
+        Ok(expected) => {
+            expected.ip() == local.ip()
+                && match (expected, local) {
+                    (SocketAddr::V6(a), SocketAddr::V6(b)) => a.scope_id() == b.scope_id(),
+                    _ => true,
+                }
+        }
+        Err(_) => false,
+    }
+}
+
 /// Static GR configuration for a single peer, set at peer creation.
 /// `None` in `PeerConfig::graceful_restart` means GR is disabled for this peer.
 /// Cloned into capability negotiation at each session open.
@@ -68,6 +123,9 @@ pub(crate) struct RouteReflectorConfig {
 /// session start so the session task can access it without the global lock.
 #[derive(Clone)]
 pub(crate) struct PeerConfig {
+    /// Configured TCP source / accepted destination, optionally with an IPv6 zone.
+    /// None selects the source automatically; session_addrs holds the actual endpoint.
+    pub(crate) local_address: Option<String>,
     pub(crate) remote_addr: IpAddr,
     pub(crate) remote_port: u16,
     /// Expected AS number from configuration; 0 means "accept any".
@@ -117,6 +175,7 @@ pub(crate) struct PeerConfig {
 /// an exhaustive struct literal so that adding a new field causes a compile
 /// error at every construction site.
 pub(crate) struct PeerParams {
+    pub(crate) local_address: Option<String>,
     pub(crate) remote_addr: IpAddr,
     pub(crate) remote_port: u16,
     pub(crate) expected_remote_asn: u32,
@@ -235,6 +294,9 @@ impl PeerParams {
     /// this peer.  Called after constructing `PeerParams` from a config or API
     /// request when the peer belongs to a named peer group.
     pub(crate) fn apply_peer_group(&mut self, pg: &PeerGroup) {
+        if self.local_address.is_none() {
+            self.local_address = pg.local_address.clone();
+        }
         if self.expected_remote_asn == 0 && pg.as_number != 0 {
             self.expected_remote_asn = pg.as_number;
         }
@@ -313,6 +375,7 @@ impl PeerParams {
 
         Peer {
             config: PeerConfig {
+                local_address: self.local_address,
                 remote_addr: self.remote_addr,
                 remote_port: if self.remote_port != 0 {
                     self.remote_port
@@ -506,6 +569,10 @@ impl TryFrom<&config::Neighbor> for PeerParams {
         };
 
         let transport_config = n.transport.as_ref().and_then(|t| t.config.as_ref());
+        validate_local_address(
+            transport_config.and_then(|t| t.local_address.as_deref()),
+            *remote_addr,
+        )?;
         let timer_config = n.timers.as_ref().and_then(|t| t.config.as_ref());
 
         let (families, send_max) = parse_afi_safis(afi_safis);
@@ -547,6 +614,9 @@ impl TryFrom<&config::Neighbor> for PeerParams {
             .unwrap_or(PeerParams::DEFAULT_CONNECT_RETRY_TIME);
 
         Ok(PeerParams {
+            local_address: transport_config
+                .and_then(|t| t.local_address.clone())
+                .filter(|s| !s.is_empty()),
             remote_addr: *remote_addr,
             remote_port: transport_config
                 .and_then(|t| t.remote_port)
@@ -654,6 +724,7 @@ pub(crate) struct DynamicPeer {
 }
 
 pub(crate) struct PeerGroup {
+    pub(crate) local_address: Option<String>,
     pub(crate) as_number: u32,
     pub(crate) dynamic_peers: Vec<DynamicPeer>,
     pub(crate) route_server_client: bool,
@@ -677,6 +748,12 @@ impl From<&config::PeerGroup> for PeerGroup {
         let afi_safis = pg.afi_safis.as_deref().unwrap_or_default();
         let (families, send_max) = parse_afi_safis(afi_safis);
         PeerGroup {
+            local_address: pg
+                .transport
+                .as_ref()
+                .and_then(|t| t.config.as_ref())
+                .and_then(|c| c.local_address.clone())
+                .filter(|s| !s.is_empty()),
             as_number: pg.config.as_ref().and_then(|c| c.peer_as).unwrap_or(0),
             dynamic_peers: Vec::new(),
             route_server_client: pg
