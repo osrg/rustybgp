@@ -1284,6 +1284,10 @@ impl GoBgpService for GrpcService {
                     ),
                 )));
                 let mut ctx = peer.context.lock().unwrap();
+                let has_session = {
+                    let arb = ctx.conn_arbiter.lock().unwrap();
+                    arb.active_close_tx.is_some() || arb.passive_close_tx.is_some()
+                };
                 ctx.force_down(
                     CloseReason::SendMessage(bgp::Message::Notification(
                         rustybgp_packet::Notification::CeasePeerDeconfigured,
@@ -1291,6 +1295,12 @@ impl GoBgpService for GrpcService {
                     true,
                 );
                 ctx.conn_arbiter = new_conn_arbiter;
+                drop(ctx);
+                // Without a live session there is no disconnect event to restart
+                // the canceled dial loop with the updated configuration.
+                if !has_session {
+                    enable_active_connect(peer, self.active_conn_tx.clone());
+                }
             }
         }
 

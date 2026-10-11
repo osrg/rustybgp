@@ -9254,6 +9254,121 @@ mod tests {
         )
     }
 
+    fn transport_update_peer(port: u16, passive: bool) -> api::Peer {
+        api::Peer {
+            conf: Some(api::PeerConf {
+                neighbor_address: "127.0.0.1".into(),
+                peer_asn: 65001,
+                ..Default::default()
+            }),
+            transport: Some(api::Transport {
+                remote_port: port.into(),
+                passive_mode: passive,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn update_peer_restarts_idle_dial_after_port_change() {
+        check_update_peer_restarts_idle_dial(false).await;
+    }
+
+    #[tokio::test]
+    async fn update_peer_restarts_idle_dial_after_passive_to_active() {
+        check_update_peer_restarts_idle_dial(true).await;
+    }
+
+    async fn check_update_peer_restarts_idle_dial(initially_passive: bool) {
+        // Reserve the old TCP port without listening so the initial active
+        // connection fails and remains in the retry loop.
+        let old_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        old_socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let initial_port = if initially_passive {
+            port
+        } else {
+            old_socket.local_addr().unwrap().port()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let svc = GrpcService::new(
+            Arc::new(tokio::sync::Notify::new()),
+            tx,
+            make_global(),
+            make_tables(),
+        );
+        svc.add_peer(tonic::Request::new(api::AddPeerRequest {
+            peer: Some(transport_update_peer(initial_port, initially_passive)),
+        }))
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+
+        // Exercise a port-only change and a passive-to-active-only change.
+        svc.update_peer(tonic::Request::new(api::UpdatePeerRequest {
+            peer: Some(transport_update_peer(port, false)),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let (_incoming, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("updated idle peer must connect")
+            .unwrap();
+        let outgoing = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outgoing.peer_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test]
+    async fn update_peer_respects_dial_suppression() {
+        // An idle passive/admin-down peer must not start dialing. A peer with
+        // either session role must wait for its disconnect event to reconnect.
+        for (passive, admin_down, session_role) in [
+            (true, false, None),
+            (false, true, None),
+            (false, false, Some(crate::fsm::Role::Active)),
+            (false, false, Some(crate::fsm::Role::Passive)),
+        ] {
+            let svc = make_grpc_service();
+            let initial = transport_update_peer(1179, passive);
+            let mut params = PeerParams::try_from(&initial).unwrap();
+            params.admin_down = admin_down;
+            // Do not start an initial dialer; install the session close channel
+            // directly when testing the session-disconnect path.
+            svc.global.write().await.add_peer(params, None).unwrap();
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let remote: IpAddr = "127.0.0.1".parse().unwrap();
+            {
+                let g = svc.global.read().await;
+                let ctx = g.peers[&remote].context.lock().unwrap();
+                let mut arb = ctx.conn_arbiter.lock().unwrap();
+                match session_role {
+                    Some(crate::fsm::Role::Active) => arb.active_close_tx = Some(tx),
+                    Some(crate::fsm::Role::Passive) => arb.passive_close_tx = Some(tx),
+                    None => {}
+                }
+            }
+            svc.update_peer(tonic::Request::new(api::UpdatePeerRequest {
+                peer: Some(transport_update_peer(2179, passive)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+            let g = svc.global.read().await;
+            let ctx = g.peers[&remote].context.lock().unwrap();
+            assert!(ctx.active_connect_join_handle.is_none());
+            if session_role.is_some() {
+                assert!(matches!(rx.try_recv(), Ok(CloseReason::SendMessage(_))));
+            }
+        }
+    }
+
     fn ipv4_path(prefix: &str, prefix_len: u32, nexthop: &str) -> api::Path {
         api::Path {
             nlri: Some(api::Nlri {
