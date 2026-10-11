@@ -897,14 +897,19 @@ impl GrpcService {
                 bgp::Attribute::MP_REACH => {
                     // MP_REACH binary: [AFI:2][SAFI:1][NH_LEN:1][nexthop:NH_LEN][reserved:1][NLRI...]
                     // Extract just the nexthop.
-                    let nh_len = a.binary().and_then(|b| b.get(3).copied()).unwrap_or(1) as usize;
-                    nexthop = a.binary().and_then(|b| {
-                        let len = *b.get(3)? as usize;
-                        if b.len() < 5 + len {
-                            return None;
-                        }
-                        bgp::Nexthop::from_bytes(&b[4..4 + len])
-                    });
+                    let mp_reach_bytes = a
+                        .binary()
+                        .ok_or_else(|| tonic::Status::invalid_argument("malformed MP_REACH"))?;
+                    if mp_reach_bytes.len() < 5
+                        || u16::from_be_bytes([mp_reach_bytes[0], mp_reach_bytes[1]])
+                            != family.afi()
+                        || mp_reach_bytes[2] != family.safi()
+                        || mp_reach_bytes.len() < 5 + mp_reach_bytes[3] as usize
+                    {
+                        return Err(tonic::Status::invalid_argument("malformed MP_REACH"));
+                    }
+                    let nh_len = mp_reach_bytes[3] as usize;
+                    nexthop = bgp::Nexthop::from_bytes(&mp_reach_bytes[4..4 + nh_len]);
                     // Flowspec carries no nexthop (RFC 8955 §4): nexthop_len=0 is valid.
                     let flowspec_no_nexthop = nh_len == 0
                         && matches!(

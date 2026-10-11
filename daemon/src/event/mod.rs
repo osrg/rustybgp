@@ -9403,6 +9403,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gobgp_compat_mp_reach_family_must_match_path() {
+        for (family, mp_family) in [
+            (Family::IPV6, Family::IPV4),
+            (Family::IPV6, Family::IPV6_MC),
+            (Family::IPV6_FLOWSPEC, Family::IPV4_FLOWSPEC),
+        ] {
+            for binary in [false, true] {
+                // A matching attribute must still be accepted, including a
+                // FlowSpec MP_REACH with no next hop.
+                for matches in [true, false] {
+                    let svc = make_grpc_service();
+                    let mut path = gobgp_binary_path(family);
+                    let attr_family = if matches { family } else { mp_family };
+                    if binary {
+                        let mp = &mut path.pattrs_binary[1];
+                        mp[3..5].copy_from_slice(&attr_family.afi().to_be_bytes());
+                        mp[5] = attr_family.safi();
+                    } else {
+                        path.nlri = Some(convert::nlri_to_api(
+                            &packet::Nlri::decode_from_bytes(family, &path.nlri_binary).unwrap(),
+                        ));
+                        path.nlri_binary.clear();
+                        path.pattrs_binary.clear();
+                        path.pattrs = vec![api::Attribute {
+                            attr: Some(api::attribute::Attr::MpReach(api::MpReachNlriAttribute {
+                                family: Some(convert::family_to_api(attr_family)),
+                                next_hops: if family == Family::IPV6_FLOWSPEC {
+                                    vec![]
+                                } else {
+                                    vec!["2001:db8::1".into()]
+                                },
+                                nlris: vec![],
+                            })),
+                        }];
+                    }
+                    let result = add_gobgp_path(&svc, path).await;
+                    let paths = svc.tables.collect_loc_rib_paths(family);
+                    if matches {
+                        result.unwrap();
+                        assert_eq!(paths.len(), 1);
+                    } else {
+                        assert_eq!(
+                            result.unwrap_err().code(),
+                            tonic::Code::InvalidArgument,
+                            "path {family:?}, MP_REACH {mp_family:?}, binary {binary}",
+                        );
+                        assert!(paths.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gobgp_compat_mp_reach_truncated_header_is_rejected() {
+        // Even FlowSpec's zero-length next hop needs the reserved byte.
+        for body in [
+            vec![],
+            vec![0],
+            vec![0, 2],
+            vec![0, 2, 133],
+            vec![0, 2, 133, 0],
+            vec![0, 2, 133, 16, 0],
+        ] {
+            let svc = make_grpc_service();
+            let mut path = gobgp_binary_path(Family::IPV6_FLOWSPEC);
+            let mut attr = vec![0x80, 14, body.len() as u8];
+            attr.extend(body);
+            path.pattrs_binary[1] = attr;
+            assert_eq!(
+                add_gobgp_path(&svc, path).await.unwrap_err().code(),
+                tonic::Code::InvalidArgument,
+            );
+            assert!(
+                svc.tables
+                    .collect_loc_rib_paths(Family::IPV6_FLOWSPEC)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn gobgp_compat_binary_fields_take_precedence_over_structured_fields() {
         let svc = make_grpc_service();
         let mut path = gobgp_binary_path(Family::IPV4);
