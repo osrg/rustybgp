@@ -4651,12 +4651,11 @@ fn conditions_to_api(c: &config::Conditions) -> Result<api::Conditions, Error> {
             .as_ref()
             .ok_or_else(|| Error::InvalidConfiguration("empty name".to_string()))?
             .to_string();
-        let set_option = set
-            .match_set_options
-            .as_ref()
-            .ok_or_else(|| Error::InvalidConfiguration("empty match option".to_string()))?;
         conditions.prefix_set = Some(api::MatchSet {
-            r#type: match_set_options_restricted_to_i32(set_option),
+            r#type: set
+                .match_set_options
+                .as_ref()
+                .map_or(0, match_set_options_restricted_to_i32),
             name,
         });
     }
@@ -4666,12 +4665,11 @@ fn conditions_to_api(c: &config::Conditions) -> Result<api::Conditions, Error> {
             .as_ref()
             .ok_or_else(|| Error::InvalidConfiguration("empty name".to_string()))?
             .to_string();
-        let set_option = set
-            .match_set_options
-            .as_ref()
-            .ok_or_else(|| Error::InvalidConfiguration("empty match option".to_string()))?;
         conditions.neighbor_set = Some(api::MatchSet {
-            r#type: match_set_options_restricted_to_i32(set_option),
+            r#type: set
+                .match_set_options
+                .as_ref()
+                .map_or(0, match_set_options_restricted_to_i32),
             name,
         });
     }
@@ -5667,8 +5665,19 @@ mod tests {
 
     #[test]
     fn config_prefix_condition() {
-        let ptable = make_ptable(
-            r#"
+        for (option, expected) in [
+            ("", rustybgp_table::MatchOption::Any),
+            (
+                "match-set-options = \"any\"",
+                rustybgp_table::MatchOption::Any,
+            ),
+            (
+                "match-set-options = \"invert\"",
+                rustybgp_table::MatchOption::Invert,
+            ),
+        ] {
+            let ptable = make_ptable(&format!(
+                r#"
 [[defined-sets.prefix-sets]]
 prefix-set-name = "ps1"
 
@@ -5684,25 +5693,36 @@ name = "s1"
 
 [policy-definitions.statements.conditions.match-prefix-set]
 prefix-set = "ps1"
-match-set-options = "any"
+{option}
 
 [policy-definitions.statements.actions]
 route-disposition = "accept-route"
 "#,
-        );
-        assert_eq!(ptable.iter_defined_sets().count(), 1);
-        let stmt = first_stmt(&ptable);
-        assert!(
-            stmt.conditions
-                .iter()
-                .any(|c| matches!(c, rustybgp_table::Condition::Prefix(n, ..) if n == "ps1"))
-        );
+            ));
+            assert_eq!(ptable.iter_defined_sets().count(), 1);
+            let stmt = first_stmt(&ptable);
+            assert!(stmt.conditions.iter().any(|c| matches!(
+                c,
+                rustybgp_table::Condition::Prefix(n, opt, _) if n == "ps1" && *opt == expected
+            )));
+        }
     }
 
     #[test]
     fn config_neighbor_condition() {
-        let ptable = make_ptable(
-            r#"
+        for (option, expected) in [
+            ("", rustybgp_table::MatchOption::Any),
+            (
+                "match-set-options = \"any\"",
+                rustybgp_table::MatchOption::Any,
+            ),
+            (
+                "match-set-options = \"invert\"",
+                rustybgp_table::MatchOption::Invert,
+            ),
+        ] {
+            let ptable = make_ptable(&format!(
+                r#"
 [[defined-sets.neighbor-sets]]
 neighbor-set-name = "ns1"
 neighbor-info-list = ["10.0.0.1/32"]
@@ -5715,19 +5735,19 @@ name = "s1"
 
 [policy-definitions.statements.conditions.match-neighbor-set]
 neighbor-set = "ns1"
-match-set-options = "any"
+{option}
 
 [policy-definitions.statements.actions]
 route-disposition = "accept-route"
 "#,
-        );
-        assert_eq!(ptable.iter_defined_sets().count(), 1);
-        let stmt = first_stmt(&ptable);
-        assert!(
-            stmt.conditions
-                .iter()
-                .any(|c| matches!(c, rustybgp_table::Condition::Neighbor(n, ..) if n == "ns1"))
-        );
+            ));
+            assert_eq!(ptable.iter_defined_sets().count(), 1);
+            let stmt = first_stmt(&ptable);
+            assert!(stmt.conditions.iter().any(|c| matches!(
+                c,
+                rustybgp_table::Condition::Neighbor(n, opt, _) if n == "ns1" && *opt == expected
+            )));
+        }
     }
 
     #[test]
