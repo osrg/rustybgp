@@ -2578,6 +2578,12 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
                     nh_str
                 )));
             }
+            if matches!(pkt_family, Family::IPV4_VPN | Family::IPV6_VPN) {
+                // RFC 4364: the VPN next-hop address is preceded by a zero RD.
+                let mut vpn_nh = vec![0; 8];
+                vpn_nh.extend(nh_bytes);
+                nh_bytes = vpn_nh;
+            }
             // Binary layout consumed by event.rs:
             //   [AFI:2][SAFI:1][NH_LEN:1][nexthop:NH_LEN][reserved:1]
             // NLRI bytes are intentionally omitted here; the daemon uses
@@ -5227,6 +5233,31 @@ mod tests {
         assert_eq!(b[0..3], [0x00, 0x02, 0x01]); // AFI=2, SAFI=1
         assert_eq!(b[3], 16); // NH_LEN=16
         assert_eq!(b.last(), Some(&0x00)); // reserved
+    }
+
+    #[test]
+    fn mp_reach_vpn_nexthop_includes_zero_rd() {
+        for family in [Family::IPV4_VPN, Family::IPV6_VPN] {
+            for next_hop in ["192.0.2.1", "2001:db8::1"] {
+                let attr = attr_from_api(api::Attribute {
+                    attr: Some(api::attribute::Attr::MpReach(api::MpReachNlriAttribute {
+                        family: Some(family_to_api(family)),
+                        next_hops: vec![next_hop.into()],
+                        nlris: vec![],
+                    })),
+                })
+                .unwrap();
+                let nh = match next_hop.parse::<std::net::IpAddr>().unwrap() {
+                    std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+                    std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+                };
+                let body = attr.binary().unwrap();
+                assert_eq!(body[3] as usize, 8 + nh.len());
+                assert_eq!(&body[4..12], &[0; 8]);
+                assert_eq!(&body[12..body.len() - 1], &nh);
+                assert_eq!(body.last(), Some(&0));
+            }
+        }
     }
 
     #[test]

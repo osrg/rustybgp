@@ -942,7 +942,14 @@ impl GrpcService {
                         return Err(tonic::Status::invalid_argument("malformed MP_REACH"));
                     }
                     let nh_len = mp_reach_bytes[3] as usize;
-                    nexthop = bgp::Nexthop::from_bytes(&mp_reach_bytes[4..4 + nh_len]);
+                    let nh_bytes = &mp_reach_bytes[4..4 + nh_len];
+                    // RFC 4364: VPN next hops have an eight-byte RD before the address.
+                    let nh_bytes = if matches!(family, Family::IPV4_VPN | Family::IPV6_VPN) {
+                        nh_bytes.get(8..).unwrap_or_default()
+                    } else {
+                        nh_bytes
+                    };
+                    nexthop = bgp::Nexthop::from_bytes(nh_bytes);
                     // Flowspec carries no nexthop (RFC 8955 §4): nexthop_len=0 is valid.
                     let flowspec_no_nexthop = nh_len == 0
                         && matches!(
