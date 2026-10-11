@@ -646,27 +646,37 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let join_handle = tokio::spawn(async move {
         loop {
-            let socket = match peer_addr {
-                IpAddr::V4(_) => tokio::net::TcpSocket::new_v4().unwrap(),
-                IpAddr::V6(_) => tokio::net::TcpSocket::new_v6().unwrap(),
-            };
-            if let Some(dev) = bind_interface.as_deref() {
-                let _ = socket.bind_device(Some(dev.as_bytes()));
-            }
-            if let Some(key) = password.as_ref() {
-                auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex);
-            }
-            tokio::select! {
-                result = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
-                    socket.connect(sockaddr),
-                ) => {
-                    if let Ok(Ok(stream)) = result {
-                        let _ = ch.send(stream);
-                        return;
-                    }
+            let socket = (|| {
+                let socket = match peer_addr {
+                    IpAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+                    IpAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+                };
+                if let Some(dev) = bind_interface.as_deref() {
+                    socket.bind_device(Some(dev.as_bytes()))?;
                 }
-                _ = &mut cancel_rx => return,
+                if let Some(key) = password.as_ref() {
+                    auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex);
+                }
+                Ok::<_, std::io::Error>(socket)
+            })();
+            match socket {
+                Ok(socket) => tokio::select! {
+                    result = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        socket.connect(sockaddr),
+                    ) => {
+                        match result {
+                            Ok(Ok(stream)) => {
+                                let _ = ch.send(stream);
+                                return;
+                            }
+                            Ok(Err(e)) => log::debug!("connect to {peer_addr} failed: {e}"),
+                            Err(_) => log::debug!("connect to {peer_addr} timed out"),
+                        }
+                    }
+                    _ = &mut cancel_rx => return,
+                },
+                Err(e) => log::warn!("socket setup for peer {peer_addr} failed: {e}"),
             }
             tokio::select! {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(retry_time)) => {}
@@ -3929,6 +3939,40 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn active_connect_bind_device_failure_does_not_fall_back() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut params = default_peer_params("127.0.0.1".parse().unwrap());
+        params.remote_port = listener.local_addr().unwrap().port();
+        params.bind_interface = Some("rbgp-no-device".into());
+        params.connect_retry_time = 0;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let global = make_global();
+        global.write().await.add_peer(params, Some(tx)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err(),
+            "a failed device bind must not fall back to an unbound connection"
+        );
+        assert!(rx.try_recv().is_err());
+        let join_handle = {
+            let g = global.read().await;
+            let mut ctx = g.peers[&"127.0.0.1".parse().unwrap()]
+                .context
+                .lock()
+                .unwrap();
+            let handle = ctx.active_connect_join_handle.take().unwrap();
+            assert!(!handle.is_finished(), "socket setup errors must retry");
+            ctx.active_connect_cancel_tx.take();
+            handle
+        };
+        tokio::time::timeout(Duration::from_secs(2), join_handle)
+            .await
+            .expect("retry loop must remain cancellable")
+            .unwrap();
+    }
 
     fn make_global() -> GlobalHandle {
         let (tx, _rx) = mpsc::unbounded_channel();
