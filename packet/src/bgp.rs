@@ -2452,8 +2452,51 @@ impl PeerCodec {
         }
     }
 
+    // Encodes NLRIs from `entries` while each one fits in the message that
+    // starts at `msg_head`. `reserve` bytes are kept free for data written
+    // after the NLRIs. Each NLRI is checked with its real encoded length,
+    // since NLRI sizes differ a lot between families (VPNv6, FlowSpec,
+    // BGP-LS, ...).
+    //
+    // An NLRI that does not fit as the first one of a message never fits,
+    // because every message for these entries carries the same attributes.
+    // It is skipped so that the following entries are still sent.
+    //
+    // Returns (nlri_bytes_written, n_entries_consumed).
+    fn encode_nlri_list<B: BufMut + AsMut<[u8]>>(
+        &self,
+        msg_head: usize,
+        dst: &mut B,
+        entries: &[PathNlri],
+        addpath: bool,
+        reserve: usize,
+    ) -> (usize, usize) {
+        let limit = msg_head + self.max_message_length() - reserve;
+        let mut buf = Vec::with_capacity(64);
+        let mut written = 0;
+        let mut n_consumed = 0;
+        for item in entries {
+            buf.clear();
+            if addpath {
+                buf.put_u32(item.path_id);
+            }
+            item.nlri.encode(&mut buf).unwrap();
+            if dst.as_mut().len() + buf.len() > limit {
+                if written > 0 {
+                    break;
+                }
+                n_consumed += 1;
+                continue;
+            }
+            dst.put_slice(&buf);
+            written += buf.len();
+            n_consumed += 1;
+        }
+        (written, n_consumed)
+    }
+
     // Encodes MP_REACH_NLRI for `entries` (already sliced to the current start).
-    // Returns (attr_bytes_written, n_nlri_encoded).
+    // Returns (attr_bytes_written, n_entries_consumed).
     fn mp_reach_encode<B: BufMut + AsMut<[u8]>>(
         &self,
         buf_head: usize,
@@ -2483,33 +2526,16 @@ impl PeerCodec {
         // SNPA padding
         dst.put_u8(0);
         let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
-        // EVPN NLRIs are up to 60 bytes (Type-5 with IPv6: 2+58).
-        let max_len = if *family == Family::L2VPN_EVPN {
-            60 + if addpath { 4 } else { 0 }
-        } else {
-            1 + 16 + if addpath { 4 } else { 0 }
-        };
-        let mut n_encoded = 0;
-        for item in entries {
-            if buf_head + self.max_message_length() > dst.as_mut().len() + max_len {
-                if addpath {
-                    dst.put_u32(item.path_id);
-                }
-                item.nlri.encode(dst).unwrap();
-                n_encoded += 1;
-            } else {
-                break;
-            }
-        }
+        let (_, n_consumed) = self.encode_nlri_list(buf_head, dst, entries, addpath, 0);
         let mp_len = (dst.as_mut().len() - pos_head) as u16;
         (&mut dst.as_mut()[pos_bin..])
             .write_u16::<NetworkEndian>(mp_len - 4)
             .unwrap();
-        (mp_len, n_encoded)
+        (mp_len, n_consumed)
     }
 
     // Encodes MP_UNREACH_NLRI for `entries` (already sliced to the current start).
-    // Returns (attr_bytes_written, n_nlri_encoded).
+    // Returns (attr_bytes_written, n_entries_consumed).
     fn mp_unreach_encode<B: BufMut + AsMut<[u8]>>(
         &self,
         buf_head: usize,
@@ -2528,29 +2554,17 @@ impl PeerCodec {
         dst.put_u16(family.afi());
         dst.put_u8(family.safi());
         let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
-        let max_len = 1 + 16 + if addpath { 4 } else { 0 };
-        let mut n_encoded = 0;
-        for item in entries {
-            if buf_head + self.max_message_length() > dst.as_mut().len() + max_len {
-                if addpath {
-                    dst.put_u32(item.path_id);
-                }
-                item.nlri.encode(dst).unwrap();
-                n_encoded += 1;
-            } else {
-                break;
-            }
-        }
+        let (_, n_consumed) = self.encode_nlri_list(buf_head, dst, entries, addpath, 0);
         let mp_len = (dst.as_mut().len() - pos_head) as u16;
         (&mut dst.as_mut()[pos_bin..])
             .write_u16::<NetworkEndian>(mp_len - 4)
             .unwrap();
-        (mp_len, n_encoded)
+        (mp_len, n_consumed)
     }
 
     // Encodes one wire BGP message starting at `start` (index into the entries
     // slice for Reach/Unreach).  Returns the new start position (start +
-    // n_encoded), or 0 for message types that have no entries.
+    // n_consumed), or 0 for message types that have no entries.
     fn do_encode<B: BufMut + AsMut<[u8]>>(
         &mut self,
         item: &Message,
@@ -2564,7 +2578,7 @@ impl PeerCodec {
         let pos_header_len = dst.as_mut().len();
         dst.put_u16(Message::HEADER_LENGTH);
 
-        let n_encoded = match item {
+        let n_consumed = match item {
             Message::Open(Open {
                 as_number,
                 holdtime,
@@ -2685,19 +2699,8 @@ impl PeerCodec {
                     (&mut dst.as_mut()[pos_attr_len..])
                         .write_u16::<NetworkEndian>(attr_len)
                         .unwrap();
-                    let max_len = 5 + if addpath { 4 } else { 0 };
-                    let mut count = 0;
-                    for item in &entries[start..] {
-                        if pos_head + self.max_message_length() > dst.as_mut().len() + max_len {
-                            if addpath {
-                                dst.put_u32(item.path_id);
-                            }
-                            item.nlri.encode(dst).unwrap();
-                            count += 1;
-                        } else {
-                            break;
-                        }
-                    }
+                    let (_, count) =
+                        self.encode_nlri_list(pos_head, dst, &entries[start..], addpath, 0);
                     count
                 } else {
                     // MP_REACH_NLRI (non-IPv4 or IPv4 with RFC 8950 extended nexthop).
@@ -2720,23 +2723,11 @@ impl PeerCodec {
                     // Traditional IPv4 withdrawn routes section.
                     let pos_withdrawn_len = dst.as_mut().len();
                     dst.put_u16(0);
-                    let max_len = 5 + if addpath { 4 } else { 0 };
-                    let mut withdrawn_len: u16 = 0;
-                    let mut count = 0;
-                    for item in &entries[start..] {
-                        if pos_head + self.max_message_length() > dst.as_mut().len() + max_len {
-                            if addpath {
-                                dst.put_u32(item.path_id);
-                                withdrawn_len += 4;
-                            }
-                            withdrawn_len += item.nlri.encode(dst).unwrap();
-                            count += 1;
-                        } else {
-                            break;
-                        }
-                    }
+                    // Keep 2 bytes for the Total Path Attribute Length below.
+                    let (withdrawn_len, count) =
+                        self.encode_nlri_list(pos_head, dst, &entries[start..], addpath, 2);
                     (&mut dst.as_mut()[pos_withdrawn_len..])
-                        .write_u16::<NetworkEndian>(withdrawn_len)
+                        .write_u16::<NetworkEndian>(withdrawn_len as u16)
                         .unwrap();
                     // Empty path attributes section.
                     dst.put_u16(0);
@@ -2796,7 +2787,7 @@ impl PeerCodec {
         (&mut dst.as_mut()[pos_header_len..])
             .write_u16::<NetworkEndian>((pos_end - pos_head) as u16)?;
 
-        Ok(start + n_encoded)
+        Ok(start + n_consumed)
     }
 
     fn decode_nlri<C: ParseContext>(
@@ -6416,6 +6407,145 @@ mod update_tests {
         for family in [Family::IPV4_FLOWSPEC, Family::IPV6_FLOWSPEC_VPN] {
             assert!(Nexthop::V4(v4).to_bytes(family).is_empty());
         }
+    }
+
+    fn vpnv6_nlri(i: u32, mask: u8) -> PathNlri {
+        use crate::mpls::{MplsLabel, MplsLabelStack};
+        use crate::vpn::VpnV6Nlri;
+        PathNlri::new(Nlri::VpnV6(VpnV6Nlri {
+            labels: MplsLabelStack::new(vec![MplsLabel::new(100)]),
+            rd: RouteDistinguisher::TwoOctetAs {
+                admin: 65001,
+                assigned: 1,
+            },
+            prefix: Ipv6Net {
+                addr: Ipv6Addr::from(if mask == 0 {
+                    0
+                } else {
+                    0x2001_0db8_u128 << 96 | (i as u128) << 64
+                }),
+                mask,
+            },
+        }))
+    }
+
+    fn vpnv6_reach(entries: Vec<PathNlri>, n_communities: u32) -> Message {
+        let communities = (0..n_communities)
+            .flat_map(|c| (0xfde8_0000u32 + c).to_be_bytes())
+            .collect();
+        Message::Update(Update::Reach {
+            family: Family::IPV6_VPN,
+            entries,
+            nexthop: Some(Nexthop::V6("2001:db8::1".parse().unwrap())),
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::empty_as_path(),
+                Attribute::new_with_bin(Attribute::COMMUNITY, communities).unwrap(),
+            ]),
+        })
+    }
+
+    #[test]
+    fn vpnv6_update_never_exceeds_max_length() {
+        // A VPNv6 NLRI is up to 28 bytes. Shift the attribute length so that
+        // the space left for the last NLRI takes every value.
+        let entries: Vec<PathNlri> = (0..200).map(|i| vpnv6_nlri(i, 128)).collect();
+        for n_communities in 0..28 {
+            let mut codec = vpnv6_codec();
+            let msg = vpnv6_reach(entries.clone(), n_communities);
+            assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+                ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+                    mp_reach.map(|r| r.entries)
+                }
+                _ => None,
+            });
+        }
+        // MP_UNREACH has no attributes to shift, so mix prefix lengths.
+        for n_short in 0..28 {
+            let entries: Vec<PathNlri> = (0..200)
+                .map(|i| vpnv6_nlri(i, if i < n_short { 64 } else { 128 }))
+                .collect();
+            let mut codec = vpnv6_codec();
+            let msg = Message::Update(Update::Unreach {
+                family: Family::IPV6_VPN,
+                entries: entries.clone(),
+            });
+            assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+                ParsedMessage::Update(ParsedUpdate::Routes { mp_unreach, .. }) => {
+                    mp_unreach.map(|r| r.entries)
+                }
+                _ => None,
+            });
+        }
+    }
+
+    #[test]
+    fn ipv4_withdraw_never_exceeds_max_length() {
+        // The Total Path Attribute Length follows the withdrawn routes, so
+        // the last withdrawn route must leave 2 bytes for it.
+        for n_short in 0..10 {
+            let entries: Vec<PathNlri> = (0..1000u32)
+                .map(|i| {
+                    PathNlri::new(Nlri::V4(Ipv4Net {
+                        addr: Ipv4Addr::from(0x0a00_0000 + (i << 8)),
+                        mask: if i < n_short { 24 } else { 32 },
+                    }))
+                })
+                .collect();
+            let mut codec = ipv4_codec();
+            let msg = Message::Update(Update::Unreach {
+                family: Family::IPV4,
+                entries: entries.clone(),
+            });
+            assert_encode_decode_splits(&mut codec, &msg, &entries, |m| match m {
+                ParsedMessage::Update(ParsedUpdate::Routes { unreach, .. }) => {
+                    unreach.map(|r| r.entries)
+                }
+                _ => None,
+            });
+        }
+    }
+
+    #[test]
+    fn nlri_that_never_fits_is_skipped() {
+        // With large attributes, a 12-byte VPNv6 NLRI (/0) fits in a message
+        // but a 28-byte one (/128) does not. The large one is skipped and
+        // the entries after it are still sent.
+        let small = [vpnv6_nlri(0, 0), vpnv6_nlri(1, 0)];
+        let big = vpnv6_nlri(2, 128);
+        let entries = vec![small[0].clone(), big.clone(), small[1].clone()];
+        // Up to 1007 communities the attributes alone still fit; more is the
+        // "attributes too long" case, which this test does not cover.
+        let mut skipped = false;
+        for n_communities in 1000..1008 {
+            let mut codec = vpnv6_codec();
+            let mut raw = Vec::new();
+            codec
+                .encode_to(&vpnv6_reach(entries.clone(), n_communities), &mut raw)
+                .unwrap();
+            check_message_sizes(&raw);
+            let mut buf = BytesMut::from(raw.as_slice());
+            let received: Vec<PathNlri> = decode_all(&mut buf, &mut codec)
+                .into_iter()
+                .filter_map(|m| match m {
+                    ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+                        mp_reach.map(|r| r.entries)
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            if received.is_empty() {
+                // Not even the small NLRI fits.
+                continue;
+            }
+            assert!(received.contains(&small[0]), "{n_communities}");
+            assert!(received.contains(&small[1]), "{n_communities}");
+            if !received.contains(&big) {
+                skipped = true;
+            }
+        }
+        assert!(skipped, "no attribute length made the big NLRI skip");
     }
 
     fn check_message_sizes(raw: &[u8]) {
