@@ -934,12 +934,18 @@ impl GrpcService {
                         .binary()
                         .ok_or_else(|| tonic::Status::invalid_argument("malformed MP_REACH"))?;
                     if mp_reach_bytes.len() < 5
-                        || u16::from_be_bytes([mp_reach_bytes[0], mp_reach_bytes[1]])
-                            != family.afi()
-                        || mp_reach_bytes[2] != family.safi()
                         || mp_reach_bytes.len() < 5 + mp_reach_bytes[3] as usize
                     {
                         return Err(tonic::Status::invalid_argument("malformed MP_REACH"));
+                    }
+                    let afi = u16::from_be_bytes([mp_reach_bytes[0], mp_reach_bytes[1]]);
+                    let safi = mp_reach_bytes[2];
+                    if afi != family.afi() || safi != family.safi() {
+                        return Err(tonic::Status::invalid_argument(format!(
+                            "MP_REACH family (afi {afi}, safi {safi}) does not match path family (afi {}, safi {})",
+                            family.afi(),
+                            family.safi()
+                        )));
                     }
                     let nh_len = mp_reach_bytes[3] as usize;
                     // RFC 8955 Section 4: the FlowSpec next hop "MUST be

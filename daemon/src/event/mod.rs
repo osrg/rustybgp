@@ -10054,10 +10054,16 @@ local-address = "{local}"
                         result.unwrap();
                         assert_eq!(paths.len(), 1);
                     } else {
+                        let status = result.unwrap_err();
                         assert_eq!(
-                            result.unwrap_err().code(),
+                            status.code(),
                             tonic::Code::InvalidArgument,
                             "path {family:?}, MP_REACH {mp_family:?}, binary {binary}",
+                        );
+                        assert!(
+                            status.message().contains("does not match path family"),
+                            "{}",
+                            status.message()
                         );
                         assert!(paths.is_empty());
                     }
