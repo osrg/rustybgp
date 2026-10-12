@@ -942,21 +942,24 @@ impl GrpcService {
                         return Err(tonic::Status::invalid_argument("malformed MP_REACH"));
                     }
                     let nh_len = mp_reach_bytes[3] as usize;
-                    nexthop = bgp::Nexthop::from_bytes(family, &mp_reach_bytes[4..4 + nh_len]);
-                    // Flowspec carries no nexthop (RFC 8955 §4): nexthop_len=0 is valid.
-                    let flowspec_no_nexthop = nh_len == 0
-                        && matches!(
-                            family,
-                            Family::IPV4_FLOWSPEC
-                                | Family::IPV6_FLOWSPEC
-                                | Family::IPV4_FLOWSPEC_VPN
-                                | Family::IPV6_FLOWSPEC_VPN
-                        );
-                    if nexthop.is_none() && !flowspec_no_nexthop {
-                        return Err(tonic::Status::new(
-                            tonic::Code::InvalidArgument,
-                            "malformed MP_REACH nexthop",
-                        ));
+                    // RFC 8955 Section 4: the FlowSpec next hop "MUST be
+                    // ignored". Ignore any length, as the wire decoder does.
+                    if matches!(
+                        family,
+                        Family::IPV4_FLOWSPEC
+                            | Family::IPV6_FLOWSPEC
+                            | Family::IPV4_FLOWSPEC_VPN
+                            | Family::IPV6_FLOWSPEC_VPN
+                    ) {
+                        nexthop = None;
+                    } else {
+                        nexthop = bgp::Nexthop::from_bytes(family, &mp_reach_bytes[4..4 + nh_len]);
+                        if nexthop.is_none() {
+                            return Err(tonic::Status::new(
+                                tonic::Code::InvalidArgument,
+                                "malformed MP_REACH nexthop",
+                            ));
+                        }
                     }
                 }
                 bgp::Attribute::NEXTHOP => {

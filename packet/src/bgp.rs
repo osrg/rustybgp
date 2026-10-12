@@ -3192,8 +3192,11 @@ impl PeerCodec {
                         return Err(err);
                     }
                     let pos = c.position() as usize;
-                    let nexthop = if nexthop_len == 0 && Nexthop::is_flowspec_family(family) {
-                        // FlowSpec carries no nexthop (RFC 8955 Section 4).
+                    let nexthop = if Nexthop::is_flowspec_family(family) {
+                        // RFC 8955 Section 4: "The Network Address of the
+                        // Next-Hop field MUST be ignored." Ignore any length,
+                        // like BIRD, so that the nexthop is never stored or
+                        // tracked by NHT.
                         None
                     } else {
                         // Any other family with nexthop_len=0 is malformed;
@@ -6266,12 +6269,17 @@ mod update_tests {
     }
 
     fn mp_reach_nexthop_update(family: Family, nexthop: &[u8]) -> Vec<u8> {
-        let mut attr = vec![0x80, 0x0E, (5 + nexthop.len()) as u8];
+        mp_reach_nexthop_nlri_update(family, nexthop, &[])
+    }
+
+    fn mp_reach_nexthop_nlri_update(family: Family, nexthop: &[u8], nlri: &[u8]) -> Vec<u8> {
+        let mut attr = vec![0x80, 0x0E, (5 + nexthop.len() + nlri.len()) as u8];
         attr.extend_from_slice(&family.afi().to_be_bytes());
         attr.push(family.safi());
         attr.push(nexthop.len() as u8);
         attr.extend_from_slice(nexthop);
         attr.push(0);
+        attr.extend_from_slice(nlri);
         let attr_len = attr.len() as u16;
         let total = 19u16 + 2 + 2 + attr_len;
         let mut buf = vec![0xff; 16];
@@ -6310,6 +6318,53 @@ mod update_tests {
                     nexthop.len()
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn mp_reach_flowspec_nexthop_is_ignored() {
+        // RFC 8955 Section 4: "The Network Address of the Next-Hop field
+        // MUST be ignored." Any length is accepted and no nexthop is kept.
+        // Destination prefix component (type 1) 10.0.0.0/24.
+        let flowspec = [0x05, 0x01, 0x18, 10, 0, 0];
+        // RD 0:65000:1 followed by the same component.
+        let flowspec_vpn = [
+            0x0d, 0x00, 0x00, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x01, 0x01, 0x18, 10, 0, 0,
+        ];
+        for (family, nlri) in [
+            (Family::IPV4_FLOWSPEC, &flowspec[..]),
+            (Family::IPV4_FLOWSPEC_VPN, &flowspec_vpn[..]),
+        ] {
+            for nh_len in [4, 7, 12, 16, 24, 32] {
+                let caps = vec![Capability::MultiProtocol(family)];
+                let mut codec = PeerCodec::negotiate(&caps, &caps);
+                let buf = mp_reach_nexthop_nlri_update(family, &vec![1; nh_len], nlri);
+                match codec.parse_message(&buf) {
+                    Ok(ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. })) => {
+                        let r = mp_reach.expect("mp_reach must be present");
+                        assert_eq!(r.entries.len(), 1, "{family:?} {nh_len}");
+                        assert_eq!(r.nexthop, None, "{family:?} {nh_len}");
+                    }
+                    Ok(_) => panic!("expected Routes"),
+                    Err(e) => panic!("{family:?} with {nh_len}-byte nexthop: {e}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mp_reach_flowspec_nexthop_past_attribute_end_is_error() {
+        let family = Family::IPV4_FLOWSPEC;
+        let caps = vec![Capability::MultiProtocol(family)];
+        let mut codec = PeerCodec::negotiate(&caps, &caps);
+        let mut buf = mp_reach_nexthop_update(family, &[1, 2, 3, 4]);
+        // Next Hop length octet: header(19) + withdrawn len(2) + attr len(2)
+        // + flags/type/len(3) + AFI/SAFI(3).
+        buf[29] = 16;
+        match codec.parse_message(&buf) {
+            Err(Notification::UpdateOptionalAttributeError) => {}
+            Err(e) => panic!("expected UpdateOptionalAttributeError, got Err({})", e),
+            Ok(_) => panic!("expected Err, got Ok"),
         }
     }
 

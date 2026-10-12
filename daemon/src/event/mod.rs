@@ -10067,6 +10067,31 @@ local-address = "{local}"
     }
 
     #[tokio::test]
+    async fn gobgp_compat_flowspec_mp_reach_nexthop_is_ignored() {
+        // RFC 8955 Section 4: the FlowSpec next hop "MUST be ignored", for
+        // any length, as the wire decoder does.
+        let family = Family::IPV6_FLOWSPEC;
+        for nh_len in [4, 7, 16, 24] {
+            let svc = make_grpc_service();
+            let mut path = gobgp_binary_path(family);
+            let old = &path.pattrs_binary[1];
+            // [flags, type, len] [AFI:2][SAFI:1][NH_LEN:1=0][reserved:1][NLRI]
+            let nlri = old[8..].to_vec();
+            let mut mp = vec![0, family.afi() as u8, family.safi(), nh_len as u8];
+            mp.extend(vec![1; nh_len]);
+            mp.push(0);
+            mp.extend(nlri);
+            let mut attr = vec![0x80, 14, mp.len() as u8];
+            attr.extend(mp);
+            path.pattrs_binary[1] = attr;
+            add_gobgp_path(&svc, path).await.unwrap();
+            let paths = svc.tables.collect_loc_rib_paths(family);
+            assert_eq!(paths.len(), 1, "next-hop length {nh_len}");
+            assert_eq!(paths[0].new_best().unwrap().nexthop, None);
+        }
+    }
+
+    #[tokio::test]
     async fn gobgp_compat_mp_reach_truncated_header_is_rejected() {
         // Even FlowSpec's zero-length next hop needs the reserved byte.
         for body in [
