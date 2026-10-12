@@ -365,10 +365,7 @@ impl TableManager {
             net.path_id,
             nh,
             post_policy_attr,
-            Some(table::OriginalPath {
-                attr: original_attr,
-                nexthop,
-            }),
+            Some(original_attr),
             filtered,
             nexthop_invalid_flag,
             pl,
@@ -1327,7 +1324,6 @@ impl TableShard {
     ) {
         let paths = self.rtable.collect_adj_in_paths(peer, None, false);
         for (family, net, remote_path_id, mut nh, source, original_attr, timestamp) in paths {
-            let original_nexthop = nh;
             let old_nh =
                 self.rtable
                     .lookup_nexthop(source.remote_addr, family, &net, remote_path_id);
@@ -1382,10 +1378,7 @@ impl TableShard {
                 remote_path_id,
                 nh,
                 post_policy_attr,
-                Some(table::OriginalPath {
-                    attr: original_attr,
-                    nexthop: original_nexthop,
-                }),
+                Some(original_attr),
                 filtered,
                 nexthop_invalid_flag,
                 None,
