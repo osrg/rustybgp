@@ -359,7 +359,7 @@ fn write_rib_entries(dst: &mut BytesMut, entries: &[RibEntry], ipv6: bool) {
 
 /// Encode a BGP NEXT_HOP attribute (type 3) for an IPv4 RIB entry.
 fn encode_nexthop_attr(nexthop: &bgp::Nexthop, dst: &mut BytesMut) {
-    let nh_bytes = nexthop.to_bytes();
+    let nh_bytes = nexthop.to_bytes(bgp::Family::IPV4);
     dst.put_u8(bgp::Attribute::FLAG_TRANSITIVE);
     dst.put_u8(bgp::Attribute::NEXTHOP);
     dst.put_u8(nh_bytes.len() as u8);
@@ -369,7 +369,7 @@ fn encode_nexthop_attr(nexthop: &bgp::Nexthop, dst: &mut BytesMut) {
 /// Encode MP_REACH_NLRI for an IPv6 RIB entry in MRT format (RFC 6396 §4.3.2):
 /// only the nexthop is written; AFI/SAFI and NLRI are omitted.
 fn encode_mrt_mp_reach_ipv6(nexthop: &bgp::Nexthop, dst: &mut BytesMut) {
-    let nh_bytes = nexthop.to_bytes();
+    let nh_bytes = nexthop.to_bytes(bgp::Family::IPV6);
     // flags = optional, non-transitive (0x80); no extended-length since value <= 255
     dst.put_u8(bgp::Attribute::FLAG_OPTIONAL);
     dst.put_u8(bgp::Attribute::MP_REACH);

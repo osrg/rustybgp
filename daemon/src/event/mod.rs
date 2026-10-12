@@ -10205,7 +10205,9 @@ local-address = "{local}"
         for family in [Family::IPV4_VPN, Family::IPV6_VPN] {
             // Raw IP lengths (4/16/32) must not be accepted without the RD;
             // zero bytes or an RD alone are not a next-hop address either.
-            for nh_len in [0, 4, 8, 16, 32] {
+            // 40 bytes (one RD before global + link-local) is not the RFC 4659
+            // Section 3.2.1.1 form, which puts an RD before each address.
+            for nh_len in [0, 4, 8, 16, 32, 40] {
                 let svc = make_grpc_service();
                 let mut path = vpn_mp_reach_path(family, "2001:db8::1");
                 let mut body = family.afi().to_be_bytes().to_vec();
@@ -10223,6 +10225,56 @@ local-address = "{local}"
                 assert!(svc.tables.collect_loc_rib_paths(family).is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn gobgp_compat_vpnv6_link_local_mp_reach_round_trips() {
+        // RFC 4659 Section 3.2.1.1: RD + global, then RD + link-local.
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let ll: Ipv6Addr = "fe80::1".parse().unwrap();
+        let expected = bgp::Nexthop::V6LinkLocal(global, ll);
+        let family = Family::IPV6_VPN;
+        let svc = make_grpc_service();
+        let mut path = vpn_mp_reach_path(family, "2001:db8::1");
+        let mut body = family.afi().to_be_bytes().to_vec();
+        body.extend([family.safi(), 48]);
+        body.extend([0; 8]);
+        body.extend(global.octets());
+        body.extend([0; 8]);
+        body.extend(ll.octets());
+        body.push(0);
+        let mut attr = vec![0x80, 14, body.len() as u8];
+        attr.extend(body);
+        path.pattrs.clear();
+        path.pattrs_binary = vec![attr];
+        add_gobgp_path(&svc, path).await.unwrap();
+        let paths = svc.tables.collect_loc_rib_paths(family);
+        assert_eq!(paths[0].new_best().unwrap().nexthop, Some(expected));
+
+        // ListPath binary output uses the same form and can be added again.
+        let mut stream = svc
+            .list_path(tonic::Request::new(api::ListPathRequest {
+                table_type: api::TableType::Global as i32,
+                family: Some(convert::family_to_api(family)),
+                enable_only_binary: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let listed = stream.next().await.unwrap().unwrap().destination.unwrap();
+        let mp_reach = listed.paths[0]
+            .pattrs_binary
+            .iter()
+            .find(|a| a[1] == bgp::Attribute::MP_REACH)
+            .unwrap();
+        assert_eq!(mp_reach[6], 48);
+        let copy = make_grpc_service();
+        add_gobgp_path(&copy, listed.paths[0].clone())
+            .await
+            .unwrap();
+        let copied = copy.tables.collect_loc_rib_paths(family);
+        assert_eq!(copied[0].new_best().unwrap().nexthop, Some(expected));
     }
 
     #[tokio::test]

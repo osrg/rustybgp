@@ -2567,23 +2567,17 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
             let nh_str = m.next_hops.first().ok_or_else(|| {
                 Error::InvalidArgument("mp_reach must carry at least one nexthop".to_string())
             })?;
-            let mut nh_bytes = Vec::with_capacity(16);
-            if let Ok(v4) = nh_str.parse::<Ipv4Addr>() {
-                nh_bytes.extend_from_slice(&v4.octets());
+            let nh = if let Ok(v4) = nh_str.parse::<Ipv4Addr>() {
+                rustybgp_packet::bgp::Nexthop::V4(v4)
             } else if let Ok(v6) = nh_str.parse::<Ipv6Addr>() {
-                nh_bytes.extend_from_slice(&v6.octets());
+                rustybgp_packet::bgp::Nexthop::V6(v6)
             } else {
                 return Err(Error::InvalidArgument(format!(
                     "invalid mp_reach nexthop: {}",
                     nh_str
                 )));
-            }
-            if matches!(pkt_family, Family::IPV4_VPN | Family::IPV6_VPN) {
-                // RFC 4364: the VPN next-hop address is preceded by a zero RD.
-                let mut vpn_nh = vec![0; 8];
-                vpn_nh.extend(nh_bytes);
-                nh_bytes = vpn_nh;
-            }
+            };
+            let nh_bytes = nh.to_bytes(pkt_family);
             // Binary layout consumed by event.rs:
             //   [AFI:2][SAFI:1][NH_LEN:1][nexthop:NH_LEN][reserved:1]
             // NLRI bytes are intentionally omitted here; the daemon uses
@@ -4303,25 +4297,12 @@ fn path_nexthop_attribute(
     nexthop: Option<packet::bgp::Nexthop>,
 ) -> Option<Attribute> {
     if family == Family::IPV4 && matches!(nexthop, Some(packet::bgp::Nexthop::V4(_))) {
-        return Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.unwrap().to_bytes());
+        return Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.unwrap().to_bytes(family));
     }
     if family == Family::IPV4 && nexthop.is_none() {
         return None;
     }
-    let mut nh = nexthop.map(|n| n.to_bytes()).unwrap_or_default();
-    if matches!(
-        family,
-        Family::IPV4_FLOWSPEC
-            | Family::IPV6_FLOWSPEC
-            | Family::IPV4_FLOWSPEC_VPN
-            | Family::IPV6_FLOWSPEC_VPN
-    ) {
-        nh.clear();
-    } else if matches!(family, Family::IPV4_VPN | Family::IPV6_VPN) {
-        let mut vpn_nh = vec![0; 8];
-        vpn_nh.extend(nh);
-        nh = vpn_nh;
-    }
+    let nh = nexthop.map(|n| n.to_bytes(family)).unwrap_or_default();
     let mut body = family.afi().to_be_bytes().to_vec();
     body.extend([family.safi(), nh.len() as u8]);
     body.extend(nh);
@@ -5247,7 +5228,12 @@ mod tests {
                     })),
                 })
                 .unwrap();
+                // RFC 4659 Section 3.2.1.2: VPN-IPv6 carries an IPv4 next
+                // hop as an IPv4-mapped IPv6 address.
                 let nh = match next_hop.parse::<std::net::IpAddr>().unwrap() {
+                    std::net::IpAddr::V4(v4) if family == Family::IPV6_VPN => {
+                        v4.to_ipv6_mapped().octets().to_vec()
+                    }
                     std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
                     std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
                 };

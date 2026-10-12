@@ -724,8 +724,52 @@ pub enum Nexthop {
 }
 
 impl Nexthop {
-    /// Parse nexthop from raw bytes (4, 16, or 32 bytes).
-    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+    /// Length of the zero Route Distinguisher before each VPN next-hop
+    /// address (RFC 4364 Section 4.3.2, RFC 4659 Section 3.2.1).
+    const VPN_RD_LEN: usize = 8;
+
+    fn is_vpn_family(family: Family) -> bool {
+        matches!(family, Family::IPV4_VPN | Family::IPV6_VPN)
+    }
+
+    fn is_flowspec_family(family: Family) -> bool {
+        matches!(
+            family,
+            Family::IPV4_FLOWSPEC
+                | Family::IPV6_FLOWSPEC
+                | Family::IPV4_FLOWSPEC_VPN
+                | Family::IPV6_FLOWSPEC_VPN
+        )
+    }
+
+    /// Parse the Next Hop field of `family` (NEXT_HOP attribute value, or
+    /// the MP_REACH_NLRI Next Hop field without the length octet).
+    ///
+    /// VPN families accept 12, 24 or 48 bytes, where each address is
+    /// preceded by a zero RD. Other families accept 4, 16 or 32 bytes.
+    /// An empty field returns None, also for FlowSpec, which carries no
+    /// next hop; the caller handles that case.
+    pub fn from_bytes(family: Family, b: &[u8]) -> Option<Self> {
+        if !Self::is_vpn_family(family) {
+            return Self::from_ip_bytes(b);
+        }
+        let rd_is_zero = |rd: &[u8]| rd.iter().all(|&x| x == 0);
+        let rd = Self::VPN_RD_LEN;
+        match b.len() {
+            12 | 24 if rd_is_zero(&b[..rd]) => Self::from_ip_bytes(&b[rd..]),
+            // RFC 4659 Section 3.2.1.1: RD + global, then RD + link-local.
+            48 if rd_is_zero(&b[..rd]) && rd_is_zero(&b[24..24 + rd]) => {
+                let mut v = Vec::with_capacity(32);
+                v.extend_from_slice(&b[rd..24]);
+                v.extend_from_slice(&b[24 + rd..]);
+                Self::from_ip_bytes(&v)
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse a next hop without RD (4, 16, or 32 bytes).
+    fn from_ip_bytes(b: &[u8]) -> Option<Self> {
         match b.len() {
             4 => Some(Nexthop::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))),
             16 => {
@@ -753,18 +797,45 @@ impl Nexthop {
         }
     }
 
-    /// Serialize to bytes for wire encoding.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        match self {
-            Nexthop::V4(addr) => addr.octets().to_vec(),
-            Nexthop::V6(addr) => addr.octets().to_vec(),
+    /// Serialize to the Next Hop field of `family` (NEXT_HOP attribute
+    /// value, or the MP_REACH_NLRI Next Hop field without the length octet).
+    ///
+    /// - FlowSpec carries no next hop (RFC 8955 Section 4): empty.
+    /// - An IPv4 next hop for an AFI=2 family is an IPv4-mapped IPv6
+    ///   address (RFC 4798 Section 2, RFC 4659 Section 3.2.1.2). SR Policy
+    ///   keeps it as is: its next-hop length does not depend on the AFI
+    ///   (RFC 9830 Section 2.1).
+    /// - VPN families put a zero RD before each address (RFC 4364
+    ///   Section 4.3.2, RFC 4659 Section 3.2.1.1): 12, 24 or 48 bytes.
+    pub fn to_bytes(&self, family: Family) -> Vec<u8> {
+        if Self::is_flowspec_family(family) {
+            return Vec::new();
+        }
+        let nexthop = match self {
+            Nexthop::V4(v4)
+                if family.afi() == Family::AFI_IP6 && family != Family::IPV6_SRPOLICY =>
+            {
+                Nexthop::V6(v4.to_ipv6_mapped())
+            }
+            _ => *self,
+        };
+        let vpn = Self::is_vpn_family(family);
+        let mut v = Vec::with_capacity(48);
+        let mut put = |octets: &[u8]| {
+            if vpn {
+                v.extend_from_slice(&[0; Self::VPN_RD_LEN]);
+            }
+            v.extend_from_slice(octets);
+        };
+        match nexthop {
+            Nexthop::V4(addr) => put(&addr.octets()),
+            Nexthop::V6(addr) => put(&addr.octets()),
             Nexthop::V6LinkLocal(global, ll) => {
-                let mut v = Vec::with_capacity(32);
-                v.extend_from_slice(&global.octets());
-                v.extend_from_slice(&ll.octets());
-                v
+                put(&global.octets());
+                put(&ll.octets());
             }
         }
+        v
     }
 
     /// Return the primary (global) IP address for forwarding decisions.
@@ -2403,39 +2474,12 @@ impl PeerCodec {
         dst.put_u8(family.safi());
         // Attribute transformation (nexthop rewrite) is applied by PeerExportContext
         // before routes enter PendingTx, so the nexthop here is already the export
-        // nexthop.  VPN families prefix the nexthop with an 8-byte zero RD (RFC 4364
-        // §4.3.2). Otherwise preserve the actual nexthop length: negotiating
-        // Extended Nexthop permits IPv6 nexthops but does not convert IPv4 ones.
-        // An IPv4 nexthop for an AFI=2 family is encoded as an IPv4-mapped IPv6
-        // address (RFC 4798 Section 2, RFC 4659 Section 3.2.1.2). SR Policy
-        // keeps the nexthop as-is: its nexthop length does not depend on the
-        // AFI (RFC 9830 Section 2.1).
-        let nexthop = match nexthop {
-            Some(Nexthop::V4(v4))
-                if family.afi() == Family::AFI_IP6 && *family != Family::IPV6_SRPOLICY =>
-            {
-                Some(Nexthop::V6(v4.to_ipv6_mapped()))
-            }
-            _ => *nexthop,
-        };
-        let nh_bytes = nexthop.map(|nh| nh.to_bytes()).unwrap_or_default();
-        if matches!(
-            *family,
-            Family::IPV4_FLOWSPEC
-                | Family::IPV6_FLOWSPEC
-                | Family::IPV4_FLOWSPEC_VPN
-                | Family::IPV6_FLOWSPEC_VPN
-        ) {
-            // Flowspec carries no nexthop (RFC 8955 §4): nexthop_len=0.
-            dst.put_u8(0);
-        } else if matches!(family, &Family::IPV4_VPN | &Family::IPV6_VPN) {
-            dst.put_u8(8 + nh_bytes.len() as u8);
-            dst.put_bytes(0, 8); // 8-byte zero RD (RFC 4364 §4.3.2)
-            dst.put_slice(&nh_bytes);
-        } else {
-            dst.put_u8(nh_bytes.len() as u8);
-            dst.put_slice(&nh_bytes);
-        }
+        // nexthop. Nexthop::to_bytes() applies the family-specific form. It
+        // preserves the actual nexthop length otherwise: negotiating Extended
+        // Nexthop permits IPv6 nexthops but does not convert IPv4 ones.
+        let nh_bytes = nexthop.map(|nh| nh.to_bytes(*family)).unwrap_or_default();
+        dst.put_u8(nh_bytes.len() as u8);
+        dst.put_slice(&nh_bytes);
         // SNPA padding
         dst.put_u8(0);
         let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
@@ -3014,8 +3058,9 @@ impl PeerCodec {
                                         } else if code == Attribute::MP_UNREACH {
                                             mp_unreach_attr = Some(a);
                                         } else if code == Attribute::NEXTHOP {
-                                            reach_nexthop =
-                                                a.binary().and_then(|b| Nexthop::from_bytes(b));
+                                            reach_nexthop = a
+                                                .binary()
+                                                .and_then(|b| Nexthop::from_bytes(Family::IPV4, b));
                                         } else if (code == Attribute::AS4_PATH
                                             || code == Attribute::AS4_AGGREGATOR)
                                             && !self.two_byte_as
@@ -3146,36 +3191,20 @@ impl PeerCodec {
                     if buf.len() < 5 + nexthop_len as usize {
                         return Err(err);
                     }
-                    let mut data = Vec::with_capacity(nexthop_len as usize);
-                    let nexthop = match nexthop_len {
-                        // FlowSpec carries no nexthop (RFC 8955 §4). Any other
-                        // family with nexthop_len=0 is malformed.
-                        0 if matches!(
-                            family,
-                            Family::IPV4_FLOWSPEC
-                                | Family::IPV6_FLOWSPEC
-                                | Family::IPV4_FLOWSPEC_VPN
-                                | Family::IPV6_FLOWSPEC_VPN
-                        ) =>
-                        {
-                            None
-                        }
-                        0 => return Err(err),
-                        4 | 16 | 32 => {
-                            let pos = c.position() as usize;
-                            data.extend_from_slice(&buf[pos..pos + nexthop_len as usize]);
-                            c.set_position(pos as u64 + nexthop_len as u64);
-                            Nexthop::from_bytes(&data)
-                        }
-                        // VPN nexthop (RFC 4364 §4.3.2): 8-byte RD (must be 0) + IP address.
-                        12 | 24 => {
-                            let pos = c.position() as usize;
-                            data.extend_from_slice(&buf[pos + 8..pos + nexthop_len as usize]);
-                            c.set_position(pos as u64 + nexthop_len as u64);
-                            Nexthop::from_bytes(&data)
-                        }
-                        _ => return Err(err),
+                    let pos = c.position() as usize;
+                    let nexthop = if nexthop_len == 0 && Nexthop::is_flowspec_family(family) {
+                        // FlowSpec carries no nexthop (RFC 8955 Section 4).
+                        None
+                    } else {
+                        // Any other family with nexthop_len=0 is malformed;
+                        // from_bytes() also rejects a length or RD that does
+                        // not match the family.
+                        Some(
+                            Nexthop::from_bytes(family, &buf[pos..pos + nexthop_len as usize])
+                                .ok_or(err)?,
+                        )
                     };
+                    c.set_position(pos as u64 + nexthop_len as u64);
                     c.read_u8().unwrap();
                     let entries = Self::decode_nlri_list(
                         family,
@@ -6180,6 +6209,157 @@ mod update_tests {
                 assert_eq!(r.entries, vec![nlri]);
             }
             _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_vpnv6_link_local_nexthop_is_48_bytes() {
+        use crate::mpls::{MplsLabel, MplsLabelStack};
+        use crate::vpn::VpnV6Nlri;
+        let nlri = PathNlri::new(Nlri::VpnV6(VpnV6Nlri {
+            labels: MplsLabelStack::new(vec![MplsLabel::new(200)]),
+            rd: RouteDistinguisher::TwoOctetAs {
+                admin: 65001,
+                assigned: 1,
+            },
+            prefix: Ipv6Net {
+                addr: "2001:db8:1::".parse().unwrap(),
+                mask: 48,
+            },
+        }));
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let ll: Ipv6Addr = "fe80::1".parse().unwrap();
+        let nexthop = Nexthop::V6LinkLocal(global, ll);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6_VPN,
+            entries: vec![nlri.clone()],
+            nexthop: Some(nexthop),
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::empty_as_path(),
+            ]),
+        });
+        // RFC 4659 Section 3.2.1.1: a zero RD before the global address and
+        // another zero RD before the link-local address.
+        let mut wire = BytesMut::new();
+        vpnv6_codec().mp_reach_encode(
+            0,
+            &mut wire,
+            &Family::IPV6_VPN,
+            std::slice::from_ref(&nlri),
+            &Some(nexthop),
+        );
+        let mut expected = vec![48];
+        expected.extend_from_slice(&[0; 8]);
+        expected.extend_from_slice(&global.octets());
+        expected.extend_from_slice(&[0; 8]);
+        expected.extend_from_slice(&ll.octets());
+        assert_eq!(&wire[7..56], &expected[..]);
+        match round_trip(&msg, vpnv6_codec()) {
+            ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
+                let r = mp_reach.expect("mp_reach must be present for VPNv6");
+                assert_eq!(r.nexthop, Some(nexthop));
+                assert_eq!(r.entries, vec![nlri]);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    fn mp_reach_nexthop_update(family: Family, nexthop: &[u8]) -> Vec<u8> {
+        let mut attr = vec![0x80, 0x0E, (5 + nexthop.len()) as u8];
+        attr.extend_from_slice(&family.afi().to_be_bytes());
+        attr.push(family.safi());
+        attr.push(nexthop.len() as u8);
+        attr.extend_from_slice(nexthop);
+        attr.push(0);
+        let attr_len = attr.len() as u16;
+        let total = 19u16 + 2 + 2 + attr_len;
+        let mut buf = vec![0xff; 16];
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.push(2);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(&attr);
+        buf
+    }
+
+    #[test]
+    fn mp_reach_nexthop_length_must_match_family() {
+        let rd = [0u8; 8];
+        let v6 = Ipv6Addr::from_str("2001:db8::1").unwrap().octets();
+        let mut vpn_v6 = rd.to_vec();
+        vpn_v6.extend_from_slice(&v6);
+        let mut bad_rd = vpn_v6.clone();
+        bad_rd[7] = 1;
+        for (family, nexthop) in [
+            // VPN next hops without the RD.
+            (Family::IPV6_VPN, v6.to_vec()),
+            (Family::IPV4_VPN, vec![192, 0, 2, 1]),
+            // An RD for a family that does not use one.
+            (Family::IPV6, vpn_v6),
+            // RFC 4659 Section 3.2.1.1: the RD is zero.
+            (Family::IPV6_VPN, bad_rd),
+        ] {
+            let caps = vec![Capability::MultiProtocol(family)];
+            let mut codec = PeerCodec::negotiate(&caps, &caps);
+            match codec.parse_message(&mp_reach_nexthop_update(family, &nexthop)) {
+                Err(Notification::UpdateOptionalAttributeError) => {}
+                Err(e) => panic!("expected UpdateOptionalAttributeError, got Err({})", e),
+                Ok(_) => panic!(
+                    "{family:?} with {}-byte nexthop: expected Err",
+                    nexthop.len()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn nexthop_bytes_depend_on_family() {
+        let v4: Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let ll: Ipv6Addr = "fe80::1".parse().unwrap();
+        let rd = [0u8; 8];
+        let cat = |parts: &[&[u8]]| parts.concat();
+        for (family, nexthop, bytes) in [
+            (Family::IPV4, Nexthop::V4(v4), v4.octets().to_vec()),
+            (
+                Family::IPV6,
+                Nexthop::V4(v4),
+                v4.to_ipv6_mapped().octets().to_vec(),
+            ),
+            (Family::IPV6_SRPOLICY, Nexthop::V4(v4), v4.octets().to_vec()),
+            (
+                Family::IPV6,
+                Nexthop::V6LinkLocal(global, ll),
+                cat(&[&global.octets(), &ll.octets()]),
+            ),
+            (Family::IPV4_VPN, Nexthop::V4(v4), cat(&[&rd, &v4.octets()])),
+            (
+                Family::IPV4_VPN,
+                Nexthop::V6(global),
+                cat(&[&rd, &global.octets()]),
+            ),
+            (
+                Family::IPV6_VPN,
+                Nexthop::V4(v4),
+                cat(&[&rd, &v4.to_ipv6_mapped().octets()]),
+            ),
+            (
+                Family::IPV6_VPN,
+                Nexthop::V6LinkLocal(global, ll),
+                cat(&[&rd, &global.octets(), &rd, &ll.octets()]),
+            ),
+        ] {
+            assert_eq!(nexthop.to_bytes(family), bytes, "{family:?} {nexthop}");
+            assert_eq!(
+                Nexthop::from_bytes(family, &bytes),
+                Some(nexthop),
+                "{family:?} {nexthop}"
+            );
+        }
+        // RFC 8955 Section 4: FlowSpec carries no next hop.
+        for family in [Family::IPV4_FLOWSPEC, Family::IPV6_FLOWSPEC_VPN] {
+            assert!(Nexthop::V4(v4).to_bytes(family).is_empty());
         }
     }
 
