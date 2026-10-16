@@ -2457,23 +2457,19 @@ impl GoBgpService for GrpcService {
                         );
                     }
                     let destinations = sink.destinations;
-                    let mut path_count = 0u64;
-                    let v: Vec<_> = destinations
-                        .into_iter()
-                        .take_while(|d| {
+                    let (tx, rx) = mpsc::channel(1024);
+                    tokio::spawn(async move {
+                        let mut path_count = 0u64;
+                        for d in destinations.into_iter().take_while(|d| {
                             if batch_size == 0 {
                                 return true;
                             }
                             path_count += d.paths.len() as u64;
                             path_count <= batch_size
-                        })
-                        .map(|d| api::ListPathResponse {
-                            destination: Some(convert::destination_to_api(d, family, &binary)),
-                        })
-                        .collect();
-                    let (tx, rx) = mpsc::channel(1024);
-                    tokio::spawn(async move {
-                        for r in v {
+                        }) {
+                            let r = api::ListPathResponse {
+                                destination: Some(convert::destination_to_api(d, family, &binary)),
+                            };
                             if tx.send(Ok(r)).await.is_err() {
                                 break;
                             }
