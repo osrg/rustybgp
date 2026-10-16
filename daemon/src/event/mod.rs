@@ -10592,6 +10592,138 @@ local-address = "{local}"
         assert!(svc.tables.collect_loc_rib_paths(Family::IPV4).is_empty());
     }
 
+    async fn assert_list_path_backpressure(
+        svc: &GrpcService,
+        request: api::ListPathRequest,
+        source: &Arc<table::Source>,
+        destinations: usize,
+    ) {
+        let baseline = Arc::strong_count(source);
+        let stream = svc
+            .list_path(tonic::Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        // Each unconverted snapshot path holds one source reference. Count
+        // those references to detect eager conversion without allocator tests.
+        assert_eq!(Arc::strong_count(source), baseline + destinations);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let remaining = Arc::strong_count(source) - baseline;
+                if remaining <= destinations - 1024 {
+                    // The queue holds 1024 responses, with at most one more
+                    // converted response waiting for the consumer.
+                    assert!(remaining >= destinations - 1025);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(source) != baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn insert_list_path_test_routes(
+        svc: &GrpcService,
+        destinations: u32,
+        paths_per_destination: u32,
+    ) -> Arc<table::Source> {
+        let source = Arc::new(table::Source::new(
+            "10.0.0.2".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            65002,
+            65001,
+            Ipv4Addr::new(10, 0, 0, 2),
+            PeerRole::Ebgp,
+        ));
+        let attr = Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+        ]);
+        for i in 0..destinations {
+            for path_id in 0..paths_per_destination {
+                svc.tables.insert_route(
+                    source.clone(),
+                    Family::IPV4,
+                    packet::PathNlri {
+                        nlri: format!("{}/32", Ipv4Addr::from(0xc6120000 + i))
+                            .parse()
+                            .unwrap(),
+                        path_id,
+                    },
+                    Some(bgp::Nexthop::V4("192.0.2.1".parse().unwrap())),
+                    attr.clone(),
+                    None,
+                    0,
+                );
+            }
+        }
+        source
+    }
+
+    #[tokio::test]
+    async fn list_path_conversion_obeys_backpressure_and_cancellation() {
+        let svc = make_grpc_service();
+        let source = insert_list_path_test_routes(&svc, 2048, 1);
+        for table_type in [
+            api::TableType::Global,
+            api::TableType::Local,
+            api::TableType::AdjIn,
+        ] {
+            for (only_binary, attribute_binary) in [(false, false), (false, true), (true, true)] {
+                assert_list_path_backpressure(
+                    &svc,
+                    api::ListPathRequest {
+                        table_type: table_type as i32,
+                        name: if table_type == api::TableType::AdjIn {
+                            source.remote_addr.to_string()
+                        } else {
+                            String::new()
+                        },
+                        enable_only_binary: only_binary,
+                        enable_attribute_binary: attribute_binary,
+                        ..Default::default()
+                    },
+                    &source,
+                    2048,
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_path_stream_preserves_whole_destination_batch_limits() {
+        let svc = make_grpc_service();
+        let source = insert_list_path_test_routes(&svc, 3, 2);
+        for (batch_size, expected_paths) in [(0, 6), (1, 0), (2, 2), (3, 2), (4, 4), (7, 6)] {
+            let mut stream = svc
+                .list_path(tonic::Request::new(api::ListPathRequest {
+                    table_type: api::TableType::AdjIn as i32,
+                    name: source.remote_addr.to_string(),
+                    batch_size,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut paths = 0;
+            while let Some(response) = stream.next().await {
+                let destination = response.unwrap().destination.unwrap();
+                assert_eq!(destination.paths.len(), 2);
+                paths += destination.paths.len();
+            }
+            assert_eq!(paths, expected_paths);
+        }
+    }
+
     #[tokio::test]
     async fn list_path_adj_in_restores_structured_and_binary_nexthops() {
         let svc = make_grpc_service();
