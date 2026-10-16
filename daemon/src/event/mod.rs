@@ -12882,7 +12882,7 @@ port = 3323
     #[tokio::test]
     async fn adj_out_established_returns_paths() {
         let svc = make_grpc_service();
-        let peer_addr: IpAddr = "10.0.0.2".parse().unwrap();
+        let peer_addr: IpAddr = "10.0.0.3".parse().unwrap();
 
         svc.add_peer(tonic::Request::new(api::AddPeerRequest {
             peer: Some(api::Peer {
@@ -12951,6 +12951,23 @@ port = 3323
             1,
             "adj-out must show the injected route for an Established peer"
         );
+
+        let source = insert_list_path_test_routes(&svc, 2048, 1);
+        for (only_binary, attribute_binary) in [(false, false), (false, true), (true, true)] {
+            assert_list_path_backpressure(
+                &svc,
+                api::ListPathRequest {
+                    table_type: api::TableType::AdjOut as i32,
+                    name: peer_addr.to_string(),
+                    enable_only_binary: only_binary,
+                    enable_attribute_binary: attribute_binary,
+                    ..Default::default()
+                },
+                &source,
+                2048,
+            )
+            .await;
+        }
     }
 
     // --- apply_config listen-port tests ---
