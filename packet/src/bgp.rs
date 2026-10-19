@@ -79,9 +79,10 @@ pub enum Notification {
     #[error("hold timer expired")]
     HoldTimerExpired,
 
-    // Code 5: FSM Error
-    #[error("FSM error: unexpected state {state}")]
-    FsmUnexpectedState { state: u8 },
+    // Code 5: FSM Error. `subcode` is the RFC 6608 subcode: 0 unspecified,
+    // 1/2/3 unexpected message in OpenSent/OpenConfirm/Established.
+    #[error("FSM error: subcode {subcode}")]
+    FsmUnexpectedState { subcode: u8 },
 
     // Code 6: Cease (RFC 4486)
     #[error("cease: maximum number of prefixes reached")]
@@ -177,7 +178,7 @@ impl Notification {
             Self::UpdateInvalidNetworkField => 10,
             Self::UpdateMalformedAsPath => 11,
             Self::HoldTimerExpired => 0,
-            Self::FsmUnexpectedState { state } => *state,
+            Self::FsmUnexpectedState { subcode } => *subcode,
             Self::CeaseMaxPrefixReached => 1,
             Self::CeaseAdminShutdown => 2,
             Self::CeasePeerDeconfigured => 3,
@@ -242,7 +243,7 @@ impl Notification {
             (3, 10) => Self::UpdateInvalidNetworkField,
             (3, 11) => Self::UpdateMalformedAsPath,
             (4, _) => Self::HoldTimerExpired,
-            (5, state) => Self::FsmUnexpectedState { state },
+            (5, subcode) => Self::FsmUnexpectedState { subcode },
             (6, 1) => Self::CeaseMaxPrefixReached,
             (6, 2) => Self::CeaseAdminShutdown,
             (6, 3) => Self::CeasePeerDeconfigured,
@@ -4888,7 +4889,7 @@ mod misc_tests {
         assert_eq!(err.notification_code(), 1);
         assert_eq!(err.notification_subcode(), 2);
         assert_eq!(err.notification_data(), &[0x10, 0x00]);
-        let err = Notification::FsmUnexpectedState { state: 3 };
+        let err = Notification::FsmUnexpectedState { subcode: 3 };
         assert_eq!(err.notification_code(), 5);
         assert_eq!(err.notification_subcode(), 3);
     }
