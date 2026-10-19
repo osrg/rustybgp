@@ -2368,6 +2368,15 @@ enum Step {
     },
 }
 
+/// Converts a looped announcement into a withdraw of the same NLRIs,
+/// keeping each entry's Add-Path path ID.
+fn reach_as_withdraw(reach: bgp::ReachNlri) -> packet::UnreachNlri {
+    packet::UnreachNlri {
+        family: reach.family,
+        entries: reach.entries,
+    }
+}
+
 /// I/O driver for one TCP connection (one BGP session).
 ///
 /// Lifetime: a single BGP session — from `accept_connection` until the TCP
@@ -3220,6 +3229,42 @@ impl PeerSession {
         true
     }
 
+    /// Returns `true` when a received announcement with `attr` has looped
+    /// back to this speaker (RFC 4271 §9.1.2, RFC 4456 §8).
+    fn is_looped(&self, attr: &Arc<Vec<packet::Attribute>>) -> bool {
+        if is_as_loop(
+            attr,
+            self.export_ctx.local_asn,
+            self.export_ctx.confederation_id,
+        ) {
+            return true;
+        }
+        let local_rid = u32::from(self.local_router_id);
+        let originator_loop = attr
+            .iter()
+            .find(|a| a.code() == packet::Attribute::ORIGINATOR_ID)
+            .is_some_and(|a| a.value().unwrap_or(0) == local_rid);
+        let cluster_loop = matches!(
+            self.export_ctx.role,
+            PeerRole::Ibgp | PeerRole::IbgpRrClient
+        ) && {
+            let local_ids = self.local_cluster_ids.load();
+            !local_ids.is_empty()
+                && attr
+                    .iter()
+                    .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
+                    .is_some_and(|a| {
+                        a.binary().is_some_and(|b| {
+                            b.as_chunks::<4>()
+                                .0
+                                .iter()
+                                .any(|c| local_ids.contains(&Ipv4Addr::new(c[0], c[1], c[2], c[3])))
+                        })
+                    })
+        };
+        originator_loop || cluster_loop
+    }
+
     /// Returns `true` if the per-peer prefix limit was exceeded (RFC 4486 §2).
     /// The caller must send a CEASE NOTIFICATION and close the session.
     async fn rx_update(
@@ -3229,35 +3274,16 @@ impl PeerSession {
         attr: Arc<Vec<packet::Attribute>>,
         timestamp: u32,
     ) -> bool {
-        // RFC 4456 §8 loop detection: discard UPDATE if ORIGINATOR_ID equals
-        // local router-id, or if CLUSTER_LIST already contains local cluster-id.
-        if reach.is_some() {
-            let local_rid = u32::from(self.local_router_id);
-            let originator_loop = attr
-                .iter()
-                .find(|a| a.code() == packet::Attribute::ORIGINATOR_ID)
-                .is_some_and(|a| a.value().unwrap_or(0) == local_rid);
-            let cluster_loop = matches!(
-                self.export_ctx.role,
-                PeerRole::Ibgp | PeerRole::IbgpRrClient
-            ) && {
-                let local_ids = self.local_cluster_ids.load();
-                !local_ids.is_empty()
-                    && attr
-                        .iter()
-                        .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
-                        .is_some_and(|a| {
-                            a.binary().is_some_and(|b| {
-                                b.as_chunks::<4>().0.iter().any(|c| {
-                                    local_ids.contains(&Ipv4Addr::new(c[0], c[1], c[2], c[3]))
-                                })
-                            })
-                        })
-            };
-            if originator_loop || cluster_loop {
-                return false;
-            }
-        }
+        // Loop detection: the local AS (or confederation ID) in AS_PATH
+        // (RFC 4271 §9.1.2), ORIGINATOR_ID equal to the local router-id, or a
+        // local cluster-id in CLUSTER_LIST (RFC 4456 §8) makes the route
+        // unusable. The UPDATE still replaces whatever this peer previously
+        // advertised for those NLRIs, so treat it as a withdraw rather than
+        // ignoring it (which would leave the stale path in the RIB).
+        let (reach, looped) = match reach {
+            Some(r) if self.is_looped(&attr) => (None, Some(reach_as_withdraw(r))),
+            r => (r, None),
+        };
         // Inject default LOCAL_PREF for iBGP announcements that omit it.
         let attr = if reach.is_some()
             && matches!(
@@ -3290,7 +3316,7 @@ impl PeerSession {
                 }
             }
         }
-        if let Some(s) = unreach {
+        for s in unreach.into_iter().chain(looped) {
             let family = s.family;
             let source = self.source[&family].clone();
             let prefix_counter = self
@@ -3630,15 +3656,8 @@ impl PeerSession {
                                             }
                                             Ok(iter) => {
                                                 for msg in iter {
-                                                    if let bgp::Message::Update(bgp::Update::Reach { attr, .. }) = &msg
-                                                        && is_as_loop(
-                                                            attr,
-                                                            self.export_ctx.local_asn,
-                                                            self.export_ctx.confederation_id,
-                                                        )
-                                                    {
-                                                        continue;
-                                                    }
+                                                    // Looped announcements still go through the FSM
+                                                    // (hold timer); rx_update turns them into withdraws.
                                                     let step = self.rx_msg(global, local_sockaddr, remote_sockaddr, msg).await;
                                                     if matches!(step, Step::Terminate { .. }) {
                                                         return step;
@@ -12290,26 +12309,83 @@ port = 3323
         assert!(rpki_sockaddr_from_config(&s).is_none());
     }
 
-    // ---- rx_update: RFC 4456 loop detection ----
+    // ---- rx_update: loop detection (RFC 4271 §9.1.2, RFC 4456 §8) ----
     //
-    // new_for_test sets local_router_id = 1.0.0.1.  Loop detection fires before
-    // source lookup, so no source setup is required; the absence of an inserted
-    // route is verified via table_state().
+    // new_for_test sets local_router_id = 1.0.0.1 and local_asn = 65001.  Each
+    // test first installs a valid path from the peer, then sends a looped
+    // UPDATE for the same prefix: the looped UPDATE must act as an implicit
+    // withdraw of the earlier path, not be ignored.
 
     fn reach_set(prefix: &str) -> Option<bgp::ReachNlri> {
+        reach_set_with_id(prefix, 0)
+    }
+
+    fn reach_set_with_id(prefix: &str, path_id: u32) -> Option<bgp::ReachNlri> {
         Some(bgp::ReachNlri {
             family: Family::IPV4,
-            entries: vec![packet::PathNlri::new(prefix.parse().unwrap())],
+            entries: vec![packet::PathNlri {
+                path_id,
+                nlri: prefix.parse().unwrap(),
+            }],
             nexthop: None,
         })
     }
 
-    #[tokio::test]
-    async fn rx_update_originator_id_loop_drops_route() {
-        let tables = make_tables();
-        let context = make_context();
+    fn loop_test_session(tables: &TableHandle, role: PeerRole) -> PeerSession {
         let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
-        let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
+        let mut session = PeerSession::new_for_test(remote_addr, make_context(), tables.clone());
+        session.export_ctx.role = role;
+        let remote_asn = if role == PeerRole::Ebgp { 65002 } else { 65001 };
+        session.source.insert(
+            Family::IPV4,
+            Arc::new(table::Source::new(
+                remote_addr,
+                "127.0.0.1".parse().unwrap(),
+                remote_asn,
+                65001,
+                Ipv4Addr::new(10, 0, 0, 2),
+                role,
+            )),
+        );
+        session
+    }
+
+    fn origin_only() -> Arc<Vec<packet::Attribute>> {
+        Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+        ])
+    }
+
+    /// Install a valid path, send `looped` for the same prefix, and assert the
+    /// looped UPDATE withdrew the earlier path.
+    async fn assert_loop_withdraws(
+        session: &mut PeerSession,
+        tables: &TableHandle,
+        looped: Arc<Vec<packet::Attribute>>,
+    ) {
+        assert!(
+            !session
+                .rx_update(reach_set("10.0.0.0/24"), None, origin_only(), 0u32)
+                .await
+        );
+        assert_eq!(tables.table_state(Family::IPV4).num_destination, 1);
+
+        let exceeded = session
+            .rx_update(reach_set("10.0.0.0/24"), None, looped, 0u32)
+            .await;
+
+        assert!(!exceeded, "loop detection must not trigger CEASE");
+        let state = tables.table_state(Family::IPV4);
+        assert_eq!(
+            state.num_destination, 0,
+            "looped UPDATE must withdraw the peer's previous path"
+        );
+    }
+
+    #[tokio::test]
+    async fn rx_update_originator_id_loop_withdraws_route() {
+        let tables = make_tables();
+        let mut session = loop_test_session(&tables, PeerRole::Ibgp);
         // local_router_id is 1.0.0.1 in new_for_test
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_value(
@@ -12318,24 +12394,14 @@ port = 3323
             )
             .unwrap(),
         ]);
-
-        let exceeded = session
-            .rx_update(reach_set("10.0.0.0/24"), None, attrs, 0u32)
-            .await;
-
-        assert!(!exceeded, "loop detection must not trigger CEASE");
-        let state = tables.table_state(Family::IPV4);
-        assert_eq!(state.num_destination, 0, "route must not be inserted");
+        assert_loop_withdraws(&mut session, &tables, attrs).await;
     }
 
     #[tokio::test]
-    async fn rx_update_cluster_list_loop_drops_route() {
+    async fn rx_update_cluster_list_loop_withdraws_route() {
         let tables = make_tables();
-        let context = make_context();
-        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
-        let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
+        let mut session = loop_test_session(&tables, PeerRole::IbgpRrClient);
         let local_cid = Ipv4Addr::new(1, 2, 3, 4);
-        session.export_ctx.role = PeerRole::IbgpRrClient;
         session
             .local_cluster_ids
             .store(Arc::new([local_cid].into_iter().collect()));
@@ -12343,25 +12409,15 @@ port = 3323
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cid_bytes).unwrap(),
         ]);
-
-        let exceeded = session
-            .rx_update(reach_set("10.0.0.0/24"), None, attrs, 0u32)
-            .await;
-
-        assert!(!exceeded, "loop detection must not trigger CEASE");
-        let state = tables.table_state(Family::IPV4);
-        assert_eq!(state.num_destination, 0, "route must not be inserted");
+        assert_loop_withdraws(&mut session, &tables, attrs).await;
     }
 
     // local cluster_id appears in the middle of a multi-entry CLUSTER_LIST
     #[tokio::test]
     async fn rx_update_cluster_list_loop_detects_middle_entry() {
         let tables = make_tables();
-        let context = make_context();
-        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
-        let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
+        let mut session = loop_test_session(&tables, PeerRole::Ibgp);
         let local_cid = Ipv4Addr::new(1, 2, 3, 4);
-        session.export_ctx.role = PeerRole::Ibgp;
         session
             .local_cluster_ids
             .store(Arc::new([local_cid].into_iter().collect()));
@@ -12373,14 +12429,68 @@ port = 3323
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cid_bytes).unwrap(),
         ]);
+        assert_loop_withdraws(&mut session, &tables, attrs).await;
+    }
 
-        let exceeded = session
-            .rx_update(reach_set("10.0.0.0/24"), None, attrs, 0u32)
+    fn as_path_attr(asns: &[u32]) -> Arc<Vec<packet::Attribute>> {
+        let mut bin = vec![packet::Attribute::AS_PATH_TYPE_SEQ, asns.len() as u8];
+        for asn in asns {
+            bin.extend_from_slice(&asn.to_be_bytes());
+        }
+        Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+            packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, bin).unwrap(),
+        ])
+    }
+
+    #[tokio::test]
+    async fn rx_update_as_path_loop_withdraws_route() {
+        let tables = make_tables();
+        let mut session = loop_test_session(&tables, PeerRole::Ebgp);
+        // local_asn is 65001 in new_for_test
+        assert_loop_withdraws(&mut session, &tables, as_path_attr(&[65002, 65001])).await;
+    }
+
+    // Add-Path: the looped UPDATE withdraws only the path with the same path ID.
+    #[tokio::test]
+    async fn rx_update_as_path_loop_withdraws_matching_path_id_only() {
+        let tables = make_tables();
+        let mut session = loop_test_session(&tables, PeerRole::Ebgp);
+        for id in [1, 2] {
+            session
+                .rx_update(reach_set_with_id("10.0.0.0/24", id), None, origin_only(), 0)
+                .await;
+        }
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+        let received = |t: &TableHandle| {
+            t.collect_peer_stats(&[peer])
+                .get(&peer)
+                .and_then(|s| s.get(&Family::IPV4))
+                .map(|s| s.received)
+        };
+        assert_eq!(received(&tables), Some(2));
+
+        session
+            .rx_update(
+                reach_set_with_id("10.0.0.0/24", 2),
+                None,
+                as_path_attr(&[65002, 65001]),
+                0,
+            )
             .await;
 
-        assert!(!exceeded, "loop detection must not trigger CEASE");
-        let state = tables.table_state(Family::IPV4);
-        assert_eq!(state.num_destination, 0, "route must not be inserted");
+        assert_eq!(received(&tables), Some(1));
+        assert_eq!(tables.table_state(Family::IPV4).num_destination, 1);
+    }
+
+    #[test]
+    fn reach_as_withdraw_keeps_nlris_and_path_ids() {
+        let reach = reach_set_with_id("10.0.0.0/24", 7).unwrap();
+        let u = reach_as_withdraw(reach);
+        assert_eq!(u.family, Family::IPV4);
+        assert_eq!(u.entries.len(), 1);
+        assert_eq!(u.entries[0].path_id, 7);
+        assert_eq!(u.entries[0].nlri, "10.0.0.0/24".parse().unwrap());
     }
 
     fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
