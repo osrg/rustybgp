@@ -69,7 +69,44 @@ impl Message {
     pub const IPV6_PREFIX: u8 = 6;
     pub const END_OF_DATA: u8 = 7;
     pub const CACHE_RESET: u8 = 8;
+    pub const ROUTER_KEY: u8 = 9;
     pub const ERROR_REPORT: u8 = 10;
+
+    /// Length of the common PDU header (RFC 8210 section 5.1).
+    const HEADER_LENGTH: usize = 8;
+    /// Upper bound for variable-length PDUs (Router Key, Error Report), so a
+    /// bogus length cannot make the decoder buffer without limit.
+    const MAX_LENGTH: usize = 65536;
+
+    /// Checks the length field of a PDU header against its type
+    /// (RFC 8210 section 5). Unknown types are an error.
+    fn check_length(version: u8, message_type: u8, length: usize) -> Result<(), Error> {
+        let ok = match message_type {
+            Message::SERIAL_NOTIFY | Message::SERIAL_QUERY => length == 12,
+            Message::RESET_QUERY | Message::CACHE_RESPONSE | Message::CACHE_RESET => length == 8,
+            Message::IPV4_PREFIX => length == 20,
+            Message::IPV6_PREFIX => length == 32,
+            Message::END_OF_DATA => length == if version >= 1 { 24 } else { 12 },
+            // Header + SKI (20) + ASN (4) + SPKI.
+            Message::ROUTER_KEY if version >= 1 => (32..=Message::MAX_LENGTH).contains(&length),
+            // Header + encapsulated PDU length (4) + error text length (4).
+            Message::ERROR_REPORT => (16..=Message::MAX_LENGTH).contains(&length),
+            _ => {
+                return Err(Error::ParseError(format!(
+                    "unknown RPKI message type: {}",
+                    message_type
+                )));
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::ParseError(format!(
+                "invalid RPKI message length {} for type {}",
+                length, message_type
+            )))
+        }
+    }
 
     fn to_bytes(&self, version: u8) -> Result<Vec<u8>, Error> {
         let buf: Vec<u8> = Vec::new();
@@ -168,14 +205,24 @@ impl Message {
                 c.write_u8(version)?;
                 c.write_u8(Message::ERROR_REPORT)?;
                 c.write_u16::<NetworkEndian>(*error_code)?;
-                c.write_u32::<NetworkEndian>(8)?;
+                c.write_u32::<NetworkEndian>(16)?;
+                // No encapsulated PDU and no error text.
+                c.write_u32::<NetworkEndian>(0)?;
+                c.write_u32::<NetworkEndian>(0)?;
             }
         }
         Ok(c.into_inner())
     }
 
-    fn from_bytes(buf: &[u8]) -> Result<(Message, usize), Error> {
-        let buflen = buf.len();
+    /// Parses one PDU from `buf`. Returns `Ok(None)` if `buf` does not yet
+    /// hold the whole PDU, and an error if the PDU is malformed or of an
+    /// unsupported type. The returned length is the number of bytes to
+    /// consume; the message is `None` for PDUs that are skipped.
+    #[allow(clippy::type_complexity)]
+    fn from_bytes(buf: &[u8]) -> Result<Option<(Option<Message>, usize)>, Error> {
+        if buf.len() < Message::HEADER_LENGTH {
+            return Ok(None);
+        }
         let mut c = Cursor::new(buf);
 
         let version = c.read_u8()?;
@@ -184,35 +231,28 @@ impl Message {
         let session_id = c.read_u16::<NetworkEndian>()?;
         let length = c.read_u32::<NetworkEndian>()? as usize;
 
-        if length > buflen {
-            return Err(Error::ParseError(
-                "RPKI message length exceeds buffer".to_string(),
-            ));
+        Message::check_length(version, message_type, length)?;
+        if length > buf.len() {
+            return Ok(None);
         }
 
-        match message_type {
+        let msg = match message_type {
             Message::SERIAL_NOTIFY => {
                 let serial_number = c.read_u32::<NetworkEndian>()?;
-                Ok((
-                    Message::SerialNotify {
-                        session_id,
-                        serial_number,
-                    },
-                    length,
-                ))
+                Message::SerialNotify {
+                    session_id,
+                    serial_number,
+                }
             }
             Message::SERIAL_QUERY => {
                 let serial_number = c.read_u32::<NetworkEndian>()?;
-                Ok((
-                    Message::SerialQuery {
-                        session_id,
-                        serial_number,
-                    },
-                    length,
-                ))
+                Message::SerialQuery {
+                    session_id,
+                    serial_number,
+                }
             }
-            Message::RESET_QUERY => Ok((Message::ResetQuery, length)),
-            Message::CACHE_RESPONSE => Ok((Message::CacheResponse { session_id }, length)),
+            Message::RESET_QUERY => Message::ResetQuery,
+            Message::CACHE_RESPONSE => Message::CacheResponse { session_id },
             Message::IPV4_PREFIX => {
                 let flags = c.read_u8()?;
                 let prefix_len = c.read_u8()?;
@@ -223,15 +263,12 @@ impl Message {
                     octets[i as usize] = c.read_u8()?;
                 }
                 let as_number = c.read_u32::<NetworkEndian>()?;
-                Ok((
-                    Message::IpPrefix(Prefix {
-                        net: IpNet::new(IpAddr::from(octets), prefix_len),
-                        flags,
-                        max_length,
-                        as_number,
-                    }),
-                    length,
-                ))
+                Message::IpPrefix(Prefix {
+                    net: IpNet::new(IpAddr::from(octets), prefix_len),
+                    flags,
+                    max_length,
+                    as_number,
+                })
             }
             Message::IPV6_PREFIX => {
                 let flags = c.read_u8()?;
@@ -243,15 +280,12 @@ impl Message {
                     octets[i as usize] = c.read_u8()?;
                 }
                 let as_number = c.read_u32::<NetworkEndian>()?;
-                Ok((
-                    Message::IpPrefix(Prefix {
-                        net: IpNet::new(IpAddr::from(octets), prefix_len),
-                        flags,
-                        max_length,
-                        as_number,
-                    }),
-                    length,
-                ))
+                Message::IpPrefix(Prefix {
+                    net: IpNet::new(IpAddr::from(octets), prefix_len),
+                    flags,
+                    max_length,
+                    as_number,
+                })
             }
             Message::END_OF_DATA => {
                 let serial_number = c.read_u32::<NetworkEndian>()?;
@@ -265,31 +299,30 @@ impl Message {
                 } else {
                     (0, 0, 0)
                 };
-                Ok((
-                    Message::EndOfData {
-                        session_id,
-                        serial_number,
-                        refresh_interval,
-                        retry_interval,
-                        expire_interval,
-                    },
-                    length,
-                ))
+                Message::EndOfData {
+                    session_id,
+                    serial_number,
+                    refresh_interval,
+                    retry_interval,
+                    expire_interval,
+                }
             }
-            Message::CACHE_RESET => Ok((Message::CacheReset, length)),
+            Message::CACHE_RESET => Message::CacheReset,
             // For ErrorReport, bytes 2-3 of the common header carry the error code
             // rather than a session ID (RFC 8210 section 10).
-            Message::ERROR_REPORT => Ok((
-                Message::ErrorReport {
-                    error_code: session_id,
-                },
-                length,
-            )),
-            _ => Err(Error::ParseError(format!(
-                "unknown RPKI message type: {}",
-                message_type
-            ))),
-        }
+            Message::ERROR_REPORT => Message::ErrorReport {
+                error_code: session_id,
+            },
+            // Router Key PDUs (BGPsec) are not used; skip them.
+            Message::ROUTER_KEY => return Ok(Some((None, length))),
+            _ => {
+                return Err(Error::ParseError(format!(
+                    "unknown RPKI message type: {}",
+                    message_type
+                )));
+            }
+        };
+        Ok(Some((Some(msg), length)))
     }
 }
 
@@ -332,13 +365,13 @@ impl Decoder for RtrCodec {
     type Error = Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        match Message::from_bytes(src) {
-            Ok((m, len)) => {
-                let _ = src.split_to(len);
-                Ok(Some(m))
+        while let Some((m, len)) = Message::from_bytes(src)? {
+            let _ = src.split_to(len);
+            if m.is_some() {
+                return Ok(m);
             }
-            Err(_) => Ok(None),
         }
+        Ok(None)
     }
 }
 
@@ -507,7 +540,15 @@ mod tests {
             0,
             0,
             0,
-            8, // length = 8 (minimal)
+            16, // length = 16 (no encapsulated PDU, no text)
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         ];
         let mut buf = BytesMut::from(raw);
         let msg = decode(&mut buf);
@@ -515,5 +556,88 @@ mod tests {
             Message::ErrorReport { error_code } => assert_eq!(error_code, 2),
             _ => panic!("unexpected message type"),
         }
+    }
+
+    fn try_decode(raw: &[u8]) -> (Result<Option<Message>, Error>, usize) {
+        let mut codec = RtrCodec::new();
+        let mut buf = BytesMut::from(raw);
+        let r = codec.decode(&mut buf);
+        (r, buf.len())
+    }
+
+    #[test]
+    fn error_report_encode_roundtrip() {
+        let mut buf = encode(&Message::ErrorReport { error_code: 5 }, 1);
+        assert_eq!(buf.len(), 16);
+        assert!(matches!(
+            decode(&mut buf),
+            Message::ErrorReport { error_code: 5 }
+        ));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn partial_pdu_waits_for_more_bytes() {
+        let full = encode(&Message::ResetQuery, 1);
+        for n in 0..full.len() {
+            let (r, left) = try_decode(&full[..n]);
+            assert!(matches!(r, Ok(None)));
+            assert_eq!(left, n);
+        }
+    }
+
+    #[test]
+    fn rejects_bad_lengths() {
+        // length 0 used to loop forever without consuming bytes.
+        for (t, len) in [
+            (Message::RESET_QUERY, 0u32),
+            (Message::RESET_QUERY, 7),
+            (Message::RESET_QUERY, 12),
+            (Message::SERIAL_NOTIFY, 8),
+            (Message::IPV4_PREFIX, 8),
+            (Message::IPV6_PREFIX, 20),
+            (Message::END_OF_DATA, 12), // v1 requires 24
+            (Message::ERROR_REPORT, 8),
+            (Message::ERROR_REPORT, 0xffff_ffff),
+            (Message::ROUTER_KEY, 8),
+            (Message::ROUTER_KEY, 0xffff_ffff),
+        ] {
+            let mut raw = vec![1, t, 0, 0];
+            raw.extend_from_slice(&len.to_be_bytes());
+            raw.resize(64, 0);
+            let (r, _) = try_decode(&raw);
+            assert!(r.is_err(), "type {} length {}", t, len);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_type() {
+        let (r, _) = try_decode(&[1, 200, 0, 0, 0, 0, 0, 8]);
+        assert!(r.is_err());
+        // Router Key is not defined in version 0.
+        let mut raw = vec![0, Message::ROUTER_KEY, 0, 0, 0, 0, 0, 32];
+        raw.resize(32, 0);
+        let (r, _) = try_decode(&raw);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn router_key_is_skipped() {
+        // Router Key PDU: header + SKI(20) + ASN(4) + 4-byte SPKI.
+        let mut raw = vec![1, Message::ROUTER_KEY, 1, 0, 0, 0, 0, 36];
+        raw.resize(36, 0xaa);
+        // Incomplete Router Key: wait for the rest.
+        let (r, left) = try_decode(&raw[..20]);
+        assert!(matches!(r, Ok(None)));
+        assert_eq!(left, 20);
+        // Router Key alone is consumed with nothing to return.
+        let (r, left) = try_decode(&raw);
+        assert!(matches!(r, Ok(None)));
+        assert_eq!(left, 0);
+        // A following PDU is still decoded.
+        raw.extend_from_slice(&encode(&Message::CacheReset, 1));
+        let (r, left) = try_decode(&raw);
+        assert!(matches!(r, Ok(Some(Message::CacheReset))));
+        assert_eq!(left, 0);
     }
 }
