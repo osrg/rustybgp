@@ -2142,6 +2142,17 @@ impl RpkiTable {
         packet::IpNet::new(prefix, mask)
     }
 
+    /// Builds the trie key for a prefix: the full-width address with the
+    /// host bits cleared, followed by the prefix length.
+    fn prefix_key(mut addr: Vec<u8>, len: u8) -> Vec<u8> {
+        for (i, b) in addr.iter_mut().enumerate() {
+            let bits = (len as usize).saturating_sub(i * 8).min(8);
+            *b &= !(0xff_u16 >> bits) as u8;
+        }
+        addr.push(len);
+        addr
+    }
+
     pub fn validate(
         &self,
         source: &Arc<Source>,
@@ -2164,21 +2175,34 @@ impl RpkiTable {
             unmatched_asn: Vec::new(),
             unmatched_length: Vec::new(),
         };
-        let asn = if let Some(a) = attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
-            match a.as_path_origin() {
-                Some(asn) => asn,
-                None => source.local_asn,
+        // RFC 6811 §2: the origin AS is the rightmost AS of the final
+        // AS_SEQUENCE segment; if the final segment is an AS_SET the origin is
+        // NONE, which no ROA can match. A route with no AS_PATH segments
+        // (confederation segments aside) originated in our own AS.
+        let asn = match attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
+            Some(a) => {
+                let stripped = a.as_path_strip_confed();
+                if stripped.binary().is_none_or(|b| b.is_empty()) {
+                    Some(source.local_asn)
+                } else {
+                    stripped.as_path_origin()
+                }
             }
-        } else {
-            source.local_asn
+            None => Some(source.local_asn),
         };
-        let mut addr = addr_bytes;
-        addr.drain((mask.div_ceil(8)) as usize..);
-        for (ipnet, entry) in m.iter_prefix(&addr) {
-            let ipnet = RpkiTable::key_to_addr(ipnet);
+        // RFC 6811 §2: a ROA covers the route when its prefix length is no
+        // longer than the route's and the route's address falls within it.
+        // Trie keys are the full-width network address followed by the
+        // prefix length, so probe each candidate length in turn.
+        for len in 0..=mask {
+            let key = RpkiTable::prefix_key(addr_bytes.clone(), len);
+            let Some(entry) = m.get(&key) else {
+                continue;
+            };
+            let ipnet = RpkiTable::key_to_addr(key);
             for roa in entry {
                 if mask <= roa.max_length {
-                    if roa.as_number != 0 && roa.as_number == asn {
+                    if roa.as_number != 0 && Some(roa.as_number) == asn {
                         result.matched.push((ipnet.clone(), roa.as_ref().clone()));
                     } else {
                         result
@@ -2205,11 +2229,11 @@ impl RpkiTable {
     }
 
     pub fn insert(&mut self, net: packet::IpNet, roa: Arc<Roa>) {
-        let (family, mut key, mask) = match net {
+        let (family, key, mask) = match net {
             packet::IpNet::V4(net) => (Family::IPV4, net.addr.octets().to_vec(), net.mask),
             packet::IpNet::V6(net) => (Family::IPV6, net.addr.octets().to_vec(), net.mask),
         };
-        key.push(mask);
+        let key = RpkiTable::prefix_key(key, mask);
         match self.roas.get_mut(&family).unwrap().get_mut(&key) {
             Some(entry) => {
                 for e in entry.iter() {
@@ -2229,11 +2253,11 @@ impl RpkiTable {
     }
 
     pub fn remove(&mut self, net: packet::IpNet, roa: &Roa) {
-        let (family, mut key, mask) = match net {
+        let (family, key, mask) = match net {
             packet::IpNet::V4(n) => (Family::IPV4, n.addr.octets().to_vec(), n.mask),
             packet::IpNet::V6(n) => (Family::IPV6, n.addr.octets().to_vec(), n.mask),
         };
-        key.push(mask);
+        let key = RpkiTable::prefix_key(key, mask);
         let trie = self.roas.get_mut(&family).unwrap();
         let is_empty = if let Some(entry) = trie.get_mut(&key) {
             entry.retain(|e| {
@@ -6577,6 +6601,170 @@ mod tests {
             id_n3 & 0x00FF_FFFF,
             0,
             "lowest freed local_id must be reused"
+        );
+    }
+
+    // --- RPKI origin validation (RFC 6811) ---
+
+    fn as_path_segments(segs: &[(u8, &[u32])]) -> Arc<Vec<packet::Attribute>> {
+        let mut bin = Vec::new();
+        for (t, asns) in segs {
+            bin.push(*t);
+            bin.push(asns.len() as u8);
+            for a in *asns {
+                bin.extend_from_slice(&a.to_be_bytes());
+            }
+        }
+        Arc::new(vec![
+            packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, bin).unwrap(),
+        ])
+    }
+
+    fn origin_seq(asn: u32) -> Arc<Vec<packet::Attribute>> {
+        as_path_segments(&[(packet::Attribute::AS_PATH_TYPE_SEQ, &[65000, asn])])
+    }
+
+    fn rpki_table(roas: &[(&str, u8, u32)]) -> RpkiTable {
+        let src = Arc::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        let mut t = RpkiTable::new();
+        for (prefix, max_length, asn) in roas {
+            let (addr, len) = prefix.split_once('/').unwrap();
+            let net = packet::IpNet::new(addr.parse().unwrap(), len.parse().unwrap());
+            t.insert(net, Arc::new(Roa::new(*max_length, *asn, src.clone())));
+        }
+        t
+    }
+
+    fn route(prefix: &str) -> packet::Nlri {
+        let (addr, len) = prefix.split_once('/').unwrap();
+        let mask = len.parse().unwrap();
+        match addr.parse().unwrap() {
+            IpAddr::V4(addr) => packet::Nlri::V4(packet::bgp::Ipv4Net { addr, mask }),
+            IpAddr::V6(addr) => packet::Nlri::V6(packet::bgp::Ipv6Net { addr, mask }),
+        }
+    }
+
+    fn validate(
+        t: &RpkiTable,
+        prefix: &str,
+        attr: Arc<Vec<packet::Attribute>>,
+    ) -> RpkiValidationState {
+        t.validate(&source(1, 65001, 65100, 1), &route(prefix), &attr)
+            .unwrap()
+            .state
+    }
+
+    #[test]
+    fn rpki_covering_less_specific_roa_is_valid() {
+        let t = rpki_table(&[("10.0.0.0/16", 24, 65001)]);
+        assert!(validate(&t, "10.0.1.0/24", origin_seq(65001)) == RpkiValidationState::Valid);
+        assert!(validate(&t, "10.0.0.0/16", origin_seq(65001)) == RpkiValidationState::Valid);
+    }
+
+    #[test]
+    fn rpki_max_length_exceeded_is_invalid() {
+        let t = rpki_table(&[("10.0.0.0/16", 24, 65001)]);
+        let r = t
+            .validate(
+                &source(1, 65001, 65100, 1),
+                &route("10.0.1.128/25"),
+                &origin_seq(65001),
+            )
+            .unwrap();
+        assert!(r.state == RpkiValidationState::Invalid);
+        assert!(matches!(r.reason, RpkiValidationReason::Length));
+    }
+
+    #[test]
+    fn rpki_wrong_origin_is_invalid() {
+        let t = rpki_table(&[("10.0.0.0/16", 24, 65001)]);
+        assert!(validate(&t, "10.0.1.0/24", origin_seq(65002)) == RpkiValidationState::Invalid);
+    }
+
+    #[test]
+    fn rpki_non_covering_more_specific_roa_is_not_found() {
+        let t = rpki_table(&[("10.0.1.0/24", 24, 65002)]);
+        assert!(validate(&t, "10.0.0.0/16", origin_seq(65001)) == RpkiValidationState::NotFound);
+        // A ROA for a sibling prefix does not cover the route either.
+        assert!(validate(&t, "10.0.2.0/24", origin_seq(65001)) == RpkiValidationState::NotFound);
+    }
+
+    #[test]
+    fn rpki_as_set_origin_is_none() {
+        let t = rpki_table(&[("10.0.0.0/16", 24, 65001), ("10.0.0.0/16", 24, 65100)]);
+        // Final segment AS_SET → origin NONE: never Valid, even if the set
+        // contains the ROA's AS or the local AS.
+        let attr = as_path_segments(&[
+            (packet::Attribute::AS_PATH_TYPE_SEQ, &[65000]),
+            (packet::Attribute::AS_PATH_TYPE_SET, &[65001, 65100]),
+        ]);
+        assert!(validate(&t, "10.0.1.0/24", attr.clone()) == RpkiValidationState::Invalid);
+        assert!(validate(&t, "192.0.2.0/24", attr) == RpkiValidationState::NotFound);
+    }
+
+    #[test]
+    fn rpki_empty_as_path_uses_local_asn() {
+        let t = rpki_table(&[("10.0.0.0/16", 24, 65100)]);
+        assert!(validate(&t, "10.0.1.0/24", as_path_segments(&[])) == RpkiValidationState::Valid);
+        assert!(validate(&t, "10.0.1.0/24", empty_attrs()) == RpkiValidationState::Valid);
+        let confed_only =
+            as_path_segments(&[(packet::Attribute::AS_PATH_TYPE_CONFED_SEQ, &[64512])]);
+        assert!(validate(&t, "10.0.1.0/24", confed_only) == RpkiValidationState::Valid);
+    }
+
+    #[test]
+    fn rpki_as0_roa_never_matches() {
+        let t = rpki_table(&[("10.0.0.0/16", 24, 0)]);
+        assert!(validate(&t, "10.0.1.0/24", origin_seq(65001)) == RpkiValidationState::Invalid);
+        assert!(validate(&t, "10.0.1.0/24", origin_seq(0)) == RpkiValidationState::Invalid);
+        // AS0 alongside a matching ROA: the matching ROA wins.
+        let t = rpki_table(&[("10.0.0.0/16", 24, 0), ("10.0.0.0/20", 24, 65001)]);
+        assert!(validate(&t, "10.0.1.0/24", origin_seq(65001)) == RpkiValidationState::Valid);
+    }
+
+    #[test]
+    fn rpki_non_byte_aligned_prefixes() {
+        let t = rpki_table(&[("10.0.16.0/20", 22, 65001)]);
+        assert!(validate(&t, "10.0.20.0/22", origin_seq(65001)) == RpkiValidationState::Valid);
+        assert!(validate(&t, "10.0.31.0/24", origin_seq(65001)) == RpkiValidationState::Invalid);
+        // 10.0.32.0/22 lies outside 10.0.16.0/20 despite sharing the first two bytes.
+        assert!(validate(&t, "10.0.32.0/22", origin_seq(65001)) == RpkiValidationState::NotFound);
+        // A less-specific route is not covered by the /20.
+        assert!(validate(&t, "10.0.0.0/19", origin_seq(65001)) == RpkiValidationState::NotFound);
+    }
+
+    #[test]
+    fn rpki_ipv6() {
+        let t = rpki_table(&[
+            ("2001:db8::/32", 48, 65001),
+            ("2001:db8:ff00::/40", 40, 65009),
+        ]);
+        assert!(validate(&t, "2001:db8:1::/48", origin_seq(65001)) == RpkiValidationState::Valid);
+        assert!(validate(&t, "2001:db8:1::/49", origin_seq(65001)) == RpkiValidationState::Invalid);
+        assert!(validate(&t, "2001:db8::/32", origin_seq(65002)) == RpkiValidationState::Invalid);
+        assert!(validate(&t, "2001:db9::/32", origin_seq(65001)) == RpkiValidationState::NotFound);
+        // Non-covering more-specific ROA (2001:db8:ff00::/40) vs a /36.
+        let t = rpki_table(&[("2001:db8:ff00::/40", 48, 65009)]);
+        assert!(
+            validate(&t, "2001:db8:f000::/36", origin_seq(65001)) == RpkiValidationState::NotFound
+        );
+        // Non-byte-aligned: /36 ROA covers a /44 inside it, not one outside.
+        let t = rpki_table(&[("2001:db8:1000::/36", 48, 65001)]);
+        assert!(
+            validate(&t, "2001:db8:1f00::/44", origin_seq(65001)) == RpkiValidationState::Valid
+        );
+        assert!(
+            validate(&t, "2001:db8:2000::/44", origin_seq(65001)) == RpkiValidationState::NotFound
+        );
+    }
+
+    #[test]
+    fn rpki_insert_normalizes_host_bits() {
+        let t = rpki_table(&[("10.0.1.7/16", 24, 65001)]);
+        assert!(validate(&t, "10.0.1.0/24", origin_seq(65001)) == RpkiValidationState::Valid);
+        assert_eq!(
+            t.iter(Family::IPV4).next().unwrap().0.to_string(),
+            "10.0.0.0/16"
         );
     }
 }
