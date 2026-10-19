@@ -674,10 +674,19 @@ impl PeerFsm {
 
     /// RFC 4271 §6.8: determine which role wins a connection collision.
     /// The Active connection wins when local Router ID > remote Router ID,
-    /// the Passive connection wins otherwise.
+    /// the Passive connection wins when it is lower. RFC 6286 §2.3: when the
+    /// IDs are equal, the connection initiated by the speaker with the larger
+    /// AS number is preserved.
     fn collision_winner(&self, role: Role) -> Role {
-        let remote_id = self.connection(role).map(|s| s.remote_id()).unwrap_or(0);
-        if self.local_router_id > remote_id {
+        let (remote_id, remote_asn) = self
+            .connection(role)
+            .map(|s| (s.remote_id(), s.remote_asn))
+            .unwrap_or((0, 0));
+        let local_wins = match self.local_router_id.cmp(&remote_id) {
+            std::cmp::Ordering::Equal => self.local_asn > remote_asn,
+            ord => ord == std::cmp::Ordering::Greater,
+        };
+        if local_wins {
             Role::Active
         } else {
             Role::Passive
@@ -1601,6 +1610,59 @@ mod tests {
         )));
         assert!(peer.connection(Role::Active).is_none());
         assert!(peer.connection(Role::Passive).is_some());
+    }
+
+    /// Drive both connections to OpenConfirm with the given remote OPEN and
+    /// return which role survived the collision.
+    fn collide_with(peer: &mut PeerFsm, remote_asn: u32, remote_id: u32) -> Role {
+        connect(peer, Role::Active);
+        connect(peer, Role::Passive);
+        peer.process(
+            Role::Active,
+            Input::MessageReceived(remote_open_msg(remote_asn, remote_id)),
+        );
+        peer.process(
+            Role::Passive,
+            Input::MessageReceived(remote_open_msg(remote_asn, remote_id)),
+        );
+        match (
+            peer.connection(Role::Active).is_some(),
+            peer.connection(Role::Passive).is_some(),
+        ) {
+            (true, false) => Role::Active,
+            (false, true) => Role::Passive,
+            other => panic!("expected exactly one survivor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_fsm_collision_equal_ids_larger_local_as_keeps_active() {
+        // RFC 6286 §2.3: equal BGP IDs → keep the connection initiated by
+        // the speaker with the larger AS. Local AS 65001 > remote 65000, so
+        // our (Active) connection survives.
+        let id = local_router_id();
+        let mut peer = make_peer_fsm(id, 65000);
+        assert_eq!(collide_with(&mut peer, 65000, id), Role::Active);
+    }
+
+    #[test]
+    fn peer_fsm_collision_equal_ids_larger_remote_as_keeps_passive() {
+        // Remote AS 65002 > local 65001: the remote-initiated (Passive)
+        // connection survives.
+        let id = local_router_id();
+        let mut peer = make_peer_fsm(id, 65002);
+        assert_eq!(collide_with(&mut peer, 65002, id), Role::Passive);
+    }
+
+    #[test]
+    fn peer_fsm_collision_router_id_still_decides_when_different() {
+        // The AS tie-break must not override a BGP ID difference.
+        let high_id = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let low_id = u32::from(Ipv4Addr::new(1, 0, 0, 1));
+        let mut peer = make_peer_fsm(low_id, 65000);
+        assert_eq!(collide_with(&mut peer, 65000, high_id), Role::Passive);
+        let mut peer = make_peer_fsm(high_id, 65002);
+        assert_eq!(collide_with(&mut peer, 65002, low_id), Role::Active);
     }
 
     #[test]
