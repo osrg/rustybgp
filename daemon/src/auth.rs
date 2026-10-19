@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 
@@ -63,26 +64,66 @@ impl TcpMd5sig {
     }
 }
 
+/// Maximum TCP-MD5 key length accepted by the kernel (TCP_MD5SIG_MAXKEYLEN).
 #[cfg(target_os = "linux")]
-pub(crate) fn set_md5sig(rawfd: RawFd, addr: &IpAddr, key: &str, ifindex: u32) {
+const TCP_MD5SIG_MAXKEYLEN: usize = 80;
+
+/// Install (or, with an empty `key`, remove) the RFC 2385 TCP-MD5 key for
+/// `addr` on `rawfd`. Errors are returned rather than ignored: a peer with
+/// `auth_password` configured must never silently run unauthenticated.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_md5sig(rawfd: RawFd, addr: &IpAddr, key: &str, ifindex: u32) -> io::Result<()> {
+    if key.len() > TCP_MD5SIG_MAXKEYLEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("TCP MD5 key is longer than {TCP_MD5SIG_MAXKEYLEN} bytes"),
+        ));
+    }
     let s = TcpMd5sig::new(addr, key.to_string(), ifindex);
-    unsafe {
+    let ret = unsafe {
         let ptr: *const TcpMd5sig = &s;
         let len = std::mem::size_of::<TcpMd5sig>() as u32;
-        let _ = libc::setsockopt(
+        libc::setsockopt(
             rawfd,
             libc::IPPROTO_TCP,
             libc::TCP_MD5SIG_EXT,
             ptr as *const _,
             len,
-        );
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(())
 }
 
 // use file per target os when you add *bsd support
 // for now, let's keep things simple
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn set_md5sig(_rawfd: RawFd, _addr: &IpAddr, _key: &str, _ifindex: u32) {}
+pub(crate) fn set_md5sig(
+    _rawfd: RawFd,
+    _addr: &IpAddr,
+    key: &str,
+    _ifindex: u32,
+) -> io::Result<()> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    Err(unsupported("TCP MD5 signatures"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unsupported(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{what} are only supported on Linux"),
+    )
+}
+
+/// Whether this platform can enforce TCP-MD5 (`auth_password`) and GTSM
+/// (`ttl_security`). Peers configuring either are refused where it can't,
+/// rather than running without the protection.
+pub(crate) const SUPPORTS_SOCKET_SECURITY: bool = cfg!(target_os = "linux");
 
 /// Resolve a network interface name to its ifindex.
 /// Returns 0 if the interface does not exist or the name is empty.
@@ -97,31 +138,59 @@ pub(crate) fn ifindex_of(device: &str) -> u32 {
 /// Packets arriving with TTL < ttl_min are dropped by the kernel.
 /// IPv4 uses IP_MINTTL; IPv6 uses IPV6_MINHOPCOUNT.
 #[cfg(target_os = "linux")]
-pub(crate) fn set_min_ttl(rawfd: RawFd, addr: &IpAddr, ttl_min: u8) {
+pub(crate) fn set_min_ttl(rawfd: RawFd, addr: &IpAddr, ttl_min: u8) -> io::Result<()> {
     let ttl_min = ttl_min as libc::c_int;
-    unsafe {
-        match addr {
-            IpAddr::V4(_) => {
-                let _ = libc::setsockopt(
-                    rawfd,
-                    libc::IPPROTO_IP,
-                    libc::IP_MINTTL,
-                    &ttl_min as *const _ as *const _,
-                    std::mem::size_of::<libc::c_int>() as u32,
-                );
-            }
-            IpAddr::V6(_) => {
-                let _ = libc::setsockopt(
-                    rawfd,
-                    libc::IPPROTO_IPV6,
-                    libc::IPV6_MINHOPCOUNT,
-                    &ttl_min as *const _ as *const _,
-                    std::mem::size_of::<libc::c_int>() as u32,
-                );
-            }
-        }
+    let (level, name) = match addr {
+        IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_MINTTL),
+        IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_MINHOPCOUNT),
+    };
+    let ret = unsafe {
+        libc::setsockopt(
+            rawfd,
+            level,
+            name,
+            &ttl_min as *const _ as *const _,
+            std::mem::size_of::<libc::c_int>() as u32,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn set_min_ttl(_rawfd: RawFd, _addr: &IpAddr, _ttl_min: u8) {}
+pub(crate) fn set_min_ttl(_rawfd: RawFd, _addr: &IpAddr, _ttl_min: u8) -> io::Result<()> {
+    Err(unsupported("GTSM minimum TTL checks"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn set_md5sig_reports_setsockopt_failure() {
+        let addr: IpAddr = "192.0.2.1".parse().unwrap();
+        // Invalid fd: the kernel error must surface instead of being dropped.
+        assert!(set_md5sig(-1, &addr, "secret", 0).is_err());
+    }
+
+    #[test]
+    fn set_md5sig_rejects_overlong_key() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr: IpAddr = "192.0.2.1".parse().unwrap();
+        let err = set_md5sig(l.as_raw_fd(), &addr, &"k".repeat(81), 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn set_min_ttl_reports_setsockopt_failure() {
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(set_min_ttl(-1, &v4, 254).is_err());
+        assert!(set_min_ttl(-1, &v6, 254).is_err());
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(set_min_ttl(l.as_raw_fd(), &v4, 254).is_ok());
+    }
+}

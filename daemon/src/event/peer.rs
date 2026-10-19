@@ -33,6 +33,31 @@ use super::*;
 /// and is well above any realistic deployment need.
 pub(crate) const ADDPATH_SEND_MAX_LIMIT: usize = u8::MAX as usize;
 
+/// Refuse a peer whose TCP-MD5 (`auth_password`) or GTSM (`ttl_security`)
+/// configuration this platform cannot enforce, instead of starting it without
+/// the protection. `supported` is `auth::SUPPORTS_SOCKET_SECURITY`.
+pub(crate) fn check_socket_security_support(
+    params: &PeerParams,
+    supported: bool,
+) -> Result<(), String> {
+    if supported {
+        return Ok(());
+    }
+    if params.password.is_some() {
+        return Err(format!(
+            "peer {}: auth-password (TCP MD5) is not supported on this platform",
+            params.remote_addr
+        ));
+    }
+    if params.ttl_security.is_some() {
+        return Err(format!(
+            "peer {}: ttl-security (GTSM) is not supported on this platform",
+            params.remote_addr
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_local_address(value: Option<&str>, remote: IpAddr) -> Result<(), String> {
     if let Some(value) = value.filter(|s| !s.is_empty()) {
         let (ip, _) = config::parse_local_address(value).map_err(|e| e.to_string())?;

@@ -672,7 +672,7 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
                     socket.bind(local)?;
                 }
                 if let Some(key) = password.as_ref() {
-                    auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex);
+                    auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex)?;
                 }
                 Ok::<_, std::io::Error>(socket)
             })();
@@ -798,6 +798,10 @@ pub(crate) struct Global {
     pub(crate) router_id: Ipv4Addr,
     listen_port: Option<u16>,
     listen_sockets: Vec<(RawFd, u32)>,
+    /// Peers with `auth_password` whose TCP-MD5 key could not be installed on
+    /// every listen socket. Passive connections from them are refused so the
+    /// session never comes up unauthenticated.
+    md5_unprotected: FnvHashSet<IpAddr>,
     /// Listen sockets created at start, with their ifindex. The listener
     /// loop takes them when it starts.
     pending_listeners: Vec<(std::net::TcpListener, u32)>,
@@ -858,6 +862,7 @@ impl Global {
             router_id: Ipv4Addr::new(0, 0, 0, 0),
             listen_port: None,
             listen_sockets: Vec::new(),
+            md5_unprotected: FnvHashSet::default(),
             pending_listeners: Vec::new(),
             peers: FnvHashMap::default(),
             local_cluster_ids: Arc::new(ArcSwap::from_pointee(FnvHashSet::default())),
@@ -1079,12 +1084,43 @@ impl Global {
         self.local_cluster_ids.store(Arc::new(ids));
     }
 
+    /// Install `addr`'s TCP-MD5 key on every listen socket, or remove it when
+    /// `password` is `None`. On failure the peer is recorded in
+    /// `md5_unprotected` (its passive connections are refused) and the first
+    /// error is returned. Removal is best effort.
+    fn set_listener_md5(&mut self, addr: IpAddr, password: Option<&str>) -> std::io::Result<()> {
+        let Some(password) = password else {
+            for &(fd, ifindex) in &self.listen_sockets {
+                let _ = auth::set_md5sig(fd, &addr, "", ifindex);
+            }
+            self.md5_unprotected.remove(&addr);
+            return Ok(());
+        };
+        let mut result = Ok(());
+        for &(fd, ifindex) in &self.listen_sockets {
+            if let Err(e) = auth::set_md5sig(fd, &addr, password, ifindex) {
+                log::error!("failed to set TCP MD5 key for peer {addr} on listener: {e}");
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
+        }
+        if result.is_err() {
+            self.md5_unprotected.insert(addr);
+        } else {
+            self.md5_unprotected.remove(&addr);
+        }
+        result
+    }
+
     fn add_peer(
         &mut self,
         mut params: PeerParams,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
     ) -> std::result::Result<(), Error> {
         peer::validate_local_address(params.local_address.as_deref(), params.remote_addr)
+            .map_err(Error::InvalidArgument)?;
+        peer::check_socket_security_support(&params, auth::SUPPORTS_SOCKET_SECURITY)
             .map_err(Error::InvalidArgument)?;
         if self.peers.contains_key(&params.remote_addr) {
             return Err(Error::AlreadyExists(
@@ -1600,11 +1636,16 @@ impl Global {
                 listen_sockets
             };
 
-            for (addr, peer) in &global.read().await.peers {
-                if let Some(password) = &peer.config.password {
-                    for (l, ifindex) in &listen_sockets {
-                        auth::set_md5sig(l.as_raw_fd(), addr, password, *ifindex);
-                    }
+            {
+                let mut g = global.write().await;
+                let keyed: Vec<(IpAddr, String)> = g
+                    .peers
+                    .iter()
+                    .filter_map(|(addr, p)| Some((*addr, p.config.password.clone()?)))
+                    .collect();
+                for (addr, password) in keyed {
+                    // Logged inside; the peer's passive connections are refused.
+                    let _ = g.set_listener_md5(addr, Some(&password));
                 }
             }
 
@@ -1703,6 +1744,7 @@ async fn accept_connection(
     let is_restarting = g.selection_deferral.is_some();
     let local_cluster_ids = Arc::clone(&g.local_cluster_ids);
     let confederation = g.confederation.as_ref().map(|c| (c.id, c.members.clone()));
+    let md5_unprotected = g.md5_unprotected.contains(&remote_addr);
     let peer = match g.peers.get_mut(&remote_addr) {
         Some(peer) => {
             if !peer::accepts_local_address(
@@ -1717,6 +1759,15 @@ async fn accept_connection(
                 log::warn!(
                     "admin down; ignore a new passive connection from {}",
                     remote_addr
+                );
+                return None;
+            }
+            if role == crate::fsm::Role::Passive
+                && peer.config.password.is_some()
+                && md5_unprotected
+            {
+                log::error!(
+                    "TCP MD5 key for {remote_addr} is not installed on the listener; refusing passive connection"
                 );
                 return None;
             }
@@ -1797,8 +1848,23 @@ async fn accept_connection(
     // (RFC 4271, Section 1.1) so iBGP can traverse intermediate routers.
     if let Some(ttl_min) = peer.config.ttl_security {
         // GTSM (RFC 5082): send with TTL=255, drop incoming below ttl_min.
-        let _ = stream.set_ttl(255);
-        auth::set_min_ttl(stream.as_raw_fd(), &remote_addr, ttl_min);
+        // Without the minimum-TTL check GTSM gives no protection, so refuse
+        // the connection rather than run it unprotected.
+        if let Err(e) = stream
+            .set_ttl(255)
+            .and_then(|_| auth::set_min_ttl(stream.as_raw_fd(), &remote_addr, ttl_min))
+        {
+            log::error!("failed to apply GTSM to connection with {remote_addr}: {e}");
+            if peer.config.delete_on_disconnected {
+                g.peers.remove(&remote_addr);
+                g.rebuild_local_cluster_ids();
+            } else {
+                peer.state
+                    .fsm
+                    .store(SessionState::Idle as u8, Ordering::Relaxed);
+            }
+            return None;
+        }
     } else if peer.config.expected_remote_asn != peer.config.local_asn {
         let _ = stream.set_ttl(peer.config.multihop_ttl.unwrap_or(1).into());
     }
@@ -4051,6 +4117,32 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn active_connect_md5_failure_does_not_dial_unauthenticated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut params = default_peer_params("127.0.0.1".parse().unwrap());
+        params.remote_port = listener.local_addr().unwrap().port();
+        // Longer than TCP_MD5SIG_MAXKEYLEN, so the key can't be installed.
+        params.password = Some("k".repeat(81));
+        params.connect_retry_time = 0;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let global = make_global();
+        global.write().await.add_peer(params, Some(tx)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err(),
+            "a failed TCP MD5 setup must not fall back to an unauthenticated connection"
+        );
+        assert!(rx.try_recv().is_err());
+        let g = global.read().await;
+        let mut ctx = g.peers[&"127.0.0.1".parse().unwrap()]
+            .context
+            .lock()
+            .unwrap();
+        ctx.active_connect_cancel_tx.take();
+    }
+
     #[test]
     fn local_address_config_api_validation_and_inheritance() {
         for (remote, local) in [
@@ -4905,6 +4997,48 @@ local-address = "{local}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn socket_security_refused_where_unsupported() {
+        let mut params = default_peer_params("10.0.0.1".parse().unwrap());
+        assert!(peer::check_socket_security_support(&params, false).is_ok());
+        params.password = Some("secret".to_string());
+        assert!(peer::check_socket_security_support(&params, true).is_ok());
+        assert!(peer::check_socket_security_support(&params, false).is_err());
+        params.password = None;
+        params.ttl_security = Some(254);
+        assert!(peer::check_socket_security_support(&params, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn passive_connection_refused_when_listener_md5_fails() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        {
+            let mut g = global.write().await;
+            g.listen_sockets.push((listener.as_raw_fd(), 0));
+            let mut params = default_peer_params(remote_addr);
+            // Longer than TCP_MD5SIG_MAXKEYLEN: the kernel can't install it.
+            let key = "k".repeat(81);
+            params.password = Some(key.clone());
+            g.add_peer(params, None).unwrap();
+            assert!(g.set_listener_md5(remote_addr, Some(&key)).is_err());
+            assert!(g.md5_unprotected.contains(&remote_addr));
+        }
+        assert!(
+            accept_connection(&global, &tables, server, crate::fsm::Role::Passive)
+                .await
+                .is_none(),
+            "must not accept an unauthenticated session for an MD5 peer"
+        );
+        // Removing the key clears the fail-closed marker.
+        let mut g = global.write().await;
+        assert!(g.set_listener_md5(remote_addr, None).is_ok());
+        assert!(!g.md5_unprotected.contains(&remote_addr));
     }
 
     #[tokio::test]
