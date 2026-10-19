@@ -2300,6 +2300,16 @@ enum GlobalEffect {
 /// fires or EOR is received).  LLGR families are also preserved (routes are kept
 /// LLGR-stale until the per-family timer fires).  Every other session family is
 /// dropped right away.
+/// Sleep future for a session timer armed with `secs` seconds. Zero means the
+/// timer is disabled (RFC 4271 §4.4 hold time 0), so the future never fires.
+fn timer_sleep(secs: u64) -> tokio::time::Sleep {
+    if secs == 0 {
+        tokio::time::sleep(Duration::new(u64::MAX, 0))
+    } else {
+        tokio::time::sleep(Duration::from_secs(secs))
+    }
+}
+
 fn families_to_drop_on_disconnect<'a>(
     session_families: impl Iterator<Item = &'a Family>,
     negotiated_gr: Option<&NegotiatedGr>,
@@ -2905,17 +2915,13 @@ impl PeerSession {
                     _,
                     crate::fsm::Output::SetKeepaliveTimer(secs),
                 ) => {
-                    self.keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
-                        .into_iter()
-                        .collect();
+                    self.keepalive_futures = vec![timer_sleep(secs)].into_iter().collect();
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
                     crate::fsm::Output::SetHoldTimer(secs),
                 ) => {
-                    self.holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
-                        .into_iter()
-                        .collect();
+                    self.holdtime_futures = vec![timer_sleep(secs)].into_iter().collect();
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -3207,9 +3213,7 @@ impl PeerSession {
                     crate::fsm::Output::SetKeepaliveTimer(secs),
                 ) = output
                 {
-                    self.keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
-                        .into_iter()
-                        .collect();
+                    self.keepalive_futures = vec![timer_sleep(secs)].into_iter().collect();
                 }
             }
         }
@@ -3975,6 +3979,13 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn timer_sleep_zero_never_fires() {
+        // Hold time 0 (RFC 4271 §4.4) must disarm the timer, not fire at once.
+        let r = tokio::time::timeout(Duration::from_millis(50), timer_sleep(0)).await;
+        assert!(r.is_err(), "zero-second session timer must be disabled");
+    }
 
     #[tokio::test]
     async fn active_connect_bind_device_failure_does_not_fall_back() {
@@ -6048,6 +6059,25 @@ local-address = "{local}"
         assert_eq!(params.holdtime, PeerParams::DEFAULT_HOLD_TIME);
         params.apply_peer_group(&make_pg_for_apply());
         assert_eq!(params.holdtime, 90);
+    }
+
+    #[test]
+    fn config_hold_time_zero_is_kept() {
+        // RFC 4271 §4.4: an explicit hold-time 0 disables the timers; it must
+        // not be silently replaced by the default (GoBGP keeps it too).
+        let mut n = make_minimal_neighbor_config("10.0.0.1");
+        n.timers = Some(config::generate::Timers {
+            config: Some(config::generate::TimersConfig {
+                hold_time: Some(0.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut params = PeerParams::try_from(&n).unwrap();
+        assert_eq!(params.holdtime, 0);
+        // Not treated as "unset" when a peer group is applied.
+        params.apply_peer_group(&make_pg_for_apply());
+        assert_eq!(params.holdtime, 0);
     }
 
     #[test]

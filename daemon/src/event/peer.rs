@@ -609,10 +609,12 @@ impl TryFrom<&config::Neighbor> for PeerParams {
             }
         }
 
+        // An explicitly configured hold-time of 0 disables the hold and
+        // keepalive timers (RFC 4271 §4.4); GoBGP only applies the default
+        // when the key is absent.
         let holdtime = timer_config
             .and_then(|c| c.hold_time)
             .map(|v| v as u64)
-            .filter(|&v| v != 0)
             .unwrap_or(PeerParams::DEFAULT_HOLD_TIME);
         let connect_retry_time = timer_config
             .and_then(|c| c.connect_retry)
@@ -769,10 +771,7 @@ impl From<&config::PeerGroup> for PeerGroup {
                 .and_then(|rs| rs.config.as_ref())
                 .and_then(|c| c.route_server_client)
                 .unwrap_or(false),
-            holdtime: timer_config
-                .and_then(|c| c.hold_time)
-                .map(|h| h as u64)
-                .filter(|&h| h != 0),
+            holdtime: timer_config.and_then(|c| c.hold_time).map(|h| h as u64),
             local_asn: pg.config.as_ref().and_then(|c| c.local_as).unwrap_or(0),
             passive: pg
                 .transport
