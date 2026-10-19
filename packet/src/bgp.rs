@@ -32,6 +32,8 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum Notification {
     // Code 1: Message Header Error
+    #[error("header error: connection not synchronized")]
+    ConnectionNotSynchronized,
     #[error("header error: bad message length")]
     BadMessageLength { data: Vec<u8> },
     #[error("header error: bad message type")]
@@ -121,7 +123,9 @@ impl Notification {
     /// Returns the BGP NOTIFICATION error code.
     pub fn notification_code(&self) -> u8 {
         match self {
-            Self::BadMessageLength { .. } | Self::BadMessageType { .. } => 1,
+            Self::ConnectionNotSynchronized
+            | Self::BadMessageLength { .. }
+            | Self::BadMessageType { .. } => 1,
             Self::OpenMalformed
             | Self::OpenUnsupportedVersionNumber { .. }
             | Self::OpenBadPeerAs
@@ -158,6 +162,7 @@ impl Notification {
     /// Returns the BGP NOTIFICATION subcode.
     pub fn notification_subcode(&self) -> u8 {
         match self {
+            Self::ConnectionNotSynchronized => 1,
             Self::BadMessageLength { .. } => 2,
             Self::BadMessageType { .. } => 3,
             Self::OpenMalformed => 0,
@@ -223,6 +228,7 @@ impl Notification {
     /// Constructs a `Notification` from a received NOTIFICATION message.
     pub fn from_notification(code: u8, subcode: u8, data: Vec<u8>) -> Self {
         match (code, subcode) {
+            (1, 1) => Self::ConnectionNotSynchronized,
             (1, 2) => Self::BadMessageLength { data },
             (1, 3) => Self::BadMessageType { data },
             (2, 0) => Self::OpenMalformed,
@@ -3353,6 +3359,10 @@ impl PeerCodec {
         if buffer_len < Message::HEADER_LENGTH as usize {
             return Ok(None);
         }
+        // RFC 4271 §6.1: the marker MUST be all ones.
+        if src[..16].iter().any(|&b| b != 0xff) {
+            return Err(Notification::ConnectionNotSynchronized);
+        }
         let message_len = (&src[16..18]).read_u16::<NetworkEndian>().unwrap() as usize;
         if message_len < Message::HEADER_LENGTH as usize || message_len > self.max_message_length()
         {
@@ -4388,6 +4398,37 @@ mod framer_tests {
             Err(Notification::BadMessageLength { .. }) => {}
             other => panic!("expected BadMessageLength, got {:?}", other.map(|_| "ok")),
         }
+    }
+
+    #[test]
+    fn framer_rejects_bad_marker() {
+        let mut buf = keepalive_bytes();
+        buf[7] = 0x00;
+        let mut framer = default_framer();
+        let mut bmut = BytesMut::from(buf.as_slice());
+        let err = framer
+            .try_parse(&mut bmut)
+            .err()
+            .expect("bad marker accepted");
+        assert_eq!(err, Notification::ConnectionNotSynchronized);
+        assert_eq!(err.notification_code(), 1);
+        assert_eq!(err.notification_subcode(), 1);
+        assert_eq!(
+            Notification::from_notification(1, 1, vec![]),
+            Notification::ConnectionNotSynchronized
+        );
+    }
+
+    #[test]
+    fn framer_rejects_all_zero_marker_before_length_check() {
+        // Marker is checked first: a zeroed header is a sync error, not a
+        // length error.
+        let mut framer = default_framer();
+        let mut bmut = BytesMut::from(&[0u8; 19][..]);
+        assert_eq!(
+            framer.try_parse(&mut bmut).err(),
+            Some(Notification::ConnectionNotSynchronized)
+        );
     }
 
     #[test]
