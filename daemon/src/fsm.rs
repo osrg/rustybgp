@@ -134,6 +134,19 @@ pub(crate) enum SessionDownReason {
     IoError,
 }
 
+/// NOTIFICATION for a message received in a state that does not expect it.
+/// RFC 6608 §4 assigns subcodes 1/2/3 for OpenSent/OpenConfirm/Established;
+/// any other state reports 0 (Unspecified Error).
+fn fsm_error(state: State) -> bgp::Message {
+    let subcode = match state {
+        State::OpenSent => 1,
+        State::OpenConfirm => 2,
+        State::Established => 3,
+        State::Idle | State::Connect | State::Active => 0,
+    };
+    bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState { subcode })
+}
+
 /// Pure BGP connection state machine.
 ///
 /// Holds all negotiation state for a single BGP connection. Has no I/O
@@ -236,10 +249,7 @@ impl Connection {
 
     fn on_open(&mut self, open: bgp::Open) -> Vec<Output> {
         if self.state != State::OpenSent {
-            let notif =
-                bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
-                    state: u8::from(self.state),
-                });
+            let notif = fsm_error(self.state);
             return vec![Output::SessionDown(
                 SessionDownReason::LocalNotification(notif.clone()),
                 Some(notif),
@@ -307,10 +317,7 @@ impl Connection {
             }
             State::Established => self.restart_hold_timer(),
             _ => {
-                let notif =
-                    bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
-                        state: u8::from(self.state),
-                    });
+                let notif = fsm_error(self.state);
                 vec![Output::SessionDown(
                     SessionDownReason::LocalNotification(notif.clone()),
                     Some(notif),
@@ -321,10 +328,7 @@ impl Connection {
 
     fn on_update(&mut self) -> Vec<Output> {
         if self.state != State::Established {
-            let notif =
-                bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
-                    state: u8::from(self.state),
-                });
+            let notif = fsm_error(self.state);
             return vec![Output::SessionDown(
                 SessionDownReason::LocalNotification(notif.clone()),
                 Some(notif),
@@ -352,10 +356,7 @@ impl Connection {
 
     fn on_route_refresh(&mut self, family: Family) -> Vec<Output> {
         if self.state != State::Established {
-            let notif =
-                bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
-                    state: u8::from(self.state),
-                });
+            let notif = fsm_error(self.state);
             return vec![Output::SessionDown(
                 SessionDownReason::LocalNotification(notif.clone()),
                 Some(notif),
@@ -1188,6 +1189,64 @@ mod tests {
             Output::RouteRefresh(Family::IPV4)
         )));
         assert!(!has_output(&out, |o| matches!(o, Output::SessionDown(..))));
+    }
+
+    /// RFC 6608 subcode carried by the FSM-error NOTIFICATION in `out`.
+    fn fsm_error_subcode(out: &[Output]) -> Option<u8> {
+        out.iter().find_map(|o| match o {
+            Output::SessionDown(
+                _,
+                Some(bgp::Message::Notification(
+                    rustybgp_packet::Notification::FsmUnexpectedState { subcode },
+                )),
+            ) => Some(*subcode),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn fsm_error_uses_rfc6608_subcodes() {
+        // OpenSent: KEEPALIVE before OPEN → subcode 1.
+        let mut s = basic_connection();
+        let _ = s.process(Input::Connected(false));
+        let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(fsm_error_subcode(&out), Some(1));
+
+        // OpenConfirm: ROUTE-REFRESH → subcode 2.
+        let mut s = basic_connection();
+        let _ = s.process(Input::Connected(false));
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        assert_eq!(s.state(), State::OpenConfirm);
+        let out = s.process(Input::MessageReceived(bgp::Message::RouteRefresh {
+            family: Family::IPV4,
+        }));
+        assert_eq!(fsm_error_subcode(&out), Some(2));
+
+        // Established: OPEN → subcode 3.
+        let mut s = basic_connection();
+        let _ = s.process(Input::Connected(false));
+        let _ = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        let _ = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
+        let out = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            60,
+        )));
+        assert_eq!(fsm_error_subcode(&out), Some(3));
+
+        // States without an RFC 6608 subcode report 0 (unspecified).
+        let mut s = basic_connection();
+        let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(fsm_error_subcode(&out), Some(0));
     }
 
     #[test]
