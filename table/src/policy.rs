@@ -249,7 +249,7 @@ fn parse_community(s: &str) -> Result<Regex, TableError> {
             .map_err(|_| TableError::InvalidArgument(format!("invalid regex {}", s)));
     }
     if let Ok(c) = WellKnownCommunity::from_str(&s.to_string().to_lowercase()) {
-        let v = c as u32;
+        let v = u32::from(c);
         return Regex::new(&format!("^{}:{}$", v >> 16, v & 0xffff))
             .map_err(|_| TableError::InvalidArgument(format!("invalid regex {}", s)));
     }
@@ -5191,5 +5191,27 @@ mod tests {
 
         let dirs: Vec<i32> = ptable.iter_assignments(1).map(|(dir, _)| dir).collect();
         assert_eq!(dirs, vec![1]);
+    }
+
+    #[test]
+    fn parse_community_well_known_uses_wire_value() {
+        let cases = [
+            ("graceful-shutdown", "65535:0"),
+            ("accept-own", "65535:1"),
+            ("llgr-stale", "65535:6"),
+            ("no-llgr", "65535:7"),
+            ("blackhole", "65535:666"),
+            ("no-export", "65535:65281"),
+            ("no-advertise", "65535:65282"),
+            ("no-export-subconfed", "65535:65283"),
+            ("no-peer", "65535:65284"),
+            ("NO-EXPORT", "65535:65281"),
+        ];
+        for (name, expected) in cases {
+            let re = parse_community(name).unwrap();
+            assert_eq!(re.as_str(), format!("^{}$", expected), "{}", name);
+            assert!(re.is_match(expected), "{}", name);
+        }
+        assert!(!parse_community("no-export").unwrap().is_match("0:5"));
     }
 }

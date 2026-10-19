@@ -32,6 +32,8 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum Notification {
     // Code 1: Message Header Error
+    #[error("header error: connection not synchronized")]
+    ConnectionNotSynchronized,
     #[error("header error: bad message length")]
     BadMessageLength { data: Vec<u8> },
     #[error("header error: bad message type")]
@@ -79,9 +81,10 @@ pub enum Notification {
     #[error("hold timer expired")]
     HoldTimerExpired,
 
-    // Code 5: FSM Error
-    #[error("FSM error: unexpected state {state}")]
-    FsmUnexpectedState { state: u8 },
+    // Code 5: FSM Error. `subcode` is the RFC 6608 subcode: 0 unspecified,
+    // 1/2/3 unexpected message in OpenSent/OpenConfirm/Established.
+    #[error("FSM error: subcode {subcode}")]
+    FsmUnexpectedState { subcode: u8 },
 
     // Code 6: Cease (RFC 4486)
     #[error("cease: maximum number of prefixes reached")]
@@ -120,7 +123,9 @@ impl Notification {
     /// Returns the BGP NOTIFICATION error code.
     pub fn notification_code(&self) -> u8 {
         match self {
-            Self::BadMessageLength { .. } | Self::BadMessageType { .. } => 1,
+            Self::ConnectionNotSynchronized
+            | Self::BadMessageLength { .. }
+            | Self::BadMessageType { .. } => 1,
             Self::OpenMalformed
             | Self::OpenUnsupportedVersionNumber { .. }
             | Self::OpenBadPeerAs
@@ -157,6 +162,7 @@ impl Notification {
     /// Returns the BGP NOTIFICATION subcode.
     pub fn notification_subcode(&self) -> u8 {
         match self {
+            Self::ConnectionNotSynchronized => 1,
             Self::BadMessageLength { .. } => 2,
             Self::BadMessageType { .. } => 3,
             Self::OpenMalformed => 0,
@@ -177,7 +183,7 @@ impl Notification {
             Self::UpdateInvalidNetworkField => 10,
             Self::UpdateMalformedAsPath => 11,
             Self::HoldTimerExpired => 0,
-            Self::FsmUnexpectedState { state } => *state,
+            Self::FsmUnexpectedState { subcode } => *subcode,
             Self::CeaseMaxPrefixReached => 1,
             Self::CeaseAdminShutdown => 2,
             Self::CeasePeerDeconfigured => 3,
@@ -222,6 +228,7 @@ impl Notification {
     /// Constructs a `Notification` from a received NOTIFICATION message.
     pub fn from_notification(code: u8, subcode: u8, data: Vec<u8>) -> Self {
         match (code, subcode) {
+            (1, 1) => Self::ConnectionNotSynchronized,
             (1, 2) => Self::BadMessageLength { data },
             (1, 3) => Self::BadMessageType { data },
             (2, 0) => Self::OpenMalformed,
@@ -242,7 +249,7 @@ impl Notification {
             (3, 10) => Self::UpdateInvalidNetworkField,
             (3, 11) => Self::UpdateMalformedAsPath,
             (4, _) => Self::HoldTimerExpired,
-            (5, state) => Self::FsmUnexpectedState { state },
+            (5, subcode) => Self::FsmUnexpectedState { subcode },
             (6, 1) => Self::CeaseMaxPrefixReached,
             (6, 2) => Self::CeaseAdminShutdown,
             (6, 3) => Self::CeasePeerDeconfigured,
@@ -991,22 +998,55 @@ impl From<&Capability> for u8 {
     }
 }
 
+/// Encode the OPEN optional parameters for `caps`: one Capabilities
+/// parameter (RFC 5492). Lengths are computed in `usize`; if a capability
+/// value or the parameters as a whole don't fit their one-octet length
+/// fields, encoding fails instead of wrapping. (Splitting into several
+/// parameters can't help since each adds overhead to the same one-octet
+/// total; RFC 9072 extended parameters are not supported.)
+fn encode_open_params(caps: &[Capability]) -> Result<Vec<u8>, Error> {
+    const CAPABILITY_PARAM: u8 = 2;
+    if caps.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut params = vec![CAPABILITY_PARAM, 0];
+    for cap in caps {
+        cap.encode(&mut params).map_err(|_| {
+            Error::InvalidArgument(format!(
+                "capability {} value exceeds 255 bytes",
+                u8::from(cap)
+            ))
+        })?;
+    }
+    if params.len() > u8::MAX as usize {
+        return Err(Error::InvalidArgument(format!(
+            "OPEN optional parameters are {} bytes, more than 255",
+            params.len()
+        )));
+    }
+    params[1] = (params.len() - 2) as u8;
+    Ok(params)
+}
+
 impl Capability {
-    fn encode<B: BufMut + AsMut<[u8]>>(&self, c: &mut B) -> Result<u8, ()> {
+    /// Encode as a capability TLV (code, length, value). The value length
+    /// is computed after encoding; values longer than 255 bytes don't fit
+    /// the one-octet length field and are rejected. Returns the TLV length.
+    fn encode<B: BufMut + AsMut<[u8]>>(&self, c: &mut B) -> Result<usize, ()> {
         let head = c.as_mut().len();
         c.put_u8(self.into());
+        let len_pos = c.as_mut().len();
+        c.put_u8(0); // value length, patched below
         match self {
             Capability::MultiProtocol(family) => {
-                c.put_u8(4);
                 c.put_u16(family.afi());
                 c.put_u8(0);
                 c.put_u8(family.safi());
             }
-            Capability::RouteRefresh => {
-                c.put_u8(0);
-            }
+            Capability::RouteRefresh
+            | Capability::ExtendedMessage
+            | Capability::EnhancedRouteRefresh => {}
             Capability::ExtendedNexthop(v) => {
-                c.put_u8(v.len() as u8 * 6);
                 for (family, afi) in v {
                     let Family(f) = family;
                     c.put_u32(*f);
@@ -1018,7 +1058,6 @@ impl Capability {
                 restart_time,
                 families,
             } => {
-                c.put_u8(families.len() as u8 * 4 + 2);
                 c.put_u16((*flags as u16) << 12 | *restart_time);
                 for (family, af_flags) in families {
                     c.put_u16(family.afi());
@@ -1027,25 +1066,16 @@ impl Capability {
                 }
             }
             Capability::FourOctetAsNumber(as_number) => {
-                c.put_u8(4);
                 c.put_u32(*as_number);
             }
             Capability::AddPath(v) => {
-                c.put_u8(v.len() as u8 * 4);
                 for (family, mode) in v {
                     c.put_u16(family.afi());
                     c.put_u8(family.safi());
                     c.put_u8(*mode);
                 }
             }
-            Capability::ExtendedMessage => {
-                c.put_u8(0);
-            }
-            Capability::EnhancedRouteRefresh => {
-                c.put_u8(0);
-            }
             Capability::LongLivedGracefulRestart(v) => {
-                c.put_u8(v.len() as u8 * 7);
                 for (family, flags, time) in v {
                     c.put_u16(family.afi());
                     c.put_u8(family.safi());
@@ -1056,20 +1086,20 @@ impl Capability {
                 }
             }
             Capability::Fqdn { hostname, domain } => {
-                c.put_u8((2 + hostname.len() + domain.len()) as u8);
-                c.put_u8(hostname.len() as u8);
+                let hostname_len = u8::try_from(hostname.len()).map_err(|_| ())?;
+                let domain_len = u8::try_from(domain.len()).map_err(|_| ())?;
+                c.put_u8(hostname_len);
                 c.put_slice(hostname.to_ascii_lowercase().as_bytes());
-                c.put_u8(domain.len() as u8);
+                c.put_u8(domain_len);
                 c.put_slice(domain.to_ascii_lowercase().as_bytes());
             }
             Capability::Unknown { code: _, bin } => {
-                c.put_u8(bin.len() as u8);
-                for v in bin {
-                    c.put_u8(*v);
-                }
+                c.put_slice(bin);
             }
         }
-        Ok((c.as_mut().len() - head) as u8)
+        let total = c.as_mut().len() - head;
+        c.as_mut()[len_pos] = u8::try_from(total - 2).map_err(|_| ())?;
+        Ok(total)
     }
 
     fn decode(code: u8, c: &mut dyn io::Read, len: u8) -> Result<Self, ()> {
@@ -2571,6 +2601,12 @@ impl PeerCodec {
         dst: &mut B,
         start: usize,
     ) -> Result<usize, Error> {
+        // Validate OPEN optional parameters before writing anything, so an
+        // oversized capability set never leaves a partial message in `dst`.
+        let open_params = match item {
+            Message::Open(open) => Some(encode_open_params(&open.capability)?),
+            _ => None,
+        };
         let pos_head = dst.as_mut().len();
         dst.put_u64(u64::MAX);
         dst.put_u64(u64::MAX);
@@ -2583,7 +2619,7 @@ impl PeerCodec {
                 as_number,
                 holdtime,
                 router_id,
-                capability,
+                capability: _,
             }) => {
                 let trans_asn = if *as_number > u16::MAX as u32 {
                     Capability::TRANS_ASN
@@ -2595,23 +2631,9 @@ impl PeerCodec {
                 dst.put_u16(trans_asn);
                 dst.put_u16(holdtime.seconds());
                 dst.put_u32(*router_id);
-                let op_param_len_pos = dst.as_mut().len();
-                dst.put_u8(0);
-                if !capability.is_empty() {
-                    dst.put_u8(2); // capability parameter type
-                    let param_len_pos = dst.as_mut().len();
-                    dst.put_u8(0);
-                    let mut cap_len = 0u8;
-                    for cap in capability {
-                        cap_len += cap.encode(dst).unwrap();
-                    }
-                    (&mut dst.as_mut()[param_len_pos..])
-                        .write_u8(cap_len)
-                        .unwrap();
-                    (&mut dst.as_mut()[op_param_len_pos..])
-                        .write_u8(cap_len + 2_u8)
-                        .unwrap();
-                }
+                let params = open_params.as_deref().unwrap_or_default();
+                dst.put_u8(params.len() as u8); // checked by encode_open_params
+                dst.put_slice(params);
                 0
             }
             Message::Update(Update::Reach {
@@ -3352,6 +3374,10 @@ impl PeerCodec {
         if buffer_len < Message::HEADER_LENGTH as usize {
             return Ok(None);
         }
+        // RFC 4271 §6.1: the marker MUST be all ones.
+        if src[..16].iter().any(|&b| b != 0xff) {
+            return Err(Notification::ConnectionNotSynchronized);
+        }
         let message_len = (&src[16..18]).read_u16::<NetworkEndian>().unwrap() as usize;
         if message_len < Message::HEADER_LENGTH as usize || message_len > self.max_message_length()
         {
@@ -3908,6 +3934,48 @@ mod capability_tests {
         framer.parse_message(&buf).unwrap()
     }
 
+    fn mp_caps(n: u16) -> Vec<Capability> {
+        (0..n)
+            .map(|i| Capability::MultiProtocol(Family::new(1000 + i, 1)))
+            .collect()
+    }
+
+    #[test]
+    fn open_encode_capabilities_up_to_253_bytes() {
+        // 42 MultiProtocol caps (6 bytes each) = 252 bytes, plus the 2-byte
+        // parameter header = 254 bytes: the largest that still fits (<= 255).
+        let msg = open_with(mp_caps(42));
+        match round_trip(&msg) {
+            ParsedMessage::Open(Open { capability, .. }) => assert_eq!(capability.len(), 42),
+            _ => panic!("expected OPEN"),
+        }
+    }
+
+    #[test]
+    fn open_encode_rejects_oversized_capabilities() {
+        // 43 caps = 258 bytes of parameters: previously the u8 length sum
+        // wrapped (or panicked in debug); now encoding fails cleanly and
+        // leaves nothing in the buffer.
+        let msg = open_with(mp_caps(43));
+        let mut buf = Vec::new();
+        assert!(PeerCodec::new().encode_to(&msg, &mut buf).is_err());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn capability_value_over_255_bytes_is_rejected() {
+        let msg = open_with(vec![Capability::Unknown {
+            code: 200,
+            bin: vec![0; 256],
+        }]);
+        let mut buf = Vec::new();
+        assert!(PeerCodec::new().encode_to(&msg, &mut buf).is_err());
+        // Previously `v.len() as u8 * 6` overflowed for 43+ tuples.
+        let many = (0..43u16).map(|i| (Family::new(1000 + i, 1), 2)).collect();
+        let msg = open_with(vec![Capability::ExtendedNexthop(many)]);
+        assert!(PeerCodec::new().encode_to(&msg, &mut Vec::new()).is_err());
+    }
+
     fn open_with(caps: Vec<Capability>) -> Message {
         Message::Open(Open {
             as_number: 65001,
@@ -4387,6 +4455,37 @@ mod framer_tests {
             Err(Notification::BadMessageLength { .. }) => {}
             other => panic!("expected BadMessageLength, got {:?}", other.map(|_| "ok")),
         }
+    }
+
+    #[test]
+    fn framer_rejects_bad_marker() {
+        let mut buf = keepalive_bytes();
+        buf[7] = 0x00;
+        let mut framer = default_framer();
+        let mut bmut = BytesMut::from(buf.as_slice());
+        let err = framer
+            .try_parse(&mut bmut)
+            .err()
+            .expect("bad marker accepted");
+        assert_eq!(err, Notification::ConnectionNotSynchronized);
+        assert_eq!(err.notification_code(), 1);
+        assert_eq!(err.notification_subcode(), 1);
+        assert_eq!(
+            Notification::from_notification(1, 1, vec![]),
+            Notification::ConnectionNotSynchronized
+        );
+    }
+
+    #[test]
+    fn framer_rejects_all_zero_marker_before_length_check() {
+        // Marker is checked first: a zeroed header is a sync error, not a
+        // length error.
+        let mut framer = default_framer();
+        let mut bmut = BytesMut::from(&[0u8; 19][..]);
+        assert_eq!(
+            framer.try_parse(&mut bmut).err(),
+            Some(Notification::ConnectionNotSynchronized)
+        );
     }
 
     #[test]
@@ -4888,7 +4987,7 @@ mod misc_tests {
         assert_eq!(err.notification_code(), 1);
         assert_eq!(err.notification_subcode(), 2);
         assert_eq!(err.notification_data(), &[0x10, 0x00]);
-        let err = Notification::FsmUnexpectedState { state: 3 };
+        let err = Notification::FsmUnexpectedState { subcode: 3 };
         assert_eq!(err.notification_code(), 5);
         assert_eq!(err.notification_subcode(), 3);
     }

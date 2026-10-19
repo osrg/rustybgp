@@ -33,6 +33,31 @@ use super::*;
 /// and is well above any realistic deployment need.
 pub(crate) const ADDPATH_SEND_MAX_LIMIT: usize = u8::MAX as usize;
 
+/// Refuse a peer whose TCP-MD5 (`auth_password`) or GTSM (`ttl_security`)
+/// configuration this platform cannot enforce, instead of starting it without
+/// the protection. `supported` is `auth::SUPPORTS_SOCKET_SECURITY`.
+pub(crate) fn check_socket_security_support(
+    params: &PeerParams,
+    supported: bool,
+) -> Result<(), String> {
+    if supported {
+        return Ok(());
+    }
+    if params.password.is_some() {
+        return Err(format!(
+            "peer {}: auth-password (TCP MD5) is not supported on this platform",
+            params.remote_addr
+        ));
+    }
+    if params.ttl_security.is_some() {
+        return Err(format!(
+            "peer {}: ttl-security (GTSM) is not supported on this platform",
+            params.remote_addr
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_local_address(value: Option<&str>, remote: IpAddr) -> Result<(), String> {
     if let Some(value) = value.filter(|s| !s.is_empty()) {
         let (ip, _) = config::parse_local_address(value).map_err(|e| e.to_string())?;
@@ -294,6 +319,9 @@ impl PeerParams {
         }
         // Always advertise RFC 8654 Extended Message support.
         local_cap.push(packet::Capability::ExtendedMessage);
+        // Always advertise RFC 2918 Route Refresh: received ROUTE-REFRESH
+        // messages are handled, and GoBGP advertises it unconditionally.
+        local_cap.push(packet::Capability::RouteRefresh);
         local_cap
     }
 
@@ -609,10 +637,12 @@ impl TryFrom<&config::Neighbor> for PeerParams {
             }
         }
 
+        // An explicitly configured hold-time of 0 disables the hold and
+        // keepalive timers (RFC 4271 §4.4); GoBGP only applies the default
+        // when the key is absent.
         let holdtime = timer_config
             .and_then(|c| c.hold_time)
             .map(|v| v as u64)
-            .filter(|&v| v != 0)
             .unwrap_or(PeerParams::DEFAULT_HOLD_TIME);
         let connect_retry_time = timer_config
             .and_then(|c| c.connect_retry)
@@ -769,10 +799,7 @@ impl From<&config::PeerGroup> for PeerGroup {
                 .and_then(|rs| rs.config.as_ref())
                 .and_then(|c| c.route_server_client)
                 .unwrap_or(false),
-            holdtime: timer_config
-                .and_then(|c| c.hold_time)
-                .map(|h| h as u64)
-                .filter(|&h| h != 0),
+            holdtime: timer_config.and_then(|c| c.hold_time).map(|h| h as u64),
             local_asn: pg.config.as_ref().and_then(|c| c.local_as).unwrap_or(0),
             passive: pg
                 .transport
