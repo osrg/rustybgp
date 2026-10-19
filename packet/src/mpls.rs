@@ -71,9 +71,18 @@ impl MplsLabelStack {
     }
 
     /// Decode a label stack from `c`, reading 3-byte labels until BoS=1.
-    pub fn decode<T: io::Read>(c: &mut T) -> Result<Self, io::Error> {
+    ///
+    /// `max_bits` is the number of bits the enclosing NLRI's length field
+    /// leaves for the stack; a stack that would exceed it is malformed.
+    pub fn decode<T: io::Read>(c: &mut T, max_bits: usize) -> Result<Self, io::Error> {
         let mut labels = Vec::new();
         loop {
+            if (labels.len() + 1) * MplsLabel::ENCODED_LEN * 8 > max_bits {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MPLS label stack exceeds NLRI length",
+                ));
+            }
             let mut buf = [0u8; 3];
             c.read_exact(&mut buf)?;
             let bos = (buf[2] & 1) != 0;
@@ -135,7 +144,7 @@ mod tests {
         assert_eq!(buf.len(), 3);
 
         let mut c = std::io::Cursor::new(&buf);
-        let decoded = MplsLabelStack::decode(&mut c).unwrap();
+        let decoded = MplsLabelStack::decode(&mut c, 255).unwrap();
         assert_eq!(decoded.labels().len(), 1);
         assert_eq!(decoded.labels()[0].value(), 100);
     }
@@ -151,7 +160,7 @@ mod tests {
         assert_eq!(buf[5] & 1, 1);
 
         let mut c = std::io::Cursor::new(&buf);
-        let decoded = MplsLabelStack::decode(&mut c).unwrap();
+        let decoded = MplsLabelStack::decode(&mut c, 255).unwrap();
         assert_eq!(decoded.labels().len(), 2);
         assert_eq!(decoded.labels()[0].value(), 200);
         assert_eq!(decoded.labels()[1].value(), 300);
@@ -161,5 +170,24 @@ mod tests {
     fn label_stack_encoded_len() {
         let stack = MplsLabelStack::new(vec![MplsLabel::new(1), MplsLabel::new(2)]);
         assert_eq!(stack.encoded_len(), 6);
+    }
+
+    #[test]
+    fn label_stack_bounded_by_max_bits() {
+        // 11 labels without BoS: 264 bits cannot fit in a 255-bit NLRI.
+        let buf = [0u8; 33];
+        let mut c = std::io::Cursor::new(&buf[..]);
+        assert!(MplsLabelStack::decode(&mut c, 255).is_err());
+
+        // A 2-label stack does not fit in 24 bits.
+        let mut buf = Vec::new();
+        MplsLabelStack::new(vec![MplsLabel::new(1), MplsLabel::new(2)]).encode(&mut buf);
+        let mut c = std::io::Cursor::new(&buf);
+        assert!(MplsLabelStack::decode(&mut c, 24).is_err());
+        let mut c = std::io::Cursor::new(&buf);
+        assert_eq!(
+            MplsLabelStack::decode(&mut c, 48).unwrap().labels().len(),
+            2
+        );
     }
 }
