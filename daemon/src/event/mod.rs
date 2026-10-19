@@ -11618,6 +11618,27 @@ local-address = "{local}"
     const CAP_ADDPATH: u8 = 69;
     const CAP_EXTENDED_NEXTHOP: u8 = 5;
     const CAP_GRACEFUL_RESTART: u8 = 64;
+    const CAP_ROUTE_REFRESH: u8 = 2;
+
+    #[test]
+    fn build_local_cap_always_advertises_route_refresh() {
+        for remote_addr in ["10.0.0.1", "2001:db8::1"] {
+            let caps = PeerParams::build_local_cap(
+                remote_addr.parse().unwrap(),
+                65001,
+                &FnvHashMap::default(),
+                None,
+                None,
+            );
+            assert!(has_cap(&caps, CAP_ROUTE_REFRESH), "{remote_addr}");
+            assert_eq!(
+                caps.iter()
+                    .filter(|c| cap_code(c) == CAP_ROUTE_REFRESH)
+                    .count(),
+                1
+            );
+        }
+    }
 
     #[test]
     fn build_local_cap_ipv4_peer_no_families_defaults_to_ipv4() {

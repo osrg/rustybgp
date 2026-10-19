@@ -294,6 +294,9 @@ impl PeerParams {
         }
         // Always advertise RFC 8654 Extended Message support.
         local_cap.push(packet::Capability::ExtendedMessage);
+        // Always advertise RFC 2918 Route Refresh: received ROUTE-REFRESH
+        // messages are handled, and GoBGP advertises it unconditionally.
+        local_cap.push(packet::Capability::RouteRefresh);
         local_cap
     }
 
