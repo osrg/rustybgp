@@ -3255,7 +3255,15 @@ impl PeerSession {
         let mut txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
         for _ in 0..self.ctrl_msgs.len() {
             let msg = self.ctrl_msgs.remove(0);
-            let wire_count = self.codec.encode_to(&msg, &mut txbuf).unwrap_or(1);
+            let wire_count = match self.codec.encode_to(&msg, &mut txbuf) {
+                Ok(n) => n,
+                Err(e) => {
+                    // e.g. an OPEN whose capabilities exceed 255 bytes: drop
+                    // the connection rather than leave it stuck in OpenSent.
+                    log::error!("{}: failed to encode message: {e}", self.remote_addr);
+                    return false;
+                }
+            };
             (*self.counter_tx).sync_tx(&msg, wire_count);
 
             if txbuf.len() > self.txbuf_size {
