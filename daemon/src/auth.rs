@@ -15,7 +15,7 @@
 
 use std::io;
 use std::net::IpAddr;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 #[repr(C)]
 struct TcpMd5sig {
@@ -164,10 +164,30 @@ pub(crate) fn set_min_ttl(_rawfd: RawFd, _addr: &IpAddr, _ttl_min: u8) -> io::Re
     Err(unsupported("GTSM minimum TTL checks"))
 }
 
+/// Apply GTSM (RFC 5082) to a socket: send with TTL / hop limit 255 and have
+/// the kernel drop received segments below `ttl_min`. Must be applied before
+/// `connect()` on active sockets so the SYN already carries TTL 255 and the
+/// SYN-ACK is subject to the minimum-TTL check.
+pub(crate) fn set_gtsm<S: std::os::fd::AsFd>(
+    sock: &S,
+    addr: &IpAddr,
+    ttl_min: u8,
+) -> io::Result<()> {
+    let s = socket2::SockRef::from(sock);
+    match addr {
+        IpAddr::V4(_) => s.set_ttl_v4(255)?,
+        IpAddr::V6(_) => {
+            s.set_unicast_hops_v6(255)?;
+            // Also cover IPv4-mapped traffic on a dual-stack socket.
+            let _ = s.set_ttl_v4(255);
+        }
+    }
+    set_min_ttl(sock.as_fd().as_raw_fd(), addr, ttl_min)
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::os::unix::io::AsRawFd;
 
     #[test]
     fn set_md5sig_reports_setsockopt_failure() {
@@ -192,5 +212,18 @@ mod tests {
         assert!(set_min_ttl(-1, &v6, 254).is_err());
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         assert!(set_min_ttl(l.as_raw_fd(), &v4, 254).is_ok());
+    }
+
+    #[test]
+    fn set_gtsm_sets_ttl_255_before_connect() {
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        set_gtsm(&s, &v4, 254).unwrap();
+        assert_eq!(s.ttl_v4().unwrap(), 255);
+
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let s = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None).unwrap();
+        set_gtsm(&s, &v6, 254).unwrap();
+        assert_eq!(s.unicast_hops_v6().unwrap(), 255);
     }
 }

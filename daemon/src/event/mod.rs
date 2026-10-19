@@ -644,6 +644,7 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
     let bind_interface = peer.config.bind_interface.clone();
     let local_address = peer.config.local_address.clone();
     let peer_ifindex = bind_interface.as_deref().map(auth::ifindex_of).unwrap_or(0);
+    let ttl_security = peer.config.ttl_security;
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let join_handle = tokio::spawn(async move {
         loop {
@@ -673,6 +674,11 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
                 }
                 if let Some(key) = password.as_ref() {
                     auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex)?;
+                }
+                // GTSM must be in place before connect(): the peer drops a
+                // SYN that arrives with TTL < 255 when it enforces GTSM.
+                if let Some(ttl_min) = ttl_security {
+                    auth::set_gtsm(&socket, &peer_addr, ttl_min)?;
                 }
                 Ok::<_, std::io::Error>(socket)
             })();
@@ -1850,10 +1856,7 @@ async fn accept_connection(
         // GTSM (RFC 5082): send with TTL=255, drop incoming below ttl_min.
         // Without the minimum-TTL check GTSM gives no protection, so refuse
         // the connection rather than run it unprotected.
-        if let Err(e) = stream
-            .set_ttl(255)
-            .and_then(|_| auth::set_min_ttl(stream.as_raw_fd(), &remote_addr, ttl_min))
-        {
+        if let Err(e) = auth::set_gtsm(&stream, &remote_addr, ttl_min) {
             log::error!("failed to apply GTSM to connection with {remote_addr}: {e}");
             if peer.config.delete_on_disconnected {
                 g.peers.remove(&remote_addr);
@@ -4115,6 +4118,28 @@ mod tests {
             .await
             .expect("retry loop must remain cancellable")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_connect_applies_gtsm_before_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut params = default_peer_params("127.0.0.1".parse().unwrap());
+        params.remote_port = listener.local_addr().unwrap().port();
+        // Minimum TTL 1 so the local SYN-ACK passes; we only check what we send.
+        params.ttl_security = Some(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let global = make_global();
+        global.write().await.add_peer(params, Some(tx)).unwrap();
+        let _accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("active connect must dial")
+            .unwrap();
+        let stream = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Set on the socket before connect(), so the SYN already used TTL 255.
+        assert_eq!(stream.ttl().unwrap(), 255);
     }
 
     #[tokio::test]
