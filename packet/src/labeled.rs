@@ -64,7 +64,7 @@ impl LabeledV4Nlri {
         }
 
         let (labels, label_bits) = if is_reach {
-            let stack = MplsLabelStack::decode(c)?;
+            let stack = MplsLabelStack::decode(c, total_bits as usize)?;
             let bits = (stack.encoded_len() * 8) as u8;
             (stack, bits)
         } else {
@@ -125,7 +125,7 @@ impl LabeledV6Nlri {
         }
 
         let (labels, label_bits) = if is_reach {
-            let stack = MplsLabelStack::decode(c)?;
+            let stack = MplsLabelStack::decode(c, total_bits as usize)?;
             let bits = (stack.encoded_len() * 8) as u8;
             (stack, bits)
         } else {
@@ -366,5 +366,21 @@ mod tests {
         nlri.encode(&mut buf);
         // total_bits = 24 + 24 = 0x30; label 0 BoS = 0x000001; prefix = 0xc0 0xa8 0x01
         assert_eq!(buf, &[0x30, 0x00, 0x00, 0x01, 0xc0, 0xa8, 0x01]);
+    }
+
+    #[test]
+    fn rejects_label_stack_exceeding_nlri_length() {
+        // 11 labels = 264 bits; (264 as u8) truncated to 8 before the fix,
+        // which made the stack look like it fit in total_bits=32.
+        for total_bits in [32u8, 255] {
+            let mut buf = vec![total_bits];
+            for i in 0..11 {
+                buf.extend_from_slice(&[0x00, 0x01, if i == 10 { 0x01 } else { 0x00 }]);
+            }
+            buf.extend_from_slice(&[0u8; 16]);
+            let len = buf.len();
+            assert!(LabeledV4Nlri::decode(&mut Cursor::new(&buf), len, true).is_err());
+            assert!(LabeledV6Nlri::decode(&mut Cursor::new(&buf), len, true).is_err());
+        }
     }
 }
