@@ -935,6 +935,17 @@ impl Global {
             });
         }
 
+        // Route-selection options are process-wide, as in GoBGP.
+        table::set_always_compare_med(
+            config
+                .global
+                .as_ref()
+                .and_then(|g| g.route_selection_options.as_ref())
+                .and_then(|r| r.config.as_ref())
+                .and_then(|c| c.always_compare_med)
+                .unwrap_or(false),
+        );
+
         if let Some(groups) = &config.peer_groups {
             for pg in groups {
                 if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {

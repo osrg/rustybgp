@@ -1079,6 +1079,11 @@ impl GoBgpService for GrpcService {
                 format!("invalid router-id: {}", g.router_id),
             )
         })?;
+        table::set_always_compare_med(
+            g.route_selection_options
+                .as_ref()
+                .is_some_and(|r| r.always_compare_med),
+        );
         if let Some(c) = g.confederation.filter(|c| c.enabled && c.identifier != 0) {
             global.confederation = Some(ConfederationConfig {
                 id: c.identifier,
@@ -1155,6 +1160,7 @@ impl GoBgpService for GrpcService {
         global.watch_event_cancels.clear();
         global.asn = 0;
         global.router_id = Ipv4Addr::new(0, 0, 0, 0);
+        table::set_always_compare_med(false);
         global.listen_port = None;
         global.pending_listeners.clear();
         global.kernel_service.take();
@@ -3570,7 +3576,10 @@ impl From<&Global> for api::Global {
             listen_addresses: Vec::new(),
             families: Vec::new(),
             use_multiple_paths: false,
-            route_selection_options: None,
+            route_selection_options: Some(api::RouteSelectionOptionsConfig {
+                always_compare_med: table::always_compare_med(),
+                ..Default::default()
+            }),
             default_route_distance: None,
             confederation: g.confederation.as_ref().map(|c| api::Confederation {
                 enabled: true,
