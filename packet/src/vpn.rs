@@ -65,12 +65,9 @@ impl VpnV4Nlri {
             return Err(malformed());
         }
 
-        let labels = MplsLabelStack::decode(c)?;
-        let label_bits = (labels.encoded_len() * 8) as u8;
-        if total_bits < label_bits + VPN_RD_BITS {
-            return Err(malformed());
-        }
-        let prefix_bits = total_bits - label_bits - VPN_RD_BITS;
+        let labels = MplsLabelStack::decode(c, (total_bits - VPN_RD_BITS) as usize)?;
+        let label_bits = labels.encoded_len() * 8;
+        let prefix_bits = (total_bits as usize - label_bits - VPN_RD_BITS as usize) as u8;
         if prefix_bits > 32 {
             return Err(malformed());
         }
@@ -122,12 +119,9 @@ impl VpnV6Nlri {
             return Err(malformed());
         }
 
-        let labels = MplsLabelStack::decode(c)?;
-        let label_bits = (labels.encoded_len() * 8) as u8;
-        if total_bits < label_bits + VPN_RD_BITS {
-            return Err(malformed());
-        }
-        let prefix_bits = total_bits - label_bits - VPN_RD_BITS;
+        let labels = MplsLabelStack::decode(c, (total_bits - VPN_RD_BITS) as usize)?;
+        let label_bits = labels.encoded_len() * 8;
+        let prefix_bits = (total_bits as usize - label_bits - VPN_RD_BITS as usize) as u8;
         if prefix_bits > 128 {
             return Err(malformed());
         }
@@ -392,5 +386,28 @@ mod tests {
         assert_eq!(nlri.rd, rd());
         assert_eq!(nlri.prefix.addr, "2001:db8::".parse::<Ipv6Addr>().unwrap());
         assert_eq!(nlri.prefix.mask, 32);
+    }
+
+    // total_bits=255 followed by `n` labels (BoS on the last) and enough
+    // trailing bytes for any RD/prefix read.
+    fn vpn_with_labels(n: usize) -> Vec<u8> {
+        let mut buf = vec![255u8];
+        for i in 0..n {
+            buf.extend_from_slice(&[0x00, 0x01, if i + 1 == n { 0x01 } else { 0x00 }]);
+        }
+        buf.extend_from_slice(&[0u8; 32]);
+        buf
+    }
+
+    #[test]
+    fn rejects_label_stack_exceeding_nlri_length() {
+        // 8 labels = 192 bits; 192 + 64 overflowed u8 before the fix.
+        // 11 labels = 264 bits; (264 as u8) truncated to 8 before the fix.
+        for n in [8, 11, 12] {
+            let buf = vpn_with_labels(n);
+            let len = buf.len();
+            assert!(VpnV4Nlri::decode(&mut Cursor::new(&buf), len).is_err());
+            assert!(VpnV6Nlri::decode(&mut Cursor::new(&buf), len).is_err());
+        }
     }
 }
