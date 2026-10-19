@@ -2993,7 +2993,7 @@ impl PeerCodec {
                 let attr_len = c
                     .read_u16::<NetworkEndian>()
                     .map_err(|_| Notification::UpdateMalformedAttributeList)?;
-                if buf.len() < (withdrawn_len + attr_len + MINIMUM_UPDATE_LENGTH as u16).into() {
+                if buf.len() < withdrawn_len as usize + attr_len as usize + MINIMUM_UPDATE_LENGTH {
                     return Err(malformed());
                 }
                 let mut seen = FnvHashSet::default();
@@ -3004,18 +3004,18 @@ impl PeerCodec {
                     if attr_end < c.position() + 2 {
                         break;
                     }
-                    let flags = c.read_u8().unwrap();
-                    let code = c.read_u8().unwrap();
+                    let flags = c.read_u8().map_err(|_| malformed())?;
+                    let code = c.read_u8().map_err(|_| malformed())?;
                     let alen = if flags & Attribute::FLAG_EXTENDED != 0 {
                         if attr_end < c.position() + 2 {
                             break;
                         }
-                        c.read_u16::<NetworkEndian>().unwrap()
+                        c.read_u16::<NetworkEndian>().map_err(|_| malformed())?
                     } else {
                         if attr_end < c.position() + 1 {
                             break;
                         }
-                        c.read_u8().unwrap() as u16
+                        c.read_u8().map_err(|_| malformed())? as u16
                     };
                     if attr_end < c.position() + alen as u64 {
                         break;
@@ -3594,6 +3594,23 @@ mod nlri_tests {
             codec.parse_message(&msg).err(),
             Some(Notification::UpdateMalformedAttributeList)
         );
+    }
+
+    #[test]
+    fn parse_message_rejects_oversized_attr_len() {
+        // withdrawn_len + attr_len + 23 overflows u16 when attr_len = 0xffff.
+        for (withdrawn_len, attr_len) in [(0u16, 0xffffu16), (0xffeb, 0x0014), (0xffff, 0xffff)] {
+            let mut codec = PeerCodec::new();
+            let mut msg = vec![0xFF; 16];
+            msg.extend_from_slice(&23u16.to_be_bytes());
+            msg.push(Message::UPDATE);
+            msg.extend_from_slice(&withdrawn_len.to_be_bytes());
+            msg.extend_from_slice(&attr_len.to_be_bytes());
+            assert_eq!(
+                codec.parse_message(&msg).err(),
+                Some(Notification::UpdateMalformedAttributeList)
+            );
+        }
     }
 }
 
