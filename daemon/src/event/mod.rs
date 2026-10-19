@@ -10082,7 +10082,7 @@ local-address = "{local}"
         // other path stays advertised.
         #[test]
         fn addpath_no_export_withdraws_only_that_path() {
-            let mut em = ExportMap::default();
+            let mut em = ExportMap::new([Family::IPV4]);
             em.mark_sent(Family::IPV4, 1, 1);
             em.mark_sent(Family::IPV4, 1, 2);
             let mut pending = crate::peer_tx::PendingTx::new(true);
@@ -12639,14 +12639,7 @@ port = 3323
                 .rx_update(reach_set_with_id("10.0.0.0/24", id), None, origin_only(), 0)
                 .await;
         }
-        let peer: IpAddr = "10.0.0.2".parse().unwrap();
-        let received = |t: &TableHandle| {
-            t.collect_peer_stats(&[peer])
-                .get(&peer)
-                .and_then(|s| s.get(&Family::IPV4))
-                .map(|s| s.received)
-        };
-        assert_eq!(received(&tables), Some(2));
+        assert_eq!(tables.table_state(Family::IPV4).num_path, 2);
 
         session
             .rx_update(
@@ -12657,8 +12650,9 @@ port = 3323
             )
             .await;
 
-        assert_eq!(received(&tables), Some(1));
-        assert_eq!(tables.table_state(Family::IPV4).num_destination, 1);
+        let state = tables.table_state(Family::IPV4);
+        assert_eq!(state.num_destination, 1);
+        assert_eq!(state.num_path, 1);
     }
 
     #[test]
