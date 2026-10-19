@@ -93,8 +93,10 @@ pub(crate) enum Output {
     /// Send a BGP message on the wire.
     SendMessage(bgp::Message),
     /// Arm or re-arm the keepalive timer (send direction, seconds).
+    /// Zero disarms the timer.
     SetKeepaliveTimer(u64),
     /// Arm or re-arm the hold timer (receive direction, seconds).
+    /// Zero disarms the timer.
     SetHoldTimer(u64),
     /// Codec configured from the negotiated capabilities. The driver should
     /// replace its PeerCodec with this.
@@ -272,11 +274,12 @@ impl Connection {
 
         // Negotiate holdtime
         self.negotiated_holdtime = std::cmp::min(self.local_holdtime, self.remote_holdtime as u64);
-        if self.negotiated_holdtime != 0 {
-            self.keepalive_interval = self.negotiated_holdtime / 3;
-            out.push(Output::SetKeepaliveTimer(self.keepalive_interval));
-            out.push(Output::SetHoldTimer(self.negotiated_holdtime));
-        }
+        // RFC 4271 §4.4: a negotiated hold time of zero means KEEPALIVE
+        // messages MUST NOT be sent and the hold timer is not run. A zero
+        // value disarms both timers (including the OpenSent hold timer).
+        self.keepalive_interval = self.negotiated_holdtime / 3;
+        out.push(Output::SetKeepaliveTimer(self.keepalive_interval));
+        out.push(Output::SetHoldTimer(self.negotiated_holdtime));
 
         // Transition to OpenConfirm
         self.state = State::OpenConfirm;
@@ -289,8 +292,8 @@ impl Connection {
         match self.state {
             State::OpenConfirm => {
                 self.state = State::Established;
-                vec![
-                    Output::SetHoldTimer(self.negotiated_holdtime),
+                let mut out = self.restart_hold_timer();
+                out.extend([
                     Output::SessionEstablished {
                         remote_asn: self.remote_asn,
                         remote_id: self.remote_id,
@@ -299,11 +302,10 @@ impl Connection {
                         effective_max: FnvHashMap::default(),
                     },
                     Output::StateChanged(State::Established),
-                ]
+                ]);
+                out
             }
-            State::Established => {
-                vec![Output::SetHoldTimer(self.negotiated_holdtime)]
-            }
+            State::Established => self.restart_hold_timer(),
             _ => {
                 let notif =
                     bgp::Message::Notification(rustybgp_packet::Notification::FsmUnexpectedState {
@@ -328,7 +330,17 @@ impl Connection {
                 Some(notif),
             )];
         }
-        vec![Output::SetHoldTimer(self.negotiated_holdtime)]
+        self.restart_hold_timer()
+    }
+
+    /// Re-arm the hold timer after a KEEPALIVE or UPDATE was received.
+    /// Nothing to do when the negotiated hold time is zero (timer disabled).
+    fn restart_hold_timer(&self) -> Vec<Output> {
+        if self.negotiated_holdtime == 0 {
+            Vec::new()
+        } else {
+            vec![Output::SetHoldTimer(self.negotiated_holdtime)]
+        }
     }
 
     fn on_notification(&mut self, err: rustybgp_packet::Notification) -> Vec<Output> {
@@ -354,7 +366,7 @@ impl Connection {
 
     fn on_keepalive_timer_expired(&mut self) -> Vec<Output> {
         match self.state {
-            State::OpenConfirm | State::Established => vec![
+            State::OpenConfirm | State::Established if self.keepalive_interval > 0 => vec![
                 Output::SendMessage(bgp::Message::Keepalive),
                 Output::SetKeepaliveTimer(self.keepalive_interval),
             ],
@@ -1275,11 +1287,55 @@ mod tests {
             60,
         )));
         assert_eq!(s.negotiated_holdtime(), 0);
+        // Both timers are explicitly disarmed (0), never armed with a value.
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SetKeepaliveTimer(0)
+        )));
+        assert!(has_output(&out, |o| matches!(o, Output::SetHoldTimer(0))));
         assert!(!has_output(&out, |o| matches!(
             o,
-            Output::SetKeepaliveTimer(_)
+            Output::SetKeepaliveTimer(n) | Output::SetHoldTimer(n) if *n != 0
         )));
+
+        // KEEPALIVE → Established: hold timer must not be (re)armed.
+        let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert_eq!(s.state(), State::Established);
         assert!(!has_output(&out, |o| matches!(o, Output::SetHoldTimer(_))));
+
+        // Further KEEPALIVE / UPDATE: still no hold timer.
+        let out = s.process(Input::MessageReceived(bgp::Message::Keepalive));
+        assert!(!has_output(&out, |o| matches!(o, Output::SetHoldTimer(_))));
+        assert!(out.is_empty());
+
+        // A stray keepalive-timer expiry must not send KEEPALIVE (RFC 4271 §4.4).
+        let out = s.process(Input::KeepaliveTimerExpired);
+        assert!(out.is_empty());
+        let out = s.process(Input::UpdateSent);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn zero_remote_holdtime_disables_timers() {
+        // Local 90, remote 0 → negotiated 0; the OpenSent hold timer must be
+        // cancelled rather than left running.
+        let mut s = basic_connection();
+        let out = s.process(Input::Connected(false));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SetHoldTimer(INITIAL_HOLD_SECS)
+        )));
+        let out = s.process(Input::MessageReceived(remote_open(
+            65002,
+            remote_router_id(),
+            0,
+        )));
+        assert_eq!(s.negotiated_holdtime(), 0);
+        assert!(has_output(&out, |o| matches!(o, Output::SetHoldTimer(0))));
+        assert!(has_output(&out, |o| matches!(
+            o,
+            Output::SetKeepaliveTimer(0)
+        )));
     }
 
     // --- PeerFsm tests ---
