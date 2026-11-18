@@ -1483,8 +1483,10 @@ impl Attribute {
                         }
                         let seg_type = b[pos];
                         let seg_count = b[pos + 1] as usize;
+                        // RFC 7606 §7.2: a zero Path Segment Length is malformed.
                         if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET)
                             .contains(&seg_type)
+                            || seg_count == 0
                         {
                             return Err(());
                         }
@@ -1512,8 +1514,10 @@ impl Attribute {
                         }
                         let seg_type = b[pos];
                         let seg_count = b[pos + 1] as usize;
+                        // RFC 7606 §7.2: a zero Path Segment Length is malformed.
                         if !(Self::AS_PATH_TYPE_SET..=Self::AS_PATH_TYPE_CONFED_SET)
                             .contains(&seg_type)
+                            || seg_count == 0
                         {
                             return Err(());
                         }
@@ -1968,35 +1972,36 @@ impl Attribute {
         buf
     }
 
+    /// Write flags, type code and length. The Extended Length bit is derived
+    /// from the length actually written, never copied from the received flags:
+    /// a peer may legally send any attribute with the bit set (RFC 4271 §4.3),
+    /// and echoing it ahead of a one-octet length would corrupt the UPDATE.
+    fn encode_header<B: BufMut>(&self, dst: &mut B, len: usize) {
+        if len > 255 {
+            dst.put_u8(self.flags | Attribute::FLAG_EXTENDED);
+            dst.put_u8(self.code);
+            dst.put_u16(len as u16);
+        } else {
+            dst.put_u8(self.flags & !Attribute::FLAG_EXTENDED);
+            dst.put_u8(self.code);
+            dst.put_u8(len as u8);
+        }
+    }
+
     fn encode<B: BufMut + AsMut<[u8]>>(&self, dst: &mut B) -> Result<u16, ()> {
         let pos_head = dst.as_mut().len();
         match self.code {
             Attribute::ORIGIN => {
-                dst.put_u8(self.flags);
-                dst.put_u8(self.code);
-                dst.put_u8(1);
+                self.encode_header(dst, 1);
                 dst.put_u8(self.value().unwrap() as u8);
             }
             Attribute::MULTI_EXIT_DESC | Attribute::LOCAL_PREF | Attribute::ORIGINATOR_ID => {
-                dst.put_u8(self.flags);
-                dst.put_u8(self.code);
-                dst.put_u8(4);
+                self.encode_header(dst, 4);
                 dst.put_u32(self.value().unwrap());
             }
             _ => {
                 let bin = self.binary().unwrap();
-                let flags = if bin.len() > 255 {
-                    self.flags | Attribute::FLAG_EXTENDED
-                } else {
-                    self.flags
-                };
-                dst.put_u8(flags);
-                dst.put_u8(self.code);
-                if flags & Attribute::FLAG_EXTENDED > 0 {
-                    dst.put_u16(bin.len() as u16);
-                } else {
-                    dst.put_u8(bin.len() as u8);
-                }
+                self.encode_header(dst, bin.len());
                 dst.put_slice(bin);
             }
         }
@@ -6918,6 +6923,91 @@ mod update_tests {
         let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+    }
+
+    /// Issue #654: an inbound attribute may legally carry the Extended Length
+    /// bit with a short value. Re-encoding must not echo that bit ahead of a
+    /// one-octet length.
+    #[test]
+    fn extended_length_inbound_attrs_reencode_well_formed() {
+        let mut attr_bytes = Vec::new();
+        attr_bytes.extend_from_slice(&[0x50, 0x01, 0x00, 0x01, 0x00]); // ORIGIN
+        attr_bytes.extend_from_slice(&[0x50, 0x02, 0x00, 0x0a, 0x02, 0x02]); // AS_PATH
+        attr_bytes.extend_from_slice(&[0x00, 0x00, 0xfd, 0xe9, 0x00, 0x00, 0xfc, 0x00]);
+        attr_bytes.extend_from_slice(&[0x90, 0x04, 0x00, 0x04, 0x00, 0x00, 0x00, 0x64]); // MED
+        attr_bytes.extend_from_slice(&[0x50, 0x05, 0x00, 0x04, 0x00, 0x00, 0x00, 0xc8]); // LOCAL_PREF
+        attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xac, 0x1e, 0xe7, 0x65]); // NEXTHOP
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        let attrs = match &msgs[..] {
+            [Message::Update(Update::Reach { attr, .. })] => attr.clone(),
+            other => panic!("expected a single Reach, got {}", other.len()),
+        };
+        for code in [
+            Attribute::ORIGIN,
+            Attribute::AS_PATH,
+            Attribute::MULTI_EXIT_DESC,
+            Attribute::LOCAL_PREF,
+        ] {
+            let a = attrs.iter().find(|a| a.code() == code).unwrap();
+            let wire = a.encode_to_bytes();
+            assert_eq!(
+                wire[0] & Attribute::FLAG_EXTENDED,
+                0,
+                "code {code}: short value must use a one-octet length"
+            );
+            assert_eq!(
+                wire[2] as usize,
+                wire.len() - 3,
+                "code {code}: length mismatch"
+            );
+            let back = Attribute::decode_from_bytes(&wire).expect("re-encoded attr must decode");
+            assert_eq!(back.code(), code);
+        }
+        // Prepending (the re-advertisement path) must stay well-formed too.
+        let as_path = attrs
+            .iter()
+            .find(|a| a.code() == Attribute::AS_PATH)
+            .unwrap();
+        let wire = as_path.as_path_prepend(65000).encode_to_bytes();
+        assert_eq!(wire[0] & Attribute::FLAG_EXTENDED, 0);
+        Attribute::decode_from_bytes(&wire).expect("prepended AS_PATH must decode");
+    }
+
+    #[test]
+    fn long_attribute_still_sets_extended_length() {
+        let a = Attribute::new_with_bin(Attribute::COMMUNITY, vec![0u8; 4 * 100]).unwrap();
+        let wire = a.encode_to_bytes();
+        assert_ne!(wire[0] & Attribute::FLAG_EXTENDED, 0);
+        assert_eq!(u16::from_be_bytes([wire[2], wire[3]]), 400);
+        Attribute::decode_from_bytes(&wire).expect("must decode");
+    }
+
+    /// RFC 7606 §7.2: a zero Path Segment Length makes AS_PATH malformed.
+    #[test]
+    fn malformed_aspath_zero_length_segment_treat_as_withdraw() {
+        for as_path_data in [
+            vec![0x02, 0x00],
+            vec![0x02, 0x01, 0x00, 0x00, 0xFD, 0xEA, 0x02, 0x00],
+        ] {
+            let mut attr_bytes = Vec::new();
+            attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+            attr_bytes.push(0x40);
+            attr_bytes.push(0x02);
+            attr_bytes.push(as_path_data.len() as u8);
+            attr_bytes.extend_from_slice(&as_path_data);
+            attr_bytes.extend_from_slice(&[0x40, 0x03, 0x04, 0xC0, 0x00, 0x02, 0x01]);
+            let buf = raw_update_with_attrs(&attr_bytes);
+            let parsed = ipv4_codec()
+                .parse_message(&buf)
+                .expect("parse must not fail");
+            let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+            assert_eq!(msgs.len(), 1);
+            assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+        }
     }
 
     #[test]
