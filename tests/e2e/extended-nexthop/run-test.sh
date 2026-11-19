@@ -86,12 +86,25 @@ else
 fi
 
 # Test 3: FRR received 172.30.1.0/24 from rustybgpd via BGP
-ROUTE_RUSTY=$(docker exec router-frr vtysh -c "show bgp ipv4 unicast 172.30.1.0/24 json" 2>/dev/null \
-    | jq '.paths | length' 2>/dev/null || echo "0")
-if [ "$ROUTE_RUSTY" -gt 0 ]; then
+# The UPDATE can arrive after FRR reports Established, so poll instead of
+# checking once.
+ROUTE_WAIT=30
+ROUTE_RUSTY=0
+for i in $(seq 1 $ROUTE_WAIT); do
+    ROUTE_RUSTY=$(docker exec router-frr vtysh -c "show bgp ipv4 unicast 172.30.1.0/24 json" 2>/dev/null \
+        | jq '.paths | length' 2>/dev/null || echo "0")
+    if [ "${ROUTE_RUSTY:-0}" -gt 0 ]; then
+        break
+    fi
+    sleep 1
+done
+if [ "${ROUTE_RUSTY:-0}" -gt 0 ]; then
     pass "FRR received 172.30.1.0/24 from rustybgpd via BGP"
 else
-    fail "FRR received 172.30.1.0/24 from rustybgpd via BGP"
+    fail "FRR received 172.30.1.0/24 from rustybgpd via BGP (waited ${ROUTE_WAIT}s)"
+    echo ""
+    echo "--- FRR IPv4 unicast RIB ---"
+    docker exec router-frr vtysh -c "show bgp ipv4 unicast" 2>/dev/null || true
 fi
 
 # Test 4: End-to-end ping from client1 to client4
