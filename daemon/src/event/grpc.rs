@@ -1079,6 +1079,11 @@ impl GoBgpService for GrpcService {
                 format!("invalid router-id: {}", g.router_id),
             )
         })?;
+        table::set_always_compare_med(
+            g.route_selection_options
+                .as_ref()
+                .is_some_and(|r| r.always_compare_med),
+        );
         if let Some(c) = g.confederation.filter(|c| c.enabled && c.identifier != 0) {
             global.confederation = Some(ConfederationConfig {
                 id: c.identifier,
@@ -1155,6 +1160,7 @@ impl GoBgpService for GrpcService {
         global.watch_event_cancels.clear();
         global.asn = 0;
         global.router_id = Ipv4Addr::new(0, 0, 0, 0);
+        table::set_always_compare_med(false);
         global.listen_port = None;
         global.pending_listeners.clear();
         global.kernel_service.take();
@@ -1202,12 +1208,28 @@ impl GoBgpService for GrpcService {
         {
             params.apply_peer_group(pg);
         }
-        if let Some(password) = params.password.as_ref() {
-            for &(fd, ifindex) in &global.listen_sockets {
-                auth::set_md5sig(fd, &params.remote_addr, password, ifindex);
+        if global.peers.contains_key(&params.remote_addr) {
+            return Err(Error::AlreadyExists("peer address already exists".to_string()).into());
+        }
+        let remote_addr = params.remote_addr;
+        if let Some(password) = params.password.clone() {
+            // Fail closed: refuse the peer rather than accept unauthenticated
+            // passive connections from it.
+            if let Err(e) = global.set_listener_md5(remote_addr, Some(&password)) {
+                global.set_listener_md5(remote_addr, None).ok();
+                return Err(tonic::Status::new(
+                    tonic::Code::FailedPrecondition,
+                    format!("failed to set TCP MD5 key for peer {remote_addr}: {e}"),
+                ));
             }
         }
-        global.add_peer(params, Some(self.active_conn_tx.clone()))?;
+        let has_password = params.password.is_some();
+        if let Err(e) = global.add_peer(params, Some(self.active_conn_tx.clone())) {
+            if has_password {
+                global.set_listener_md5(remote_addr, None).ok();
+            }
+            return Err(e.into());
+        }
         Ok(tonic::Response::new(api::AddPeerResponse {}))
     }
     async fn delete_peer(
@@ -1228,9 +1250,7 @@ impl GoBgpService for GrpcService {
                     );
                 }
                 if p.config.password.is_some() {
-                    for &(fd, ifindex) in &global.listen_sockets {
-                        auth::set_md5sig(fd, &peer_addr, "", ifindex);
-                    }
+                    global.set_listener_md5(peer_addr, None).ok();
                 }
                 if let Some(bfd) = &global.bfd_handle {
                     bfd.remove_peer(peer_addr);
@@ -1322,6 +1342,8 @@ impl GoBgpService for GrpcService {
         }
         peer::validate_local_address(new_params.local_address.as_deref(), new_params.remote_addr)
             .map_err(Error::InvalidArgument)?;
+        peer::check_socket_security_support(&new_params, auth::SUPPORTS_SOCKET_SECURITY)
+            .map_err(Error::InvalidArgument)?;
 
         let peer = global
             .peers
@@ -1343,7 +1365,6 @@ impl GoBgpService for GrpcService {
 
         let global_asn = global.asn;
         let router_id = u32::from(global.router_id);
-        let listen_sockets = global.listen_sockets.clone();
         let peer_addr = new_params.remote_addr;
 
         let new_local_asn = if new_params.local_asn == 0 {
@@ -1464,14 +1485,16 @@ impl GoBgpService for GrpcService {
         // Update TCP MD5 socket option after releasing the peer borrow.
         if old_password != new_params.password {
             if old_password.is_some() {
-                for &(fd, ifindex) in &listen_sockets {
-                    auth::set_md5sig(fd, &peer_addr, "", ifindex);
-                }
+                global.set_listener_md5(peer_addr, None).ok();
             }
-            if let Some(pw) = &new_params.password {
-                for &(fd, ifindex) in &listen_sockets {
-                    auth::set_md5sig(fd, &peer_addr, pw, ifindex);
-                }
+            if let Some(pw) = &new_params.password
+                && let Err(e) = global.set_listener_md5(peer_addr, Some(pw))
+            {
+                // The peer's passive connections are now refused (fail closed).
+                return Err(tonic::Status::new(
+                    tonic::Code::FailedPrecondition,
+                    format!("failed to set TCP MD5 key for peer {peer_addr}: {e}"),
+                ));
             }
         }
 
@@ -3570,7 +3593,10 @@ impl From<&Global> for api::Global {
             listen_addresses: Vec::new(),
             families: Vec::new(),
             use_multiple_paths: false,
-            route_selection_options: None,
+            route_selection_options: Some(api::RouteSelectionOptionsConfig {
+                always_compare_med: table::always_compare_med(),
+                ..Default::default()
+            }),
             default_route_distance: None,
             confederation: g.confederation.as_ref().map(|c| api::Confederation {
                 enabled: true,

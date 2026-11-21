@@ -637,6 +637,9 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             if rs_isolation_suppress(&best.source, export_ctx.role) {
                 return None;
             }
+            if well_known_community_suppress(&best.attr, export_ctx.role) {
+                return None;
+            }
             Some(best)
         });
         // BMP Adj-RIB-Out pre-policy: what would be exported before per-peer policy.
@@ -746,6 +749,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             .filter(|p| p.source.remote_addr != remote_addr)
             .filter(|p| !ibgp_split_horizon_suppress(&p.source, export_ctx.role, cluster_id))
             .filter(|p| !rs_isolation_suppress(&p.source, export_ctx.role))
+            .filter(|p| !well_known_community_suppress(&p.attr, export_ctx.role))
             .take(effective_max)
             .filter_map(|path| {
                 if rtc_filter.is_some_and(|f| !f.allows(&path.attr)) {
@@ -981,6 +985,47 @@ pub(super) fn is_ibgp_learned(source: &table::Source) -> bool {
 pub(super) fn rs_isolation_suppress(source: &table::Source, dest_role: PeerRole) -> bool {
     // RS-client routes must not reach non-RS-client peers, and vice versa.
     source.is_rs_client() != matches!(dest_role, PeerRole::RsClient)
+}
+
+/// RFC 1997 well-known community check for a single path.
+///
+/// Returns `true` when the path's COMMUNITY attribute forbids sending it to
+/// a peer of `dest_role`:
+/// - NO_ADVERTISE: never advertised to any peer.
+/// - NO_EXPORT: not advertised outside the AS / confederation (eBGP peers;
+///   confederation-eBGP peers are inside the confederation and still get it).
+/// - NO_EXPORT_SUBCONFED: not advertised to any external peer, including
+///   confederation-eBGP peers.
+///
+/// Route-server clients are exempt: a route server is transparent and does
+/// not apply these filters on behalf of its clients.
+pub(super) fn well_known_community_suppress(
+    attr: &[packet::Attribute],
+    dest_role: PeerRole,
+) -> bool {
+    const NO_EXPORT: u32 = 0xffff_ff01;
+    const NO_ADVERTISE: u32 = 0xffff_ff02;
+    const NO_EXPORT_SUBCONFED: u32 = 0xffff_ff03;
+    if dest_role == PeerRole::RsClient {
+        return false;
+    }
+    let Some(bin) = attr
+        .iter()
+        .find(|a| a.code() == packet::Attribute::COMMUNITY)
+        .and_then(|a| a.binary())
+    else {
+        return false;
+    };
+    bin.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_be_bytes(*c))
+        .any(|c| match c {
+            NO_ADVERTISE => true,
+            NO_EXPORT => dest_role == PeerRole::Ebgp,
+            NO_EXPORT_SUBCONFED => matches!(dest_role, PeerRole::Ebgp | PeerRole::ConfedEbgp),
+            _ => false,
+        })
 }
 
 pub(super) fn ibgp_split_horizon_suppress(

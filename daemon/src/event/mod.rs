@@ -644,6 +644,7 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
     let bind_interface = peer.config.bind_interface.clone();
     let local_address = peer.config.local_address.clone();
     let peer_ifindex = bind_interface.as_deref().map(auth::ifindex_of).unwrap_or(0);
+    let ttl_security = peer.config.ttl_security;
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let join_handle = tokio::spawn(async move {
         loop {
@@ -672,7 +673,12 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
                     socket.bind(local)?;
                 }
                 if let Some(key) = password.as_ref() {
-                    auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex);
+                    auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex)?;
+                }
+                // GTSM must be in place before connect(): the peer drops a
+                // SYN that arrives with TTL < 255 when it enforces GTSM.
+                if let Some(ttl_min) = ttl_security {
+                    auth::set_gtsm(&socket, &peer_addr, ttl_min)?;
                 }
                 Ok::<_, std::io::Error>(socket)
             })();
@@ -798,6 +804,10 @@ pub(crate) struct Global {
     pub(crate) router_id: Ipv4Addr,
     listen_port: Option<u16>,
     listen_sockets: Vec<(RawFd, u32)>,
+    /// Peers with `auth_password` whose TCP-MD5 key could not be installed on
+    /// every listen socket. Passive connections from them are refused so the
+    /// session never comes up unauthenticated.
+    md5_unprotected: FnvHashSet<IpAddr>,
     /// Listen sockets created at start, with their ifindex. The listener
     /// loop takes them when it starts.
     pending_listeners: Vec<(std::net::TcpListener, u32)>,
@@ -858,6 +868,7 @@ impl Global {
             router_id: Ipv4Addr::new(0, 0, 0, 0),
             listen_port: None,
             listen_sockets: Vec::new(),
+            md5_unprotected: FnvHashSet::default(),
             pending_listeners: Vec::new(),
             peers: FnvHashMap::default(),
             local_cluster_ids: Arc::new(ArcSwap::from_pointee(FnvHashSet::default())),
@@ -934,6 +945,17 @@ impl Global {
                     .collect(),
             });
         }
+
+        // Route-selection options are process-wide, as in GoBGP.
+        table::set_always_compare_med(
+            config
+                .global
+                .as_ref()
+                .and_then(|g| g.route_selection_options.as_ref())
+                .and_then(|r| r.config.as_ref())
+                .and_then(|c| c.always_compare_med)
+                .unwrap_or(false),
+        );
 
         if let Some(groups) = &config.peer_groups {
             for pg in groups {
@@ -1068,12 +1090,43 @@ impl Global {
         self.local_cluster_ids.store(Arc::new(ids));
     }
 
+    /// Install `addr`'s TCP-MD5 key on every listen socket, or remove it when
+    /// `password` is `None`. On failure the peer is recorded in
+    /// `md5_unprotected` (its passive connections are refused) and the first
+    /// error is returned. Removal is best effort.
+    fn set_listener_md5(&mut self, addr: IpAddr, password: Option<&str>) -> std::io::Result<()> {
+        let Some(password) = password else {
+            for &(fd, ifindex) in &self.listen_sockets {
+                let _ = auth::set_md5sig(fd, &addr, "", ifindex);
+            }
+            self.md5_unprotected.remove(&addr);
+            return Ok(());
+        };
+        let mut result = Ok(());
+        for &(fd, ifindex) in &self.listen_sockets {
+            if let Err(e) = auth::set_md5sig(fd, &addr, password, ifindex) {
+                log::error!("failed to set TCP MD5 key for peer {addr} on listener: {e}");
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
+        }
+        if result.is_err() {
+            self.md5_unprotected.insert(addr);
+        } else {
+            self.md5_unprotected.remove(&addr);
+        }
+        result
+    }
+
     fn add_peer(
         &mut self,
         mut params: PeerParams,
         tx: Option<mpsc::UnboundedSender<TcpStream>>,
     ) -> std::result::Result<(), Error> {
         peer::validate_local_address(params.local_address.as_deref(), params.remote_addr)
+            .map_err(Error::InvalidArgument)?;
+        peer::check_socket_security_support(&params, auth::SUPPORTS_SOCKET_SECURITY)
             .map_err(Error::InvalidArgument)?;
         if self.peers.contains_key(&params.remote_addr) {
             return Err(Error::AlreadyExists(
@@ -1589,11 +1642,16 @@ impl Global {
                 listen_sockets
             };
 
-            for (addr, peer) in &global.read().await.peers {
-                if let Some(password) = &peer.config.password {
-                    for (l, ifindex) in &listen_sockets {
-                        auth::set_md5sig(l.as_raw_fd(), addr, password, *ifindex);
-                    }
+            {
+                let mut g = global.write().await;
+                let keyed: Vec<(IpAddr, String)> = g
+                    .peers
+                    .iter()
+                    .filter_map(|(addr, p)| Some((*addr, p.config.password.clone()?)))
+                    .collect();
+                for (addr, password) in keyed {
+                    // Logged inside; the peer's passive connections are refused.
+                    let _ = g.set_listener_md5(addr, Some(&password));
                 }
             }
 
@@ -1692,6 +1750,7 @@ async fn accept_connection(
     let is_restarting = g.selection_deferral.is_some();
     let local_cluster_ids = Arc::clone(&g.local_cluster_ids);
     let confederation = g.confederation.as_ref().map(|c| (c.id, c.members.clone()));
+    let md5_unprotected = g.md5_unprotected.contains(&remote_addr);
     let peer = match g.peers.get_mut(&remote_addr) {
         Some(peer) => {
             if !peer::accepts_local_address(
@@ -1706,6 +1765,15 @@ async fn accept_connection(
                 log::warn!(
                     "admin down; ignore a new passive connection from {}",
                     remote_addr
+                );
+                return None;
+            }
+            if role == crate::fsm::Role::Passive
+                && peer.config.password.is_some()
+                && md5_unprotected
+            {
+                log::error!(
+                    "TCP MD5 key for {remote_addr} is not installed on the listener; refusing passive connection"
                 );
                 return None;
             }
@@ -1786,8 +1854,20 @@ async fn accept_connection(
     // (RFC 4271, Section 1.1) so iBGP can traverse intermediate routers.
     if let Some(ttl_min) = peer.config.ttl_security {
         // GTSM (RFC 5082): send with TTL=255, drop incoming below ttl_min.
-        let _ = stream.set_ttl(255);
-        auth::set_min_ttl(stream.as_raw_fd(), &remote_addr, ttl_min);
+        // Without the minimum-TTL check GTSM gives no protection, so refuse
+        // the connection rather than run it unprotected.
+        if let Err(e) = auth::set_gtsm(&stream, &remote_addr, ttl_min) {
+            log::error!("failed to apply GTSM to connection with {remote_addr}: {e}");
+            if peer.config.delete_on_disconnected {
+                g.peers.remove(&remote_addr);
+                g.rebuild_local_cluster_ids();
+            } else {
+                peer.state
+                    .fsm
+                    .store(SessionState::Idle as u8, Ordering::Relaxed);
+            }
+            return None;
+        }
     } else if peer.config.expected_remote_asn != peer.config.local_asn {
         let _ = stream.set_ttl(peer.config.multihop_ttl.unwrap_or(1).into());
     }
@@ -2300,6 +2380,16 @@ enum GlobalEffect {
 /// fires or EOR is received).  LLGR families are also preserved (routes are kept
 /// LLGR-stale until the per-family timer fires).  Every other session family is
 /// dropped right away.
+/// Sleep future for a session timer armed with `secs` seconds. Zero means the
+/// timer is disabled (RFC 4271 §4.4 hold time 0), so the future never fires.
+fn timer_sleep(secs: u64) -> tokio::time::Sleep {
+    if secs == 0 {
+        tokio::time::sleep(Duration::new(u64::MAX, 0))
+    } else {
+        tokio::time::sleep(Duration::from_secs(secs))
+    }
+}
+
 fn families_to_drop_on_disconnect<'a>(
     session_families: impl Iterator<Item = &'a Family>,
     negotiated_gr: Option<&NegotiatedGr>,
@@ -2356,6 +2446,15 @@ enum Step {
         reason: crate::fsm::SessionDownReason,
         notification: Option<bgp::Message>,
     },
+}
+
+/// Converts a looped announcement into a withdraw of the same NLRIs,
+/// keeping each entry's Add-Path path ID.
+fn reach_as_withdraw(reach: bgp::ReachNlri) -> packet::UnreachNlri {
+    packet::UnreachNlri {
+        family: reach.family,
+        entries: reach.entries,
+    }
 }
 
 /// I/O driver for one TCP connection (one BGP session).
@@ -2905,17 +3004,13 @@ impl PeerSession {
                     _,
                     crate::fsm::Output::SetKeepaliveTimer(secs),
                 ) => {
-                    self.keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
-                        .into_iter()
-                        .collect();
+                    self.keepalive_futures = vec![timer_sleep(secs)].into_iter().collect();
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
                     crate::fsm::Output::SetHoldTimer(secs),
                 ) => {
-                    self.holdtime_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
-                        .into_iter()
-                        .collect();
+                    self.holdtime_futures = vec![timer_sleep(secs)].into_iter().collect();
                 }
                 crate::fsm::PeerFsmOutput::Connection(
                     _,
@@ -3160,7 +3255,15 @@ impl PeerSession {
         let mut txbuf = bytes::BytesMut::with_capacity(self.txbuf_size);
         for _ in 0..self.ctrl_msgs.len() {
             let msg = self.ctrl_msgs.remove(0);
-            let wire_count = self.codec.encode_to(&msg, &mut txbuf).unwrap_or(1);
+            let wire_count = match self.codec.encode_to(&msg, &mut txbuf) {
+                Ok(n) => n,
+                Err(e) => {
+                    // e.g. an OPEN whose capabilities exceed 255 bytes: drop
+                    // the connection rather than leave it stuck in OpenSent.
+                    log::error!("{}: failed to encode message: {e}", self.remote_addr);
+                    return false;
+                }
+            };
             (*self.counter_tx).sync_tx(&msg, wire_count);
 
             if txbuf.len() > self.txbuf_size {
@@ -3207,13 +3310,47 @@ impl PeerSession {
                     crate::fsm::Output::SetKeepaliveTimer(secs),
                 ) = output
                 {
-                    self.keepalive_futures = vec![tokio::time::sleep(Duration::from_secs(secs))]
-                        .into_iter()
-                        .collect();
+                    self.keepalive_futures = vec![timer_sleep(secs)].into_iter().collect();
                 }
             }
         }
         true
+    }
+
+    /// Returns `true` when a received announcement with `attr` has looped
+    /// back to this speaker (RFC 4271 §9.1.2, RFC 4456 §8).
+    fn is_looped(&self, attr: &Arc<Vec<packet::Attribute>>) -> bool {
+        if is_as_loop(
+            attr,
+            self.export_ctx.local_asn,
+            self.export_ctx.confederation_id,
+        ) {
+            return true;
+        }
+        let local_rid = u32::from(self.local_router_id);
+        let originator_loop = attr
+            .iter()
+            .find(|a| a.code() == packet::Attribute::ORIGINATOR_ID)
+            .is_some_and(|a| a.value().unwrap_or(0) == local_rid);
+        let cluster_loop = matches!(
+            self.export_ctx.role,
+            PeerRole::Ibgp | PeerRole::IbgpRrClient
+        ) && {
+            let local_ids = self.local_cluster_ids.load();
+            !local_ids.is_empty()
+                && attr
+                    .iter()
+                    .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
+                    .is_some_and(|a| {
+                        a.binary().is_some_and(|b| {
+                            b.as_chunks::<4>()
+                                .0
+                                .iter()
+                                .any(|c| local_ids.contains(&Ipv4Addr::new(c[0], c[1], c[2], c[3])))
+                        })
+                    })
+        };
+        originator_loop || cluster_loop
     }
 
     /// Returns `true` if the per-peer prefix limit was exceeded (RFC 4486 §2).
@@ -3225,35 +3362,16 @@ impl PeerSession {
         attr: Arc<Vec<packet::Attribute>>,
         timestamp: u32,
     ) -> bool {
-        // RFC 4456 §8 loop detection: discard UPDATE if ORIGINATOR_ID equals
-        // local router-id, or if CLUSTER_LIST already contains local cluster-id.
-        if reach.is_some() {
-            let local_rid = u32::from(self.local_router_id);
-            let originator_loop = attr
-                .iter()
-                .find(|a| a.code() == packet::Attribute::ORIGINATOR_ID)
-                .is_some_and(|a| a.value().unwrap_or(0) == local_rid);
-            let cluster_loop = matches!(
-                self.export_ctx.role,
-                PeerRole::Ibgp | PeerRole::IbgpRrClient
-            ) && {
-                let local_ids = self.local_cluster_ids.load();
-                !local_ids.is_empty()
-                    && attr
-                        .iter()
-                        .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
-                        .is_some_and(|a| {
-                            a.binary().is_some_and(|b| {
-                                b.as_chunks::<4>().0.iter().any(|c| {
-                                    local_ids.contains(&Ipv4Addr::new(c[0], c[1], c[2], c[3]))
-                                })
-                            })
-                        })
-            };
-            if originator_loop || cluster_loop {
-                return false;
-            }
-        }
+        // Loop detection: the local AS (or confederation ID) in AS_PATH
+        // (RFC 4271 §9.1.2), ORIGINATOR_ID equal to the local router-id, or a
+        // local cluster-id in CLUSTER_LIST (RFC 4456 §8) makes the route
+        // unusable. The UPDATE still replaces whatever this peer previously
+        // advertised for those NLRIs, so treat it as a withdraw rather than
+        // ignoring it (which would leave the stale path in the RIB).
+        let (reach, looped) = match reach {
+            Some(r) if self.is_looped(&attr) => (None, Some(reach_as_withdraw(r))),
+            r => (r, None),
+        };
         // Inject default LOCAL_PREF for iBGP announcements that omit it.
         let attr = if reach.is_some()
             && matches!(
@@ -3286,7 +3404,7 @@ impl PeerSession {
                 }
             }
         }
-        if let Some(s) = unreach {
+        for s in unreach.into_iter().chain(looped) {
             let family = s.family;
             let source = self.source[&family].clone();
             let prefix_counter = self
@@ -3626,15 +3744,8 @@ impl PeerSession {
                                             }
                                             Ok(iter) => {
                                                 for msg in iter {
-                                                    if let bgp::Message::Update(bgp::Update::Reach { attr, .. }) = &msg
-                                                        && is_as_loop(
-                                                            attr,
-                                                            self.export_ctx.local_asn,
-                                                            self.export_ctx.confederation_id,
-                                                        )
-                                                    {
-                                                        continue;
-                                                    }
+                                                    // Looped announcements still go through the FSM
+                                                    // (hold timer); rx_update turns them into withdraws.
                                                     let step = self.rx_msg(global, local_sockaddr, remote_sockaddr, msg).await;
                                                     if matches!(step, Step::Terminate { .. }) {
                                                         return step;
@@ -3977,6 +4088,13 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
+    async fn timer_sleep_zero_never_fires() {
+        // Hold time 0 (RFC 4271 §4.4) must disarm the timer, not fire at once.
+        let r = tokio::time::timeout(Duration::from_millis(50), timer_sleep(0)).await;
+        assert!(r.is_err(), "zero-second session timer must be disabled");
+    }
+
+    #[tokio::test]
     async fn active_connect_bind_device_failure_does_not_fall_back() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut params = default_peer_params("127.0.0.1".parse().unwrap());
@@ -4008,6 +4126,54 @@ mod tests {
             .await
             .expect("retry loop must remain cancellable")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_connect_applies_gtsm_before_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut params = default_peer_params("127.0.0.1".parse().unwrap());
+        params.remote_port = listener.local_addr().unwrap().port();
+        // Minimum TTL 1 so the local SYN-ACK passes; we only check what we send.
+        params.ttl_security = Some(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let global = make_global();
+        global.write().await.add_peer(params, Some(tx)).unwrap();
+        let _accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("active connect must dial")
+            .unwrap();
+        let stream = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Set on the socket before connect(), so the SYN already used TTL 255.
+        assert_eq!(stream.ttl().unwrap(), 255);
+    }
+
+    #[tokio::test]
+    async fn active_connect_md5_failure_does_not_dial_unauthenticated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut params = default_peer_params("127.0.0.1".parse().unwrap());
+        params.remote_port = listener.local_addr().unwrap().port();
+        // Longer than TCP_MD5SIG_MAXKEYLEN, so the key can't be installed.
+        params.password = Some("k".repeat(81));
+        params.connect_retry_time = 0;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let global = make_global();
+        global.write().await.add_peer(params, Some(tx)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err(),
+            "a failed TCP MD5 setup must not fall back to an unauthenticated connection"
+        );
+        assert!(rx.try_recv().is_err());
+        let g = global.read().await;
+        let mut ctx = g.peers[&"127.0.0.1".parse().unwrap()]
+            .context
+            .lock()
+            .unwrap();
+        ctx.active_connect_cancel_tx.take();
     }
 
     #[test]
@@ -4864,6 +5030,48 @@ local-address = "{local}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn socket_security_refused_where_unsupported() {
+        let mut params = default_peer_params("10.0.0.1".parse().unwrap());
+        assert!(peer::check_socket_security_support(&params, false).is_ok());
+        params.password = Some("secret".to_string());
+        assert!(peer::check_socket_security_support(&params, true).is_ok());
+        assert!(peer::check_socket_security_support(&params, false).is_err());
+        params.password = None;
+        params.ttl_security = Some(254);
+        assert!(peer::check_socket_security_support(&params, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn passive_connection_refused_when_listener_md5_fails() {
+        let global = make_global();
+        let tables = make_tables();
+        let (client, server) = loopback_pair().await;
+        let remote_addr = client.local_addr().unwrap().ip();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        {
+            let mut g = global.write().await;
+            g.listen_sockets.push((listener.as_raw_fd(), 0));
+            let mut params = default_peer_params(remote_addr);
+            // Longer than TCP_MD5SIG_MAXKEYLEN: the kernel can't install it.
+            let key = "k".repeat(81);
+            params.password = Some(key.clone());
+            g.add_peer(params, None).unwrap();
+            assert!(g.set_listener_md5(remote_addr, Some(&key)).is_err());
+            assert!(g.md5_unprotected.contains(&remote_addr));
+        }
+        assert!(
+            accept_connection(&global, &tables, server, crate::fsm::Role::Passive)
+                .await
+                .is_none(),
+            "must not accept an unauthenticated session for an MD5 peer"
+        );
+        // Removing the key clears the fail-closed marker.
+        let mut g = global.write().await;
+        assert!(g.set_listener_md5(remote_addr, None).is_ok());
+        assert!(!g.md5_unprotected.contains(&remote_addr));
     }
 
     #[tokio::test]
@@ -6048,6 +6256,25 @@ local-address = "{local}"
         assert_eq!(params.holdtime, PeerParams::DEFAULT_HOLD_TIME);
         params.apply_peer_group(&make_pg_for_apply());
         assert_eq!(params.holdtime, 90);
+    }
+
+    #[test]
+    fn config_hold_time_zero_is_kept() {
+        // RFC 4271 §4.4: an explicit hold-time 0 disables the timers; it must
+        // not be silently replaced by the default (GoBGP keeps it too).
+        let mut n = make_minimal_neighbor_config("10.0.0.1");
+        n.timers = Some(config::generate::Timers {
+            config: Some(config::generate::TimersConfig {
+                hold_time: Some(0.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut params = PeerParams::try_from(&n).unwrap();
+        assert_eq!(params.holdtime, 0);
+        // Not treated as "unset" when a peer group is applied.
+        params.apply_peer_group(&make_pg_for_apply());
+        assert_eq!(params.holdtime, 0);
     }
 
     #[test]
@@ -9737,6 +9964,153 @@ local-address = "{local}"
                 "LLGR_STALE community must not appear"
             );
         }
+
+        // ---- RFC 1997 well-known communities ----
+
+        const NO_EXPORT: u32 = 0xffff_ff01;
+        const NO_ADVERTISE: u32 = 0xffff_ff02;
+        const NO_EXPORT_SUBCONFED: u32 = 0xffff_ff03;
+
+        fn path_with_communities(
+            local_path_id: u32,
+            source: Arc<table::Source>,
+            communities: &[u32],
+        ) -> table::Path {
+            let mut p = path(local_path_id, source);
+            let bin: Vec<u8> = communities.iter().flat_map(|c| c.to_be_bytes()).collect();
+            let mut attr = (*p.attr).clone();
+            attr.push(packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, bin).unwrap());
+            p.attr = Arc::new(attr);
+            p
+        }
+
+        /// Run a single non-add-path best change for `p` towards a peer with
+        /// `ctx` and return whether a reach was emitted.
+        fn well_known_sent(p: table::Path, ctx: &PeerExportContext) -> bool {
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let update = change(&net, true, true, None, vec![p]);
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                ctx,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let sent = !reach_entries(&pending.drain_messages(Family::IPV4)).is_empty();
+            assert_eq!(sent, em.was_sent(Family::IPV4, 1));
+            sent
+        }
+
+        #[test]
+        fn no_export_suppressed_to_ebgp_only() {
+            let p = || path_with_communities(1, source(PEER), &[0xfde8_0064, NO_EXPORT]);
+            assert!(!well_known_sent(p(), &ebgp_ctx()));
+            assert!(well_known_sent(p(), &confed_ebgp_ctx()));
+            assert!(well_known_sent(p(), &ibgp_ctx()));
+            assert!(well_known_sent(
+                path_with_communities(1, rs_client_source(PEER), &[NO_EXPORT]),
+                &rs_client_ctx()
+            ));
+        }
+
+        #[test]
+        fn no_advertise_suppressed_to_all_but_rs_client() {
+            let p = || path_with_communities(1, source(PEER), &[NO_ADVERTISE]);
+            assert!(!well_known_sent(p(), &ebgp_ctx()));
+            assert!(!well_known_sent(p(), &confed_ebgp_ctx()));
+            assert!(!well_known_sent(p(), &ibgp_ctx()));
+            // Route servers do not apply well-known community filtering (GoBGP compat).
+            assert!(well_known_sent(
+                path_with_communities(1, rs_client_source(PEER), &[NO_ADVERTISE]),
+                &rs_client_ctx()
+            ));
+        }
+
+        #[test]
+        fn no_export_subconfed_suppressed_to_ebgp_and_confed_ebgp() {
+            let p = || path_with_communities(1, source(PEER), &[NO_EXPORT_SUBCONFED]);
+            assert!(!well_known_sent(p(), &ebgp_ctx()));
+            assert!(!well_known_sent(p(), &confed_ebgp_ctx()));
+            assert!(well_known_sent(p(), &ibgp_ctx()));
+        }
+
+        #[test]
+        fn unrelated_communities_not_suppressed() {
+            let p = path_with_communities(1, source(PEER), &[0xffff_ff04, 0xffff_0000]);
+            assert!(well_known_sent(p, &ebgp_ctx()));
+        }
+
+        // A best that gains NO_EXPORT must withdraw the previously sent route.
+        #[test]
+        fn no_export_withdraws_previously_sent_route() {
+            let mut em = ExportMap::default();
+            em.mark_sent(Family::IPV4, 1, 0);
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path_with_communities(1, source(PEER), &[NO_EXPORT]);
+            let update = change(&net, true, true, Some(1), vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(!em.was_sent(Family::IPV4, 1));
+            let msgs = pending.drain_messages(Family::IPV4);
+            assert!(reach_entries(&msgs).is_empty());
+            assert_eq!(unreach_entries(&msgs), vec![(net, 0)]);
+        }
+
+        // Add-Path: a NO_EXPORT path is withdrawn by its path ID while the
+        // other path stays advertised.
+        #[test]
+        fn addpath_no_export_withdraws_only_that_path() {
+            let mut em = ExportMap::new([Family::IPV4]);
+            em.mark_sent(Family::IPV4, 1, 1);
+            em.mark_sent(Family::IPV4, 1, 2);
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let net = nlri("10.0.0.0/24");
+            let p1 = path(1, source(PEER));
+            let p2 = path_with_communities(2, source("10.0.0.3"), &[NO_EXPORT]);
+            let update = change(&net, false, true, Some(2), vec![p1, p2]);
+
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(em.contains_path(Family::IPV4, 1, 1));
+            assert!(!em.contains_path(Family::IPV4, 1, 2));
+            let msgs = pending.drain_messages(Family::IPV4);
+            assert!(reach_entries(&msgs).is_empty());
+            assert_eq!(unreach_entries(&msgs), vec![(net, 2)]);
+        }
     } // mod process_nlri_change
 
     fn make_grpc_service() -> GrpcService {
@@ -11441,6 +11815,27 @@ local-address = "{local}"
     const CAP_ADDPATH: u8 = 69;
     const CAP_EXTENDED_NEXTHOP: u8 = 5;
     const CAP_GRACEFUL_RESTART: u8 = 64;
+    const CAP_ROUTE_REFRESH: u8 = 2;
+
+    #[test]
+    fn build_local_cap_always_advertises_route_refresh() {
+        for remote_addr in ["10.0.0.1", "2001:db8::1"] {
+            let caps = PeerParams::build_local_cap(
+                remote_addr.parse().unwrap(),
+                65001,
+                &FnvHashMap::default(),
+                None,
+                None,
+            );
+            assert!(has_cap(&caps, CAP_ROUTE_REFRESH), "{remote_addr}");
+            assert_eq!(
+                caps.iter()
+                    .filter(|c| cap_code(c) == CAP_ROUTE_REFRESH)
+                    .count(),
+                1
+            );
+        }
+    }
 
     #[test]
     fn build_local_cap_ipv4_peer_no_families_defaults_to_ipv4() {
@@ -12092,26 +12487,83 @@ port = 3323
         assert!(rpki_sockaddr_from_config(&s).is_none());
     }
 
-    // ---- rx_update: RFC 4456 loop detection ----
+    // ---- rx_update: loop detection (RFC 4271 §9.1.2, RFC 4456 §8) ----
     //
-    // new_for_test sets local_router_id = 1.0.0.1.  Loop detection fires before
-    // source lookup, so no source setup is required; the absence of an inserted
-    // route is verified via table_state().
+    // new_for_test sets local_router_id = 1.0.0.1 and local_asn = 65001.  Each
+    // test first installs a valid path from the peer, then sends a looped
+    // UPDATE for the same prefix: the looped UPDATE must act as an implicit
+    // withdraw of the earlier path, not be ignored.
 
     fn reach_set(prefix: &str) -> Option<bgp::ReachNlri> {
+        reach_set_with_id(prefix, 0)
+    }
+
+    fn reach_set_with_id(prefix: &str, path_id: u32) -> Option<bgp::ReachNlri> {
         Some(bgp::ReachNlri {
             family: Family::IPV4,
-            entries: vec![packet::PathNlri::new(prefix.parse().unwrap())],
+            entries: vec![packet::PathNlri {
+                path_id,
+                nlri: prefix.parse().unwrap(),
+            }],
             nexthop: None,
         })
     }
 
-    #[tokio::test]
-    async fn rx_update_originator_id_loop_drops_route() {
-        let tables = make_tables();
-        let context = make_context();
+    fn loop_test_session(tables: &TableHandle, role: PeerRole) -> PeerSession {
         let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
-        let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
+        let mut session = PeerSession::new_for_test(remote_addr, make_context(), tables.clone());
+        session.export_ctx.role = role;
+        let remote_asn = if role == PeerRole::Ebgp { 65002 } else { 65001 };
+        session.source.insert(
+            Family::IPV4,
+            Arc::new(table::Source::new(
+                remote_addr,
+                "127.0.0.1".parse().unwrap(),
+                remote_asn,
+                65001,
+                Ipv4Addr::new(10, 0, 0, 2),
+                role,
+            )),
+        );
+        session
+    }
+
+    fn origin_only() -> Arc<Vec<packet::Attribute>> {
+        Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+        ])
+    }
+
+    /// Install a valid path, send `looped` for the same prefix, and assert the
+    /// looped UPDATE withdrew the earlier path.
+    async fn assert_loop_withdraws(
+        session: &mut PeerSession,
+        tables: &TableHandle,
+        looped: Arc<Vec<packet::Attribute>>,
+    ) {
+        assert!(
+            !session
+                .rx_update(reach_set("10.0.0.0/24"), None, origin_only(), 0u32)
+                .await
+        );
+        assert_eq!(tables.table_state(Family::IPV4).num_destination, 1);
+
+        let exceeded = session
+            .rx_update(reach_set("10.0.0.0/24"), None, looped, 0u32)
+            .await;
+
+        assert!(!exceeded, "loop detection must not trigger CEASE");
+        let state = tables.table_state(Family::IPV4);
+        assert_eq!(
+            state.num_destination, 0,
+            "looped UPDATE must withdraw the peer's previous path"
+        );
+    }
+
+    #[tokio::test]
+    async fn rx_update_originator_id_loop_withdraws_route() {
+        let tables = make_tables();
+        let mut session = loop_test_session(&tables, PeerRole::Ibgp);
         // local_router_id is 1.0.0.1 in new_for_test
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_value(
@@ -12120,24 +12572,14 @@ port = 3323
             )
             .unwrap(),
         ]);
-
-        let exceeded = session
-            .rx_update(reach_set("10.0.0.0/24"), None, attrs, 0u32)
-            .await;
-
-        assert!(!exceeded, "loop detection must not trigger CEASE");
-        let state = tables.table_state(Family::IPV4);
-        assert_eq!(state.num_destination, 0, "route must not be inserted");
+        assert_loop_withdraws(&mut session, &tables, attrs).await;
     }
 
     #[tokio::test]
-    async fn rx_update_cluster_list_loop_drops_route() {
+    async fn rx_update_cluster_list_loop_withdraws_route() {
         let tables = make_tables();
-        let context = make_context();
-        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
-        let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
+        let mut session = loop_test_session(&tables, PeerRole::IbgpRrClient);
         let local_cid = Ipv4Addr::new(1, 2, 3, 4);
-        session.export_ctx.role = PeerRole::IbgpRrClient;
         session
             .local_cluster_ids
             .store(Arc::new([local_cid].into_iter().collect()));
@@ -12145,25 +12587,15 @@ port = 3323
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cid_bytes).unwrap(),
         ]);
-
-        let exceeded = session
-            .rx_update(reach_set("10.0.0.0/24"), None, attrs, 0u32)
-            .await;
-
-        assert!(!exceeded, "loop detection must not trigger CEASE");
-        let state = tables.table_state(Family::IPV4);
-        assert_eq!(state.num_destination, 0, "route must not be inserted");
+        assert_loop_withdraws(&mut session, &tables, attrs).await;
     }
 
     // local cluster_id appears in the middle of a multi-entry CLUSTER_LIST
     #[tokio::test]
     async fn rx_update_cluster_list_loop_detects_middle_entry() {
         let tables = make_tables();
-        let context = make_context();
-        let remote_addr: IpAddr = "10.0.0.2".parse().unwrap();
-        let mut session = PeerSession::new_for_test(remote_addr, context, tables.clone());
+        let mut session = loop_test_session(&tables, PeerRole::Ibgp);
         let local_cid = Ipv4Addr::new(1, 2, 3, 4);
-        session.export_ctx.role = PeerRole::Ibgp;
         session
             .local_cluster_ids
             .store(Arc::new([local_cid].into_iter().collect()));
@@ -12175,14 +12607,62 @@ port = 3323
         let attrs = Arc::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cid_bytes).unwrap(),
         ]);
+        assert_loop_withdraws(&mut session, &tables, attrs).await;
+    }
 
-        let exceeded = session
-            .rx_update(reach_set("10.0.0.0/24"), None, attrs, 0u32)
+    fn as_path_attr(asns: &[u32]) -> Arc<Vec<packet::Attribute>> {
+        let mut bin = vec![packet::Attribute::AS_PATH_TYPE_SEQ, asns.len() as u8];
+        for asn in asns {
+            bin.extend_from_slice(&asn.to_be_bytes());
+        }
+        Arc::new(vec![
+            packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+            packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, bin).unwrap(),
+        ])
+    }
+
+    #[tokio::test]
+    async fn rx_update_as_path_loop_withdraws_route() {
+        let tables = make_tables();
+        let mut session = loop_test_session(&tables, PeerRole::Ebgp);
+        // local_asn is 65001 in new_for_test
+        assert_loop_withdraws(&mut session, &tables, as_path_attr(&[65002, 65001])).await;
+    }
+
+    // Add-Path: the looped UPDATE withdraws only the path with the same path ID.
+    #[tokio::test]
+    async fn rx_update_as_path_loop_withdraws_matching_path_id_only() {
+        let tables = make_tables();
+        let mut session = loop_test_session(&tables, PeerRole::Ebgp);
+        for id in [1, 2] {
+            session
+                .rx_update(reach_set_with_id("10.0.0.0/24", id), None, origin_only(), 0)
+                .await;
+        }
+        assert_eq!(tables.table_state(Family::IPV4).num_path, 2);
+
+        session
+            .rx_update(
+                reach_set_with_id("10.0.0.0/24", 2),
+                None,
+                as_path_attr(&[65002, 65001]),
+                0,
+            )
             .await;
 
-        assert!(!exceeded, "loop detection must not trigger CEASE");
         let state = tables.table_state(Family::IPV4);
-        assert_eq!(state.num_destination, 0, "route must not be inserted");
+        assert_eq!(state.num_destination, 1);
+        assert_eq!(state.num_path, 1);
+    }
+
+    #[test]
+    fn reach_as_withdraw_keeps_nlris_and_path_ids() {
+        let reach = reach_set_with_id("10.0.0.0/24", 7).unwrap();
+        let u = reach_as_withdraw(reach);
+        assert_eq!(u.family, Family::IPV4);
+        assert_eq!(u.entries.len(), 1);
+        assert_eq!(u.entries[0].path_id, 7);
+        assert_eq!(u.entries[0].nlri, "10.0.0.0/24".parse().unwrap());
     }
 
     fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
