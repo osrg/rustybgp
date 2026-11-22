@@ -596,6 +596,16 @@ impl TableManager {
         self.rpki.write().unwrap().drop_source(addr);
     }
 
+    pub(crate) fn set_selection_options(&self, opts: table::SelectionOptions) {
+        for shard in &self.shards {
+            shard.lock().unwrap().rtable.set_selection_options(opts);
+        }
+    }
+
+    pub(crate) fn selection_options(&self) -> table::SelectionOptions {
+        self.shards[0].lock().unwrap().rtable.selection_options()
+    }
+
     pub(crate) fn table_state(&self, family: Family) -> table::TableState {
         let mut state = table::TableState::default();
         for shard in &self.shards {
@@ -1119,10 +1129,10 @@ fn fib_eligible(path: &table::Path) -> bool {
 /// of the ECMP set: their role is Ibgp, so they can tie with an iBGP path
 /// in decision steps 1-6 and would otherwise add our own interface address
 /// to the multipath route.
-fn fib_nexthops(update: &table::NlriChange) -> Vec<bgp::Nexthop> {
+fn fib_nexthops(update: &table::NlriChange, opts: table::SelectionOptions) -> Vec<bgp::Nexthop> {
     if update.new_best().is_some_and(fib_eligible) {
         update
-            .ecmp_paths()
+            .ecmp_paths(opts)
             .into_iter()
             .filter(|p| fib_eligible(p))
             .filter_map(|p| p.nexthop)
@@ -1231,7 +1241,7 @@ impl TableShard {
         if let Some(handle) = kernel_handle
             && update.best_changed
         {
-            let nexthops = fib_nexthops(&update);
+            let nexthops = fib_nexthops(&update, self.rtable.selection_options());
             let metric = update
                 .new_best()
                 .and_then(|p| {
@@ -1620,7 +1630,7 @@ mod tests {
             "192.168.2.0/24",
             vec![(src, Some("192.0.2.1".parse().unwrap()))],
         );
-        let nhs = fib_nexthops(&update);
+        let nhs = fib_nexthops(&update, table::SelectionOptions::default());
         assert_eq!(nhs.len(), 1);
         assert_eq!(
             nhs[0].addr(),
@@ -1633,7 +1643,7 @@ mod tests {
         // Prefix emptied: the possibly stale BGP-installed route must be
         // withdrawn from the kernel.
         let update = change_with_paths("192.168.2.0/24", vec![]);
-        assert!(fib_nexthops(&update).is_empty());
+        assert!(fib_nexthops(&update, table::SelectionOptions::default()).is_empty());
     }
 
     #[test]
@@ -1646,7 +1656,7 @@ mod tests {
             "10.0.0.0/24",
             vec![(table::Source::kernel(), Some("10.0.0.1".parse().unwrap()))],
         );
-        assert!(fib_nexthops(&update).is_empty());
+        assert!(fib_nexthops(&update, table::SelectionOptions::default()).is_empty());
     }
 
     #[test]
@@ -1657,7 +1667,7 @@ mod tests {
             "192.168.2.0/24",
             vec![(table::Source::local(), Some("192.0.2.9".parse().unwrap()))],
         );
-        assert!(fib_nexthops(&update).is_empty());
+        assert!(fib_nexthops(&update, table::SelectionOptions::default()).is_empty());
     }
 
     #[test]
@@ -1682,7 +1692,7 @@ mod tests {
                 (table::Source::local(), Some("192.0.2.9".parse().unwrap())),
             ],
         );
-        let nhs = fib_nexthops(&update);
+        let nhs = fib_nexthops(&update, table::SelectionOptions::default());
         assert_eq!(nhs.len(), 1);
         assert_eq!(
             nhs[0].addr(),

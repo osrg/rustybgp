@@ -1814,6 +1814,36 @@ impl Attribute {
         }
     }
 
+    /// Returns the neighbor AS for the MULTI_EXIT_DISC comparison in RFC 4271
+    /// section 9.1.2.2 c): the first AS of the first segment that is not
+    /// AS_CONFED_SEQUENCE or AS_CONFED_SET, when that segment is an
+    /// AS_SEQUENCE. Returns None when the AS_PATH is empty or begins with an
+    /// AS_SET. RFC 4271 says that the neighbor AS is then the local AS: "If
+    /// the route is learned via IBGP, and the other IBGP speaker either (a)
+    /// originated the route, or (b) created the route by aggregation and the
+    /// AS_PATH attribute of the aggregate route is either empty or begins
+    /// with an AS_SET, it is the local AS."
+    pub fn as_path_neighbor_as(&self) -> Option<u32> {
+        assert_eq!(self.code, Attribute::AS_PATH);
+        let buf = self.binary().unwrap();
+        let mut pos = 0usize;
+        while pos + 2 <= buf.len() {
+            let seg_type = buf[pos];
+            let seg_count = buf[pos + 1] as usize;
+            match seg_type {
+                Attribute::AS_PATH_TYPE_CONFED_SEQ | Attribute::AS_PATH_TYPE_CONFED_SET => {
+                    pos += 2 + seg_count * 4;
+                }
+                Attribute::AS_PATH_TYPE_SEQ if seg_count > 0 => {
+                    let b = buf.get(pos + 2..pos + 6)?;
+                    return Some(u32::from_be_bytes(b.try_into().unwrap()));
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     pub fn as_path_origin(&self) -> Option<u32> {
         let buf = self.binary().unwrap();
         let len = buf.len() as u64;
@@ -3470,6 +3500,25 @@ mod confed_as_path_tests {
         data.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SET, &[65050]));
         let result = as_path(data).as_path_strip_confed();
         assert!(result.binary().unwrap().is_empty());
+    }
+
+    #[test]
+    fn as_path_neighbor_as_skips_confed_segments() {
+        let mut data = seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001]);
+        data.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65100, 65200]));
+        assert_eq!(as_path(data).as_path_neighbor_as(), Some(65100));
+    }
+
+    #[test]
+    fn as_path_neighbor_as_is_none_for_local_as() {
+        // Empty, only confed segments, or beginning with an AS_SET: the
+        // neighbor AS is the local AS.
+        assert_eq!(as_path(vec![]).as_path_neighbor_as(), None);
+        let data = seg_bytes(Attribute::AS_PATH_TYPE_CONFED_SEQ, &[65001]);
+        assert_eq!(as_path(data).as_path_neighbor_as(), None);
+        let mut data = seg_bytes(Attribute::AS_PATH_TYPE_SET, &[65100]);
+        data.extend_from_slice(&seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65200]));
+        assert_eq!(as_path(data).as_path_neighbor_as(), None);
     }
 }
 

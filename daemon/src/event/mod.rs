@@ -935,6 +935,16 @@ impl Global {
             });
         }
 
+        tables.set_selection_options(table::SelectionOptions {
+            always_compare_med: config
+                .global
+                .as_ref()
+                .and_then(|g| g.route_selection_options.as_ref())
+                .and_then(|o| o.config.as_ref())
+                .and_then(|c| c.always_compare_med)
+                .unwrap_or(false),
+        });
+
         if let Some(groups) = &config.peer_groups {
             for pg in groups {
                 if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {
@@ -13194,6 +13204,50 @@ port = 3323
         assert!(
             g.apply_config(make_tables(), &port_config(Some(65536)))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn apply_config_sets_always_compare_med() {
+        let mut g = bare_global();
+        let tables = make_tables();
+        let mut c = port_config(Some(-1));
+        c.global.as_mut().unwrap().route_selection_options =
+            Some(config::generate::RouteSelectionOptions {
+                config: Some(config::generate::RouteSelectionOptionsConfig {
+                    always_compare_med: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        g.apply_config(tables.clone(), &c).unwrap();
+        assert!(tables.selection_options().always_compare_med);
+    }
+
+    #[tokio::test]
+    async fn start_bgp_sets_always_compare_med() {
+        let svc = make_unstarted_grpc_service();
+        let mut req = start_bgp_req(-1);
+        req.get_mut()
+            .global
+            .as_mut()
+            .unwrap()
+            .route_selection_options = Some(api::RouteSelectionOptionsConfig {
+            always_compare_med: true,
+            ..Default::default()
+        });
+        svc.start_bgp(req).await.unwrap();
+        let rsp = svc
+            .get_bgp(tonic::Request::new(api::GetBgpRequest {}))
+            .await
+            .unwrap();
+        assert!(
+            rsp.into_inner()
+                .global
+                .unwrap()
+                .route_selection_options
+                .unwrap()
+                .always_compare_med
         );
     }
 

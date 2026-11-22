@@ -198,6 +198,22 @@ pub struct RpkiValidation {
     pub unmatched_length: Vec<(packet::IpNet, Roa)>,
 }
 
+/// Options for best-path selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectionOptions {
+    /// Compare MULTI_EXIT_DISC also between paths from different
+    /// neighbor ASes.
+    pub always_compare_med: bool,
+}
+
+impl SelectionOptions {
+    /// Whether MULTI_EXIT_DISC is compared between paths with these
+    /// neighbor ASes.
+    fn compare_med(&self, a: Option<u32>, b: Option<u32>) -> bool {
+        self.always_compare_med || a == b
+    }
+}
+
 // Readers for the path attribute values used by best-path selection.
 
 fn find_attr(attr: &[Attribute], code: u8) -> Option<&Attribute> {
@@ -216,6 +232,19 @@ fn attr_as_path_len(attr: &[Attribute]) -> usize {
 fn attr_origin(attr: &[Attribute]) -> u8 {
     find_attr(attr, Attribute::ORIGIN)
         .map_or(Attribute::ORIGIN_INCOMPLETE, |a| a.value().unwrap() as u8)
+}
+
+/// MULTI_EXIT_DISC, or 0 when absent. RFC 4271 section 9.1.2.2 c): "If
+/// route n has no MULTI_EXIT_DISC attribute, the function returns the
+/// lowest possible MULTI_EXIT_DISC value (i.e., 0)."
+fn attr_med(attr: &[Attribute]) -> u32 {
+    find_attr(attr, Attribute::MULTI_EXIT_DESC).map_or(0, |a| a.value().unwrap())
+}
+
+/// Neighbor AS for the MULTI_EXIT_DISC comparison. None means the local AS
+/// (see `Attribute::as_path_neighbor_as()`).
+fn attr_neighbor_as(attr: &[Attribute]) -> Option<u32> {
+    find_attr(attr, Attribute::AS_PATH).and_then(|a| a.as_path_neighbor_as())
 }
 
 fn attr_cluster_list_len(attr: &[Attribute]) -> usize {
@@ -355,6 +384,8 @@ struct NewEntry<'a> {
     local_pref: Option<u32>,
     as_path_len: Option<usize>,
     origin: Option<u8>,
+    neighbor_as: Option<Option<u32>>,
+    med: Option<u32>,
     cluster_list_len: Option<usize>,
     router_id: Option<u32>,
 }
@@ -367,6 +398,8 @@ impl<'a> NewEntry<'a> {
             local_pref: None,
             as_path_len: None,
             origin: None,
+            neighbor_as: None,
+            med: None,
             cluster_list_len: None,
             router_id: None,
         }
@@ -398,6 +431,18 @@ impl<'a> NewEntry<'a> {
         *self.origin.get_or_insert_with(|| attr_origin(&e.path.attr))
     }
 
+    fn neighbor_as(&mut self) -> Option<u32> {
+        let e = self.entry;
+        *self
+            .neighbor_as
+            .get_or_insert_with(|| attr_neighbor_as(&e.path.attr))
+    }
+
+    fn med(&mut self) -> u32 {
+        let e = self.entry;
+        *self.med.get_or_insert_with(|| attr_med(&e.path.attr))
+    }
+
     fn cluster_list_len(&mut self) -> usize {
         let e = self.entry;
         *self
@@ -427,14 +472,25 @@ impl<'a> NewEntry<'a> {
 /// 4. Higher LOCAL_PREF.
 /// 5. Shorter AS_PATH.
 /// 6. Lower ORIGIN.
-/// 7. eBGP over iBGP. A confederation eBGP peer counts as iBGP.
-/// 8. Lower ORIGINATOR_ID, or BGP Identifier of the peer when absent.
-/// 9. Shorter CLUSTER_LIST. RFC 4456 section 9: "In addition, the
-///    following rule SHOULD be inserted between Steps f) and g): a BGP
-///    Speaker SHOULD prefer a route with the shorter CLUSTER_LIST length."
-/// 10. Lower peer address. RFC 4271 section 9.1.2.2 g): "Prefer the route
+/// 7. Lower MULTI_EXIT_DISC, only when both paths have the same neighbor
+///    AS, or when `always_compare_med` is set. RFC 4271 section 9.1.2.2 c):
+///    "MULTI_EXIT_DISC is only comparable between routes learned from the
+///    same neighboring AS (the neighboring AS is determined from the
+///    AS_PATH attribute)."
+/// 8. eBGP over iBGP. A confederation eBGP peer counts as iBGP.
+/// 9. Lower ORIGINATOR_ID, or BGP Identifier of the peer when absent.
+/// 10. Shorter CLUSTER_LIST. RFC 4456 section 9: "In addition, the
+///     following rule SHOULD be inserted between Steps f) and g): a BGP
+///     Speaker SHOULD prefer a route with the shorter CLUSTER_LIST length."
+/// 11. Lower peer address. RFC 4271 section 9.1.2.2 g): "Prefer the route
 ///     received from the lowest peer address."
-/// 11. Lower Add-Path path ID, for paths from the same peer.
+/// 12. Lower Add-Path path ID, for paths from the same peer.
+///
+/// Step 7 is not transitive, so the order can depend on the order of
+/// arrival. For example, A and B are from AS 1 and B has the lower MED, and
+/// C is from AS 2. B is preferred over A, but later steps can prefer A over
+/// C and C over B. Like GoBGP and the default of BIRD and FRR, the paths
+/// are not grouped by neighbor AS (deterministic MED) to avoid this.
 ///
 /// The GR stale state is not compared, as in GoBGP and BIRD. A GR stale
 /// path keeps its place, so the best path does not change when a peer
@@ -442,7 +498,12 @@ impl<'a> NewEntry<'a> {
 ///
 /// An entry is identified by its peer address and path ID, so two
 /// different entries never compare Equal.
-fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::cmp::Ordering {
+fn compare(
+    new: &mut NewEntry<'_>,
+    other: &RibEntry,
+    evpn_type2: bool,
+    opts: SelectionOptions,
+) -> std::cmp::Ordering {
     let a = new.entry;
     let b = other;
 
@@ -472,6 +533,12 @@ fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::c
     let ord = new.origin().cmp(&attr_origin(&b.path.attr));
     if ord.is_ne() {
         return ord;
+    }
+    if opts.compare_med(new.neighbor_as(), attr_neighbor_as(&b.path.attr)) {
+        let ord = new.med().cmp(&attr_med(&b.path.attr));
+        if ord.is_ne() {
+            return ord;
+        }
     }
     let ord = b
         .path
@@ -607,12 +674,12 @@ impl Destination {
 
     /// Inserts `entry` before the first entry that it is preferred over (see
     /// `compare()`), or at the end. The entries stay ordered best first.
-    fn insert_ordered(&mut self, entry: RibEntry, evpn_type2: bool) {
+    fn insert_ordered(&mut self, entry: RibEntry, evpn_type2: bool, opts: SelectionOptions) {
         let mut new = NewEntry::new(&entry);
         let idx = self
             .entry
             .iter()
-            .position(|e| compare(&mut new, e, evpn_type2).is_lt())
+            .position(|e| compare(&mut new, e, evpn_type2, opts).is_lt())
             .unwrap_or(self.entry.len());
         self.entry.insert(idx, entry);
     }
@@ -620,10 +687,15 @@ impl Destination {
     /// Takes out the entries for which `pred` returns true and inserts them
     /// again. Used after a change that can move entries in the order, such
     /// as a change of the stale state or of the nexthop reachability.
-    fn reposition(&mut self, evpn_type2: bool, mut pred: impl FnMut(&RibEntry) -> bool) {
+    fn reposition(
+        &mut self,
+        evpn_type2: bool,
+        opts: SelectionOptions,
+        mut pred: impl FnMut(&RibEntry) -> bool,
+    ) {
         let moved: Vec<RibEntry> = self.entry.extract_if(.., |e| pred(e)).collect();
         for e in moved {
-            self.insert_ordered(e, evpn_type2);
+            self.insert_ordered(e, evpn_type2, opts);
         }
     }
 }
@@ -744,14 +816,21 @@ impl NlriChange {
     }
 
     /// All paths tied with the best on LLGR stale, LOCAL_PREF, AS_PATH
-    /// length, ORIGIN, eBGP/iBGP and CLUSTER_LIST length. The router-id
-    /// tie-break is not used.
+    /// length, ORIGIN, MULTI_EXIT_DISC, eBGP/iBGP and CLUSTER_LIST length.
+    /// MULTI_EXIT_DISC is compared under the same condition as in best-path
+    /// selection. The router-id tie-break is not used.
     ///
     /// Returns an empty slice when there are no paths.  Used to build the
     /// ECMP nexthop set for kernel FIB installation.
-    pub fn ecmp_paths(&self) -> Vec<&Path> {
+    pub fn ecmp_paths(&self, opts: SelectionOptions) -> Vec<&Path> {
         let Some(best) = self.current_paths.first() else {
             return vec![];
+        };
+        let best_neighbor_as = attr_neighbor_as(&best.attr);
+        let best_med = attr_med(&best.attr);
+        let med_tied = |p: &Path| {
+            !opts.compare_med(attr_neighbor_as(&p.attr), best_neighbor_as)
+                || attr_med(&p.attr) == best_med
         };
         let key = |p: &Path| {
             (
@@ -763,10 +842,13 @@ impl NlriChange {
                 attr_cluster_list_len(&p.attr),
             )
         };
+        // filter(), not take_while(): MULTI_EXIT_DISC is not transitive and
+        // the router ID is compared before the CLUSTER_LIST length, so a tied
+        // path can come after one that is not tied.
         let best_key = key(best);
         self.current_paths
             .iter()
-            .take_while(|p| key(p) == best_key)
+            .filter(|p| key(p) == best_key && med_tied(p))
             .collect()
     }
 }
@@ -953,6 +1035,7 @@ pub struct Table {
     ribs: FnvHashMap<Family, Rib>,
     route_stats: FnvHashMap<IpAddr, FnvHashMap<Family, PrefixStats>>,
     shard_idx: u32,
+    selection_options: SelectionOptions,
 }
 
 impl Default for Table {
@@ -1391,7 +1474,7 @@ impl Table {
             }
         }
 
-        dst.insert_ordered(entry, is_evpn_type2(&net));
+        dst.insert_ordered(entry, is_evpn_type2(&net), self.selection_options);
 
         // During Restarting Speaker deferral, routes are accumulated but
         // best-path changes are suppressed; end_deferral() emits them all at once.
@@ -1880,7 +1963,7 @@ impl Table {
                 }
                 // Reachability is part of the order: entries with an
                 // unreachable nexthop are kept after the eligible ones.
-                dst.reposition(is_evpn_type2(net), |e| {
+                dst.reposition(is_evpn_type2(net), self.selection_options, |e| {
                     e.path.nexthop.map(|nh| nh.addr()) == Some(addr)
                 });
 
@@ -1954,7 +2037,9 @@ impl Table {
                         p.path.source.mark_llgr_stale();
                     }
                 }
-                dst.reposition(is_evpn_type2(net), |e| e.path.source.remote_addr == addr);
+                dst.reposition(is_evpn_type2(net), self.selection_options, |e| {
+                    e.path.source.remote_addr == addr
+                });
                 let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
                 let best_changed = old_best_id != new_best_id;
                 if best_changed || any_unfiltered_from_addr {
@@ -2075,7 +2160,20 @@ impl Table {
                 .collect(),
             route_stats: FnvHashMap::default(),
             shard_idx,
+            selection_options: SelectionOptions::default(),
         }
+    }
+
+    /// Sets the options for best-path selection. Called once before BGP
+    /// starts, at StartBgp or when the config file is loaded. The options
+    /// are not changed after that, so paths already in the table are not
+    /// ordered again.
+    pub fn set_selection_options(&mut self, opts: SelectionOptions) {
+        self.selection_options = opts;
+    }
+
+    pub fn selection_options(&self) -> SelectionOptions {
+        self.selection_options
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3031,6 +3129,139 @@ mod tests {
             .flat_map(|d| d.paths.into_iter().map(|p| p.remote_path_id))
             .collect();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// AS_PATH with one AS_SEQUENCE of `neighbor_as` (empty when None), and
+    /// MULTI_EXIT_DISC when `med` is Some.
+    fn attrs_with_med(neighbor_as: Option<u32>, med: Option<u32>) -> Arc<Vec<packet::Attribute>> {
+        let mut bin = Vec::new();
+        if let Some(asn) = neighbor_as {
+            bin.push(packet::Attribute::AS_PATH_TYPE_SEQ);
+            bin.push(1);
+            bin.extend_from_slice(&asn.to_be_bytes());
+        }
+        let mut attrs =
+            vec![packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, bin).unwrap()];
+        if let Some(med) = med {
+            attrs.push(
+                packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, med).unwrap(),
+            );
+        }
+        Arc::new(attrs)
+    }
+
+    /// Inserts one path from each of `paths` into a new table, in order, and
+    /// returns the remote addresses in the order of the destination.
+    fn med_order(
+        opts: SelectionOptions,
+        paths: &[(&Arc<Source>, Arc<Vec<packet::Attribute>>)],
+    ) -> Vec<IpAddr> {
+        let mut rt = Table::new(0);
+        rt.set_selection_options(opts);
+        let net = nlri(10, 0, 0, 0, 24);
+        for (src, attrs) in paths {
+            rt.insert(
+                (*src).clone(),
+                Family::IPV4,
+                net.clone(),
+                0,
+                nh(),
+                attrs.clone(),
+                None,
+                false,
+                false,
+                None,
+                0u32,
+            );
+        }
+        entry_order(&rt, &net)
+    }
+
+    #[test]
+    fn best_path_lower_med_wins_for_same_neighbor_as() {
+        // The second peer has the higher router ID but the lower MED.
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65001, 65000, 2);
+        let a1 = attrs_with_med(Some(65001), Some(20));
+        let a2 = attrs_with_med(Some(65001), Some(10));
+        for order in [
+            [(&s1, a1.clone()), (&s2, a2.clone())],
+            [(&s2, a2.clone()), (&s1, a1.clone())],
+        ] {
+            assert_eq!(
+                med_order(SelectionOptions::default(), &order),
+                vec![s2.remote_addr, s1.remote_addr]
+            );
+        }
+    }
+
+    #[test]
+    fn best_path_missing_med_is_lowest() {
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65001, 65000, 2);
+        let order = [
+            (&s1, attrs_with_med(Some(65001), Some(1))),
+            (&s2, attrs_with_med(Some(65001), None)),
+        ];
+        assert_eq!(
+            med_order(SelectionOptions::default(), &order),
+            vec![s2.remote_addr, s1.remote_addr]
+        );
+    }
+
+    #[test]
+    fn best_path_med_compared_for_empty_as_path() {
+        // Both paths are originated in the local AS, so the neighbor AS is
+        // the same.
+        let s1 = source(1, 65000, 65000, 1);
+        let s2 = source(2, 65000, 65000, 2);
+        let order = [
+            (&s1, attrs_with_med(None, Some(20))),
+            (&s2, attrs_with_med(None, Some(10))),
+        ];
+        assert_eq!(
+            med_order(SelectionOptions::default(), &order),
+            vec![s2.remote_addr, s1.remote_addr]
+        );
+    }
+
+    #[test]
+    fn best_path_med_compared_across_neighbor_as_only_when_always() {
+        // Different neighbor ASes: MED is ignored and the lower router ID
+        // wins, unless always_compare_med is set.
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        let order = [
+            (&s1, attrs_with_med(Some(65001), Some(20))),
+            (&s2, attrs_with_med(Some(65002), Some(10))),
+        ];
+        assert_eq!(
+            med_order(SelectionOptions::default(), &order),
+            vec![s1.remote_addr, s2.remote_addr]
+        );
+        let always = SelectionOptions {
+            always_compare_med: true,
+        };
+        assert_eq!(
+            med_order(always, &order),
+            vec![s2.remote_addr, s1.remote_addr]
+        );
+    }
+
+    #[test]
+    fn best_path_med_compared_after_origin() {
+        // A lower MED does not beat a lower ORIGIN.
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65001, 65000, 2);
+        let mut a1 = (*attrs_with_med(Some(65001), Some(20))).clone();
+        a1.push(packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap());
+        let mut a2 = (*attrs_with_med(Some(65001), Some(10))).clone();
+        a2.push(packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap());
+        let order = [(&s2, Arc::new(a2)), (&s1, Arc::new(a1))];
+        assert_eq!(
+            med_order(SelectionOptions::default(), &order),
+            vec![s1.remote_addr, s2.remote_addr]
+        );
     }
 
     #[test]
@@ -6332,14 +6563,14 @@ mod tests {
     #[test]
     fn ecmp_paths_empty_when_no_paths() {
         let change = make_nlri_change(vec![]);
-        assert!(change.ecmp_paths().is_empty());
+        assert!(change.ecmp_paths(SelectionOptions::default()).is_empty());
     }
 
     #[test]
     fn ecmp_paths_single_path() {
         let src = source(1, 65001, 65000, 1);
         let change = make_nlri_change(vec![path_with_nh(src, 1, empty_attrs())]);
-        assert_eq!(change.ecmp_paths().len(), 1);
+        assert_eq!(change.ecmp_paths(SelectionOptions::default()).len(), 1);
     }
 
     #[test]
@@ -6353,7 +6584,7 @@ mod tests {
             path_with_nh(src1, 1, attr.clone()),
             path_with_nh(src2, 2, attr.clone()),
         ]);
-        assert_eq!(change.ecmp_paths().len(), 2);
+        assert_eq!(change.ecmp_paths(SelectionOptions::default()).len(), 2);
     }
 
     #[test]
@@ -6365,7 +6596,7 @@ mod tests {
             path_with_nh(src1, 1, attrs_with_local_pref(200)),
             path_with_nh(src2, 2, attrs_with_local_pref(100)),
         ]);
-        assert_eq!(change.ecmp_paths().len(), 1);
+        assert_eq!(change.ecmp_paths(SelectionOptions::default()).len(), 1);
     }
 
     #[test]
@@ -6378,7 +6609,7 @@ mod tests {
             path_with_nh(src1, 1, empty_attrs()),
             path_with_nh(src2, 2, Arc::new(vec![community_attr(0xffff_0006)])),
         ]);
-        assert_eq!(change.ecmp_paths().len(), 1);
+        assert_eq!(change.ecmp_paths(SelectionOptions::default()).len(), 1);
     }
 
     #[test]
@@ -6392,7 +6623,40 @@ mod tests {
             path_with_nh(src1, 1, empty_attrs()),
             path_with_nh(src2, 2, empty_attrs()),
         ]);
-        assert_eq!(change.ecmp_paths().len(), 2);
+        assert_eq!(change.ecmp_paths(SelectionOptions::default()).len(), 2);
+    }
+
+    #[test]
+    fn ecmp_paths_compares_med_only_for_same_neighbor_as() {
+        let src1 = source(1, 65001, 65000, 1);
+        let src2 = source(2, 65001, 65000, 2);
+        let src3 = source(3, 65002, 65000, 3);
+        // src2 has a higher MED from the same AS, src3 from a different AS.
+        let change = make_nlri_change(vec![
+            path_with_nh(src1, 1, attrs_with_med(Some(65001), Some(10))),
+            path_with_nh(src2, 2, attrs_with_med(Some(65001), Some(20))),
+            path_with_nh(src3, 3, attrs_with_med(Some(65002), Some(20))),
+        ]);
+        let addrs = |opts| -> Vec<IpAddr> {
+            change
+                .ecmp_paths(opts)
+                .iter()
+                .map(|p| p.source.remote_addr)
+                .collect()
+        };
+        assert_eq!(
+            addrs(SelectionOptions::default()),
+            vec![
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3))
+            ]
+        );
+        assert_eq!(
+            addrs(SelectionOptions {
+                always_compare_med: true
+            }),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]
+        );
     }
 
     #[test]
@@ -6403,7 +6667,7 @@ mod tests {
             path_with_nh(src1, 1, attrs_with_as_path_len(1)),
             path_with_nh(src2, 2, attrs_with_as_path_len(2)),
         ]);
-        assert_eq!(change.ecmp_paths().len(), 1);
+        assert_eq!(change.ecmp_paths(SelectionOptions::default()).len(), 1);
     }
 
     // --- EVPN Type-2 best-path selection ---
