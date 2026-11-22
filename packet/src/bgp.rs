@@ -2017,6 +2017,23 @@ impl Attribute {
         out
     }
 
+    // Returns the length of this attribute in the wire format that encode()
+    // writes.
+    fn wire_len(&self) -> usize {
+        match self.code {
+            Attribute::ORIGIN => 4,
+            Attribute::MULTI_EXIT_DESC | Attribute::LOCAL_PREF | Attribute::ORIGINATOR_ID => 7,
+            _ => {
+                let len = self.binary().unwrap().len();
+                if len > 255 || self.flags & Attribute::FLAG_EXTENDED > 0 {
+                    4 + len
+                } else {
+                    3 + len
+                }
+            }
+        }
+    }
+
     pub(crate) fn encode_wire<B: BufMut + AsMut<[u8]>>(&self, dst: &mut B) -> u16 {
         self.encode(dst).unwrap()
     }
@@ -2519,7 +2536,7 @@ impl PeerCodec {
     // BGP-LS, ...).
     //
     // An NLRI that does not fit as the first one of a message never fits,
-    // because every message for these entries carries the same attributes.
+    // because every message for these entries has the same fixed part.
     // It is skipped so that the following entries are still sent.
     //
     // Returns (nlri_bytes_written, n_entries_consumed).
@@ -2555,43 +2572,198 @@ impl PeerCodec {
         (written, n_consumed)
     }
 
-    // Encodes MP_REACH_NLRI for `entries` (already sliced to the current start).
-    // Returns (attr_bytes_written, n_entries_consumed).
-    fn mp_reach_encode<B: BufMut + AsMut<[u8]>>(
-        &self,
-        buf_head: usize,
+    // Encodes the path attributes of a Reach message, except MP_REACH_NLRI
+    // and NEXT_HOP. The export layer (export_attrs) selects the attributes,
+    // so everything given is encoded.
+    fn encode_path_attrs<B: BufMut + AsMut<[u8]>>(&self, attr: &[Attribute], dst: &mut B) {
+        for a in attr {
+            if !self.two_byte_as {
+                a.encode_wire(dst);
+                continue;
+            }
+            match a.code() {
+                Attribute::AS_PATH => {
+                    // RFC 6793 §4.2.2: send AS_PATH in two-octet-ASN
+                    // wire form to an OLD BGP speaker, with a
+                    // companion AS4_PATH carrying the real
+                    // four-octet AS numbers whenever one doesn't fit
+                    // in two octets.
+                    let downgraded =
+                        Attribute::new_with_bin(Attribute::AS_PATH, a.as_path_downgrade_2byte())
+                            .unwrap();
+                    downgraded.encode_wire(dst);
+                    if a.as_path_has_wide_as() {
+                        let stripped = a.as_path_strip_confed();
+                        let as4_path = Attribute::new_with_bin(
+                            Attribute::AS4_PATH,
+                            stripped.binary().unwrap().clone(),
+                        )
+                        .unwrap();
+                        as4_path.encode_wire(dst);
+                    }
+                }
+                Attribute::AGGREGATOR => {
+                    // RFC 6793 §4.2.2: likewise for AGGREGATOR/AS4_AGGREGATOR.
+                    let downgraded = Attribute::new_with_bin(
+                        Attribute::AGGREGATOR,
+                        a.aggregator_downgrade_2byte(),
+                    )
+                    .unwrap();
+                    downgraded.encode_wire(dst);
+                    if a.aggregator_asn() > u16::MAX as u32 {
+                        let as4_aggregator = Attribute::new_with_bin(
+                            Attribute::AS4_AGGREGATOR,
+                            a.binary().unwrap().clone(),
+                        )
+                        .unwrap();
+                        as4_aggregator.encode_wire(dst);
+                    }
+                }
+                _ => {
+                    a.encode_wire(dst);
+                }
+            }
+        }
+    }
+
+    // Encodes a Reach message into as many UPDATE messages as needed.
+    // Returns the number of wire messages written.
+    //
+    // RFC 8654 Section 4 says that an UPDATE that is still too big "must not
+    // be sent to the neighbor" and that "if the NLRI was previously
+    // advertised to that peer, it must be withdrawn from service". An NLRI
+    // that does not fit in a message even alone with the path attributes is
+    // sent in a withdrawal instead. We do not know here if the NLRI was
+    // advertised before, so it is always withdrawn, like BIRD does.
+    fn encode_reach<B: BufMut + AsMut<[u8]>>(
+        &mut self,
         dst: &mut B,
-        family: &Family,
+        family: Family,
         entries: &[PathNlri],
         nexthop: &Option<Nexthop>,
-    ) -> (u16, usize) {
-        let pos_head = dst.as_mut().len();
-        // always use extended length
-        dst.put_u8(
-            Attribute::canonical_flags(Attribute::MP_REACH).unwrap() | Attribute::FLAG_EXTENDED,
-        );
-        dst.put_u8(Attribute::MP_REACH);
-        let pos_bin = dst.as_mut().len();
-        dst.put_u16(0);
-        dst.put_u16(family.afi());
-        dst.put_u8(family.safi());
-        // Attribute transformation (nexthop rewrite) is applied by PeerExportContext
-        // before routes enter PendingTx, so the nexthop here is already the export
-        // nexthop. Nexthop::to_bytes() applies the family-specific form. It
-        // preserves the actual nexthop length otherwise: negotiating Extended
-        // Nexthop permits IPv6 nexthops but does not convert IPv4 ones.
-        let nh_bytes = nexthop.map(|nh| nh.to_bytes(*family)).unwrap_or_default();
-        dst.put_u8(nh_bytes.len() as u8);
-        dst.put_slice(&nh_bytes);
-        // SNPA padding
-        dst.put_u8(0);
-        let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
-        let (_, n_consumed) = self.encode_nlri_list(buf_head, dst, entries, addpath, 0);
-        let mp_len = (dst.as_mut().len() - pos_head) as u16;
-        (&mut dst.as_mut()[pos_bin..])
-            .write_u16::<NetworkEndian>(mp_len - 4)
-            .unwrap();
-        (mp_len, n_consumed)
+        attr: &[Attribute],
+    ) -> Result<usize, Error> {
+        let addpath = self.families.get(&family).is_some_and(|s| s.addpath_tx);
+        // RFC 8950: IPv4 uses MP_REACH_NLRI when extended nexthop is negotiated.
+        let via_mp = family != Family::IPV4 || self.extended_nexthop;
+        // Attribute transformation (nexthop rewrite) is applied by
+        // PeerExportContext before routes enter PendingTx, so the nexthop
+        // here is already the export nexthop. Nexthop::to_bytes() applies the
+        // family-specific form. It preserves the actual nexthop length
+        // otherwise: negotiating Extended Nexthop permits IPv6 nexthops but
+        // does not convert IPv4 ones.
+        let mp_nexthop = if via_mp {
+            nexthop.map(|nh| nh.to_bytes(family)).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Traditional IPv4 uses the NEXT_HOP attribute.
+        let nexthop_attr = match nexthop.map(|nh| nh.addr()) {
+            Some(IpAddr::V4(v4)) if !via_mp => {
+                Some(Attribute::new_with_bin(Attribute::NEXTHOP, v4.octets().to_vec()).unwrap())
+            }
+            _ => None,
+        };
+
+        // Upper bound of the length of the path attributes, except
+        // MP_REACH_NLRI. For a two-octet AS peer, AS_PATH and AGGREGATOR are
+        // sent as a downgraded attribute and possibly AS4_PATH or
+        // AS4_AGGREGATOR. Neither of them is longer than the original
+        // attribute, so twice the original length is enough.
+        let attrs_max_len: usize = attr
+            .iter()
+            .chain(nexthop_attr.iter())
+            .map(|a| match a.code() {
+                Attribute::AS_PATH | Attribute::AGGREGATOR if self.two_byte_as => 2 * a.wire_len(),
+                _ => a.wire_len(),
+            })
+            .sum();
+        // MP_REACH_NLRI header, AFI, SAFI, next hop length, next hop and
+        // the reserved octet.
+        let mp_reach_len = if via_mp {
+            4 + 3 + 1 + mp_nexthop.len() + 1
+        } else {
+            0
+        };
+        // Room for the NLRIs in one message.
+        let room = self
+            .max_message_length()
+            .saturating_sub(Message::HEADER_LENGTH as usize + 4 + attrs_max_len + mp_reach_len);
+
+        let mut wire_count = 0;
+        let mut withdrawn = Vec::new();
+        let mut nlri = Vec::with_capacity(64);
+        let mut start = 0;
+        while start < entries.len() {
+            // An NLRI that does not fit even alone never fits.
+            let item = &entries[start];
+            nlri.clear();
+            if addpath {
+                nlri.put_u32(item.path_id);
+            }
+            item.nlri.encode(&mut nlri).unwrap();
+            if nlri.len() > room {
+                withdrawn.push(item.clone());
+                start += 1;
+                continue;
+            }
+
+            let pos_head = dst.as_mut().len();
+            dst.put_u64(u64::MAX);
+            dst.put_u64(u64::MAX);
+            let pos_header_len = dst.as_mut().len();
+            dst.put_u16(0);
+            dst.put_u8(Message::UPDATE);
+            // No withdrawn routes in a Reach message.
+            dst.put_u16(0);
+            let pos_attr_len = dst.as_mut().len();
+            dst.put_u16(0);
+            let pos_attr = dst.as_mut().len();
+            self.encode_path_attrs(attr, dst);
+            if let Some(a) = &nexthop_attr {
+                a.encode_wire(dst);
+            }
+            debug_assert!(dst.as_mut().len() - pos_attr <= attrs_max_len);
+            let n_consumed = if via_mp {
+                // always use extended length
+                dst.put_u8(
+                    Attribute::canonical_flags(Attribute::MP_REACH).unwrap()
+                        | Attribute::FLAG_EXTENDED,
+                );
+                dst.put_u8(Attribute::MP_REACH);
+                let pos_mp_len = dst.as_mut().len();
+                dst.put_u16(0);
+                dst.put_u16(family.afi());
+                dst.put_u8(family.safi());
+                dst.put_u8(mp_nexthop.len() as u8);
+                dst.put_slice(&mp_nexthop);
+                // SNPA padding
+                dst.put_u8(0);
+                let (_, n) = self.encode_nlri_list(pos_head, dst, &entries[start..], addpath, 0);
+                let mp_len = dst.as_mut().len() - pos_mp_len - 2;
+                (&mut dst.as_mut()[pos_mp_len..]).write_u16::<NetworkEndian>(mp_len as u16)?;
+                let attr_len = dst.as_mut().len() - pos_attr;
+                (&mut dst.as_mut()[pos_attr_len..]).write_u16::<NetworkEndian>(attr_len as u16)?;
+                n
+            } else {
+                let attr_len = dst.as_mut().len() - pos_attr;
+                (&mut dst.as_mut()[pos_attr_len..]).write_u16::<NetworkEndian>(attr_len as u16)?;
+                let (_, n) = self.encode_nlri_list(pos_head, dst, &entries[start..], addpath, 0);
+                n
+            };
+            let msg_len = dst.as_mut().len() - pos_head;
+            (&mut dst.as_mut()[pos_header_len..]).write_u16::<NetworkEndian>(msg_len as u16)?;
+            wire_count += 1;
+            start += n_consumed;
+        }
+        if !withdrawn.is_empty() {
+            let msg = Message::Update(Update::Unreach {
+                family,
+                entries: withdrawn,
+            });
+            wire_count += self.encode_to(&msg, dst)?;
+        }
+        Ok(wire_count)
     }
 
     // Encodes MP_UNREACH_NLRI for `entries` (already sliced to the current start).
@@ -2666,104 +2838,8 @@ impl PeerCodec {
                 dst.put_slice(params);
                 0
             }
-            Message::Update(Update::Reach {
-                family,
-                entries,
-                nexthop,
-                attr,
-            }) => {
-                let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
-                // RFC 8950: IPv4 uses MP_REACH_NLRI when extended nexthop is negotiated.
-                let ipv4_via_mp = self.extended_nexthop;
-                dst.put_u8(Message::UPDATE);
-                // No withdrawn routes in a Reach message.
-                dst.put_u16(0);
-                let pos_attr_len = dst.as_mut().len();
-                dst.put_u16(0);
-                let mut attr_len: u16 = 0;
-
-                // Write path attributes.  The export layer (export_attrs) is
-                // responsible for attribute selection; encode everything given.
-                // NEXTHOP is written below for traditional IPv4.
-                // MP_REACH/MP_UNREACH are synthesized below for MP paths.
-                for a in attr.as_ref() {
-                    if !self.two_byte_as {
-                        attr_len += a.encode_wire(dst);
-                        continue;
-                    }
-                    match a.code() {
-                        Attribute::AS_PATH => {
-                            // RFC 6793 §4.2.2: send AS_PATH in two-octet-ASN
-                            // wire form to an OLD BGP speaker, with a
-                            // companion AS4_PATH carrying the real
-                            // four-octet AS numbers whenever one doesn't fit
-                            // in two octets.
-                            let downgraded = Attribute::new_with_bin(
-                                Attribute::AS_PATH,
-                                a.as_path_downgrade_2byte(),
-                            )
-                            .unwrap();
-                            attr_len += downgraded.encode_wire(dst);
-                            if a.as_path_has_wide_as() {
-                                let stripped = a.as_path_strip_confed();
-                                let as4_path = Attribute::new_with_bin(
-                                    Attribute::AS4_PATH,
-                                    stripped.binary().unwrap().clone(),
-                                )
-                                .unwrap();
-                                attr_len += as4_path.encode_wire(dst);
-                            }
-                        }
-                        Attribute::AGGREGATOR => {
-                            // RFC 6793 §4.2.2: likewise for AGGREGATOR/AS4_AGGREGATOR.
-                            let downgraded = Attribute::new_with_bin(
-                                Attribute::AGGREGATOR,
-                                a.aggregator_downgrade_2byte(),
-                            )
-                            .unwrap();
-                            attr_len += downgraded.encode_wire(dst);
-                            if a.aggregator_asn() > u16::MAX as u32 {
-                                let as4_aggregator = Attribute::new_with_bin(
-                                    Attribute::AS4_AGGREGATOR,
-                                    a.binary().unwrap().clone(),
-                                )
-                                .unwrap();
-                                attr_len += as4_aggregator.encode_wire(dst);
-                            }
-                        }
-                        _ => {
-                            attr_len += a.encode_wire(dst);
-                        }
-                    }
-                }
-
-                if *family == Family::IPV4 && !ipv4_via_mp {
-                    // Traditional IPv4: NEXTHOP attribute + NLRI section after attrs.
-                    if !entries[start..].is_empty()
-                        && let Some(nh) = nexthop
-                        && let IpAddr::V4(v4) = nh.addr()
-                    {
-                        let nh_attr =
-                            Attribute::new_with_bin(Attribute::NEXTHOP, v4.octets().to_vec())
-                                .unwrap();
-                        attr_len += nh_attr.encode_wire(dst);
-                    }
-                    (&mut dst.as_mut()[pos_attr_len..])
-                        .write_u16::<NetworkEndian>(attr_len)
-                        .unwrap();
-                    let (_, count) =
-                        self.encode_nlri_list(pos_head, dst, &entries[start..], addpath, 0);
-                    count
-                } else {
-                    // MP_REACH_NLRI (non-IPv4 or IPv4 with RFC 8950 extended nexthop).
-                    let (mp_len, count) =
-                        self.mp_reach_encode(pos_head, dst, family, &entries[start..], nexthop);
-                    attr_len += mp_len;
-                    (&mut dst.as_mut()[pos_attr_len..])
-                        .write_u16::<NetworkEndian>(attr_len)
-                        .unwrap();
-                    count
-                }
+            Message::Update(Update::Reach { .. }) => {
+                unreachable!("Reach messages are encoded by encode_reach()")
             }
             Message::Update(Update::Unreach { family, entries }) => {
                 let addpath = self.families.get(family).is_some_and(|s| s.addpath_tx);
@@ -3369,14 +3445,26 @@ impl PeerCodec {
 
     /// Encode `msg` into `dst`, splitting into multiple wire UPDATE messages
     /// if entries exceed the per-message size limit.  Returns the number of
-    /// wire messages written (always >= 1).
+    /// wire messages written.
+    ///
+    /// A route that does not fit in a message with its path attributes is
+    /// withdrawn instead (RFC 8654 Section 4), so a Reach message can also
+    /// produce withdrawals. A Reach message with no entries writes nothing.
     pub fn encode_to<B: BufMut + AsMut<[u8]>>(
         &mut self,
         msg: &Message,
         dst: &mut B,
     ) -> Result<usize, Error> {
+        if let Message::Update(Update::Reach {
+            family,
+            entries,
+            nexthop,
+            attr,
+        }) = msg
+        {
+            return self.encode_reach(dst, *family, entries, nexthop, attr);
+        }
         let total = match msg {
-            Message::Update(Update::Reach { entries, .. }) => entries.len(),
             Message::Update(Update::Unreach { entries, .. }) => entries.len(),
             _ => 0,
         };
@@ -3694,6 +3782,32 @@ mod attribute_tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
+
+    #[test]
+    fn wire_len_matches_encode() {
+        let attrs = vec![
+            Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+            Attribute::new_with_value(Attribute::MULTI_EXIT_DESC, 100).unwrap(),
+            Attribute::new_with_value(Attribute::LOCAL_PREF, 100).unwrap(),
+            Attribute::new_with_value(Attribute::ORIGINATOR_ID, 1).unwrap(),
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
+            )
+            .unwrap(),
+            // Longer than 255 bytes: extended length.
+            Attribute::new_with_bin(Attribute::COMMUNITY, vec![0; 400]).unwrap(),
+            // Extended length flag with a short value.
+            Attribute::new_opaque(
+                100,
+                Attribute::FLAG_OPTIONAL | Attribute::FLAG_TRANSITIVE | Attribute::FLAG_EXTENDED,
+                vec![1, 2, 3],
+            ),
+        ];
+        for a in &attrs {
+            assert_eq!(a.wire_len(), a.encode_to_bytes().len(), "{:?}", a.code());
+        }
+    }
 
     fn ipv4_codec() -> PeerCodec {
         let mut c = PeerCodec::new();
@@ -5675,6 +5789,25 @@ mod update_tests {
         }
     }
 
+    // Encodes a Reach message for `entry` with no other path attributes and
+    // returns its MP_REACH_NLRI attribute.
+    fn mp_reach_attr(
+        codec: &mut PeerCodec,
+        family: Family,
+        entry: &PathNlri,
+        nexthop: Option<Nexthop>,
+    ) -> Vec<u8> {
+        let msg = Message::Update(Update::Reach {
+            family,
+            entries: vec![entry.clone()],
+            nexthop,
+            attr: Arc::new(Vec::new()),
+        });
+        let mut wire = Vec::new();
+        assert_eq!(codec.encode_to(&msg, &mut wire).unwrap(), 1);
+        wire.split_off(Message::HEADER_LENGTH as usize + 4)
+    }
+
     fn ipv4_extended_nexthop_codec() -> PeerCodec {
         let local = vec![
             Capability::MultiProtocol(Family::IPV4),
@@ -5687,15 +5820,8 @@ mod update_tests {
     fn update_ipv4_extended_nexthop_preserves_ipv4_nexthop() {
         let prefix = ipv4_prefix("10.0.0.0", 8);
         let nexthop = Some(Nexthop::V4("192.0.2.1".parse().unwrap()));
-        let codec = ipv4_extended_nexthop_codec();
-        let mut wire = BytesMut::new();
-        codec.mp_reach_encode(
-            0,
-            &mut wire,
-            &Family::IPV4,
-            std::slice::from_ref(&prefix),
-            &nexthop,
-        );
+        let mut codec = ipv4_extended_nexthop_codec();
+        let wire = mp_reach_attr(&mut codec, Family::IPV4, &prefix, nexthop);
         // MP_REACH must carry a four-byte IPv4 nexthop even when both peers
         // advertise Extended Nexthop. Padding it to 16 bytes yields c000:201::.
         assert_eq!(
@@ -5729,14 +5855,12 @@ mod update_tests {
     fn update_ipv6_ipv4_nexthop_is_ipv4_mapped() {
         let prefix = ipv6_prefix("2001:db8::", 32);
         let nexthop: Ipv4Addr = "192.0.2.1".parse().unwrap();
-        let codec = ipv6_codec();
-        let mut wire = BytesMut::new();
-        codec.mp_reach_encode(
-            0,
-            &mut wire,
-            &Family::IPV6,
-            std::slice::from_ref(&prefix),
-            &Some(Nexthop::V4(nexthop)),
+        let mut codec = ipv6_codec();
+        let wire = mp_reach_attr(
+            &mut codec,
+            Family::IPV6,
+            &prefix,
+            Some(Nexthop::V4(nexthop)),
         );
         // An IPv4 nexthop for AFI=2 is sent as ::ffff:192.0.2.1 (16 bytes).
         assert_eq!(
@@ -6349,13 +6473,11 @@ mod update_tests {
         });
         // RFC 4659 Section 3.2.1.2: 24-byte VPN-IPv6 nexthop with a zero RD and
         // an IPv4-mapped IPv6 address.
-        let mut wire = BytesMut::new();
-        vpnv6_codec().mp_reach_encode(
-            0,
-            &mut wire,
-            &Family::IPV6_VPN,
-            std::slice::from_ref(&nlri),
-            &Some(Nexthop::V4(nexthop)),
+        let wire = mp_reach_attr(
+            &mut vpnv6_codec(),
+            Family::IPV6_VPN,
+            &nlri,
+            Some(Nexthop::V4(nexthop)),
         );
         let mut expected = vec![24];
         expected.extend_from_slice(&[0; 8]);
@@ -6400,14 +6522,7 @@ mod update_tests {
         });
         // RFC 4659 Section 3.2.1.1: a zero RD before the global address and
         // another zero RD before the link-local address.
-        let mut wire = BytesMut::new();
-        vpnv6_codec().mp_reach_encode(
-            0,
-            &mut wire,
-            &Family::IPV6_VPN,
-            std::slice::from_ref(&nlri),
-            &Some(nexthop),
-        );
+        let wire = mp_reach_attr(&mut vpnv6_codec(), Family::IPV6_VPN, &nlri, Some(nexthop));
         let mut expected = vec![48];
         expected.extend_from_slice(&[0; 8]);
         expected.extend_from_slice(&global.octets());
@@ -6671,17 +6786,42 @@ mod update_tests {
         }
     }
 
+    // Decodes `raw` and returns the (reach, unreach) NLRIs of all UPDATEs.
+    fn decode_reach_unreach(raw: &[u8], codec: &mut PeerCodec) -> (Vec<PathNlri>, Vec<PathNlri>) {
+        let mut buf = BytesMut::from(raw);
+        let mut reach = Vec::new();
+        let mut unreach = Vec::new();
+        for m in decode_all(&mut buf, codec) {
+            if let ParsedMessage::Update(ParsedUpdate::Routes {
+                reach: r,
+                unreach: u,
+                mp_reach,
+                mp_unreach,
+                ..
+            }) = m
+            {
+                for x in [r, mp_reach].into_iter().flatten() {
+                    reach.extend(x.entries);
+                }
+                for x in [u, mp_unreach].into_iter().flatten() {
+                    unreach.extend(x.entries);
+                }
+            }
+        }
+        (reach, unreach)
+    }
+
     #[test]
-    fn nlri_that_never_fits_is_skipped() {
+    fn nlri_that_never_fits_is_withdrawn() {
         // With large attributes, a 12-byte VPNv6 NLRI (/0) fits in a message
-        // but a 28-byte one (/128) does not. The large one is skipped and
+        // but a 28-byte one (/128) does not. The large one is withdrawn and
         // the entries after it are still sent.
         let small = [vpnv6_nlri(0, 0), vpnv6_nlri(1, 0)];
         let big = vpnv6_nlri(2, 128);
         let entries = vec![small[0].clone(), big.clone(), small[1].clone()];
         // Up to 1007 communities the attributes alone still fit; more is the
-        // "attributes too long" case, which this test does not cover.
-        let mut skipped = false;
+        // "attributes too long" case, which other tests cover.
+        let mut withdrawn = false;
         for n_communities in 1000..1008 {
             let mut codec = vpnv6_codec();
             let mut raw = Vec::new();
@@ -6689,28 +6829,93 @@ mod update_tests {
                 .encode_to(&vpnv6_reach(entries.clone(), n_communities), &mut raw)
                 .unwrap();
             check_message_sizes(&raw);
-            let mut buf = BytesMut::from(raw.as_slice());
-            let received: Vec<PathNlri> = decode_all(&mut buf, &mut codec)
-                .into_iter()
-                .filter_map(|m| match m {
-                    ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
-                        mp_reach.map(|r| r.entries)
-                    }
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-            if received.is_empty() {
+            let (reach, unreach) = decode_reach_unreach(&raw, &mut codec);
+            if reach.is_empty() {
                 // Not even the small NLRI fits.
+                assert_eq!(unreach.len(), entries.len(), "{n_communities}");
                 continue;
             }
-            assert!(received.contains(&small[0]), "{n_communities}");
-            assert!(received.contains(&small[1]), "{n_communities}");
-            if !received.contains(&big) {
-                skipped = true;
+            assert!(reach.contains(&small[0]), "{n_communities}");
+            assert!(reach.contains(&small[1]), "{n_communities}");
+            if !reach.contains(&big) {
+                assert_eq!(unreach, vec![big.clone()], "{n_communities}");
+                withdrawn = true;
+            } else {
+                assert!(unreach.is_empty(), "{n_communities}");
             }
         }
-        assert!(skipped, "no attribute length made the big NLRI skip");
+        assert!(withdrawn, "no attribute length made the big NLRI withdrawn");
+    }
+
+    fn ipv4_reach_with_communities(entries: Vec<PathNlri>, n_communities: u32) -> Message {
+        let communities = (0..n_communities)
+            .flat_map(|c| (0xfde8_0000u32 + c).to_be_bytes())
+            .collect();
+        Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries,
+            nexthop: Some(Nexthop::V4("192.0.2.1".parse().unwrap())),
+            attr: Arc::new(vec![
+                Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                Attribute::empty_as_path(),
+                Attribute::new_with_bin(Attribute::COMMUNITY, communities).unwrap(),
+            ]),
+        })
+    }
+
+    #[test]
+    fn ipv4_attributes_too_long_are_withdrawn() {
+        // 1100 communities (4400 bytes) do not fit in 4096 bytes. The routes
+        // must be withdrawn, not sent in an oversized UPDATE (RFC 8654
+        // Section 4).
+        let entries = vec![
+            ipv4_prefix("198.51.100.0", 24),
+            ipv4_prefix("203.0.113.0", 24),
+        ];
+        let msg = ipv4_reach_with_communities(entries.clone(), 1100);
+        let mut codec = ipv4_codec();
+        let mut raw = Vec::new();
+        assert_eq!(codec.encode_to(&msg, &mut raw).unwrap(), 1);
+        check_message_sizes(&raw);
+        let (reach, unreach) = decode_reach_unreach(&raw, &mut codec);
+        assert!(reach.is_empty());
+        assert_eq!(unreach, entries);
+    }
+
+    #[test]
+    fn vpnv6_attributes_too_long_are_withdrawn() {
+        let entries: Vec<PathNlri> = (0..3).map(|i| vpnv6_nlri(i, 64)).collect();
+        let mut codec = vpnv6_codec();
+        let mut raw = Vec::new();
+        assert_eq!(
+            codec
+                .encode_to(&vpnv6_reach(entries.clone(), 1100), &mut raw)
+                .unwrap(),
+            1
+        );
+        check_message_sizes(&raw);
+        let (reach, unreach) = decode_reach_unreach(&raw, &mut codec);
+        assert!(reach.is_empty());
+        assert_eq!(unreach, entries);
+    }
+
+    #[test]
+    fn long_attributes_are_sent_with_extended_message() {
+        // The same UPDATE is sent as is when the Extended Message capability
+        // is negotiated.
+        let caps = vec![
+            Capability::MultiProtocol(Family::IPV4),
+            Capability::ExtendedMessage,
+        ];
+        let mut codec = PeerCodec::negotiate(&caps, &caps);
+        let entries = vec![ipv4_prefix("198.51.100.0", 24)];
+        let msg = ipv4_reach_with_communities(entries.clone(), 1100);
+        let mut raw = Vec::new();
+        assert_eq!(codec.encode_to(&msg, &mut raw).unwrap(), 1);
+        assert!(raw.len() > Message::MAX_LENGTH);
+        let (reach, unreach) = decode_reach_unreach(&raw, &mut codec);
+        assert_eq!(reach, entries);
+        assert!(unreach.is_empty());
     }
 
     fn check_message_sizes(raw: &[u8]) {
@@ -7353,6 +7558,67 @@ mod two_byte_as_tests {
         let mut c = ipv4_codec();
         c.two_byte_as = true;
         c
+    }
+
+    #[test]
+    fn long_attributes_never_exceed_max_length() {
+        // For a two-octet AS peer, AS_PATH and AGGREGATOR are sent with
+        // AS4_PATH and AS4_AGGREGATOR, so the attributes on the wire are
+        // longer than the stored ones. Shift the attribute length around the
+        // limit: every message fits, and every route is either sent or
+        // withdrawn.
+        let asns: Vec<u32> = (0..10).map(|i| 400_000 + i).collect();
+        let entries = vec![
+            ipv4_prefix("198.51.100.0", 24),
+            ipv4_prefix("203.0.113.1", 32),
+        ];
+        let mut seen_reach = false;
+        let mut seen_unreach = false;
+        for n_communities in 980..1000u32 {
+            let communities = (0..n_communities)
+                .flat_map(|c| (0xfde8_0000u32 + c).to_be_bytes())
+                .collect();
+            let msg = Message::Update(Update::Reach {
+                family: Family::IPV4,
+                entries: entries.clone(),
+                nexthop: Some(Nexthop::V4(Ipv4Addr::new(192, 0, 2, 1))),
+                attr: Arc::new(vec![
+                    Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
+                    Attribute::new_with_bin(
+                        Attribute::AS_PATH,
+                        seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &asns),
+                    )
+                    .unwrap(),
+                    Attribute::new_with_bin(
+                        Attribute::AGGREGATOR,
+                        aggregator_bin(400_000, Ipv4Addr::new(198, 51, 100, 1)),
+                    )
+                    .unwrap(),
+                    Attribute::new_with_bin(Attribute::COMMUNITY, communities).unwrap(),
+                ]),
+            });
+            let mut codec = ipv4_codec_2byte_as();
+            let mut buf = BytesMut::new();
+            codec.encode_to(&msg, &mut buf).unwrap();
+            let mut got = Vec::new();
+            while let Some(m) = codec.try_parse(&mut buf).unwrap() {
+                if let ParsedMessage::Update(ParsedUpdate::Routes { reach, unreach, .. }) = m {
+                    if let Some(r) = reach {
+                        seen_reach = true;
+                        got.extend(r.entries);
+                    }
+                    if let Some(u) = unreach {
+                        seen_unreach = true;
+                        got.extend(u.entries);
+                    }
+                }
+            }
+            got.sort_by_key(|p| format!("{:?}", p));
+            let mut want = entries.clone();
+            want.sort_by_key(|p| format!("{:?}", p));
+            assert_eq!(got, want, "{n_communities}");
+        }
+        assert!(seen_reach && seen_unreach);
     }
 
     fn round_trip(msg: &Message, codec: PeerCodec) -> ParsedMessage {
