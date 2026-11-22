@@ -874,7 +874,7 @@ impl TableManager {
                 t.disconnected(addr, family, kernel_handle.as_deref(), &subs);
             }
             for &family in stale_families {
-                t.mark_stale(addr, family, kernel_handle.as_deref(), &subs);
+                t.mark_stale(addr, family);
             }
         }
     }
@@ -1162,16 +1162,10 @@ impl TableShard {
         }
     }
 
-    fn mark_stale(
-        &mut self,
-        addr: IpAddr,
-        family: Family,
-        kernel_handle: Option<&kernel::KernelHandle>,
-        subs: &[(SubscriptionId, mpsc::UnboundedSender<BgpEvent>)],
-    ) {
-        for change in self.rtable.restale(addr, family) {
-            self.distribute_update(change, kernel_handle, subs);
-        }
+    /// Marks the paths from `addr` as GR stale. This does not change the best
+    /// path, so there is nothing to distribute.
+    fn mark_stale(&mut self, addr: IpAddr, family: Family) {
+        self.rtable.restale(addr, family);
     }
 
     #[allow(clippy::too_many_arguments)]

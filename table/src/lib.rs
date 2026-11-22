@@ -428,14 +428,17 @@ impl<'a> NewEntry<'a> {
 /// 5. Shorter AS_PATH.
 /// 6. Lower ORIGIN.
 /// 7. eBGP over iBGP. A confederation eBGP peer counts as iBGP.
-/// 8. Not GR stale.
-/// 9. Lower ORIGINATOR_ID, or BGP Identifier of the peer when absent.
-/// 10. Shorter CLUSTER_LIST. RFC 4456 section 9: "In addition, the
-///     following rule SHOULD be inserted between Steps f) and g): a BGP
-///     Speaker SHOULD prefer a route with the shorter CLUSTER_LIST length."
-/// 11. Lower peer address. RFC 4271 section 9.1.2.2 g): "Prefer the route
+/// 8. Lower ORIGINATOR_ID, or BGP Identifier of the peer when absent.
+/// 9. Shorter CLUSTER_LIST. RFC 4456 section 9: "In addition, the
+///    following rule SHOULD be inserted between Steps f) and g): a BGP
+///    Speaker SHOULD prefer a route with the shorter CLUSTER_LIST length."
+/// 10. Lower peer address. RFC 4271 section 9.1.2.2 g): "Prefer the route
 ///     received from the lowest peer address."
-/// 12. Lower Add-Path path ID, for paths from the same peer.
+/// 11. Lower Add-Path path ID, for paths from the same peer.
+///
+/// The GR stale state is not compared, as in GoBGP and BIRD. A GR stale
+/// path keeps its place, so the best path does not change when a peer
+/// restarts and again when it comes back.
 ///
 /// An entry is identified by its peer address and path ID, so two
 /// different entries never compare Equal.
@@ -476,10 +479,6 @@ fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::c
         .role
         .prefers_over_ibgp()
         .cmp(&a.path.source.role.prefers_over_ibgp());
-    if ord.is_ne() {
-        return ord;
-    }
-    let ord = a.path.source.is_stale().cmp(&b.path.source.is_stale());
     if ord.is_ne() {
         return ord;
     }
@@ -745,8 +744,8 @@ impl NlriChange {
     }
 
     /// All paths tied with the best on LLGR stale, LOCAL_PREF, AS_PATH
-    /// length, ORIGIN, eBGP/iBGP, GR stale and CLUSTER_LIST length. The
-    /// router-id tie-break is not used.
+    /// length, ORIGIN, eBGP/iBGP and CLUSTER_LIST length. The router-id
+    /// tie-break is not used.
     ///
     /// Returns an empty slice when there are no paths.  Used to build the
     /// ECMP nexthop set for kernel FIB installation.
@@ -761,7 +760,6 @@ impl NlriChange {
                 attr_as_path_len(&p.attr),
                 attr_origin(&p.attr),
                 p.source.role.prefers_over_ibgp(),
-                p.source.is_stale(),
                 attr_cluster_list_len(&p.attr),
             )
         };
@@ -1915,52 +1913,20 @@ impl Table {
         changes
     }
 
-    /// Mark all paths from `addr` in `family` as stale and re-run best-path
-    /// selection.  Returns one NlriChange per destination that changed.
-    pub fn restale(&mut self, addr: IpAddr, family: Family) -> Vec<NlriChange> {
-        let mut changes = Vec::new();
-        if let Some(rt) = self.ribs.get_mut(&family) {
-            for (net, dst) in rt.destinations.iter_mut() {
-                if !dst.entry.iter().any(|p| p.path.source.remote_addr == addr) {
-                    continue;
-                }
-                let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
-                // Track whether any unfiltered path from addr exists (any rank may shift).
-                let any_unfiltered_from_addr = dst
-                    .entry
-                    .iter()
-                    .any(|e| e.path.source.remote_addr == addr && !e.is_filtered());
-                for p in dst.entry.iter() {
+    /// Mark all paths from `addr` in `family` as GR stale.
+    ///
+    /// The GR stale state is not used in best-path selection, so this does
+    /// not change the best path or the order of the paths.
+    pub fn restale(&mut self, addr: IpAddr, family: Family) {
+        if let Some(rt) = self.ribs.get(&family) {
+            for dst in rt.destinations.values() {
+                for p in &dst.entry {
                     if p.path.source.remote_addr == addr {
                         p.path.source.mark_stale();
                     }
                 }
-                dst.reposition(is_evpn_type2(net), |e| e.path.source.remote_addr == addr);
-                let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
-                let best_changed = old_best_id != new_best_id;
-                // Emit NlriChange when best changed (non-Add-Path) or any unfiltered
-                // path from addr existed (Add-Path peers may need rank-boundary updates).
-                if best_changed || any_unfiltered_from_addr {
-                    let current_paths = Arc::new(
-                        dst.entry
-                            .iter()
-                            .filter(|e| !e.is_filtered())
-                            .map(|e| e.path.clone())
-                            .collect(),
-                    );
-                    changes.push(NlriChange {
-                        family,
-                        net: net.clone(),
-                        dest_id: dst.id,
-                        best_changed,
-                        any_changed: any_unfiltered_from_addr,
-                        replaced_path_id: None,
-                        current_paths,
-                    });
-                }
             }
         }
-        changes
     }
 
     /// Mark the source for `addr` as LLGR stale in `family`.
@@ -4945,8 +4911,8 @@ mod tests {
     #[test]
     fn fresh_and_stale_compete_in_best_path() {
         // Simulate GR: existing route is marked stale, then a fresh route arrives
-        // from a different peer. The fresh peer has a higher router_id (worse
-        // tie-breaker) but must win because non-stale beats stale.
+        // from a different peer. The GR stale state is not used in best-path
+        // selection, so the stale path with the lower router_id stays the best.
         let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let stale_src = source(1, 65001, 65000, 1); // router_id=1 (better tie-breaker)
@@ -4985,11 +4951,11 @@ mod tests {
 
         let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best.len(), 2);
-        // rank=1 (best) should be the fresh source despite worse router_id
+        // rank=1 (best) is the stale source, which has the lower router_id.
         let winner = best.iter().find(|(_, _, r)| *r == 1).unwrap();
-        assert!(!winner.1.source.is_stale());
-        let loser = best.iter().find(|(_, _, r)| *r == 2).unwrap();
-        assert!(loser.1.source.is_stale());
+        assert!(winner.1.source.is_stale());
+        let other = best.iter().find(|(_, _, r)| *r == 2).unwrap();
+        assert!(!other.1.source.is_stale());
     }
 
     #[test]
@@ -5122,9 +5088,10 @@ mod tests {
     // --- restale ---
 
     #[test]
-    fn restale_demotes_stale_when_fresh_alternative_exists() {
-        // stale source has lower router_id (normally wins), fresh source has higher.
-        // After mark_stale + restale(), fresh must be rank=1.
+    fn restale_keeps_stale_best_when_fresh_alternative_exists() {
+        // The stale source has the lower router_id, so it is the best path.
+        // The GR stale state is not used in best-path selection, so it stays
+        // the best path after restale().
         let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let stale_src = source(1, 65001, 65000, 1); // router_id 1 (better without stale)
@@ -5169,16 +5136,14 @@ mod tests {
                 == stale_src.remote_addr
         );
 
-        let changes = rt.restale(stale_src.remote_addr, Family::IPV4);
-
-        // restale() must emit changes: old rank-1 (stale) loses to fresh.
-        assert!(!changes.is_empty());
+        rt.restale(stale_src.remote_addr, Family::IPV4);
 
         let best = flat_best(&rt, &Family::IPV4);
         let winner = best.iter().find(|(_, _, r)| *r == 1).unwrap();
-        assert_eq!(winner.1.source.remote_addr, fresh_src.remote_addr);
-        let loser = best.iter().find(|(_, _, r)| *r == 2).unwrap();
-        assert_eq!(loser.1.source.remote_addr, stale_src.remote_addr);
+        assert_eq!(winner.1.source.remote_addr, stale_src.remote_addr);
+        assert!(winner.1.source.is_stale());
+        let other = best.iter().find(|(_, _, r)| *r == 2).unwrap();
+        assert_eq!(other.1.source.remote_addr, fresh_src.remote_addr);
     }
 
     /// GR helper: when the same peer reconnects after a session drop and re-sends
@@ -5375,7 +5340,7 @@ mod tests {
 
     #[test]
     fn restale_no_alternative_keeps_stale_as_best() {
-        // Only one source; after mark_stale + restale(), it stays as rank=1.
+        // Only one source; after restale(), it stays as rank=1.
         let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
         let src = source(1, 65001, 65000, 1);
@@ -5394,13 +5359,7 @@ mod tests {
             0u32,
         );
 
-        let changes = rt.restale(src.remote_addr, Family::IPV4);
-
-        // best_changed=false (sole path stays rank-1), but any_changed=true so
-        // Add-Path peers can diff and confirm no boundary shift occurred.
-        assert_eq!(changes.len(), 1);
-        assert!(!changes[0].best_changed);
-        assert!(changes[0].any_changed);
+        rt.restale(src.remote_addr, Family::IPV4);
 
         let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best.len(), 1);
@@ -6420,6 +6379,20 @@ mod tests {
             path_with_nh(src2, 2, Arc::new(vec![community_attr(0xffff_0006)])),
         ]);
         assert_eq!(change.ecmp_paths().len(), 1);
+    }
+
+    #[test]
+    fn ecmp_paths_includes_gr_stale_path() {
+        // The GR stale state is not used in best-path selection, so a GR
+        // stale path stays an ECMP member.
+        let src1 = source(1, 65000, 65000, 1);
+        let src2 = source(2, 65000, 65000, 2);
+        src2.mark_stale();
+        let change = make_nlri_change(vec![
+            path_with_nh(src1, 1, empty_attrs()),
+            path_with_nh(src2, 2, empty_attrs()),
+        ]);
+        assert_eq!(change.ecmp_paths().len(), 2);
     }
 
     #[test]
