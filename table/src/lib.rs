@@ -429,8 +429,10 @@ impl<'a> NewEntry<'a> {
 /// 6. Lower ORIGIN.
 /// 7. eBGP over iBGP. A confederation eBGP peer counts as iBGP.
 /// 8. Not GR stale.
-/// 9. Shorter CLUSTER_LIST.
-/// 10. Lower ORIGINATOR_ID, or BGP Identifier of the peer when absent.
+/// 9. Lower ORIGINATOR_ID, or BGP Identifier of the peer when absent.
+/// 10. Shorter CLUSTER_LIST. RFC 4456 section 9: "In addition, the
+///     following rule SHOULD be inserted between Steps f) and g): a BGP
+///     Speaker SHOULD prefer a route with the shorter CLUSTER_LIST length."
 fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::cmp::Ordering {
     let a = new.entry;
     let b = other;
@@ -475,13 +477,12 @@ fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::c
     if ord.is_ne() {
         return ord;
     }
-    let ord = new
-        .cluster_list_len()
-        .cmp(&attr_cluster_list_len(&b.path.attr));
+    let ord = new.router_id().cmp(&path_router_id(&b.path));
     if ord.is_ne() {
         return ord;
     }
-    new.router_id().cmp(&path_router_id(&b.path))
+    new.cluster_list_len()
+        .cmp(&attr_cluster_list_len(&b.path.attr))
 }
 
 /// Bitmap-based allocator for per-Rib destination IDs.
@@ -2955,9 +2956,10 @@ mod tests {
             None,
             0u32,
         );
-        // One hop in CLUSTER_LIST — shorter wins
+        // One hop in CLUSTER_LIST - shorter wins. Same router ID, so
+        // CLUSTER_LIST decides.
         let update = rt.insert(
-            source(2, 65001, 65000, 2),
+            source(2, 65001, 65000, 1),
             Family::IPV4,
             net.clone(),
             0,
@@ -2974,6 +2976,45 @@ mod tests {
         assert_eq!(
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    #[test]
+    fn best_path_router_id_compared_before_cluster_list() {
+        let mut rt = Table::new(0);
+        let net = nlri(10, 0, 0, 0, 24);
+        // Lower router ID but longer CLUSTER_LIST: wins, because the router
+        // ID is compared first.
+        rt.insert(
+            source(1, 65001, 65000, 1),
+            Family::IPV4,
+            net.clone(),
+            0,
+            nh(),
+            attrs_with_cluster_list(&[1, 2]),
+            None,
+            false,
+            false,
+            None,
+            0u32,
+        );
+        rt.insert(
+            source(2, 65001, 65000, 2),
+            Family::IPV4,
+            net.clone(),
+            0,
+            nh(),
+            attrs_with_cluster_list(&[1]),
+            None,
+            false,
+            false,
+            None,
+            0u32,
+        );
+        let best = flat_best(&rt, &Family::IPV4);
+        assert_eq!(
+            best[0].1.source.remote_addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
         );
     }
 
@@ -2995,9 +3036,10 @@ mod tests {
             None,
             0u32,
         );
-        // No CLUSTER_LIST (length 0) — wins
+        // No CLUSTER_LIST (length 0) - wins. Same router ID, so
+        // CLUSTER_LIST decides.
         let update = rt.insert(
-            source(2, 65001, 65000, 2),
+            source(2, 65001, 65000, 1),
             Family::IPV4,
             net.clone(),
             0,
