@@ -204,6 +204,9 @@ pub struct SelectionOptions {
     /// Compare MULTI_EXIT_DISC also between paths from different
     /// neighbor ASes.
     pub always_compare_med: bool,
+    /// Compare the BGP Identifier also between eBGP paths, instead of
+    /// keeping the current best path (RFC 5004).
+    pub external_compare_router_id: bool,
 }
 
 impl SelectionOptions {
@@ -460,7 +463,8 @@ impl<'a> NewEntry<'a> {
 
 /// Compares the entry being inserted with `other`, an entry already in the
 /// destination. Less means that `new` is preferred. `evpn_type2` is true for
-/// an EVPN MAC/IP Advertisement route.
+/// an EVPN MAC/IP Advertisement route. `best` is the local path ID of the
+/// best path before the change.
 ///
 /// Steps, in order:
 /// 1. Eligible entries (see `RibEntry::is_eligible()`) first.
@@ -478,13 +482,24 @@ impl<'a> NewEntry<'a> {
 ///    same neighboring AS (the neighboring AS is determined from the
 ///    AS_PATH attribute)."
 /// 8. eBGP over iBGP. A confederation eBGP peer counts as iBGP.
-/// 9. Lower ORIGINATOR_ID, or BGP Identifier of the peer when absent.
-/// 10. Shorter CLUSTER_LIST. RFC 4456 section 9: "In addition, the
+/// 9. The best path, when both paths are from eBGP peers with different
+///    BGP Identifiers, unless `external_compare_router_id` is set. RFC 5004
+///    section 3: "When comparing all the paths in route selection, if
+///    neither Path A nor Path B is eliminated by the route selection
+///    algorithm prior to Step f) -- BGP identifier comparison (Section
+///    9.1.2.2, [BGP]) -- we propose that the existing best path (Path A) be
+///    kept as the best path (thus avoiding switching the best path to Path
+///    B)." A confederation eBGP peer counts as iBGP here too: "This
+///    algorithm SHOULD NOT be applied when either path is from a BGP
+///    Confederation peer." A path that replaces the best path keeps its
+///    local path ID, so it stays the best path.
+/// 10. Lower ORIGINATOR_ID, or BGP Identifier of the peer when absent.
+/// 11. Shorter CLUSTER_LIST. RFC 4456 section 9: "In addition, the
 ///     following rule SHOULD be inserted between Steps f) and g): a BGP
 ///     Speaker SHOULD prefer a route with the shorter CLUSTER_LIST length."
-/// 11. Lower peer address. RFC 4271 section 9.1.2.2 g): "Prefer the route
+/// 12. Lower peer address. RFC 4271 section 9.1.2.2 g): "Prefer the route
 ///     received from the lowest peer address."
-/// 12. Lower Add-Path path ID, for paths from the same peer.
+/// 13. Lower Add-Path path ID, for paths from the same peer.
 ///
 /// Step 7 is not transitive, so the order can depend on the order of
 /// arrival. For example, A and B are from AS 1 and B has the lower MED, and
@@ -503,6 +518,7 @@ fn compare(
     other: &RibEntry,
     evpn_type2: bool,
     opts: SelectionOptions,
+    best: Option<u32>,
 ) -> std::cmp::Ordering {
     let a = new.entry;
     let b = other;
@@ -548,6 +564,19 @@ fn compare(
         .cmp(&a.path.source.role.prefers_over_ibgp());
     if ord.is_ne() {
         return ord;
+    }
+    if let Some(best) = best
+        && !opts.external_compare_router_id
+        && a.path.source.role.prefers_over_ibgp()
+        && b.path.source.role.prefers_over_ibgp()
+        && a.path.source.router_id != b.path.source.router_id
+    {
+        if a.path.local_path_id == best {
+            return std::cmp::Ordering::Less;
+        }
+        if b.path.local_path_id == best {
+            return std::cmp::Ordering::Greater;
+        }
     }
     let ord = new.router_id().cmp(&path_router_id(&b.path));
     if ord.is_ne() {
@@ -674,12 +703,19 @@ impl Destination {
 
     /// Inserts `entry` before the first entry that it is preferred over (see
     /// `compare()`), or at the end. The entries stay ordered best first.
-    fn insert_ordered(&mut self, entry: RibEntry, evpn_type2: bool, opts: SelectionOptions) {
+    /// `best` is the local path ID of the best path before the change.
+    fn insert_ordered(
+        &mut self,
+        entry: RibEntry,
+        evpn_type2: bool,
+        opts: SelectionOptions,
+        best: Option<u32>,
+    ) {
         let mut new = NewEntry::new(&entry);
         let idx = self
             .entry
             .iter()
-            .position(|e| compare(&mut new, e, evpn_type2, opts).is_lt())
+            .position(|e| compare(&mut new, e, evpn_type2, opts, best).is_lt())
             .unwrap_or(self.entry.len());
         self.entry.insert(idx, entry);
     }
@@ -693,9 +729,10 @@ impl Destination {
         opts: SelectionOptions,
         mut pred: impl FnMut(&RibEntry) -> bool,
     ) {
+        let best = self.unfiltered_best().map(|e| e.path.local_path_id);
         let moved: Vec<RibEntry> = self.entry.extract_if(.., |e| pred(e)).collect();
         for e in moved {
-            self.insert_ordered(e, evpn_type2, opts);
+            self.insert_ordered(e, evpn_type2, opts, best);
         }
     }
 }
@@ -1377,6 +1414,9 @@ impl Table {
             .entry(net.clone())
             .or_insert_with(|| Destination::with_id(id_alloc.alloc()));
 
+        // Used by the RFC 5004 step of compare().
+        let old_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
+
         // Capture the current best's (source, attr, nexthop) before any modification.
         // Comparing it with the post-insertion best detects all best-path changes:
         // new path wins, old best replaced (same local_path_id, new attrs), or
@@ -1474,7 +1514,12 @@ impl Table {
             }
         }
 
-        dst.insert_ordered(entry, is_evpn_type2(&net), self.selection_options);
+        dst.insert_ordered(
+            entry,
+            is_evpn_type2(&net),
+            self.selection_options,
+            old_best_id,
+        );
 
         // During Restarting Speaker deferral, routes are accumulated but
         // best-path changes are suppressed; end_deferral() emits them all at once.
@@ -2975,7 +3020,7 @@ mod tests {
         let net = nlri(10, 0, 0, 0, 24);
         // router_id=10
         rt.insert(
-            source(1, 65001, 65000, 10),
+            source(1, 65000, 65000, 10),
             Family::IPV4,
             net.clone(),
             0,
@@ -2989,7 +3034,7 @@ mod tests {
         );
         // router_id=5 (lower wins)
         let update = rt.insert(
-            source(2, 65002, 65000, 5),
+            source(2, 65000, 65000, 5),
             Family::IPV4,
             net.clone(),
             0,
@@ -3152,7 +3197,7 @@ mod tests {
 
     /// Inserts one path from each of `paths` into a new table, in order, and
     /// returns the remote addresses in the order of the destination.
-    fn med_order(
+    fn insert_order(
         opts: SelectionOptions,
         paths: &[(&Arc<Source>, Arc<Vec<packet::Attribute>>)],
     ) -> Vec<IpAddr> {
@@ -3189,7 +3234,7 @@ mod tests {
             [(&s2, a2.clone()), (&s1, a1.clone())],
         ] {
             assert_eq!(
-                med_order(SelectionOptions::default(), &order),
+                insert_order(SelectionOptions::default(), &order),
                 vec![s2.remote_addr, s1.remote_addr]
             );
         }
@@ -3204,7 +3249,7 @@ mod tests {
             (&s2, attrs_with_med(Some(65001), None)),
         ];
         assert_eq!(
-            med_order(SelectionOptions::default(), &order),
+            insert_order(SelectionOptions::default(), &order),
             vec![s2.remote_addr, s1.remote_addr]
         );
     }
@@ -3220,7 +3265,7 @@ mod tests {
             (&s2, attrs_with_med(None, Some(10))),
         ];
         assert_eq!(
-            med_order(SelectionOptions::default(), &order),
+            insert_order(SelectionOptions::default(), &order),
             vec![s2.remote_addr, s1.remote_addr]
         );
     }
@@ -3236,14 +3281,15 @@ mod tests {
             (&s2, attrs_with_med(Some(65002), Some(10))),
         ];
         assert_eq!(
-            med_order(SelectionOptions::default(), &order),
+            insert_order(SelectionOptions::default(), &order),
             vec![s1.remote_addr, s2.remote_addr]
         );
         let always = SelectionOptions {
             always_compare_med: true,
+            ..Default::default()
         };
         assert_eq!(
-            med_order(always, &order),
+            insert_order(always, &order),
             vec![s2.remote_addr, s1.remote_addr]
         );
     }
@@ -3259,7 +3305,83 @@ mod tests {
         a2.push(packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap());
         let order = [(&s2, Arc::new(a2)), (&s1, Arc::new(a1))];
         assert_eq!(
-            med_order(SelectionOptions::default(), &order),
+            insert_order(SelectionOptions::default(), &order),
+            vec![s1.remote_addr, s2.remote_addr]
+        );
+    }
+
+    #[test]
+    fn rfc5004_keeps_current_ebgp_best() {
+        // s2 has the lower router ID but arrives later.
+        let s1 = source(1, 65001, 65000, 10);
+        let s2 = source(2, 65002, 65000, 5);
+        let s3 = source(3, 65003, 65000, 7);
+        let order = [
+            (&s1, empty_attrs()),
+            (&s2, empty_attrs()),
+            (&s3, empty_attrs()),
+        ];
+        // The paths that are not the best are ordered by router ID.
+        assert_eq!(
+            insert_order(SelectionOptions::default(), &order),
+            vec![s1.remote_addr, s2.remote_addr, s3.remote_addr]
+        );
+        let opts = SelectionOptions {
+            external_compare_router_id: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            insert_order(opts, &order),
+            vec![s2.remote_addr, s3.remote_addr, s1.remote_addr]
+        );
+    }
+
+    #[test]
+    fn rfc5004_not_applied_for_same_bgp_identifier() {
+        // Parallel sessions to the same speaker: the lower peer address
+        // wins.
+        let s1 = source(2, 65001, 65000, 7);
+        let s2 = source(1, 65001, 65000, 7);
+        let order = [(&s1, empty_attrs()), (&s2, empty_attrs())];
+        assert_eq!(
+            insert_order(SelectionOptions::default(), &order),
+            vec![s2.remote_addr, s1.remote_addr]
+        );
+    }
+
+    #[test]
+    fn rfc5004_not_applied_for_confed_peer() {
+        let confed = |addr: u8, router_id: u8| {
+            Arc::new(Source::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, addr)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
+                65001,
+                65000,
+                Ipv4Addr::new(0, 0, 0, router_id),
+                PeerRole::ConfedEbgp,
+            ))
+        };
+        let s1 = confed(1, 10);
+        let s2 = confed(2, 5);
+        let order = [(&s1, empty_attrs()), (&s2, empty_attrs())];
+        assert_eq!(
+            insert_order(SelectionOptions::default(), &order),
+            vec![s2.remote_addr, s1.remote_addr]
+        );
+    }
+
+    #[test]
+    fn rfc5004_replaced_best_stays_best() {
+        let s1 = source(1, 65001, 65000, 10);
+        let s2 = source(2, 65002, 65000, 5);
+        // s1 sends the path again with other attributes.
+        let order = [
+            (&s1, empty_attrs()),
+            (&s2, empty_attrs()),
+            (&s1, Arc::new(vec![community_attr(0x0001_0001)])),
+        ];
+        assert_eq!(
+            insert_order(SelectionOptions::default(), &order),
             vec![s1.remote_addr, s2.remote_addr]
         );
     }
@@ -3430,7 +3552,7 @@ mod tests {
         let net = nlri(10, 0, 0, 0, 24);
         // Same CLUSTER_LIST length (1), higher ORIGINATOR_ID
         rt.insert(
-            source(1, 65001, 65000, 1),
+            source(1, 65000, 65000, 1),
             Family::IPV4,
             net.clone(),
             0,
@@ -3454,7 +3576,7 @@ mod tests {
         );
         // Same CLUSTER_LIST length (1), lower ORIGINATOR_ID — wins
         let update = rt.insert(
-            source(2, 65001, 65000, 2),
+            source(2, 65000, 65000, 2),
             Family::IPV4,
             net.clone(),
             0,
@@ -4896,8 +5018,8 @@ mod tests {
         // Inserting a new best should update best and current_paths correctly.
         let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
-        let s1 = source(1, 65001, 65000, 10); // router_id=10
-        let s2 = source(2, 65002, 65000, 5); // router_id=5, better
+        let s1 = source(1, 65000, 65000, 10); // router_id=10
+        let s2 = source(2, 65000, 65000, 5); // router_id=5, better
 
         // Insert s1 → best, local_path_id=1
         let update = rt.insert(
@@ -6653,7 +6775,8 @@ mod tests {
         );
         assert_eq!(
             addrs(SelectionOptions {
-                always_compare_med: true
+                always_compare_med: true,
+                ..Default::default()
             }),
             vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]
         );

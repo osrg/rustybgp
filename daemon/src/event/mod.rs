@@ -935,13 +935,15 @@ impl Global {
             });
         }
 
+        let o = config
+            .global
+            .as_ref()
+            .and_then(|g| g.route_selection_options.as_ref())
+            .and_then(|o| o.config.as_ref());
         tables.set_selection_options(table::SelectionOptions {
-            always_compare_med: config
-                .global
-                .as_ref()
-                .and_then(|g| g.route_selection_options.as_ref())
-                .and_then(|o| o.config.as_ref())
-                .and_then(|c| c.always_compare_med)
+            always_compare_med: o.and_then(|c| c.always_compare_med).unwrap_or(false),
+            external_compare_router_id: o
+                .and_then(|c| c.external_compare_router_id)
                 .unwrap_or(false),
         });
 
@@ -13208,7 +13210,7 @@ port = 3323
     }
 
     #[test]
-    fn apply_config_sets_always_compare_med() {
+    fn apply_config_sets_selection_options() {
         let mut g = bare_global();
         let tables = make_tables();
         let mut c = port_config(Some(-1));
@@ -13216,16 +13218,19 @@ port = 3323
             Some(config::generate::RouteSelectionOptions {
                 config: Some(config::generate::RouteSelectionOptionsConfig {
                     always_compare_med: Some(true),
+                    external_compare_router_id: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()
             });
         g.apply_config(tables.clone(), &c).unwrap();
-        assert!(tables.selection_options().always_compare_med);
+        let opts = tables.selection_options();
+        assert!(opts.always_compare_med);
+        assert!(opts.external_compare_router_id);
     }
 
     #[tokio::test]
-    async fn start_bgp_sets_always_compare_med() {
+    async fn start_bgp_sets_selection_options() {
         let svc = make_unstarted_grpc_service();
         let mut req = start_bgp_req(-1);
         req.get_mut()
@@ -13234,6 +13239,7 @@ port = 3323
             .unwrap()
             .route_selection_options = Some(api::RouteSelectionOptionsConfig {
             always_compare_med: true,
+            external_compare_router_id: true,
             ..Default::default()
         });
         svc.start_bgp(req).await.unwrap();
@@ -13241,14 +13247,14 @@ port = 3323
             .get_bgp(tonic::Request::new(api::GetBgpRequest {}))
             .await
             .unwrap();
-        assert!(
-            rsp.into_inner()
-                .global
-                .unwrap()
-                .route_selection_options
-                .unwrap()
-                .always_compare_med
-        );
+        let o = rsp
+            .into_inner()
+            .global
+            .unwrap()
+            .route_selection_options
+            .unwrap();
+        assert!(o.always_compare_med);
+        assert!(o.external_compare_router_id);
     }
 
     // --- start_bgp (gRPC) listen-port tests ---

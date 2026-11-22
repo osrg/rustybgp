@@ -13,7 +13,8 @@
 #   bmp-receiver:  172.30.20.10
 #
 # peer-a announces: 10.1.0.0/24 and 10.2.0.0/24
-# peer-b announces: 10.1.0.0/24 (duplicate; peer-a wins via lower router-id 172.30.20.2 < 172.30.20.3)
+# peer-b announces: 10.1.0.0/24 (duplicate; peer-a wins via lower router-id 172.30.20.2 < 172.30.20.3,
+#   external-compare-router-id is set)
 # BMP policy: local-rib, added via gobgp CLI after BGP convergence
 #
 # Test scenarios:

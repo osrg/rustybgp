@@ -2,6 +2,11 @@ global:
   config:
     as: 65001
     router-id: "172.30.20.1"
+  # Both peers are eBGP. Without this, the path that arrives first stays
+  # the best path (RFC 5004), and the test cannot know which one it is.
+  route-selection-options:
+    config:
+      external-compare-router-id: true
 
 neighbors:
   - config:

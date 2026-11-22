@@ -1085,10 +1085,10 @@ impl GoBgpService for GrpcService {
                 members: c.member_as_list.into_iter().collect(),
             });
         }
+        let o = g.route_selection_options.unwrap_or_default();
         self.tables.set_selection_options(table::SelectionOptions {
-            always_compare_med: g
-                .route_selection_options
-                .is_some_and(|o| o.always_compare_med),
+            always_compare_med: o.always_compare_med,
+            external_compare_router_id: o.external_compare_router_id,
         });
         self.init.notify_one();
 
@@ -1182,6 +1182,7 @@ impl GoBgpService for GrpcService {
         let opts = self.tables.selection_options();
         global.route_selection_options = Some(api::RouteSelectionOptionsConfig {
             always_compare_med: opts.always_compare_med,
+            external_compare_router_id: opts.external_compare_router_id,
             ..Default::default()
         });
 
