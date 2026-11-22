@@ -433,6 +433,12 @@ impl<'a> NewEntry<'a> {
 /// 10. Shorter CLUSTER_LIST. RFC 4456 section 9: "In addition, the
 ///     following rule SHOULD be inserted between Steps f) and g): a BGP
 ///     Speaker SHOULD prefer a route with the shorter CLUSTER_LIST length."
+/// 11. Lower peer address. RFC 4271 section 9.1.2.2 g): "Prefer the route
+///     received from the lowest peer address."
+/// 12. Lower Add-Path path ID, for paths from the same peer.
+///
+/// An entry is identified by its peer address and path ID, so two
+/// different entries never compare Equal.
 fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::cmp::Ordering {
     let a = new.entry;
     let b = other;
@@ -481,8 +487,17 @@ fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::c
     if ord.is_ne() {
         return ord;
     }
-    new.cluster_list_len()
-        .cmp(&attr_cluster_list_len(&b.path.attr))
+    let ord = new
+        .cluster_list_len()
+        .cmp(&attr_cluster_list_len(&b.path.attr));
+    if ord.is_ne() {
+        return ord;
+    }
+    let ord = a.path.source.remote_addr.cmp(&b.path.source.remote_addr);
+    if ord.is_ne() {
+        return ord;
+    }
+    a.remote_path_id.cmp(&b.remote_path_id)
 }
 
 /// Bitmap-based allocator for per-Rib destination IDs.
@@ -2977,6 +2992,79 @@ mod tests {
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
         );
+    }
+
+    /// CLUSTER_LIST of length 1 and the given ORIGINATOR_ID.
+    fn attrs_reflected(originator_id: Ipv4Addr) -> Arc<Vec<packet::Attribute>> {
+        let mut attrs = (*attrs_with_cluster_list(&[1])).clone();
+        attrs.push(
+            packet::Attribute::new_with_value(
+                packet::Attribute::ORIGINATOR_ID,
+                u32::from(originator_id),
+            )
+            .unwrap(),
+        );
+        Arc::new(attrs)
+    }
+
+    #[test]
+    fn best_path_lowest_peer_address_breaks_tie() {
+        // Two route reflectors send the same client route: same
+        // ORIGINATOR_ID and CLUSTER_LIST length. The lower peer address wins,
+        // whatever the order of arrival.
+        let rr1 = source(1, 65000, 65000, 1);
+        let rr2 = source(2, 65000, 65000, 2);
+        let originator = Ipv4Addr::new(192, 0, 2, 9);
+        for order in [[&rr2, &rr1], [&rr1, &rr2]] {
+            let mut rt = Table::new(0);
+            let net = nlri(10, 0, 0, 0, 24);
+            for src in order {
+                rt.insert(
+                    src.clone(),
+                    Family::IPV4,
+                    net.clone(),
+                    0,
+                    nh(),
+                    attrs_reflected(originator),
+                    None,
+                    false,
+                    false,
+                    None,
+                    0u32,
+                );
+            }
+            assert_eq!(
+                entry_order(&rt, &net),
+                vec![rr1.remote_addr, rr2.remote_addr]
+            );
+        }
+    }
+
+    #[test]
+    fn best_path_lowest_path_id_breaks_tie_for_same_peer() {
+        let mut rt = Table::new(0);
+        let net = nlri(10, 0, 0, 0, 24);
+        let s = source(1, 65001, 65000, 1);
+        for remote_path_id in [2, 1] {
+            rt.insert(
+                s.clone(),
+                Family::IPV4,
+                net.clone(),
+                remote_path_id,
+                nh(),
+                empty_attrs(),
+                None,
+                false,
+                false,
+                None,
+                0u32,
+            );
+        }
+        let ids: Vec<u32> = rt
+            .destinations(TableQuery::Global, Family::IPV4, vec![], true)
+            .flat_map(|d| d.paths.into_iter().map(|p| p.remote_path_id))
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]
