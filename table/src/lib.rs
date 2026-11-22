@@ -198,63 +198,48 @@ pub struct RpkiValidation {
     pub unmatched_length: Vec<(packet::IpNet, Roa)>,
 }
 
-struct PathAttribute {
-    attr: Arc<Vec<Attribute>>,
+// Readers for the path attribute values used by best-path selection.
+
+fn find_attr(attr: &[Attribute], code: u8) -> Option<&Attribute> {
+    attr.iter().find(|a| a.code() == code)
 }
 
-impl PathAttribute {
-    fn new(attr: Arc<Vec<packet::Attribute>>) -> Self {
-        PathAttribute { attr }
-    }
+fn attr_local_pref(attr: &[Attribute]) -> u32 {
+    find_attr(attr, Attribute::LOCAL_PREF)
+        .map_or(Attribute::DEFAULT_LOCAL_PREF, |a| a.value().unwrap())
+}
 
-    fn attr_local_preference(&self) -> u32 {
-        match self
-            .attr
-            .iter()
-            .find(|a| a.code() == packet::Attribute::LOCAL_PREF)
-        {
-            Some(attr) => attr.value().unwrap(),
-            None => packet::Attribute::DEFAULT_LOCAL_PREF,
-        }
-    }
+fn attr_as_path_len(attr: &[Attribute]) -> usize {
+    find_attr(attr, Attribute::AS_PATH).map_or(0, |a| a.as_path_length())
+}
 
-    fn attr_origin(&self) -> u8 {
-        match self
-            .attr
-            .iter()
-            .find(|a| a.code() == packet::Attribute::ORIGIN)
-        {
-            Some(attr) => attr.value().unwrap() as u8,
-            None => packet::Attribute::ORIGIN_INCOMPLETE,
-        }
-    }
+fn attr_origin(attr: &[Attribute]) -> u8 {
+    find_attr(attr, Attribute::ORIGIN)
+        .map_or(Attribute::ORIGIN_INCOMPLETE, |a| a.value().unwrap() as u8)
+}
 
-    fn attr_originator_id(&self) -> Option<u32> {
-        self.attr
-            .iter()
-            .find(|a| a.code() == packet::Attribute::ORIGINATOR_ID)
-            .map(|attr| attr.value().unwrap())
-    }
+fn attr_cluster_list_len(attr: &[Attribute]) -> usize {
+    find_attr(attr, Attribute::CLUSTER_LIST)
+        .and_then(|a| a.binary())
+        .map_or(0, |b| b.len() / 4)
+}
 
-    fn attr_cluster_list_length(&self) -> usize {
-        self.attr
-            .iter()
-            .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
-            .and_then(|a| a.binary())
-            .map(|b| b.len() / 4)
-            .unwrap_or(0)
-    }
+/// ORIGINATOR_ID, or the BGP Identifier of the peer when it is absent.
+fn path_router_id(path: &Path) -> u32 {
+    find_attr(&path.attr, Attribute::ORIGINATOR_ID)
+        .map_or(path.source.router_id, |a| a.value().unwrap())
+}
 
-    fn attr_as_path_length(&self) -> usize {
-        match self
-            .attr
-            .iter()
-            .find(|a| a.code() == packet::Attribute::AS_PATH)
-        {
-            Some(attr) => attr.as_path_length(),
-            None => 0,
-        }
-    }
+/// Sequence number of the MAC Mobility extended community, if present.
+fn mac_mobility_seq(attr: &[Attribute]) -> Option<u32> {
+    packet::evpn::mac_mobility(attr).map(|(seq, _)| seq)
+}
+
+fn is_evpn_type2(net: &packet::Nlri) -> bool {
+    matches!(
+        net,
+        packet::Nlri::Evpn(packet::evpn::EvpnNlri::MacIpAdvertisement(_))
+    )
 }
 
 /// A path snapshot shared outside the table crate.
@@ -324,6 +309,9 @@ const _: () = assert!(std::mem::size_of::<RibEntry>() <= 80);
 impl RibEntry {
     const FLAG_FILTERED: u8 = 1 << 0;
     const FLAG_NEXTHOP_INVALID: u8 = 1 << 1;
+    /// The attributes carry the LLGR_STALE community. The attributes of an
+    /// entry never change, so this is checked once when the entry is made.
+    const FLAG_LLGR_STALE_COMMUNITY: u8 = 1 << 2;
 
     fn is_filtered(&self) -> bool {
         self.flags & RibEntry::FLAG_FILTERED != 0
@@ -331,6 +319,12 @@ impl RibEntry {
 
     fn is_nexthop_invalid(&self) -> bool {
         self.flags & RibEntry::FLAG_NEXTHOP_INVALID != 0
+    }
+
+    /// Filtered entries and entries with an unreachable nexthop are not
+    /// candidates for best-path selection.
+    fn is_eligible(&self) -> bool {
+        self.flags & (RibEntry::FLAG_FILTERED | RibEntry::FLAG_NEXTHOP_INVALID) == 0
     }
 
     fn set_nexthop_invalid(&mut self, invalid: bool) {
@@ -345,109 +339,148 @@ impl RibEntry {
     /// marked LLGR stale by the helper, or the received attributes carry the
     /// LLGR_STALE community (0xFFFF0006) propagated from another helper.
     fn is_llgr_stale(&self) -> bool {
-        self.path.source.is_llgr_stale() || has_llgr_stale_community(&self.path.attr)
-    }
-
-    fn originator_id(&self) -> u32 {
-        PathAttribute::new(self.path.attr.clone())
-            .attr_originator_id()
-            .unwrap_or(self.path.source.router_id)
+        self.path.source.is_llgr_stale() || self.flags & RibEntry::FLAG_LLGR_STALE_COMMUNITY != 0
     }
 }
 
-/// Compare two EVPN Type-2 (MAC/IP Advertisement) RibEntries.
+/// The entry being inserted into a destination.
 ///
-/// MAC Mobility extended community (type=0x06, subtype=0x00) takes priority
-/// over the standard BGP best-path algorithm: the entry with the higher
-/// sequence number wins regardless of other attributes.  When one entry
-/// carries the community and the other does not, the one with mobility wins
-/// (it represents a more recent MAC move).  Equal or absent mobility falls
-/// through to the standard RibEntry ordering.
-/// Compare two EVPN Type-2 (MAC/IP Advertisement) RibEntries.
-///
-/// MAC Mobility extended community (type=0x06, subtype=0x00) takes priority
-/// over the standard BGP best-path algorithm: the entry with the higher
-/// sequence number wins regardless of other attributes.  When one entry
-/// carries the community and the other does not, the one with mobility wins
-/// (it represents a more recent MAC move).  Equal or absent mobility falls
-/// through to the standard RibEntry ordering.
-///
-/// Ordering follows the same convention as RibEntry::Ord: Less means "self
-/// is better" (sorts first in the destination list).
-fn evpn_type2_cmp(a: &RibEntry, b: &RibEntry) -> std::cmp::Ordering {
-    let a_mm = packet::evpn::mac_mobility(a.path.attr.as_ref());
-    let b_mm = packet::evpn::mac_mobility(b.path.attr.as_ref());
-    match (a_mm, b_mm) {
-        (Some((a_seq, _)), Some((b_seq, _))) => {
-            // Higher sequence is better; reverse so that a better entry sorts as Less.
-            a_seq.cmp(&b_seq).reverse().then_with(|| a.cmp(b))
+/// It is compared with each entry it passes on the way to its position. So
+/// each of its values is read from the attributes only when a comparison
+/// first needs it, and then kept. The values of the other entry are read
+/// when needed and not kept.
+struct NewEntry<'a> {
+    entry: &'a RibEntry,
+    mac_mobility: Option<Option<u32>>,
+    local_pref: Option<u32>,
+    as_path_len: Option<usize>,
+    origin: Option<u8>,
+    cluster_list_len: Option<usize>,
+    router_id: Option<u32>,
+}
+
+impl<'a> NewEntry<'a> {
+    fn new(entry: &'a RibEntry) -> Self {
+        NewEntry {
+            entry,
+            mac_mobility: None,
+            local_pref: None,
+            as_path_len: None,
+            origin: None,
+            cluster_list_len: None,
+            router_id: None,
         }
-        // Entry with MAC Mobility is a more recent advertisement and wins.
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.cmp(b),
+    }
+
+    fn mac_mobility(&mut self) -> Option<u32> {
+        let e = self.entry;
+        *self
+            .mac_mobility
+            .get_or_insert_with(|| mac_mobility_seq(&e.path.attr))
+    }
+
+    fn local_pref(&mut self) -> u32 {
+        let e = self.entry;
+        *self
+            .local_pref
+            .get_or_insert_with(|| attr_local_pref(&e.path.attr))
+    }
+
+    fn as_path_len(&mut self) -> usize {
+        let e = self.entry;
+        *self
+            .as_path_len
+            .get_or_insert_with(|| attr_as_path_len(&e.path.attr))
+    }
+
+    fn origin(&mut self) -> u8 {
+        let e = self.entry;
+        *self.origin.get_or_insert_with(|| attr_origin(&e.path.attr))
+    }
+
+    fn cluster_list_len(&mut self) -> usize {
+        let e = self.entry;
+        *self
+            .cluster_list_len
+            .get_or_insert_with(|| attr_cluster_list_len(&e.path.attr))
+    }
+
+    fn router_id(&mut self) -> u32 {
+        let e = self.entry;
+        *self
+            .router_id
+            .get_or_insert_with(|| path_router_id(&e.path))
     }
 }
 
-impl Ord for RibEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let self_pa = PathAttribute::new(self.path.attr.clone());
-        let other_pa = PathAttribute::new(other.path.attr.clone());
-        // Higher LOCAL_PREF is better (reverse order)
-        self_pa
-            .attr_local_preference()
-            .cmp(&other_pa.attr_local_preference())
-            .reverse()
-            // Shorter AS path is better
-            .then_with(|| {
-                self_pa
-                    .attr_as_path_length()
-                    .cmp(&other_pa.attr_as_path_length())
-            })
-            // Lower origin is better (IGP=0 < EGP=1 < Incomplete=2)
-            .then_with(|| self_pa.attr_origin().cmp(&other_pa.attr_origin()))
-            // eBGP preferred over iBGP (ConfedEbgp treated as iBGP per RFC 5065 §9)
-            .then_with(|| {
-                other
-                    .path
-                    .source
-                    .role
-                    .prefers_over_ibgp()
-                    .cmp(&self.path.source.role.prefers_over_ibgp())
-            })
-            // Non-stale is better than stale (false < true, and Less = better here)
-            .then_with(|| {
-                self.path
-                    .source
-                    .is_stale()
-                    .cmp(&other.path.source.is_stale())
-            })
-            // LLGR stale is worse than GR stale (RFC 9494)
-            .then_with(|| self.is_llgr_stale().cmp(&other.is_llgr_stale()))
-            // Shorter CLUSTER_LIST is better (RFC 4456 s9)
-            .then_with(|| {
-                self_pa
-                    .attr_cluster_list_length()
-                    .cmp(&other_pa.attr_cluster_list_length())
-            })
-            // Lower originator ID / router ID is better (RFC 4456 s9)
-            .then_with(|| self.originator_id().cmp(&other.originator_id()))
-    }
-}
+/// Compares the entry being inserted with `other`, an entry already in the
+/// destination. Less means that `new` is preferred. `evpn_type2` is true for
+/// an EVPN MAC/IP Advertisement route.
+///
+/// Steps, in order:
+/// 1. Eligible entries (see `RibEntry::is_eligible()`) first.
+/// 2. EVPN MAC/IP Advertisement routes only: a higher MAC Mobility sequence
+///    number. A route with MAC Mobility is preferred over one without.
+/// 3. Higher LOCAL_PREF.
+/// 4. Shorter AS_PATH.
+/// 5. Lower ORIGIN.
+/// 6. eBGP over iBGP. A confederation eBGP peer counts as iBGP.
+/// 7. Not GR stale.
+/// 8. Not LLGR stale.
+/// 9. Shorter CLUSTER_LIST.
+/// 10. Lower ORIGINATOR_ID, or BGP Identifier of the peer when absent.
+fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::cmp::Ordering {
+    let a = new.entry;
+    let b = other;
 
-impl PartialOrd for RibEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+    let ord = b.is_eligible().cmp(&a.is_eligible());
+    if ord.is_ne() {
+        return ord;
     }
-}
-
-impl PartialEq for RibEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
+    if evpn_type2 {
+        // None < Some, so a route with MAC Mobility comes first.
+        let ord = mac_mobility_seq(&b.path.attr).cmp(&new.mac_mobility());
+        if ord.is_ne() {
+            return ord;
+        }
     }
+    let ord = attr_local_pref(&b.path.attr).cmp(&new.local_pref());
+    if ord.is_ne() {
+        return ord;
+    }
+    let ord = new.as_path_len().cmp(&attr_as_path_len(&b.path.attr));
+    if ord.is_ne() {
+        return ord;
+    }
+    let ord = new.origin().cmp(&attr_origin(&b.path.attr));
+    if ord.is_ne() {
+        return ord;
+    }
+    let ord = b
+        .path
+        .source
+        .role
+        .prefers_over_ibgp()
+        .cmp(&a.path.source.role.prefers_over_ibgp());
+    if ord.is_ne() {
+        return ord;
+    }
+    let ord = a.path.source.is_stale().cmp(&b.path.source.is_stale());
+    if ord.is_ne() {
+        return ord;
+    }
+    let ord = a.is_llgr_stale().cmp(&b.is_llgr_stale());
+    if ord.is_ne() {
+        return ord;
+    }
+    let ord = new
+        .cluster_list_len()
+        .cmp(&attr_cluster_list_len(&b.path.attr));
+    if ord.is_ne() {
+        return ord;
+    }
+    new.router_id().cmp(&path_router_id(&b.path))
 }
-
-impl Eq for RibEntry {}
 
 /// Bitmap-based allocator for per-Rib destination IDs.
 ///
@@ -553,6 +586,28 @@ impl Destination {
 
     fn unfiltered_best(&self) -> Option<&RibEntry> {
         self.unfiltered_iter().next()
+    }
+
+    /// Inserts `entry` before the first entry that it is preferred over (see
+    /// `compare()`), or at the end. The entries stay ordered best first.
+    fn insert_ordered(&mut self, entry: RibEntry, evpn_type2: bool) {
+        let mut new = NewEntry::new(&entry);
+        let idx = self
+            .entry
+            .iter()
+            .position(|e| compare(&mut new, e, evpn_type2).is_lt())
+            .unwrap_or(self.entry.len());
+        self.entry.insert(idx, entry);
+    }
+
+    /// Takes out the entries for which `pred` returns true and inserts them
+    /// again. Used after a change that can move entries in the order, such
+    /// as a change of the stale state or of the nexthop reachability.
+    fn reposition(&mut self, evpn_type2: bool, mut pred: impl FnMut(&RibEntry) -> bool) {
+        let moved: Vec<RibEntry> = self.entry.extract_if(.., |e| pred(e)).collect();
+        for e in moved {
+            self.insert_ordered(e, evpn_type2);
+        }
     }
 }
 
@@ -681,28 +736,20 @@ impl NlriChange {
         let Some(best) = self.current_paths.first() else {
             return vec![];
         };
-        let best_pa = PathAttribute::new(best.attr.clone());
-        let key = (
-            best_pa.attr_local_preference(),
-            best_pa.attr_as_path_length(),
-            best_pa.attr_origin(),
-            best.source.role.prefers_over_ibgp(),
-            best.source.is_stale(),
-            best_pa.attr_cluster_list_length(),
-        );
+        let key = |p: &Path| {
+            (
+                attr_local_pref(&p.attr),
+                attr_as_path_len(&p.attr),
+                attr_origin(&p.attr),
+                p.source.role.prefers_over_ibgp(),
+                p.source.is_stale(),
+                attr_cluster_list_len(&p.attr),
+            )
+        };
+        let best_key = key(best);
         self.current_paths
             .iter()
-            .take_while(|p| {
-                let pa = PathAttribute::new(p.attr.clone());
-                (
-                    pa.attr_local_preference(),
-                    pa.attr_as_path_length(),
-                    pa.attr_origin(),
-                    p.source.role.prefers_over_ibgp(),
-                    p.source.is_stale(),
-                    pa.attr_cluster_list_length(),
-                ) == key
-            })
+            .take_while(|p| key(p) == best_key)
             .collect()
     }
 }
@@ -1132,8 +1179,7 @@ impl Table {
     /// the originating peer actually sent, mirroring GoBGP's rsRib behaviour.
     fn rs_local_paths(dst: &Destination, peer: IpAddr) -> Vec<PathEntry> {
         // dst.entry is ordered best first, so the first candidate is the best
-        // one. This also keeps the EVPN Type-2 ordering, which RibEntry's Ord
-        // does not include.
+        // one.
         let best = dst.entry.iter().find(|e| {
             e.path.source.is_rs_client() && e.path.source.remote_addr != peer && !e.is_filtered()
         });
@@ -1210,6 +1256,11 @@ impl Table {
         let flags = if filtered { RibEntry::FLAG_FILTERED } else { 0 }
             | if nexthop_invalid {
                 RibEntry::FLAG_NEXTHOP_INVALID
+            } else {
+                0
+            }
+            | if has_llgr_stale_community(&attr) {
+                RibEntry::FLAG_LLGR_STALE_COMMUNITY
             } else {
                 0
             };
@@ -1323,16 +1374,7 @@ impl Table {
             }
         }
 
-        let idx = if matches!(
-            &net,
-            packet::Nlri::Evpn(packet::evpn::EvpnNlri::MacIpAdvertisement(_))
-        ) {
-            dst.entry
-                .partition_point(|a| evpn_type2_cmp(&entry, a).is_ge())
-        } else {
-            dst.entry.partition_point(|a| entry.cmp(a).is_ge())
-        };
-        dst.entry.insert(idx, entry);
+        dst.insert_ordered(entry, is_evpn_type2(&net));
 
         // During Restarting Speaker deferral, routes are accumulated but
         // best-path changes are suppressed; end_deferral() emits them all at once.
@@ -1819,6 +1861,11 @@ impl Table {
                 if !any_changed {
                     continue;
                 }
+                // Reachability is part of the order: entries with an
+                // unreachable nexthop are kept after the eligible ones.
+                dst.reposition(is_evpn_type2(net), |e| {
+                    e.path.nexthop.map(|nh| nh.addr()) == Some(addr)
+                });
 
                 // Phase 3: compute change after modification.
                 let new_best_key = dst
@@ -1869,7 +1916,7 @@ impl Table {
                         p.path.source.mark_stale();
                     }
                 }
-                dst.entry.sort_unstable();
+                dst.reposition(is_evpn_type2(net), |e| e.path.source.remote_addr == addr);
                 let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
                 let best_changed = old_best_id != new_best_id;
                 // Emit NlriChange when best changed (non-Add-Path) or any unfiltered
@@ -1922,7 +1969,7 @@ impl Table {
                         p.path.source.mark_llgr_stale();
                     }
                 }
-                dst.entry.sort_unstable();
+                dst.reposition(is_evpn_type2(net), |e| e.path.source.remote_addr == addr);
                 let new_best_id = dst.unfiltered_best().map(|e| e.path.local_path_id);
                 let best_changed = old_best_id != new_best_id;
                 if best_changed || any_unfiltered_from_addr {
@@ -2965,6 +3012,86 @@ mod tests {
             best.source.remote_addr,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
         );
+    }
+
+    /// Remote addresses of the paths of `net` in the order of the
+    /// destination, filtered paths included.
+    fn entry_order(rt: &Table, net: &packet::Nlri) -> Vec<IpAddr> {
+        rt.destinations(TableQuery::Global, Family::IPV4, vec![], true)
+            .find(|d| &d.net == net)
+            .map(|d| d.paths.iter().map(|p| p.source.remote_addr).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn ineligible_paths_are_kept_after_eligible_ones() {
+        let mut rt = Table::new(0);
+        let net = nlri(10, 0, 0, 0, 24);
+        let filtered = source(1, 65001, 65000, 1);
+        let accepted = source(2, 65002, 65000, 2);
+        // The filtered path has the higher LOCAL_PREF but must not come
+        // before the accepted one.
+        for (src, local_pref, is_filtered) in [(&filtered, 200, true), (&accepted, 100, false)] {
+            rt.insert(
+                src.clone(),
+                Family::IPV4,
+                net.clone(),
+                0,
+                nh(),
+                attrs_with_local_pref(local_pref),
+                None,
+                is_filtered,
+                false,
+                None,
+                0u32,
+            );
+        }
+        assert_eq!(
+            entry_order(&rt, &net),
+            vec![accepted.remote_addr, filtered.remote_addr]
+        );
+    }
+
+    #[test]
+    fn nexthop_reachability_change_repositions_paths() {
+        let mut rt = Table::new(0);
+        let net = nlri(10, 0, 0, 0, 24);
+        let a = source(1, 65001, 65000, 1);
+        let b = source(2, 65002, 65000, 2);
+        let c = source(3, 65003, 65000, 3);
+        let b_nexthop = Ipv4Addr::new(192, 0, 2, 2);
+        for (src, local_pref, nexthop) in [
+            (&a, 300, Ipv4Addr::new(192, 0, 2, 1)),
+            (&b, 200, b_nexthop),
+            (&c, 100, Ipv4Addr::new(192, 0, 2, 3)),
+        ] {
+            rt.insert(
+                src.clone(),
+                Family::IPV4,
+                net.clone(),
+                0,
+                Some(bgp::Nexthop::V4(nexthop)),
+                attrs_with_local_pref(local_pref),
+                None,
+                false,
+                false,
+                None,
+                0u32,
+            );
+        }
+        let in_order = vec![a.remote_addr, b.remote_addr, c.remote_addr];
+        assert_eq!(entry_order(&rt, &net), in_order);
+
+        // An unreachable nexthop moves b after the eligible paths.
+        rt.update_nexthop_validity(IpAddr::V4(b_nexthop), false);
+        assert_eq!(
+            entry_order(&rt, &net),
+            vec![a.remote_addr, c.remote_addr, b.remote_addr]
+        );
+
+        // Reachable again: b goes back to its place by LOCAL_PREF.
+        rt.update_nexthop_validity(IpAddr::V4(b_nexthop), true);
+        assert_eq!(entry_order(&rt, &net), in_order);
     }
 
     #[test]
