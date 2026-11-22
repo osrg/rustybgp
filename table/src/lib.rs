@@ -419,14 +419,16 @@ impl<'a> NewEntry<'a> {
 ///
 /// Steps, in order:
 /// 1. Eligible entries (see `RibEntry::is_eligible()`) first.
-/// 2. EVPN MAC/IP Advertisement routes only: a higher MAC Mobility sequence
+/// 2. Not LLGR stale. RFC 9494 section 4.4: "A least preferred route MUST be
+///    treated as less preferred than any other route that is not also least
+///    preferred."
+/// 3. EVPN MAC/IP Advertisement routes only: a higher MAC Mobility sequence
 ///    number. A route with MAC Mobility is preferred over one without.
-/// 3. Higher LOCAL_PREF.
-/// 4. Shorter AS_PATH.
-/// 5. Lower ORIGIN.
-/// 6. eBGP over iBGP. A confederation eBGP peer counts as iBGP.
-/// 7. Not GR stale.
-/// 8. Not LLGR stale.
+/// 4. Higher LOCAL_PREF.
+/// 5. Shorter AS_PATH.
+/// 6. Lower ORIGIN.
+/// 7. eBGP over iBGP. A confederation eBGP peer counts as iBGP.
+/// 8. Not GR stale.
 /// 9. Shorter CLUSTER_LIST.
 /// 10. Lower ORIGINATOR_ID, or BGP Identifier of the peer when absent.
 fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::cmp::Ordering {
@@ -434,6 +436,10 @@ fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::c
     let b = other;
 
     let ord = b.is_eligible().cmp(&a.is_eligible());
+    if ord.is_ne() {
+        return ord;
+    }
+    let ord = a.is_llgr_stale().cmp(&b.is_llgr_stale());
     if ord.is_ne() {
         return ord;
     }
@@ -466,10 +472,6 @@ fn compare(new: &mut NewEntry<'_>, other: &RibEntry, evpn_type2: bool) -> std::c
         return ord;
     }
     let ord = a.path.source.is_stale().cmp(&b.path.source.is_stale());
-    if ord.is_ne() {
-        return ord;
-    }
-    let ord = a.is_llgr_stale().cmp(&b.is_llgr_stale());
     if ord.is_ne() {
         return ord;
     }
@@ -726,9 +728,9 @@ impl NlriChange {
         self.current_paths.first()
     }
 
-    /// All paths tied with the best through BGP decision steps 1-6
-    /// (LocalPref, AS_PATH length, Origin, eBGP/iBGP, stale, CLUSTER_LIST
-    /// length), excluding the final router-id tiebreaker.
+    /// All paths tied with the best on LLGR stale, LOCAL_PREF, AS_PATH
+    /// length, ORIGIN, eBGP/iBGP, GR stale and CLUSTER_LIST length. The
+    /// router-id tie-break is not used.
     ///
     /// Returns an empty slice when there are no paths.  Used to build the
     /// ECMP nexthop set for kernel FIB installation.
@@ -738,6 +740,7 @@ impl NlriChange {
         };
         let key = |p: &Path| {
             (
+                p.source.is_llgr_stale() || has_llgr_stale_community(&p.attr),
                 attr_local_pref(&p.attr),
                 attr_as_path_len(&p.attr),
                 attr_origin(&p.attr),
@@ -6277,6 +6280,19 @@ mod tests {
     }
 
     #[test]
+    fn ecmp_paths_excludes_llgr_stale_path() {
+        // Same attributes except LLGR_STALE: the stale path is least
+        // preferred, so it is not an ECMP member of the fresh best.
+        let src1 = source(1, 65000, 65000, 1);
+        let src2 = source(2, 65000, 65000, 2);
+        let change = make_nlri_change(vec![
+            path_with_nh(src1, 1, empty_attrs()),
+            path_with_nh(src2, 2, Arc::new(vec![community_attr(0xffff_0006)])),
+        ]);
+        assert_eq!(change.ecmp_paths().len(), 1);
+    }
+
+    #[test]
     fn ecmp_paths_stops_at_longer_as_path() {
         let src1 = source(1, 65001, 65000, 1);
         let src2 = source(2, 65002, 65000, 2);
@@ -6566,6 +6582,47 @@ mod tests {
         let changes = rt.restale_llgr(s1.remote_addr, Family::IPV4);
 
         assert!(!changes.is_empty());
+        assert!(changes[0].best_changed);
+        let best = flat_best(&rt, &Family::IPV4);
+        assert_eq!(best[0].1.source.remote_addr, s2.remote_addr);
+    }
+
+    #[test]
+    fn llgr_stale_community_path_loses_despite_higher_local_pref() {
+        let mut rt = Table::new(0);
+        let net = nlri(10, 0, 0, 0, 24);
+        let stale = source(1, 65001, 65000, 1);
+        let fresh = source(2, 65002, 65000, 2);
+        insert_with_attrs(
+            &mut rt,
+            &stale,
+            &net,
+            Arc::new(vec![
+                packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
+                community_attr(0xffff_0006),
+            ]),
+        );
+        insert_with_attrs(&mut rt, &fresh, &net, attrs_with_local_pref(100));
+
+        let best = flat_best(&rt, &Family::IPV4);
+        assert_eq!(best[0].1.source.remote_addr, fresh.remote_addr);
+    }
+
+    #[test]
+    fn restale_llgr_demotes_path_despite_higher_local_pref() {
+        let mut rt = Table::new(0);
+        let net = nlri(10, 0, 0, 0, 24);
+        let s1 = source(1, 65001, 65000, 1);
+        let s2 = source(2, 65002, 65000, 2);
+        insert_with_attrs(&mut rt, &s1, &net, attrs_with_local_pref(200));
+        insert_with_attrs(&mut rt, &s2, &net, attrs_with_local_pref(100));
+        assert_eq!(
+            flat_best(&rt, &Family::IPV4)[0].1.source.remote_addr,
+            s1.remote_addr
+        );
+
+        let changes = rt.restale_llgr(s1.remote_addr, Family::IPV4);
+
         assert!(changes[0].best_changed);
         let best = flat_best(&rt, &Family::IPV4);
         assert_eq!(best[0].1.source.remote_addr, s2.remote_addr);
