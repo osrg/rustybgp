@@ -1131,15 +1131,12 @@ impl Table {
     /// Uses pre-import-policy attributes (`original_attr`) so callers see what
     /// the originating peer actually sent, mirroring GoBGP's rsRib behaviour.
     fn rs_local_paths(dst: &Destination, peer: IpAddr) -> Vec<PathEntry> {
-        let best = dst
-            .entry
-            .iter()
-            .filter(|e| {
-                e.path.source.is_rs_client()
-                    && e.path.source.remote_addr != peer
-                    && !e.is_filtered()
-            })
-            .max();
+        // dst.entry is ordered best first, so the first candidate is the best
+        // one. This also keeps the EVPN Type-2 ordering, which RibEntry's Ord
+        // does not include.
+        let best = dst.entry.iter().find(|e| {
+            e.path.source.is_rs_client() && e.path.source.remote_addr != peer && !e.is_filtered()
+        });
         best.into_iter()
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
@@ -5966,6 +5963,44 @@ mod tests {
         assert_eq!(dests.len(), 1);
         assert_eq!(dests[0].paths.len(), 1);
         assert_eq!(dests[0].paths[0].source.remote_addr, peer2.remote_addr);
+    }
+
+    #[test]
+    fn rs_local_returns_best_not_worst_path() {
+        let peer1 = rs_source(1, 65001);
+        let peer2 = rs_source(2, 65002);
+        let peer3 = rs_source(3, 65003);
+        let n1 = nlri(10, 0, 1, 0, 24);
+
+        let mut rt = Table::new(0);
+        for (src, local_pref) in [(&peer3, 200), (&peer2, 100)] {
+            rt.insert(
+                src.clone(),
+                Family::IPV4,
+                n1.clone(),
+                0,
+                nh(),
+                attrs_with_local_pref(local_pref),
+                None,
+                false,
+                false,
+                None,
+                0u32,
+            );
+        }
+
+        // peer3 has the higher LOCAL_PREF, so it is the best path for peer1.
+        let dests: Vec<_> = rt
+            .destinations(
+                TableQuery::RsLocal(peer1.remote_addr),
+                Family::IPV4,
+                vec![],
+                false,
+            )
+            .collect();
+        assert_eq!(dests.len(), 1);
+        assert_eq!(dests[0].paths.len(), 1);
+        assert_eq!(dests[0].paths[0].source.remote_addr, peer3.remote_addr);
     }
 
     #[test]
