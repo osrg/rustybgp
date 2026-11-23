@@ -150,6 +150,8 @@ impl MessageCounter {
     }
 }
 
+mod config_file;
+
 mod grpc;
 use grpc::GrpcService;
 
@@ -885,7 +887,7 @@ impl Global {
         }
     }
 
-    fn apply_config(
+    fn apply_global_config(
         &mut self,
         tables: Arc<TableManager>,
         config: &rustybgp_config::BgpConfig,
@@ -946,19 +948,6 @@ impl Global {
                 .and_then(|c| c.external_compare_router_id)
                 .unwrap_or(false),
         });
-
-        if let Some(groups) = &config.peer_groups {
-            for pg in groups {
-                if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone())
-                    && let Err(e) = self.add_peer_group(name.clone(), PeerGroup::from(pg))
-                {
-                    log::warn!("skipping peer group {name}: {e:?}");
-                }
-            }
-        }
-
-        let (ptable, (import, export)) = convert::policy_table_from_config(config)?;
-        self.replace_policies(&tables, ptable, import, export);
 
         Ok(self.asn != 0)
     }
@@ -1341,7 +1330,7 @@ impl Global {
 
         if let Some(bgp) = bgp.as_ref() {
             let mut server = global.write().await;
-            match server.apply_config(tables.clone(), bgp) {
+            match server.apply_global_config(tables.clone(), bgp) {
                 Ok(ready) => {
                     if ready {
                         if let Some(listen_port) = server.listen_port {
@@ -1447,26 +1436,6 @@ impl Global {
                 }
             }
         }
-        if let Some(neighbors) = bgp.as_ref().and_then(|x| x.dynamic_neighbors.as_ref()) {
-            let mut server = global.write().await;
-            for n in neighbors {
-                let Some((prefix, name)) = n
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.prefix.as_deref().zip(c.peer_group.as_deref()))
-                else {
-                    log::warn!("skipping dynamic neighbor without prefix or peer group");
-                    continue;
-                };
-                let Ok(net) = packet::IpNet::from_str(prefix) else {
-                    log::warn!("skipping dynamic neighbor {prefix}: invalid prefix");
-                    continue;
-                };
-                if let Err(e) = server.add_dynamic_neighbor(name, net) {
-                    log::warn!("skipping dynamic neighbor {prefix}: {e:?}");
-                }
-            }
-        }
         if let Some(bmp_servers) = bgp.as_ref().and_then(|x| x.bmp_servers.as_ref()) {
             let mut server = global.write().await;
             for s in bmp_servers {
@@ -1488,38 +1457,11 @@ impl Global {
                 }
             }
         }
-        if let Some(peers) = bgp.as_ref().and_then(|x| x.neighbors.as_ref()) {
-            // Resolve params outside the write lock so that async NDP lookups
-            // for unnumbered peers (neighbor-interface) do not hold the lock.
-            let mut resolved: Vec<(PeerParams, Option<String>)> = Vec::new();
-            for p in peers {
-                match PeerParams::try_from(p) {
-                    Ok(mut params) => {
-                        if let Some(ifname) = params.neighbor_interface.as_deref() {
-                            match kernel::get_link_local_neighbor(ifname).await {
-                                Ok(ll) => params.remote_addr = IpAddr::V6(ll),
-                                Err(e) => {
-                                    log::warn!(
-                                        "skipping unnumbered peer {ifname}: NDP lookup failed: {e}"
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                        let pg = p.config.as_ref().and_then(|c| c.peer_group.clone());
-                        resolved.push((params, pg));
-                    }
-                    Err(e) => log::warn!("skipping invalid peer config: {}", e),
-                }
-            }
-            let mut server = global.write().await;
-            for (params, pg_name) in resolved {
-                if let Err(e) =
-                    server.add_static_peer(params, pg_name.as_deref(), Some(active_tx.clone()))
-                {
-                    log::error!("failed to add peer from config: {}", e);
-                }
-            }
+        if let Some(bgp) = bgp.as_ref()
+            && let Err(e) =
+                config_file::apply_peer_policy_config(&global, &tables, &active_tx, bgp).await
+        {
+            panic!("{:?}", e);
         }
         if let Some(rpki_servers) = bgp.as_ref().and_then(|x| x.rpki_servers.as_ref()) {
             for s in rpki_servers {
@@ -13232,14 +13174,15 @@ port = 3323
     #[test]
     fn apply_config_port_absent_defaults_to_179() {
         let mut g = bare_global();
-        g.apply_config(make_tables(), &port_config(None)).unwrap();
+        g.apply_global_config(make_tables(), &port_config(None))
+            .unwrap();
         assert_eq!(g.listen_port, Some(Global::BGP_PORT));
     }
 
     #[test]
     fn apply_config_port_minus_one_disables_listen() {
         let mut g = bare_global();
-        g.apply_config(make_tables(), &port_config(Some(-1)))
+        g.apply_global_config(make_tables(), &port_config(Some(-1)))
             .unwrap();
         assert_eq!(g.listen_port, None);
     }
@@ -13247,7 +13190,7 @@ port = 3323
     #[test]
     fn apply_config_port_valid_sets_port() {
         let mut g = bare_global();
-        g.apply_config(make_tables(), &port_config(Some(1179)))
+        g.apply_global_config(make_tables(), &port_config(Some(1179)))
             .unwrap();
         assert_eq!(g.listen_port, Some(1179));
     }
@@ -13256,7 +13199,7 @@ port = 3323
     fn apply_config_port_zero_is_error() {
         let mut g = bare_global();
         assert!(
-            g.apply_config(make_tables(), &port_config(Some(0)))
+            g.apply_global_config(make_tables(), &port_config(Some(0)))
                 .is_err()
         );
     }
@@ -13265,7 +13208,7 @@ port = 3323
     fn apply_config_port_out_of_range_is_error() {
         let mut g = bare_global();
         assert!(
-            g.apply_config(make_tables(), &port_config(Some(65536)))
+            g.apply_global_config(make_tables(), &port_config(Some(65536)))
                 .is_err()
         );
     }
@@ -13284,7 +13227,7 @@ port = 3323
                 }),
                 ..Default::default()
             });
-        g.apply_config(tables.clone(), &c).unwrap();
+        g.apply_global_config(tables.clone(), &c).unwrap();
         let opts = tables.selection_options();
         assert!(opts.always_compare_med);
         assert!(opts.external_compare_router_id);
