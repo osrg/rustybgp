@@ -2772,17 +2772,12 @@ impl GoBgpService for GrpcService {
             }
         }
 
-        let mut global = self.global.write().await;
-        global.ptable = new_ptable;
-        // A full policy reload invalidates any per-peer export override built
-        // against the old table; clear all of them rather than leave a peer
-        // holding a stale Arc<PolicyAssignment> disconnected from the new table.
-        for peer in global.peers.values() {
-            peer.state.export_policy.store(None);
-        }
-        drop(global);
-        self.tables.import_policy.store(new_import);
-        self.tables.export_policy.store(new_export);
+        self.global.write().await.replace_policies(
+            &self.tables,
+            new_ptable,
+            new_import,
+            new_export,
+        );
         Ok(tonic::Response::new(api::SetPoliciesResponse {}))
     }
     async fn add_defined_set(

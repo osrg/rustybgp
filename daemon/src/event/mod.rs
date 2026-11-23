@@ -957,49 +957,8 @@ impl Global {
             }
         }
 
-        if config.defined_sets.is_some() || config.policy_definitions.is_some() {
-            convert::load_policy_from_config(&mut self.ptable, config)?;
-        }
-
-        if let Some(g) = config.global.as_ref() {
-            let f = |direction: i32,
-                     policy_list: Option<&Vec<String>>,
-                     action: Option<&config::generate::DefaultPolicyType>|
-             -> api::PolicyAssignment {
-                api::PolicyAssignment {
-                    name: "".to_string(),
-                    direction,
-                    policies: policy_list.map_or(Vec::new(), |x| {
-                        x.iter()
-                            .map(|x| api::Policy {
-                                name: x.to_string(),
-                                statements: Vec::new(),
-                            })
-                            .collect()
-                    }),
-                    default_action: action.map_or(1, convert::default_policy_type_to_i32),
-                }
-            };
-            if let Some(Some(config)) = g.apply_policy.as_ref().map(|x| x.config.as_ref()) {
-                self.add_policy_assignment(
-                    tables.clone(),
-                    f(
-                        1,
-                        config.import_policy_list.as_ref(),
-                        config.default_import_policy.as_ref(),
-                    ),
-                )?;
-
-                self.add_policy_assignment(
-                    tables.clone(),
-                    f(
-                        2,
-                        config.export_policy_list.as_ref(),
-                        config.default_export_policy.as_ref(),
-                    ),
-                )?;
-            }
-        }
+        let (ptable, (import, export)) = convert::policy_table_from_config(config)?;
+        self.replace_policies(&tables, ptable, import, export);
 
         Ok(self.asn != 0)
     }
@@ -1080,6 +1039,26 @@ impl Global {
             })
             .collect();
         self.local_cluster_ids.store(Arc::new(ids));
+    }
+
+    /// Replaces the whole policy table and the global import and export
+    /// assignments.
+    fn replace_policies(
+        &mut self,
+        tables: &TableManager,
+        ptable: table::PolicyTable,
+        import: Option<Arc<table::PolicyAssignment>>,
+        export: Option<Arc<table::PolicyAssignment>>,
+    ) {
+        self.ptable = ptable;
+        // A full policy reload invalidates any per-peer export override built
+        // against the old table; clear all of them rather than leave a peer
+        // holding a stale Arc<PolicyAssignment> disconnected from the new table.
+        for peer in self.peers.values() {
+            peer.state.export_policy.store(None);
+        }
+        tables.import_policy.store(import);
+        tables.export_policy.store(export);
     }
 
     fn add_peer_group(&mut self, name: String, pg: PeerGroup) -> Result<(), Error> {

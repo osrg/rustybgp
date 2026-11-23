@@ -4957,11 +4957,51 @@ fn statement_from_config(s: &config::Statement) -> Result<api::Statement, Error>
     })
 }
 
-pub(crate) fn default_policy_type_to_i32(t: &config::DefaultPolicyType) -> i32 {
-    match t {
-        config::DefaultPolicyType::AcceptRoute => 1,
-        config::DefaultPolicyType::RejectRoute => 2,
+/// Global import and export policy assignments built by
+/// `policy_table_from_config()`.
+pub(crate) type GlobalAssignments = (
+    Option<std::sync::Arc<rustybgp_table::PolicyAssignment>>,
+    Option<std::sync::Arc<rustybgp_table::PolicyAssignment>>,
+);
+
+/// Builds a new policy table from the defined sets, the policy definitions
+/// and the global apply-policy in the config file.
+pub(crate) fn policy_table_from_config(
+    config: &config::BgpConfig,
+) -> Result<(rustybgp_table::PolicyTable, GlobalAssignments), Error> {
+    use rustybgp_table::{Disposition, PolicyDirection};
+
+    let mut ptable = rustybgp_table::PolicyTable::new();
+    load_policy_from_config(&mut ptable, config)?;
+
+    let mut import = None;
+    let mut export = None;
+    if let Some(c) = config
+        .global
+        .as_ref()
+        .and_then(|g| g.apply_policy.as_ref())
+        .and_then(|a| a.config.as_ref())
+    {
+        let default_action = |t: Option<&config::DefaultPolicyType>| match t {
+            None | Some(config::DefaultPolicyType::AcceptRoute) => Disposition::Accept,
+            Some(config::DefaultPolicyType::RejectRoute) => Disposition::Reject,
+        };
+        let (_, a) = ptable.add_assignment(
+            "",
+            PolicyDirection::Import,
+            default_action(c.default_import_policy.as_ref()),
+            c.import_policy_list.clone().unwrap_or_default(),
+        )?;
+        import = Some(a);
+        let (_, a) = ptable.add_assignment(
+            "",
+            PolicyDirection::Export,
+            default_action(c.default_export_policy.as_ref()),
+            c.export_policy_list.clone().unwrap_or_default(),
+        )?;
+        export = Some(a);
     }
+    Ok((ptable, (import, export)))
 }
 
 pub(crate) fn load_policy_from_config(
@@ -5735,6 +5775,47 @@ mod tests {
             .iter_statements("".to_string())
             .next()
             .expect("no statement")
+    }
+
+    #[test]
+    fn config_global_apply_policy() {
+        let conf: config::BgpConfig = toml::from_str(
+            r#"
+[global.config]
+as = 65001
+router-id = "192.0.2.1"
+[global.apply-policy.config]
+import-policy-list = ["p1"]
+default-import-policy = "reject-route"
+
+[[policy-definitions]]
+name = "p1"
+[[policy-definitions.statements]]
+name = "s1"
+[policy-definitions.statements.actions]
+route-disposition = "accept-route"
+"#,
+        )
+        .expect("invalid TOML");
+        let (_, (import, export)) = policy_table_from_config(&conf).unwrap();
+        let import = import.expect("no import assignment");
+        assert_eq!(import.disposition, rustybgp_table::Disposition::Reject);
+        assert_eq!(import.policies.len(), 1);
+        assert_eq!(&*import.policies[0].name, "p1");
+        let export = export.expect("no export assignment");
+        assert_eq!(export.disposition, rustybgp_table::Disposition::Accept);
+        assert!(export.policies.is_empty());
+
+        let conf: config::BgpConfig = toml::from_str(
+            r#"
+[global.config]
+as = 65001
+router-id = "192.0.2.1"
+"#,
+        )
+        .expect("invalid TOML");
+        let (_, (import, export)) = policy_table_from_config(&conf).unwrap();
+        assert!(import.is_none() && export.is_none());
     }
 
     // ── condition tests ──────────────────────────────────────────────────────
