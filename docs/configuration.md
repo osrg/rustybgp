@@ -26,17 +26,28 @@ the setting; an explicit neighbor setting takes precedence. The gRPC
 ## Reloading the configuration file
 
 Send SIGHUP to rustybgpd to reload the file given with `-f`. As in GoBGP,
-rustybgpd compares the new file with the last file that it applied, and
+rustybgpd compares the new file with the configuration that runs now, and
 applies only the changes.
 
-These sections are reloaded:
+These changes are applied:
 
-- `defined-sets`
-- `policy-definitions`
-- `global.apply-policy`
+- `defined-sets`, `policy-definitions` and `global.apply-policy`
+- added and removed `neighbors`. A removed neighbor gets a Cease
+  NOTIFICATION (Peer De-configured).
+- added and removed `peer-groups`
+- added and removed `dynamic-neighbors`. Sessions of dynamic peers that are
+  already up are not affected.
 
-Changes to other sections are not applied until rustybgpd is restarted. A
-per-neighbor export policy keeps its policy names and uses the new
+These changes are not applied until rustybgpd is restarted, and a warning
+is logged for each of them:
+
+- a changed neighbor or peer group (the same address or name with
+  different settings)
+- any change to unnumbered neighbors (`neighbor-interface`)
+- changes to the other sections, such as `global`, `bmp-servers` and
+  `rpki-servers`
+
+A per-neighbor export policy keeps its policy names and uses the new
 definitions of those policies.
 
 Routes already in the tables are not evaluated again with the new policies.
@@ -44,10 +55,12 @@ Run a soft reset to apply the new policies to them. GoBGP v4 runs a soft
 reset in for every peer after a policy change. rustybgpd does not, as
 proposed for GoBGP v5 (osrg/gobgp#3851).
 
-If the file cannot be read, or the new policies are not valid (for example,
-an assignment uses a policy that is not defined), nothing is changed and a
-warning is logged. The next reload compares the file with the last file that
-was applied.
+If the file cannot be read, nothing is changed and a warning is logged. If
+one change fails, for example a neighbor that cannot be added or policies
+that are not valid, a warning is logged and the other changes are still
+applied. A neighbor, peer group or dynamic neighbor that could not be added
+is tried again at the next reload. When the policies are not valid, the
+old policies stay.
 
 When rustybgpd is started without `-f`, SIGHUP is not handled and stops the
 process.

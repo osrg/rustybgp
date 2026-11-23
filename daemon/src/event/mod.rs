@@ -1615,7 +1615,13 @@ impl Global {
         }
 
         if let (Some(bgp), Some(path)) = (bgp, bgp_path) {
-            config_file::spawn_reloader(global.clone(), tables.clone(), path, bgp);
+            config_file::spawn_reloader(
+                global.clone(),
+                tables.clone(),
+                active_tx.clone(),
+                path,
+                bgp,
+            );
         }
 
         if any_peer {
