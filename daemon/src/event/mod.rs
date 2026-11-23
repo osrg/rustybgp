@@ -11306,6 +11306,128 @@ local-address = "{local}"
         assert!(t.rtable.collect_loc_rib_paths(&Family::IPV4).is_empty());
     }
 
+    fn loc_rib_len(svc: &GrpcService, family: Family) -> usize {
+        svc.tables
+            .shards
+            .iter()
+            .map(|t| {
+                t.lock()
+                    .unwrap()
+                    .rtable
+                    .collect_loc_rib_paths(&family)
+                    .len()
+            })
+            .sum()
+    }
+
+    fn add_path_stream_req(paths: Vec<api::Path>) -> api::AddPathStreamRequest {
+        api::AddPathStreamRequest {
+            table_type: api::TableType::Global as i32,
+            paths,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn add_path_stream_honors_withdraw() {
+        let svc = make_grpc_service();
+        let path = ipv4_path("10.1.0.0", 24, "10.0.0.1");
+        svc.add_path_stream_request(add_path_stream_req(vec![path.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(loc_rib_len(&svc, Family::IPV4), 1);
+
+        let withdraw = api::Path {
+            is_withdraw: true,
+            ..path
+        };
+        svc.add_path_stream_request(add_path_stream_req(vec![withdraw]))
+            .await
+            .unwrap();
+        assert_eq!(loc_rib_len(&svc, Family::IPV4), 0);
+    }
+
+    #[tokio::test]
+    async fn add_path_stream_withdraw_invalidates_uuid() {
+        let svc = make_grpc_service();
+        let path = ipv4_path("10.1.0.0", 24, "10.0.0.1");
+        let uuid = svc
+            .add_path(tonic::Request::new(api::AddPathRequest {
+                path: Some(path.clone()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .uuid;
+        let withdraw = api::Path {
+            is_withdraw: true,
+            ..path
+        };
+        svc.add_path_stream_request(add_path_stream_req(vec![withdraw]))
+            .await
+            .unwrap();
+        let err = delete_gobgp_path(&svc, uuid).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn add_path_stream_vrf() {
+        let svc = make_grpc_service();
+        svc.add_vrf(tonic::Request::new(make_vrf_req(
+            "vrf1", 65000, 100, 65000, 100,
+        )))
+        .await
+        .unwrap();
+        let req = api::AddPathStreamRequest {
+            table_type: api::TableType::Vrf as i32,
+            vrf_id: "vrf1".to_string(),
+            paths: vec![ipv4_path("10.1.0.0", 24, "10.0.0.1")],
+        };
+        svc.add_path_stream_request(req.clone()).await.unwrap();
+        assert_eq!(loc_rib_len(&svc, Family::IPV4_VPN), 1);
+        assert_eq!(loc_rib_len(&svc, Family::IPV4), 0);
+
+        let err = svc
+            .add_path_stream_request(api::AddPathStreamRequest {
+                vrf_id: "nonexistent".to_string(),
+                ..req
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn add_path_stream_rejects_request_with_invalid_path() {
+        let svc = make_grpc_service();
+        let req = add_path_stream_req(vec![
+            ipv4_path("10.1.0.0", 24, "10.0.0.1"),
+            ipv4_path("not-a-prefix", 24, "10.0.0.1"),
+        ]);
+        let err = svc.add_path_stream_request(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(loc_rib_len(&svc, Family::IPV4), 0);
+    }
+
+    #[tokio::test]
+    async fn add_path_stream_rejects_unsupported_table_type() {
+        let svc = make_grpc_service();
+        for table_type in [
+            api::TableType::Unspecified,
+            api::TableType::AdjIn,
+            api::TableType::AdjOut,
+        ] {
+            let req = api::AddPathStreamRequest {
+                table_type: table_type as i32,
+                ..add_path_stream_req(vec![ipv4_path("10.1.0.0", 24, "10.0.0.1")])
+            };
+            let err = svc.add_path_stream_request(req).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+        assert_eq!(loc_rib_len(&svc, Family::IPV4), 0);
+    }
+
     #[tokio::test]
     async fn add_path_returns_valid_uuid() {
         let svc = make_grpc_service();

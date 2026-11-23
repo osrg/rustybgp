@@ -702,6 +702,15 @@ impl From<api::PeerGroup> for PeerGroup {
 
 type PathUuidMap = FnvHashMap<uuid::Uuid, (Family, Vec<packet::PathNlri>)>;
 
+/// A path from AddPath or AddPathStream, converted and ready to apply.
+struct LocalPath {
+    family: Family,
+    nets: Vec<packet::PathNlri>,
+    attrs: Option<Arc<packet::PathAttributes>>,
+    nexthop: Option<bgp::Nexthop>,
+    is_withdraw: bool,
+}
+
 pub(super) struct GrpcService {
     init: Arc<tokio::sync::Notify>,
     active_conn_tx: mpsc::UnboundedSender<TcpStream>,
@@ -1000,6 +1009,97 @@ impl GrpcService {
             attrs,
             nexthop,
         ))
+    }
+
+    fn find_vrf(&self, vrf_id: &str) -> Result<table::Vrf, tonic::Status> {
+        if vrf_id.is_empty() {
+            return Err(Error::InvalidArgument(
+                "vrf_id is required for VRF table type".to_string(),
+            )
+            .into());
+        }
+        self.tables
+            .list_vrfs(Some(vrf_id))
+            .into_iter()
+            .next()
+            .ok_or_else(|| tonic::Status::not_found(format!("VRF '{}' not found", vrf_id)))
+    }
+
+    /// Converts a path that AddPath or AddPathStream receives. With a VRF,
+    /// the path is translated to the VPN family of the VRF.
+    fn prepare_local_path(
+        &self,
+        path: api::Path,
+        vrf: Option<&table::Vrf>,
+    ) -> Result<LocalPath, tonic::Status> {
+        let is_withdraw = path.is_withdraw;
+        let (mut family, mut nets, mut attrs, nexthop) = self.local_path(path)?;
+        if let Some(vrf) = vrf {
+            (family, nets, attrs) = vrf_export_path(family, nets, attrs, vrf)?;
+        }
+        Ok(LocalPath {
+            family,
+            nets,
+            attrs,
+            nexthop,
+            is_withdraw,
+        })
+    }
+
+    /// Adds or withdraws a path made by prepare_local_path(). The caller
+    /// holds the path_uuid_map lock.
+    fn apply_local_path(&self, uuid_map: &mut PathUuidMap, path: &LocalPath) {
+        if path.is_withdraw {
+            self.withdraw_local_paths(uuid_map, path.family, &path.nets);
+            return;
+        }
+        let Some(attrs) = &path.attrs else {
+            return;
+        };
+        let timestamp = crate::proto::unix_secs();
+        for net in &path.nets {
+            self.tables.insert_route(
+                table::Source::local(),
+                path.family,
+                net.clone(),
+                path.nexthop,
+                attrs.clone(),
+                None,
+                timestamp,
+            );
+        }
+    }
+
+    /// Handles one AddPathStream request. All paths are converted before any
+    /// of them is applied, so a request with an invalid path changes nothing.
+    pub(super) async fn add_path_stream_request(
+        &self,
+        request: api::AddPathStreamRequest,
+    ) -> Result<(), tonic::Status> {
+        // Like GoBGP, only the global and VRF tables are accepted, and the
+        // table type must be set.
+        let vrf = match api::TableType::try_from(request.table_type) {
+            Ok(api::TableType::Global) => None,
+            Ok(api::TableType::Vrf) => Some(self.find_vrf(&request.vrf_id)?),
+            _ => {
+                return Err(tonic::Status::invalid_argument(format!(
+                    "unsupported table type: {}",
+                    request.table_type
+                )));
+            }
+        };
+        let paths = request
+            .paths
+            .into_iter()
+            .map(|path| self.prepare_local_path(path, vrf.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Serialize route mutations and UUID bookkeeping with AddPath and
+        // DeletePath.
+        let mut uuid_map = self.path_uuid_map.lock().await;
+        for path in &paths {
+            self.apply_local_path(&mut uuid_map, path);
+        }
+        Ok(())
     }
 }
 
@@ -2086,54 +2186,20 @@ impl GoBgpService for GrpcService {
         let table_type =
             api::TableType::try_from(inner.table_type).unwrap_or(api::TableType::Global);
         let path = inner.path.ok_or(Error::EmptyArgument)?;
-        let is_withdraw = path.is_withdraw;
-        let (mut family, nets, attrs, nexthop) = self.local_path(path)?;
-        let mut insert_nets = nets.clone();
-        let mut insert_attrs = attrs;
-        if table_type == api::TableType::Vrf {
-            let vrf_id = inner.vrf_id;
-            if vrf_id.is_empty() {
-                return Err(Error::InvalidArgument(
-                    "vrf_id is required for VRF table type".to_string(),
-                )
-                .into());
-            }
-            let vrf = self
-                .tables
-                .list_vrfs(Some(&vrf_id))
-                .into_iter()
-                .next()
-                .ok_or_else(|| tonic::Status::not_found(format!("VRF '{}' not found", vrf_id)))?;
-            let (vpn_family, vpn_nets, vpn_attrs) =
-                vrf_export_path(family, insert_nets, insert_attrs, &vrf)?;
-            family = vpn_family;
-            insert_nets = vpn_nets;
-            insert_attrs = vpn_attrs;
-        }
-        let map_nets = insert_nets.clone();
-        let timestamp = crate::proto::unix_secs();
-        let source = table::Source::local();
+        let vrf = if table_type == api::TableType::Vrf {
+            Some(self.find_vrf(&inner.vrf_id)?)
+        } else {
+            None
+        };
+        let path = self.prepare_local_path(path, vrf.as_ref())?;
         // Serialize route mutations and UUID bookkeeping with DeletePath.
         let mut uuid_map = self.path_uuid_map.lock().await;
-        if is_withdraw {
-            self.withdraw_local_paths(&mut uuid_map, family, &insert_nets);
+        self.apply_local_path(&mut uuid_map, &path);
+        if path.is_withdraw {
             return Ok(tonic::Response::new(api::AddPathResponse::default()));
         }
-        if let Some(attrs) = insert_attrs {
-            for net in insert_nets {
-                self.tables.insert_route(
-                    source.clone(),
-                    family,
-                    net,
-                    nexthop,
-                    attrs.clone(),
-                    None,
-                    timestamp,
-                );
-            }
-        }
         let id = uuid::Uuid::new_v4();
-        uuid_map.insert(id, (family, map_nets));
+        uuid_map.insert(id, (path.family, path.nets));
         Ok(tonic::Response::new(api::AddPathResponse {
             uuid: id.as_bytes().to_vec(),
         }))
@@ -2439,26 +2505,8 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<tonic::Streaming<api::AddPathStreamRequest>>,
     ) -> Result<tonic::Response<api::AddPathStreamResponse>, tonic::Status> {
         let mut stream = request.into_inner();
-        let source = table::Source::local();
-        while let Some(Ok(request)) = stream.next().await {
-            for path in request.paths {
-                if let Ok((family, nets, attrs, nexthop)) = self.local_path(path)
-                    && let Some(attrs) = attrs
-                {
-                    let timestamp = crate::proto::unix_secs();
-                    for net in nets {
-                        self.tables.insert_route(
-                            source.clone(),
-                            family,
-                            net,
-                            nexthop,
-                            attrs.clone(),
-                            None,
-                            timestamp,
-                        );
-                    }
-                }
-            }
+        while let Some(request) = stream.next().await {
+            self.add_path_stream_request(request?).await?;
         }
         Ok(tonic::Response::new(api::AddPathStreamResponse {}))
     }
