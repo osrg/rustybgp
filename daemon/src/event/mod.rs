@@ -1080,6 +1080,36 @@ impl Global {
         self.local_cluster_ids.store(Arc::new(ids));
     }
 
+    /// Adds a statically configured peer, from the config file or from the
+    /// AddPeer API. Applies the named peer group, if it exists, and installs
+    /// the peer's TCP MD5 key on the listen sockets. Dynamic peers are created
+    /// by `add_peer()` directly and do not go through this function.
+    fn add_static_peer(
+        &mut self,
+        mut params: PeerParams,
+        peer_group: Option<&str>,
+        tx: Option<mpsc::UnboundedSender<TcpStream>>,
+    ) -> std::result::Result<(), Error> {
+        if let Some(pg) = peer_group
+            .filter(|n| !n.is_empty())
+            .and_then(|n| self.peer_group.get(n))
+        {
+            params.apply_peer_group(pg);
+        }
+        let addr = params.remote_addr;
+        self.add_peer(params, tx)?;
+        if let Some(password) = self
+            .peers
+            .get(&addr)
+            .and_then(|p| p.config.password.as_ref())
+        {
+            for &(fd, ifindex) in &self.listen_sockets {
+                auth::set_md5sig(fd, &addr, password, ifindex);
+            }
+        }
+        Ok(())
+    }
+
     fn add_peer(
         &mut self,
         mut params: PeerParams,
@@ -1468,11 +1498,10 @@ impl Global {
                 }
             }
             let mut server = global.write().await;
-            for (mut params, pg_name) in resolved {
-                if let Some(pg) = pg_name.as_deref().and_then(|n| server.peer_group.get(n)) {
-                    params.apply_peer_group(pg);
-                }
-                if let Err(e) = server.add_peer(params, Some(active_tx.clone())) {
+            for (params, pg_name) in resolved {
+                if let Err(e) =
+                    server.add_static_peer(params, pg_name.as_deref(), Some(active_tx.clone()))
+                {
                     log::error!("failed to add peer from config: {}", e);
                 }
             }

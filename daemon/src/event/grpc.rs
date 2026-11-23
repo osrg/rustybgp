@@ -1202,23 +1202,12 @@ impl GoBgpService for GrpcService {
                 .map_err(|e| Error::InvalidArgument(format!("NDP lookup for {ifname}: {e}")))?;
             params.remote_addr = IpAddr::V6(ll);
         }
-        let mut global = self.global.write().await;
-        let pg_name = api_peer
-            .conf
-            .as_ref()
-            .map(|c| c.peer_group.as_str())
-            .unwrap_or_default();
-        if !pg_name.is_empty()
-            && let Some(pg) = global.peer_group.get(pg_name)
-        {
-            params.apply_peer_group(pg);
-        }
-        if let Some(password) = params.password.as_ref() {
-            for &(fd, ifindex) in &global.listen_sockets {
-                auth::set_md5sig(fd, &params.remote_addr, password, ifindex);
-            }
-        }
-        global.add_peer(params, Some(self.active_conn_tx.clone()))?;
+        let pg_name = api_peer.conf.as_ref().map(|c| c.peer_group.as_str());
+        self.global.write().await.add_static_peer(
+            params,
+            pg_name,
+            Some(self.active_conn_tx.clone()),
+        )?;
         Ok(tonic::Response::new(api::AddPeerResponse {}))
     }
     async fn delete_peer(
