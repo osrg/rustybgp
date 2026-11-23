@@ -1,0 +1,10 @@
+# Step 1: only gobgp-a, no policy.
+
+[global.config]
+  as = 65001
+  router-id = "172.30.50.1"
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "172.30.50.2"
+    peer-as = 65002

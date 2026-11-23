@@ -1,0 +1,32 @@
+# Step 3: delete gobgp-a, and change the hold time of gobgp-b. The change is
+# not applied, so the gobgp-b session must stay up.
+
+[global.config]
+  as = 65001
+  router-id = "172.30.50.1"
+
+[global.apply-policy.config]
+  export-policy-list = ["reject-ps2"]
+  default-export-policy = "accept-route"
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "172.30.50.3"
+    peer-as = 65003
+  [neighbors.timers.config]
+    hold-time = 30.0
+
+[[defined-sets.prefix-sets]]
+  prefix-set-name = "ps2"
+  [[defined-sets.prefix-sets.prefix-list]]
+    ip-prefix = "10.0.2.0/24"
+    masklength-range = "24..24"
+
+[[policy-definitions]]
+  name = "reject-ps2"
+  [[policy-definitions.statements]]
+    name = "s1"
+    [policy-definitions.statements.conditions.match-prefix-set]
+      prefix-set = "ps2"
+    [policy-definitions.statements.actions]
+      route-disposition = "reject-route"

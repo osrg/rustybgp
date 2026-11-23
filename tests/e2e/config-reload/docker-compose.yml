@@ -1,0 +1,48 @@
+networks:
+  reload-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.50.0/24
+          gateway: 172.30.50.254
+
+services:
+  rusty:
+    build:
+      context: ${RUSTYBGP_BUILD_CONTEXT:-../../..}
+      dockerfile: ${RUSTYBGP_DOCKERFILE:-tests/e2e/shared/Dockerfile.rustybgp}
+      args:
+        RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-musl}
+    container_name: rusty
+    networks:
+      reload-net:
+        ipv4_address: 172.30.50.1
+    volumes:
+      - ./step1.toml:/etc/rustybgp/step1.toml:ro
+      - ./step2.toml:/etc/rustybgp/step2.toml:ro
+      - ./step3.toml:/etc/rustybgp/step3.toml:ro
+      - ./entrypoint-rusty.sh:/entrypoint.sh:ro
+
+  gobgp-a:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.gobgp
+    container_name: gobgp-a
+    command: ["-f", "/etc/gobgpd.conf"]
+    networks:
+      reload-net:
+        ipv4_address: 172.30.50.2
+    volumes:
+      - ./gobgp-a/gobgpd.conf:/etc/gobgpd.conf:ro
+
+  gobgp-b:
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/shared/Dockerfile.gobgp
+    container_name: gobgp-b
+    command: ["-f", "/etc/gobgpd.conf"]
+    networks:
+      reload-net:
+        ipv4_address: 172.30.50.3
+    volumes:
+      - ./gobgp-b/gobgpd.conf:/etc/gobgpd.conf:ro

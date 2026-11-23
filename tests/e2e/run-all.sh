@@ -63,6 +63,7 @@ export RUSTYBGP_DOCKERFILE="Dockerfile"
 
 ALL_TESTS=(
     add-path
+    config-reload
     confederation
     evpn
     extended-nexthop
