@@ -140,7 +140,7 @@ def emit_class_def(ctx, stmt, struct_name, prefix, fd):
 
     print('// struct for container %s:%s.' % (prefix, stmt.arg), file=fd)
     emit_description(stmt, fd)
-    print('#[derive(Deserialize, Debug, Default)]')
+    print('#[derive(Deserialize, Debug, Default, PartialEq)]')
     print('#[serde(deny_unknown_fields)]')
     print('pub struct %s {' % convert_to_golang(struct_name), file=fd)
 

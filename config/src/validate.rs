@@ -52,7 +52,7 @@ fn validate_transport(transport: Option<&Transport>) -> Result<(), ConfigError> 
     Ok(())
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BgpConfig {
     pub global: Option<Global>,

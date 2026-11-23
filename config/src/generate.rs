@@ -655,7 +655,7 @@ type BgpNextHopType = String;
 // typedef for typedef bgp-pol:bgp-set-med-type.
 type BgpSetMedType = String;
 // struct for container gobgp:state.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicNeighborState {
     // original -> gobgp:prefix
@@ -666,7 +666,7 @@ pub struct DynamicNeighborState {
     pub peer_group: Option<String>,
 }
 // struct for container gobgp:config.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicNeighborConfig {
     // original -> gobgp:prefix
@@ -677,7 +677,7 @@ pub struct DynamicNeighborConfig {
     pub peer_group: Option<String>,
 }
 // struct for container gobgp:dynamic-neighbor.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicNeighbor {
     // original -> gobgp:prefix
@@ -687,7 +687,7 @@ pub struct DynamicNeighbor {
     pub state: Option<DynamicNeighborState>,
 }
 // struct for container gobgp:state.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CollectorState {
     // original -> gobgp:url
@@ -700,7 +700,7 @@ pub struct CollectorState {
     pub table_dump_interval: Option<u64>,
 }
 // struct for container gobgp:config.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CollectorConfig {
     // original -> gobgp:url
@@ -713,7 +713,7 @@ pub struct CollectorConfig {
     pub table_dump_interval: Option<u64>,
 }
 // struct for container gobgp:collector.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Collector {
     // original -> gobgp:collector-config
@@ -722,7 +722,7 @@ pub struct Collector {
     pub state: Option<CollectorState>,
 }
 // struct for container gobgp:state.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ZebraState {
     // original -> gobgp:enabled
@@ -758,7 +758,7 @@ pub struct ZebraState {
     pub software_name: Option<String>,
 }
 // struct for container gobgp:config.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ZebraConfig {
     // original -> gobgp:enabled
@@ -794,7 +794,7 @@ pub struct ZebraConfig {
     pub software_name: Option<String>,
 }
 // struct for container gobgp:zebra.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Zebra {
     // original -> gobgp:zebra-config
@@ -803,7 +803,7 @@ pub struct Zebra {
     pub state: Option<ZebraState>,
 }
 // struct for container gobgp:config.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MrtConfig {
     // original -> gobgp:dump-type
@@ -826,7 +826,7 @@ pub struct MrtConfig {
     pub rotation_interval: Option<u64>,
 }
 // struct for container gobgp:mrt.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Mrt {
     // original -> gobgp:file-name
@@ -835,7 +835,7 @@ pub struct Mrt {
 }
 // struct for container gobgp:state.
 // Configured states of VRF.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VrfState {
     // original -> gobgp:name
@@ -858,7 +858,7 @@ pub struct VrfState {
 }
 // struct for container gobgp:config.
 // Configuration parameters for VRF.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VrfConfig {
     // original -> gobgp:name
@@ -886,7 +886,7 @@ pub struct VrfConfig {
 }
 // struct for container gobgp:vrf.
 // VRF instance configurations on the local system.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Vrf {
     // original -> gobgp:name
@@ -899,7 +899,7 @@ pub struct Vrf {
 }
 // struct for container gobgp:state.
 // Configuration parameters relating to BMP server.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BmpServerState {
     // original -> gobgp:address
@@ -934,7 +934,7 @@ pub struct BmpServerState {
 }
 // struct for container gobgp:config.
 // Configuration parameters relating to BMP server.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BmpServerConfig {
     // original -> gobgp:address
@@ -969,7 +969,7 @@ pub struct BmpServerConfig {
 }
 // struct for container gobgp:bmp-server.
 // List of BMP servers configured on the local system.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BmpServer {
     // original -> gobgp:address
@@ -982,7 +982,7 @@ pub struct BmpServer {
 }
 // struct for container gobgp:rpki-received.
 // Counters for reception RPKI Message types.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RpkiReceived {
     // original -> gobgp:serial-notify
@@ -1015,7 +1015,7 @@ pub struct RpkiReceived {
 }
 // struct for container gobgp:rpki-sent.
 // Counters for transmission RPKI Message types.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RpkiSent {
     // original -> gobgp:serial-query
@@ -1032,7 +1032,7 @@ pub struct RpkiSent {
 }
 // struct for container gobgp:rpki-messages.
 // Counters for transmission and reception RPKI Message types.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RpkiMessages {
     // original -> gobgp:rpki-sent
@@ -1046,7 +1046,7 @@ pub struct RpkiMessages {
 }
 // struct for container gobgp:state.
 // State information relating to RPKI server.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RpkiServerState {
     // original -> gobgp:up
@@ -1086,7 +1086,7 @@ pub struct RpkiServerState {
 }
 // struct for container gobgp:config.
 // Configuration parameters relating to RPKI server.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RpkiServerConfig {
     // original -> gobgp:address
@@ -1119,7 +1119,7 @@ pub struct RpkiServerConfig {
 }
 // struct for container gobgp:rpki-server.
 // List of RPKI servers configured on the local system.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RpkiServer {
     // original -> gobgp:address
@@ -1132,7 +1132,7 @@ pub struct RpkiServer {
 }
 // struct for container bgp:state.
 // State information relating to the BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PeerGroupState {
     // original -> bgp:peer-as
@@ -1193,7 +1193,7 @@ pub struct PeerGroupState {
 // struct for container bgp:config.
 // Configuration parameters relating to the BGP neighbor or
 // group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PeerGroupConfig {
     // original -> bgp:peer-as
@@ -1250,7 +1250,7 @@ pub struct PeerGroupConfig {
 // struct for container bgp:peer-group.
 // List of BGP peer-groups configured on the local system -
 // uniquely identified by peer-group name.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PeerGroup {
     // original -> bgp:peer-group-name
@@ -1330,7 +1330,7 @@ pub struct PeerGroup {
 }
 // struct for container gobgp:bfd-async.
 // Counters for BFD asynchronous-mode control packets.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BfdAsync {
     // original -> gobgp:last-packet-transmitted
@@ -1352,7 +1352,7 @@ pub struct BfdAsync {
 }
 // struct for container gobgp:state.
 // BFD configuration and operational state.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BfdState {
     // original -> gobgp:enabled
@@ -1419,7 +1419,7 @@ pub struct BfdState {
 }
 // struct for container gobgp:config.
 // BFD configuration parameters.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BfdConfig {
     // original -> gobgp:enabled
@@ -1446,7 +1446,7 @@ pub struct BfdConfig {
 }
 // struct for container gobgp:bfd.
 // Configure BFD liveness detection for this BGP neighbor.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Bfd {
     // original -> gobgp:bfd-config
@@ -1458,7 +1458,7 @@ pub struct Bfd {
 }
 // struct for container gobgp:state.
 // State information for TTL Security.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TtlSecurityState {
     // original -> gobgp:enabled
@@ -1472,7 +1472,7 @@ pub struct TtlSecurityState {
 }
 // struct for container gobgp:config.
 // Configuration parameters for TTL Security.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TtlSecurityConfig {
     // original -> gobgp:enabled
@@ -1486,7 +1486,7 @@ pub struct TtlSecurityConfig {
 }
 // struct for container gobgp:ttl-security.
 // Configure TTL Security feature.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TtlSecurity {
     // original -> gobgp:ttl-security-config
@@ -1499,7 +1499,7 @@ pub struct TtlSecurity {
 // struct for container gobgp:state.
 // State information relating to route server
 // client(s) used for the BGP neighbor.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteServerState {
     // original -> gobgp:route-server-client
@@ -1518,7 +1518,7 @@ pub struct RouteServerState {
 // struct for container gobgp:config.
 // Configuration parameters relating to route server
 // client(s) used for the BGP neighbor.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteServerConfig {
     // original -> gobgp:route-server-client
@@ -1536,7 +1536,7 @@ pub struct RouteServerConfig {
 }
 // struct for container gobgp:route-server.
 // Configure the local router as a route server.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteServer {
     // original -> gobgp:route-server-config
@@ -1550,7 +1550,7 @@ pub struct RouteServer {
 }
 // struct for container bgp-op:prefixes.
 // Prefix counters for the BGP session.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Prefixes {
     // original -> bgp-op:received
@@ -1566,7 +1566,7 @@ pub struct Prefixes {
 }
 // struct for container bgp:state.
 // State information associated with ADD_PATHS.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AddPathsState {
     // original -> bgp:receive
@@ -1582,7 +1582,7 @@ pub struct AddPathsState {
 }
 // struct for container bgp:config.
 // Configuration parameters relating to ADD_PATHS.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AddPathsConfig {
     // original -> bgp:receive
@@ -1599,7 +1599,7 @@ pub struct AddPathsConfig {
 // struct for container bgp:add-paths.
 // Parameters relating to the advertisement and receipt of
 // multiple paths for a single NLRI (add-paths).
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AddPaths {
     // original -> bgp:add-paths-config
@@ -1612,7 +1612,7 @@ pub struct AddPaths {
 // struct for container bgp:state.
 // State information relating to the AS_PATH manipulation
 // mechanisms for the BGP peer or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AsPathOptionsState {
     // original -> bgp:allow-own-as
@@ -1638,7 +1638,7 @@ pub struct AsPathOptionsState {
 // struct for container bgp:config.
 // Configuration parameters relating to AS_PATH manipulation
 // for the BGP peer or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AsPathOptionsConfig {
     // original -> bgp:allow-own-as
@@ -1664,7 +1664,7 @@ pub struct AsPathOptionsConfig {
 // struct for container bgp:as-path-options.
 // AS_PATH manipulation parameters for the BGP neighbor or
 // group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AsPathOptions {
     // original -> bgp:as-path-options-config
@@ -1679,7 +1679,7 @@ pub struct AsPathOptions {
 // struct for container bgp:state.
 // State information relating to route reflection for the
 // BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteReflectorState {
     // original -> bgp:route-reflector-cluster-id
@@ -1698,7 +1698,7 @@ pub struct RouteReflectorState {
 // struct for container bgp:config.
 // Configuraton parameters relating to route reflection
 // for the BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteReflectorConfig {
     // original -> bgp:route-reflector-cluster-id
@@ -1716,7 +1716,7 @@ pub struct RouteReflectorConfig {
 }
 // struct for container bgp:route-reflector.
 // Route reflector parameters for the BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteReflector {
     // original -> bgp:route-reflector-config
@@ -1731,7 +1731,7 @@ pub struct RouteReflector {
 // struct for container bgp:state.
 // State information for eBGP multihop, for the BGP neighbor
 // or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EbgpMultihopState {
     // original -> bgp:enabled
@@ -1749,7 +1749,7 @@ pub struct EbgpMultihopState {
 // struct for container bgp:config.
 // Configuration parameters relating to eBGP multihop for the
 // BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EbgpMultihopConfig {
     // original -> bgp:enabled
@@ -1766,7 +1766,7 @@ pub struct EbgpMultihopConfig {
 }
 // struct for container bgp:ebgp-multihop.
 // eBGP multi-hop parameters for the BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EbgpMultihop {
     // original -> bgp:ebgp-multihop-config
@@ -1781,7 +1781,7 @@ pub struct EbgpMultihop {
 // struct for container bgp:state.
 // State information relating to logging for the BGP neighbor
 // or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingOptionsState {
     // original -> bgp:log-neighbor-state-changes
@@ -1794,7 +1794,7 @@ pub struct LoggingOptionsState {
 // struct for container bgp:config.
 // Configuration parameters enabling or modifying logging
 // for events relating to the BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingOptionsConfig {
     // original -> bgp:log-neighbor-state-changes
@@ -1807,7 +1807,7 @@ pub struct LoggingOptionsConfig {
 // struct for container bgp:logging-options.
 // Logging options for events related to the BGP neighbor or
 // group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingOptions {
     // original -> bgp:logging-options-config
@@ -1822,7 +1822,7 @@ pub struct LoggingOptions {
 // struct for container bgp:state.
 // State information relating to enhanced error handling
 // mechanisms for the BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorHandlingState {
     // original -> bgp:treat-as-withdraw
@@ -1843,7 +1843,7 @@ pub struct ErrorHandlingState {
 // Configuration parameters enabling or modifying the
 // behavior or enhanced error handling mechanisms for the BGP
 // neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorHandlingConfig {
     // original -> bgp:treat-as-withdraw
@@ -1857,7 +1857,7 @@ pub struct ErrorHandlingConfig {
 // struct for container bgp:error-handling.
 // Error handling parameters used for the BGP neighbor or
 // group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorHandling {
     // original -> bgp:error-handling-config
@@ -1873,7 +1873,7 @@ pub struct ErrorHandling {
 // struct for container bgp:state.
 // State information relating to the transport session(s)
 // used for the BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransportState {
     // original -> bgp:tcp-mss
@@ -1922,7 +1922,7 @@ pub struct TransportState {
 // struct for container bgp:config.
 // Configuration parameters relating to the transport
 // session(s) used for the BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransportConfig {
     // original -> bgp:tcp-mss
@@ -1969,7 +1969,7 @@ pub struct TransportConfig {
 }
 // struct for container bgp:transport.
 // Transport session parameters for the BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Transport {
     // original -> bgp:transport-config
@@ -1984,7 +1984,7 @@ pub struct Transport {
 // struct for container bgp:state.
 // State information relating to the timers used for the BGP
 // neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TimersState {
     // original -> bgp:connect-retry
@@ -2049,7 +2049,7 @@ pub struct TimersState {
 // struct for container bgp:config.
 // Configuration parameters relating to timers used for the
 // BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TimersConfig {
     // original -> bgp:connect-retry
@@ -2092,7 +2092,7 @@ pub struct TimersConfig {
 }
 // struct for container bgp:timers.
 // Timers related to a BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Timers {
     // original -> bgp:timers-config
@@ -2105,7 +2105,7 @@ pub struct Timers {
     pub state: Option<TimersState>,
 }
 // struct for container gobgp:adj-table.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AdjTable {
     // original -> gobgp:ADVERTISED
@@ -2120,7 +2120,7 @@ pub struct AdjTable {
 // struct for container bgp:queues.
 // Counters related to queued messages associated with the
 // BGP neighbor.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Queues {
     // original -> bgp-op:input
@@ -2133,7 +2133,7 @@ pub struct Queues {
 }
 // struct for container bgp:received.
 // Counters for BGP messages received from the neighbor.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Received {
     // original -> bgp-op:UPDATE
@@ -2180,7 +2180,7 @@ pub struct Received {
 }
 // struct for container bgp:sent.
 // Counters relating to BGP messages sent to the neighbor.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Sent {
     // original -> bgp-op:UPDATE
@@ -2228,7 +2228,7 @@ pub struct Sent {
 // struct for container bgp:messages.
 // Counters for BGP messages sent and received from the
 // neighbor.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Messages {
     // original -> bgp:sent
@@ -2240,7 +2240,7 @@ pub struct Messages {
 }
 // struct for container bgp:state.
 // State information relating to the BGP neighbor or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NeighborState {
     // original -> bgp:peer-as
@@ -2353,7 +2353,7 @@ pub struct NeighborState {
 // struct for container bgp:config.
 // Configuration parameters relating to the BGP neighbor or
 // group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NeighborConfig {
     // original -> bgp:peer-as
@@ -2425,7 +2425,7 @@ pub struct NeighborConfig {
 // struct for container bgp:neighbor.
 // List of BGP neighbors configured on the local system,
 // uniquely identified by peer IPv[46] address.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Neighbor {
     // original -> bgp:neighbor-address
@@ -2504,7 +2504,7 @@ pub struct Neighbor {
     pub bfd: Option<Bfd>,
 }
 // struct for container gobgp:state.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LongLivedGracefulRestartState {
     // original -> gobgp:enabled
@@ -2528,7 +2528,7 @@ pub struct LongLivedGracefulRestartState {
     pub peer_restart_timer_expired: Option<bool>,
 }
 // struct for container gobgp:config.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LongLivedGracefulRestartConfig {
     // original -> gobgp:enabled
@@ -2539,7 +2539,7 @@ pub struct LongLivedGracefulRestartConfig {
     pub restart_time: Option<u32>,
 }
 // struct for container gobgp:long-lived-graceful-restart.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LongLivedGracefulRestart {
     // original -> gobgp:long-lived-graceful-restart-config
@@ -2548,7 +2548,7 @@ pub struct LongLivedGracefulRestart {
     pub state: Option<LongLivedGracefulRestartState>,
 }
 // struct for container gobgp:state.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteTargetMembershipState {
     // original -> gobgp:deferral-time
@@ -2556,7 +2556,7 @@ pub struct RouteTargetMembershipState {
     pub deferral_time: Option<u16>,
 }
 // struct for container gobgp:config.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteTargetMembershipConfig {
     // original -> gobgp:deferral-time
@@ -2564,7 +2564,7 @@ pub struct RouteTargetMembershipConfig {
     pub deferral_time: Option<u16>,
 }
 // struct for container gobgp:route-target-membership.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteTargetMembership {
     // original -> gobgp:route-target-membership-config
@@ -2574,7 +2574,7 @@ pub struct RouteTargetMembership {
 }
 // struct for container bgp-mp:l2vpn-evpn.
 // BGP EVPN configuration options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct L2vpnEvpn {
     // original -> bgp-mp:prefix-limit
@@ -2585,7 +2585,7 @@ pub struct L2vpnEvpn {
 }
 // struct for container bgp-mp:l2vpn-vpls.
 // BGP-signalled VPLS configuration options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct L2vpnVpls {
     // original -> bgp-mp:prefix-limit
@@ -2596,7 +2596,7 @@ pub struct L2vpnVpls {
 }
 // struct for container bgp-mp:l3vpn-ipv6-multicast.
 // Multicast IPv6 L3VPN configuration options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct L3vpnIpv6Multicast {
     // original -> bgp-mp:prefix-limit
@@ -2607,7 +2607,7 @@ pub struct L3vpnIpv6Multicast {
 }
 // struct for container bgp-mp:l3vpn-ipv4-multicast.
 // Multicast IPv4 L3VPN configuration options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct L3vpnIpv4Multicast {
     // original -> bgp-mp:prefix-limit
@@ -2618,7 +2618,7 @@ pub struct L3vpnIpv4Multicast {
 }
 // struct for container bgp-mp:l3vpn-ipv6-unicast.
 // Unicast IPv6 L3VPN configuration options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct L3vpnIpv6Unicast {
     // original -> bgp-mp:prefix-limit
@@ -2629,7 +2629,7 @@ pub struct L3vpnIpv6Unicast {
 }
 // struct for container bgp-mp:l3vpn-ipv4-unicast.
 // Unicast IPv4 L3VPN configuration options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct L3vpnIpv4Unicast {
     // original -> bgp-mp:prefix-limit
@@ -2640,7 +2640,7 @@ pub struct L3vpnIpv4Unicast {
 }
 // struct for container bgp-mp:ipv6-labelled-unicast.
 // IPv6 Labelled Unicast configuration options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ipv6LabelledUnicast {
     // original -> bgp-mp:prefix-limit
@@ -2651,7 +2651,7 @@ pub struct Ipv6LabelledUnicast {
 }
 // struct for container bgp-mp:ipv4-labelled-unicast.
 // IPv4 Labelled Unicast configuration options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ipv4LabelledUnicast {
     // original -> bgp-mp:prefix-limit
@@ -2663,7 +2663,7 @@ pub struct Ipv4LabelledUnicast {
 // struct for container bgp-mp:state.
 // State information for common IPv4 and IPv6 unicast
 // parameters.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ipv6UnicastState {
     // original -> bgp-mp:send-default-route
@@ -2675,7 +2675,7 @@ pub struct Ipv6UnicastState {
 // struct for container bgp-mp:config.
 // Configuration parameters for common IPv4 and IPv6 unicast
 // AFI-SAFI options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ipv6UnicastConfig {
     // original -> bgp-mp:send-default-route
@@ -2686,7 +2686,7 @@ pub struct Ipv6UnicastConfig {
 }
 // struct for container bgp-mp:ipv6-unicast.
 // IPv6 unicast configuration options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ipv6Unicast {
     // original -> bgp-mp:prefix-limit
@@ -2706,7 +2706,7 @@ pub struct Ipv6Unicast {
 // struct for container bgp-mp:state.
 // State information for common IPv4 and IPv6 unicast
 // parameters.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ipv4UnicastState {
     // original -> bgp-mp:send-default-route
@@ -2718,7 +2718,7 @@ pub struct Ipv4UnicastState {
 // struct for container bgp-mp:config.
 // Configuration parameters for common IPv4 and IPv6 unicast
 // AFI-SAFI options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ipv4UnicastConfig {
     // original -> bgp-mp:send-default-route
@@ -2730,7 +2730,7 @@ pub struct Ipv4UnicastConfig {
 // struct for container bgp-mp:state.
 // State information relating to the prefix-limit for the
 // AFI-SAFI.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PrefixLimitState {
     // original -> bgp-mp:max-prefixes
@@ -2756,7 +2756,7 @@ pub struct PrefixLimitState {
 // struct for container bgp-mp:config.
 // Configuration parameters relating to the prefix
 // limit for the AFI-SAFI.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PrefixLimitConfig {
     // original -> bgp-mp:max-prefixes
@@ -2782,7 +2782,7 @@ pub struct PrefixLimitConfig {
 // struct for container bgp-mp:prefix-limit.
 // Configure the maximum number of prefixes that will be
 // accepted from a peer.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PrefixLimit {
     // original -> bgp-mp:prefix-limit-config
@@ -2796,7 +2796,7 @@ pub struct PrefixLimit {
 }
 // struct for container bgp-mp:ipv4-unicast.
 // IPv4 unicast configuration options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ipv4Unicast {
     // original -> bgp-mp:prefix-limit
@@ -2815,7 +2815,7 @@ pub struct Ipv4Unicast {
 }
 // struct for container rpol:state.
 // Operational state for routing policy.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyPolicyState {
     // original -> rpol:import-policy
@@ -2845,7 +2845,7 @@ pub struct ApplyPolicyState {
 }
 // struct for container rpol:config.
 // Policy configuration data.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyPolicyConfig {
     // original -> rpol:import-policy
@@ -2878,7 +2878,7 @@ pub struct ApplyPolicyConfig {
 // Import and export policies are with respect to the local
 // routing table, i.e., export (send) and import (receive),
 // depending on the context.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyPolicy {
     // original -> rpol:apply-policy-config
@@ -2890,7 +2890,7 @@ pub struct ApplyPolicy {
 }
 // struct for container bgp-mp:state.
 // State information relating to the AFI-SAFI.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AfiSafiState {
     // original -> bgp-mp:afi-safi-name
@@ -2917,7 +2917,7 @@ pub struct AfiSafiState {
 }
 // struct for container bgp-mp:config.
 // Configuration parameters for the AFI-SAFI.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AfiSafiConfig {
     // original -> bgp-mp:afi-safi-name
@@ -2932,7 +2932,7 @@ pub struct AfiSafiConfig {
 }
 // struct for container bgp-mp:state.
 // State information for BGP graceful-restart.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MpGracefulRestartState {
     // original -> bgp-mp:enabled
@@ -2964,7 +2964,7 @@ pub struct MpGracefulRestartState {
 }
 // struct for container bgp-mp:config.
 // Configuration options for BGP graceful-restart.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MpGracefulRestartConfig {
     // original -> bgp-mp:enabled
@@ -2975,7 +2975,7 @@ pub struct MpGracefulRestartConfig {
 }
 // struct for container bgp-mp:graceful-restart.
 // Parameters relating to BGP graceful-restart.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MpGracefulRestart {
     // original -> bgp-mp:mp-graceful-restart-config
@@ -2988,7 +2988,7 @@ pub struct MpGracefulRestart {
 // struct for container bgp-mp:afi-safi.
 // AFI,SAFI configuration available for the
 // neighbour or group.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AfiSafi {
     // original -> bgp-mp:afi-safi-name
@@ -3076,7 +3076,7 @@ pub struct AfiSafi {
 }
 // struct for container bgp:state.
 // State information associated with graceful-restart.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GracefulRestartState {
     // original -> bgp:enabled
@@ -3149,7 +3149,7 @@ pub struct GracefulRestartState {
 }
 // struct for container bgp:config.
 // Configuration parameters relating to graceful-restart.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GracefulRestartConfig {
     // original -> bgp:enabled
@@ -3197,7 +3197,7 @@ pub struct GracefulRestartConfig {
 }
 // struct for container bgp:graceful-restart.
 // Parameters relating the graceful restart mechanism for BGP.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GracefulRestart {
     // original -> bgp:graceful-restart-config
@@ -3209,7 +3209,7 @@ pub struct GracefulRestart {
 }
 // struct for container bgp-mp:state.
 // State information relating to iBGP multipath.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IbgpState {
     // original -> bgp-mp:maximum-paths
@@ -3220,7 +3220,7 @@ pub struct IbgpState {
 }
 // struct for container bgp-mp:config.
 // Configuration parameters relating to iBGP multipath.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IbgpConfig {
     // original -> bgp-mp:maximum-paths
@@ -3231,7 +3231,7 @@ pub struct IbgpConfig {
 }
 // struct for container bgp-mp:ibgp.
 // Multipath parameters for iBGP.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ibgp {
     // original -> bgp-mp:ibgp-config
@@ -3243,7 +3243,7 @@ pub struct Ibgp {
 }
 // struct for container bgp-mp:state.
 // State information relating to eBGP multipath.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EbgpState {
     // original -> bgp-mp:allow-multiple-as
@@ -3261,7 +3261,7 @@ pub struct EbgpState {
 }
 // struct for container bgp-mp:config.
 // Configuration parameters relating to eBGP multipath.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EbgpConfig {
     // original -> bgp-mp:allow-multiple-as
@@ -3279,7 +3279,7 @@ pub struct EbgpConfig {
 }
 // struct for container bgp-mp:ebgp.
 // Multipath parameters for eBGP.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ebgp {
     // original -> bgp-mp:ebgp-config
@@ -3291,7 +3291,7 @@ pub struct Ebgp {
 }
 // struct for container bgp-mp:state.
 // State parameters relating to multipath.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct UseMultiplePathsState {
     // original -> bgp-mp:enabled
@@ -3303,7 +3303,7 @@ pub struct UseMultiplePathsState {
 }
 // struct for container bgp-mp:config.
 // Configuration parameters relating to multipath.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct UseMultiplePathsConfig {
     // original -> bgp-mp:enabled
@@ -3316,7 +3316,7 @@ pub struct UseMultiplePathsConfig {
 // struct for container bgp-mp:use-multiple-paths.
 // Parameters related to the use of multiple paths for the
 // same NLRI.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct UseMultiplePaths {
     // original -> bgp-mp:use-multiple-paths-config
@@ -3334,7 +3334,7 @@ pub struct UseMultiplePaths {
 }
 // struct for container bgp:state.
 // State information relating to the BGP confederations.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ConfederationState {
     // original -> bgp:enabled
@@ -3355,7 +3355,7 @@ pub struct ConfederationState {
 }
 // struct for container bgp:config.
 // Configuration parameters relating to BGP confederations.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ConfederationConfig {
     // original -> bgp:enabled
@@ -3377,7 +3377,7 @@ pub struct ConfederationConfig {
 // struct for container bgp:confederation.
 // Parameters indicating whether the local system acts as part
 // of a BGP confederation.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Confederation {
     // original -> bgp:confederation-config
@@ -3389,7 +3389,7 @@ pub struct Confederation {
 }
 // struct for container bgp:state.
 // State information relating to the default route distance.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DefaultRouteDistanceState {
     // original -> bgp:external-route-distance
@@ -3406,7 +3406,7 @@ pub struct DefaultRouteDistanceState {
 // struct for container bgp:config.
 // Configuration parameters relating to the default route
 // distance.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DefaultRouteDistanceConfig {
     // original -> bgp:external-route-distance
@@ -3424,7 +3424,7 @@ pub struct DefaultRouteDistanceConfig {
 // Administrative distance (or preference) assigned to
 // routes received from different sources
 // (external, internal, and local).
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DefaultRouteDistance {
     // original -> bgp:default-route-distance-config
@@ -3437,7 +3437,7 @@ pub struct DefaultRouteDistance {
 }
 // struct for container bgp-mp:state.
 // State information for the route selection options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteSelectionOptionsState {
     // original -> bgp-mp:always-compare-med
@@ -3490,7 +3490,7 @@ pub struct RouteSelectionOptionsState {
 // struct for container bgp-mp:config.
 // Configuration parameters relating to route selection
 // options.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteSelectionOptionsConfig {
     // original -> bgp-mp:always-compare-med
@@ -3542,7 +3542,7 @@ pub struct RouteSelectionOptionsConfig {
 }
 // struct for container bgp-mp:route-selection-options.
 // Parameters relating to options for route selection.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteSelectionOptions {
     // original -> bgp-mp:route-selection-options-config
@@ -3555,7 +3555,7 @@ pub struct RouteSelectionOptions {
 }
 // struct for container bgp:state.
 // State information relating to the global BGP router.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalState {
     // original -> bgp:as
@@ -3590,7 +3590,7 @@ pub struct GlobalState {
 }
 // struct for container bgp:config.
 // Configuration parameters relating to the global BGP router.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalConfig {
     // original -> bgp:as
@@ -3617,7 +3617,7 @@ pub struct GlobalConfig {
 }
 // struct for container bgp:global.
 // Global configuration for the BGP router.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Global {
     // original -> bgp:global-config
@@ -3663,7 +3663,7 @@ pub struct Global {
 }
 // struct for container bgp:bgp.
 // Top-level configuration and state for the BGP router.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Bgp {
     // original -> bgp:global
@@ -3696,7 +3696,7 @@ pub struct Bgp {
     pub dynamic_neighbors: Option<Vec<DynamicNeighbor>>,
 }
 // struct for container gobgp:set-large-community-method.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SetLargeCommunityMethod {
     // original -> gobgp:communities
@@ -3704,7 +3704,7 @@ pub struct SetLargeCommunityMethod {
     pub communities_list: Option<Vec<String>>,
 }
 // struct for container gobgp:set-large-community.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SetLargeCommunity {
     // original -> gobgp:set-large-community-method
@@ -3716,7 +3716,7 @@ pub struct SetLargeCommunity {
 // struct for container bgp-pol:set-ext-community-method.
 // Option to set communities using an inline list or
 // reference to an existing defined set.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SetExtCommunityMethod {
     // original -> bgp-pol:communities
@@ -3735,7 +3735,7 @@ pub struct SetExtCommunityMethod {
 // Action to set the extended community attributes of the
 // route, along with options to modify how the community is
 // modified.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SetExtCommunity {
     // original -> bgp-pol:set-ext-community-method
@@ -3754,7 +3754,7 @@ pub struct SetExtCommunity {
 // struct for container bgp-pol:set-community-method.
 // Option to set communities using an inline list or
 // reference to an existing defined set.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SetCommunityMethod {
     // original -> bgp-pol:communities
@@ -3771,7 +3771,7 @@ pub struct SetCommunityMethod {
 // struct for container bgp-pol:set-community.
 // action to set the community attributes of the route, along
 // with options to modify how the community is modified.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SetCommunity {
     // original -> bgp-pol:set-community-method
@@ -3789,7 +3789,7 @@ pub struct SetCommunity {
 // struct for container bgp-pol:set-as-path-prepend.
 // action to prepend local AS number to the AS-path a
 // specified number of times.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SetAsPathPrepend {
     // original -> bgp-pol:repeat-n
@@ -3806,7 +3806,7 @@ pub struct SetAsPathPrepend {
 // struct for container bgp-pol:bgp-actions.
 // Definitions for policy action statements that
 // change BGP-specific attributes of the route.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BgpActions {
     // original -> bgp-pol:set-as-path-prepend
@@ -3851,7 +3851,7 @@ pub struct BgpActions {
 // struct for container rpol:igp-actions.
 // Actions to set IGP route attributes; these actions
 // apply to multiple IGPs.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IgpActions {
     // original -> rpol:set-tag
@@ -3862,7 +3862,7 @@ pub struct IgpActions {
 // struct for container rpol:actions.
 // Action statements for this policy
 // statement.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Actions {
     // original -> rpol:route-disposition
@@ -3882,7 +3882,7 @@ pub struct Actions {
     pub bgp_actions: Option<BgpActions>,
 }
 // struct for container gobgp:match-large-community-set.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MatchLargeCommunitySet {
     // original -> gobgp:large-community-set
@@ -3897,7 +3897,7 @@ pub struct MatchLargeCommunitySet {
 // struct for container bgp-pol:as-path-length.
 // Value and comparison operations for conditions based on the
 // length of the AS path in the route update.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AsPathLength {
     // original -> ptypes:operator
@@ -3910,7 +3910,7 @@ pub struct AsPathLength {
 // struct for container bgp-pol:community-count.
 // Value and comparison operations for conditions based on the
 // number of communities in the route update.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CommunityCount {
     // original -> ptypes:operator
@@ -3923,7 +3923,7 @@ pub struct CommunityCount {
 // struct for container bgp-pol:match-as-path-set.
 // Match a referenced as-path set according to the logic
 // defined in the match-set-options leaf.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MatchAsPathSet {
     // original -> bgp-pol:as-path-set
@@ -3939,7 +3939,7 @@ pub struct MatchAsPathSet {
 // struct for container bgp-pol:match-ext-community-set.
 // Match a referenced extended community-set according to the
 // logic defined in the match-set-options leaf.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MatchExtCommunitySet {
     // original -> bgp-pol:ext-community-set
@@ -3955,7 +3955,7 @@ pub struct MatchExtCommunitySet {
 // struct for container bgp-pol:match-community-set.
 // Match a referenced community-set according to the logic
 // defined in the match-set-options leaf.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MatchCommunitySet {
     // original -> bgp-pol:community-set
@@ -3972,7 +3972,7 @@ pub struct MatchCommunitySet {
 // Policy conditions for matching
 // BGP-specific defined sets or comparing BGP-specific
 // attributes.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BgpConditions {
     // original -> bgp-pol:match-community-set
@@ -4040,13 +4040,13 @@ pub struct BgpConditions {
 }
 // struct for container rpol:igp-conditions.
 // Policy conditions for IGP attributes.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IgpConditions {}
 // struct for container rpol:match-tag-set.
 // Match a referenced tag set according to the logic defined
 // in the match-options-set leaf.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MatchTagSet {
     // original -> rpol:tag-set
@@ -4064,7 +4064,7 @@ pub struct MatchTagSet {
 // struct for container rpol:match-neighbor-set.
 // Match a referenced neighbor set according to the logic
 // defined in the match-set-options-leaf.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MatchNeighborSet {
     // original -> rpol:neighbor-set
@@ -4082,7 +4082,7 @@ pub struct MatchNeighborSet {
 // struct for container rpol:match-prefix-set.
 // Match a referenced prefix-set according to the logic
 // defined in the match-set-options leaf.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MatchPrefixSet {
     // original -> rpol:prefix-set
@@ -4100,7 +4100,7 @@ pub struct MatchPrefixSet {
 // struct for container rpol:conditions.
 // Condition statements for this
 // policy statement.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Conditions {
     // original -> rpol:call-policy
@@ -4153,7 +4153,7 @@ pub struct Conditions {
 // within a policy definition.  They are evaluated in
 // the order specified (see the description of policy
 // evaluation at the top of this module.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Statement {
     // original -> rpol:name
@@ -4173,7 +4173,7 @@ pub struct Statement {
 // name.  These policy definitions are expected to be
 // referenced (by name) in policy chains specified in import
 // or export configuration statements.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyDefinition {
     // original -> rpol:name
@@ -4185,7 +4185,7 @@ pub struct PolicyDefinition {
     pub statements: Option<Vec<Statement>>,
 }
 // struct for container gobgp:large-community-set.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LargeCommunitySet {
     // original -> gobgp:large-community-set-name
@@ -4198,7 +4198,7 @@ pub struct LargeCommunitySet {
 }
 // struct for container bgp-pol:as-path-set.
 // Definitions for AS path sets.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AsPathSet {
     // original -> bgp-pol:as-path-set-name
@@ -4213,7 +4213,7 @@ pub struct AsPathSet {
 }
 // struct for container bgp-pol:ext-community-set.
 // Definitions for extended community sets.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtCommunitySet {
     // original -> bgp-pol:ext-community-set-name
@@ -4228,7 +4228,7 @@ pub struct ExtCommunitySet {
 }
 // struct for container bgp-pol:community-set.
 // Definitions for community sets.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CommunitySet {
     // original -> bgp-pol:community-set-name
@@ -4243,7 +4243,7 @@ pub struct CommunitySet {
 }
 // struct for container bgp-pol:bgp-defined-sets.
 // BGP-related set definitions for policy match conditions.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BgpDefinedSets {
     // original -> bgp-pol:community-sets
@@ -4264,7 +4264,7 @@ pub struct BgpDefinedSets {
 }
 // struct for container rpol:tag.
 // list of tags that are part of the tag set.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Tag {
     // original -> rpol:value
@@ -4273,7 +4273,7 @@ pub struct Tag {
 }
 // struct for container rpol:tag-set.
 // Definitions for tag sets.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TagSet {
     // original -> rpol:tag-set-name
@@ -4288,7 +4288,7 @@ pub struct TagSet {
 }
 // struct for container rpol:neighbor-set.
 // Definitions for neighbor sets.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NeighborSet {
     // original -> rpol:neighbor-set-name
@@ -4303,7 +4303,7 @@ pub struct NeighborSet {
 }
 // struct for container rpol:prefix.
 // List of prefix expressions that are part of the set.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Prefix {
     // original -> rpol:ip-prefix
@@ -4331,7 +4331,7 @@ pub struct Prefix {
 }
 // struct for container rpol:prefix-set.
 // List of the defined prefix sets.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PrefixSet {
     // original -> rpol:prefix-set-name
@@ -4347,7 +4347,7 @@ pub struct PrefixSet {
 // struct for container rpol:defined-sets.
 // Predefined sets of attributes used in policy match
 // statements.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DefinedSets {
     // original -> rpol:prefix-sets
@@ -4369,7 +4369,7 @@ pub struct DefinedSets {
 }
 // struct for container rpol:routing-policy.
 // top-level container for all routing policy configuration.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingPolicy {
     // original -> rpol:defined-sets
