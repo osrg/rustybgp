@@ -2462,7 +2462,26 @@ pub(crate) fn attr_from_api(a: api::Attribute) -> Result<Attribute, Error> {
         api::attribute::Attr::AsPath(p) => {
             let mut c = Cursor::new(Vec::new());
             for s in p.segments {
-                let _ = c.write_u8(s.r#type as u8);
+                // Reject segments that would be malformed on the wire
+                // (RFC 7606 Section 7.2): an unknown segment type or a zero
+                // Path Segment Length. The length field is one octet, so a
+                // segment holds at most 255 AS numbers.
+                let seg_type = s.r#type;
+                if !(Attribute::AS_PATH_TYPE_SET as i32..=Attribute::AS_PATH_TYPE_CONFED_SET as i32)
+                    .contains(&seg_type)
+                {
+                    return Err(Error::InvalidArgument(format!(
+                        "invalid AS_PATH segment type: {}",
+                        seg_type
+                    )));
+                }
+                if s.numbers.is_empty() || s.numbers.len() > u8::MAX as usize {
+                    return Err(Error::InvalidArgument(format!(
+                        "invalid AS_PATH segment length: {}",
+                        s.numbers.len()
+                    )));
+                }
+                let _ = c.write_u8(seg_type as u8);
                 let _ = c.write_u8(s.numbers.len() as u8);
                 for n in s.numbers {
                     c.write_u32::<NetworkEndian>(n).unwrap();
@@ -5272,6 +5291,63 @@ mod tests {
     fn mp_reach_rejects_invalid_nexthop() {
         let bad = mp_reach_api_v4("not-an-ip");
         assert!(attr_from_api(bad).is_err());
+    }
+
+    fn as_path_api(segments: Vec<(i32, Vec<u32>)>) -> api::Attribute {
+        api::Attribute {
+            attr: Some(api::attribute::Attr::AsPath(api::AsPathAttribute {
+                segments: segments
+                    .into_iter()
+                    .map(|(r#type, numbers)| api::AsSegment { r#type, numbers })
+                    .collect(),
+            })),
+        }
+    }
+
+    #[test]
+    fn as_path_accepts_valid_segments() {
+        // An empty AS_PATH has no segments at all.
+        let attr = attr_from_api(as_path_api(vec![])).unwrap();
+        assert!(attr.binary().unwrap().is_empty());
+
+        let numbers: Vec<u32> = (0..255).map(|i| 65000 + i).collect();
+        let attr = attr_from_api(as_path_api(vec![
+            (Attribute::AS_PATH_TYPE_SEQ as i32, numbers),
+            (Attribute::AS_PATH_TYPE_SET as i32, vec![65100]),
+        ]))
+        .unwrap();
+        let b = attr.binary().unwrap();
+        assert_eq!(b.len(), 2 + 255 * 4 + 2 + 4);
+        assert_eq!(&b[..2], &[Attribute::AS_PATH_TYPE_SEQ, 255]);
+        assert_eq!(
+            &b[2 + 255 * 4..2 + 255 * 4 + 2],
+            &[Attribute::AS_PATH_TYPE_SET, 1]
+        );
+    }
+
+    #[test]
+    fn as_path_rejects_malformed_segments() {
+        let seq = Attribute::AS_PATH_TYPE_SEQ as i32;
+        for segments in [
+            // Zero Path Segment Length (RFC 7606 Section 7.2).
+            vec![(seq, vec![])],
+            vec![(seq, vec![65000]), (seq, vec![])],
+            // More AS numbers than the one-octet length field can hold.
+            vec![(seq, (0..256).collect())],
+            // Unknown segment types; 258 must not wrap to AS_SEQUENCE.
+            vec![(0, vec![65000])],
+            vec![(5, vec![65000])],
+            vec![(258, vec![65000])],
+            vec![(-1, vec![65000])],
+        ] {
+            assert!(
+                matches!(
+                    attr_from_api(as_path_api(segments.clone())),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "{segments:?} must be rejected"
+            );
+        }
     }
 
     // ─── Extended Community round-trip ───────────────────────────────────────
