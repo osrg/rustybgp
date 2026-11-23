@@ -49,7 +49,7 @@ pub(super) async fn apply_peer_policy_config(
         }
 
         let (ptable, (import, export)) = convert::policy_table_from_config(config)?;
-        server.replace_policies(tables, ptable, import, export);
+        server.replace_policies(tables, ptable, import, export)?;
 
         for n in config.dynamic_neighbors.iter().flatten() {
             let Some((prefix, name)) = n

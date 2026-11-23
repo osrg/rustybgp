@@ -1032,22 +1032,39 @@ impl Global {
 
     /// Replaces the whole policy table and the global import and export
     /// assignments.
+    ///
+    /// Each per-peer export override is rebuilt against the new table with
+    /// the same policy names and default action, as GoBGP's SetPolicies
+    /// does. If a name is not in the new table, nothing is replaced and an
+    /// error is returned.
     fn replace_policies(
         &mut self,
         tables: &TableManager,
         ptable: table::PolicyTable,
         import: Option<Arc<table::PolicyAssignment>>,
         export: Option<Arc<table::PolicyAssignment>>,
-    ) {
-        self.ptable = ptable;
-        // A full policy reload invalidates any per-peer export override built
-        // against the old table; clear all of them rather than leave a peer
-        // holding a stale Arc<PolicyAssignment> disconnected from the new table.
+    ) -> Result<(), Error> {
+        let mut rebuilt = Vec::new();
         for peer in self.peers.values() {
-            peer.state.export_policy.store(None);
+            if let Some(old) = peer.state.export_policy.load_full() {
+                let names = old.policies.iter().map(|p| p.name.to_string()).collect();
+                let new = ptable.build_assignment(
+                    None,
+                    &old.name,
+                    table::PolicyDirection::Export,
+                    old.disposition,
+                    names,
+                )?;
+                rebuilt.push((peer, new));
+            }
         }
+        for (peer, new) in rebuilt {
+            peer.state.export_policy.store(Some(new));
+        }
+        self.ptable = ptable;
         tables.import_policy.store(import);
         tables.export_policy.store(export);
+        Ok(())
     }
 
     fn add_peer_group(&mut self, name: String, pg: PeerGroup) -> Result<(), Error> {
@@ -4539,6 +4556,68 @@ local-address = "{local}"
         let assignment = peer.state.export_policy.load_full().unwrap();
         assert_eq!(assignment.policies.len(), 1);
         assert_eq!(assignment.policies[0].name.as_ref(), "p1");
+    }
+
+    #[tokio::test]
+    async fn set_policies_rebuilds_per_peer_export_policy() {
+        let svc = make_grpc_service();
+        let remote_addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        {
+            let mut g = svc.global.write().await;
+            add_simple_policy(&mut g, "p1", table::Disposition::Reject);
+            let mut params = default_peer_params(remote_addr);
+            params.export_policy = Some((table::Disposition::Reject, vec!["p1".to_string()]));
+            g.add_peer(params, None).unwrap();
+        }
+        let policy = |name: &str| api::Policy {
+            name: name.to_string(),
+            statements: vec![api::Statement {
+                name: format!("{name}-new"),
+                ..Default::default()
+            }],
+        };
+        let export_policy = |svc: &GrpcService| {
+            let g = svc.global.try_read().unwrap();
+            g.peers[&remote_addr]
+                .state
+                .export_policy
+                .load_full()
+                .unwrap()
+        };
+
+        svc.set_policies(tonic::Request::new(api::SetPoliciesRequest {
+            policies: vec![policy("p1")],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let a = export_policy(&svc);
+        assert_eq!(a.disposition, table::Disposition::Reject);
+        assert_eq!(a.policies.len(), 1);
+        assert_eq!(a.policies[0].statements[0].name.as_ref(), "p1-new");
+
+        // p1 is gone from the new table: nothing is replaced.
+        assert!(
+            svc.set_policies(tonic::Request::new(api::SetPoliciesRequest {
+                policies: vec![policy("p2")],
+                ..Default::default()
+            }))
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            export_policy(&svc).policies[0].statements[0].name.as_ref(),
+            "p1-new"
+        );
+        assert!(
+            svc.global
+                .read()
+                .await
+                .ptable
+                .iter_policies("p2".to_string())
+                .next()
+                .is_none()
+        );
     }
 
     #[tokio::test]

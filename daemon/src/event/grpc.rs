@@ -2777,7 +2777,7 @@ impl GoBgpService for GrpcService {
             new_ptable,
             new_import,
             new_export,
-        );
+        )?;
         Ok(tonic::Response::new(api::SetPoliciesResponse {}))
     }
     async fn add_defined_set(
