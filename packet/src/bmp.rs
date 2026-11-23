@@ -551,8 +551,10 @@ mod tests {
     }
 
     // --- RouteMonitoring IPv6 Reach ---
-    // RustyBGP uses FLAG_EXTENDED (0x90) for MP_REACH_NLRI; GoBGP uses 0x80.
-    // All other bytes are identical to GoBGP output.
+    // RustyBGP uses FLAG_EXTENDED (0x90) for MP_REACH_NLRI and encodes it as
+    // the first path attribute (RFC 7606 Section 5.1); GoBGP uses 0x80 and
+    // encodes it after ORIGIN and AS_PATH. All other bytes are identical to
+    // GoBGP output.
     #[test]
     fn route_monitoring_ipv6_reach() {
         let msg = Message::RouteMonitoring {
@@ -562,7 +564,7 @@ mod tests {
         };
         assert_eq!(
             encode(&msg),
-            "0300000074000080000000000000000020010db80000000000000000000000010000fdea0a0000020000000000000000ffffffffffffffffffffffffffffffff0044020000002d4001010040020602010000fde9900e001c0002011020010db8000000000000000000000001003020010db80001",
+            "0300000074000080000000000000000020010db80000000000000000000000010000fdea0a0000020000000000000000ffffffffffffffffffffffffffffffff0044020000002d900e001c0002011020010db8000000000000000000000001003020010db800014001010040020602010000fde9",
         );
     }
 

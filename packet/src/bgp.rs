@@ -2839,12 +2839,13 @@ impl PeerCodec {
             let pos_attr_len = dst.as_mut().len();
             dst.put_u16(0);
             let pos_attr = dst.as_mut().len();
-            self.encode_path_attrs(attr, dst);
-            if let Some(a) = &nexthop_attr {
-                a.encode_wire(dst);
-            }
-            debug_assert!(dst.as_mut().len() - pos_attr <= attrs_max_len);
             let n_consumed = if via_mp {
+                // RFC 7606 Section 5.1: "The MP_REACH_NLRI or
+                // MP_UNREACH_NLRI attribute (if present) SHALL be encoded
+                // as the very first path attribute in an UPDATE message."
+                // The NLRIs are written before the other attributes, so
+                // keep attrs_max_len bytes free for them.
+                //
                 // always use extended length
                 dst.put_u8(
                     Attribute::canonical_flags(Attribute::MP_REACH).unwrap()
@@ -2859,13 +2860,22 @@ impl PeerCodec {
                 dst.put_slice(&mp_nexthop);
                 // SNPA padding
                 dst.put_u8(0);
-                let (_, n) = self.encode_nlri_list(pos_head, dst, &entries[start..], addpath, 0);
+                let (_, n) =
+                    self.encode_nlri_list(pos_head, dst, &entries[start..], addpath, attrs_max_len);
                 let mp_len = dst.as_mut().len() - pos_mp_len - 2;
                 (&mut dst.as_mut()[pos_mp_len..]).write_u16::<NetworkEndian>(mp_len as u16)?;
+                let pos_other_attrs = dst.as_mut().len();
+                self.encode_path_attrs(attr, dst);
+                debug_assert!(dst.as_mut().len() - pos_other_attrs <= attrs_max_len);
                 let attr_len = dst.as_mut().len() - pos_attr;
                 (&mut dst.as_mut()[pos_attr_len..]).write_u16::<NetworkEndian>(attr_len as u16)?;
                 n
             } else {
+                self.encode_path_attrs(attr, dst);
+                if let Some(a) = &nexthop_attr {
+                    a.encode_wire(dst);
+                }
+                debug_assert!(dst.as_mut().len() - pos_attr <= attrs_max_len);
                 let attr_len = dst.as_mut().len() - pos_attr;
                 (&mut dst.as_mut()[pos_attr_len..]).write_u16::<NetworkEndian>(attr_len as u16)?;
                 let (_, n) = self.encode_nlri_list(pos_head, dst, &entries[start..], addpath, 0);
@@ -7187,6 +7197,103 @@ mod update_tests {
             }) => Some(r.entries),
             _ => None,
         });
+    }
+
+    // Returns the type code of the first path attribute of each UPDATE in
+    // `raw`.
+    fn first_attr_codes(raw: &[u8]) -> Vec<u8> {
+        let mut codes = Vec::new();
+        let mut pos = 0;
+        while pos < raw.len() {
+            let msg_len = u16::from_be_bytes([raw[pos + 16], raw[pos + 17]]) as usize;
+            let withdrawn_len = u16::from_be_bytes([raw[pos + 19], raw[pos + 20]]) as usize;
+            // The type code follows the flags of the first attribute.
+            codes.push(raw[pos + 19 + 2 + withdrawn_len + 2 + 1]);
+            pos += msg_len;
+        }
+        codes
+    }
+
+    #[test]
+    fn encode_reach_puts_mp_reach_first() {
+        // A large COMMUNITY makes the attributes written after the NLRIs
+        // take a good part of each message.
+        let mut attrs = (*ipv6_attrs_no_nh()).clone();
+        attrs.insert(Attribute::new_with_bin(Attribute::COMMUNITY, vec![0xfd; 4 * 200]).unwrap());
+        let attrs = Arc::new(attrs);
+        let mut codec = ipv6_codec();
+        let entries = ipv6_entries(1500);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6,
+            entries: entries.clone(),
+            nexthop: Some(Nexthop::V6("2001:db8::1".parse().unwrap())),
+            attr: attrs.clone(),
+        });
+        let mut raw = Vec::new();
+        let wire_count = codec.encode_to(&msg, &mut raw).unwrap();
+        assert!(wire_count > 1);
+        check_message_sizes(&raw);
+        assert_eq!(
+            first_attr_codes(&raw),
+            vec![Attribute::MP_REACH; wire_count]
+        );
+        let mut buf = BytesMut::from(raw.as_slice());
+        let mut all_nlri = Vec::new();
+        for m in decode_all(&mut buf, &mut codec) {
+            let ParsedMessage::Update(ParsedUpdate::Routes {
+                mp_reach: Some(r),
+                attrs: got,
+                ..
+            }) = m
+            else {
+                panic!("expected MP_REACH");
+            };
+            assert_eq!(PathAttributes::new(got), *attrs);
+            all_nlri.extend(r.entries);
+        }
+        assert_eq!(all_nlri, entries);
+    }
+
+    #[test]
+    fn encode_reach_puts_mp_reach_first_two_byte_as() {
+        // For a two-octet AS peer, AS_PATH is sent with AS4_PATH after the
+        // NLRIs. The space kept for them is an upper bound, so every
+        // message must still fit.
+        let caps = vec![Capability::MultiProtocol(Family::IPV6)];
+        let mut codec = PeerCodec::negotiate(&caps, &caps);
+        let mut attrs = (*ipv6_attrs_no_nh()).clone();
+        let wide: Vec<u32> = (0..100).map(|i| 400000 + i).collect();
+        let mut as_path = vec![Attribute::AS_PATH_TYPE_SEQ, wide.len() as u8];
+        for asn in &wide {
+            as_path.extend_from_slice(&asn.to_be_bytes());
+        }
+        attrs.insert(Attribute::new_with_bin(Attribute::AS_PATH, as_path).unwrap());
+        let entries = ipv6_entries(1500);
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV6,
+            entries: entries.clone(),
+            nexthop: Some(Nexthop::V6("2001:db8::1".parse().unwrap())),
+            attr: Arc::new(attrs),
+        });
+        let mut raw = Vec::new();
+        let wire_count = codec.encode_to(&msg, &mut raw).unwrap();
+        assert!(wire_count > 1);
+        check_message_sizes(&raw);
+        assert_eq!(
+            first_attr_codes(&raw),
+            vec![Attribute::MP_REACH; wire_count]
+        );
+        let mut buf = BytesMut::from(raw.as_slice());
+        let all_nlri: Vec<PathNlri> = decode_all(&mut buf, &mut codec)
+            .into_iter()
+            .flat_map(|m| match m {
+                ParsedMessage::Update(ParsedUpdate::Routes {
+                    mp_reach: Some(r), ..
+                }) => r.entries,
+                _ => panic!("expected MP_REACH"),
+            })
+            .collect();
+        assert_eq!(all_nlri, entries);
     }
 
     #[test]
