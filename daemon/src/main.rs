@@ -85,7 +85,10 @@ async fn main() -> Result<(), std::io::Error> {
         )
         .get_matches();
 
-    let conf = if let Some(conf) = args.get_one::<String>("config") {
+    let conf_path = args
+        .get_one::<String>("config")
+        .map(std::path::PathBuf::from);
+    let conf = if let Some(conf) = conf_path.as_ref() {
         let conf: config::BgpConfig = config::read_from_file(conf).expect("invalid configuration");
         Some(conf)
     } else {
@@ -130,6 +133,7 @@ async fn main() -> Result<(), std::io::Error> {
 
     event::main(
         conf,
+        conf_path,
         args.get_flag("any"),
         args.get_flag("graceful-restart"),
         api_sockaddr,

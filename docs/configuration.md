@@ -22,3 +22,32 @@ the setting; an explicit neighbor setting takes precedence. The gRPC
 `Transport.local_address` field has the same behavior, and changing it through
 `UpdatePeer` restarts the session.
 
+
+## Reloading the configuration file
+
+Send SIGHUP to rustybgpd to reload the file given with `-f`. As in GoBGP,
+rustybgpd compares the new file with the last file that it applied, and
+applies only the changes.
+
+These sections are reloaded:
+
+- `defined-sets`
+- `policy-definitions`
+- `global.apply-policy`
+
+Changes to other sections are not applied until rustybgpd is restarted. A
+per-neighbor export policy keeps its policy names and uses the new
+definitions of those policies.
+
+Routes already in the tables are not evaluated again with the new policies.
+Run a soft reset to apply the new policies to them. GoBGP v4 runs a soft
+reset in for every peer after a policy change. rustybgpd does not, as
+proposed for GoBGP v5 (osrg/gobgp#3851).
+
+If the file cannot be read, or the new policies are not valid (for example,
+an assignment uses a policy that is not defined), nothing is changed and a
+warning is logged. The next reload compares the file with the last file that
+was applied.
+
+When rustybgpd is started without `-f`, SIGHUP is not handled and stops the
+process.

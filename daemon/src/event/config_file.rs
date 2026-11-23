@@ -18,9 +18,11 @@
 //! through the same `Global` method as the matching gRPC handler.
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use tokio::net::TcpStream;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use crate::config;
@@ -99,4 +101,143 @@ pub(super) async fn apply_peer_policy_config(
         }
     }
     Ok(())
+}
+
+/// Reloads the config file at `path` on SIGHUP. `current` is the config
+/// loaded at startup. Each reload compares the new file with the last one
+/// that was applied, as GoBGP does, and applies only what changed.
+///
+/// Only policies are reloaded: defined sets, policy definitions and the
+/// global apply-policy. Routes already in the tables are not re-evaluated;
+/// a soft reset applies the new policies to them.
+pub(super) fn spawn_reloader(
+    global: GlobalHandle,
+    tables: TableHandle,
+    path: PathBuf,
+    mut current: config::BgpConfig,
+) {
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("failed to install the SIGHUP handler: {e}");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        while hup.recv().await.is_some() {
+            log::info!("reloading config file {}", path.display());
+            let new = match config::read_from_file(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("failed to read config file {}: {e}", path.display());
+                    continue;
+                }
+            };
+            match reload(&global, &tables, &current, &new).await {
+                Ok(()) => current = new,
+                Err(e) => log::warn!("failed to reload config file {}: {e:?}", path.display()),
+            }
+        }
+    });
+}
+
+fn global_apply_policy(c: &config::BgpConfig) -> Option<&config::generate::ApplyPolicy> {
+    c.global.as_ref().and_then(|g| g.apply_policy.as_ref())
+}
+
+fn policy_changed(old: &config::BgpConfig, new: &config::BgpConfig) -> bool {
+    old.defined_sets != new.defined_sets
+        || old.policy_definitions != new.policy_definitions
+        || global_apply_policy(old) != global_apply_policy(new)
+}
+
+/// Applies the difference between `old` and `new`. On error nothing is
+/// changed, so the next reload compares against `old` again.
+async fn reload(
+    global: &GlobalHandle,
+    tables: &TableHandle,
+    old: &config::BgpConfig,
+    new: &config::BgpConfig,
+) -> Result<(), Error> {
+    if policy_changed(old, new) {
+        let (ptable, (import, export)) = convert::policy_table_from_config(new)?;
+        global
+            .write()
+            .await
+            .replace_policies(tables, ptable, import, export)?;
+        log::info!("policies are updated");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::event::Global;
+    use crate::table_manager::TableManager;
+
+    fn make_global() -> GlobalHandle {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
+        Arc::new(tokio::sync::RwLock::new(Global::new(tx, bfd_tx)))
+    }
+
+    fn conf(import_policy: &str, statement: &str) -> config::BgpConfig {
+        let text = format!(
+            r#"
+[global.config]
+as = 65001
+router-id = "192.0.2.1"
+[global.apply-policy.config]
+import-policy-list = ["{import_policy}"]
+
+[[policy-definitions]]
+name = "p1"
+[[policy-definitions.statements]]
+name = "{statement}"
+"#
+        );
+        toml::from_str(&text).unwrap()
+    }
+
+    fn import_statement(tables: &TableHandle) -> String {
+        tables.import_policy.load_full().unwrap().policies[0].statements[0]
+            .name
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn reload_policies() {
+        let global = make_global();
+        let tables: TableHandle = Arc::new(TableManager::new(1));
+        let c1 = conf("p1", "s1");
+        reload(&global, &tables, &config::BgpConfig::default(), &c1)
+            .await
+            .unwrap();
+        assert_eq!(import_statement(&tables), "s1");
+
+        // No change: the assignment is not rebuilt.
+        let before = tables.import_policy.load_full().unwrap();
+        reload(&global, &tables, &c1, &conf("p1", "s1"))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &before,
+            &tables.import_policy.load_full().unwrap()
+        ));
+
+        let c2 = conf("p1", "s2");
+        reload(&global, &tables, &c1, &c2).await.unwrap();
+        assert_eq!(import_statement(&tables), "s2");
+
+        // An unknown policy name fails and keeps the current policies.
+        assert!(
+            reload(&global, &tables, &c2, &conf("p9", "s3"))
+                .await
+                .is_err()
+        );
+        assert_eq!(import_statement(&tables), "s2");
+    }
 }

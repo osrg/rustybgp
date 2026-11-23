@@ -1326,6 +1326,7 @@ impl Global {
 
     async fn serve(
         bgp: Option<config::BgpConfig>,
+        bgp_path: Option<std::path::PathBuf>,
         any_peer: bool,
         is_restarting: bool,
         active_tx: mpsc::UnboundedSender<TcpStream>,
@@ -1549,6 +1550,10 @@ impl Global {
                 }
                 global.write().await.selection_deferral = Some(deferral);
             }
+        }
+
+        if let (Some(bgp), Some(path)) = (bgp, bgp_path) {
+            config_file::spawn_reloader(global.clone(), tables.clone(), path, bgp);
         }
 
         if any_peer {
@@ -1889,6 +1894,7 @@ pub(crate) use crate::table_manager::{
 
 pub(crate) async fn main(
     bgp: Option<config::BgpConfig>,
+    bgp_path: Option<std::path::PathBuf>,
     any_peer: bool,
     is_restarting: bool,
     api_sockaddr: SocketAddr,
@@ -1896,6 +1902,7 @@ pub(crate) async fn main(
     let (active_tx, active_rx) = mpsc::unbounded_channel();
     Global::serve(
         bgp,
+        bgp_path,
         any_peer,
         is_restarting,
         active_tx,
