@@ -563,7 +563,7 @@ mod tests {
             0,
             None,
             rustybgp_table::Source::local(),
-            Arc::new(vec![]),
+            Arc::new(rustybgp_packet::PathAttributes::default()),
             0u32,
         )
     }
@@ -651,7 +651,15 @@ mod tests {
             rustybgp_table::PeerRole::Ebgp,
         ));
         src.mark_stale();
-        (Family::RTC, nlri, 0, None, src, Arc::new(vec![]), 0u32)
+        (
+            Family::RTC,
+            nlri,
+            0,
+            None,
+            src,
+            Arc::new(rustybgp_packet::PathAttributes::default()),
+            0u32,
+        )
     }
 
     #[test]

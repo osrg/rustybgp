@@ -181,7 +181,7 @@ pub struct PathEntry {
     /// AddPath path identifier received from the peer (0 when AddPath is not in use).
     pub remote_path_id: u32,
     pub timestamp: u32,
-    pub attr: Arc<Vec<packet::Attribute>>,
+    pub attr: Arc<packet::PathAttributes>,
     pub validation: Option<RpkiValidation>,
     /// True when this path is marked stale during Graceful Restart (RFC 4724).
     pub stale: bool,
@@ -286,7 +286,7 @@ pub struct Path {
     pub local_path_id: u32,
     pub source: Arc<Source>,
     pub nexthop: Option<bgp::Nexthop>,
-    pub attr: Arc<Vec<packet::Attribute>>,
+    pub attr: Arc<packet::PathAttributes>,
 }
 
 struct RibEntry {
@@ -296,7 +296,7 @@ struct RibEntry {
     /// When import policy does not modify attributes this Arc points to the same
     /// allocation as `path.attr`, so storing it costs only a reference-count
     /// increment.
-    original_attr: Arc<Vec<packet::Attribute>>,
+    original_attr: Arc<packet::PathAttributes>,
     // There is no separate pre-import-policy nexthop. Import policy cannot
     // change the nexthop (PolicyTable::build_assignment() rejects nexthop
     // actions in import policies), so `path.nexthop` is also the nexthop
@@ -770,7 +770,7 @@ pub struct Reach {
     pub source: Arc<Source>,
     pub family: Family,
     pub net: packet::PathNlri,
-    pub attr: Arc<Vec<packet::Attribute>>,
+    pub attr: Arc<packet::PathAttributes>,
     pub nexthop: Option<bgp::Nexthop>,
     pub timestamp: u32,
 }
@@ -815,7 +815,7 @@ pub type SoftResetPath = (
     u32,
     Option<bgp::Nexthop>,
     Arc<Source>,
-    Arc<Vec<packet::Attribute>>,
+    Arc<packet::PathAttributes>,
     u32,
 );
 
@@ -1383,8 +1383,8 @@ impl Table {
         net: packet::Nlri,
         remote_id: u32,
         nexthop: Option<bgp::Nexthop>,
-        attr: Arc<Vec<packet::Attribute>>,
-        original_attr: Option<Arc<Vec<packet::Attribute>>>,
+        attr: Arc<packet::PathAttributes>,
+        original_attr: Option<Arc<packet::PathAttributes>>,
         filtered: bool,
         nexthop_invalid: bool,
         prefix_limit: Option<(u32, &Arc<AtomicU64>)>,
@@ -2226,7 +2226,7 @@ impl Table {
         assignment: &PolicyAssignment,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attr: &mut Arc<Vec<packet::Attribute>>,
+        attr: &mut Arc<packet::PathAttributes>,
         nexthop: &mut Option<bgp::Nexthop>,
         local_addr: IpAddr,
         peer_addr: IpAddr,
@@ -2329,7 +2329,7 @@ impl RpkiTable {
         &self,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &Arc<packet::PathAttributes>,
     ) -> Option<RpkiValidation> {
         let (family, addr_bytes, mask) = match net {
             packet::Nlri::V4(n) => (Family::IPV4, n.addr.octets().to_vec(), n.mask),
@@ -2537,8 +2537,8 @@ mod tests {
         Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)))
     }
 
-    fn empty_attrs() -> Arc<Vec<packet::Attribute>> {
-        Arc::new(Vec::new())
+    fn empty_attrs() -> Arc<packet::PathAttributes> {
+        Arc::new(packet::PathAttributes::default())
     }
 
     #[test]
@@ -2573,19 +2573,19 @@ mod tests {
         }
     }
 
-    fn attrs_with_local_pref(val: u32) -> Arc<Vec<packet::Attribute>> {
-        Arc::new(vec![
+    fn attrs_with_local_pref(val: u32) -> Arc<packet::PathAttributes> {
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, val).unwrap(),
-        ])
+        ]))
     }
 
-    fn attrs_with_origin(val: u32) -> Arc<Vec<packet::Attribute>> {
-        Arc::new(vec![
+    fn attrs_with_origin(val: u32) -> Arc<packet::PathAttributes> {
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, val).unwrap(),
-        ])
+        ]))
     }
 
-    fn attrs_with_as_path_len(len: u8) -> Arc<Vec<packet::Attribute>> {
+    fn attrs_with_as_path_len(len: u8) -> Arc<packet::PathAttributes> {
         // Build AS_PATH binary: type=SEQ, count=len, then len * 4 bytes (dummy ASNs)
         let mut bin = Vec::new();
         bin.push(packet::Attribute::AS_PATH_TYPE_SEQ);
@@ -2593,9 +2593,9 @@ mod tests {
         for i in 0..len as u32 {
             bin.extend_from_slice(&(65000 + i).to_be_bytes());
         }
-        Arc::new(vec![
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, bin).unwrap(),
-        ])
+        ]))
     }
 
     /// Flat list of (nlri, path, rank) from collect_loc_rib_paths(), sorted by nlri then rank.
@@ -2637,7 +2637,7 @@ mod tests {
 
         let mut rt = Table::new(0);
         let family = Family::IPV4;
-        let attrs = Arc::new(Vec::new());
+        let attrs = Arc::new(packet::PathAttributes::default());
 
         rt.insert(
             s1.clone(),
@@ -3054,12 +3054,12 @@ mod tests {
         );
     }
 
-    fn attrs_with_cluster_list(ids: &[u8]) -> Arc<Vec<packet::Attribute>> {
+    fn attrs_with_cluster_list(ids: &[u8]) -> Arc<packet::PathAttributes> {
         // Each id is used as the last octet of a 4-byte cluster ID (0.0.0.id).
         let bytes: Vec<u8> = ids.iter().flat_map(|&id| [0u8, 0, 0, id]).collect();
-        Arc::new(vec![
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, bytes).unwrap(),
-        ])
+        ]))
     }
 
     #[test]
@@ -3104,9 +3104,9 @@ mod tests {
     }
 
     /// CLUSTER_LIST of length 1 and the given ORIGINATOR_ID.
-    fn attrs_reflected(originator_id: Ipv4Addr) -> Arc<Vec<packet::Attribute>> {
+    fn attrs_reflected(originator_id: Ipv4Addr) -> Arc<packet::PathAttributes> {
         let mut attrs = (*attrs_with_cluster_list(&[1])).clone();
-        attrs.push(
+        attrs.insert(
             packet::Attribute::new_with_value(
                 packet::Attribute::ORIGINATOR_ID,
                 u32::from(originator_id),
@@ -3178,7 +3178,7 @@ mod tests {
 
     /// AS_PATH with one AS_SEQUENCE of `neighbor_as` (empty when None), and
     /// MULTI_EXIT_DISC when `med` is Some.
-    fn attrs_with_med(neighbor_as: Option<u32>, med: Option<u32>) -> Arc<Vec<packet::Attribute>> {
+    fn attrs_with_med(neighbor_as: Option<u32>, med: Option<u32>) -> Arc<packet::PathAttributes> {
         let mut bin = Vec::new();
         if let Some(asn) = neighbor_as {
             bin.push(packet::Attribute::AS_PATH_TYPE_SEQ);
@@ -3192,14 +3192,14 @@ mod tests {
                 packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, med).unwrap(),
             );
         }
-        Arc::new(attrs)
+        Arc::new(packet::PathAttributes::new(attrs))
     }
 
     /// Inserts one path from each of `paths` into a new table, in order, and
     /// returns the remote addresses in the order of the destination.
     fn insert_order(
         opts: SelectionOptions,
-        paths: &[(&Arc<Source>, Arc<Vec<packet::Attribute>>)],
+        paths: &[(&Arc<Source>, Arc<packet::PathAttributes>)],
     ) -> Vec<IpAddr> {
         let mut rt = Table::new(0);
         rt.set_selection_options(opts);
@@ -3300,9 +3300,9 @@ mod tests {
         let s1 = source(1, 65001, 65000, 1);
         let s2 = source(2, 65001, 65000, 2);
         let mut a1 = (*attrs_with_med(Some(65001), Some(20))).clone();
-        a1.push(packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap());
+        a1.insert(packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap());
         let mut a2 = (*attrs_with_med(Some(65001), Some(10))).clone();
-        a2.push(packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap());
+        a2.insert(packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap());
         let order = [(&s2, Arc::new(a2)), (&s1, Arc::new(a1))];
         assert_eq!(
             insert_order(SelectionOptions::default(), &order),
@@ -3378,7 +3378,12 @@ mod tests {
         let order = [
             (&s1, empty_attrs()),
             (&s2, empty_attrs()),
-            (&s1, Arc::new(vec![community_attr(0x0001_0001)])),
+            (
+                &s1,
+                Arc::new(packet::PathAttributes::new(vec![community_attr(
+                    0x0001_0001,
+                )])),
+            ),
         ];
         assert_eq!(
             insert_order(SelectionOptions::default(), &order),
@@ -3559,7 +3564,7 @@ mod tests {
             nh(),
             {
                 let mut attrs = (*attrs_with_cluster_list(&[99])).clone();
-                attrs.push(
+                attrs.insert(
                     packet::Attribute::new_with_value(
                         packet::Attribute::ORIGINATOR_ID,
                         u32::from(Ipv4Addr::new(0, 0, 0, 10)),
@@ -3583,7 +3588,7 @@ mod tests {
             nh(),
             {
                 let mut attrs = (*attrs_with_cluster_list(&[99])).clone();
-                attrs.push(
+                attrs.insert(
                     packet::Attribute::new_with_value(
                         packet::Attribute::ORIGINATOR_ID,
                         u32::from(Ipv4Addr::new(0, 0, 0, 5)),
@@ -4782,7 +4787,7 @@ mod tests {
     fn remove_best_with_filtered_head() {
         let mut rt = Table::new(0);
         let net = nlri(10, 0, 0, 0, 24);
-        // Each peer produces its own Arc<Vec<Attribute>> (realistic: separate UPDATE messages).
+        // Each peer produces its own Arc<PathAttributes> (realistic: separate UPDATE messages).
         // filtered at head
         rt.insert(
             source(1, 65001, 65000, 1),
@@ -6673,7 +6678,7 @@ mod tests {
         }
     }
 
-    fn path_with_nh(src: Arc<Source>, nexthop_addr: u8, attr: Arc<Vec<packet::Attribute>>) -> Path {
+    fn path_with_nh(src: Arc<Source>, nexthop_addr: u8, attr: Arc<packet::PathAttributes>) -> Path {
         Path {
             local_path_id: 0,
             source: src,
@@ -6729,7 +6734,13 @@ mod tests {
         let src2 = source(2, 65000, 65000, 2);
         let change = make_nlri_change(vec![
             path_with_nh(src1, 1, empty_attrs()),
-            path_with_nh(src2, 2, Arc::new(vec![community_attr(0xffff_0006)])),
+            path_with_nh(
+                src2,
+                2,
+                Arc::new(packet::PathAttributes::new(vec![community_attr(
+                    0xffff_0006,
+                )])),
+            ),
         ]);
         assert_eq!(change.ecmp_paths(SelectionOptions::default()).len(), 1);
     }
@@ -6812,21 +6823,21 @@ mod tests {
         }))
     }
 
-    fn attrs_with_mac_mobility(seq: u32) -> Arc<Vec<packet::Attribute>> {
+    fn attrs_with_mac_mobility(seq: u32) -> Arc<packet::PathAttributes> {
         // Extended Community: type=0x06 (EVPN), subtype=0x00 (MAC Mobility),
         // flags=0x00 (non-sticky), reserved=0x00, seq (4 bytes big-endian).
         let mut ec = vec![0x06u8, 0x00, 0x00, 0x00];
         ec.extend_from_slice(&seq.to_be_bytes());
-        Arc::new(vec![
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::EXTENDED_COMMUNITY, ec).unwrap(),
-        ])
+        ]))
     }
 
     fn evpn_insert(
         rt: &mut Table,
         src: &Arc<Source>,
         net: &packet::Nlri,
-        attrs: Arc<Vec<packet::Attribute>>,
+        attrs: Arc<packet::PathAttributes>,
     ) {
         rt.insert(
             src.clone(),
@@ -7003,19 +7014,23 @@ mod tests {
         .unwrap()
     }
 
-    fn attrs_with_no_llgr() -> Arc<Vec<packet::Attribute>> {
-        Arc::new(vec![community_attr(0xffff_0007)])
+    fn attrs_with_no_llgr() -> Arc<packet::PathAttributes> {
+        Arc::new(packet::PathAttributes::new(vec![community_attr(
+            0xffff_0007,
+        )]))
     }
 
-    fn attrs_with_llgr_stale() -> Arc<Vec<packet::Attribute>> {
-        Arc::new(vec![community_attr(0xffff_0006)])
+    fn attrs_with_llgr_stale() -> Arc<packet::PathAttributes> {
+        Arc::new(packet::PathAttributes::new(vec![community_attr(
+            0xffff_0006,
+        )]))
     }
 
     fn insert_with_attrs(
         rt: &mut Table,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attrs: Arc<Vec<packet::Attribute>>,
+        attrs: Arc<packet::PathAttributes>,
     ) {
         rt.insert(
             source.clone(),
@@ -7087,10 +7102,10 @@ mod tests {
             &mut rt,
             &stale,
             &net,
-            Arc::new(vec![
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
                 community_attr(0xffff_0006),
-            ]),
+            ])),
         );
         insert_with_attrs(&mut rt, &fresh, &net, attrs_with_local_pref(100));
 
@@ -7315,7 +7330,7 @@ mod tests {
 
     // --- RPKI origin validation (RFC 6811) ---
 
-    fn as_path_segments(segs: &[(u8, &[u32])]) -> Arc<Vec<packet::Attribute>> {
+    fn as_path_segments(segs: &[(u8, &[u32])]) -> Arc<packet::PathAttributes> {
         let mut bin = Vec::new();
         for (t, asns) in segs {
             bin.push(*t);
@@ -7324,12 +7339,12 @@ mod tests {
                 bin.extend_from_slice(&a.to_be_bytes());
             }
         }
-        Arc::new(vec![
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, bin).unwrap(),
-        ])
+        ]))
     }
 
-    fn origin_seq(asn: u32) -> Arc<Vec<packet::Attribute>> {
+    fn origin_seq(asn: u32) -> Arc<packet::PathAttributes> {
         as_path_segments(&[(packet::Attribute::AS_PATH_TYPE_SEQ, &[65000, asn])])
     }
 
@@ -7356,7 +7371,7 @@ mod tests {
     fn validate(
         t: &RpkiTable,
         prefix: &str,
-        attr: Arc<Vec<packet::Attribute>>,
+        attr: Arc<packet::PathAttributes>,
     ) -> RpkiValidationState {
         t.validate(&source(1, 65001, 65100, 1), &route(prefix), &attr)
             .unwrap()

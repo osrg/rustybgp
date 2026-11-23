@@ -2128,6 +2128,112 @@ impl std::fmt::Display for HoldTime {
     }
 }
 
+/// The path attributes of a route, kept in ascending order of attribute
+/// type code, with at most one attribute per type code.
+///
+/// RFC 4271 Section 5 says: "The sender of an UPDATE message SHOULD order
+/// path attributes within the UPDATE message in ascending order of attribute
+/// type." Keeping the attributes in this order when they are stored means
+/// the encoder can write them as they are. It also makes two lists with the
+/// same attributes compare and hash equal, whatever order they were
+/// received in.
+///
+/// The list cannot be changed directly. Every way to build or change it keeps
+/// the order. There is no way to get a mutable reference to an attribute,
+/// because replacing it with an attribute of another type code would break
+/// the order. Use `insert()` to replace an attribute.
+///
+/// MP_REACH_NLRI, MP_UNREACH_NLRI and NEXT_HOP are not stored here. The
+/// encoder writes them from the NLRIs and the next hop.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+pub struct PathAttributes(Vec<Attribute>);
+
+impl PathAttributes {
+    /// Builds the list from attributes in any order. If several attributes
+    /// have the same type code, the first one is kept. This follows RFC 7606
+    /// Section 3 (g) for a received UPDATE: "If any other attribute (whether
+    /// recognized or unrecognized) appears more than once in an UPDATE
+    /// message, then all the occurrences of the attribute other than the
+    /// first one SHALL be discarded and the UPDATE message will continue to
+    /// be processed."
+    pub fn new(mut attrs: Vec<Attribute>) -> Self {
+        if !attrs.is_sorted_by(|a, b| a.code() < b.code()) {
+            // A stable sort keeps the first of the attributes with the same
+            // type code in front, so dedup_by_key() keeps that one.
+            attrs.sort_by_key(|a| a.code());
+            attrs.dedup_by_key(|a| a.code());
+        }
+        PathAttributes(attrs)
+    }
+
+    fn position(&self, code: u8) -> Result<usize, usize> {
+        self.0.binary_search_by_key(&code, |a| a.code())
+    }
+
+    /// Returns the attribute with type code `code`.
+    pub fn get(&self, code: u8) -> Option<&Attribute> {
+        self.position(code).ok().map(|i| &self.0[i])
+    }
+
+    /// Returns true if an attribute with type code `code` is present.
+    pub fn contains(&self, code: u8) -> bool {
+        self.position(code).is_ok()
+    }
+
+    /// Adds `attr` at the position for its type code. An attribute with the
+    /// same type code is replaced.
+    pub fn insert(&mut self, attr: Attribute) {
+        match self.position(attr.code()) {
+            Ok(i) => self.0[i] = attr,
+            Err(i) => self.0.insert(i, attr),
+        }
+    }
+
+    /// Removes the attribute with type code `code` and returns it.
+    pub fn remove(&mut self, code: u8) -> Option<Attribute> {
+        self.position(code).ok().map(|i| self.0.remove(i))
+    }
+
+    /// Keeps only the attributes for which `f` returns true.
+    pub fn retain(&mut self, f: impl FnMut(&Attribute) -> bool) {
+        self.0.retain(f);
+    }
+
+    /// Returns the attributes as a Vec, in ascending order of type code.
+    pub fn into_vec(self) -> Vec<Attribute> {
+        self.0
+    }
+}
+
+impl std::ops::Deref for PathAttributes {
+    type Target = [Attribute];
+
+    fn deref(&self) -> &[Attribute] {
+        &self.0
+    }
+}
+
+impl From<Vec<Attribute>> for PathAttributes {
+    fn from(attrs: Vec<Attribute>) -> Self {
+        PathAttributes::new(attrs)
+    }
+}
+
+impl FromIterator<Attribute> for PathAttributes {
+    fn from_iter<I: IntoIterator<Item = Attribute>>(iter: I) -> Self {
+        PathAttributes::new(iter.into_iter().collect())
+    }
+}
+
+impl<'a> IntoIterator for &'a PathAttributes {
+    type Item = &'a Attribute;
+    type IntoIter = std::slice::Iter<'a, Attribute>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 /// BGP OPEN message body (RFC 4271 §4.2).
 #[derive(Clone)]
 pub struct Open {
@@ -2151,7 +2257,7 @@ pub enum Update {
         entries: Vec<PathNlri>,
         /// `None` only for AFIs that carry no nexthop (e.g. Flowspec).
         nexthop: Option<Nexthop>,
-        attr: Arc<Vec<Attribute>>,
+        attr: Arc<PathAttributes>,
     },
     /// Route withdrawal.
     Unreach {
@@ -2349,7 +2455,7 @@ fn validate_update(update: ParsedUpdate, is_ebgp: bool) -> Result<Vec<Message>, 
             };
 
             // Normal path: attribute-discard errors are already absent from attrs.
-            let attr = Arc::new(attrs);
+            let attr = Arc::new(PathAttributes::new(attrs));
             let mut msgs: Vec<Message> = Vec::new();
 
             if let Some(r) = reach {
@@ -3860,7 +3966,7 @@ mod attribute_tests {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
             nexthop: None,
-            attr: Arc::new(attrs),
+            attr: Arc::new(PathAttributes::new(attrs)),
         })
     }
 
@@ -4836,11 +4942,11 @@ mod message_tests {
             family: Family::IPV4,
             entries: net.iter().cloned().map(PathNlri::new).collect(),
             nexthop: None,
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
                 Attribute::new_with_bin(Attribute::NEXTHOP, vec![0, 0, 0, 0]).unwrap(),
-            ]),
+            ])),
         });
         let codec = {
             let mut c = PeerCodec::new();
@@ -4905,10 +5011,10 @@ mod message_tests {
             family: Family::IPV6,
             entries: net.iter().cloned().map(PathNlri::new).collect(),
             nexthop: Some(Nexthop::V6("2001:db8::1".parse().unwrap())),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(Attribute::AS_PATH, vec![2, 1, 1, 0, 0, 0]).unwrap(),
-            ]),
+            ])),
         });
         let codec = {
             let mut c = PeerCodec::new();
@@ -5551,8 +5657,8 @@ mod update_tests {
         c
     }
 
-    fn ipv4_attrs(nexthop: Ipv4Addr) -> Arc<Vec<Attribute>> {
-        Arc::new(vec![
+    fn ipv4_attrs(nexthop: Ipv4Addr) -> Arc<PathAttributes> {
+        Arc::new(PathAttributes::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
                 Attribute::AS_PATH,
@@ -5560,7 +5666,7 @@ mod update_tests {
             )
             .unwrap(),
             Attribute::new_with_bin(Attribute::NEXTHOP, nexthop.octets().to_vec()).unwrap(),
-        ])
+        ]))
     }
 
     fn ipv4_prefix(addr: &str, mask: u8) -> PathNlri {
@@ -5584,15 +5690,15 @@ mod update_tests {
         framer.parse_message(&buf).unwrap()
     }
 
-    fn ipv6_attrs_no_nh() -> Arc<Vec<Attribute>> {
-        Arc::new(vec![
+    fn ipv6_attrs_no_nh() -> Arc<PathAttributes> {
+        Arc::new(PathAttributes::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
                 Attribute::AS_PATH,
                 vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
             )
             .unwrap(),
-        ])
+        ]))
     }
 
     #[test]
@@ -5668,14 +5774,14 @@ mod update_tests {
             family: Family::IPV6,
             entries: vec![prefix.clone()],
             nexthop: Some(Nexthop::V6(nexthop)),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
                     Attribute::AS_PATH,
                     vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
                 )
                 .unwrap(),
-            ]),
+            ])),
         });
         match round_trip(&msg, ipv6_codec()) {
             ParsedMessage::Update(ParsedUpdate::Routes {
@@ -5785,7 +5891,7 @@ mod update_tests {
     fn update_attr_med_preserved_on_encode() {
         let med_value: u32 = 150;
         let mut attrs = (*ipv4_attrs("192.0.2.254".parse().unwrap())).clone();
-        attrs.push(Attribute::new_with_value(Attribute::MULTI_EXIT_DESC, med_value).unwrap());
+        attrs.insert(Attribute::new_with_value(Attribute::MULTI_EXIT_DESC, med_value).unwrap());
         let msg = Message::Update(Update::Reach {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
@@ -5815,7 +5921,7 @@ mod update_tests {
             family,
             entries: vec![entry.clone()],
             nexthop,
-            attr: Arc::new(Vec::new()),
+            attr: Arc::new(PathAttributes::default()),
         });
         let mut wire = Vec::new();
         assert_eq!(codec.encode_to(&msg, &mut wire).unwrap(), 1);
@@ -5846,10 +5952,10 @@ mod update_tests {
             family: Family::IPV4,
             entries: vec![prefix.clone()],
             nexthop,
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::empty_as_path(),
-            ]),
+            ])),
         });
         match round_trip(&msg, codec) {
             ParsedMessage::Update(ParsedUpdate::Routes {
@@ -5888,10 +5994,10 @@ mod update_tests {
             family: Family::IPV6,
             entries: vec![prefix.clone()],
             nexthop: Some(Nexthop::V4(nexthop)),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::empty_as_path(),
-            ]),
+            ])),
         });
         match round_trip(&msg, codec) {
             ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
@@ -5911,14 +6017,14 @@ mod update_tests {
             family: Family::IPV4,
             entries: vec![prefix.clone()],
             nexthop: Some(Nexthop::V6(nexthop_v6)),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
                     Attribute::AS_PATH,
                     vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
                 )
                 .unwrap(),
-            ]),
+            ])),
         });
         match round_trip(&msg, ipv4_extended_nexthop_codec()) {
             ParsedMessage::Update(ParsedUpdate::Routes {
@@ -5960,7 +6066,7 @@ mod update_tests {
     fn update_attr_community() {
         let community: u32 = (65001u32 << 16) | 100;
         let mut attrs = (*ipv4_attrs("192.0.2.254".parse().unwrap())).clone();
-        attrs.push(
+        attrs.insert(
             Attribute::new_with_bin(Attribute::COMMUNITY, community.to_be_bytes().to_vec())
                 .unwrap(),
         );
@@ -6018,7 +6124,7 @@ mod update_tests {
             family: Family::IPV4,
             entries: vec![prefix.clone()],
             nexthop: None,
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
                     Attribute::AS_PATH,
@@ -6031,7 +6137,7 @@ mod update_tests {
                 )
                 .unwrap(),
                 Attribute::new_with_bin(Attribute::PREFIX_SID, sid_bytes.clone()).unwrap(),
-            ]),
+            ])),
         });
         match round_trip(&msg, ipv4_codec()) {
             ParsedMessage::Update(ParsedUpdate::Routes { reach, attrs, .. }) => {
@@ -6063,7 +6169,7 @@ mod update_tests {
             family: Family::IPV4,
             entries: vec![prefix.clone()],
             nexthop: None,
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
                     Attribute::AS_PATH,
@@ -6076,7 +6182,7 @@ mod update_tests {
                 )
                 .unwrap(),
                 Attribute::new_with_bin(Attribute::PREFIX_SID, sid_bytes.clone()).unwrap(),
-            ]),
+            ])),
         });
         match round_trip(&msg, ipv4_codec()) {
             ParsedMessage::Update(ParsedUpdate::Routes { attrs, .. }) => {
@@ -6123,14 +6229,14 @@ mod update_tests {
             family: Family::IPV4_MUP,
             entries: vec![nlri.clone()],
             nexthop: Some(Nexthop::V4(nexthop)),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
                     Attribute::AS_PATH,
                     vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
                 )
                 .unwrap(),
-            ]),
+            ])),
         });
         match round_trip(&msg, ipv4_mup_codec()) {
             ParsedMessage::Update(ParsedUpdate::Routes {
@@ -6161,14 +6267,14 @@ mod update_tests {
             family: Family::IPV6_MUP,
             entries: vec![nlri.clone()],
             nexthop: Some(Nexthop::V6(nexthop)),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
                     Attribute::AS_PATH,
                     vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
                 )
                 .unwrap(),
-            ]),
+            ])),
         });
         match round_trip(&msg, ipv6_mup_codec()) {
             ParsedMessage::Update(ParsedUpdate::Routes {
@@ -6235,7 +6341,7 @@ mod update_tests {
             family: Family::IPV4_MUP,
             entries: vec![nlri.clone()],
             nexthop: Some(Nexthop::V4(nexthop)),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
                     Attribute::AS_PATH,
@@ -6243,7 +6349,7 @@ mod update_tests {
                 )
                 .unwrap(),
                 Attribute::new_with_bin(Attribute::EXTENDED_COMMUNITY, ec_bytes.clone()).unwrap(),
-            ]),
+            ])),
         });
         match round_trip(&msg, ipv4_mup_codec()) {
             ParsedMessage::Update(ParsedUpdate::Routes {
@@ -6398,14 +6504,14 @@ mod update_tests {
             family: Family::IPV4_VPN,
             entries: vec![nlri.clone()],
             nexthop: Some(nexthop),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
                     Attribute::AS_PATH,
                     vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
                 )
                 .unwrap(),
-            ]),
+            ])),
         });
         match round_trip(&msg, vpnv4_codec()) {
             ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
@@ -6440,14 +6546,14 @@ mod update_tests {
             family: Family::IPV6_VPN,
             entries: vec![nlri.clone()],
             nexthop: Some(nexthop),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::new_with_bin(
                     Attribute::AS_PATH,
                     vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x00, 0xFD, 0xEA],
                 )
                 .unwrap(),
-            ]),
+            ])),
         });
         match round_trip(&msg, vpnv6_codec()) {
             ParsedMessage::Update(ParsedUpdate::Routes { mp_reach, .. }) => {
@@ -6480,10 +6586,10 @@ mod update_tests {
             family: Family::IPV6_VPN,
             entries: vec![nlri.clone()],
             nexthop: Some(Nexthop::V4(nexthop)),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::empty_as_path(),
-            ]),
+            ])),
         });
         // RFC 4659 Section 3.2.1.2: 24-byte VPN-IPv6 nexthop with a zero RD and
         // an IPv4-mapped IPv6 address.
@@ -6529,10 +6635,10 @@ mod update_tests {
             family: Family::IPV6_VPN,
             entries: vec![nlri.clone()],
             nexthop: Some(nexthop),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::empty_as_path(),
-            ]),
+            ])),
         });
         // RFC 4659 Section 3.2.1.1: a zero RD before the global address and
         // another zero RD before the link-local address.
@@ -6731,11 +6837,11 @@ mod update_tests {
             family: Family::IPV6_VPN,
             entries,
             nexthop: Some(Nexthop::V6("2001:db8::1".parse().unwrap())),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::empty_as_path(),
                 Attribute::new_with_bin(Attribute::COMMUNITY, communities).unwrap(),
-            ]),
+            ])),
         })
     }
 
@@ -6869,11 +6975,11 @@ mod update_tests {
             family: Family::IPV4,
             entries,
             nexthop: Some(Nexthop::V4("192.0.2.1".parse().unwrap())),
-            attr: Arc::new(vec![
+            attr: Arc::new(PathAttributes::new(vec![
                 Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                 Attribute::empty_as_path(),
                 Attribute::new_with_bin(Attribute::COMMUNITY, communities).unwrap(),
-            ]),
+            ])),
         })
     }
 
@@ -7218,6 +7324,35 @@ mod update_tests {
         let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Message::Update(Update::Unreach { .. })));
+    }
+
+    #[test]
+    fn received_attrs_are_stored_in_ascending_order() {
+        // COMMUNITY, AS_PATH + NEXT_HOP, MED, ORIGIN: not in ascending order.
+        let mut attr_bytes = Vec::new();
+        attr_bytes.extend_from_slice(&[0xC0, 0x08, 0x04, 0xFD, 0xE9, 0x00, 0x01]);
+        attr_bytes.extend_from_slice(&base_attrs_without_origin());
+        attr_bytes.extend_from_slice(&[0x80, 0x04, 0x04, 0x00, 0x00, 0x00, 0x0A]);
+        attr_bytes.extend_from_slice(&[0x40, 0x01, 0x01, 0x00]);
+        let buf = raw_update_with_attrs(&attr_bytes);
+        let parsed = ipv4_codec()
+            .parse_message(&buf)
+            .expect("parse must not fail");
+        let msgs: Vec<Message> = validate_message(parsed, false).unwrap().collect();
+        assert_eq!(msgs.len(), 1);
+        let Message::Update(Update::Reach { attr, .. }) = &msgs[0] else {
+            panic!("expected Reach");
+        };
+        let codes: Vec<u8> = attr.iter().map(|a| a.code()).collect();
+        assert_eq!(
+            codes,
+            vec![
+                Attribute::ORIGIN,
+                Attribute::AS_PATH,
+                Attribute::MULTI_EXIT_DESC,
+                Attribute::COMMUNITY,
+            ]
+        );
     }
 
     #[test]
@@ -7719,7 +7854,7 @@ mod two_byte_as_tests {
                 family: Family::IPV4,
                 entries: entries.clone(),
                 nexthop: Some(Nexthop::V4(Ipv4Addr::new(192, 0, 2, 1))),
-                attr: Arc::new(vec![
+                attr: Arc::new(PathAttributes::new(vec![
                     Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
                     Attribute::new_with_bin(
                         Attribute::AS_PATH,
@@ -7732,7 +7867,7 @@ mod two_byte_as_tests {
                     )
                     .unwrap(),
                     Attribute::new_with_bin(Attribute::COMMUNITY, communities).unwrap(),
-                ]),
+                ])),
             });
             let mut codec = ipv4_codec_2byte_as();
             let mut buf = BytesMut::new();
@@ -8144,7 +8279,7 @@ mod two_byte_as_tests {
 
     #[test]
     fn encode_writes_downgraded_as_path_and_as4_path() {
-        let attr = Arc::new(vec![
+        let attr = Arc::new(PathAttributes::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
                 Attribute::AS_PATH,
@@ -8154,7 +8289,7 @@ mod two_byte_as_tests {
                 ),
             )
             .unwrap(),
-        ]);
+        ]));
         let msg = Message::Update(Update::Reach {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
@@ -8183,14 +8318,14 @@ mod two_byte_as_tests {
 
     #[test]
     fn encode_omits_as4_path_when_no_wide_as() {
-        let attr = Arc::new(vec![
+        let attr = Arc::new(PathAttributes::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
                 Attribute::AS_PATH,
                 seg_bytes(Attribute::AS_PATH_TYPE_SEQ, &[65000, 4000]),
             )
             .unwrap(),
-        ]);
+        ]));
         let msg = Message::Update(Update::Reach {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
@@ -8204,7 +8339,7 @@ mod two_byte_as_tests {
 
     #[test]
     fn encode_writes_downgraded_aggregator_and_as4_aggregator() {
-        let attr = Arc::new(vec![
+        let attr = Arc::new(PathAttributes::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
                 Attribute::AS_PATH,
@@ -8216,7 +8351,7 @@ mod two_byte_as_tests {
                 aggregator_bin(400000, Ipv4Addr::new(198, 51, 100, 1)),
             )
             .unwrap(),
-        ]);
+        ]));
         let msg = Message::Update(Update::Reach {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
@@ -8245,7 +8380,7 @@ mod two_byte_as_tests {
 
     #[test]
     fn encode_omits_as4_aggregator_when_as_fits_two_bytes() {
-        let attr = Arc::new(vec![
+        let attr = Arc::new(PathAttributes::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
                 Attribute::AS_PATH,
@@ -8257,7 +8392,7 @@ mod two_byte_as_tests {
                 aggregator_bin(65055, Ipv4Addr::new(198, 51, 100, 1)),
             )
             .unwrap(),
-        ]);
+        ]));
         let msg = Message::Update(Update::Reach {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
@@ -8276,7 +8411,7 @@ mod two_byte_as_tests {
 
     #[test]
     fn round_trip_through_two_byte_as_session_preserves_as_path() {
-        let attr = Arc::new(vec![
+        let attr = Arc::new(PathAttributes::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
                 Attribute::AS_PATH,
@@ -8286,7 +8421,7 @@ mod two_byte_as_tests {
                 ),
             )
             .unwrap(),
-        ]);
+        ]));
         let msg = Message::Update(Update::Reach {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
@@ -8314,7 +8449,7 @@ mod two_byte_as_tests {
 
     #[test]
     fn round_trip_through_two_byte_as_session_preserves_aggregator() {
-        let attr = Arc::new(vec![
+        let attr = Arc::new(PathAttributes::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             Attribute::new_with_bin(
                 Attribute::AS_PATH,
@@ -8326,7 +8461,7 @@ mod two_byte_as_tests {
                 aggregator_bin(400000, Ipv4Addr::new(198, 51, 100, 1)),
             )
             .unwrap(),
-        ]);
+        ]));
         let msg = Message::Update(Update::Reach {
             family: Family::IPV4,
             entries: vec![ipv4_prefix("10.0.0.0", 8)],
@@ -8347,5 +8482,103 @@ mod two_byte_as_tests {
             }
             _ => panic!("expected Update::Routes"),
         }
+    }
+}
+
+#[cfg(test)]
+mod path_attributes_tests {
+    use super::*;
+
+    fn med(v: u32) -> Attribute {
+        Attribute::new_with_value(Attribute::MULTI_EXIT_DESC, v).unwrap()
+    }
+
+    fn origin(v: u32) -> Attribute {
+        Attribute::new_with_value(Attribute::ORIGIN, v).unwrap()
+    }
+
+    fn local_pref(v: u32) -> Attribute {
+        Attribute::new_with_value(Attribute::LOCAL_PREF, v).unwrap()
+    }
+
+    fn codes(attrs: &PathAttributes) -> Vec<u8> {
+        attrs.iter().map(|a| a.code()).collect()
+    }
+
+    #[test]
+    fn new_sorts_by_code() {
+        let attrs = PathAttributes::new(vec![
+            local_pref(100),
+            origin(0),
+            Attribute::empty_as_path(),
+            med(10),
+        ]);
+        assert_eq!(
+            codes(&attrs),
+            vec![
+                Attribute::ORIGIN,
+                Attribute::AS_PATH,
+                Attribute::MULTI_EXIT_DESC,
+                Attribute::LOCAL_PREF,
+            ]
+        );
+    }
+
+    #[test]
+    fn new_keeps_first_of_duplicates() {
+        let attrs = PathAttributes::new(vec![med(10), origin(0), med(20)]);
+        assert_eq!(
+            codes(&attrs),
+            vec![Attribute::ORIGIN, Attribute::MULTI_EXIT_DESC]
+        );
+        assert_eq!(
+            attrs.get(Attribute::MULTI_EXIT_DESC).unwrap().value(),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn insert_adds_at_code_position() {
+        let mut attrs = PathAttributes::new(vec![origin(0), local_pref(100)]);
+        attrs.insert(med(10));
+        assert_eq!(
+            codes(&attrs),
+            vec![
+                Attribute::ORIGIN,
+                Attribute::MULTI_EXIT_DESC,
+                Attribute::LOCAL_PREF,
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_replaces_same_code() {
+        let mut attrs = PathAttributes::new(vec![origin(0), med(10)]);
+        attrs.insert(med(20));
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(
+            attrs.get(Attribute::MULTI_EXIT_DESC).unwrap().value(),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn remove_and_get() {
+        let mut attrs = PathAttributes::new(vec![origin(0), med(10)]);
+        assert!(attrs.contains(Attribute::MULTI_EXIT_DESC));
+        assert_eq!(attrs.remove(Attribute::MULTI_EXIT_DESC), Some(med(10)));
+        assert_eq!(attrs.remove(Attribute::MULTI_EXIT_DESC), None);
+        assert!(attrs.get(Attribute::MULTI_EXIT_DESC).is_none());
+        assert_eq!(codes(&attrs), vec![Attribute::ORIGIN]);
+    }
+
+    #[test]
+    fn equal_regardless_of_input_order() {
+        use std::hash::{BuildHasher, RandomState};
+        let a = PathAttributes::new(vec![origin(0), med(10), local_pref(100)]);
+        let b = PathAttributes::new(vec![local_pref(100), med(10), origin(0)]);
+        assert_eq!(a, b);
+        let s = RandomState::new();
+        assert_eq!(s.hash_one(&a), s.hash_one(&b));
     }
 }

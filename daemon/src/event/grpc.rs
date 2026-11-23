@@ -59,7 +59,7 @@ fn adj_rib_in_to_table_event(change: &AdjRibInChange) -> api::WatchEventResponse
 fn loc_rib_to_table_event(
     family: Family,
     net: &packet::Nlri,
-    attr: Option<&Arc<Vec<packet::Attribute>>>,
+    attr: Option<&Arc<packet::PathAttributes>>,
 ) -> api::WatchEventResponse {
     let path = if let Some(attrs) = attr {
         api::Path {
@@ -885,7 +885,7 @@ impl GrpcService {
         (
             Family,
             Vec<packet::PathNlri>,
-            Option<Arc<Vec<packet::Attribute>>>,
+            Option<Arc<packet::PathAttributes>>,
             Option<bgp::Nexthop>,
         ),
         tonic::Status,
@@ -919,7 +919,7 @@ impl GrpcService {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let mut attr = Vec::new();
+        let mut attr = bgp::PathAttributes::default();
         let mut nexthop = None;
         let mut seen = FnvHashSet::default();
         for a in attributes {
@@ -981,14 +981,14 @@ impl GrpcService {
                 bgp::Attribute::ORIGINATOR_ID
                 | bgp::Attribute::CLUSTER_LIST
                 | bgp::Attribute::MP_UNREACH => {}
-                _ => attr.push(a),
+                _ => attr.insert(a),
             }
         }
-        if !attr.iter().any(|a| a.code() == bgp::Attribute::ORIGIN) {
-            attr.push(bgp::Attribute::new_with_value(bgp::Attribute::ORIGIN, 0).unwrap());
+        if !attr.contains(bgp::Attribute::ORIGIN) {
+            attr.insert(bgp::Attribute::new_with_value(bgp::Attribute::ORIGIN, 0).unwrap());
         }
-        if !attr.iter().any(|a| a.code() == bgp::Attribute::AS_PATH) {
-            attr.push(bgp::Attribute::empty_as_path());
+        if !attr.contains(bgp::Attribute::AS_PATH) {
+            attr.insert(bgp::Attribute::empty_as_path());
         }
         let attrs = Some(Arc::new(attr));
         Ok((
@@ -2615,9 +2615,9 @@ impl GoBgpService for GrpcService {
                 Family::RTC,
                 nlri,
                 None,
-                Arc::new(vec![
+                Arc::new(packet::PathAttributes::new(vec![
                     packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-                ]),
+                ])),
                 None,
                 now,
             );

@@ -23,8 +23,8 @@ use rustybgp_packet::bgp::{self, Family, Nexthop};
 use rustybgp_packet::{self as packet};
 use std::sync::Arc;
 
-type AttrKey = (Arc<Vec<packet::Attribute>>, Option<Nexthop>);
-type ReachValue = (packet::Nlri, Arc<Vec<packet::Attribute>>, Option<Nexthop>);
+type AttrKey = (Arc<packet::PathAttributes>, Option<Nexthop>);
+type ReachValue = (packet::Nlri, Arc<packet::PathAttributes>, Option<Nexthop>);
 
 pub(crate) struct PendingTx {
     // Key is (dest_id, path_id): integer keys hash much cheaper than PathNlri
@@ -74,7 +74,7 @@ impl PendingTx {
         nlri: packet::Nlri,
         path_id: u32,
         nexthop: Option<Nexthop>,
-        attr: Arc<Vec<packet::Attribute>>,
+        attr: Arc<packet::PathAttributes>,
     ) {
         let key = (dest_id, if self.addpath_tx { path_id } else { 0 });
         self.unreach.remove(&key);
@@ -150,10 +150,10 @@ mod tests {
         packet::Nlri::from_str(net).unwrap()
     }
 
-    fn attr(origin: u32) -> Arc<Vec<packet::Attribute>> {
-        Arc::new(vec![
+    fn attr(origin: u32) -> Arc<packet::PathAttributes> {
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, origin).unwrap(),
-        ])
+        ]))
     }
 
     fn nh() -> Option<Nexthop> {

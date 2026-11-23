@@ -37,7 +37,7 @@ pub(crate) struct AdjRibInChange {
     pub(crate) family: Family,
     pub(crate) addpath: bool,
     pub(crate) nlris: Vec<packet::PathNlri>,
-    pub(crate) attrs: Option<Arc<Vec<packet::Attribute>>>,
+    pub(crate) attrs: Option<Arc<packet::PathAttributes>>,
     pub(crate) nexthop: Option<bgp::Nexthop>,
     pub(crate) timestamp: u32,
 }
@@ -70,7 +70,7 @@ pub(crate) struct PeerDownData {
 pub(crate) struct LocRibChange {
     pub(crate) family: Family,
     pub(crate) net: packet::Nlri,
-    pub(crate) attr: Option<Arc<Vec<packet::Attribute>>>,
+    pub(crate) attr: Option<Arc<packet::PathAttributes>>,
     pub(crate) nexthop: Option<bgp::Nexthop>,
     pub(crate) timestamp: u32,
 }
@@ -86,7 +86,7 @@ pub(crate) struct AdjRibOutChange {
     pub(crate) family: Family,
     pub(crate) addpath: bool,
     pub(crate) nlri: packet::PathNlri,
-    pub(crate) attrs: Option<Arc<Vec<packet::Attribute>>>,
+    pub(crate) attrs: Option<Arc<packet::PathAttributes>>,
     pub(crate) nexthop: Option<bgp::Nexthop>,
     pub(crate) timestamp: u32,
 }
@@ -274,7 +274,7 @@ impl TableManager {
                     };
                     dest.net = local_nlri;
                     for path in &mut dest.paths {
-                        let stripped: Vec<_> = path
+                        let stripped: packet::PathAttributes = path
                             .attr
                             .iter()
                             .filter(|a| a.code() != packet::Attribute::EXTENDED_COMMUNITY)
@@ -306,7 +306,7 @@ impl TableManager {
         family: Family,
         net: packet::PathNlri,
         nexthop: Option<bgp::Nexthop>,
-        attr: Arc<Vec<packet::Attribute>>,
+        attr: Arc<packet::PathAttributes>,
         prefix_limit: Option<(u32, Arc<std::sync::atomic::AtomicU64>)>,
         timestamp: u32,
     ) -> bool {
@@ -684,9 +684,9 @@ impl TableManager {
         policy: Option<&table::PolicyAssignment>,
         source: &Arc<table::Source>,
         net: &packet::Nlri,
-        attrs: &Arc<Vec<packet::Attribute>>,
+        attrs: &Arc<packet::PathAttributes>,
         nexthop: &mut Option<packet::bgp::Nexthop>,
-    ) -> (bool, Arc<Vec<packet::Attribute>>) {
+    ) -> (bool, Arc<packet::PathAttributes>) {
         let Some(policy) = policy else {
             return (false, Arc::clone(attrs));
         };
@@ -979,7 +979,7 @@ fn kernel_route_to_path(
     Family,
     packet::PathNlri,
     bgp::Nexthop,
-    Arc<Vec<packet::Attribute>>,
+    Arc<packet::PathAttributes>,
 )> {
     let nexthop_ip = kr.nexthop?;
     let nexthop = match nexthop_ip {
@@ -1002,16 +1002,16 @@ fn kernel_route_to_path(
             (nlri, Family::IPV6)
         }
     };
-    let mut attrs = vec![
+    let mut attrs = packet::PathAttributes::new(vec![
         packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0) // 0 = IGP
             .unwrap(),
         packet::Attribute::empty_as_path(),
-    ];
+    ]);
     if kr.metric > 0
         && let Some(med) =
             packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, kr.metric)
     {
-        attrs.push(med);
+        attrs.insert(med);
     }
     Some((
         family,
@@ -1185,7 +1185,7 @@ impl TableShard {
         source: Arc<table::Source>,
         family: Family,
         nets: &[packet::PathNlri],
-        attrs: Option<&Arc<Vec<packet::Attribute>>>,
+        attrs: Option<&Arc<packet::PathAttributes>>,
         nexthop: Option<bgp::Nexthop>,
         timestamp: u32,
     ) {
@@ -1210,7 +1210,7 @@ impl TableShard {
         source: Arc<table::Source>,
         family: Family,
         nets: &[packet::PathNlri],
-        attrs: Option<&Arc<Vec<packet::Attribute>>>,
+        attrs: Option<&Arc<packet::PathAttributes>>,
         nexthop: Option<bgp::Nexthop>,
         timestamp: u32,
     ) {
@@ -1609,7 +1609,7 @@ mod tests {
                 local_path_id: i as u32,
                 source,
                 nexthop: nexthop.map(packet::bgp::Nexthop::V4),
-                attr: Arc::new(vec![]),
+                attr: Arc::new(packet::PathAttributes::default()),
             })
             .collect();
         table::NlriChange {
@@ -1727,7 +1727,7 @@ mod tests {
             Family::IPV4,
             net,
             Some(packet::bgp::Nexthop::V4(nh)),
-            Arc::new(vec![]),
+            Arc::new(packet::PathAttributes::default()),
             None,
             0u32,
         );
@@ -1845,9 +1845,9 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             table::PeerRole::Ebgp,
         ));
-        let attr = Arc::new(vec![
+        let attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0u32).unwrap(),
-        ]);
+        ]));
 
         // Insert 64 distinct /24 prefixes.  With FnvHasher % 2, this is
         // more than enough to guarantee both shards receive at least one route.

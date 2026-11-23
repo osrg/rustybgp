@@ -63,7 +63,7 @@ impl BmpAdjOut {
         family: Family,
         nlri: packet::Nlri,
         path_id: u32,
-        attrs: Option<Arc<Vec<packet::Attribute>>>,
+        attrs: Option<Arc<packet::PathAttributes>>,
         nexthop: Option<bgp::Nexthop>,
     ) {
         use crate::table_manager::{AdjRibOutChange, BgpEvent};
@@ -96,7 +96,7 @@ impl BmpAdjOut {
         family: Family,
         nlri: packet::Nlri,
         path_id: u32,
-        route: Option<(Arc<Vec<packet::Attribute>>, Option<bgp::Nexthop>)>,
+        route: Option<(Arc<packet::PathAttributes>, Option<bgp::Nexthop>)>,
     ) {
         let (attrs, nh) = match route {
             Some((a, nh)) => (Some(a), nh),
@@ -112,7 +112,7 @@ impl BmpAdjOut {
         family: Family,
         nlri: packet::Nlri,
         path_id: u32,
-        route: Option<(Arc<Vec<packet::Attribute>>, Option<bgp::Nexthop>)>,
+        route: Option<(Arc<packet::PathAttributes>, Option<bgp::Nexthop>)>,
     ) {
         let (attrs, nh) = match route {
             Some((a, nh)) => (Some(a), nh),
@@ -277,7 +277,7 @@ impl PeerExportContext {
     /// `options.OldNextHop`, captured before `UpdatePathAttrs` runs).
     pub(super) fn pre_policy_defaults(
         &self,
-        attr: &mut Arc<Vec<packet::Attribute>>,
+        attr: &mut Arc<packet::PathAttributes>,
         nexthop: &mut Option<bgp::Nexthop>,
         family: Family,
         is_local: bool,
@@ -311,8 +311,8 @@ impl PeerExportContext {
     /// rather than here, after policy has already run.
     pub(super) fn export_attrs(
         &self,
-        attrs: &Arc<Vec<bgp::Attribute>>,
-    ) -> Arc<Vec<bgp::Attribute>> {
+        attrs: &Arc<bgp::PathAttributes>,
+    ) -> Arc<bgp::PathAttributes> {
         let exported = match self.role {
             PeerRole::RsClient => attrs.clone(),
             PeerRole::Ibgp | PeerRole::IbgpRrClient => {
@@ -320,8 +320,8 @@ impl PeerExportContext {
             }
             PeerRole::ConfedEbgp => {
                 // Prepend local Member-AS to AS_CONFED_SEQUENCE; retain LOCAL_PREF.
-                let has_as_path = attrs.iter().any(|a| a.code() == bgp::Attribute::AS_PATH);
-                let mut new_attrs: Vec<bgp::Attribute> = attrs
+                let has_as_path = attrs.contains(bgp::Attribute::AS_PATH);
+                let mut new_attrs: bgp::PathAttributes = attrs
                     .iter()
                     .map(|a| {
                         if a.code() == bgp::Attribute::AS_PATH {
@@ -332,7 +332,7 @@ impl PeerExportContext {
                     })
                     .collect();
                 if !has_as_path {
-                    new_attrs.push(
+                    new_attrs.insert(
                         bgp::Attribute::empty_as_path().as_path_prepend_confed(self.local_asn),
                     );
                 }
@@ -346,8 +346,8 @@ impl PeerExportContext {
                 } else {
                     self.local_asn
                 };
-                let has_as_path = attrs.iter().any(|a| a.code() == bgp::Attribute::AS_PATH);
-                let mut new_attrs: Vec<bgp::Attribute> = attrs
+                let has_as_path = attrs.contains(bgp::Attribute::AS_PATH);
+                let mut new_attrs: bgp::PathAttributes = attrs
                     .iter()
                     .filter(|a| {
                         !matches!(
@@ -367,7 +367,7 @@ impl PeerExportContext {
                     })
                     .collect();
                 if !has_as_path {
-                    new_attrs.push(bgp::Attribute::empty_as_path().as_path_prepend(prepend_asn));
+                    new_attrs.insert(bgp::Attribute::empty_as_path().as_path_prepend(prepend_asn));
                 }
                 Arc::new(new_attrs)
             }
@@ -464,7 +464,7 @@ pub(super) trait NlriSink {
         nlri: packet::Nlri,
         path_id: u32,
         nexthop: Option<bgp::Nexthop>,
-        attr: Arc<Vec<packet::Attribute>>,
+        attr: Arc<packet::PathAttributes>,
         source: &Arc<table::Source>,
     );
     fn unreach(&mut self, dest_id: u32, nlri: packet::Nlri, path_id: u32);
@@ -477,7 +477,7 @@ impl NlriSink for crate::peer_tx::PendingTx {
         nlri: packet::Nlri,
         path_id: u32,
         nexthop: Option<bgp::Nexthop>,
-        attr: Arc<Vec<packet::Attribute>>,
+        attr: Arc<packet::PathAttributes>,
         _source: &Arc<table::Source>,
     ) {
         crate::peer_tx::PendingTx::reach(self, dest_id, nlri, path_id, nexthop, attr);
@@ -506,7 +506,7 @@ impl NlriSink for AdjOutSink {
         nlri: packet::Nlri,
         _path_id: u32,
         nexthop: Option<bgp::Nexthop>,
-        attr: Arc<Vec<packet::Attribute>>,
+        attr: Arc<packet::PathAttributes>,
         source: &Arc<table::Source>,
     ) {
         let entry = table::PathEntry {
@@ -536,7 +536,7 @@ impl NlriSink for AdjOutSink {
     }
 }
 
-type GroupedAttrKey = (Arc<Vec<packet::Attribute>>, Option<bgp::Nexthop>);
+type GroupedAttrKey = (Arc<packet::PathAttributes>, Option<bgp::Nexthop>);
 
 /// `NlriSink` that groups routes by (attr, nexthop) directly, bypassing the
 /// per-NLRI HashMap in `PendingTx`.
@@ -580,7 +580,7 @@ impl NlriSink for GroupedSink {
         nlri: packet::Nlri,
         path_id: u32,
         nexthop: Option<bgp::Nexthop>,
-        attr: Arc<Vec<packet::Attribute>>,
+        attr: Arc<packet::PathAttributes>,
         _source: &Arc<table::Source>,
     ) {
         let key = packet::PathNlri {
@@ -737,7 +737,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
         // export_attrs can be applied in one step below.
         let current_top_n: Vec<(
             u32,
-            Arc<Vec<packet::Attribute>>,
+            Arc<packet::PathAttributes>,
             Option<bgp::Nexthop>,
             Arc<table::Source>,
         )> = update
@@ -836,20 +836,15 @@ pub(super) fn process_nlri_change<S: NlriSink>(
 /// Sets ORIGINATOR_ID to `source_router_id` if absent, and prepends
 /// `cluster_id` to CLUSTER_LIST (creating the attribute if absent).
 pub(super) fn rr_reflect_attrs(
-    attrs: &Arc<Vec<packet::Attribute>>,
+    attrs: &Arc<packet::PathAttributes>,
     source_router_id: u32,
     cluster_id: Ipv4Addr,
-) -> Arc<Vec<packet::Attribute>> {
-    let has_originator = attrs
-        .iter()
-        .any(|a| a.code() == packet::Attribute::ORIGINATOR_ID);
-
+) -> Arc<packet::PathAttributes> {
     let cid_bytes = u32::from(cluster_id).to_be_bytes();
     let new_cluster_list: Vec<u8> = {
         let mut v = cid_bytes.to_vec();
         if let Some(existing) = attrs
-            .iter()
-            .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
+            .get(packet::Attribute::CLUSTER_LIST)
             .and_then(|a| a.binary())
         {
             v.extend_from_slice(existing);
@@ -857,22 +852,18 @@ pub(super) fn rr_reflect_attrs(
         v
     };
 
-    let mut new_attrs: Vec<packet::Attribute> = attrs
-        .iter()
-        .filter(|a| a.code() != packet::Attribute::CLUSTER_LIST)
-        .cloned()
-        .collect();
-
-    if !has_originator
+    let mut new_attrs = packet::PathAttributes::clone(attrs);
+    if !new_attrs.contains(packet::Attribute::ORIGINATOR_ID)
         && let Some(a) =
             packet::Attribute::new_with_value(packet::Attribute::ORIGINATOR_ID, source_router_id)
     {
-        new_attrs.push(a);
+        new_attrs.insert(a);
     }
-    if let Some(a) =
-        packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, new_cluster_list)
-    {
-        new_attrs.push(a);
+    match packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, new_cluster_list) {
+        Some(a) => new_attrs.insert(a),
+        None => {
+            new_attrs.remove(packet::Attribute::CLUSTER_LIST);
+        }
     }
     Arc::new(new_attrs)
 }
@@ -883,39 +874,21 @@ pub(super) fn rr_reflect_attrs(
 /// helper), returns a clone of the original Arc.  Otherwise appends 4 bytes to
 /// the existing COMMUNITY attribute, or creates a new one if absent.
 pub(super) fn with_llgr_stale_community(
-    attr: &Arc<Vec<packet::Attribute>>,
-) -> Arc<Vec<packet::Attribute>> {
+    attr: &Arc<packet::PathAttributes>,
+) -> Arc<packet::PathAttributes> {
     const LLGR_STALE: [u8; 4] = [0xff, 0xff, 0x00, 0x06];
-    let existing = attr
-        .iter()
-        .find(|a| a.code() == packet::Attribute::COMMUNITY)
-        .and_then(|a| a.binary());
-    if let Some(bin) = existing {
-        if bin.chunks(4).any(|c| c == LLGR_STALE) {
-            return Arc::clone(attr);
-        }
-        // Append to the existing COMMUNITY attribute, replacing it in-place.
-        let mut new_bin = bin.to_vec();
-        new_bin.extend_from_slice(&LLGR_STALE);
-        let new_community =
-            packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, new_bin).unwrap();
-        return Arc::new(
-            attr.iter()
-                .map(|a| {
-                    if a.code() == packet::Attribute::COMMUNITY {
-                        new_community.clone()
-                    } else {
-                        a.clone()
-                    }
-                })
-                .collect(),
-        );
-    }
-    // No COMMUNITY attribute: append a new one.
-    let mut new_attrs: Vec<packet::Attribute> = attr.iter().cloned().collect();
-    new_attrs.push(
-        packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, LLGR_STALE.to_vec()).unwrap(),
-    );
+    let mut new_bin = match attr
+        .get(packet::Attribute::COMMUNITY)
+        .and_then(|a| a.binary())
+    {
+        Some(bin) if bin.chunks(4).any(|c| c == LLGR_STALE) => return Arc::clone(attr),
+        Some(bin) => bin.to_vec(),
+        None => Vec::new(),
+    };
+    new_bin.extend_from_slice(&LLGR_STALE);
+    let mut new_attrs = packet::PathAttributes::clone(attr);
+    new_attrs
+        .insert(packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, new_bin).unwrap());
     Arc::new(new_attrs)
 }
 
@@ -924,7 +897,7 @@ pub(super) fn with_llgr_stale_community(
 /// Applies only to route announcements; `confederation_id` of 0 disables the
 /// confederation check.
 pub(super) fn is_as_loop(
-    attr: &Arc<Vec<bgp::Attribute>>,
+    attr: &Arc<bgp::PathAttributes>,
     local_asn: u32,
     confederation_id: u32,
 ) -> bool {
@@ -947,18 +920,13 @@ pub(super) fn is_as_loop(
 /// fallback for peers that omit it.  Returns the original Arc unchanged when
 /// LOCAL_PREF is already present (no allocation).
 pub(super) fn inject_local_pref_if_absent(
-    attr: Arc<Vec<packet::Attribute>>,
-) -> Arc<Vec<packet::Attribute>> {
-    if attr
-        .iter()
-        .any(|a| a.code() == packet::Attribute::LOCAL_PREF)
-    {
+    attr: Arc<packet::PathAttributes>,
+) -> Arc<packet::PathAttributes> {
+    if attr.contains(packet::Attribute::LOCAL_PREF) {
         return attr;
     }
-    let mut new_attr: Vec<packet::Attribute> = (*attr).clone();
-    let pos = new_attr.partition_point(|a| a.code() < packet::Attribute::LOCAL_PREF);
+    let mut new_attr = packet::PathAttributes::clone(&attr);
     new_attr.insert(
-        pos,
         packet::Attribute::new_with_value(
             packet::Attribute::LOCAL_PREF,
             packet::Attribute::DEFAULT_LOCAL_PREF,

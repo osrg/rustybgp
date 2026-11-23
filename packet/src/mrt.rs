@@ -212,7 +212,7 @@ pub struct RibEntry {
     pub peer_index: u16,
     pub originated: u32,
     pub nexthop: Option<bgp::Nexthop>,
-    pub attrs: Arc<Vec<bgp::Attribute>>,
+    pub attrs: Arc<bgp::PathAttributes>,
 }
 
 pub enum TableDumpRecord {
@@ -410,13 +410,13 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
     ];
 
-    fn make_attrs_origin_aspath() -> Arc<Vec<bgp::Attribute>> {
+    fn make_attrs_origin_aspath() -> Arc<bgp::PathAttributes> {
         // AS_PATH binary: SEQ(0x02), count(1), AS65001(4 bytes big-endian)
         let as_path_bin = vec![0x02u8, 0x01, 0x00, 0x00, 0xfd, 0xe9];
-        Arc::new(vec![
+        Arc::new(bgp::PathAttributes::new(vec![
             bgp::Attribute::new_with_value(bgp::Attribute::ORIGIN, 0u32).unwrap(),
             bgp::Attribute::new_with_bin(bgp::Attribute::AS_PATH, as_path_bin).unwrap(),
-        ])
+        ]))
     }
 
     #[test]

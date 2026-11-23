@@ -17,8 +17,8 @@ pub mod bgp;
 pub use self::bgp::Notification;
 pub use self::bgp::validate_message;
 pub use self::bgp::{
-    Attribute, Capability, Family, HoldTime, IpNet, Nlri, Open, ParsedMessage, PathNlri, ReachNlri,
-    UnreachNlri, Update,
+    Attribute, Capability, Family, HoldTime, IpNet, Nlri, Open, ParsedMessage, PathAttributes,
+    PathNlri, ReachNlri, UnreachNlri, Update,
 };
 pub use self::error::Error;
 

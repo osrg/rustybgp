@@ -724,7 +724,7 @@ mod tests {
             family,
             addpath: false,
             nlris,
-            attrs: Some(Arc::new(Vec::new())),
+            attrs: Some(Arc::new(packet::PathAttributes::default())),
             nexthop: None,
             timestamp: 0u32,
         }

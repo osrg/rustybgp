@@ -2064,13 +2064,13 @@ async fn process_restarting_outputs(
 type ExportedPath = (
     Family,
     Vec<packet::PathNlri>,
-    Option<Arc<Vec<packet::Attribute>>>,
+    Option<Arc<packet::PathAttributes>>,
 );
 
 fn vrf_export_path(
     family: Family,
     nets: Vec<packet::PathNlri>,
-    attrs: Option<Arc<Vec<packet::Attribute>>>,
+    attrs: Option<Arc<packet::PathAttributes>>,
     vrf: &table::Vrf,
 ) -> Result<ExportedPath, tonic::Status> {
     let vpn_family = match family {
@@ -2120,23 +2120,16 @@ fn vrf_export_path(
             .iter()
             .flat_map(|rt| rt.iter().copied())
             .collect();
-        let mut new_attrs: Vec<packet::Attribute> =
-            attrs.as_deref().map_or_else(Vec::new, |v| v.to_vec());
-        if let Some(ec) = new_attrs
-            .iter_mut()
-            .find(|a| a.code() == packet::bgp::Attribute::EXTENDED_COMMUNITY)
+        let mut new_attrs: packet::PathAttributes = attrs.as_deref().cloned().unwrap_or_default();
+        let mut data = new_attrs
+            .get(packet::bgp::Attribute::EXTENDED_COMMUNITY)
+            .and_then(|ec| ec.binary().cloned())
+            .unwrap_or_default();
+        data.extend_from_slice(&rt_bytes);
+        if let Some(ec) =
+            packet::Attribute::new_with_bin(packet::bgp::Attribute::EXTENDED_COMMUNITY, data)
         {
-            let mut data = ec.binary().cloned().unwrap_or_default();
-            data.extend_from_slice(&rt_bytes);
-            *ec = packet::Attribute::new_with_bin(packet::bgp::Attribute::EXTENDED_COMMUNITY, data)
-                .unwrap();
-        } else {
-            if let Some(ec) = packet::Attribute::new_with_bin(
-                packet::bgp::Attribute::EXTENDED_COMMUNITY,
-                rt_bytes,
-            ) {
-                new_attrs.push(ec);
-            }
+            new_attrs.insert(ec);
         }
         Some(Arc::new(new_attrs))
     };
@@ -3251,7 +3244,7 @@ impl PeerSession {
 
     /// Returns `true` when a received announcement with `attr` has looped
     /// back to this speaker (RFC 4271 §9.1.2, RFC 4456 §8).
-    fn is_looped(&self, attr: &Arc<Vec<packet::Attribute>>) -> bool {
+    fn is_looped(&self, attr: &Arc<packet::PathAttributes>) -> bool {
         if is_as_loop(
             attr,
             self.export_ctx.local_asn,
@@ -3291,7 +3284,7 @@ impl PeerSession {
         &mut self,
         reach: Option<bgp::ReachNlri>,
         unreach: Option<packet::UnreachNlri>,
-        attr: Arc<Vec<packet::Attribute>>,
+        attr: Arc<packet::PathAttributes>,
         timestamp: u32,
     ) -> bool {
         // Loop detection: the local AS (or confederation ID) in AS_PATH
@@ -3465,7 +3458,7 @@ impl PeerSession {
                     family: *family,
                     entries: entries.clone(),
                 }),
-                Arc::new(Vec::new()),
+                Arc::new(packet::PathAttributes::default()),
             )),
             _ => None,
         };
@@ -6332,9 +6325,9 @@ local-address = "{local}"
             local_path_id: 1,
             source,
             nexthop: Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
-            attr: Arc::new(vec![
+            attr: Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-            ]),
+            ])),
         };
         table::NlriChange {
             family: Family::IPV4,
@@ -6367,7 +6360,7 @@ local-address = "{local}"
             local_path_id: 1,
             source,
             nexthop: Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
-            attr: Arc::new(vec![]),
+            attr: Arc::new(packet::PathAttributes::default()),
         };
         table::NlriChange {
             family: Family::IPV4,
@@ -6468,9 +6461,9 @@ local-address = "{local}"
             Family::IPV4,
             net,
             Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
-            Arc::new(vec![
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0u32).unwrap(),
-            ]),
+            ])),
             None,
             0u32,
         );
@@ -6650,9 +6643,9 @@ local-address = "{local}"
             Family::IPV4_VPN,
             packet::PathNlri::new(vpn_nlri),
             Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
-            Arc::new(vec![
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0u32).unwrap(),
-            ]),
+            ])),
             None,
             0u32,
         );
@@ -7131,7 +7124,7 @@ local-address = "{local}"
         ));
         let ipv4_net: packet::Nlri = "10.1.0.0/24".parse().unwrap();
         let ipv6_net: packet::Nlri = "2001:db8::/32".parse().unwrap();
-        let attrs = Arc::new(Vec::new());
+        let attrs = Arc::new(packet::PathAttributes::default());
         let nh4 = packet::bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 2));
         let nh6 =
             packet::bgp::Nexthop::V6(std::net::Ipv6Addr::new(0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1));
@@ -7201,7 +7194,7 @@ local-address = "{local}"
             PeerRole::Ebgp,
         ));
         let ipv4_net: packet::Nlri = "10.2.0.0/24".parse().unwrap();
-        let attrs = Arc::new(Vec::new());
+        let attrs = Arc::new(packet::PathAttributes::default());
         let nh4 = packet::bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 3));
 
         {
@@ -7754,9 +7747,9 @@ local-address = "{local}"
                 local_path_id,
                 source,
                 nexthop: Some(bgp::Nexthop::V4(Ipv4Addr::new(1, 1, 1, 1))),
-                attr: Arc::new(vec![
+                attr: Arc::new(packet::PathAttributes::new(vec![
                     packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-                ]),
+                ])),
             }
         }
 
@@ -8695,25 +8688,25 @@ local-address = "{local}"
 
         // ---- export_attrs / pre_policy_defaults per-role correctness ----
 
-        fn attr_with_local_pref() -> Arc<Vec<packet::Attribute>> {
-            Arc::new(vec![
+        fn attr_with_local_pref() -> Arc<packet::PathAttributes> {
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
-            ])
+            ]))
         }
 
-        fn attr_with_aspath() -> Arc<Vec<packet::Attribute>> {
-            Arc::new(vec![
+        fn attr_with_aspath() -> Arc<packet::PathAttributes> {
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 packet::Attribute::empty_as_path(),
-            ])
+            ]))
         }
 
-        fn attr_with_med() -> Arc<Vec<packet::Attribute>> {
-            Arc::new(vec![
+        fn attr_with_med() -> Arc<packet::PathAttributes> {
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, 50).unwrap(),
-            ])
+            ]))
         }
 
         #[test]
@@ -8849,23 +8842,23 @@ local-address = "{local}"
             );
         }
 
-        fn attr_with_originator_id() -> Arc<Vec<packet::Attribute>> {
-            Arc::new(vec![
+        fn attr_with_originator_id() -> Arc<packet::PathAttributes> {
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 packet::Attribute::new_with_value(packet::Attribute::ORIGINATOR_ID, 0x0a000001)
                     .unwrap(),
-            ])
+            ]))
         }
 
-        fn attr_with_cluster_list() -> Arc<Vec<packet::Attribute>> {
-            Arc::new(vec![
+        fn attr_with_cluster_list() -> Arc<packet::PathAttributes> {
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 packet::Attribute::new_with_bin(
                     packet::Attribute::CLUSTER_LIST,
                     vec![0x00, 0x00, 0xff, 0x01],
                 )
                 .unwrap(),
-            ])
+            ]))
         }
 
         #[test]
@@ -8941,8 +8934,8 @@ local-address = "{local}"
             );
         }
 
-        fn attr_with_opaque_transitive() -> Arc<Vec<packet::Attribute>> {
-            Arc::new(vec![
+        fn attr_with_opaque_transitive() -> Arc<packet::PathAttributes> {
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 // Unknown optional transitive (code=200, flags=optional|transitive)
                 packet::Attribute::new_opaque(
@@ -8952,11 +8945,11 @@ local-address = "{local}"
                         | 0x80, /* optional */
                     vec![0x01, 0x02, 0x03],
                 ),
-            ])
+            ]))
         }
 
-        fn attr_with_opaque_non_transitive() -> Arc<Vec<packet::Attribute>> {
-            Arc::new(vec![
+        fn attr_with_opaque_non_transitive() -> Arc<packet::PathAttributes> {
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 // Unknown optional non-transitive (code=201, flags=optional only)
                 packet::Attribute::new_opaque(
@@ -8964,7 +8957,7 @@ local-address = "{local}"
                     0x80, /* optional */
                     vec![0x04, 0x05, 0x06],
                 ),
-            ])
+            ]))
         }
 
         #[test]
@@ -9000,12 +8993,12 @@ local-address = "{local}"
             }
         }
 
-        fn aigp_attr() -> Arc<Vec<bgp::Attribute>> {
+        fn aigp_attr() -> Arc<bgp::PathAttributes> {
             // AIGP TLV: type=1, len=11, value=8-byte metric (all zeros)
             let aigp_tlv: Vec<u8> = vec![1, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0];
-            Arc::new(vec![
+            Arc::new(packet::PathAttributes::new(vec![
                 bgp::Attribute::new_with_bin(bgp::Attribute::AIGP, aigp_tlv).unwrap(),
-            ])
+            ]))
         }
 
         #[test]
@@ -9031,7 +9024,7 @@ local-address = "{local}"
         #[test]
         fn pre_policy_defaults_rewrites_nexthop_for_ebgp() {
             let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
-            let mut attr = Arc::new(vec![]);
+            let mut attr = Arc::new(packet::PathAttributes::default());
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
             let mut nexthop = Some(original);
             ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
@@ -9045,7 +9038,7 @@ local-address = "{local}"
         #[test]
         fn pre_policy_defaults_keeps_nexthop_for_ibgp() {
             let ctx = ibgp_ctx();
-            let mut attr = Arc::new(vec![]);
+            let mut attr = Arc::new(packet::PathAttributes::default());
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
             let mut nexthop = Some(original);
             ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
@@ -9057,7 +9050,7 @@ local-address = "{local}"
         #[test]
         fn pre_policy_defaults_honors_explicit_local_nexthop_for_ebgp() {
             let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
-            let mut attr = Arc::new(vec![]);
+            let mut attr = Arc::new(packet::PathAttributes::default());
             let explicit = bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1));
             let mut nexthop = Some(explicit);
             ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, true);
@@ -9071,7 +9064,7 @@ local-address = "{local}"
         #[test]
         fn pre_policy_defaults_fills_self_for_local_unspecified_nexthop_ebgp() {
             let ctx = ebgp_ctx(); // local_addr = 127.0.0.1
-            let mut attr = Arc::new(vec![]);
+            let mut attr = Arc::new(packet::PathAttributes::default());
             let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::UNSPECIFIED));
             ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, true);
             assert_eq!(
@@ -9084,7 +9077,7 @@ local-address = "{local}"
         #[test]
         fn pre_policy_defaults_honors_explicit_local_nexthop_for_ibgp() {
             let ctx = ibgp_ctx();
-            let mut attr = Arc::new(vec![]);
+            let mut attr = Arc::new(packet::PathAttributes::default());
             let explicit = bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1));
             let mut nexthop = Some(explicit);
             ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, true);
@@ -9098,7 +9091,7 @@ local-address = "{local}"
         #[test]
         fn pre_policy_defaults_fills_self_for_local_unspecified_nexthop_ibgp() {
             let ctx = ibgp_ctx(); // local_addr = 127.0.0.1
-            let mut attr = Arc::new(vec![]);
+            let mut attr = Arc::new(packet::PathAttributes::default());
             let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::UNSPECIFIED));
             ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, true);
             assert_eq!(
@@ -9114,7 +9107,7 @@ local-address = "{local}"
             // self-nexthop for eBGP regardless of the nexthop value -- is_local
             // only changes behavior for locally-injected routes.
             let ctx = ebgp_ctx();
-            let mut attr = Arc::new(vec![]);
+            let mut attr = Arc::new(packet::PathAttributes::default());
             let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(192, 168, 1, 1)));
             ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
             assert_eq!(
@@ -9146,17 +9139,17 @@ local-address = "{local}"
             }
         }
 
-        fn attr_with_confed_seq() -> Arc<Vec<packet::Attribute>> {
+        fn attr_with_confed_seq() -> Arc<packet::PathAttributes> {
             // AS_PATH: AS_CONFED_SEQ [65002] followed by AS_SEQ [65100]
             let mut data: Vec<u8> = vec![packet::Attribute::AS_PATH_TYPE_CONFED_SEQ, 1];
             data.extend_from_slice(&65002u32.to_be_bytes());
             data.extend_from_slice(&[packet::Attribute::AS_PATH_TYPE_SEQ, 1]);
             data.extend_from_slice(&65100u32.to_be_bytes());
-            Arc::new(vec![
+            Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 100).unwrap(),
                 packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, data).unwrap(),
-            ])
+            ]))
         }
 
         #[test]
@@ -9181,10 +9174,10 @@ local-address = "{local}"
         #[test]
         fn confed_ebgp_export_attrs_retains_local_pref() {
             let ctx = confed_ebgp_ctx();
-            let attrs = Arc::new(vec![
+            let attrs = Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
-            ]);
+            ]));
             let exported = ctx.export_attrs(&attrs);
             assert!(
                 exported
@@ -9231,7 +9224,7 @@ local-address = "{local}"
         #[test]
         fn confed_ebgp_pre_policy_defaults_rewrites_nexthop_to_local() {
             let ctx = confed_ebgp_ctx(); // local_addr = 127.0.0.1
-            let mut attr = Arc::new(vec![]);
+            let mut attr = Arc::new(packet::PathAttributes::default());
             let original = bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1));
             let mut nexthop = Some(original);
             ctx.pre_policy_defaults(&mut attr, &mut nexthop, Family::IPV4, false);
@@ -9360,7 +9353,7 @@ local-address = "{local}"
         fn path_with_attrs(
             pid: u32,
             src: Arc<table::Source>,
-            attrs: Arc<Vec<packet::Attribute>>,
+            attrs: Arc<packet::PathAttributes>,
         ) -> table::Path {
             table::Path {
                 local_path_id: pid,
@@ -9372,7 +9365,7 @@ local-address = "{local}"
 
         fn drain_first_reach_attrs(
             pending: &mut crate::peer_tx::PendingTx,
-        ) -> Arc<Vec<packet::Attribute>> {
+        ) -> Arc<packet::PathAttributes> {
             let msgs = pending.drain_messages(Family::IPV4);
             for msg in msgs {
                 if let bgp::Message::Update(bgp::Update::Reach { entries, attr, .. }) = msg
@@ -9427,11 +9420,11 @@ local-address = "{local}"
             let mut pending = crate::peer_tx::PendingTx::new(false);
             let net = nlri("10.0.0.0/24");
             let orig_id = u32::from(Ipv4Addr::new(9, 9, 9, 9));
-            let attrs = Arc::new(vec![
+            let attrs = Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 packet::Attribute::new_with_value(packet::Attribute::ORIGINATOR_ID, orig_id)
                     .unwrap(),
-            ]);
+            ]));
             let src = ibgp_source(PEER);
             let p = path_with_attrs(1, src, attrs);
             let update = change(&net, true, true, None, vec![p]);
@@ -9471,11 +9464,11 @@ local-address = "{local}"
             let net = nlri("10.0.0.0/24");
             let existing_cid = Ipv4Addr::new(2, 0, 0, 2);
             let cluster_bytes: Vec<u8> = u32::from(existing_cid).to_be_bytes().to_vec();
-            let attrs = Arc::new(vec![
+            let attrs = Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
                 packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cluster_bytes)
                     .unwrap(),
-            ]);
+            ]));
             let p = path_with_attrs(1, ibgp_source(PEER), attrs);
             let update = change(&net, true, true, None, vec![p]);
 
@@ -9725,7 +9718,7 @@ local-address = "{local}"
         }
         // ---- LLGR_STALE community on export ----
 
-        fn reach_attrs(msgs: &[bgp::Message]) -> Option<Arc<Vec<packet::Attribute>>> {
+        fn reach_attrs(msgs: &[bgp::Message]) -> Option<Arc<packet::PathAttributes>> {
             for msg in msgs {
                 if let bgp::Message::Update(bgp::Update::Reach { attr, .. }) = msg {
                     return Some(Arc::clone(attr));
@@ -10601,7 +10594,9 @@ local-address = "{local}"
             Family::IPV4,
             packet::PathNlri::new(nlri),
             Some(bgp::Nexthop::V4("192.0.2.2".parse().unwrap())),
-            Arc::new(vec![packet::Attribute::empty_as_path()]),
+            Arc::new(packet::PathAttributes::new(vec![
+                packet::Attribute::empty_as_path(),
+            ])),
             None,
             0,
         );
@@ -10713,9 +10708,9 @@ local-address = "{local}"
             Ipv4Addr::new(10, 0, 0, 2),
             PeerRole::Ebgp,
         ));
-        let attr = Arc::new(vec![
+        let attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-        ]);
+        ]));
         for i in 0..destinations {
             for path_id in 0..paths_per_destination {
                 svc.tables.insert_route(
@@ -10824,9 +10819,9 @@ local-address = "{local}"
                     path_id: 0,
                 },
                 Some(nh),
-                Arc::new(vec![
+                Arc::new(packet::PathAttributes::new(vec![
                     packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-                ]),
+                ])),
                 None,
                 0,
             ));
@@ -12223,10 +12218,10 @@ port = 3323
         session
     }
 
-    fn origin_only() -> Arc<Vec<packet::Attribute>> {
-        Arc::new(vec![
+    fn origin_only() -> Arc<packet::PathAttributes> {
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-        ])
+        ]))
     }
 
     /// Install a valid path, send `looped` for the same prefix, and assert the
@@ -12234,7 +12229,7 @@ port = 3323
     async fn assert_loop_withdraws(
         session: &mut PeerSession,
         tables: &TableHandle,
-        looped: Arc<Vec<packet::Attribute>>,
+        looped: Arc<packet::PathAttributes>,
     ) {
         assert!(
             !session
@@ -12260,13 +12255,13 @@ port = 3323
         let tables = make_tables();
         let mut session = loop_test_session(&tables, PeerRole::Ibgp);
         // local_router_id is 1.0.0.1 in new_for_test
-        let attrs = Arc::new(vec![
+        let attrs = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(
                 packet::Attribute::ORIGINATOR_ID,
                 u32::from(Ipv4Addr::new(1, 0, 0, 1)),
             )
             .unwrap(),
-        ]);
+        ]));
         assert_loop_withdraws(&mut session, &tables, attrs).await;
     }
 
@@ -12279,9 +12274,9 @@ port = 3323
             .local_cluster_ids
             .store(Arc::new([local_cid].into_iter().collect()));
         let cid_bytes = u32::from(local_cid).to_be_bytes().to_vec();
-        let attrs = Arc::new(vec![
+        let attrs = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cid_bytes).unwrap(),
-        ]);
+        ]));
         assert_loop_withdraws(&mut session, &tables, attrs).await;
     }
 
@@ -12299,21 +12294,21 @@ port = 3323
         cid_bytes.extend_from_slice(&u32::from(Ipv4Addr::new(2, 0, 0, 2)).to_be_bytes());
         cid_bytes.extend_from_slice(&u32::from(local_cid).to_be_bytes());
         cid_bytes.extend_from_slice(&u32::from(Ipv4Addr::new(3, 0, 0, 3)).to_be_bytes());
-        let attrs = Arc::new(vec![
+        let attrs = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::CLUSTER_LIST, cid_bytes).unwrap(),
-        ]);
+        ]));
         assert_loop_withdraws(&mut session, &tables, attrs).await;
     }
 
-    fn as_path_attr(asns: &[u32]) -> Arc<Vec<packet::Attribute>> {
+    fn as_path_attr(asns: &[u32]) -> Arc<packet::PathAttributes> {
         let mut bin = vec![packet::Attribute::AS_PATH_TYPE_SEQ, asns.len() as u8];
         for asn in asns {
             bin.extend_from_slice(&asn.to_be_bytes());
         }
-        Arc::new(vec![
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
             packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, bin).unwrap(),
-        ])
+        ]))
     }
 
     #[tokio::test]
@@ -12471,15 +12466,15 @@ port = 3323
         }
     }
 
-    fn attrs(cluster: Ipv4Addr) -> Arc<Vec<packet::Attribute>> {
-        Arc::new(vec![
+    fn attrs(cluster: Ipv4Addr) -> Arc<packet::PathAttributes> {
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
             packet::Attribute::new_with_bin(
                 packet::Attribute::CLUSTER_LIST,
                 cluster.octets().to_vec(),
             )
             .unwrap(),
-        ])
+        ]))
     }
 
     fn rr_params(addr: &str, cluster: Option<Ipv4Addr>) -> PeerParams {
@@ -12539,13 +12534,13 @@ port = 3323
                 .await;
             assert_eq!(tables.table_state(Family::IPV4).num_destination, 1);
             // ORIGINATOR_ID protection still applies to ordinary iBGP speakers.
-            let originator = Arc::new(vec![
+            let originator = Arc::new(packet::PathAttributes::new(vec![
                 packet::Attribute::new_with_value(
                     packet::Attribute::ORIGINATOR_ID,
                     u32::from(session.local_router_id),
                 )
                 .unwrap(),
-            ]);
+            ]));
             session
                 .rx_update(reach_set("203.0.113.0/24"), None, originator, 0)
                 .await;
@@ -14463,8 +14458,8 @@ mod as_loop_tests {
         bgp::Attribute::new_with_bin(bgp::Attribute::AS_PATH, data).unwrap()
     }
 
-    fn make_attr(asns: &[u32]) -> Arc<Vec<bgp::Attribute>> {
-        Arc::new(vec![as_path_attr(asns)])
+    fn make_attr(asns: &[u32]) -> Arc<bgp::PathAttributes> {
+        Arc::new(packet::PathAttributes::new(vec![as_path_attr(asns)]))
     }
 
     #[test]
@@ -14491,9 +14486,9 @@ mod as_loop_tests {
 
     #[test]
     fn no_as_path_attr_is_not_a_loop() {
-        let attr = Arc::new(vec![
+        let attr = Arc::new(packet::PathAttributes::new(vec![
             bgp::Attribute::new_with_value(bgp::Attribute::ORIGIN, 0).unwrap(),
-        ]);
+        ]));
         assert!(!is_as_loop(&attr, 65001, 0));
     }
 }
@@ -14502,7 +14497,7 @@ mod as_loop_tests {
 mod local_pref_tests {
     use super::*;
 
-    fn attr_with_codes(codes: &[u8]) -> Arc<Vec<packet::Attribute>> {
+    fn attr_with_codes(codes: &[u8]) -> Arc<packet::PathAttributes> {
         Arc::new(
             codes
                 .iter()
@@ -14527,10 +14522,10 @@ mod local_pref_tests {
 
     #[test]
     fn preserves_existing_local_pref() {
-        let attr = Arc::new(vec![
+        let attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
             packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
-        ]);
+        ]));
         let result = inject_local_pref_if_absent(Arc::clone(&attr));
         assert!(Arc::ptr_eq(&result, &attr), "must return the same Arc");
         let lp = result
@@ -14555,9 +14550,9 @@ mod local_pref_tests {
     #[test]
     fn no_allocation_when_already_present() {
         // Arc::ptr_eq confirms inject_local_pref_if_absent returns the original Arc.
-        let attr = Arc::new(vec![
+        let attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 100).unwrap(),
-        ]);
+        ]));
         let result = inject_local_pref_if_absent(Arc::clone(&attr));
         assert!(Arc::ptr_eq(&result, &attr));
     }
@@ -14574,7 +14569,7 @@ mod llgr_community_tests {
         packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, bin).unwrap()
     }
 
-    fn has_community(attr: &Arc<Vec<packet::Attribute>>, val: u32) -> bool {
+    fn has_community(attr: &Arc<packet::PathAttributes>, val: u32) -> bool {
         attr.iter()
             .find(|a| a.code() == packet::Attribute::COMMUNITY)
             .and_then(|a| a.binary())
@@ -14586,9 +14581,9 @@ mod llgr_community_tests {
 
     #[test]
     fn adds_community_when_none_present() {
-        let attr = Arc::new(vec![
+        let attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-        ]);
+        ]));
         let result = with_llgr_stale_community(&attr);
         assert!(has_community(&result, LLGR_STALE));
     }
@@ -14596,7 +14591,7 @@ mod llgr_community_tests {
     #[test]
     fn appends_to_existing_community() {
         const OTHER: u32 = 0x0001_0002;
-        let attr = Arc::new(vec![community_attr(&[OTHER])]);
+        let attr = Arc::new(packet::PathAttributes::new(vec![community_attr(&[OTHER])]));
         let result = with_llgr_stale_community(&attr);
         assert!(has_community(&result, LLGR_STALE));
         assert!(
@@ -14607,7 +14602,9 @@ mod llgr_community_tests {
 
     #[test]
     fn no_duplicate_when_already_tagged() {
-        let attr = Arc::new(vec![community_attr(&[LLGR_STALE])]);
+        let attr = Arc::new(packet::PathAttributes::new(vec![community_attr(&[
+            LLGR_STALE,
+        ])]));
         let result = with_llgr_stale_community(&attr);
         assert!(Arc::ptr_eq(&result, &attr), "must return original Arc");
         let count = result

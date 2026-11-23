@@ -314,7 +314,8 @@ impl Decoder for BmpCodec {
 mod tests {
     use super::*;
     use crate::bgp::{
-        self, Attribute, Family, HoldTime, Ipv4Net, Ipv6Net, Nexthop, Nlri, PathNlri, Update,
+        self, Attribute, Family, HoldTime, Ipv4Net, Ipv6Net, Nexthop, Nlri, PathAttributes,
+        PathNlri, Update,
     };
     use bytes::BytesMut;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -374,13 +375,13 @@ mod tests {
     }
 
     // Common attrs: ORIGIN IGP + AS_PATH [65001].  NEXTHOP is added by the encoder for IPv4.
-    fn basic_attrs() -> Arc<Vec<Attribute>> {
-        Arc::new(vec![
+    fn basic_attrs() -> Arc<PathAttributes> {
+        Arc::new(PathAttributes::new(vec![
             Attribute::new_with_value(Attribute::ORIGIN, 0).unwrap(),
             // AS_PATH: SEQ, count=1, ASN=65001 (4-byte).
             Attribute::new_with_bin(Attribute::AS_PATH, vec![0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9])
                 .unwrap(),
-        ])
+        ]))
     }
 
     fn ipv4_reach_update() -> bgp::Message {

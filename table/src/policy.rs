@@ -348,7 +348,7 @@ impl Condition {
         &self,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attr: &Arc<Vec<packet::Attribute>>,
+        attr: &Arc<packet::PathAttributes>,
         nexthop: Option<&bgp::Nexthop>,
         peer_addr: IpAddr,
         rpki: Option<&RpkiTable>,
@@ -816,7 +816,7 @@ impl Statement {
         &self,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attr: &mut Arc<Vec<packet::Attribute>>,
+        attr: &mut Arc<packet::PathAttributes>,
         nexthop: &mut Option<bgp::Nexthop>,
         original_nexthop: Option<bgp::Nexthop>,
         is_confed: bool,
@@ -879,27 +879,28 @@ impl Statement {
                     .collect(),
                 CommunityActionType::Replace => action.communities.clone(),
             };
-            attrs.retain(|a| a.code() != packet::Attribute::COMMUNITY);
-            if let Some(new_attr) = communities_to_attr(new_communities) {
-                attrs.push(new_attr);
+            match communities_to_attr(new_communities) {
+                Some(new_attr) => attrs.insert(new_attr),
+                None => {
+                    attrs.remove(packet::Attribute::COMMUNITY);
+                }
             }
         }
 
         if let Some(action) = &self.actions.local_pref {
             let attrs = Arc::make_mut(attr);
-            attrs.retain(|a| a.code() != packet::Attribute::LOCAL_PREF);
-            if let Some(new_attr) =
-                packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, action.value)
-            {
-                attrs.push(new_attr);
+            match packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, action.value) {
+                Some(new_attr) => attrs.insert(new_attr),
+                None => {
+                    attrs.remove(packet::Attribute::LOCAL_PREF);
+                }
             }
         }
 
         if let Some(action) = &self.actions.med {
             let attrs = Arc::make_mut(attr);
             let current = attrs
-                .iter()
-                .find(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
+                .get(packet::Attribute::MULTI_EXIT_DESC)
                 .and_then(|a| a.value())
                 .unwrap_or(0);
             let new_med = match action.action_type {
@@ -908,11 +909,11 @@ impl Statement {
                 }
                 MedActionType::Replace => action.value.clamp(0, u32::MAX as i64) as u32,
             };
-            attrs.retain(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC);
-            if let Some(new_attr) =
-                packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, new_med)
-            {
-                attrs.push(new_attr);
+            match packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, new_med) {
+                Some(new_attr) => attrs.insert(new_attr),
+                None => {
+                    attrs.remove(packet::Attribute::MULTI_EXIT_DESC);
+                }
             }
         }
 
@@ -921,8 +922,7 @@ impl Statement {
         {
             let attrs = Arc::make_mut(attr);
             let existing = attrs
-                .iter()
-                .find(|a| a.code() == packet::Attribute::AS_PATH)
+                .get(packet::Attribute::AS_PATH)
                 .cloned()
                 .unwrap_or_else(packet::Attribute::empty_as_path);
             let asn = if action.use_left_most {
@@ -941,8 +941,7 @@ impl Statement {
                     new_as_path.as_path_prepend(asn)
                 };
             }
-            attrs.retain(|a| a.code() != packet::Attribute::AS_PATH);
-            attrs.push(new_as_path);
+            attrs.insert(new_as_path);
         }
 
         if let Some(action) = &self.actions.ext_community {
@@ -960,9 +959,11 @@ impl Statement {
                     .collect(),
                 CommunityActionType::Replace => action.communities.clone(),
             };
-            attrs.retain(|a| a.code() != packet::Attribute::EXTENDED_COMMUNITY);
-            if let Some(new_attr) = ext_communities_to_attr(new_communities) {
-                attrs.push(new_attr);
+            match ext_communities_to_attr(new_communities) {
+                Some(new_attr) => attrs.insert(new_attr),
+                None => {
+                    attrs.remove(packet::Attribute::EXTENDED_COMMUNITY);
+                }
             }
         }
 
@@ -981,19 +982,22 @@ impl Statement {
                     .collect(),
                 CommunityActionType::Replace => action.communities.clone(),
             };
-            attrs.retain(|a| a.code() != packet::Attribute::LARGE_COMMUNITY);
-            if let Some(new_attr) = large_communities_to_attr(new_communities) {
-                attrs.push(new_attr);
+            match large_communities_to_attr(new_communities) {
+                Some(new_attr) => attrs.insert(new_attr),
+                None => {
+                    attrs.remove(packet::Attribute::LARGE_COMMUNITY);
+                }
             }
         }
 
         if let Some(action) = &self.actions.origin {
             let attrs = Arc::make_mut(attr);
-            attrs.retain(|a| a.code() != packet::Attribute::ORIGIN);
-            if let Some(new_attr) =
-                packet::Attribute::new_with_value(packet::Attribute::ORIGIN, action.origin as u32)
+            match packet::Attribute::new_with_value(packet::Attribute::ORIGIN, action.origin as u32)
             {
-                attrs.push(new_attr);
+                Some(new_attr) => attrs.insert(new_attr),
+                None => {
+                    attrs.remove(packet::Attribute::ORIGIN);
+                }
             }
         }
 
@@ -1150,7 +1154,7 @@ impl Policy {
         &self,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attr: &mut Arc<Vec<packet::Attribute>>,
+        attr: &mut Arc<packet::PathAttributes>,
         nexthop: &mut Option<bgp::Nexthop>,
         original_nexthop: Option<bgp::Nexthop>,
         is_confed: bool,
@@ -1201,7 +1205,7 @@ impl PolicyAssignment {
         &self,
         source: &Arc<Source>,
         net: &packet::Nlri,
-        attr: &mut Arc<Vec<packet::Attribute>>,
+        attr: &mut Arc<packet::PathAttributes>,
         nexthop: &mut Option<bgp::Nexthop>,
         original_nexthop: Option<bgp::Nexthop>,
         is_confed: bool,
@@ -1257,9 +1261,9 @@ pub fn apply_import(
     rpki: Option<&RpkiTable>,
     source: &Arc<Source>,
     net: &packet::Nlri,
-    attrs: &Arc<Vec<packet::Attribute>>,
+    attrs: &Arc<packet::PathAttributes>,
     nexthop: &mut Option<bgp::Nexthop>,
-) -> (bool, Arc<Vec<packet::Attribute>>) {
+) -> (bool, Arc<packet::PathAttributes>) {
     let mut attr = Arc::clone(attrs);
     // Import has no pre-policy nexthop defaulting step, so the "original" is
     // just the current value -- NexthopAction::Unchanged is a no-op here.
@@ -1302,7 +1306,7 @@ pub fn apply_export(
     rpki: Option<&RpkiTable>,
     source: &Arc<Source>,
     net: &packet::Nlri,
-    attr: &mut Arc<Vec<packet::Attribute>>,
+    attr: &mut Arc<packet::PathAttributes>,
     nexthop: &mut Option<bgp::Nexthop>,
     original_nexthop: Option<bgp::Nexthop>,
     is_confed: bool,
@@ -2614,14 +2618,14 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254))
     }
 
-    fn attrs_with_community(communities: &[u32]) -> Arc<Vec<packet::Attribute>> {
+    fn attrs_with_community(communities: &[u32]) -> Arc<packet::PathAttributes> {
         let mut bin = Vec::with_capacity(communities.len() * 4);
         for c in communities {
             bin.extend_from_slice(&c.to_be_bytes());
         }
-        Arc::new(vec![
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, bin).unwrap(),
-        ])
+        ]))
     }
 
     fn get_communities(attrs: &[packet::Attribute]) -> Vec<u32> {
@@ -2695,7 +2699,7 @@ mod tests {
 
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -2841,9 +2845,9 @@ mod tests {
 
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 100).unwrap(),
-        ]);
+        ]));
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -2874,7 +2878,7 @@ mod tests {
 
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -2924,10 +2928,10 @@ mod tests {
             .and_then(|a| a.value())
     }
 
-    fn attrs_with_med(med: u32) -> Arc<Vec<packet::Attribute>> {
-        Arc::new(vec![
+    fn attrs_with_med(med: u32) -> Arc<packet::PathAttributes> {
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, med).unwrap(),
-        ])
+        ]))
     }
 
     #[test]
@@ -2957,7 +2961,7 @@ mod tests {
         let assignment = make_med_assignment(MedActionType::Replace, 100);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -3094,7 +3098,9 @@ mod tests {
         let assignment = make_as_prepend_assignment(65100, 1, false);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![as_path_attr(&[65001, 65002])]);
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![as_path_attr(&[
+            65001, 65002,
+        ])]));
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -3116,7 +3122,7 @@ mod tests {
         let assignment = make_as_prepend_assignment(65100, 3, false);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![as_path_attr(&[65001])]);
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![as_path_attr(&[65001])]));
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -3138,7 +3144,9 @@ mod tests {
         let assignment = make_as_prepend_assignment(0, 1, true);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![as_path_attr(&[65001, 65002])]);
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![as_path_attr(&[
+            65001, 65002,
+        ])]));
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -3160,7 +3168,7 @@ mod tests {
         let assignment = make_as_prepend_assignment(65100, 2, false);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -3185,7 +3193,9 @@ mod tests {
         let assignment = make_as_prepend_assignment(65100, 1, false);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![as_path_attr(&[65001, 65002])]);
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![as_path_attr(&[
+            65001, 65002,
+        ])]));
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -3248,14 +3258,14 @@ mod tests {
     // soo:65002:100: type=0x00, sub=0x03, ASN=65002, val=100
     const SOO_65002_100: [u8; 8] = [0x00, 0x03, 0xFD, 0xEA, 0x00, 0x00, 0x00, 0x64];
 
-    fn attrs_with_ext_community(communities: &[[u8; 8]]) -> Arc<Vec<packet::Attribute>> {
+    fn attrs_with_ext_community(communities: &[[u8; 8]]) -> Arc<packet::PathAttributes> {
         let mut bin = Vec::with_capacity(communities.len() * 8);
         for c in communities {
             bin.extend_from_slice(c);
         }
-        Arc::new(vec![
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::EXTENDED_COMMUNITY, bin).unwrap(),
-        ])
+        ]))
     }
 
     #[test]
@@ -3367,16 +3377,16 @@ mod tests {
         large_communities_from_attr(attrs)
     }
 
-    fn attrs_with_large_community(communities: &[(u32, u32, u32)]) -> Arc<Vec<packet::Attribute>> {
+    fn attrs_with_large_community(communities: &[(u32, u32, u32)]) -> Arc<packet::PathAttributes> {
         let mut bin = Vec::with_capacity(communities.len() * 12);
         for (ga, ld1, ld2) in communities {
             bin.extend_from_slice(&ga.to_be_bytes());
             bin.extend_from_slice(&ld1.to_be_bytes());
             bin.extend_from_slice(&ld2.to_be_bytes());
         }
-        Arc::new(vec![
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::LARGE_COMMUNITY, bin).unwrap(),
-        ])
+        ]))
     }
 
     #[test]
@@ -3496,9 +3506,9 @@ mod tests {
         let assignment = make_origin_assignment(0); // IGP
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 2).unwrap(), // Incomplete
-        ]);
+        ]));
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -3520,9 +3530,9 @@ mod tests {
         let assignment = make_origin_assignment(2); // Incomplete
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(), // IGP
-        ]);
+        ]));
         let mut nexthop = nh();
         Table::apply_policy(
             &assignment,
@@ -3573,9 +3583,9 @@ mod tests {
         let assignment = make_condition_assignment(vec![ConditionConfig::LocalPrefEq(200)]);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 200).unwrap(),
-        ]);
+        ]));
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3597,9 +3607,9 @@ mod tests {
         let assignment = make_condition_assignment(vec![ConditionConfig::LocalPrefEq(200)]);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::LOCAL_PREF, 100).unwrap(),
-        ]);
+        ]));
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3621,9 +3631,9 @@ mod tests {
         let assignment = make_condition_assignment(vec![ConditionConfig::MedEq(50)]);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, 50).unwrap(),
-        ]);
+        ]));
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3645,9 +3655,9 @@ mod tests {
         let assignment = make_condition_assignment(vec![ConditionConfig::MedEq(50)]);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::MULTI_EXIT_DESC, 99).unwrap(),
-        ]);
+        ]));
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3670,9 +3680,9 @@ mod tests {
         let assignment = make_condition_assignment(vec![ConditionConfig::Origin(1)]);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 1).unwrap(),
-        ]);
+        ]));
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3695,9 +3705,9 @@ mod tests {
         let assignment = make_condition_assignment(vec![ConditionConfig::Origin(1)]);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-        ]);
+        ]));
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3720,7 +3730,7 @@ mod tests {
             make_condition_assignment(vec![ConditionConfig::RouteType(RouteType::Local)]);
         let s = Source::local();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3743,7 +3753,7 @@ mod tests {
             make_condition_assignment(vec![ConditionConfig::RouteType(RouteType::Local)]);
         let s = source(); // remote peer, not local
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3767,7 +3777,7 @@ mod tests {
         // source() has remote_asn=65001, local_asn=65000 => external
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3859,7 +3869,7 @@ mod tests {
             make_condition_assignment(vec![ConditionConfig::AfiSafiIn(vec![bgp::Family::IPV4])]);
         let s = source();
         let net = nlri(); // V4
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3882,7 +3892,7 @@ mod tests {
             make_condition_assignment(vec![ConditionConfig::AfiSafiIn(vec![bgp::Family::IPV6])]);
         let s = source();
         let net = nlri(); // V4
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3913,7 +3923,7 @@ mod tests {
             PeerRole::Ibgp,
         ));
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh();
         let d = Table::apply_policy(
             &assignment,
@@ -3962,14 +3972,14 @@ mod tests {
         ptable.assignment_import.unwrap()
     }
 
-    fn attrs_with_ext_community_bytes(bytes: &[[u8; 8]]) -> Arc<Vec<packet::Attribute>> {
+    fn attrs_with_ext_community_bytes(bytes: &[[u8; 8]]) -> Arc<packet::PathAttributes> {
         let mut bin = Vec::with_capacity(bytes.len() * 8);
         for b in bytes {
             bin.extend_from_slice(b);
         }
-        Arc::new(vec![
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::EXTENDED_COMMUNITY, bin).unwrap(),
-        ])
+        ]))
     }
 
     fn rt_bytes(asn: u16, local: u32) -> [u8; 8] {
@@ -4074,16 +4084,16 @@ mod tests {
 
     fn attrs_with_large_community_tuples(
         communities: &[(u32, u32, u32)],
-    ) -> Arc<Vec<packet::Attribute>> {
+    ) -> Arc<packet::PathAttributes> {
         let mut bin = Vec::with_capacity(communities.len() * 12);
         for (ga, ld1, ld2) in communities {
             bin.extend_from_slice(&ga.to_be_bytes());
             bin.extend_from_slice(&ld1.to_be_bytes());
             bin.extend_from_slice(&ld2.to_be_bytes());
         }
-        Arc::new(vec![
+        Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_bin(packet::Attribute::LARGE_COMMUNITY, bin).unwrap(),
-        ])
+        ]))
     }
 
     #[test]
@@ -4166,7 +4176,7 @@ mod tests {
             make_nexthop_condition_assignment(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let d = Table::apply_policy(
             &assignment,
@@ -4189,7 +4199,7 @@ mod tests {
             make_nexthop_condition_assignment(vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))]);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let d = Table::apply_policy(
             &assignment,
@@ -4214,7 +4224,7 @@ mod tests {
         ]);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let d = Table::apply_policy(
             &assignment,
@@ -4320,7 +4330,7 @@ mod tests {
             PeerRole::Ebgp,
         ));
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = nh(); // original nexthop: 10.0.0.1
         Table::apply_policy(
             &assignment,
@@ -4351,7 +4361,7 @@ mod tests {
         let assignment = make_nexthop_assignment(NexthopAction::Unchanged);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)));
         let original_nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         Table::apply_policy(
@@ -4380,7 +4390,7 @@ mod tests {
         let assignment = make_nexthop_assignment(NexthopAction::Unchanged);
         let s = source();
         let net = nlri();
-        let mut attr = Arc::new(vec![]);
+        let mut attr = Arc::new(packet::PathAttributes::default());
         let mut nexthop = Some(bgp::Nexthop::V4(Ipv4Addr::new(127, 0, 0, 1)));
         Table::apply_policy(
             &assignment,
@@ -4534,7 +4544,7 @@ mod tests {
             addr: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0),
             mask: 48,
         });
-        let attr = Arc::new(vec![]);
+        let attr = Arc::new(packet::PathAttributes::default());
         let mut nh = Some(bgp::Nexthop::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
         let (filtered, _) = apply_import(&assignment, None, &src, &matched_net, &attr, &mut nh);
         assert!(
@@ -4547,7 +4557,7 @@ mod tests {
             addr: Ipv6Addr::new(0x2001, 0x0db9, 0, 0, 0, 0, 0, 0),
             mask: 32,
         });
-        let attr2 = Arc::new(vec![]);
+        let attr2 = Arc::new(packet::PathAttributes::default());
         let mut nh2 = Some(bgp::Nexthop::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
         let (filtered2, _) = apply_import(&assignment, None, &src, &no_match_net, &attr2, &mut nh2);
         assert!(!filtered2, "2001:db9::/32 should not match ipv6 prefix set");
@@ -4557,9 +4567,9 @@ mod tests {
     fn apply_import_rejected_by_policy() {
         use rustybgp_packet as packet;
         let policy = reject_all_import_policy();
-        let attrs = Arc::new(vec![
+        let attrs = Arc::new(packet::PathAttributes::new(vec![
             packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
-        ]);
+        ]));
         let mut nh = Some(bgp::Nexthop::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let net = "10.0.0.0/24".parse().unwrap();
         let src = import_source(1);
@@ -4602,7 +4612,7 @@ mod tests {
                 condition.evalute(
                     &source(),
                     &nlri(),
-                    &Arc::new(vec![]),
+                    &Arc::new(packet::PathAttributes::default()),
                     None,
                     addr.parse().unwrap(),
                     None,
