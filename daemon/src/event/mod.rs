@@ -1135,7 +1135,7 @@ impl Global {
         let p = self
             .peers
             .remove(&addr)
-            .ok_or_else(|| Error::NotFound("peer address doesn't exists".to_string()))?;
+            .ok_or_else(|| Error::NotFound("peer not found".to_string()))?;
         self.rebuild_local_cluster_ids();
         {
             let mut ctx = p.context.lock().unwrap();
@@ -4637,6 +4637,38 @@ local-address = "{local}"
         let assignment = peer.state.export_policy.load_full().unwrap();
         assert_eq!(assignment.policies.len(), 1);
         assert_eq!(assignment.policies[0].name.as_ref(), "p1");
+    }
+
+    #[tokio::test]
+    async fn unknown_peer_is_not_found() {
+        let svc = make_grpc_service();
+        let address = "10.0.0.1".to_string();
+        let code = svc
+            .delete_peer(tonic::Request::new(api::DeletePeerRequest {
+                address: address.clone(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err()
+            .code();
+        assert_eq!(code, tonic::Code::NotFound);
+        let code = svc
+            .enable_peer(tonic::Request::new(api::EnablePeerRequest {
+                address: address.clone(),
+            }))
+            .await
+            .unwrap_err()
+            .code();
+        assert_eq!(code, tonic::Code::NotFound);
+        let code = svc
+            .disable_peer(tonic::Request::new(api::DisablePeerRequest {
+                address,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err()
+            .code();
+        assert_eq!(code, tonic::Code::NotFound);
     }
 
     #[tokio::test]

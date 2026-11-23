@@ -1217,13 +1217,7 @@ impl GoBgpService for GrpcService {
         let peer_addr = IpAddr::from_str(&request.into_inner().address).map_err(|_| {
             tonic::Status::new(tonic::Code::InvalidArgument, "invalid peer address")
         })?;
-        self.global
-            .write()
-            .await
-            .delete_peer(peer_addr)
-            .map_err(|_| {
-                tonic::Status::new(tonic::Code::AlreadyExists, "peer address doesn't exists")
-            })?;
+        self.global.write().await.delete_peer(peer_addr)?;
         Ok(tonic::Response::new(api::DeletePeerResponse {}))
     }
     type ListPeerStream = Pin<
@@ -1569,10 +1563,7 @@ impl GoBgpService for GrpcService {
                     return Ok(tonic::Response::new(api::EnablePeerResponse {}));
                 }
             }
-            return Err(tonic::Status::new(
-                tonic::Code::AlreadyExists,
-                "peer address doesn't exists",
-            ));
+            return Err(tonic::Status::not_found("peer not found"));
         }
         Err(tonic::Status::new(
             tonic::Code::InvalidArgument,
@@ -1596,10 +1587,7 @@ impl GoBgpService for GrpcService {
                     return Ok(tonic::Response::new(api::DisablePeerResponse {}));
                 }
             }
-            return Err(tonic::Status::new(
-                tonic::Code::AlreadyExists,
-                "peer address doesn't exists",
-            ));
+            return Err(tonic::Status::not_found("peer not found"));
         }
         Err(tonic::Status::new(
             tonic::Code::InvalidArgument,
