@@ -61,20 +61,16 @@ pub struct Vrf {
 impl Vrf {
     /// Returns true when at least one RT in `attrs` extended communities
     /// matches this VRF's import_rt set.
-    pub fn can_import(&self, attrs: &[Attribute]) -> bool {
-        for attr in attrs {
-            if attr.code() == Attribute::EXTENDED_COMMUNITY {
-                let Some(data) = attr.binary() else {
-                    continue;
-                };
-                for bytes in data.as_chunks::<8>().0 {
-                    if self.import_rt.contains(bytes) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+    pub fn can_import(&self, attrs: &packet::PathAttributes) -> bool {
+        attrs
+            .get(Attribute::EXTENDED_COMMUNITY)
+            .and_then(|a| a.binary())
+            .is_some_and(|data| {
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .any(|bytes| self.import_rt.contains(bytes))
+            })
     }
 }
 
@@ -219,51 +215,51 @@ impl SelectionOptions {
 
 // Readers for the path attribute values used by best-path selection.
 
-fn find_attr(attr: &[Attribute], code: u8) -> Option<&Attribute> {
-    attr.iter().find(|a| a.code() == code)
-}
-
-fn attr_local_pref(attr: &[Attribute]) -> u32 {
-    find_attr(attr, Attribute::LOCAL_PREF)
+fn attr_local_pref(attr: &packet::PathAttributes) -> u32 {
+    attr.get(Attribute::LOCAL_PREF)
         .map_or(Attribute::DEFAULT_LOCAL_PREF, |a| a.value().unwrap())
 }
 
-fn attr_as_path_len(attr: &[Attribute]) -> usize {
-    find_attr(attr, Attribute::AS_PATH).map_or(0, |a| a.as_path_length())
+fn attr_as_path_len(attr: &packet::PathAttributes) -> usize {
+    attr.get(Attribute::AS_PATH)
+        .map_or(0, |a| a.as_path_length())
 }
 
-fn attr_origin(attr: &[Attribute]) -> u8 {
-    find_attr(attr, Attribute::ORIGIN)
+fn attr_origin(attr: &packet::PathAttributes) -> u8 {
+    attr.get(Attribute::ORIGIN)
         .map_or(Attribute::ORIGIN_INCOMPLETE, |a| a.value().unwrap() as u8)
 }
 
 /// MULTI_EXIT_DISC, or 0 when absent. RFC 4271 section 9.1.2.2 c): "If
 /// route n has no MULTI_EXIT_DISC attribute, the function returns the
 /// lowest possible MULTI_EXIT_DISC value (i.e., 0)."
-fn attr_med(attr: &[Attribute]) -> u32 {
-    find_attr(attr, Attribute::MULTI_EXIT_DESC).map_or(0, |a| a.value().unwrap())
+fn attr_med(attr: &packet::PathAttributes) -> u32 {
+    attr.get(Attribute::MULTI_EXIT_DESC)
+        .map_or(0, |a| a.value().unwrap())
 }
 
 /// Neighbor AS for the MULTI_EXIT_DISC comparison. None means the local AS
 /// (see `Attribute::as_path_neighbor_as()`).
-fn attr_neighbor_as(attr: &[Attribute]) -> Option<u32> {
-    find_attr(attr, Attribute::AS_PATH).and_then(|a| a.as_path_neighbor_as())
+fn attr_neighbor_as(attr: &packet::PathAttributes) -> Option<u32> {
+    attr.get(Attribute::AS_PATH)
+        .and_then(|a| a.as_path_neighbor_as())
 }
 
-fn attr_cluster_list_len(attr: &[Attribute]) -> usize {
-    find_attr(attr, Attribute::CLUSTER_LIST)
+fn attr_cluster_list_len(attr: &packet::PathAttributes) -> usize {
+    attr.get(Attribute::CLUSTER_LIST)
         .and_then(|a| a.binary())
         .map_or(0, |b| b.len() / 4)
 }
 
 /// ORIGINATOR_ID, or the BGP Identifier of the peer when it is absent.
 fn path_router_id(path: &Path) -> u32 {
-    find_attr(&path.attr, Attribute::ORIGINATOR_ID)
+    path.attr
+        .get(Attribute::ORIGINATOR_ID)
         .map_or(path.source.router_id, |a| a.value().unwrap())
 }
 
 /// Sequence number of the MAC Mobility extended community, if present.
-fn mac_mobility_seq(attr: &[Attribute]) -> Option<u32> {
+fn mac_mobility_seq(attr: &packet::PathAttributes) -> Option<u32> {
     packet::evpn::mac_mobility(attr).map(|(seq, _)| seq)
 }
 
@@ -308,11 +304,10 @@ struct RibEntry {
 }
 
 /// Returns true if `attrs` contains the LLGR_STALE well-known community (0xFFFF0006).
-fn has_llgr_stale_community(attrs: &[packet::Attribute]) -> bool {
+fn has_llgr_stale_community(attrs: &packet::PathAttributes) -> bool {
     const LLGR_STALE: u32 = 0xffff_0006;
     attrs
-        .iter()
-        .find(|a| a.code() == packet::Attribute::COMMUNITY)
+        .get(packet::Attribute::COMMUNITY)
         .and_then(|a| a.binary())
         .is_some_and(|bin| {
             bin.chunks(4)
@@ -321,11 +316,10 @@ fn has_llgr_stale_community(attrs: &[packet::Attribute]) -> bool {
 }
 
 /// Returns true if `attrs` contains the NO_LLGR well-known community (0xFFFF0007).
-pub fn has_no_llgr_community(attrs: &[packet::Attribute]) -> bool {
+pub fn has_no_llgr_community(attrs: &packet::PathAttributes) -> bool {
     const NO_LLGR: u32 = 0xffff_0007;
     attrs
-        .iter()
-        .find(|a| a.code() == packet::Attribute::COMMUNITY)
+        .get(packet::Attribute::COMMUNITY)
         .and_then(|a| a.binary())
         .is_some_and(|bin| {
             bin.chunks(4)
@@ -2351,7 +2345,7 @@ impl RpkiTable {
         // AS_SEQUENCE segment; if the final segment is an AS_SET the origin is
         // NONE, which no ROA can match. A route with no AS_PATH segments
         // (confederation segments aside) originated in our own AS.
-        let asn = match attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
+        let asn = match attr.get(packet::Attribute::AS_PATH) {
             Some(a) => {
                 let stripped = a.as_path_strip_confed();
                 if stripped.binary().is_none_or(|b| b.is_empty()) {
@@ -6445,7 +6439,7 @@ mod tests {
     fn can_import_matching_rt() {
         let rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x64];
         let vrf = make_vrf(vec![rt]);
-        let attrs = vec![ext_community_attr(&[rt])];
+        let attrs = packet::PathAttributes::new(vec![ext_community_attr(&[rt])]);
         assert!(vrf.can_import(&attrs));
     }
 
@@ -6454,7 +6448,7 @@ mod tests {
         let rt_import: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x64];
         let rt_other: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x65];
         let vrf = make_vrf(vec![rt_import]);
-        let attrs = vec![ext_community_attr(&[rt_other])];
+        let attrs = packet::PathAttributes::new(vec![ext_community_attr(&[rt_other])]);
         assert!(!vrf.can_import(&attrs));
     }
 
@@ -6464,7 +6458,7 @@ mod tests {
         let rt_b: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x02];
         let vrf = make_vrf(vec![rt_b]);
         // path carries both RT A and RT B; RT B matches
-        let attrs = vec![ext_community_attr(&[rt_a, rt_b])];
+        let attrs = packet::PathAttributes::new(vec![ext_community_attr(&[rt_a, rt_b])]);
         assert!(vrf.can_import(&attrs));
     }
 
@@ -6472,7 +6466,7 @@ mod tests {
     fn can_import_empty_import_rt() {
         let rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x64];
         let vrf = make_vrf(vec![]);
-        let attrs = vec![ext_community_attr(&[rt])];
+        let attrs = packet::PathAttributes::new(vec![ext_community_attr(&[rt])]);
         assert!(!vrf.can_import(&attrs));
     }
 
@@ -6480,7 +6474,7 @@ mod tests {
     fn can_import_no_ext_community_attr() {
         let rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xe8, 0x00, 0x00, 0x00, 0x64];
         let vrf = make_vrf(vec![rt]);
-        let attrs: Vec<packet::Attribute> = vec![];
+        let attrs = packet::PathAttributes::default();
         assert!(!vrf.can_import(&attrs));
     }
 

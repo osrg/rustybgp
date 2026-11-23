@@ -3254,8 +3254,7 @@ impl PeerSession {
         }
         let local_rid = u32::from(self.local_router_id);
         let originator_loop = attr
-            .iter()
-            .find(|a| a.code() == packet::Attribute::ORIGINATOR_ID)
+            .get(packet::Attribute::ORIGINATOR_ID)
             .is_some_and(|a| a.value().unwrap_or(0) == local_rid);
         let cluster_loop = matches!(
             self.export_ctx.role,
@@ -3263,17 +3262,14 @@ impl PeerSession {
         ) && {
             let local_ids = self.local_cluster_ids.load();
             !local_ids.is_empty()
-                && attr
-                    .iter()
-                    .find(|a| a.code() == packet::Attribute::CLUSTER_LIST)
-                    .is_some_and(|a| {
-                        a.binary().is_some_and(|b| {
-                            b.as_chunks::<4>()
-                                .0
-                                .iter()
-                                .any(|c| local_ids.contains(&Ipv4Addr::new(c[0], c[1], c[2], c[3])))
-                        })
+                && attr.get(packet::Attribute::CLUSTER_LIST).is_some_and(|a| {
+                    a.binary().is_some_and(|b| {
+                        b.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .any(|c| local_ids.contains(&Ipv4Addr::new(c[0], c[1], c[2], c[3])))
                     })
+                })
         };
         originator_loop || cluster_loop
     }

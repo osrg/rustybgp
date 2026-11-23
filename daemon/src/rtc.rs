@@ -50,7 +50,7 @@
 //! RTC routes retained in the RIB (via GrState) as the outbound VPN filter.
 //! SessionDropped is only sent on a complete drop (no GR, or GR timed out).
 
-use rustybgp_packet::bgp::{Attribute, Family, Nlri};
+use rustybgp_packet::bgp::{Attribute, Family, Nlri, PathAttributes};
 use rustybgp_packet::rtc::MatchType;
 use rustybgp_table::SoftResetPath;
 use std::collections::HashSet;
@@ -146,23 +146,19 @@ impl RtcFilter {
     /// Returns true when a VPN route with these attributes should be forwarded
     /// to the peer. A route is forwarded when any of its RT extended communities
     /// matches one of the peer's advertised RTs (or the peer sent a wildcard).
-    pub(crate) fn allows(&self, attrs: &[Attribute]) -> bool {
+    pub(crate) fn allows(&self, attrs: &PathAttributes) -> bool {
         if self.accept_all {
             return true;
         }
-        for attr in attrs {
-            if attr.code() == Attribute::EXTENDED_COMMUNITY {
-                let Some(data) = attr.binary() else {
-                    continue;
-                };
-                for bytes in data.as_chunks::<8>().0 {
-                    if self.rts.contains(bytes) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        attrs
+            .get(Attribute::EXTENDED_COMMUNITY)
+            .and_then(|a| a.binary())
+            .is_some_and(|data| {
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .any(|bytes| self.rts.contains(bytes))
+            })
     }
 }
 
@@ -580,7 +576,7 @@ mod tests {
     fn filter_empty_paths_allows_nothing() {
         let filter = RtcFilter::from_paths(&[]);
         let rt: [u8; 8] = [0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64];
-        let attrs = [ext_community_attr(&[rt])];
+        let attrs = PathAttributes::new(vec![ext_community_attr(&[rt])]);
         assert!(!filter.allows(&attrs));
     }
 
@@ -589,7 +585,7 @@ mod tests {
         let path = make_rtc_path(MatchType::Wildcard);
         let filter = RtcFilter::from_paths(&[path]);
         let rt: [u8; 8] = [0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64];
-        let attrs = [ext_community_attr(&[rt])];
+        let attrs = PathAttributes::new(vec![ext_community_attr(&[rt])]);
         assert!(filter.allows(&attrs));
     }
 
@@ -598,7 +594,7 @@ mod tests {
         let path = make_rtc_path(MatchType::AsWildcard { origin_as: 65001 });
         let filter = RtcFilter::from_paths(&[path]);
         let rt: [u8; 8] = [0x00, 0x02, 0xfd, 0xea, 0x00, 0x00, 0x00, 0x64];
-        let attrs = [ext_community_attr(&[rt])];
+        let attrs = PathAttributes::new(vec![ext_community_attr(&[rt])]);
         assert!(filter.allows(&attrs));
     }
 
@@ -610,7 +606,7 @@ mod tests {
             route_target: rt,
         });
         let filter = RtcFilter::from_paths(&[path]);
-        let attrs = [ext_community_attr(&[rt])];
+        let attrs = PathAttributes::new(vec![ext_community_attr(&[rt])]);
         assert!(filter.allows(&attrs));
     }
 
@@ -623,7 +619,7 @@ mod tests {
             route_target: rt1,
         });
         let filter = RtcFilter::from_paths(&[path]);
-        let attrs = [ext_community_attr(&[rt2])];
+        let attrs = PathAttributes::new(vec![ext_community_attr(&[rt2])]);
         assert!(!filter.allows(&attrs));
     }
 
@@ -635,7 +631,7 @@ mod tests {
             route_target: rt,
         });
         let filter = RtcFilter::from_paths(&[path]);
-        assert!(!filter.allows(&[]));
+        assert!(!filter.allows(&PathAttributes::default()));
     }
 
     fn make_stale_rtc_path(match_type: MatchType) -> SoftResetPath {
@@ -681,9 +677,9 @@ mod tests {
 
         let filter = RtcFilter::from_paths(&[stale_path, fresh_path]);
         // Pre-disconnect RT: allowed (stale path is the confirmed interest).
-        assert!(filter.allows(&[ext_community_attr(&[stale_rt])]));
+        assert!(filter.allows(&PathAttributes::new(vec![ext_community_attr(&[stale_rt])])));
         // New RT from new session, before EOR: must be blocked.
-        assert!(!filter.allows(&[ext_community_attr(&[fresh_rt])]));
+        assert!(!filter.allows(&PathAttributes::new(vec![ext_community_attr(&[fresh_rt])])));
     }
 
     #[test]
@@ -703,7 +699,7 @@ mod tests {
         });
 
         let filter = RtcFilter::from_paths(&[path1, path2]);
-        assert!(filter.allows(&[ext_community_attr(&[rt1])]));
-        assert!(filter.allows(&[ext_community_attr(&[rt2])]));
+        assert!(filter.allows(&PathAttributes::new(vec![ext_community_attr(&[rt1])])));
+        assert!(filter.allows(&PathAttributes::new(vec![ext_community_attr(&[rt2])])));
     }
 }

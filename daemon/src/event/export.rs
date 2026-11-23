@@ -282,12 +282,8 @@ impl PeerExportContext {
         family: Family,
         is_local: bool,
     ) {
-        if self.role == PeerRole::Ebgp
-            && attr
-                .iter()
-                .any(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
-        {
-            Arc::make_mut(attr).retain(|a| a.code() != packet::Attribute::MULTI_EXIT_DESC);
+        if self.role == PeerRole::Ebgp && attr.contains(packet::Attribute::MULTI_EXIT_DESC) {
+            Arc::make_mut(attr).remove(packet::Attribute::MULTI_EXIT_DESC);
         }
 
         self.export_nexthop(nexthop, family, is_local);
@@ -901,7 +897,7 @@ pub(super) fn is_as_loop(
     local_asn: u32,
     confederation_id: u32,
 ) -> bool {
-    let Some(as_path) = attr.iter().find(|a| a.code() == bgp::Attribute::AS_PATH) else {
+    let Some(as_path) = attr.get(bgp::Attribute::AS_PATH) else {
         return false;
     };
     if as_path.as_path_count(local_asn).is_ok_and(|n| n > 0) {

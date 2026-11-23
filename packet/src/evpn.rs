@@ -638,15 +638,14 @@ impl fmt::Display for EthernetIpPrefixRoute {
     }
 }
 
-/// Extract the MAC Mobility extended community from a slice of attributes.
+/// Extract the MAC Mobility extended community from the path attributes.
 ///
 /// Returns `Some((sequence, sticky))` if the MAC Mobility extended community
 /// (RFC 7432 §7.7, type 0x06 subtype 0x00) is present, `None` otherwise.
 /// Used for EVPN Type-2 best path selection in the table crate.
-pub fn mac_mobility(attrs: &[crate::bgp::Attribute]) -> Option<(u32, bool)> {
+pub fn mac_mobility(attrs: &crate::bgp::PathAttributes) -> Option<(u32, bool)> {
     attrs
-        .iter()
-        .find(|a| a.code() == crate::bgp::Attribute::EXTENDED_COMMUNITY)
+        .get(crate::bgp::Attribute::EXTENDED_COMMUNITY)
         .and_then(|a| a.binary())
         .and_then(|b| {
             b.as_chunks::<8>().0.iter().find_map(|ec| {
@@ -1354,7 +1353,7 @@ mod tests {
 
     #[test]
     fn mac_mobility_absent() {
-        assert_eq!(mac_mobility(&[]), None);
+        assert_eq!(mac_mobility(&crate::bgp::PathAttributes::default()), None);
     }
 
     #[test]
@@ -1365,7 +1364,10 @@ mod tests {
             vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         )
         .unwrap();
-        assert_eq!(mac_mobility(&[attr]), None);
+        assert_eq!(
+            mac_mobility(&crate::bgp::PathAttributes::new(vec![attr])),
+            None
+        );
     }
 
     #[test]
@@ -1376,7 +1378,10 @@ mod tests {
             vec![0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 42],
         )
         .unwrap();
-        assert_eq!(mac_mobility(&[attr]), Some((42, false)));
+        assert_eq!(
+            mac_mobility(&crate::bgp::PathAttributes::new(vec![attr])),
+            Some((42, false))
+        );
     }
 
     #[test]
@@ -1387,7 +1392,10 @@ mod tests {
             vec![0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 100],
         )
         .unwrap();
-        assert_eq!(mac_mobility(&[attr]), Some((100, true)));
+        assert_eq!(
+            mac_mobility(&crate::bgp::PathAttributes::new(vec![attr])),
+            Some((100, true))
+        );
     }
 
     #[test]
@@ -1401,7 +1409,10 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(mac_mobility(&[attr]), Some((99, false)));
+        assert_eq!(
+            mac_mobility(&crate::bgp::PathAttributes::new(vec![attr])),
+            Some((99, false))
+        );
     }
 
     // -----------------------------------------------------------------------

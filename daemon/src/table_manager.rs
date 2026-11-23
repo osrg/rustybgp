@@ -274,13 +274,8 @@ impl TableManager {
                     };
                     dest.net = local_nlri;
                     for path in &mut dest.paths {
-                        let stripped: packet::PathAttributes = path
-                            .attr
-                            .iter()
-                            .filter(|a| a.code() != packet::Attribute::EXTENDED_COMMUNITY)
-                            .cloned()
-                            .collect();
-                        path.attr = std::sync::Arc::new(stripped);
+                        std::sync::Arc::make_mut(&mut path.attr)
+                            .remove(packet::Attribute::EXTENDED_COMMUNITY);
                     }
                     out.push(dest);
                 }
@@ -1244,11 +1239,7 @@ impl TableShard {
             let nexthops = fib_nexthops(&update, self.rtable.selection_options());
             let metric = update
                 .new_best()
-                .and_then(|p| {
-                    p.attr
-                        .iter()
-                        .find(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
-                })
+                .and_then(|p| p.attr.get(packet::Attribute::MULTI_EXIT_DESC))
                 .and_then(|a| a.value())
                 .unwrap_or(0);
             handle.apply(kernel::KernelRouteChange {

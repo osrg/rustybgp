@@ -400,7 +400,7 @@ impl Condition {
                 };
             }
             Condition::AsPath(_name, opt, set) => {
-                if let Some(a) = attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
+                if let Some(a) = attr.get(packet::Attribute::AS_PATH) {
                     for set in &set.single_sets {
                         if set.is_match(a) {
                             return *opt == MatchOption::Any;
@@ -423,7 +423,7 @@ impl Condition {
                 return found;
             }
             Condition::AsPathLength(c, v) => {
-                if let Some(a) = attr.iter().find(|a| a.code() == packet::Attribute::AS_PATH) {
+                if let Some(a) = attr.get(packet::Attribute::AS_PATH) {
                     let l = a.as_path_length() as u32;
                     match c {
                         Comparison::Eq => {
@@ -446,23 +446,18 @@ impl Condition {
             }
             Condition::LocalPrefEq(v) => {
                 return attr
-                    .iter()
-                    .find(|a| a.code() == packet::Attribute::LOCAL_PREF)
+                    .get(packet::Attribute::LOCAL_PREF)
                     .and_then(|a| a.value())
                     == Some(*v);
             }
             Condition::MedEq(v) => {
                 return attr
-                    .iter()
-                    .find(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
+                    .get(packet::Attribute::MULTI_EXIT_DESC)
                     .and_then(|a| a.value())
                     == Some(*v);
             }
             Condition::Origin(v) => {
-                return attr
-                    .iter()
-                    .find(|a| a.code() == packet::Attribute::ORIGIN)
-                    .and_then(|a| a.value())
+                return attr.get(packet::Attribute::ORIGIN).and_then(|a| a.value())
                     == Some(*v as u32);
             }
             Condition::RouteType(rt) => {
@@ -653,10 +648,9 @@ pub struct CommunityAction {
     pub communities: Vec<u32>,
 }
 
-fn communities_from_attr(attrs: &[packet::Attribute]) -> Vec<u32> {
+fn communities_from_attr(attrs: &packet::PathAttributes) -> Vec<u32> {
     attrs
-        .iter()
-        .find(|a| a.code() == packet::Attribute::COMMUNITY)
+        .get(packet::Attribute::COMMUNITY)
         .and_then(|a| a.binary())
         .map(|bin| {
             bin.chunks(4)
@@ -677,10 +671,9 @@ fn communities_to_attr(communities: Vec<u32>) -> Option<packet::Attribute> {
     packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, bin)
 }
 
-fn ext_communities_from_attr(attrs: &[packet::Attribute]) -> Vec<[u8; 8]> {
+fn ext_communities_from_attr(attrs: &packet::PathAttributes) -> Vec<[u8; 8]> {
     attrs
-        .iter()
-        .find(|a| a.code() == packet::Attribute::EXTENDED_COMMUNITY)
+        .get(packet::Attribute::EXTENDED_COMMUNITY)
         .and_then(|a| a.binary())
         .map(|bin| bin.chunks(8).filter_map(|c| c.try_into().ok()).collect())
         .unwrap_or_default()
@@ -697,10 +690,9 @@ fn ext_communities_to_attr(communities: Vec<[u8; 8]>) -> Option<packet::Attribut
     packet::Attribute::new_with_bin(packet::Attribute::EXTENDED_COMMUNITY, bin)
 }
 
-fn large_communities_from_attr(attrs: &[packet::Attribute]) -> Vec<(u32, u32, u32)> {
+fn large_communities_from_attr(attrs: &packet::PathAttributes) -> Vec<(u32, u32, u32)> {
     attrs
-        .iter()
-        .find(|a| a.code() == packet::Attribute::LARGE_COMMUNITY)
+        .get(packet::Attribute::LARGE_COMMUNITY)
         .and_then(|a| a.binary())
         .map(|bin| {
             bin.chunks(12)
@@ -2628,7 +2620,7 @@ mod tests {
         ]))
     }
 
-    fn get_communities(attrs: &[packet::Attribute]) -> Vec<u32> {
+    fn get_communities(attrs: &packet::PathAttributes) -> Vec<u32> {
         communities_from_attr(attrs)
     }
 
@@ -2832,7 +2824,7 @@ mod tests {
         assignment
     }
 
-    fn get_local_pref(attrs: &[packet::Attribute]) -> Option<u32> {
+    fn get_local_pref(attrs: &packet::PathAttributes) -> Option<u32> {
         attrs
             .iter()
             .find(|a| a.code() == packet::Attribute::LOCAL_PREF)
@@ -2921,7 +2913,7 @@ mod tests {
         assignment
     }
 
-    fn get_med(attrs: &[packet::Attribute]) -> Option<u32> {
+    fn get_med(attrs: &packet::PathAttributes) -> Option<u32> {
         attrs
             .iter()
             .find(|a| a.code() == packet::Attribute::MULTI_EXIT_DESC)
@@ -3085,7 +3077,7 @@ mod tests {
         attr
     }
 
-    fn get_as_path(attrs: &[packet::Attribute]) -> Vec<u32> {
+    fn get_as_path(attrs: &packet::PathAttributes) -> Vec<u32> {
         attrs
             .iter()
             .find(|a| a.code() == packet::Attribute::AS_PATH)
@@ -3247,7 +3239,7 @@ mod tests {
         assignment
     }
 
-    fn get_ext_communities(attrs: &[packet::Attribute]) -> Vec<[u8; 8]> {
+    fn get_ext_communities(attrs: &packet::PathAttributes) -> Vec<[u8; 8]> {
         ext_communities_from_attr(attrs)
     }
 
@@ -3373,7 +3365,7 @@ mod tests {
         assignment
     }
 
-    fn get_large_communities(attrs: &[packet::Attribute]) -> Vec<(u32, u32, u32)> {
+    fn get_large_communities(attrs: &packet::PathAttributes) -> Vec<(u32, u32, u32)> {
         large_communities_from_attr(attrs)
     }
 
@@ -3493,7 +3485,7 @@ mod tests {
         assignment
     }
 
-    fn get_origin(attrs: &[packet::Attribute]) -> Option<u8> {
+    fn get_origin(attrs: &packet::PathAttributes) -> Option<u8> {
         attrs
             .iter()
             .find(|a| a.code() == packet::Attribute::ORIGIN)
