@@ -10,10 +10,4 @@ updates:
     schedule:
       interval: "daily"
     open-pull-requests-limit: 50
-
-  - package-ecosystem: "gomod" # See documentation for possible values
-    directory: "/tests/integration/functional" # Location of package manifests
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 50
     
