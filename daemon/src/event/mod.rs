@@ -949,8 +949,10 @@ impl Global {
 
         if let Some(groups) = &config.peer_groups {
             for pg in groups {
-                if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone()) {
-                    self.peer_group.insert(name, PeerGroup::from(pg));
+                if let Some(name) = pg.config.as_ref().and_then(|x| x.peer_group_name.clone())
+                    && let Err(e) = self.add_peer_group(name.clone(), PeerGroup::from(pg))
+                {
+                    log::warn!("skipping peer group {name}: {e:?}");
                 }
             }
         }
@@ -1078,6 +1080,34 @@ impl Global {
             })
             .collect();
         self.local_cluster_ids.store(Arc::new(ids));
+    }
+
+    fn add_peer_group(&mut self, name: String, pg: PeerGroup) -> Result<(), Error> {
+        match self.peer_group.entry(name) {
+            Occupied(_) => Err(Error::AlreadyExists(
+                "peer group name already exists".to_string(),
+            )),
+            Vacant(v) => {
+                v.insert(pg);
+                Ok(())
+            }
+        }
+    }
+
+    fn add_dynamic_neighbor(
+        &mut self,
+        peer_group: &str,
+        prefix: packet::IpNet,
+    ) -> Result<(), Error> {
+        let pg = self
+            .peer_group
+            .get_mut(peer_group)
+            .ok_or_else(|| Error::NotFound("peer group isn't found".to_string()))?;
+        if pg.dynamic_peers.iter().any(|p| p.prefix == prefix) {
+            return Err(Error::AlreadyExists("prefix already exists".to_string()));
+        }
+        pg.dynamic_peers.push(DynamicPeer { prefix });
+        Ok(())
     }
 
     /// Adds a statically configured peer, from the config file or from the
@@ -1441,14 +1471,20 @@ impl Global {
         if let Some(neighbors) = bgp.as_ref().and_then(|x| x.dynamic_neighbors.as_ref()) {
             let mut server = global.write().await;
             for n in neighbors {
-                if let Some(prefix) = n.config.as_ref().and_then(|x| x.prefix.as_ref())
-                    && let Ok(prefix) = packet::IpNet::from_str(prefix)
-                    && let Some(name) = n.config.as_ref().and_then(|x| x.peer_group.as_ref())
-                {
-                    server
-                        .peer_group
-                        .entry(name.to_string())
-                        .and_modify(|e| e.dynamic_peers.push(DynamicPeer { prefix }));
+                let Some((prefix, name)) = n
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.prefix.as_deref().zip(c.peer_group.as_deref()))
+                else {
+                    log::warn!("skipping dynamic neighbor without prefix or peer group");
+                    continue;
+                };
+                let Ok(net) = packet::IpNet::from_str(prefix) else {
+                    log::warn!("skipping dynamic neighbor {prefix}: invalid prefix");
+                    continue;
+                };
+                if let Err(e) = server.add_dynamic_neighbor(name, net) {
+                    log::warn!("skipping dynamic neighbor {prefix}: {e:?}");
                 }
             }
         }
@@ -4481,6 +4517,32 @@ local-address = "{local}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn add_peer_group_and_dynamic_neighbor() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
+        let mut g = Global::new(tx, bfd_tx);
+        let pg = || PeerGroup::from(&config::generate::PeerGroup::default());
+        let net = |s: &str| packet::IpNet::from_str(s).unwrap();
+
+        g.add_peer_group("g".to_string(), pg()).unwrap();
+        assert!(matches!(
+            g.add_peer_group("g".to_string(), pg()),
+            Err(Error::AlreadyExists(_))
+        ));
+
+        g.add_dynamic_neighbor("g", net("10.0.0.0/24")).unwrap();
+        assert!(matches!(
+            g.add_dynamic_neighbor("g", net("10.0.0.0/24")),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            g.add_dynamic_neighbor("missing", net("10.0.1.0/24")),
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(g.peer_group["g"].dynamic_peers.len(), 1);
     }
 
     fn make_global() -> GlobalHandle {

@@ -1937,24 +1937,11 @@ impl GoBgpService for GrpcService {
             check_auth_password(pw).map_err(tonic::Status::from)?;
         }
 
-        match self
-            .global
+        self.global
             .write()
             .await
-            .peer_group
-            .entry(conf.peer_group_name.clone())
-        {
-            Occupied(_) => {
-                return Err(tonic::Status::new(
-                    tonic::Code::AlreadyExists,
-                    "peer group name already exists",
-                ));
-            }
-            Vacant(v) => {
-                v.insert(PeerGroup::from(pg));
-                return Ok(tonic::Response::new(api::AddPeerGroupResponse {}));
-            }
-        }
+            .add_peer_group(conf.peer_group_name.clone(), PeerGroup::from(pg))?;
+        Ok(tonic::Response::new(api::AddPeerGroupResponse {}))
     }
     async fn delete_peer_group(
         &self,
@@ -2081,21 +2068,10 @@ impl GoBgpService for GrpcService {
         let prefix = packet::IpNet::from_str(&dynamic.prefix)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
 
-        let global = &mut self.global.write().await;
-        let pg = global
-            .peer_group
-            .get_mut(&dynamic.peer_group)
-            .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "peer group isn't found"))?;
-
-        for p in &pg.dynamic_peers {
-            if p.prefix == prefix {
-                return Err(tonic::Status::new(
-                    tonic::Code::AlreadyExists,
-                    "prefix already exists",
-                ));
-            }
-        }
-        pg.dynamic_peers.push(DynamicPeer { prefix });
+        self.global
+            .write()
+            .await
+            .add_dynamic_neighbor(&dynamic.peer_group, prefix)?;
         Ok(tonic::Response::new(api::AddDynamicNeighborResponse {}))
     }
     async fn delete_dynamic_neighbor(

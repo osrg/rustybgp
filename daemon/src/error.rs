@@ -25,6 +25,8 @@ pub(crate) enum Error {
     InvalidArgument(String),
     #[error("entity already exists")]
     AlreadyExists(String),
+    #[error("entity not found")]
+    NotFound(String),
     #[error("invalid configuration")]
     InvalidConfiguration(String),
     #[error("config error")]
@@ -46,6 +48,7 @@ impl From<Error> for tonic::Status {
             }
             Error::InvalidArgument(s) => tonic::Status::new(tonic::Code::InvalidArgument, s),
             Error::AlreadyExists(s) => tonic::Status::new(tonic::Code::AlreadyExists, s),
+            Error::NotFound(s) => tonic::Status::new(tonic::Code::NotFound, s),
             Error::Table(e) => match e {
                 rustybgp_table::TableError::InvalidArgument(s) => {
                     tonic::Status::new(tonic::Code::InvalidArgument, s)
