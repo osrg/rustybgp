@@ -9922,6 +9922,181 @@ local-address = "{local}"
                 1
             );
         }
+
+        // ---- RFC 1997 well-known communities ----
+
+        const NO_EXPORT: u32 = 0xffff_ff01;
+        const NO_ADVERTISE: u32 = 0xffff_ff02;
+        const NO_EXPORT_SUBCONFED: u32 = 0xffff_ff03;
+
+        fn path_with_communities(
+            pid: u32,
+            src: Arc<table::Source>,
+            communities: &[u32],
+        ) -> table::Path {
+            let bin: Vec<u8> = communities.iter().flat_map(|c| c.to_be_bytes()).collect();
+            path_with_attrs(
+                pid,
+                src,
+                Arc::new(packet::PathAttributes::new(vec![
+                    packet::Attribute::new_with_value(packet::Attribute::ORIGIN, 0).unwrap(),
+                    packet::Attribute::new_with_bin(packet::Attribute::COMMUNITY, bin).unwrap(),
+                ])),
+            )
+        }
+
+        /// Run process_nlri_change (non-Add-Path) for one path and return
+        /// whether it was advertised.
+        fn advertised(ctx: &PeerExportContext, p: table::Path) -> bool {
+            let mut em = ExportMap::default();
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let update = change(&net, true, true, None, vec![p]);
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                ctx,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let sent = reach_entries(&pending.drain_messages(Family::IPV4)).len() == 1;
+            assert_eq!(sent, em.was_sent(Family::IPV4, 1));
+            sent
+        }
+
+        #[test]
+        fn well_known_community_per_peer_role() {
+            // (community, ctx, ctx name, advertised)
+            let cases: Vec<(u32, PeerExportContext, &str, bool)> = vec![
+                // A community other than the three does not filter anything.
+                (0xfde8_0064, ebgp_ctx(), "ebgp", true),
+                (0xfde8_0064, ibgp_ctx(), "ibgp", true),
+                (0xfde8_0064, confed_ebgp_ctx(), "confed", true),
+                // NO_ADVERTISE: no peer gets the route.
+                (NO_ADVERTISE, ebgp_ctx(), "ebgp", false),
+                (NO_ADVERTISE, ibgp_ctx(), "ibgp", false),
+                (NO_ADVERTISE, confed_ebgp_ctx(), "confed", false),
+                // NO_EXPORT: stays inside the confederation.
+                (NO_EXPORT, ebgp_ctx(), "ebgp", false),
+                (NO_EXPORT, ibgp_ctx(), "ibgp", true),
+                (NO_EXPORT, confed_ebgp_ctx(), "confed", true),
+                // NO_EXPORT_SUBCONFED: stays inside the member AS.
+                (NO_EXPORT_SUBCONFED, ebgp_ctx(), "ebgp", false),
+                (NO_EXPORT_SUBCONFED, ibgp_ctx(), "ibgp", true),
+                (NO_EXPORT_SUBCONFED, confed_ebgp_ctx(), "confed", false),
+            ];
+            for (community, ctx, name, expected) in cases {
+                let p = path_with_communities(1, source(PEER), &[community]);
+                assert_eq!(
+                    advertised(&ctx, p),
+                    expected,
+                    "community {community:#010x} to {name} peer"
+                );
+            }
+        }
+
+        #[test]
+        fn well_known_community_found_among_others() {
+            let p = path_with_communities(1, source(PEER), &[0xfde8_0064, NO_EXPORT]);
+            assert!(!advertised(&ebgp_ctx(), p));
+        }
+
+        #[test]
+        fn well_known_community_not_checked_for_rs_client() {
+            // RFC 7947 2.2.4: a route server leaves the communities to its
+            // clients.
+            let p = path_with_communities(1, rs_client_source(PEER), &[NO_ADVERTISE]);
+            assert!(advertised(&rs_client_ctx(), p));
+        }
+
+        #[test]
+        fn well_known_community_not_checked_for_local_routes() {
+            // RFC 1997 defines the communities for received routes.
+            for src in [table::Source::local(), table::Source::kernel()] {
+                let p = path_with_communities(1, src, &[NO_EXPORT, NO_ADVERTISE]);
+                assert!(advertised(&ebgp_ctx(), p));
+            }
+        }
+
+        #[test]
+        fn well_known_community_withdraws_previously_sent_route() {
+            // The best path changes to one carrying NO_EXPORT: the route
+            // advertised before must be withdrawn.
+            let mut em = ExportMap::default();
+            em.mark_sent(Family::IPV4, 1, 0);
+            let mut pending = crate::peer_tx::PendingTx::new(false);
+            let net = nlri("10.0.0.0/24");
+            let p = path_with_communities(1, source(PEER), &[NO_EXPORT]);
+            let update = change(&net, true, true, None, vec![p]);
+
+            process_nlri_change(
+                &update,
+                1,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(!em.was_sent(Family::IPV4, 1));
+            let msgs = pending.drain_messages(Family::IPV4);
+            assert!(reach_entries(&msgs).is_empty());
+            assert_eq!(unreach_entries(&msgs), vec![(net, 0)]);
+        }
+
+        #[test]
+        fn well_known_community_addpath_skips_suppressed_path() {
+            // Add-Path with effective_max = 2 and three paths: the NO_EXPORT
+            // path is dropped before the top-N cut, so it does not use a
+            // slot. Paths 1 and 3 are sent, and path 2 (sent before) is
+            // withdrawn.
+            let mut em = ExportMap::new([Family::IPV4]);
+            em.mark_sent(Family::IPV4, 1, 2);
+            let mut pending = crate::peer_tx::PendingTx::new(true);
+            let net = nlri("10.0.0.0/24");
+            let src = source(PEER);
+            let paths = vec![
+                path(1, src.clone()),
+                path_with_communities(2, src.clone(), &[NO_EXPORT]),
+                path(3, src.clone()),
+            ];
+            let update = change(&net, true, true, None, paths);
+
+            process_nlri_change(
+                &update,
+                2,
+                SELF.parse().unwrap(),
+                &mut em,
+                &mut pending,
+                &ebgp_ctx(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert!(em.contains_path(Family::IPV4, 1, 1));
+            assert!(!em.contains_path(Family::IPV4, 1, 2));
+            assert!(em.contains_path(Family::IPV4, 1, 3));
+            let msgs = pending.drain_messages(Family::IPV4);
+            let mut sent: Vec<u32> = reach_entries(&msgs).iter().map(|e| e.1).collect();
+            sent.sort();
+            assert_eq!(sent, vec![1, 3]);
+            assert_eq!(unreach_entries(&msgs), vec![(net, 2)]);
+        }
+
         // ---- LLGR_STALE community on export ----
 
         fn reach_attrs(msgs: &[bgp::Message]) -> Option<Arc<packet::PathAttributes>> {

@@ -622,7 +622,8 @@ pub(super) fn process_nlri_change<S: NlriSink>(
         }
         // Compute the best path visible to this peer: None if no best exists,
         // the best originated from this peer (echo prevention), or the best is
-        // suppressed by split-horizon.
+        // suppressed by split-horizon, RS isolation or an RFC 1997 well-known
+        // community.
         let visible_best = update.new_best().and_then(|best| {
             if best.source.remote_addr == remote_addr {
                 return None;
@@ -631,6 +632,9 @@ pub(super) fn process_nlri_change<S: NlriSink>(
                 return None;
             }
             if rs_isolation_suppress(&best.source, export_ctx.role) {
+                return None;
+            }
+            if well_known_community_suppress(&best.attr, &best.source, export_ctx.role) {
                 return None;
             }
             Some(best)
@@ -742,6 +746,7 @@ pub(super) fn process_nlri_change<S: NlriSink>(
             .filter(|p| p.source.remote_addr != remote_addr)
             .filter(|p| !ibgp_split_horizon_suppress(&p.source, export_ctx.role, cluster_id))
             .filter(|p| !rs_isolation_suppress(&p.source, export_ctx.role))
+            .filter(|p| !well_known_community_suppress(&p.attr, &p.source, export_ctx.role))
             .take(effective_max)
             .filter_map(|path| {
                 if rtc_filter.is_some_and(|f| !f.allows(&path.attr)) {
@@ -964,4 +969,68 @@ pub(super) fn ibgp_split_horizon_suppress(
         // RR mode: suppress only non-client -> non-client.
         Some(_) => !source.is_rr_client() && dest_role == PeerRole::Ibgp,
     }
+}
+
+/// RFC 1997 well-known community check for a single path.
+///
+/// Returns `true` when the path must not be sent to a peer with `dest_role`.
+/// RFC 1997 says:
+///
+///   NO_EXPORT (0xFFFFFF01)
+///      All routes received carrying a communities attribute
+///      containing this value MUST NOT be advertised outside a BGP
+///      confederation boundary (a stand-alone autonomous system that
+///      is not part of a confederation should be considered a
+///      confederation itself).
+///   NO_ADVERTISE (0xFFFFFF02)
+///      All routes received carrying a communities attribute
+///      containing this value MUST NOT be advertised to other BGP
+///      peers.
+///   NO_EXPORT_SUBCONFED (0xFFFFFF03)
+///      All routes received carrying a communities attribute
+///      containing this value MUST NOT be advertised to external BGP
+///      peers (this includes peers in other members autonomous
+///      systems inside a BGP confederation).
+///
+/// The check uses the attributes before export policy, as GoBGP, FRR and
+/// BIRD do.  A community added by export policy is for the receiving peer.
+///
+/// The rules are for received routes, so locally originated paths (gRPC
+/// AddPath and kernel redistribution) are not checked.  GoBGP and BIRD do
+/// the same.
+///
+/// A route server client is not checked.  RFC 7947 2.2.4 says:
+///
+///   Transitive as well as non-transitive Communities attributes
+///   applied to an NLRI UPDATE sent to a route server SHOULD NOT be
+///   modified, processed, or removed, except as defined by local
+///   policy.
+pub(super) fn well_known_community_suppress(
+    attr: &packet::PathAttributes,
+    source: &table::Source,
+    dest_role: PeerRole,
+) -> bool {
+    const NO_EXPORT: u32 = 0xffff_ff01;
+    const NO_ADVERTISE: u32 = 0xffff_ff02;
+    const NO_EXPORT_SUBCONFED: u32 = 0xffff_ff03;
+
+    if dest_role == PeerRole::RsClient || source.is_local() || source.is_kernel() {
+        return false;
+    }
+    let Some(bin) = attr
+        .get(packet::Attribute::COMMUNITY)
+        .and_then(|a| a.binary())
+    else {
+        return false;
+    };
+    bin.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_be_bytes(*c))
+        .any(|c| match c {
+            NO_ADVERTISE => true,
+            NO_EXPORT_SUBCONFED => matches!(dest_role, PeerRole::Ebgp | PeerRole::ConfedEbgp),
+            NO_EXPORT => dest_role == PeerRole::Ebgp,
+            _ => false,
+        })
 }
