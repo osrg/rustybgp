@@ -18,6 +18,7 @@ use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use fnv::{FnvHashMap, FnvHashSet};
 
+use std::borrow::Cow;
 use std::convert::Into;
 use std::io::Cursor;
 use std::marker::PhantomData;
@@ -2692,11 +2693,35 @@ impl PeerCodec {
         (written, n_consumed)
     }
 
-    // Encodes the path attributes of a Reach message, except MP_REACH_NLRI
-    // and NEXT_HOP. The export layer (export_attrs) selects the attributes,
-    // so everything given is encoded.
-    fn encode_path_attrs<B: BufMut + AsMut<[u8]>>(&self, attr: &[Attribute], dst: &mut B) {
+    // Encodes the path attributes of a Reach message, except MP_REACH_NLRI.
+    // The export layer (export_attrs) selects the attributes, so everything
+    // given is encoded.
+    //
+    // `attr` is in ascending order of type code (PathAttributes). NEXT_HOP
+    // (`nexthop`) and, for a two-octet AS peer, AS4_PATH and AS4_AGGREGATOR
+    // are made here. They are written at the position for their type code,
+    // so that all the attributes are in the order RFC 4271 Section 5 asks
+    // for: "The sender of an UPDATE message SHOULD order path attributes
+    // within the UPDATE message in ascending order of attribute type."
+    fn encode_path_attrs<B: BufMut + AsMut<[u8]>>(
+        &self,
+        attr: &[Attribute],
+        nexthop: Option<&Attribute>,
+        dst: &mut B,
+    ) {
+        // The attributes made here that are not written yet, in ascending
+        // order of type code: NEXT_HOP, AS4_PATH and AS4_AGGREGATOR.
+        let mut made: [Option<Cow<'_, Attribute>>; 3] = [nexthop.map(Cow::Borrowed), None, None];
+        // Writes the attributes in `made` whose type code is below `code`.
+        let write_made = |made: &mut [Option<Cow<'_, Attribute>>; 3], code: u16, dst: &mut B| {
+            for m in made.iter_mut() {
+                if m.as_ref().is_some_and(|a| u16::from(a.code()) < code) {
+                    m.take().unwrap().encode_wire(dst);
+                }
+            }
+        };
         for a in attr {
+            write_made(&mut made, a.code().into(), dst);
             if !self.two_byte_as {
                 a.encode_wire(dst);
                 continue;
@@ -2719,7 +2744,7 @@ impl PeerCodec {
                             stripped.binary().unwrap().clone(),
                         )
                         .unwrap();
-                        as4_path.encode_wire(dst);
+                        made[1] = Some(Cow::Owned(as4_path));
                     }
                 }
                 Attribute::AGGREGATOR => {
@@ -2736,7 +2761,7 @@ impl PeerCodec {
                             a.binary().unwrap().clone(),
                         )
                         .unwrap();
-                        as4_aggregator.encode_wire(dst);
+                        made[2] = Some(Cow::Owned(as4_aggregator));
                     }
                 }
                 _ => {
@@ -2744,6 +2769,7 @@ impl PeerCodec {
                 }
             }
         }
+        write_made(&mut made, u16::MAX, dst);
     }
 
     // Encodes a Reach message into as many UPDATE messages as needed.
@@ -2865,16 +2891,13 @@ impl PeerCodec {
                 let mp_len = dst.as_mut().len() - pos_mp_len - 2;
                 (&mut dst.as_mut()[pos_mp_len..]).write_u16::<NetworkEndian>(mp_len as u16)?;
                 let pos_other_attrs = dst.as_mut().len();
-                self.encode_path_attrs(attr, dst);
+                self.encode_path_attrs(attr, None, dst);
                 debug_assert!(dst.as_mut().len() - pos_other_attrs <= attrs_max_len);
                 let attr_len = dst.as_mut().len() - pos_attr;
                 (&mut dst.as_mut()[pos_attr_len..]).write_u16::<NetworkEndian>(attr_len as u16)?;
                 n
             } else {
-                self.encode_path_attrs(attr, dst);
-                if let Some(a) = &nexthop_attr {
-                    a.encode_wire(dst);
-                }
+                self.encode_path_attrs(attr, nexthop_attr.as_ref(), dst);
                 debug_assert!(dst.as_mut().len() - pos_attr <= attrs_max_len);
                 let attr_len = dst.as_mut().len() - pos_attr;
                 (&mut dst.as_mut()[pos_attr_len..]).write_u16::<NetworkEndian>(attr_len as u16)?;
@@ -7294,6 +7317,124 @@ mod update_tests {
             })
             .collect();
         assert_eq!(all_nlri, entries);
+    }
+
+    // Returns the type codes of the path attributes of the one UPDATE in
+    // `raw`, in wire order.
+    fn wire_attr_codes(raw: &[u8]) -> Vec<u8> {
+        let msg_len = u16::from_be_bytes([raw[16], raw[17]]) as usize;
+        assert_eq!(msg_len, raw.len(), "expected one message");
+        let withdrawn_len = u16::from_be_bytes([raw[19], raw[20]]) as usize;
+        let mut pos = 19 + 2 + withdrawn_len;
+        let attr_len = u16::from_be_bytes([raw[pos], raw[pos + 1]]) as usize;
+        pos += 2;
+        let end = pos + attr_len;
+        let mut codes = Vec::new();
+        while pos < end {
+            let flags = raw[pos];
+            codes.push(raw[pos + 1]);
+            if flags & Attribute::FLAG_EXTENDED != 0 {
+                pos += 4 + u16::from_be_bytes([raw[pos + 2], raw[pos + 3]]) as usize;
+            } else {
+                pos += 3 + raw[pos + 2] as usize;
+            }
+        }
+        codes
+    }
+
+    fn community_attrs() -> PathAttributes {
+        let mut attrs = (*ipv6_attrs_no_nh()).clone();
+        attrs.insert(Attribute::new_with_value(Attribute::MULTI_EXIT_DESC, 10).unwrap());
+        attrs.insert(Attribute::new_with_value(Attribute::LOCAL_PREF, 100).unwrap());
+        attrs
+            .insert(Attribute::new_with_bin(Attribute::COMMUNITY, vec![0xfd, 0xe9, 0, 1]).unwrap());
+        attrs.insert(
+            Attribute::new_with_bin(
+                Attribute::LARGE_COMMUNITY,
+                vec![0, 0, 0xfd, 0xe9, 0, 0, 0, 1, 0, 0, 0, 2],
+            )
+            .unwrap(),
+        );
+        attrs
+    }
+
+    #[test]
+    fn encode_reach_puts_nexthop_at_its_position() {
+        let mut codec = ipv4_codec();
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: Some(Nexthop::V4("192.0.2.1".parse().unwrap())),
+            attr: Arc::new(community_attrs()),
+        });
+        let mut raw = Vec::new();
+        codec.encode_to(&msg, &mut raw).unwrap();
+        assert_eq!(
+            wire_attr_codes(&raw),
+            vec![
+                Attribute::ORIGIN,
+                Attribute::AS_PATH,
+                Attribute::NEXTHOP,
+                Attribute::MULTI_EXIT_DESC,
+                Attribute::LOCAL_PREF,
+                Attribute::COMMUNITY,
+                Attribute::LARGE_COMMUNITY,
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_reach_puts_as4_attrs_at_their_position() {
+        let mut codec = ipv4_codec();
+        codec.two_byte_as = true;
+        let mut attrs = community_attrs();
+        // AS_PATH and AGGREGATOR with an AS number that does not fit in two
+        // octets, so AS4_PATH and AS4_AGGREGATOR are sent too.
+        attrs.insert(
+            Attribute::new_with_bin(
+                Attribute::AS_PATH,
+                vec![Attribute::AS_PATH_TYPE_SEQ, 1, 0x00, 0x06, 0x1a, 0x80],
+            )
+            .unwrap(),
+        );
+        attrs.insert(
+            Attribute::new_with_bin(
+                Attribute::AGGREGATOR,
+                vec![0x00, 0x06, 0x1a, 0x80, 192, 0, 2, 1],
+            )
+            .unwrap(),
+        );
+        attrs.insert(
+            Attribute::new_with_bin(
+                Attribute::EXTENDED_COMMUNITY,
+                vec![0, 2, 0xfd, 0xe9, 0, 0, 0, 1],
+            )
+            .unwrap(),
+        );
+        let msg = Message::Update(Update::Reach {
+            family: Family::IPV4,
+            entries: vec![ipv4_prefix("10.0.0.0", 8)],
+            nexthop: Some(Nexthop::V4("192.0.2.1".parse().unwrap())),
+            attr: Arc::new(attrs),
+        });
+        let mut raw = Vec::new();
+        codec.encode_to(&msg, &mut raw).unwrap();
+        assert_eq!(
+            wire_attr_codes(&raw),
+            vec![
+                Attribute::ORIGIN,
+                Attribute::AS_PATH,
+                Attribute::NEXTHOP,
+                Attribute::MULTI_EXIT_DESC,
+                Attribute::LOCAL_PREF,
+                Attribute::AGGREGATOR,
+                Attribute::COMMUNITY,
+                Attribute::EXTENDED_COMMUNITY,
+                Attribute::AS4_PATH,
+                Attribute::AS4_AGGREGATOR,
+                Attribute::LARGE_COMMUNITY,
+            ]
+        );
     }
 
     #[test]
