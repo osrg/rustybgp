@@ -1214,39 +1214,17 @@ impl GoBgpService for GrpcService {
         &self,
         request: tonic::Request<api::DeletePeerRequest>,
     ) -> Result<tonic::Response<api::DeletePeerResponse>, tonic::Status> {
-        if let Ok(peer_addr) = IpAddr::from_str(&request.into_inner().address) {
-            let mut global = self.global.write().await;
-            if let Some(p) = global.peers.remove(&peer_addr) {
-                global.rebuild_local_cluster_ids();
-                {
-                    let mut ctx = p.context.lock().unwrap();
-                    ctx.force_down(
-                        CloseReason::SendMessage(bgp::Message::Notification(
-                            rustybgp_packet::Notification::CeasePeerDeconfigured,
-                        )),
-                        true,
-                    );
-                }
-                if p.config.password.is_some() {
-                    for &(fd, ifindex) in &global.listen_sockets {
-                        auth::set_md5sig(fd, &peer_addr, "", ifindex);
-                    }
-                }
-                if let Some(bfd) = &global.bfd_handle {
-                    bfd.remove_peer(peer_addr);
-                }
-                return Ok(tonic::Response::new(api::DeletePeerResponse {}));
-            } else {
-                return Err(tonic::Status::new(
-                    tonic::Code::AlreadyExists,
-                    "peer address doesn't exists",
-                ));
-            }
-        }
-        Err(tonic::Status::new(
-            tonic::Code::InvalidArgument,
-            "invalid peer address",
-        ))
+        let peer_addr = IpAddr::from_str(&request.into_inner().address).map_err(|_| {
+            tonic::Status::new(tonic::Code::InvalidArgument, "invalid peer address")
+        })?;
+        self.global
+            .write()
+            .await
+            .delete_peer(peer_addr)
+            .map_err(|_| {
+                tonic::Status::new(tonic::Code::AlreadyExists, "peer address doesn't exists")
+            })?;
+        Ok(tonic::Response::new(api::DeletePeerResponse {}))
     }
     type ListPeerStream = Pin<
         Box<
@@ -1948,21 +1926,8 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::DeletePeerGroupRequest>,
     ) -> Result<tonic::Response<api::DeletePeerGroupResponse>, tonic::Status> {
         let name = request.into_inner().name;
-        let mut global = self.global.write().await;
-        match global.peer_group.get(&name) {
-            None => Err(tonic::Status::new(
-                tonic::Code::NotFound,
-                "peer group not found",
-            )),
-            Some(pg) if !pg.dynamic_peers.is_empty() => Err(tonic::Status::new(
-                tonic::Code::FailedPrecondition,
-                "peer group has dynamic neighbors; delete them first",
-            )),
-            Some(_) => {
-                global.peer_group.remove(&name);
-                Ok(tonic::Response::new(api::DeletePeerGroupResponse {}))
-            }
-        }
+        self.global.write().await.delete_peer_group(&name)?;
+        Ok(tonic::Response::new(api::DeletePeerGroupResponse {}))
     }
     async fn update_peer_group(
         &self,
@@ -2081,19 +2046,10 @@ impl GoBgpService for GrpcService {
         let req = request.into_inner();
         let prefix = packet::IpNet::from_str(&req.prefix)
             .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
-        let mut global = self.global.write().await;
-        let pg = global
-            .peer_group
-            .get_mut(&req.peer_group)
-            .ok_or_else(|| tonic::Status::new(tonic::Code::NotFound, "peer group not found"))?;
-        let before = pg.dynamic_peers.len();
-        pg.dynamic_peers.retain(|dp| dp.prefix != prefix);
-        if pg.dynamic_peers.len() == before {
-            return Err(tonic::Status::new(
-                tonic::Code::NotFound,
-                "prefix not found in peer group",
-            ));
-        }
+        self.global
+            .write()
+            .await
+            .delete_dynamic_neighbor(&req.peer_group, prefix)?;
         Ok(tonic::Response::new(api::DeleteDynamicNeighborResponse {}))
     }
     type ListDynamicNeighborStream = Pin<

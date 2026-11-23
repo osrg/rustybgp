@@ -1095,6 +1095,68 @@ impl Global {
         Ok(())
     }
 
+    fn delete_peer_group(&mut self, name: &str) -> Result<(), Error> {
+        match self.peer_group.get(name) {
+            None => Err(Error::NotFound("peer group not found".to_string())),
+            Some(pg) if !pg.dynamic_peers.is_empty() => Err(Error::FailedPrecondition(
+                "peer group has dynamic neighbors; delete them first".to_string(),
+            )),
+            Some(_) => {
+                self.peer_group.remove(name);
+                Ok(())
+            }
+        }
+    }
+
+    /// Removes `prefix` from the dynamic neighbors of `peer_group`. Dynamic
+    /// peers that are already up are not affected.
+    fn delete_dynamic_neighbor(
+        &mut self,
+        peer_group: &str,
+        prefix: packet::IpNet,
+    ) -> Result<(), Error> {
+        let pg = self
+            .peer_group
+            .get_mut(peer_group)
+            .ok_or_else(|| Error::NotFound("peer group not found".to_string()))?;
+        let before = pg.dynamic_peers.len();
+        pg.dynamic_peers.retain(|dp| dp.prefix != prefix);
+        if pg.dynamic_peers.len() == before {
+            return Err(Error::NotFound(
+                "prefix not found in peer group".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Removes a peer and closes its session with a Cease NOTIFICATION
+    /// (Peer De-configured).
+    fn delete_peer(&mut self, addr: IpAddr) -> Result<(), Error> {
+        let p = self
+            .peers
+            .remove(&addr)
+            .ok_or_else(|| Error::NotFound("peer address doesn't exists".to_string()))?;
+        self.rebuild_local_cluster_ids();
+        {
+            let mut ctx = p.context.lock().unwrap();
+            ctx.force_down(
+                CloseReason::SendMessage(bgp::Message::Notification(
+                    rustybgp_packet::Notification::CeasePeerDeconfigured,
+                )),
+                true,
+            );
+        }
+        if p.config.password.is_some() {
+            for &(fd, ifindex) in &self.listen_sockets {
+                auth::set_md5sig(fd, &addr, "", ifindex);
+            }
+        }
+        if let Some(bfd) = &self.bfd_handle {
+            bfd.remove_peer(addr);
+        }
+        Ok(())
+    }
+
     /// Adds a statically configured peer, from the config file or from the
     /// AddPeer API. Applies the named peer group, if it exists, and installs
     /// the peer's TCP MD5 key on the listen sockets. Dynamic peers are created
@@ -4465,7 +4527,7 @@ local-address = "{local}"
     }
 
     #[test]
-    fn add_peer_group_and_dynamic_neighbor() {
+    fn add_and_delete_peer_group_and_dynamic_neighbor() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let (bfd_tx, _bfd_rx) = mpsc::unbounded_channel();
         let mut g = Global::new(tx, bfd_tx);
@@ -4488,6 +4550,18 @@ local-address = "{local}"
             Err(Error::NotFound(_))
         ));
         assert_eq!(g.peer_group["g"].dynamic_peers.len(), 1);
+
+        assert!(matches!(
+            g.delete_peer_group("g"),
+            Err(Error::FailedPrecondition(_))
+        ));
+        assert!(matches!(
+            g.delete_dynamic_neighbor("g", net("10.0.1.0/24")),
+            Err(Error::NotFound(_))
+        ));
+        g.delete_dynamic_neighbor("g", net("10.0.0.0/24")).unwrap();
+        g.delete_peer_group("g").unwrap();
+        assert!(matches!(g.delete_peer_group("g"), Err(Error::NotFound(_))));
     }
 
     fn make_global() -> GlobalHandle {
