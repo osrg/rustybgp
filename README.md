@@ -44,7 +44,7 @@ Peer            AS Up/Down State       |#Received  Accepted
 - Peer group
 - Address families: IPv4/IPv6 unicast/multicast, L3VPN (RFC 4364), EVPN Types 1–5 (RFC 7432), BGP-LS (RFC 7752), Flowspec (RFC 8955), SR Policy (RFC 9256), MUP ([draft-ietf-bess-mup-safi](https://datatracker.ietf.org/doc/draft-ietf-bess-mup-safi/))
 
-See [configuration details](docs/configuration.md) for transport settings.
+See the [documentation site](https://osrg.github.io/rustybgp/) (source in [`docs/`](docs/)) for architecture, configuration, administration, automation, and the [RFC support matrix](docs/content/reference/rfc-support.md).
 
 ## Differences from GoBGP
 

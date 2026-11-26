@@ -1,0 +1,11 @@
+/* Status icons used in support matrices. */
+.md-typeset .ok { color: #2e7d32; }
+.md-typeset .partial { color: #ef6c00; }
+.md-typeset .no { color: #c62828; }
+[data-md-color-scheme="slate"] .md-typeset .ok { color: #66bb6a; }
+[data-md-color-scheme="slate"] .md-typeset .partial { color: #ffa726; }
+[data-md-color-scheme="slate"] .md-typeset .no { color: #ef5350; }
+
+/* Keep wide reference tables readable. */
+.md-typeset table:not([class]) { font-size: 0.72rem; }
+.md-typeset table:not([class]) td { vertical-align: top; }
