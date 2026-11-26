@@ -132,3 +132,10 @@ RUSTYBGP_DOCKERFILE=Dockerfile \
 - `Dockerfile.bird` — BIRD image built from source (CZ.NIC publishes no official
   prebuilt image); used as a real RFC 6793 OLD BGP speaker in `two-byte-as`
 - `helpers.sh` — shell functions sourced by every `run-test.sh`
+
+The `run-test.sh` scripts run with `set -o pipefail`. Do not end a pipeline
+with a command that stops reading early, such as `grep -q`, `head`, or
+`awk '{...; exit}'`. The writer of the pipe can get SIGPIPE, and then the
+pipeline fails even though the pattern matched. A negated check such as
+`! has_route` then passes by mistake. Use `grep ... >/dev/null` instead of
+`grep -q`.

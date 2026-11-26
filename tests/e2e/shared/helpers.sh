@@ -12,6 +12,12 @@ if [ -z "${RUST_TARGET:-}" ]; then
     esac
 fi
 
+# The run-test.sh scripts use "set -o pipefail". Do not end a pipeline with
+# a command that exits before it reads all input, such as "grep -q", "head" or
+# "awk '{...; exit}'". The command that writes to the pipe can then get
+# SIGPIPE, and pipefail makes the whole pipeline fail even when the pattern
+# matched. Use "grep ... >/dev/null" instead of "grep -q".
+
 # Query FRR BGP neighbor state via vtysh JSON output.
 frr_bgp_state() {
     local container=$1 neighbor=$2
@@ -24,7 +30,7 @@ frr_bgp_state() {
 gobgp_bgp_state() {
     local container=$1 neighbor=$2
     if docker exec "$container" gobgp neighbor "$neighbor" 2>/dev/null \
-        | grep -qE "BGP state = .*ESTABLISHED"; then
+        | grep -E "BGP state = .*ESTABLISHED" >/dev/null; then
         echo "Established"
     else
         echo "Idle"
@@ -36,7 +42,7 @@ gobgp_bgp_state() {
 bird_bgp_state() {
     local container=$1 protocol=$2
     if docker exec "$container" birdc show protocols "$protocol" 2>/dev/null \
-        | grep -qE "^${protocol}[[:space:]]+BGP[[:space:]].*Established"; then
+        | grep -E "^${protocol}[[:space:]]+BGP[[:space:]].*Established" >/dev/null; then
         echo "Established"
     else
         echo "Idle"

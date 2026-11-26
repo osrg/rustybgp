@@ -52,7 +52,7 @@ BFD_TIMEOUT_WAIT=3
 wait_for_bfd_log() {
     local timeout=$1 pattern=$2
     for i in $(seq 1 "$timeout"); do
-        if docker logs bfd-peer 2>&1 | grep -q "$pattern"; then
+        if docker logs bfd-peer 2>&1 | grep "$pattern" >/dev/null; then
             return 0
         fi
         sleep 1

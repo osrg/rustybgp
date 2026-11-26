@@ -101,28 +101,28 @@ echo "--- Scenario 1: Basic RT filter ---"
 A_RIB=$(docker exec gobgp-a gobgp global rib -a vpnv4 2>/dev/null || true)
 B_RIB=$(docker exec gobgp-b gobgp global rib -a vpnv4 2>/dev/null || true)
 
-if echo "$A_RIB" | grep -q "10.1.0.0/24"; then
+if echo "$A_RIB" | grep "10.1.0.0/24" >/dev/null; then
     pass "gobgp-a received 10.1.0.0/24 (RT:65001:100 matches its VRF)"
 else
     fail "gobgp-a did not receive 10.1.0.0/24 (RT:65001:100)"
     echo "    gobgp-a VPN RIB: $A_RIB"
 fi
 
-if ! echo "$A_RIB" | grep -q "10.2.0.0/24"; then
+if ! echo "$A_RIB" | grep "10.2.0.0/24" >/dev/null; then
     pass "gobgp-a did NOT receive 10.2.0.0/24 (RT:65001:200 filtered by RTC)"
 else
     fail "gobgp-a wrongly received 10.2.0.0/24 (RT:65001:200 should be filtered)"
     echo "    gobgp-a VPN RIB: $A_RIB"
 fi
 
-if echo "$B_RIB" | grep -q "10.2.0.0/24"; then
+if echo "$B_RIB" | grep "10.2.0.0/24" >/dev/null; then
     pass "gobgp-b received 10.2.0.0/24 (RT:65001:200 matches its VRF)"
 else
     fail "gobgp-b did not receive 10.2.0.0/24 (RT:65001:200)"
     echo "    gobgp-b VPN RIB: $B_RIB"
 fi
 
-if ! echo "$B_RIB" | grep -q "10.1.0.0/24"; then
+if ! echo "$B_RIB" | grep "10.1.0.0/24" >/dev/null; then
     pass "gobgp-b did NOT receive 10.1.0.0/24 (RT:65001:100 filtered by RTC)"
 else
     fail "gobgp-b wrongly received 10.1.0.0/24 (RT:65001:100 should be filtered)"
@@ -139,14 +139,14 @@ echo "Waiting for RTC NLRI propagation and VPN route delivery..."
 sleep 5
 
 A_RIB2=$(docker exec gobgp-a gobgp global rib -a vpnv4 2>/dev/null || true)
-if echo "$A_RIB2" | grep -q "10.2.0.0/24"; then
+if echo "$A_RIB2" | grep "10.2.0.0/24" >/dev/null; then
     pass "gobgp-a now receives 10.2.0.0/24 after adding VRF for RT:65001:200"
 else
     fail "gobgp-a still missing 10.2.0.0/24 after adding VRF for RT:65001:200"
     echo "    gobgp-a VPN RIB: $A_RIB2"
 fi
 
-if echo "$A_RIB2" | grep -q "10.1.0.0/24"; then
+if echo "$A_RIB2" | grep "10.1.0.0/24" >/dev/null; then
     pass "gobgp-a still receives 10.1.0.0/24 (RT:65001:100 unchanged)"
 else
     fail "gobgp-a lost 10.1.0.0/24 after adding second VRF"
@@ -162,14 +162,14 @@ echo "Waiting for RTC NLRI withdrawal and VPN route withdrawal..."
 sleep 5
 
 A_RIB3=$(docker exec gobgp-a gobgp global rib -a vpnv4 2>/dev/null || true)
-if ! echo "$A_RIB3" | grep -q "10.2.0.0/24"; then
+if ! echo "$A_RIB3" | grep "10.2.0.0/24" >/dev/null; then
     pass "gobgp-a no longer receives 10.2.0.0/24 after deleting VRF for RT:65001:200"
 else
     fail "gobgp-a still has 10.2.0.0/24 after deleting VRF for RT:65001:200"
     echo "    gobgp-a VPN RIB: $A_RIB3"
 fi
 
-if echo "$A_RIB3" | grep -q "10.1.0.0/24"; then
+if echo "$A_RIB3" | grep "10.1.0.0/24" >/dev/null; then
     pass "gobgp-a still receives 10.1.0.0/24 (RT:65001:100 unchanged)"
 else
     fail "gobgp-a lost 10.1.0.0/24 after deleting second VRF"

@@ -117,9 +117,9 @@ ASPATH_JSON=$(docker exec frr-ext vtysh -c "show bgp ipv4 unicast 10.0.1.0/24 js
     | jq -r '.paths[0].aspath.string // empty' 2>/dev/null || echo "")
 if [ -n "$ASPATH_JSON" ]; then
     # AS_PATH should contain 65000 and must not contain 65001 or 65002
-    if echo "$ASPATH_JSON" | grep -qw "65000" \
-        && ! echo "$ASPATH_JSON" | grep -qw "65001" \
-        && ! echo "$ASPATH_JSON" | grep -qw "65002"; then
+    if echo "$ASPATH_JSON" | grep -w "65000" >/dev/null \
+        && ! echo "$ASPATH_JSON" | grep -w "65001" >/dev/null \
+        && ! echo "$ASPATH_JSON" | grep -w "65002" >/dev/null; then
         pass "AS_PATH at frr-ext shows confederation AS (65000), member ASes stripped (path: $ASPATH_JSON)"
     else
         fail "AS_PATH at frr-ext is wrong (expected 65000 only, got: $ASPATH_JSON)"

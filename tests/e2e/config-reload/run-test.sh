@@ -62,7 +62,7 @@ reload() {
 
 # has_route <container> <prefix>
 has_route() {
-    docker exec "$1" gobgp global rib 2>/dev/null | grep -q "$2"
+    docker exec "$1" gobgp global rib 2>/dev/null | grep "$2" >/dev/null
 }
 
 # wait_for <seconds> <command...>: returns 0 once the command succeeds.
@@ -168,7 +168,7 @@ else
     fail "gobgp-a session is down after reload"
 fi
 
-if docker exec rusty gobgp neighbor 2>/dev/null | grep -q "$GOBGP_A"; then
+if docker exec rusty gobgp neighbor 2>/dev/null | grep "$GOBGP_A" >/dev/null; then
     fail "rusty no longer has neighbor gobgp-a"
     docker exec rusty gobgp neighbor 2>/dev/null || true
 else
@@ -184,7 +184,7 @@ else
     docker exec gobgp-b gobgp neighbor "$RUSTY" 2>/dev/null || true
 fi
 
-if docker logs rusty 2>&1 | grep -q "neighbor $GOBGP_B is changed"; then
+if docker logs rusty 2>&1 | grep "neighbor $GOBGP_B is changed" >/dev/null; then
     pass "rusty logs that the change of gobgp-b is not applied"
 else
     fail "rusty logs that the change of gobgp-b is not applied"

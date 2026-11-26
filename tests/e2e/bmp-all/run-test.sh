@@ -82,7 +82,7 @@ bmp_absent() {
         fail "$desc"
         echo "    Filter: $filter"
         echo "    Unexpected matches:"
-        docker logs bmp-receiver 2>/dev/null | jq -c "select($filter)" | head -5 | sed 's/^/      /'
+        docker logs bmp-receiver 2>/dev/null | jq -c "select($filter)" | sed -n "1,5s/^/      /p"
     fi
 }
 

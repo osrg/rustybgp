@@ -124,7 +124,7 @@ fi
 # Test 2: ENCODE direction. rusty must have downgraded 10.0.1.0/24's AS_PATH to
 # two-octet + AS4_PATH; bird-old (real BIRD) must show the reconciled AS_PATH.
 ASPATH_1001=$(docker exec bird-old birdc show route all 2>/dev/null \
-    | awk '/^10\.0\.1\.0\/24/{f=1; next} f && /BGP.as_path:/{print; exit}' \
+    | awk '/^10\.0\.1\.0\/24/{f=1; next} f && /BGP.as_path:/ && !done {print; done=1}' \
     | sed 's/.*BGP.as_path: *//')
 if [ "$ASPATH_1001" = "65010 4200000000" ]; then
     pass "bird-old reconstructed AS_PATH '65010 4200000000' for 10.0.1.0/24 from rusty's AS4_PATH"
@@ -136,7 +136,7 @@ fi
 
 # Test 3: no AS4_PATH needed when the whole AS_PATH fits in two octets.
 ASPATH_1003=$(docker exec bird-old birdc show route all 2>/dev/null \
-    | awk '/^10\.0\.3\.0\/24/{f=1; next} f && /BGP.as_path:/{print; exit}' \
+    | awk '/^10\.0\.3\.0\/24/{f=1; next} f && /BGP.as_path:/ && !done {print; done=1}' \
     | sed 's/.*BGP.as_path: *//')
 if [ "$ASPATH_1003" = "65010" ]; then
     pass "bird-old shows a clean AS_PATH '65010' for 10.0.3.0/24 (no AS4_PATH needed)"
@@ -147,7 +147,7 @@ fi
 # Test 4: DECODE direction. bird-old must have downgraded 10.0.2.0/24's AS_PATH
 # to two-octet + AS4_PATH when relaying to rusty; rusty must reconcile it back.
 RUSTY_RIB=$(docker exec rusty gobgp global rib 2>/dev/null || true)
-if echo "$RUSTY_RIB" | grep "10.0.2.0/24" | grep -q "65020 4200000001"; then
+if echo "$RUSTY_RIB" | grep "10.0.2.0/24" | grep "65020 4200000001" >/dev/null; then
     pass "rusty reconciled AS_PATH '65020 4200000001' for 10.0.2.0/24 from bird-old's (real BIRD-generated) AS4_PATH"
 else
     fail "rusty AS_PATH for 10.0.2.0/24 is wrong (expected to contain '65020 4200000001')"
