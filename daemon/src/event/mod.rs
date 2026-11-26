@@ -11429,6 +11429,32 @@ local-address = "{local}"
     }
 
     #[tokio::test]
+    async fn add_path_rejects_unsupported_table_type() {
+        let svc = make_grpc_service();
+        for table_type in [api::TableType::AdjIn, api::TableType::AdjOut] {
+            let err = svc
+                .add_path(tonic::Request::new(api::AddPathRequest {
+                    table_type: table_type as i32,
+                    path: Some(ipv4_path("10.1.0.0", 24, "10.0.0.1")),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+        let err = svc
+            .add_path(tonic::Request::new(api::AddPathRequest {
+                table_type: 100,
+                path: Some(ipv4_path("10.1.0.0", 24, "10.0.0.1")),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(loc_rib_len(&svc, Family::IPV4), 0);
+    }
+
+    #[tokio::test]
     async fn add_path_returns_valid_uuid() {
         let svc = make_grpc_service();
         let req = tonic::Request::new(api::AddPathRequest {

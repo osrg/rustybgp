@@ -2183,14 +2183,18 @@ impl GoBgpService for GrpcService {
         request: tonic::Request<api::AddPathRequest>,
     ) -> Result<tonic::Response<api::AddPathResponse>, tonic::Status> {
         let inner = request.into_inner();
-        let table_type =
-            api::TableType::try_from(inner.table_type).unwrap_or(api::TableType::Global);
-        let path = inner.path.ok_or(Error::EmptyArgument)?;
-        let vrf = if table_type == api::TableType::Vrf {
-            Some(self.find_vrf(&inner.vrf_id)?)
-        } else {
-            None
+        // Unspecified is taken as the global table, like DeletePath. GoBGP
+        // ignores table_type in AddPath, so clients often leave it unset.
+        let vrf = match api::TableType::try_from(inner.table_type) {
+            Ok(api::TableType::Unspecified | api::TableType::Global) => None,
+            Ok(api::TableType::Vrf) => Some(self.find_vrf(&inner.vrf_id)?),
+            _ => {
+                return Err(tonic::Status::invalid_argument(
+                    "AddPath only supports global and VRF tables",
+                ));
+            }
         };
+        let path = inner.path.ok_or(Error::EmptyArgument)?;
         let path = self.prepare_local_path(path, vrf.as_ref())?;
         // Serialize route mutations and UUID bookkeeping with DeletePath.
         let mut uuid_map = self.path_uuid_map.lock().await;
