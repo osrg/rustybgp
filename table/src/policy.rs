@@ -400,14 +400,19 @@ impl Condition {
                 };
             }
             Condition::AsPath(_name, opt, set) => {
-                if let Some(a) = attr.get(packet::Attribute::AS_PATH) {
-                    for set in &set.single_sets {
-                        if set.is_match(a) {
-                            return *opt == MatchOption::Any;
-                        }
-                    }
-                }
-                return !(*opt == MatchOption::Any);
+                let a = attr.get(packet::Attribute::AS_PATH);
+                let single = set
+                    .single_sets
+                    .iter()
+                    .map(|m| a.is_some_and(|a| m.is_match(a)));
+                // Build the string only when the set has regex patterns.
+                let s = if set.sets.is_empty() {
+                    String::new()
+                } else {
+                    a.map(as_path_string).unwrap_or_default()
+                };
+                let regex = set.sets.iter().map(|r| r.is_match(&s));
+                return match_results(single.chain(regex), opt);
             }
             Condition::Neighbor(_name, opt, set) => {
                 let mut found = false;
@@ -512,6 +517,56 @@ impl Condition {
         }
         false
     }
+}
+
+/// Combine per-pattern match results with a match option.
+/// An empty input gives false for Any and true for All and Invert.
+fn match_results(mut results: impl Iterator<Item = bool>, opt: &MatchOption) -> bool {
+    match opt {
+        MatchOption::Any => results.any(|r| r),
+        MatchOption::All => results.all(|r| r),
+        MatchOption::Invert => !results.any(|r| r),
+    }
+}
+
+/// Format AS_PATH as a string for regex matching, in the same format as
+/// GoBGP: AS_SEQUENCE "1 2", AS_SET "{1,2}", AS_CONFED_SEQUENCE "(1 2)",
+/// AS_CONFED_SET "[1,2]". Segments are separated by a space.
+fn as_path_string(attr: &Attribute) -> String {
+    let buf = match attr.binary() {
+        Some(b) => b,
+        None => return String::new(),
+    };
+    let mut s = String::new();
+    let mut pos = 0;
+    while pos + 2 <= buf.len() {
+        let seg_type = buf[pos];
+        let n = buf[pos + 1] as usize;
+        pos += 2;
+        if pos + n * 4 > buf.len() {
+            break;
+        }
+        let (open, close, sep) = match seg_type {
+            Attribute::AS_PATH_TYPE_SET => ("{", "}", ","),
+            Attribute::AS_PATH_TYPE_CONFED_SEQ => ("(", ")", " "),
+            Attribute::AS_PATH_TYPE_CONFED_SET => ("[", "]", ","),
+            _ => ("", "", " "),
+        };
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(open);
+        for i in 0..n {
+            if i != 0 {
+                s.push_str(sep);
+            }
+            let b = &buf[pos + i * 4..pos + i * 4 + 4];
+            s.push_str(&u32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string());
+        }
+        s.push_str(close);
+        pos += n * 4;
+    }
+    s
 }
 
 fn match_string_set(strs: &[String], patterns: &[Regex], opt: &MatchOption) -> bool {
@@ -3985,6 +4040,165 @@ mod tests {
         b[6] = (local >> 8) as u8;
         b[7] = local as u8;
         b
+    }
+
+    fn make_as_path_condition_assignment(
+        patterns: &[&str],
+        opt: MatchOption,
+    ) -> Arc<PolicyAssignment> {
+        let mut ptable = PolicyTable::new();
+        ptable
+            .add_defined_set(DefinedSetConfig::AsPath {
+                name: "as1".to_string(),
+                patterns: patterns.iter().map(|p| p.to_string()).collect(),
+            })
+            .unwrap();
+        ptable
+            .add_statement(
+                "st1",
+                vec![ConditionConfig::AsPathSet("as1".to_string(), opt)],
+                Some(Disposition::Reject),
+                Actions::default(),
+            )
+            .unwrap();
+        ptable.add_policy("p1", vec!["st1".to_string()]).unwrap();
+        ptable
+            .add_assignment(
+                "global",
+                PolicyDirection::Import,
+                Disposition::Accept,
+                vec!["p1".to_string()],
+            )
+            .unwrap();
+        ptable.assignment_import.unwrap()
+    }
+
+    /// Build an AS_PATH attribute from (segment type, ASNs) pairs.
+    fn as_path_segments(segs: &[(u8, &[u32])]) -> packet::Attribute {
+        let mut bin = Vec::new();
+        for (t, asns) in segs {
+            bin.push(*t);
+            bin.push(asns.len() as u8);
+            for a in asns.iter() {
+                bin.extend_from_slice(&a.to_be_bytes());
+            }
+        }
+        packet::Attribute::new_with_bin(packet::Attribute::AS_PATH, bin).unwrap()
+    }
+
+    /// Returns true if the AS-path condition matches (the statement rejects).
+    fn as_path_condition_matches(
+        patterns: &[&str],
+        opt: MatchOption,
+        as_path: packet::Attribute,
+    ) -> bool {
+        let assignment = make_as_path_condition_assignment(patterns, opt);
+        let s = source();
+        let net = nlri();
+        let mut attr = Arc::new(packet::PathAttributes::new(vec![as_path]));
+        let mut nexthop = nh();
+        let d = Table::apply_policy(
+            &assignment,
+            &s,
+            &net,
+            &mut attr,
+            &mut nexthop,
+            local_addr(),
+            s.remote_addr,
+            None,
+            None,
+            false,
+        );
+        d == Disposition::Reject
+    }
+
+    #[test]
+    fn as_path_string_format() {
+        let seq = packet::Attribute::AS_PATH_TYPE_SEQ;
+        let set = packet::Attribute::AS_PATH_TYPE_SET;
+        let cseq = packet::Attribute::AS_PATH_TYPE_CONFED_SEQ;
+        let cset = packet::Attribute::AS_PATH_TYPE_CONFED_SET;
+        let a = as_path_segments(&[
+            (cseq, &[65010, 65011]),
+            (cset, &[65012, 65013]),
+            (seq, &[65001, 65002]),
+            (set, &[65003, 65004]),
+        ]);
+        assert_eq!(
+            as_path_string(&a),
+            "(65010 65011) [65012,65013] 65001 65002 {65003,65004}"
+        );
+        assert_eq!(as_path_string(&packet::Attribute::empty_as_path()), "");
+    }
+
+    #[test]
+    fn as_path_set_regex_any() {
+        // Patterns that are not single-AS matchers are compiled as regex.
+        let path = || as_path_attr(&[65001, 65002, 65003]);
+        assert!(as_path_condition_matches(
+            &["^65001_.*_65003$"],
+            MatchOption::Any,
+            path()
+        ));
+        assert!(!as_path_condition_matches(
+            &["^65002_"],
+            MatchOption::Any,
+            path()
+        ));
+    }
+
+    #[test]
+    fn as_path_set_regex_underscore_matches_set_delimiter() {
+        let seq = packet::Attribute::AS_PATH_TYPE_SEQ;
+        let set = packet::Attribute::AS_PATH_TYPE_SET;
+        let a = as_path_segments(&[(seq, &[65001]), (set, &[65003, 65004])]);
+        assert!(as_path_condition_matches(
+            &["_6500[34]_.*$"],
+            MatchOption::Any,
+            a
+        ));
+    }
+
+    #[test]
+    fn as_path_set_all() {
+        let path = || as_path_attr(&[65001, 65002, 65003]);
+        // Single matcher and regex, both match.
+        assert!(as_path_condition_matches(
+            &["^65001_", "_6500[23]_65003$"],
+            MatchOption::All,
+            path()
+        ));
+        // One pattern does not match.
+        assert!(!as_path_condition_matches(
+            &["^65001_", "_65009_"],
+            MatchOption::All,
+            path()
+        ));
+        assert!(!as_path_condition_matches(
+            &["^65001_", "^6500[9]_"],
+            MatchOption::All,
+            path()
+        ));
+    }
+
+    #[test]
+    fn as_path_set_invert() {
+        let path = || as_path_attr(&[65001, 65002, 65003]);
+        assert!(!as_path_condition_matches(
+            &["_65009_", "_65002_"],
+            MatchOption::Invert,
+            path()
+        ));
+        assert!(!as_path_condition_matches(
+            &["^6500[1]_"],
+            MatchOption::Invert,
+            path()
+        ));
+        assert!(as_path_condition_matches(
+            &["_65009_", "^6500[9]_"],
+            MatchOption::Invert,
+            path()
+        ));
     }
 
     #[test]
