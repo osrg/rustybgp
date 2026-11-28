@@ -626,6 +626,20 @@ pub(crate) enum ToPeerEvent {
     RouteRefreshFamilies(Vec<Family>),
 }
 
+/// TTL for outgoing packets of a BGP session, or None to keep the socket
+/// default. With GTSM (RFC 5082) the TTL is 255. Without GTSM, eBGP uses
+/// the multihop TTL or 1. Same-AS internal peers keep the socket default
+/// (RFC 4271, Section 1.1) so that iBGP can go through other routers.
+fn outgoing_ttl(config: &PeerConfig) -> Option<u8> {
+    if config.ttl_security.is_some() {
+        Some(255)
+    } else if config.expected_remote_asn != config.local_asn {
+        Some(config.multihop_ttl.unwrap_or(1))
+    } else {
+        None
+    }
+}
+
 pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<TcpStream>) {
     if peer.admin_down || peer.config.passive || peer.config.delete_on_disconnected {
         return;
@@ -646,6 +660,7 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
     let bind_interface = peer.config.bind_interface.clone();
     let local_address = peer.config.local_address.clone();
     let peer_ifindex = bind_interface.as_deref().map(auth::ifindex_of).unwrap_or(0);
+    let ttl = outgoing_ttl(&peer.config);
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let join_handle = tokio::spawn(async move {
         loop {
@@ -675,6 +690,11 @@ pub(super) fn enable_active_connect(peer: &mut Peer, ch: mpsc::UnboundedSender<T
                 }
                 if let Some(key) = password.as_ref() {
                     auth::set_md5sig(socket.as_raw_fd(), &peer_addr, key, peer_ifindex);
+                }
+                // Set the TTL before connect() so that the SYN also uses it.
+                // A GTSM peer can check the TTL of the SYN too.
+                if let Some(ttl) = ttl {
+                    let _ = auth::set_ttl(&socket, &peer_addr, ttl);
                 }
                 Ok::<_, std::io::Error>(socket)
             })();
@@ -1870,14 +1890,12 @@ async fn accept_connection(
             g.peers.get_mut(&remote_addr).unwrap()
         }
     };
-    // Without GTSM, preserve the socket TTL for same-AS internal peers
-    // (RFC 4271, Section 1.1) so iBGP can traverse intermediate routers.
+    if let Some(ttl) = outgoing_ttl(&peer.config) {
+        let _ = auth::set_ttl(&stream, &remote_addr, ttl);
+    }
     if let Some(ttl_min) = peer.config.ttl_security {
-        // GTSM (RFC 5082): send with TTL=255, drop incoming below ttl_min.
-        let _ = stream.set_ttl(255);
+        // GTSM (RFC 5082): drop incoming packets below ttl_min.
         auth::set_min_ttl(stream.as_raw_fd(), &remote_addr, ttl_min);
-    } else if peer.config.expected_remote_asn != peer.config.local_asn {
-        let _ = stream.set_ttl(peer.config.multihop_ttl.unwrap_or(1).into());
     }
     let context = Arc::clone(&peer.context);
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<CloseReason>();
@@ -5069,7 +5087,11 @@ local-address = "{local}"
     /// Pass `server_stream` to `accept_connection`; `remote_addr` is
     /// `client_stream.local_addr().ip()`.
     async fn loopback_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        loopback_pair_on("127.0.0.1:0").await
+    }
+
+    async fn loopback_pair_on(bind: &str) -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (client, server) =
             tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept(),);
@@ -5090,12 +5112,26 @@ local-address = "{local}"
             (0, 65001, None, Some(200), 255),
             (0, 65002, Some(7), Some(200), 255),
         ];
-        for role in [crate::fsm::Role::Active, crate::fsm::Role::Passive] {
+        // IPv6 sessions must set the hop limit, not IP_TTL.
+        let ttl_of = |s: &tokio::net::TcpStream| {
+            let s = socket2::SockRef::from(s);
+            match s.local_addr().unwrap().is_ipv6() {
+                true => s.unicast_hops_v6().unwrap(),
+                false => s.ttl_v4().unwrap(),
+            }
+        };
+        for (bind, role) in [
+            ("127.0.0.1:0", crate::fsm::Role::Active),
+            ("127.0.0.1:0", crate::fsm::Role::Passive),
+            ("[::1]:0", crate::fsm::Role::Active),
+            ("[::1]:0", crate::fsm::Role::Passive),
+        ] {
             for (local_asn, remote_asn, multihop_ttl, ttl_security, expected) in cases {
                 let global = make_global();
                 let tables = make_tables();
-                let (client, server) = loopback_pair().await;
-                server.set_ttl(73).unwrap();
+                let (client, server) = loopback_pair_on(bind).await;
+                let remote = client.local_addr().unwrap().ip();
+                auth::set_ttl(&server, &remote, 73).unwrap();
                 let mut params = default_peer_params(client.local_addr().unwrap().ip());
                 params.local_asn = local_asn;
                 params.expected_remote_asn = remote_asn;
@@ -5107,9 +5143,9 @@ local-address = "{local}"
                     .await
                     .unwrap();
                 assert_eq!(
-                    session.stream.as_ref().unwrap().ttl().unwrap(),
+                    ttl_of(session.stream.as_ref().unwrap()),
                     expected,
-                    "{role:?}: local AS {local_asn}, remote AS {remote_asn}, multihop {multihop_ttl:?}, GTSM {ttl_security:?}"
+                    "{bind} {role:?}: local AS {local_asn}, remote AS {remote_asn}, multihop {multihop_ttl:?}, GTSM {ttl_security:?}"
                 );
             }
         }

@@ -93,6 +93,21 @@ pub(crate) fn ifindex_of(device: &str) -> u32 {
     nix::net::if_::if_nametoindex(device).unwrap_or(0)
 }
 
+/// Set the TTL of outgoing packets. IPv4 uses IP_TTL; IPv6 uses
+/// IPV6_UNICAST_HOPS. IP_TTL does not change the hop limit of native
+/// IPv6 packets, so an IPv6 socket needs the IPv6 option.
+pub(crate) fn set_ttl<S: std::os::fd::AsFd>(
+    sock: &S,
+    addr: &IpAddr,
+    ttl: u8,
+) -> std::io::Result<()> {
+    let s = socket2::SockRef::from(sock);
+    match addr {
+        IpAddr::V4(_) => s.set_ttl_v4(ttl.into()),
+        IpAddr::V6(_) => s.set_unicast_hops_v6(ttl.into()),
+    }
+}
+
 /// Set the minimum acceptable TTL for incoming packets (RFC 5082 GTSM).
 /// Packets arriving with TTL < ttl_min are dropped by the kernel.
 /// IPv4 uses IP_MINTTL; IPv6 uses IPV6_MINHOPCOUNT.
@@ -125,3 +140,23 @@ pub(crate) fn set_min_ttl(rawfd: RawFd, addr: &IpAddr, ttl_min: u8) {
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn set_min_ttl(_rawfd: RawFd, _addr: &IpAddr, _ttl_min: u8) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The active connect path sets the TTL before connect(), so check an
+    // unconnected socket of each family.
+    #[test]
+    fn set_ttl_sets_ipv4_ttl_and_ipv6_hop_limit() {
+        let v4 = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        set_ttl(&v4, &"192.0.2.1".parse().unwrap(), 7).unwrap();
+        assert_eq!(v4.ttl_v4().unwrap(), 7);
+
+        let v6 = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None).unwrap();
+        let default_hops = v6.unicast_hops_v6().unwrap();
+        set_ttl(&v6, &"2001:db8::1".parse().unwrap(), 255).unwrap();
+        assert_eq!(v6.unicast_hops_v6().unwrap(), 255);
+        assert_ne!(default_hops, 255);
+    }
+}

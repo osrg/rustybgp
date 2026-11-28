@@ -546,8 +546,8 @@ fn create_send_socket(peer_addr: IpAddr, remote_port: u16) -> std::io::Result<Op
         std_sock.connect(remote)?;
         std_sock.set_nonblocking(true)?;
         let sock = UdpSocket::from_std(std_sock)?;
-        // GTSM: set outgoing TTL to 255.
-        sock.set_ttl(255)?;
+        // GTSM: set outgoing TTL (hop limit for IPv6) to 255.
+        crate::auth::set_ttl(&sock, &peer_addr, 255)?;
         return Ok(Some(sock));
     }
 
