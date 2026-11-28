@@ -71,18 +71,28 @@ pub(crate) struct BfdPeerConfig {
     pub port: u16,
 }
 
-impl Default for BfdPeerConfig {
-    fn default() -> Self {
+impl BfdPeerConfig {
+    /// Build a peer config from the configuration file or the gRPC API.
+    /// A value of 0, which is also what an omitted field gives, selects
+    /// the default, as GoBGP does: 1 second for both intervals, 3 for the
+    /// detect multiplier, and port 3784.
+    pub(crate) fn new(
+        desired_min_tx_interval_us: u32,
+        required_min_rx_interval_us: u32,
+        detect_multiplier: u8,
+        port: u16,
+    ) -> Self {
+        fn or_default<T: PartialEq + Default>(v: T, default: T) -> T {
+            if v == T::default() { default } else { v }
+        }
         Self {
-            desired_min_tx_interval_us: DEFAULT_TX_US,
-            required_min_rx_interval_us: DEFAULT_RX_US,
-            detect_multiplier: DEFAULT_DETECT_MULT,
-            port: 0,
+            desired_min_tx_interval_us: or_default(desired_min_tx_interval_us, DEFAULT_TX_US),
+            required_min_rx_interval_us: or_default(required_min_rx_interval_us, DEFAULT_RX_US),
+            detect_multiplier: or_default(detect_multiplier, DEFAULT_DETECT_MULT),
+            port,
         }
     }
-}
 
-impl BfdPeerConfig {
     fn remote_port(&self) -> u16 {
         if self.port > 0 { self.port } else { BFD_PORT }
     }
@@ -556,4 +566,29 @@ fn create_send_socket(peer_addr: IpAddr, remote_port: u16) -> std::io::Result<Op
          for {peer_addr}; falling back to server socket"
     );
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_config_zero_selects_defaults() {
+        let c = BfdPeerConfig::new(0, 0, 0, 0);
+        assert_eq!(c.desired_min_tx_interval_us, DEFAULT_TX_US);
+        assert_eq!(c.required_min_rx_interval_us, DEFAULT_RX_US);
+        assert_eq!(c.detect_multiplier, DEFAULT_DETECT_MULT);
+        assert_eq!(c.remote_port(), BFD_PORT);
+        assert_eq!(c.tx_interval(), Duration::from_secs(1));
+        assert_eq!(c.detect_interval(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn peer_config_keeps_set_values() {
+        let c = BfdPeerConfig::new(300_000, 200_000, 5, 4784);
+        assert_eq!(c.desired_min_tx_interval_us, 300_000);
+        assert_eq!(c.required_min_rx_interval_us, 200_000);
+        assert_eq!(c.detect_multiplier, 5);
+        assert_eq!(c.remote_port(), 4784);
+    }
 }

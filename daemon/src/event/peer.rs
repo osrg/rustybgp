@@ -693,12 +693,12 @@ impl TryFrom<&config::Neighbor> for PeerParams {
                 .and_then(|b| b.config.as_ref())
                 .and_then(|bc| {
                     if bc.enabled.unwrap_or(false) {
-                        Some(crate::bfd::BfdPeerConfig {
-                            desired_min_tx_interval_us: bc.desired_minimum_tx_interval.unwrap_or(0),
-                            required_min_rx_interval_us: bc.required_minimum_receive.unwrap_or(0),
-                            detect_multiplier: bc.detection_multiplier.unwrap_or(0),
-                            port: 0,
-                        })
+                        Some(crate::bfd::BfdPeerConfig::new(
+                            bc.desired_minimum_tx_interval.unwrap_or(0),
+                            bc.required_minimum_receive.unwrap_or(0),
+                            bc.detection_multiplier.unwrap_or(0),
+                            bc.port.unwrap_or(0),
+                        ))
                     } else {
                         None
                     }

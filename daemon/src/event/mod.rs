@@ -5077,6 +5077,43 @@ local-address = "{local}"
     }
 
     #[test]
+    fn peer_params_from_config_bfd_defaults_and_port() {
+        // Omitted intervals and multiplier select the defaults.
+        let mut n = make_minimal_neighbor_config("10.0.0.1");
+        n.bfd = Some(config::Bfd {
+            config: Some(config::BfdConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let params = PeerParams::try_from(&n).unwrap();
+        let bfd = params.bfd_config.unwrap();
+        assert_eq!(bfd.desired_min_tx_interval_us, 1_000_000);
+        assert_eq!(bfd.required_min_rx_interval_us, 1_000_000);
+        assert_eq!(bfd.detect_multiplier, 3);
+        assert_eq!(bfd.port, 0);
+
+        // Set values, including the port, are used as they are.
+        n.bfd = Some(config::Bfd {
+            config: Some(config::BfdConfig {
+                enabled: Some(true),
+                port: Some(4784),
+                desired_minimum_tx_interval: Some(300_000),
+                required_minimum_receive: Some(200_000),
+                detection_multiplier: Some(5),
+            }),
+            ..Default::default()
+        });
+        let params = PeerParams::try_from(&n).unwrap();
+        let bfd = params.bfd_config.unwrap();
+        assert_eq!(bfd.desired_min_tx_interval_us, 300_000);
+        assert_eq!(bfd.required_min_rx_interval_us, 200_000);
+        assert_eq!(bfd.detect_multiplier, 5);
+        assert_eq!(bfd.port, 4784);
+    }
+
+    #[test]
     fn peer_params_from_config_neighbor_without_apply_policy_is_none() {
         let n = make_minimal_neighbor_config("10.0.0.1");
         let params = PeerParams::try_from(&n).unwrap();
