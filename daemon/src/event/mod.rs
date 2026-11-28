@@ -1959,15 +1959,26 @@ fn start_grpc_server(
     active_tx: mpsc::UnboundedSender<TcpStream>,
     addr: SocketAddr,
 ) {
+    // Bind before spawning the server task, so that a bind failure stops
+    // the daemon. A panic in the spawned task would not stop the process,
+    // and the daemon would keep running without the API.
+    let incoming = match tonic::transport::server::TcpIncoming::bind(addr) {
+        // Server::serve() also sets TCP_NODELAY by default.
+        Ok(incoming) => incoming.with_nodelay(Some(true)),
+        Err(err) => {
+            log::error!("failed to listen on grpc {addr}: {err}");
+            std::process::exit(1);
+        }
+    };
     tokio::spawn(async move {
         if let Err(err) = tonic::transport::Server::builder()
             .add_service(GoBgpServiceServer::new(GrpcService::new(
                 notify, active_tx, global, tables,
             )))
-            .serve(addr)
+            .serve_with_incoming(incoming)
             .await
         {
-            panic!("failed to listen on grpc {}", err);
+            log::error!("grpc server failed: {err}");
         }
     });
 }
