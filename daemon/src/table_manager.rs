@@ -1124,6 +1124,20 @@ fn fib_eligible(path: &table::Path) -> bool {
 /// of the ECMP set: their role is Ibgp, so they can tie with an iBGP path
 /// in decision steps 1-6 and would otherwise add our own interface address
 /// to the multipath route.
+/// Return true when routes of `family` are synced to the kernel FIB.
+///
+/// Unicast routes go to the main table and VPN routes go to the VRF
+/// tables.  Multicast SAFI routes use the same Nlri::V4/V6 as unicast, but
+/// they are for RPF lookups and must not be forwarding entries.  If they
+/// were synced, a multicast route would replace or withdraw the unicast
+/// route for the same prefix, because both map to one kernel entry.
+fn fib_family(family: Family) -> bool {
+    matches!(
+        family,
+        Family::IPV4 | Family::IPV6 | Family::IPV4_VPN | Family::IPV6_VPN
+    )
+}
+
 fn fib_nexthops(update: &table::NlriChange, opts: table::SelectionOptions) -> Vec<bgp::Nexthop> {
     if update.new_best().is_some_and(fib_eligible) {
         update
@@ -1235,6 +1249,7 @@ impl TableShard {
         // proto bgp route instead of installing anything.
         if let Some(handle) = kernel_handle
             && update.best_changed
+            && fib_family(update.family)
         {
             let nexthops = fib_nexthops(&update, self.rtable.selection_options());
             let metric = update
@@ -1612,6 +1627,18 @@ mod tests {
             replaced_path_id: None,
             current_paths: Arc::new(paths),
         }
+    }
+
+    #[test]
+    fn fib_family_excludes_multicast() {
+        assert!(fib_family(Family::IPV4));
+        assert!(fib_family(Family::IPV6));
+        assert!(fib_family(Family::IPV4_VPN));
+        assert!(fib_family(Family::IPV6_VPN));
+        assert!(!fib_family(Family::IPV4_MC));
+        assert!(!fib_family(Family::IPV6_MC));
+        assert!(!fib_family(Family::IPV4_MPLS));
+        assert!(!fib_family(Family::IPV4_FLOWSPEC));
     }
 
     #[test]
